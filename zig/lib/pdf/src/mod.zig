@@ -22,7 +22,7 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
-const minimum_direct_render_dpi: u16 = 72;
+const minimum_direct_render_dpi: u16 = 1;
 const minimum_requested_render_dpi: u16 = 72;
 
 pub const RenderedPagePng = struct {
@@ -31,11 +31,35 @@ pub const RenderedPagePng = struct {
     effective_dpi: u16,
     width: u32,
     height: u32,
+    quality: RenderQuality = .native,
+    diagnostics: ?reader.PageRenderDiagnostics = null,
 
     pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
         alloc.free(self.png);
         self.* = undefined;
     }
+};
+
+pub const RenderQuality = enum {
+    /// Every supported page paint operation was rendered by the native Zig
+    /// path within its deterministic limits.
+    native,
+    /// Native rendering completed, but one or more text groups used the
+    /// bounded raster-font fallback. Callers may still OCR the result while
+    /// surfacing the diagnostic counters.
+    degraded,
+    /// Native decoding rejected an unsupported construct and a compatibility
+    /// backend produced the pixels. This is never selected on platforms
+    /// without such a backend.
+    compatibility_backend,
+};
+
+pub const RenderProfile = enum {
+    /// Preserve PDF sampling semantics exactly, including nearest-neighbor
+    /// minification when /Interpolate is absent.
+    exact,
+    /// Preserve bilevel ink coverage during minification for OCR inputs.
+    ocr,
 };
 
 pub const Backend = struct {
@@ -89,13 +113,13 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
 
 pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
-    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels, .exact);
 }
 
-fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64, profile: RenderProfile) ![]u8 {
     if (page_number == 0 or page_number > try parsed.pageCount()) return error.InvalidPageNumber;
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
-    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation);
+    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile, null);
 }
 
 fn renderParsedPagePngEffectiveWithRotationAlloc(
@@ -105,18 +129,21 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
 ) ![]u8 {
-    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation) catch |err| switch (err) {
+    if (used_compatibility_backend) |value| value.* = false;
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
         error.UnexpectedEof,
-        => if (builtin.os.tag == .macos)
-            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation)
-        else
-            return err,
+        => if (builtin.os.tag == .macos) blk: {
+            if (used_compatibility_backend) |value| value.* = true;
+            break :blk try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+        } else return err,
         else => return err,
     };
 }
@@ -128,8 +155,10 @@ fn renderParsedPagePngNativeAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
 ) ![]u8 {
     const reader_alloc = parsed.allocator();
+    try parsed.checkCancellation();
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
@@ -140,6 +169,10 @@ fn renderParsedPagePngNativeAlloc(
     if (preflight_width > std.math.maxInt(u32) or preflight_height > std.math.maxInt(u32)) return error.RenderedPageTooLarge;
     var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
+    try parsed.checkCancellation();
+    if (profile == .ocr) {
+        try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
+    }
     scalePageRenderRuns(&render_runs, scale);
     alignPageBoxToPixelGrid(&render_runs.page_box);
     const page_box = render_runs.page_box;
@@ -173,7 +206,11 @@ fn renderParsedPagePngNativeAlloc(
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation);
+    try parsed.checkCancellation();
+    const png = try render.renderPageContentPngInBoxRotatedCancelable(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
+    errdefer alloc.free(png);
+    try parsed.checkCancellation();
+    return png;
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
@@ -188,9 +225,10 @@ fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
 }
 
 /// Renders at the requested DPI when safe, reducing it only enough to satisfy
-/// both the dimension and pixel guards without crossing the 72-DPI quality
-/// floor. Pages that cannot fit safely at that floor fail explicitly rather
-/// than silently producing an OCR input below the documented minimum.
+/// both the dimension and pixel guards. The requested DPI remains at least 72,
+/// but malformed or scan-oriented PDFs sometimes encode pixel dimensions as
+/// page points; adaptive rendering may report a lower effective DPI while
+/// still producing the largest output admitted by the explicit safety caps.
 pub fn renderParsedPagePngAdaptiveAlloc(
     alloc: Allocator,
     parsed: *reader.Reader,
@@ -198,6 +236,18 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     requested_dpi: u16,
     max_pixels: u64,
     max_dimension: u32,
+) !RenderedPagePng {
+    return try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, parsed, page_number, requested_dpi, max_pixels, max_dimension, .exact);
+}
+
+pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    profile: RenderProfile,
 ) !RenderedPagePng {
     if (page_number == 0) return error.InvalidPageNumber;
     if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
@@ -229,12 +279,19 @@ pub fn renderParsedPagePngAdaptiveAlloc(
         effective_dpi -= 1;
     }
 
+    parsed.clearRenderDiagnostics();
+    var used_compatibility_backend = false;
+    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation, profile, &used_compatibility_backend);
+    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
+    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
     return .{
-        .png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation),
+        .png = png,
         .requested_dpi = requested_dpi,
         .effective_dpi = effective_dpi,
         .width = width,
         .height = height,
+        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
+        .diagnostics = diagnostics,
     };
 }
 
@@ -327,6 +384,11 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
+        // A retained stencil is the page-space target of the Pattern paint,
+        // unlike tile-local image runs. Scale it exactly once with the outer
+        // pattern occurrence.
+        if (run.stencil_mask) |*mask|
+            scaleImageRuns(@as(*[1]reader.ImageRun, @ptrCast(mask))[0..], scale);
         // Tiling geometry and tile-local runs remain in pattern space. The
         // pattern matrix is the single mapping into the scaled page space;
         // scaling both produced tiles that grew by scale^2 at higher DPI.
@@ -2663,8 +2725,11 @@ test "adaptive OCR rendering records effective DPI and enforces safety caps" {
     try std.testing.expectEqual(adaptive.width, decoded.width);
     try std.testing.expectEqual(adaptive.height, decoded.height);
 
-    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700));
-    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400));
+    var compact = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400);
+    defer compact.deinit(alloc);
+    try std.testing.expect(compact.effective_dpi < 72);
+    try std.testing.expect(compact.width <= 400);
+    try std.testing.expect(compact.height <= 400);
     try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
     try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
 }
@@ -2681,9 +2746,25 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
         .points = tile_points,
     };
     const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    const stencil_rgba = try alloc.dupe(u8, &.{ 0xff, 0xff, 0xff, 0xff });
     var runs = [_]reader.PatternRun{.{
         .kind = .fill,
         .points = target_points,
+        .stencil_mask = .{
+            .rgba = stencil_rgba,
+            .width = 1,
+            .height = 1,
+            .a = 20,
+            .b = 0,
+            .c = 0,
+            .d = 20,
+            .e = 3,
+            .f = 4,
+            .x = 3,
+            .y = 4,
+            .draw_width = 20,
+            .draw_height = 20,
+        },
         .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
         .pattern_x_step = 5,
         .pattern_y_step = 5,
@@ -2697,6 +2778,10 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.d, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6), runs[0].stencil_mask.?.e, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), runs[0].stencil_mask.?.f, 0.001);
 }
 
 test "native page renderer renders the requested one-based PDF page" {

@@ -8,6 +8,7 @@
 //! Remote-store implementations and backup algorithms stay in backups.zig.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 pub const format_version: u32 = 2;
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
@@ -105,12 +106,18 @@ pub const ShardSnapshot = struct {
     snapshot_path: []const u8,
     artifact_size_bytes: u64 = 0,
     artifact_sha256: []const u8 = "",
+    /// Authenticates the per-file native generation inventory independently
+    /// from the whole-tree transport identity. This permits selective repair
+    /// only when the authoritative inventory itself is unchanged.
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 
     pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.start_key));
         if (self.end_key) |value| alloc.free(@constCast(value));
         alloc.free(@constCast(self.snapshot_path));
         if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
+        if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
     }
 };
 
@@ -161,6 +168,10 @@ pub const TableBackupPlan = struct {
     format: BackupFormat = .native,
     io: ?std.Io = null,
     fence: ?TableBackupFence = null,
+    /// Borrowed cooperative cancellation for capture, hashing, and local
+    /// materialization. Durable publication still reports ambiguity according
+    /// to the backup protocol once its commit point has been crossed.
+    cancellation: CancellationToken = .none,
 };
 
 pub const TableRestorePlan = struct {
@@ -172,4 +183,8 @@ pub const TableRestorePlan = struct {
     replace_existing: bool = false,
     publication_hook: ?RestorePublicationHook = null,
     io: ?std.Io = null,
+    /// Cooperative cancellation for long-running staged repair. The token's
+    /// semantic callback is safe across compiled runtime boundaries and is
+    /// borrowed only for the synchronous restore callback.
+    cancellation: CancellationToken = .none,
 };

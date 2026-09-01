@@ -1479,6 +1479,35 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    UnsupportedIndexCapabilityError:
+      type: object
+      additionalProperties: false
+      description: The requested index depends on a capability unavailable in the current deployment.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [unsupported_index_capability]
+        message:
+          type: string
+          enum: [artifact-backed index sources are not supported by this deployment]
+        retryable:
+          type: boolean
+          enum: [false]
+    IndexMutationServiceUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [index_capability_upgrade_pending, index_probe_unavailable]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -1723,6 +1752,118 @@ components:
           type: boolean
           enum: [false]
           description: Retrying the same cursor cannot succeed; restart traversal instead.
+    TopologyChangedError:
+      type: object
+      additionalProperties: false
+      description: The table topology changed while a query was running after Antfly's bounded internal retry.
+      required: [status, error, message, action, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [409]
+        error:
+          type: string
+          enum: [topology_changed]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable explanation of why the query must be retried.
+        action:
+          type: string
+          enum: [retry_query]
+          description: Stable client action for recovering from the conflict.
+        retryable:
+          type: boolean
+          enum: [true]
+          description: Retrying the complete query against fresh topology may succeed.
+    QueryConflictError:
+      oneOf:
+        - $ref: '#/components/schemas/HierarchyCursorStaleError'
+        - $ref: '#/components/schemas/TopologyChangedError'
+      discriminator:
+        propertyName: error
+        mapping:
+          hierarchy_cursor_stale: '#/components/schemas/HierarchyCursorStaleError'
+          topology_changed: '#/components/schemas/TopologyChangedError'
+    UnsupportedHierarchyGroupingError:
+      type: object
+      additionalProperties: false
+      description: A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
+      required: [status, error, message, reason, field, action, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [unsupported_hierarchy_grouping]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable remediation using only public query fields.
+        reason:
+          type: string
+          enum: [unit_identity_unavailable]
+          description: Stable reason the requested hierarchy level is unavailable.
+        field:
+          type: string
+          enum: [hierarchy.group_by.level]
+          description: Public request field that selected the unsupported grouping level.
+        action:
+          type: string
+          enum: [use_source_grouping_or_direct_members]
+          description: Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+        retryable:
+          type: boolean
+          enum: [false]
+          description: Retrying the same request cannot succeed without changing its hierarchy grouping.
+    UnsupportedQueryError:
+      type: object
+      additionalProperties: false
+      description: A query requests an unsupported feature without a more specific structured diagnostic.
+      required: [status, error, message, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [unsupported_query_request]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error summary.
+        retryable:
+          type: boolean
+          enum: [false]
+          description: Retrying the same request cannot succeed without changing it.
+    QueryFilterError:
+      type: object
+      additionalProperties: false
+      description: A public filter or exclusion query contains an invalid or unsupported node.
+      required: [status, error, message, field, offending_node, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [400, 422]
+        error:
+          type: string
+          enum: [invalid_query_request, unsupported_query_request]
+        message:
+          type: string
+        field:
+          type: string
+          enum: [filter_query, exclusion_query]
+        offending_node:
+          type: string
+          description: Stable name of the first invalid or unsupported filter node.
+        retryable:
+          type: boolean
+          enum: [false]
     ExactSortError:
       type: object
       additionalProperties: false
@@ -1737,6 +1878,7 @@ components:
       properties:
         error:
           type: string
+          enum: [unsupported_exact_sort]
           description: Stable error class.
           example: unsupported_exact_sort
         message:
@@ -1787,7 +1929,247 @@ components:
         status:
           type: integer
           format: int32
+          enum: [422]
           example: 422
+    QueryCandidateBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - message
+        - reason
+        - budget_rejection_reason
+        - sort_rejection_reason
+        - sort_rejection_detail
+        - sort_rejection_field
+        - status
+      properties:
+        error:
+          type: string
+          enum: [query_candidate_budget_exceeded]
+        message:
+          type: string
+        reason:
+          type: string
+        budget_rejection_reason:
+          type: string
+        sort_rejection_reason:
+          type: string
+        sort_rejection_detail:
+          type: string
+        sort_rejection_field:
+          type: string
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+    GraphDistinctBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, dimension, maximum, remediation]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_distinct_budget_exceeded]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named graph operation whose exact distinct aggregation exhausted the request budget.
+        dimension:
+          type: string
+          enum: [distinct_identities, distinct_state_bytes]
+          description: Distinct aggregation resource exhausted by the operation.
+        maximum:
+          type: integer
+          format: uint64
+          description: Configured request ceiling for the exhausted resource.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for reducing exact distinct state.
+    GraphWorkBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, mode, dimension, maximum, remediation]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_work_budget_exceeded]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named graph operation whose exact execution exhausted the request budget.
+        mode:
+          type: string
+          description: Graph operation mode, such as match or pattern.
+        dimension:
+          type: string
+          enum: [explored_nodes, explored_edges, explored_edge_bytes, scanned_anchors, intermediate_states, retained_state_bytes]
+          description: Bounded resource exhausted by the operation.
+        maximum:
+          type: integer
+          format: uint64
+          description: Configured request ceiling for the exhausted resource.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for reducing graph work.
+    GraphPathWeightDomainError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, objective, violation, remediation]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_path_weight_domain_error]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named shortest-path operation that encountered the incompatible edge weight.
+        objective:
+          $ref: "indexes.yaml#/components/schemas/GraphPathObjective"
+          description: Canonical path objective selected by the named operation.
+        violation:
+          type: string
+          enum: [negative_edge_weight, edge_weight_above_one, path_sum_overflow]
+          description: Stable machine-readable reason the weight was rejected.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for correcting the graph or query.
+    GraphAnchorFilterRequiresIndexError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_anchor_filter_requires_index]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+    GraphQueryUnsupportedError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, feature, reason]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_query_unsupported]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+        feature:
+          type: string
+          description: >-
+            Graph operation feature, such as `match` or `traverse`, or the
+            rejected request feature, such as `order_by`, when `operation` is
+            `$request`.
+        reason:
+          type: string
+          enum:
+            - expand_strategy_not_supported
+            - direction_must_be_out
+            - deduplicate_nodes_must_be_true
+            - weight_mode_must_be_min_hops
+            - start_selector_not_supported
+            - target_selector_not_supported
+            - target_required
+            - k_must_equal_one
+            - pattern_required
+            - external_alias_document_filter_not_supported
+            - external_alias_source_not_supported
+            - reverse_variable_path_not_supported
+            - legacy_graph_searches_not_supported
+            - request_control_not_supported
+            - unsupported_mode
+          description: Stable machine-readable constraint that prevents exact public execution.
+    GraphMatchOperationLimitExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, maximum, actual]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_match_operation_limit_exceeded]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        maximum:
+          type: integer
+          format: uint64
+          description: Maximum named MATCH operations accepted in one request.
+        actual:
+          type: integer
+          format: uint64
+          description: Named MATCH operations supplied by the request.
+    GraphQueryUnprocessableError:
+      oneOf:
+        - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
+        - $ref: '#/components/schemas/GraphWorkBudgetExceededError'
+        - $ref: '#/components/schemas/GraphPathWeightDomainError'
+        - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+        - $ref: '#/components/schemas/GraphQueryUnsupportedError'
+        - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
+      discriminator:
+        propertyName: error
+        mapping:
+          graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
+          graph_work_budget_exceeded: '#/components/schemas/GraphWorkBudgetExceededError'
+          graph_path_weight_domain_error: '#/components/schemas/GraphPathWeightDomainError'
+          graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+          graph_query_unsupported: '#/components/schemas/GraphQueryUnsupportedError'
+          graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
+    QueryUnprocessableError:
+      oneOf:
+        - $ref: '#/components/schemas/ExactSortError'
+        - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/GraphQueryUnprocessableError'
+        - $ref: '#/components/schemas/QueryFilterError'
+        - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
+        - $ref: '#/components/schemas/UnsupportedQueryError'
     SortDirection:
       $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
@@ -1801,6 +2183,21 @@ components:
         - degraded
         - error
       description: Overall health status of the cluster
+    IndexRuntimeCapabilities:
+      type: object
+      additionalProperties: false
+      required: [artifact_sources, artifact_sources_state]
+      description: Deployment-level index capabilities clients can inspect before submitting index mutations.
+      properties:
+        artifact_sources:
+          type: boolean
+          description: Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+        artifact_sources_state:
+          $ref: "#/components/schemas/ArtifactSourcesCapabilityState"
+    ArtifactSourcesCapabilityState:
+      type: string
+      enum: [available, upgrade_pending, unsupported]
+      description: Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
     ClusterStatus:
       type: object
       required:
@@ -1820,6 +2217,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -1846,6 +2245,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -2443,6 +2844,7 @@ components:
         - corrupt_artifact
         - unreadable_artifact
         - enrichment_failed
+        - resource_limit_exceeded
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -2479,6 +2881,9 @@ components:
         unit_id:
           type: string
           description: Unit identifier for unit-scoped artifacts, when applicable.
+        index_source_artifact_name:
+          type: string
+          description: Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
         source_artifact_name:
           type: string
           description: Source artifact stream used to produce this artifact, when applicable.
@@ -3594,7 +3999,7 @@ components:
           type: object
           additionalProperties:
             x-go-type-skip-optional-pointer: false
-            $ref: "indexes.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         shards: # map[types.ID]*ShardInfo
           type: object
           additionalProperties:
@@ -4020,7 +4425,7 @@ components:
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/IndexStats"
         config:
-          $ref: "indexes.yaml#/components/schemas/IndexConfig"
+          $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
     LsmStorageStatus:
@@ -4346,6 +4751,7 @@ components:
         - $unset
         - $inc
         - $push
+        - $pull
         - $addToSet
         - $min
         - $max
@@ -4355,6 +4761,7 @@ components:
         - UNSET
         - INC
         - PUSH
+        - PULL
         - ADD_TO_SET
         - MIN
         - MAX
@@ -4372,7 +4779,11 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: "$.views"
         value:
-          description: Value for operation (not required for $unset). Type depends on the supported operator.
+          description: >-
+            Value for operation (not required for $unset). Type depends on the
+            supported operator. `$pull` removes every array element exactly
+            equal to this JSON value; projected graph-edge values identify the
+            relationship by `target`.
 
     Transform:
       type: object
@@ -4551,12 +4962,12 @@ components:
             Transform operations allow you to modify documents without read-modify-write races:
             - Operations are applied atomically on the server
             - Multiple operations per document are applied in sequence
-            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
 
             Common use cases:
             - Increment counters (views, likes, votes)
             - Update timestamps ($set)
-            - Add unique array values ($addToSet)
+            - Add or remove array values ($addToSet, $pull)
             - Update nested fields without overwriting the entire document
           items:
             $ref: "#/components/schemas/Transform"
@@ -5750,8 +6161,9 @@ components:
 
     RetrievalQueryRequest:
       description: |
-        A query in the retrieval pipeline. Extends QueryRequest with an optional
-        tree search configuration. Each query specifies its own table.
+        A canonical query in the retrieval pipeline with an optional tree search
+        configuration. Each query specifies its own table. Deprecated stateful
+        graph_searches compatibility is intentionally unavailable here.
 
         When both search fields (semantic_search, full_text_search) and tree_search
         are provided, the search results are used as start nodes for tree navigation.
@@ -6490,7 +6902,8 @@ components:
       oneOf:
         - $ref: "query.yaml#/components/schemas/Query"
       x-go-type: json.RawMessage
-      description: A validated Antfly query retained as raw JSON by Go servers and clients.
+      x-zig-type: raw_json
+      description: An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 
     HierarchyProjection:
       type: object
@@ -6637,7 +7050,8 @@ components:
         size predictable. The presence of this object selects the canonical contract:
         without `group_by` or `children`, including when the object is empty, direct index
         matches are returned. `ancestors` only controls projected context and never changes result
-        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+        cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+        source-grouped result shape.
       allOf:
         - not:
             description: Relevance grouping and sequential child traversal are separate operations.
@@ -6747,6 +7161,7 @@ components:
               - anyOf:
                   - required: [query]
                   - required: [full_text_search]
+                  - required: [full_text_index]
                   - required: [filter_query]
                   - required: [exclusion_query]
                   - required: [semantic_search]
@@ -6765,8 +7180,7 @@ components:
                   - required: [reranker]
                   - required: [analyses]
                   - required: [aggregations]
-                  - required: [graph_searches]
-                  - required: [expand_strategy]
+                  - required: [graph_queries]
                   - required: [document_renderer]
                   - required: [pruner]
                   - required: [join]
@@ -6778,6 +7192,7 @@ components:
           example: "wikipedia"
         query:
           x-go-type: json.RawMessage
+          x-zig-type: std.json.Value
           type: object
           additionalProperties: true
           description: |
@@ -6820,6 +7235,23 @@ components:
           example:
             query: "+body:computer +category:technology"
             boost: 1.0
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          maxLength: 256
+          x-antfly-runtime-validation: "Requires full_text_search or at least one scoring text clause after normalizing the query AST; filter-only and exclusion-only query trees receive HTTP 422."
+          description: |
+            Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+            Use this to query a named document- or artifact-backed full-text index. The selected
+            index must exist and have type `full_text`. Omit this field to use the table's active
+            schema full-text index, preserving v0.2 behavior. Structured document filters continue
+            to use the active schema index even when retrieval uses a named artifact index. This
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+            from filter-only or exclusion-only trees.
+          example: "document_text"
         semantic_search:
           type: string
           x-antfly-max-utf8-bytes: 1048576
@@ -6863,8 +7295,15 @@ components:
           items:
             type: string
           description: |
-            List of vector index names to use for semantic search. Required when using semantic_search.
-            Multiple indexes can be specified, and their results will be merged using RRF.
+            Embedding index names selected for `semantic_search` or explicit `embeddings`.
+            Dense and sparse indexes are supported when the corresponding query representation is
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+            serverless may infer its single published dense index when this field is omitted. When
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+            Provisioned results from multiple indexes are merged using RRF. Serverless currently
+            executes at most one dense and one sparse index per request; it rejects multiple
+            same-kind selectors and omitted selectors when more than one corresponding index is
+            published rather than choosing an index by catalog order.
           example: ["title_body_nomic", "description_embedding"]
         filter_prefix:
           type: string
@@ -7138,22 +7577,18 @@ components:
             ```
         analyses:
           $ref: "#/components/schemas/Analyses"
-        graph_searches:
-          type: object
-          additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/GraphQuery"
+        graph_queries:
+          $ref: "indexes.yaml#/components/schemas/GraphQueries"
           description: |
-            Declarative graph queries to execute after full-text/vector searches.
-            Results can reference search results using node selectors like $full_text_results.
-        expand_strategy:
-          type: string
-          enum:
-            - union
-            - intersection
-          description: |
-            Strategy for merging graph results with search results:
-            - union: Include nodes from both search and graph results
-            - intersection: Only include nodes appearing in both
+            Declarative graph matching, traversal, and path queries. A nested node
+            `filter` is a typed, non-scoring stored-document predicate. It shares
+            familiar scalar syntax with document queries but deliberately excludes
+            analyzer-backed and index-only clauses. A request may contain at most
+            64 named graph operations, of which at most 8 may be named `match`
+            operations. Each operation key is a GraphIdentifier under the
+            versioned policy published in the GraphIdentifier schema.
+            Put multiple counts over one pattern in the same `match` return
+            object so they share one complete anchor scan.
         document_renderer:
           type: string
           description: |
@@ -7284,7 +7719,7 @@ components:
             product catalogs, etc.) without ingesting that data into Antfly.
 
             **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-            **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+            **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
             **Example - Join Antfly products with Postgres customers:**
             ```json
@@ -7304,6 +7739,57 @@ components:
               }
             }
             ```
+    StatefulQueryRequest:
+      description: >-
+        Stateful Antfly query request. Canonical clients use graph_queries;
+        deprecated graph_searches is retained only at the stateful public
+        transport boundary for the v0.2 transition window.
+      allOf:
+        - $ref: '#/components/schemas/QueryRequest'
+        - type: object
+          not:
+            anyOf:
+              - description: Use graph_queries or deprecated graph_searches, never both.
+                required: [graph_queries, graph_searches]
+              - description: Canonical graph_queries return typed results and cannot use the legacy hit expansion adapter.
+                required: [graph_queries, expand_strategy]
+              - description: Hierarchy child traversal cannot use the legacy graph hit expansion adapter.
+                allOf:
+                  - required: [hierarchy]
+                    properties:
+                      hierarchy:
+                        required: [children]
+                  - anyOf:
+                      - required: [graph_searches]
+                      - required: [expand_strategy]
+          properties:
+            graph_searches:
+              deprecated: true
+              type: object
+              maxProperties: 64
+              additionalProperties:
+                $ref: "indexes.yaml#/components/schemas/LegacyGraphQuery"
+              description: |
+                Deprecated compatibility alias for the v0.2 graph query contract.
+                Use `graph_queries`; requests containing both fields are rejected.
+                Legacy operation names remain opaque and byte-for-byte compatible;
+                canonical GraphIdentifier rules apply only to `graph_queries`.
+                The request-wide limit of 64 operations also applies here to bound
+                execution work during the compatibility window.
+            expand_strategy:
+              deprecated: true
+              type: string
+              enum:
+                - union
+                - intersection
+              description: |
+                Deprecated compatibility behavior for `graph_searches`. Canonical
+                `graph_queries` return independently typed, potentially table-qualified
+                identities and cannot be combined with this field.
+
+                Strategy for merging legacy graph results with search results:
+                - union: Include nodes from both search and graph results
+                - intersection: Only include nodes appearing in both
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -7919,6 +8405,9 @@ components:
           description: Unit identifier when the hit is attached to a document unit.
         artifact:
           $ref: "#/components/schemas/HierarchyArtifact"
+        matched_artifact:
+          $ref: "#/components/schemas/HierarchyArtifact"
+          description: Artifact member that supplied the score for a source-level grouped hit.
         ancestors:
           $ref: "#/components/schemas/QueryHitHierarchyAncestors"
         evidence:
@@ -7937,7 +8426,7 @@ components:
         chunks:
           type: array
           deprecated: true
-          description: Legacy child chunk hits included for source-level rollups.
+          description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: "#/components/schemas/HierarchyMatchHit"
 
@@ -7971,7 +8460,9 @@ components:
             non-dense and fused results.
         _index_scores:
           type: object # map[string]float64
-          additionalProperties: true
+          additionalProperties:
+            type: number
+            format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
         _source:
@@ -7984,9 +8475,10 @@ components:
             Stable ancestry envelope for derived document hierarchy hits. Present when
             the hit is a derived unit/chunk/embedding artifact or when a source-level
             group includes nested matches. Standard fields include `level`,
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+            `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
             `ancestors` with response-local or requested DB-backed source/unit context when available.
-            Legacy rollup requests continue to use `chunks` instead of `matches`.
+            V0.2-compatible implicit rollup requests continue to use the deprecated
+            `chunks` field instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -8039,15 +8531,26 @@ components:
           description: Whether value is exact or a lower bound.
     QueryResponses:
       type: object
-      description: Responses from multiple query operations.
+      description: Canonical responses from multiple query operations.
       properties:
         responses:
           type: array
           items:
             $ref: "#/components/schemas/QueryResult"
-    QueryResult:
+    StatefulQueryResponses:
       type: object
-      description: Result of a query operation as an array of results and a count.
+      description: >-
+        Responses from the stateful compatibility transport. Canonical requests
+        still produce canonical graph result variants; deprecated graph_searches
+        may produce LegacyGraphSearchResult values during the transition window.
+      properties:
+        responses:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatefulQueryResult"
+    QueryResultBase:
+      type: object
+      description: Fields shared by canonical and stateful query result envelopes.
       required:
         - took
         - status
@@ -8066,11 +8569,6 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/AnalysesResult"
           description: Analysis results like PCA and t-SNE per index embeddings.
-        graph_results:
-          type: object
-          additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/GraphQueryResult"
-          description: Results from declarative graph queries.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -8092,6 +8590,22 @@ components:
         table:
           type: string
           description: Which table this result came from
+    QueryResult:
+      description: Result of a canonical query operation.
+      allOf:
+        - $ref: "#/components/schemas/QueryResultBase"
+        - type: object
+          properties:
+            graph_results:
+              $ref: "indexes.yaml#/components/schemas/GraphQueryResults"
+    StatefulQueryResult:
+      description: Result emitted by the stateful compatibility transport.
+      allOf:
+        - $ref: "#/components/schemas/QueryResultBase"
+        - type: object
+          properties:
+            graph_results:
+              $ref: "indexes.yaml#/components/schemas/StatefulGraphQueryResults"
     LinearMergePageStatus:
       type: string
       enum:
@@ -8127,7 +8641,9 @@ components:
       properties:
         records:
           type: object
-          additionalProperties: true
+          additionalProperties:
+            type: object
+            additionalProperties: true
           description: |
             Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}}
 
@@ -8538,7 +9054,7 @@ components:
         op:
           type: string
           description: |
-            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`.
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
             `$delete_document` (delete entire Antfly doc, `on_delete` only).
           example: "$set"
@@ -8558,6 +9074,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationBadRequest:
+      description: Invalid index configuration or a deployment capability mismatch
+      content:
+        application/json:
+          schema:
+            # The generic Error schema intentionally accepts this structured
+            # shape, so these alternatives overlap by design. Keep the typed
+            # capability error first for generators that parse alternatives in
+            # declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/UnsupportedIndexCapabilityError"
+              - $ref: "#/components/schemas/Error"
     PayloadTooLarge:
       description: Request body exceeds the configured size limit
       content:
@@ -8588,6 +9116,26 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationServiceUnavailable:
+      description: Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged.
+      headers:
+        Retry-After:
+          required: false
+          description: Minimum number of seconds clients should wait when the failure is retryable.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            # Create-table, create-index, and restore also share infrastructure
+            # failures (metadata leadership, HA admission, and restore-worker
+            # capacity). Keep the narrow typed retry contract first, then fall
+            # back to the public error envelope for generators that probe
+            # alternatives in declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+              - $ref: "#/components/schemas/Error"
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:
@@ -8669,18 +9217,24 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-    UnsupportedExactSort:
-      description: Exact sort cannot be executed through a supported native plan
+    QueryUnprocessable:
+      description: The query is valid but cannot be executed exactly under the declared contract
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ExactSortError"
+            $ref: "#/components/schemas/QueryUnprocessableError"
     HierarchyCursorStale:
-      description: The hierarchy changed after the traversal cursor was issued
+      description: Deprecated response component retained for generated-client source compatibility; query endpoints now use QueryConflict
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/HierarchyCursorStaleError"
+    QueryConflict:
+      description: The query's pinned hierarchy or table topology changed while it was running
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/QueryConflictError"
     QueryTemporarilyUnavailable:
       description: A query dependency or read path is temporarily unavailable and the request is safe to retry
       headers:
@@ -9722,7 +10276,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryRequest"
+              $ref: "#/components/schemas/StatefulQueryRequest"
           application/x-ndjson:
             schema:
               type: string
@@ -9730,10 +10284,21 @@ paths:
       responses:
         "200":
           description: Query successful
+          headers:
+            Deprecation:
+              description: |
+                RFC 9745 structured deprecation date. Stateful Antfly emits
+                this header when a successful request used the deprecated
+                `graph_searches` field; canonical requests and canonical-only
+                serverless surfaces omit it.
+              schema:
+                type: string
+                pattern: '^@[0-9]+$'
+                example: '@1787702400'
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryResponses"
+                $ref: "#/components/schemas/StatefulQueryResponses"
         "400":
           description: Invalid query request
           content:
@@ -9741,9 +10306,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          $ref: "#/components/responses/HierarchyCursorStale"
+          $ref: "#/components/responses/QueryConflict"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/QueryUnprocessable"
         "503":
           $ref: "#/components/responses/QueryTemporarilyUnavailable"
         "500":
@@ -10069,13 +10634,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "422":
           description: Durable destinations cannot be bound to this credential type
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
     delete:
       summary: Drop a table
       tags:
@@ -10120,7 +10687,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryRequest" # Table name in path takes precedence
+              $ref: "#/components/schemas/StatefulQueryRequest" # Table name in path takes precedence
           application/x-ndjson:
             schema:
               type: string
@@ -10128,16 +10695,27 @@ paths:
       responses:
         "200":
           description: Query successful
+          headers:
+            Deprecation:
+              description: |
+                RFC 9745 structured deprecation date. Stateful Antfly emits
+                this header when a successful request used the deprecated
+                `graph_searches` field; canonical requests and canonical-only
+                serverless surfaces omit it.
+              schema:
+                type: string
+                pattern: '^@[0-9]+$'
+                example: '@1787702400'
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryResponses"
+                $ref: "#/components/schemas/StatefulQueryResponses"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
-          $ref: "#/components/responses/HierarchyCursorStale"
+          $ref: "#/components/responses/QueryConflict"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/QueryUnprocessable"
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "503":
@@ -10373,7 +10951,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/destination-authorization:
@@ -11374,7 +11952,7 @@ paths:
               schema:
                 $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "405":
@@ -11390,7 +11968,7 @@ paths:
         "429":
           $ref: "#/components/responses/StorageResourceExhausted"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:

@@ -2501,10 +2501,13 @@ fn searchProfiledRequestAttempt(
             snapshot_fence_held = false;
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
-            return .{ .results = empty, .profile = profile };
+            var exhausted = empty;
+            exhausted.candidate_coverage = .exhausted;
+            return .{ .results = exhausted, .profile = profile };
         }
         if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
-            const empty = search_results.SearchResults.init(self.alloc, req.k);
+            var empty = search_results.SearchResults.init(self.alloc, req.k);
+            empty.candidate_coverage = .exhausted;
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
                 .results = empty,
@@ -2814,14 +2817,16 @@ fn searchProfiledRequestAttempt(
         if (flat_leaves_scored > 0) {
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+                var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
+                reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
             }
 
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
+            results.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
             results.sort();
             if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -2842,7 +2847,8 @@ fn searchProfiledRequestAttempt(
         error.NotFound => {
             if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
             approx_results.deinit();
-            const empty = search_results.SearchResults.init(self.alloc, req.k);
+            var empty = search_results.SearchResults.init(self.alloc, req.k);
+            empty.candidate_coverage = .exhausted;
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
                 .results = empty,
@@ -2916,7 +2922,8 @@ fn searchProfiledRequestAttempt(
                 error.NotFound => {
                     if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
-                    const empty = search_results.SearchResults.init(self.alloc, req.k);
+                    var empty = search_results.SearchResults.init(self.alloc, req.k);
+                    empty.candidate_coverage = .exhausted;
                     profile.total_ns = elapsed_fn_u64(total_start);
                     return .{
                         .results = empty,
@@ -2927,13 +2934,15 @@ fn searchProfiledRequestAttempt(
             };
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+                var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
+                reranked.candidate_coverage = .exhausted;
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
             }
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
+            results.candidate_coverage = .exhausted;
             results.sort();
             if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -2955,12 +2964,16 @@ fn searchProfiledRequestAttempt(
     var previous_wave_leaf: u32 = 0;
     var next_wave_leaf: u32 = initial_wave_leaves;
     profile.traversal_initial_wave_leaves = initial_wave_leaves;
+    var traversal_stopped_early = false;
     while (true) {
         try search_types.checkCancelled(req);
         // Best-effort search avoids the exhaustive visited bitmap on its hot
         // path, but still needs a corruption ceiling: a valid strict tree can
         // never pop more nodes than the published node high-water mark.
-        if (!exhaustive_coverage and profile.nodes_visited >= published_snapshot.node_count) break;
+        if (!exhaustive_coverage and profile.nodes_visited >= published_snapshot.node_count) {
+            traversal_stopped_early = true;
+            break;
+        }
         if (!exhaustive_coverage and beam_state.leaves_explored >= next_wave_leaf) {
             profile.traversal_waves += 1;
             profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
@@ -2981,7 +2994,10 @@ fn searchProfiledRequestAttempt(
             }
         }
         var candidate = candidates.pop() orelse break;
-        if (!exhaustive_coverage and search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
+        if (!exhaustive_coverage and search_mod.shouldStopBeamSearch(&beam_state, search_width)) {
+            traversal_stopped_early = true;
+            break;
+        }
         if (exhaustive_coverage and !scratch.markCoverageNodeVisited(candidate.id, published_snapshot.node_count)) {
             return error.IncompletePublishedSnapshot;
         }
@@ -3024,6 +3040,7 @@ fn searchProfiledRequestAttempt(
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) {
             node_handle.deinit(self.alloc);
             node_handle_active = false;
+            traversal_stopped_early = true;
             break;
         }
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldSkipInternalCandidate(candidate, &approx_results, &beam_state, epsilon)) {
@@ -3094,17 +3111,21 @@ fn searchProfiledRequestAttempt(
         }
     }
 
+    profile.traversal_frontier_remaining = @intCast(candidates.count() + @intFromBool(traversal_stopped_early));
+
     try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
 
     if (should_rerank) {
-        const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+        var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
         approx_results.deinit();
+        reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
         profile.total_ns = elapsed_fn_u64(total_start);
         return .{ .results = reranked, .profile = profile };
     }
 
     var results = try approx_results.toFinalResults();
     approx_results.deinit();
+    results.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
     results.sort();
     if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
     profile.total_ns = elapsed_fn_u64(total_start);

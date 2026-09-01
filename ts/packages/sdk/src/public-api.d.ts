@@ -2703,6 +2703,23 @@ export interface components {
              */
             retry_after_ms?: number;
         };
+        /** @description The requested index depends on a capability unavailable in the current deployment. */
+        UnsupportedIndexCapabilityError: {
+            /** @enum {string} */
+            error: "unsupported_index_capability";
+            /** @enum {string} */
+            message: "artifact-backed index sources are not supported by this deployment";
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        /** @description A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe. */
+        IndexMutationServiceUnavailableError: {
+            /** @enum {string} */
+            error: "index_capability_upgrade_pending" | "index_probe_unavailable";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+        };
         /** @description The metadata service does not yet provide the consistency capability required by backup. */
         MetadataCapabilityUnavailableError: {
             /**
@@ -2855,7 +2872,7 @@ export interface components {
              */
             status: 409;
             /**
-             * @description Stable machine-readable error code.
+             * @description Stable machine-readable error code. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
             error: "hierarchy_cursor_stale";
@@ -2877,12 +2894,111 @@ export interface components {
              */
             retryable: false;
         };
+        /** @description The table topology changed while a query was running after Antfly's bounded internal retry. */
+        TopologyChangedError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 409;
+            /**
+             * @description Stable machine-readable error code. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            error: "topology_changed";
+            /** @description Human-readable explanation of why the query must be retried. */
+            message: string;
+            /**
+             * @description Stable client action for recovering from the conflict.
+             * @enum {string}
+             */
+            action: "retry_query";
+            /**
+             * @description Retrying the complete query against fresh topology may succeed.
+             * @enum {boolean}
+             */
+            retryable: true;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
+        /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
+        UnsupportedHierarchyGroupingError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_hierarchy_grouping";
+            /** @description Human-readable remediation using only public query fields. */
+            message: string;
+            /**
+             * @description Stable reason the requested hierarchy level is unavailable.
+             * @enum {string}
+             */
+            reason: "unit_identity_unavailable";
+            /**
+             * @description Public request field that selected the unsupported grouping level.
+             * @enum {string}
+             */
+            field: "hierarchy.group_by.level";
+            /**
+             * @description Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+             * @enum {string}
+             */
+            action: "use_source_grouping_or_direct_members";
+            /**
+             * @description Retrying the same request cannot succeed without changing its hierarchy grouping.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A query requests an unsupported feature without a more specific structured diagnostic. */
+        UnsupportedQueryError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_query_request";
+            /** @description Human-readable error summary. */
+            message: string;
+            /**
+             * @description Retrying the same request cannot succeed without changing it.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A public filter or exclusion query contains an invalid or unsupported node. */
+        QueryFilterError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 400 | 422;
+            /** @enum {string} */
+            error: "invalid_query_request" | "unsupported_query_request";
+            message: string;
+            /** @enum {string} */
+            field: "filter_query" | "exclusion_query";
+            /** @description Stable name of the first invalid or unsupported filter node. */
+            offending_node: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
              * @example unsupported_exact_sort
+             * @enum {string}
              */
-            error: string;
+            error: "unsupported_exact_sort";
             /**
              * @description Human-readable error summary.
              * @example exact sort is unsupported for this query
@@ -2934,9 +3050,177 @@ export interface components {
             /**
              * Format: int32
              * @example 422
+             * @enum {integer}
              */
-            status: number;
+            status: 422;
         };
+        QueryCandidateBudgetExceededError: {
+            /** @enum {string} */
+            error: "query_candidate_budget_exceeded";
+            message: string;
+            reason: string;
+            budget_rejection_reason: string;
+            sort_rejection_reason: string;
+            sort_rejection_detail: string;
+            sort_rejection_field: string;
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+        };
+        GraphDistinctBudgetExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_distinct_budget_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named graph operation whose exact distinct aggregation exhausted the request budget. */
+            operation: string;
+            /**
+             * @description Distinct aggregation resource exhausted by the operation.
+             * @enum {string}
+             */
+            dimension: "distinct_identities" | "distinct_state_bytes";
+            /**
+             * Format: uint64
+             * @description Configured request ceiling for the exhausted resource.
+             */
+            maximum: number;
+            /** @description Stable user-facing guidance for reducing exact distinct state. */
+            remediation: string;
+        };
+        GraphWorkBudgetExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_work_budget_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named graph operation whose exact execution exhausted the request budget. */
+            operation: string;
+            /** @description Graph operation mode, such as match or pattern. */
+            mode: string;
+            /**
+             * @description Bounded resource exhausted by the operation.
+             * @enum {string}
+             */
+            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "scanned_anchors" | "intermediate_states" | "retained_state_bytes";
+            /**
+             * Format: uint64
+             * @description Configured request ceiling for the exhausted resource.
+             */
+            maximum: number;
+            /** @description Stable user-facing guidance for reducing graph work. */
+            remediation: string;
+        };
+        GraphPathWeightDomainError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_path_weight_domain_error";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named shortest-path operation that encountered the incompatible edge weight. */
+            operation: string;
+            /** @description Canonical path objective selected by the named operation. */
+            objective: components["schemas"]["GraphPathObjective"];
+            /**
+             * @description Stable machine-readable reason the weight was rejected.
+             * @enum {string}
+             */
+            violation: "negative_edge_weight" | "edge_weight_above_one" | "path_sum_overflow";
+            /** @description Stable user-facing guidance for correcting the graph or query. */
+            remediation: string;
+        };
+        GraphAnchorFilterRequiresIndexError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_anchor_filter_requires_index";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        GraphQueryUnsupportedError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_query_unsupported";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint. */
+            operation: string;
+            /** @description Graph operation feature, such as `match` or `traverse`, or the rejected request feature, such as `order_by`, when `operation` is `$request`. */
+            feature: string;
+            /**
+             * @description Stable machine-readable constraint that prevents exact public execution.
+             * @enum {string}
+             */
+            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "legacy_graph_searches_not_supported" | "request_control_not_supported" | "unsupported_mode";
+        };
+        GraphMatchOperationLimitExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_match_operation_limit_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /**
+             * Format: uint64
+             * @description Maximum named MATCH operations accepted in one request.
+             */
+            maximum: number;
+            /**
+             * Format: uint64
+             * @description Named MATCH operations supplied by the request.
+             */
+            actual: number;
+        };
+        GraphQueryUnprocessableError: components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -2954,6 +3238,17 @@ export interface components {
          * @enum {string}
          */
         ClusterHealth: "unknown" | "healthy" | "unhealthy" | "degraded" | "error";
+        /** @description Deployment-level index capabilities clients can inspect before submitting index mutations. */
+        IndexRuntimeCapabilities: {
+            /** @description Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available. */
+            artifact_sources: boolean;
+            artifact_sources_state: components["schemas"]["ArtifactSourcesCapabilityState"];
+        };
+        /**
+         * @description Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+         * @enum {string}
+         */
+        ArtifactSourcesCapabilityState: "available" | "upgrade_pending" | "unsupported";
         ClusterStatus: {
             health: components["schemas"]["ClusterHealth"];
             /** @description Optional message providing details about the health status */
@@ -2965,6 +3260,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -2982,6 +3278,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -3342,7 +3639,7 @@ export interface components {
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
          */
-        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed";
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed" | "resource_limit_exceeded";
         /**
          * @description Repair subsystem to inspect or run.
          * @enum {string}
@@ -3359,6 +3656,8 @@ export interface components {
             parent_doc_key?: string;
             /** @description Unit identifier for unit-scoped artifacts, when applicable. */
             unit_id?: string;
+            /** @description Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired. */
+            index_source_artifact_name?: string;
             /** @description Source artifact stream used to produce this artifact, when applicable. */
             source_artifact_name?: string;
             /** @description Derived artifact name that must be reprocessed or made readable. */
@@ -4159,7 +4458,7 @@ export interface components {
              */
             description?: string;
             indexes: {
-                [key: string]: components["schemas"]["IndexConfig"];
+                [key: string]: components["schemas"]["CreatedIndex"];
             };
             shards: {
                 [key: string]: components["schemas"]["ShardConfig"];
@@ -4415,7 +4714,7 @@ export interface components {
             shard_status: {
                 [key: string]: components["schemas"]["IndexStats"];
             };
-            config: components["schemas"]["IndexConfig"];
+            config: components["schemas"]["CreatedIndex"];
             status: components["schemas"]["IndexStats"];
         };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
@@ -4641,7 +4940,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$addToSet" | "$min" | "$max";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$min" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -4649,7 +4948,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`. */
             value?: unknown;
         };
         /**
@@ -4858,12 +5157,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+             *     - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
              *     - Update timestamps ($set)
-             *     - Add unique array values ($addToSet)
+             *     - Add or remove array values ($addToSet, $pull)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -5719,8 +6018,9 @@ export interface components {
             beam_width?: number;
         };
         /**
-         * @description A query in the retrieval pipeline. Extends QueryRequest with an optional
-         *     tree search configuration. Each query specifies its own table.
+         * @description A canonical query in the retrieval pipeline with an optional tree search
+         *     configuration. Each query specifies its own table. Deprecated stateful
+         *     graph_searches compatibility is intentionally unavailable here.
          *
          *     When both search fields (semantic_search, full_text_search) and tree_search
          *     are provided, the search results are used as start nodes for tree navigation.
@@ -6232,7 +6532,7 @@ export interface components {
              */
             packed_values: string;
         };
-        /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
+        /** @description An Antfly query expression retained as syntactically validated JSON and compiled by the query engine. */
         RawQuery: components["schemas"]["Query"];
         HierarchyProjection: {
             /**
@@ -6323,7 +6623,8 @@ export interface components {
          *     size predictable. The presence of this object selects the canonical contract:
          *     without `group_by` or `children`, including when the object is empty, direct index
          *     matches are returned. `ancestors` only controls projected context and never changes result
-         *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+         *     cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+         *     source-grouped result shape.
          */
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
@@ -6396,6 +6697,19 @@ export interface components {
              */
             full_text_search?: components["schemas"]["RawQuery"];
             /**
+             * @description Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+             *     Use this to query a named document- or artifact-backed full-text index. The selected
+             *     index must exist and have type `full_text`. Omit this field to use the table's active
+             *     schema full-text index, preserving v0.2 behavior. Structured document filters continue
+             *     to use the active schema index even when retrieval uses a named artifact index. This
+             *     selector is invalid without `full_text_search` or a scoring text clause in `query` and
+             *     receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+             *     is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+             *     from filter-only or exclusion-only trees.
+             * @example document_text
+             */
+            full_text_index?: string;
+            /**
              * @description Natural language query for vector similarity search. Results are ranked by semantic similarity
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
@@ -6432,8 +6746,15 @@ export interface components {
              */
             embedding_template?: string;
             /**
-             * @description List of vector index names to use for semantic search. Required when using semantic_search.
-             *     Multiple indexes can be specified, and their results will be merged using RRF.
+             * @description Embedding index names selected for `semantic_search` or explicit `embeddings`.
+             *     Dense and sparse indexes are supported when the corresponding query representation is
+             *     supplied. Provisioned deployments require at least one index for `semantic_search`;
+             *     serverless may infer its single published dense index when this field is omitted. When
+             *     `embeddings` is supplied without this field, the embedding map keys select the indexes.
+             *     Provisioned results from multiple indexes are merged using RRF. Serverless currently
+             *     executes at most one dense and one sparse index per request; it rejects multiple
+             *     same-kind selectors and omitted selectors when more than one corresponding index is
+             *     published rather than choosing an index by catalog order.
              * @example [
              *       "title_body_nomic",
              *       "description_embedding"
@@ -6709,19 +7030,17 @@ export interface components {
             reranker?: components["schemas"]["RerankerConfig"];
             analyses?: components["schemas"]["Analyses"];
             /**
-             * @description Declarative graph queries to execute after full-text/vector searches.
-             *     Results can reference search results using node selectors like $full_text_results.
+             * @description Declarative graph matching, traversal, and path queries. A nested node
+             *     `filter` is a typed, non-scoring stored-document predicate. It shares
+             *     familiar scalar syntax with document queries but deliberately excludes
+             *     analyzer-backed and index-only clauses. A request may contain at most
+             *     64 named graph operations, of which at most 8 may be named `match`
+             *     operations. Each operation key is a GraphIdentifier under the
+             *     versioned policy published in the GraphIdentifier schema.
+             *     Put multiple counts over one pattern in the same `match` return
+             *     object so they share one complete anchor scan.
              */
-            graph_searches?: {
-                [key: string]: components["schemas"]["GraphQuery"];
-            };
-            /**
-             * @description Strategy for merging graph results with search results:
-             *     - union: Include nodes from both search and graph results
-             *     - intersection: Only include nodes appearing in both
-             * @enum {string}
-             */
-            expand_strategy?: "union" | "intersection";
+            graph_queries?: components["schemas"]["GraphQueries"];
             /**
              * @description Optional Handlebars template string for rendering document content in RAG queries.
              *     Template has access to document fields via `{{this.fields.fieldName}}`.
@@ -6848,7 +7167,7 @@ export interface components {
              *     product catalogs, etc.) without ingesting that data into Antfly.
              *
              *     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-             *     **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+             *     **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
              *
              *     **Example - Join Antfly products with Postgres customers:**
              *     ```json
@@ -6872,6 +7191,33 @@ export interface components {
             foreign_sources?: {
                 [key: string]: components["schemas"]["ForeignSource"];
             };
+        };
+        /** @description Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window. */
+        StatefulQueryRequest: components["schemas"]["QueryRequest"] & {
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for the v0.2 graph query contract.
+             *     Use `graph_queries`; requests containing both fields are rejected.
+             *     Legacy operation names remain opaque and byte-for-byte compatible;
+             *     canonical GraphIdentifier rules apply only to `graph_queries`.
+             *     The request-wide limit of 64 operations also applies here to bound
+             *     execution work during the compatibility window.
+             */
+            graph_searches?: {
+                [key: string]: components["schemas"]["LegacyGraphQuery"];
+            };
+            /**
+             * @deprecated
+             * @description Deprecated compatibility behavior for `graph_searches`. Canonical
+             *     `graph_queries` return independently typed, potentially table-qualified
+             *     identities and cannot be combined with this field.
+             *
+             *     Strategy for merging legacy graph results with search results:
+             *     - union: Include nodes from both search and graph results
+             *     - intersection: Only include nodes appearing in both
+             * @enum {string}
+             */
+            expand_strategy?: "union" | "intersection";
         };
         Analyses: {
             pca?: boolean;
@@ -7368,6 +7714,8 @@ export interface components {
             /** @description Unit identifier when the hit is attached to a document unit. */
             parent_unit_id?: string;
             artifact?: components["schemas"]["HierarchyArtifact"];
+            /** @description Artifact member that supplied the score for a source-level grouped hit. */
+            matched_artifact?: components["schemas"]["HierarchyArtifact"];
             ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
             evidence?: components["schemas"]["HierarchyEvidence"];
             /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
@@ -7378,7 +7726,7 @@ export interface components {
             revision?: string;
             /**
              * @deprecated
-             * @description Legacy child chunk hits included for source-level rollups.
+             * @description Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
              */
             chunks?: components["schemas"]["HierarchyMatchHit"][];
         };
@@ -7401,7 +7749,7 @@ export interface components {
             _distance?: number;
             /** @description Scores partitioned by index when using RRF search. */
             _index_scores?: {
-                [key: string]: unknown;
+                [key: string]: number;
             };
             _source?: {
                 [key: string]: unknown;
@@ -7410,9 +7758,10 @@ export interface components {
              * @description Stable ancestry envelope for derived document hierarchy hits. Present when
              *     the hit is a derived unit/chunk/embedding artifact or when a source-level
              *     group includes nested matches. Standard fields include `level`,
-             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
-             *     Legacy rollup requests continue to use `chunks` instead of `matches`.
+             *     V0.2-compatible implicit rollup requests continue to use the deprecated
+             *     `chunks` field instead of `matches`.
              */
             hierarchy?: components["schemas"]["QueryHitHierarchy"];
             /**
@@ -7447,12 +7796,16 @@ export interface components {
              */
             relation: "exact" | "gte";
         };
-        /** @description Responses from multiple query operations. */
+        /** @description Canonical responses from multiple query operations. */
         QueryResponses: {
             responses?: components["schemas"]["QueryResult"][];
         };
-        /** @description Result of a query operation as an array of results and a count. */
-        QueryResult: {
+        /** @description Responses from the stateful compatibility transport. Canonical requests still produce canonical graph result variants; deprecated graph_searches may produce LegacyGraphSearchResult values during the transition window. */
+        StatefulQueryResponses: {
+            responses?: components["schemas"]["StatefulQueryResult"][];
+        };
+        /** @description Fields shared by canonical and stateful query result envelopes. */
+        QueryResultBase: {
             hits?: components["schemas"]["QueryHits"];
             /**
              * @description Aggregation results keyed by the user-defined aggregation names from the request.
@@ -7464,10 +7817,6 @@ export interface components {
             /** @description Analysis results like PCA and t-SNE per index embeddings. */
             analyses?: {
                 [key: string]: components["schemas"]["AnalysesResult"];
-            };
-            /** @description Results from declarative graph queries. */
-            graph_results?: {
-                [key: string]: components["schemas"]["GraphQueryResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -7485,6 +7834,14 @@ export interface components {
             error?: string;
             /** @description Which table this result came from */
             table?: string;
+        };
+        /** @description Result of a canonical query operation. */
+        QueryResult: components["schemas"]["QueryResultBase"] & {
+            graph_results?: components["schemas"]["GraphQueryResults"];
+        };
+        /** @description Result emitted by the stateful compatibility transport. */
+        StatefulQueryResult: components["schemas"]["QueryResultBase"] & {
+            graph_results?: components["schemas"]["StatefulGraphQueryResults"];
         };
         /**
          * @description Status of a linear merge page operation:
@@ -7537,7 +7894,9 @@ export interface components {
              *     }
              */
             records: {
-                [key: string]: unknown;
+                [key: string]: {
+                    [key: string]: unknown;
+                };
             };
             /**
              * @description ID of last record from previous merge request.
@@ -7608,11 +7967,10 @@ export interface components {
              * @description Base64-encoded target document key
              */
             target: string;
-            /** @description Edge type (e.g., "cites", "similar_to", "authored_by") */
-            type: string;
+            type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
-             * @description Edge weight/confidence (0.0 to 1.0)
+             * @description Finite non-negative edge cost or confidence. The max_weight_product path objective additionally requires values in [0,1].
              */
             weight: number;
             /**
@@ -7696,7 +8054,7 @@ export interface components {
             path_edges?: components["schemas"]["Edge"][];
             /**
              * Format: double
-             * @description Product of edge weights along the path
+             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
              */
             total_weight?: number;
         };
@@ -7750,7 +8108,10 @@ export interface components {
             /** @description Ordered list of node keys (base64-encoded) */
             nodes?: string[];
             edges?: components["schemas"]["PathEdge"][];
-            /** Format: double */
+            /**
+             * Format: double
+             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
+             */
             total_weight?: number;
             length?: number;
         };
@@ -8001,7 +8362,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -8200,6 +8561,14 @@ export interface components {
             } | null;
         };
         /**
+         * @description Objective used to rank graph paths:
+         *     - min_hops: Minimize the number of edges.
+         *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+         *     - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
+         * @enum {string}
+         */
+        GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -8227,6 +8596,8 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
+            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -8240,41 +8611,27 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only serialized asset producer configuration. It may contain provider credentials and is never returned. */
+            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
-        CreateIndexCommon: {
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
-             */
-            version?: number;
-            /** @description Inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
+        FullTextArtifactIndexSource: {
+            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
+            artifact: string;
+            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
+            field?: string;
         };
         FullTextIndexConfig: {
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
-            /** @description Document field indexed as text. Omit for the table's default full-document text index. */
+            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
             field?: string;
-            /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             artifact_name?: string;
-        };
-        /** @description Create a full-text index. */
-        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
-            /** @enum {string} */
-            type: "full_text";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "full_text";
         };
         /**
          * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -8288,6 +8645,11 @@ export interface components {
          * @enum {string}
          */
         DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated artifact stream. */
+            artifact: string;
+        };
         /**
          * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
          * @default l2_squared
@@ -9239,9 +9601,14 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
-            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            /**
+             * @deprecated
+             * @description Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
+             */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
@@ -9276,21 +9643,50 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
-        /** @description Create a dense or sparse embeddings index. */
-        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
-            /** @enum {string} */
-            type: "embeddings";
-        } & {
+        /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
+        GraphEdgeType: string;
+        /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
             /**
-             * @description discriminator enum property added by openapi-typescript
+             * @default document
              * @enum {string}
              */
-            type: "embeddings";
+            model?: "document" | "external";
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
+        GraphArtifactSourceConfig: {
+            artifact: string;
+            /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: components["schemas"]["GraphEdgeType"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
-            /** @description Edge type name (e.g., 'cites', 'similar_to') */
-            name: string;
+            name: components["schemas"]["GraphEdgeType"];
             /**
              * @description Document field containing target node key(s) for automatic edge creation.
              *     Supports string (single target) or array of strings (multiple targets).
@@ -9325,19 +9721,6 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
-        /** @description Artifact stream materialized into graph edges. */
-        GraphArtifactSourceConfig: {
-            /** @enum {string} */
-            kind: "artifact";
-            artifact: string;
-            path?: string;
-            /**
-             * @default extraction_relation
-             * @enum {string}
-             */
-            format?: "extraction_relation" | "extraction_graph";
-            mention_edge_type?: string;
-        };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
             /** @enum {string} */
@@ -9356,31 +9739,6 @@ export interface components {
             producer_json?: {
                 [key: string]: unknown;
             };
-        };
-        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
-        GraphTemplateValue: string | number;
-        /** @description Maps each artifact item to graph node identifiers. */
-        GraphArtifactNodeMappingConfig: {
-            /**
-             * @default document
-             * @enum {string}
-             */
-            model?: "document" | "external";
-            source?: components["schemas"]["GraphTemplateValue"];
-            target?: components["schemas"]["GraphTemplateValue"];
-        };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
-        GraphArtifactEdgeMappingConfig: {
-            type?: components["schemas"]["GraphTemplateValue"];
-            weight?: components["schemas"]["GraphTemplateValue"];
-            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
-        GraphArtifactContextConfig: {
-            doc_fields?: string[];
         };
         /** @description Algebraic law used to combine bounded graph traversal provenance. */
         GraphBoundedTraversalConfig: {
@@ -9427,6 +9785,8 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
@@ -9439,15 +9799,91 @@ export interface components {
             template?: string;
             /** @description List of edge types with their configurations */
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            /** @description Maximum number of edges per document (0 = unlimited) */
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
             max_edges_per_document?: number;
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
+            /** @description Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name. */
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicIndexConfig: {
+            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            derive_from_schema?: boolean;
+        };
+        /**
+         * @description The type of the index.
+         * @enum {string}
+         */
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /** @description Configuration for an index */
+        IndexConfig: {
+            /** @description Name of the index */
+            name: string;
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            type: components["schemas"]["IndexType"];
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /**
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+             * @example [
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
+             *     ]
+             */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
+        CreateIndexCommon: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        };
+        /** @description Create a full-text index. */
+        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
+        };
+        /** @description Create a dense or sparse embeddings index. */
+        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
         };
         /** @description Create a graph index. */
         CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
@@ -9459,11 +9895,6 @@ export interface components {
              * @enum {string}
              */
             type: "graph";
-        };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
-        AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
-            derive_from_schema?: boolean;
         };
         /** @description Create a schema-derived algebraic index. */
         CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
@@ -9674,49 +10105,218 @@ export interface components {
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
-        /**
-         * @description The type of the index.
-         * @enum {string}
-         */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
-        /** @description Configuration for an index */
-        IndexConfig: {
-            /** @description Name of the index */
+        /** @description Credential-free normalized enrichment configuration returned after index creation. */
+        CreatedEnrichmentConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            template?: string;
+            source_artifact_name?: string;
+            expected_dims?: number;
+            /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
+            vector_space?: string;
+            chunk_size?: number;
+            chunk_overlap?: number;
+            chunker_json?: string;
+            /** @default false */
+            full_text_index?: boolean;
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
+        CreatedIndexCommon: {
+            /** @description Name of the created index */
             name: string;
             /** @description Optional description of the index and its purpose */
             description?: string;
-            type: components["schemas"]["IndexType"];
             /**
              * @description Version of the index implementation. Defaults to 0.
              * @default 0
              */
             version?: number;
+            /** @description Normalized inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
+        };
+        /** @description Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources. */
+        CreatedFullTextIndexConfig: {
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
+            mem_only?: boolean;
+            field?: string;
+        };
+        /** @description Normalized effective full-text index configuration returned after creation. */
+        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
             /**
-             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
-             * @example [
-             *       {
-             *         "name": "document_chunks_v1",
-             *         "kind": "chunk",
-             *         "field": "text",
-             *         "source_artifact_name": "document_units_v1",
-             *         "chunk_size": 512
-             *       },
-             *       {
-             *         "name": "document_chunk_dense_v1",
-             *         "kind": "embedding",
-             *         "field": "text",
-             *         "source_artifact_name": "document_chunks_v1",
-             *         "expected_dims": 768
-             *       }
-             *     ]
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
              */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+            type: "full_text";
+        };
+        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
+        CreatedProviderConfig: {
+            /** @description Configured provider discriminator. */
+            provider: string;
+            /** @description Configured provider model when applicable. */
+            model?: string;
+            models?: string[];
+            project_id?: string;
+            location?: string;
+            region?: string;
+            /** Format: uri */
+            url?: string;
+            /** Format: uri */
+            api_url?: string;
+            dimension?: number;
+            dimensions?: number;
+            input_type?: string;
+            truncate?: string;
+            strip_new_lines?: boolean;
+            batch_size?: number;
+            /** Format: float */
+            temperature?: number;
+            max_tokens?: number;
+            /** Format: float */
+            top_p?: number;
+            top_k?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+            timeout?: number;
+        };
+        /** @description Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility. */
+        CreatedEmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @default false */
+            external?: boolean;
+            /** @default false */
+            sparse?: boolean;
+            dimension?: number;
+            field?: string;
+            /** @description Embedding artifact streams indexed together as independent vector members. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources. */
+            readonly embedding_name?: string;
+            /**
+             * @deprecated
+             * @description Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
+             */
+            readonly source_artifact_name?: string;
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            mem_only?: boolean;
+            embedder?: components["schemas"]["CreatedProviderConfig"];
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @default 10 */
+            top_k?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_weight?: number;
+            /** @default 1024 */
+            chunk_size?: number;
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
+        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
+        /** @description Canonical artifact stream materialized into graph edges. */
+        CreatedGraphArtifactSourceConfig: {
+            artifact: string;
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+        };
+        /** @description Credential-free graph artifact producer configuration returned after creation. */
+        CreatedGraphArtifactProducerConfig: {
+            name: string;
+            /** @enum {string} */
+            kind: "asset";
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Credential-free normalized graph configuration returned after creation. */
+        CreatedGraphIndexConfig: {
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            template?: string;
+            edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
+            max_edges_per_document?: number;
+            sources?: components["schemas"]["CreatedGraphArtifactSourceConfig"][];
+            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Normalized effective graph index configuration returned after creation. */
+        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
+        };
+        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
+        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Discriminated normalized configuration returned after an index is created. */
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         /**
-         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
+         * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
+        /**
+         * @description Stable machine-readable reason why an index is pending, partial, or failed.
+         * @enum {string}
+         */
+        IndexReadinessReason: "load_failure" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "incarnation_pending" | "source_publication" | "repair" | "backfill" | "coverage" | "replay" | "publication";
+        /**
+         * @description Stable machine-readable reason why an artifact source is pending or failed.
+         * @enum {string}
+         */
+        IndexSourceReadinessReason: "index_failed" | "enrichment_failure" | "repair" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
+        IndexSourceReadinessStatus: {
+            /** @description Configured artifact stream identity. */
+            artifact: string;
+            /** @enum {string} */
+            state: "pending" | "ready" | "failed";
+            /** @description Whether this source is fully observed and published on every expected shard. */
+            complete: boolean;
+            /** @description Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexSourceReadinessReason"][];
+        };
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
             /** @description Whether the published generation can safely answer queries. */
@@ -9735,8 +10335,10 @@ export interface components {
              * @description Highest revision published to the query-visible index represented by this observation.
              */
             published_revision?: number;
-            /** @description Stable, machine-readable blockers. Empty when state is ready. */
-            pending_reasons: string[];
+            /** @description Stable, machine-readable blockers or failure reasons. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexReadinessReason"][];
+            /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. */
+            sources?: components["schemas"]["IndexSourceReadinessStatus"][];
         };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
@@ -9747,6 +10349,12 @@ export interface components {
             state: "rebuilding" | "waiting" | "paused" | "failed";
             /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
             action_required: boolean;
+            /** @description Whether this repair currently prevents the proven serving incarnation from answering queries. */
+            blocks_queryable: boolean;
+            /** @description Whether this repair prevents the desired incarnation from satisfying the complete milestone. */
+            blocks_complete: boolean;
+            /** @description Diagnostic reason automation stopped. Present only when action_required is true. */
+            reason?: string;
         };
         FullTextIndexStats: {
             /**
@@ -11489,7 +12097,10 @@ export interface components {
         DisjunctionQuery: {
             disjuncts: components["schemas"]["Query"][];
             boost?: components["schemas"]["Boost"];
-            /** Format: double */
+            /**
+             * Format: uint32
+             * @description Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+             */
             min?: number;
         };
         BooleanQuery: {
@@ -11722,134 +12333,348 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
-        /**
-         * @description Type of graph query to execute
-         * @enum {string}
-         */
-        GraphQueryType: "traverse" | "neighbors" | "shortest_path" | "k_shortest_paths" | "pattern";
-        /** @description Filter nodes during graph traversal using existing query primitives */
-        NodeFilter: {
-            /** @description Antfly query to filter nodes (same syntax as search filter_query) */
-            filter_query?: {
-                [key: string]: unknown;
-            };
-            /** @description Filter by key prefix */
-            filter_prefix?: string;
+        /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
+        GraphIdentifier: string;
+        GraphDocumentFuzzyFilter: {
+            term: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+            /** @description Required so fuzzy and exact term predicates remain structurally distinct. */
+            fuzziness: components["schemas"]["Fuzziness"];
+            /** Format: int32 */
+            prefix_length?: number;
         };
-        /** @description Defines how to select start/target nodes for graph queries */
-        GraphNodeSelector: {
-            /** @description Explicit list of node keys */
-            keys?: string[];
+        GraphDocumentTermFilter: {
+            term: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+        };
+        GraphDocumentPrefixFilter: {
+            prefix: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+        };
+        GraphDocumentRegexpFilter: {
+            regexp: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+        };
+        GraphDocumentWildcardFilter: {
+            wildcard: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+        };
+        /** @description At least one of min or max is required and enforced by every Antfly execution boundary. When both are present, min must not exceed max. */
+        GraphDocumentNumericRangeBody: {
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+            /** Format: double */
+            min?: number;
+            /** Format: double */
+            max?: number;
+            /** @default true */
+            inclusive_min?: boolean;
+            /** @default false */
+            inclusive_max?: boolean;
+        };
+        GraphDocumentNumericRangeFilter: {
+            numeric_range: components["schemas"]["GraphDocumentNumericRangeBody"];
+        };
+        /** @description At least one of min or max is required and enforced by every Antfly execution boundary. */
+        GraphDocumentTermRangeBody: {
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+            min?: string;
+            max?: string;
+            /** @default true */
+            inclusive_min?: boolean;
+            /** @default false */
+            inclusive_max?: boolean;
+        };
+        GraphDocumentTermRangeFilter: {
+            term_range: components["schemas"]["GraphDocumentTermRangeBody"];
+        };
+        /** @description At least one of start or end is required and enforced by every Antfly execution boundary. Bounds are RFC 3339 instants in Antfly's unsigned Unix-nanosecond domain, from 1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive. When both are present, start must not exceed end after offset normalization. */
+        GraphDocumentDateRangeBody: {
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+            /** Format: date-time */
+            start?: string;
+            /** Format: date-time */
+            end?: string;
+            /** @default true */
+            inclusive_start?: boolean;
+            /** @default false */
+            inclusive_end?: boolean;
+        };
+        GraphDocumentDateRangeFilter: {
+            date_range: components["schemas"]["GraphDocumentDateRangeBody"];
+        };
+        GraphDocumentMatchAllFilter: {
+            match_all: Record<string, never>;
+        };
+        GraphDocumentMatchNoneFilter: {
+            match_none: Record<string, never>;
+        };
+        GraphDocumentIdsFilter: {
+            ids: string[];
+        };
+        GraphDocumentBoolFieldBody: {
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
+            value: boolean;
+        };
+        GraphDocumentBoolFieldFilter: {
+            bool_field: components["schemas"]["GraphDocumentBoolFieldBody"];
+        };
+        GraphDocumentFilterConjunction: {
+            conjuncts: components["schemas"]["GraphDocumentFilter"][];
+        };
+        GraphDocumentFilterDisjunction: {
+            disjuncts: components["schemas"]["GraphDocumentFilter"][];
             /**
-             * @description Reference to search results to use as nodes:
-             *     - "$full_text_results" - use full-text search results
-             *     - "$embeddings_results.index_name" - use vector search results from specific index
+             * Format: uint32
+             * @description Minimum number of disjuncts that must match. Omit for conventional context-sensitive disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete thresholded disjunction is negated as one group.
              */
-            result_ref?: string;
-            /** @description Maximum number of nodes to select from the referenced results */
-            limit?: number;
-            /** @description Filter which nodes to use as start/target */
-            node_filter?: components["schemas"]["NodeFilter"];
+            min?: number;
         };
-        /**
-         * @description Path weighting algorithm for pathfinding:
-         *     - min_hops: Minimize number of edges
-         *     - min_weight: Minimize sum of edge weights
-         *     - max_weight: Maximize product of edge weights
-         * @enum {string}
-         */
-        PathWeightMode: "min_hops" | "min_weight" | "max_weight";
-        /** @description Parameters for graph traversal and pathfinding */
-        GraphQueryParams: {
-            /** @description Filter by edge types */
-            edge_types?: string[];
+        /** @description Stored-document boolean predicate. `must` and `filter` are required clauses; `should` uses its disjunction threshold; and `must_not` negates its thresholded disjunction as one group. Thus a `must_not.min` of N excludes a document only when at least N of that group's clauses match. */
+        GraphDocumentFilterBoolean: {
+            must?: components["schemas"]["GraphDocumentFilterConjunction"];
+            should?: components["schemas"]["GraphDocumentFilterDisjunction"];
+            must_not?: components["schemas"]["GraphDocumentFilterDisjunction"];
+            filter?: components["schemas"]["GraphDocumentFilter"];
+        };
+        /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in GraphMatch.where. */
+        GraphDocumentFilter: components["schemas"]["GraphDocumentFuzzyFilter"] | components["schemas"]["GraphDocumentTermFilter"] | components["schemas"]["GraphDocumentPrefixFilter"] | components["schemas"]["GraphDocumentRegexpFilter"] | components["schemas"]["GraphDocumentWildcardFilter"] | components["schemas"]["GraphDocumentNumericRangeFilter"] | components["schemas"]["GraphDocumentTermRangeFilter"] | components["schemas"]["GraphDocumentDateRangeFilter"] | components["schemas"]["GraphDocumentMatchAllFilter"] | components["schemas"]["GraphDocumentMatchNoneFilter"] | components["schemas"]["GraphDocumentIdsFilter"] | components["schemas"]["GraphDocumentBoolFieldFilter"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
+        /** @description Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of a branched pattern. */
+        GraphMatchNode: {
+            /** @description Owning table for this alias. Omit for the queried table. */
+            table?: string;
+            /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
+        };
+        /** @description Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective. */
+        GraphEdgeWeightRange: {
+            /** Format: double */
+            min?: number;
+            /** Format: double */
+            max?: number;
+        };
+        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
+        GraphMatchEdge: {
+            from: components["schemas"]["GraphIdentifier"];
+            to: components["schemas"]["GraphIdentifier"];
+            /** @description Stored-edge direction relative to `from`; defaults to `out`. */
             direction?: components["schemas"]["EdgeDirection"];
-            /** @description Maximum traversal depth */
-            max_depth?: number;
-            /**
-             * Format: double
-             * @description Minimum edge weight
-             */
-            min_weight?: number;
-            /**
-             * Format: double
-             * @description Maximum edge weight
-             */
-            max_weight?: number;
-            /** @description Maximum number of results (traversal) */
-            max_results?: number;
-            /** @description Remove duplicate nodes (traversal) */
-            deduplicate_nodes?: boolean;
-            /** @description Include path information (traversal) */
-            include_paths?: boolean;
-            weight_mode?: components["schemas"]["PathWeightMode"];
-            /** @description Number of paths to find (k-shortest-paths) */
-            k?: number;
-            /** @description Filter which nodes to visit during traversal */
-            node_filter?: components["schemas"]["NodeFilter"];
-            /** @description Graph algorithm to run (e.g., 'pagerank', 'betweenness') */
-            algorithm?: string;
-            /** @description Parameters for the graph algorithm */
-            algorithm_params?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description Edge constraints in a pattern step */
-        PatternEdgeStep: {
-            /** @description Edge types to traverse (empty = any) */
-            types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
-            /**
-             * @description Minimum number of hops (1 = direct edge)
-             * @default 1
-             */
+            /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
+            types?: components["schemas"]["GraphEdgeType"][];
+            /** @default 1 */
             min_hops?: number;
+            /** @default 1 */
+            max_hops?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+        };
+        GraphWhereAnd: {
+            and: components["schemas"]["GraphWhereExpression"][];
+        };
+        GraphAliasOperand: {
+            alias: components["schemas"]["GraphIdentifier"];
+        };
+        GraphNotEqualPredicate: {
+            left: components["schemas"]["GraphAliasOperand"];
+            right: components["schemas"]["GraphAliasOperand"];
+        };
+        GraphWhereNotEqual: {
+            not_equal: components["schemas"]["GraphNotEqualPredicate"];
+        };
+        /** @description Correlated negative-edge predicate over aliases already visible at this point in the MATCH. It does not introduce new aliases. */
+        GraphNotExistsPattern: {
+            edges: components["schemas"]["GraphMatchEdge"][];
+        };
+        GraphWhereNotExists: {
+            not_exists: components["schemas"]["GraphNotExistsPattern"];
+        };
+        GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
+        /** @description One correlated left-outer graph pattern. Optional groups are evaluated in array order and must connect to an alias visible from the required MATCH or an earlier optional group. Each input binding is extended by every matching optional binding; when none match, exactly one binding is retained with every alias introduced by this group set to null. */
+        GraphOptionalMatch: {
+            /** @description Keys are GraphIdentifiers naming aliases introduced by this optional match. */
+            nodes?: {
+                [key: string]: components["schemas"]["GraphMatchNode"];
+            };
+            edges: components["schemas"]["GraphMatchEdge"][];
+            where?: components["schemas"]["GraphWhereExpression"];
+        };
+        /** @description `anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
+        GraphMatch: {
+            anchor: components["schemas"]["GraphIdentifier"];
+            /** @description Keys are GraphIdentifiers naming aliases in the required match. */
+            nodes: {
+                [key: string]: components["schemas"]["GraphMatchNode"];
+            };
+            edges: components["schemas"]["GraphMatchEdge"][];
+            where?: components["schemas"]["GraphWhereExpression"];
+            /** @description Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null. */
+            optional?: components["schemas"]["GraphOptionalMatch"][];
+        };
+        GraphBindingsReturn: {
+            bindings: components["schemas"]["GraphIdentifier"][];
+            /** @default 100 */
+            limit?: number;
             /**
-             * @description Maximum number of hops (>1 = variable-length path)
+             * @description Hydrate documents for projected non-null bindings when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting an available document.
+             * @default false
+             */
+            include_documents?: boolean;
+            /** @description Document fields to hydrate. Requires include_documents=true; omit to include all fields. */
+            fields?: string[];
+        };
+        /**
+         * @description Count every complete graph binding, including a binding retained by an unmatched optional group through null extension.
+         * @enum {string}
+         */
+        GraphRowCountTarget: "*";
+        GraphRowCountAggregate: {
+            count: components["schemas"]["GraphRowCountTarget"];
+        };
+        GraphAliasCountAggregate: {
+            /** @description Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count. */
+            count: components["schemas"]["GraphIdentifier"];
+            /**
+             * @description Count exact table-qualified identities. Exact distinct sets share a request resource budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+             * @default false
+             */
+            distinct?: boolean;
+        };
+        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows; count(alias) counts only bindings where that alias is non-null. */
+        GraphCountAggregate: components["schemas"]["GraphRowCountAggregate"] | components["schemas"]["GraphAliasCountAggregate"];
+        GraphAggregatesReturn: {
+            /** @description Keys are GraphIdentifiers naming aggregate results. */
+            aggregates: {
+                [key: string]: components["schemas"]["GraphCountAggregate"];
+            };
+        };
+        /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
+        GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
+        /** @description Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages and charged to the request-wide `scanned_anchors` work dimension; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted. */
+        GraphMatchQuery: {
+            index: string;
+            match: components["schemas"]["GraphMatch"];
+            return: components["schemas"]["GraphReturn"];
+        };
+        GraphKeyNodeSelector: {
+            /** @description Exact keys in the table being queried. */
+            keys: string[];
+        };
+        GraphPathEndpoint: {
+            key: string;
+            /** @description Optional table qualifier for an exact cross-table node identity. Omit for the query table. */
+            table?: string;
+        };
+        GraphIdentityNodeSelector: {
+            /** @description Exact node identities. Omitted table means the query table. */
+            identities: components["schemas"]["GraphPathEndpoint"][];
+        };
+        /** @description Select nodes from a prior graph result. `binding` is valid only when `result_ref` names a prior MATCH result; traversal and path results select their returned or endpoint nodes and prohibit `binding`. */
+        GraphResultRefNodeSelector: {
+            /** @description `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A path result selects the endpoint node of each returned path. */
+            result_ref: string;
+            binding?: components["schemas"]["GraphIdentifier"];
+            /** @description Maximum referenced results to use. Omit only when the referenced result is complete. */
+            limit?: number;
+        };
+        /** @description Select graph nodes using exactly one explicit, exact selector form. */
+        GraphNodeSelector: components["schemas"]["GraphKeyNodeSelector"] | components["schemas"]["GraphIdentityNodeSelector"] | components["schemas"]["GraphResultRefNodeSelector"];
+        /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
+        GraphTraversal: {
+            start: components["schemas"]["GraphNodeSelector"];
+            /** @description Stored-edge direction relative to each expanded node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            /**
+             * @description Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
              * @default 1
              */
-            max_hops?: number;
+            max_depth?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+            /** @default 100 */
+            limit?: number;
+            /** @default false */
+            include_paths?: boolean;
             /**
-             * Format: double
-             * @description Minimum edge weight filter
+             * @description Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
+             * @default false
              */
-            min_weight?: number;
-            /**
-             * Format: double
-             * @description Maximum edge weight filter
-             */
-            max_weight?: number;
-        };
-        /** @description A step in a graph pattern query */
-        PatternStep: {
-            /** @description Name for this node (reuse alias for cycle detection) */
-            alias?: string;
-            /** @description Filter constraints for nodes at this step */
-            node_filter?: components["schemas"]["NodeFilter"];
-            /** @description Edge to traverse to reach this step (null for first step) */
-            edge?: components["schemas"]["PatternEdgeStep"];
-        };
-        /** @description Declarative graph query to execute after full-text/vector searches */
-        GraphQuery: {
-            type: components["schemas"]["GraphQueryType"];
-            /** @description Graph index name (must be graph type) */
-            index_name: string;
-            /** @description Starting node(s) for the query */
-            start_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan. */
-            target_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Traversal/pathfinding parameters */
-            params?: components["schemas"]["GraphQueryParams"];
-            /** @description Pattern steps for pattern query type */
-            pattern?: components["schemas"]["PatternStep"][];
-            /** @description Which aliases to return from pattern query (empty = all) */
-            return_aliases?: string[];
-            /** @description Fetch full documents for graph results */
             include_documents?: boolean;
-            /** @description Include edge details for each node */
-            include_edges?: boolean;
-            /** @description Which fields to return from documents */
+            /** @description Requires include_documents=true. Omit to include all document fields. */
             fields?: string[];
+            /** @description Non-scoring structured stored-document predicate for reached nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
+        };
+        GraphTraverseQuery: {
+            index: string;
+            traverse: components["schemas"]["GraphTraversal"];
+        };
+        /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
+        GraphShortestPath: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
+            /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            /** @default 10 */
+            max_depth?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+            /** @default min_hops */
+            objective?: components["schemas"]["GraphPathObjective"];
+            /** @description Non-scoring structured stored-document predicate for path nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
+            /**
+             * @description Attach the terminal stored document as paths[].document when it exists at the pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted.
+             * @default false
+             */
+            include_documents?: boolean;
+            /** @description Requires include_documents=true. Omit to include all document fields. */
+            fields?: string[];
+        };
+        GraphShortestPathQuery: {
+            index: string;
+            shortest_path: components["schemas"]["GraphShortestPath"];
+        };
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective. */
+        GraphKShortestPaths: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
+            /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
+            k: number;
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            /** @default 10 */
+            max_depth?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+            /** @default min_hops */
+            objective?: components["schemas"]["GraphPathObjective"];
+            /** @description Non-scoring structured stored-document predicate for path nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
+            /**
+             * @description Attach each terminal stored document as paths[].document when it exists at the pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted.
+             * @default false
+             */
+            include_documents?: boolean;
+            /** @description Requires include_documents=true. Omit to include all document fields. */
+            fields?: string[];
+        };
+        GraphKShortestPathsQuery: {
+            index: string;
+            k_shortest_paths: components["schemas"]["GraphKShortestPaths"];
+        };
+        GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
+        /** @description Named canonical graph operations. When graph_queries is present it must contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy. */
+        GraphQueries: {
+            [key: string]: components["schemas"]["GraphQuery"];
         };
         /**
          * @description Configuration for pruning search results based on score quality.
@@ -11897,8 +12722,285 @@ export interface components {
              */
             std_dev_threshold?: number;
         };
-        /** @description A node in graph query results */
+        /**
+         * @description Deprecated discriminator used by LegacyGraphQuery.
+         * @enum {string}
+         */
+        GraphQueryType: "traverse" | "neighbors" | "shortest_path" | "k_shortest_paths" | "pattern";
+        /** @description Deprecated free-form graph filter accepted by the v0.2 compatibility contract. */
+        LegacyGraphDocumentQuery: {
+            [key: string]: unknown;
+        };
+        /** @description Filter nodes during graph traversal using existing query primitives */
+        NodeFilter: {
+            /** @description Antfly query to filter nodes (same syntax as search filter_query) */
+            filter_query?: components["schemas"]["LegacyGraphDocumentQuery"];
+            /** @description Filter by key prefix */
+            filter_prefix?: string;
+        };
+        /**
+         * @deprecated
+         * @description Deprecated v0.2 graph selector. Unqualified target keys match any reachable table.
+         */
+        LegacyGraphNodeSelector: {
+            /** @description Legacy list of node keys. Target keys match any reachable table. */
+            keys?: string[];
+            /** @description Exact node identities. Omitted table means the query table. */
+            identities?: components["schemas"]["GraphPathEndpoint"][];
+            /**
+             * @description Reference to search results to use as nodes:
+             *     - "$full_text_results" - use full-text search results
+             *     - "$embeddings_results" - use merged vector search results
+             *     - "$fused_results" - use fused retrieval results
+             *     - "$graph_results.<query-name>" - use a prior graph query result
+             */
+            result_ref?: string;
+            /** @description Maximum number of nodes to select from result_ref; invalid with keys or identities. */
+            limit?: number;
+            /** @description Filter which nodes to use as start/target */
+            node_filter?: components["schemas"]["NodeFilter"];
+        };
+        /**
+         * @description Path weighting algorithm for pathfinding:
+         *     - min_hops: Minimize number of edges
+         *     - min_weight: Minimize sum of finite non-negative edge weights
+         *     - max_weight: Maximize product of finite edge weights in [0,1]
+         * @enum {string}
+         */
+        PathWeightMode: "min_hops" | "min_weight" | "max_weight";
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches traversal and path parameters.
+         */
+        GraphQueryParams: {
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            direction?: components["schemas"]["EdgeDirection"];
+            max_depth?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+            max_results?: number;
+            deduplicate_nodes?: boolean;
+            include_paths?: boolean;
+            weight_mode?: components["schemas"]["PathWeightMode"];
+            k?: number;
+            node_filter?: components["schemas"]["NodeFilter"];
+            algorithm?: string;
+            algorithm_params?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @deprecated
+         * @description Deprecated linear graph_searches pattern edge.
+         */
+        PatternEdgeStep: {
+            /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
+            types?: components["schemas"]["GraphEdgeType"][];
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @default 1 */
+            min_hops?: number;
+            /** @default 1 */
+            max_hops?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+        };
+        /**
+         * @deprecated
+         * @description Deprecated linear graph_searches pattern step.
+         */
+        PatternStep: {
+            alias?: string;
+            node_filter?: components["schemas"]["NodeFilter"];
+            edge?: components["schemas"]["PatternEdgeStep"];
+        };
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
+         */
+        LegacyGraphQuery: {
+            type: components["schemas"]["GraphQueryType"];
+            index_name: string;
+            start_nodes?: components["schemas"]["LegacyGraphNodeSelector"];
+            target_nodes?: components["schemas"]["LegacyGraphNodeSelector"];
+            params?: components["schemas"]["GraphQueryParams"];
+            pattern?: components["schemas"]["PatternStep"][];
+            return_aliases?: string[];
+            include_documents?: boolean;
+            include_edges?: boolean;
+            fields?: string[];
+        };
+        /** @description One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order. */
+        GraphBindingNode: {
+            /** @description Exact document key. */
+            key: string;
+            /** @description Owning table for a cross-table binding; omitted for the queried table. */
+            table?: string;
+            /** @description Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted. */
+            document?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphResultBinding: components["schemas"]["GraphBindingNode"] | null;
+        GraphResultRow: {
+            [key: string]: components["schemas"]["GraphResultBinding"];
+        };
+        /** @description Completion statistics for a bounded graph result. */
+        GraphResultStats: {
+            /**
+             * Format: uint64
+             * @description Number of primary result items returned (nodes or rows).
+             */
+            returned_items: number;
+            /** @description True when bounded enumeration stopped before exhaustive completion. */
+            truncated: boolean;
+        };
+        /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
+        GraphBindingsResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "bindings";
+            rows: components["schemas"]["GraphResultRow"][];
+            stats: components["schemas"]["GraphResultStats"];
+        };
+        GraphAggregateValue: {
+            /** @description Decimal string so counts remain lossless in JavaScript. */
+            value: string;
+            /**
+             * @description Always true. Exact aggregate execution fails instead of returning a partial value.
+             * @enum {boolean}
+             */
+            exact: true;
+        };
+        /** @description Completion statistics for a graph result that is exact or fails without producing a result. */
+        GraphExactResultStats: {
+            /**
+             * Format: uint64
+             * @description Number of primary result items returned (paths or aggregates).
+             */
+            returned_items: number;
+        };
+        /** @description Complete exact aggregates from a canonical graph MATCH query. */
+        GraphAggregatesResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "aggregates";
+            /** @description Keys are the GraphIdentifiers selected by the corresponding aggregate return projection. */
+            aggregates: {
+                [key: string]: components["schemas"]["GraphAggregateValue"];
+            };
+            stats: components["schemas"]["GraphExactResultStats"];
+        };
+        /**
+         * @description Physical stored-edge orientation relative to this path edge's `from` endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal relationships.
+         * @enum {string}
+         */
+        GraphPathEdgeDirection: "out" | "in";
+        /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
+        GraphPathEdge: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
+            direction: components["schemas"]["GraphPathEdgeDirection"];
+            type: components["schemas"]["GraphEdgeType"];
+            /**
+             * Format: double
+             * @description Finite durable edge weight. max_weight_product paths further require values in [0,1].
+             */
+            weight: number;
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description A traversal result node. Traversal paths, when requested, are carried by path and path_edges. Pathfinding results use GraphPathResult instead. */
         GraphResultNode: {
+            /** @description Document key */
+            key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
+            /** @description Hop count from the start node; when path is present this equals path length minus one */
+            depth: number;
+            /** @description Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted. */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true. */
+            path?: components["schemas"]["GraphPathEndpoint"][];
+            /** @description Ordered typed traversal edges from the start node. Present only with path for traversal queries. */
+            path_edges?: components["schemas"]["GraphPathEdge"][];
+            /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
+            provenance?: string[];
+            /** @description Parsed evidence envelope for provenance labels and edge metadata */
+            evidence?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Composable results from a canonical traversal query. */
+        GraphNodesResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "nodes";
+            /** @description Traversal result nodes; requested paths are stored on each node. */
+            nodes: components["schemas"]["GraphResultNode"][];
+            stats: components["schemas"]["GraphResultStats"];
+        };
+        /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
+        GraphPath: {
+            /** @description Ordered node identities. Table is omitted for nodes in the query table. */
+            nodes: components["schemas"]["GraphPathEndpoint"][];
+            /** @description Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1]. */
+            edges: components["schemas"]["GraphPathEdge"][];
+            objective: components["schemas"]["GraphPathObjective"];
+            /**
+             * Format: double
+             * @description Sum of raw edge weights along the path, independent of the selected ranking objective.
+             */
+            weight_sum: number;
+            /**
+             * Format: double
+             * @description The user-facing value optimized by objective; edge count for min_hops, weight_sum for min_weight_sum, and the raw edge-weight product for max_weight_product.
+             */
+            objective_value: number;
+            length: number;
+        };
+        /** @description One authoritative pathfinding result. The terminal identity is the last element of path.nodes, so it is never duplicated in a parallel node array. */
+        GraphPathResult: {
+            path: components["schemas"]["GraphPath"];
+            /** @description Stored terminal document when include_documents=true and the terminal identity exists at the pinned snapshot; otherwise omitted. */
+            document?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Composable results from canonical shortest_path or k_shortest_paths queries. */
+        GraphPathsResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "paths";
+            paths: components["schemas"]["GraphPathResult"][];
+            stats: components["schemas"]["GraphExactResultStats"];
+        };
+        /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
+        GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["GraphPathsResult"];
+        /** @description Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy. */
+        GraphQueryResults: {
+            [key: string]: components["schemas"]["GraphResult"];
+        };
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches node response with an unqualified string path.
+         */
+        LegacyGraphResultNode: {
             /** @description Document key */
             key: string;
             /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
@@ -11914,7 +13016,7 @@ export interface components {
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Keys in path from start to this node */
+            /** @description Deprecated unqualified keys in the path from the start node to this node */
             path?: string[];
             /** @description Edges in path from start to this node */
             path_edges?: components["schemas"]["PathEdge"][];
@@ -11924,34 +13026,57 @@ export interface components {
             evidence?: {
                 [key: string]: unknown;
             };
-            /** @description Connected edges (when include_edges=true) */
+            /** @description Connected edges when supplied by the graph executor. */
             edges?: components["schemas"]["Edge"][];
         };
-        /** @description A single match from a pattern query */
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches pattern response row.
+         */
         PatternMatch: {
-            /** @description Map of alias to matched node */
             bindings?: {
-                [key: string]: components["schemas"]["GraphResultNode"];
+                [key: string]: components["schemas"]["LegacyGraphResultNode"];
             };
-            /** @description Edges traversed in this match */
             path?: components["schemas"]["PathEdge"][];
         };
-        /** @description Results of a graph query */
-        GraphQueryResult: {
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches response envelope.
+         */
+        LegacyGraphSearchResult: {
+            /**
+             * @description Optional transition discriminator accepted by current SDKs. Servers omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue to decode the original response shape.
+             * @enum {string}
+             */
+            kind?: "legacy";
+            /** @deprecated */
             type: components["schemas"]["GraphQueryType"];
-            /** @description Result nodes */
-            nodes?: components["schemas"]["GraphResultNode"][];
-            /** @description Result paths (for pathfinding queries) */
+            /** @description Result nodes. Optional for compatibility with v0.2 responses. */
+            nodes?: components["schemas"]["LegacyGraphResultNode"][];
+            /** @description Result paths. Optional for compatibility with v0.2 responses. */
             paths?: components["schemas"]["Path"][];
-            /** @description Pattern matches (for pattern queries) */
+            /**
+             * @deprecated
+             * @description Deprecated graph_searches pattern results; use rows for graph_queries.
+             */
             matches?: components["schemas"]["PatternMatch"][];
-            /** @description Total number of results */
+            /**
+             * @deprecated
+             * @description Deprecated graph_searches result count; use stats or a named count aggregate.
+             */
             total: number;
             /**
              * Format: int64
-             * @description Query execution time
+             * @deprecated
+             * @description Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
              */
             took?: number;
+        };
+        /** @description Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window. */
+        StatefulGraphResult: components["schemas"]["GraphResult"] | components["schemas"]["LegacyGraphSearchResult"];
+        /** @description Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used graph_searches. */
+        StatefulGraphQueryResults: {
+            [key: string]: components["schemas"]["StatefulGraphResult"];
         };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
@@ -11975,166 +13100,6 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        /** @description Credential-free normalized enrichment configuration returned after index creation. */
-        CreatedEnrichmentConfig: {
-            name: string;
-            kind: components["schemas"]["EnrichmentKind"];
-            field?: string;
-            template?: string;
-            source_artifact_name?: string;
-            expected_dims?: number;
-            chunk_size?: number;
-            chunk_overlap?: number;
-            chunker_json?: string;
-            /** @default false */
-            full_text_index?: boolean;
-            content_type?: string;
-            execution?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
-        CreatedIndexCommon: {
-            /** @description Name of the created index */
-            name: string;
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
-             */
-            version?: number;
-            /** @description Normalized inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
-        };
-        /** @description Normalized effective full-text index configuration returned after creation. */
-        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
-            /** @enum {string} */
-            type: "full_text";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "full_text";
-        };
-        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
-        CreatedProviderConfig: {
-            /** @description Configured provider discriminator. */
-            provider: string;
-            /** @description Configured provider model when applicable. */
-            model?: string;
-            models?: string[];
-            project_id?: string;
-            location?: string;
-            region?: string;
-            /** Format: uri */
-            url?: string;
-            /** Format: uri */
-            api_url?: string;
-            dimension?: number;
-            dimensions?: number;
-            input_type?: string;
-            truncate?: string;
-            strip_new_lines?: boolean;
-            batch_size?: number;
-            /** Format: float */
-            temperature?: number;
-            max_tokens?: number;
-            /** Format: float */
-            top_p?: number;
-            top_k?: number;
-            /** Format: float */
-            frequency_penalty?: number;
-            /** Format: float */
-            presence_penalty?: number;
-            timeout?: number;
-        };
-        /** @description Credential-free normalized embeddings configuration returned after creation. */
-        CreatedEmbeddingsIndexConfig: {
-            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
-            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
-            /** @default false */
-            external?: boolean;
-            /** @default false */
-            sparse?: boolean;
-            dimension?: number;
-            field?: string;
-            embedding_name?: string;
-            source_artifact_name?: string;
-            template?: string;
-            distance_metric?: components["schemas"]["DistanceMetric"];
-            mem_only?: boolean;
-            embedder?: components["schemas"]["CreatedProviderConfig"];
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
-            chunker?: components["schemas"]["ChunkerConfig"];
-            /** @default 10 */
-            top_k?: number;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_weight?: number;
-            /** @default 1024 */
-            chunk_size?: number;
-            execution?: components["schemas"]["IndexExecutionConfig"];
-        };
-        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
-        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
-            /** @enum {string} */
-            type: "embeddings";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "embeddings";
-        };
-        /** @description Credential-free graph artifact producer configuration returned after creation. */
-        CreatedGraphArtifactProducerConfig: {
-            name: string;
-            /** @enum {string} */
-            kind: "asset";
-            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
-            content_type?: string;
-            execution?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Credential-free normalized graph configuration returned after creation. */
-        CreatedGraphIndexConfig: {
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
-            template?: string;
-            edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            max_edges_per_document?: number;
-            source?: components["schemas"]["GraphArtifactSourceConfig"];
-            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
-            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
-            resolvers?: components["schemas"]["GraphResolverConfig"][];
-        };
-        /** @description Normalized effective graph index configuration returned after creation. */
-        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
-            /** @enum {string} */
-            type: "graph";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "graph";
-        };
-        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
-        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
-            /** @enum {string} */
-            type: "algebraic";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "algebraic";
-        };
-        /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -13107,7 +14072,7 @@ export interface components {
          */
         InferenceModelQuantization: "q4_k" | "q8" | "fp16";
         /**
-         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
          * @enum {string}
          */
         InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
@@ -13142,13 +14107,13 @@ export interface components {
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**
-             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
              * @default auto
              */
             residency_mode?: components["schemas"]["InferenceA4bResidencyMode"];
             /**
              * Format: uint32
-             * @description Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+             * @description Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
              * @default 0
              */
             memory_budget_mb?: number;
@@ -13926,6 +14891,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Invalid index configuration or a deployment capability mismatch */
+        IndexMutationBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnsupportedIndexCapabilityError"] | components["schemas"]["Error"];
+            };
+        };
         /** @description Request body exceeds the configured size limit */
         PayloadTooLarge: {
             headers: {
@@ -13969,6 +14943,17 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged. */
+        IndexMutationServiceUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait when the failure is retryable. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"] | components["schemas"]["Error"];
             };
         };
         /** @description Backup could not establish the required metadata authority before starting side effects. */
@@ -14049,22 +15034,31 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Exact sort cannot be executed through a supported native plan */
-        UnsupportedExactSort: {
+        /** @description The query is valid but cannot be executed exactly under the declared contract */
+        QueryUnprocessable: {
             headers: {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ExactSortError"];
+                "application/json": components["schemas"]["QueryUnprocessableError"];
             };
         };
-        /** @description The hierarchy changed after the traversal cursor was issued */
+        /** @description Deprecated response component retained for generated-client source compatibility; query endpoints now use QueryConflict */
         HierarchyCursorStale: {
             headers: {
                 [name: string]: unknown;
             };
             content: {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
+            };
+        };
+        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        QueryConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryConflictError"];
             };
         };
         /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
@@ -15068,7 +16062,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryRequest"];
+                "application/json": components["schemas"]["StatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };
@@ -15076,10 +16070,17 @@ export interface operations {
             /** @description Query successful */
             200: {
                 headers: {
+                    /**
+                     * @description RFC 9745 structured deprecation date. Stateful Antfly emits
+                     *     this header when a successful request used the deprecated
+                     *     `graph_searches` field; canonical requests and canonical-only
+                     *     serverless surfaces omit it.
+                     */
+                    Deprecation?: string;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryResponses"];
+                    "application/json": components["schemas"]["StatefulQueryResponses"];
                 };
             };
             /** @description Invalid query request */
@@ -15091,8 +16092,8 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            409: components["responses"]["QueryConflict"];
+            422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15315,7 +16316,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             /** @description Durable destinations cannot be bound to this credential type */
             422: {
                 headers: {
@@ -15325,6 +16326,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropTable: {
@@ -15362,7 +16364,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryRequest"];
+                "application/json": components["schemas"]["StatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };
@@ -15370,16 +16372,23 @@ export interface operations {
             /** @description Query successful */
             200: {
                 headers: {
+                    /**
+                     * @description RFC 9745 structured deprecation date. Stateful Antfly emits
+                     *     this header when a successful request used the deprecated
+                     *     `graph_searches` field; canonical requests and canonical-only
+                     *     serverless surfaces omit it.
+                     */
+                    Deprecation?: string;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryResponses"];
+                    "application/json": components["schemas"]["StatefulQueryResponses"];
                 };
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            409: components["responses"]["QueryConflict"];
+            422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15558,7 +16567,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     reauthorizeTableDestinations: {
@@ -16380,7 +17389,7 @@ export interface operations {
                     "application/json": components["schemas"]["CreatedIndex"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
@@ -16395,7 +17404,7 @@ export interface operations {
             };
             429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropIndex: {

@@ -169,6 +169,69 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
+func TestQueryAcceptsExplicitEmbeddingIndexes(t *testing.T) {
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"responses":[]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var sparse Embedding
+	if err := sparse.FromEmbedding1(oapi.Embedding1{
+		Indices: []uint32{1, 5},
+		Values:  []float32{0.5, 0.75},
+	}); err != nil {
+		t.Fatalf("FromEmbedding1: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Table:      "docs",
+		Embeddings: map[string]Embedding{"sparse_idx": sparse},
+		Indexes:    []string{"sparse_idx"},
+	}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !strings.Contains(gotBody, `"indexes":["sparse_idx"]`) ||
+		!strings.Contains(gotBody, `"embeddings":{"sparse_idx":{"indices":[1,5],"values":[0.5,0.75]}}`) {
+		t.Fatalf("unexpected query body: %s", gotBody)
+	}
+}
+
+func TestQueryEmbeddingValidationMatchesServerContract(t *testing.T) {
+	client, err := NewAntflyClient("http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("NewAntflyClient: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Indexes: []string{"dense_idx"},
+	}); err == nil || !strings.Contains(err.Error(), "semantic_search or embeddings required") {
+		t.Fatalf("indexes-only error = %v", err)
+	}
+
+	var dense Embedding
+	if err := dense.FromEmbedding0(oapi.Embedding0{1, 0, 0}); err != nil {
+		t.Fatalf("FromEmbedding0: %v", err)
+	}
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Embeddings: map[string]Embedding{"dense_idx": dense},
+		Offset:     1,
+	}); err == nil || !strings.Contains(err.Error(), "offset not available") {
+		t.Fatalf("embedding offset error = %v", err)
+	}
+}
+
 func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	var gotPath string
 	var gotBody string
@@ -216,6 +279,35 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	}
 	if strings.Contains(gotBody, `"name"`) {
 		t.Fatalf("request duplicated path identity: %s", gotBody)
+	}
+}
+
+func TestCreateIndexRejectsInvalidDirectUnionBeforeNetwork(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var request CreateIndexRequest
+	if err := request.FromCreateFullTextIndexRequest(CreateFullTextIndexRequest{
+		ArtifactName: "chunks_v1",
+		Sources:      []FullTextArtifactIndexSource{{Artifact: "chunks_v2"}},
+	}); err != nil {
+		t.Fatalf("FromCreateFullTextIndexRequest: %v", err)
+	}
+
+	if _, err := client.CreateIndex(context.Background(), "docs", "text", request); err == nil ||
+		!strings.Contains(err.Error(), "sources cannot be combined with artifact_name") {
+		t.Fatalf("CreateIndex error = %v, want relationship validation", err)
+	}
+	if requests != 0 {
+		t.Fatalf("server received %d requests, want 0", requests)
 	}
 }
 
@@ -273,6 +365,34 @@ func TestCreateIndexPreservesStorageAdmissionRetry(t *testing.T) {
 	if exhausted.StatusCode != http.StatusTooManyRequests || exhausted.Code != "storage_resource_exhausted" ||
 		!exhausted.Retryable || exhausted.RetryAfterMS != 1250 || exhausted.RetryAfterSeconds != 2 {
 		t.Fatalf("StorageResourceExhaustedError = %#v", exhausted)
+	}
+}
+
+func TestCreateIndexPreservesTemporaryMutationRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "4")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"index_probe_unavailable","message":"model probe is temporarily unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	_, err = client.CreateIndex(context.Background(), "docs", "vectors", *request)
+	var unavailable *IndexMutationTemporarilyUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("CreateIndex error = %T %[1]v, want IndexMutationTemporarilyUnavailableError", err)
+	}
+	if unavailable.StatusCode != http.StatusServiceUnavailable || unavailable.Code != "index_probe_unavailable" ||
+		!unavailable.Retryable || unavailable.RetryAfterSeconds != 4 {
+		t.Fatalf("IndexMutationTemporarilyUnavailableError = %#v", unavailable)
 	}
 }
 
@@ -583,6 +703,117 @@ func TestQueryPreservesHierarchyCursorRestartGuidance(t *testing.T) {
 	}
 }
 
+func TestQueryPreservesTopologyRetryGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":409,"error":"topology_changed","message":"the table topology changed while the query was running","action":"retry_query","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want TopologyChangedError")
+	}
+	var topology *TopologyChangedError
+	if !errors.As(err, &topology) {
+		t.Fatalf("error = %T %[1]v, want TopologyChangedError", err)
+	}
+	if topology.StatusCode != http.StatusConflict ||
+		topology.Code != "topology_changed" ||
+		topology.Action != "retry_query" ||
+		!topology.Retryable {
+		t.Fatalf("topology error = %#v, want retry-query guidance", topology)
+	}
+}
+
+func TestQueryPreservesGeneratedGraphErrorDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"error":"graph_work_budget_exceeded","message":"exact graph work exceeded the configured request budget","retryable":false,"operation":"friends","mode":"match","dimension":"explored_edges","maximum":2048,"remediation":"narrow the anchor"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want GraphQueryError")
+	}
+	var graphErr *GraphQueryError
+	if !errors.As(err, &graphErr) {
+		t.Fatalf("error = %T %[1]v, want GraphQueryError", err)
+	}
+	if graphErr.Code != "graph_work_budget_exceeded" || graphErr.Message != "exact graph work exceeded the configured request budget" || graphErr.Retryable {
+		t.Fatalf("graph error = %#v", graphErr)
+	}
+	if graphErr.Detail.Kind != oapi.GraphQueryErrorVariantWorkBudgetExceeded || graphErr.Detail.WorkBudgetExceeded == nil {
+		t.Fatalf("graph error detail = %#v", graphErr.Detail)
+	}
+	if graphErr.Detail.WorkBudgetExceeded.Operation != "friends" || graphErr.Detail.WorkBudgetExceeded.Maximum != 2048 {
+		t.Fatalf("work budget detail = %#v", graphErr.Detail.WorkBudgetExceeded)
+	}
+}
+
+func TestQueryGenericStructuredErrorPreservesCodeMessageAndBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"error":"future_query_error","message":"actionable server message","detail":"preserved"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %[1]v, want APIError", err)
+	}
+	if apiErr.Code != "future_query_error" || apiErr.Message != "actionable server message" || !strings.Contains(string(apiErr.RawBody), `"detail":"preserved"`) {
+		t.Fatalf("API error = %#v", apiErr)
+	}
+}
+
+func TestQueryGenericStructuredCodeErrorPreservesCodeMessageAndBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"code":"future_storage_error","message":"actionable server message","detail":"preserved"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %[1]v, want APIError", err)
+	}
+	if apiErr.Code != "future_storage_error" || apiErr.Message != "actionable server message" || !strings.Contains(string(apiErr.RawBody), `"detail":"preserved"`) {
+		t.Fatalf("API error = %#v", apiErr)
+	}
+}
+
 func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -666,7 +897,7 @@ func TestLinearMergeSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	}
 
 	result, err := client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
-		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+		Records: LinearMergeRecords{"doc-1": {"title": "hello"}},
 	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 1024,
@@ -701,7 +932,7 @@ func TestLinearMergeRejectsOversizedSuccessResponse(t *testing.T) {
 	}
 
 	_, err = client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
-		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+		Records: LinearMergeRecords{"doc-1": {"title": "hello"}},
 	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 16,
@@ -725,8 +956,8 @@ func TestExecuteLinearMergeUsesWriteOptions(t *testing.T) {
 		t.Fatalf("NewAntflyClientWithOptions: %v", err)
 	}
 
-	_, err = client.ExecuteLinearMerge(context.Background(), "files", SortedPages(map[string]any{
-		"doc-1": map[string]any{"title": strings.Repeat("x", 128)},
+	_, err = client.ExecuteLinearMerge(context.Background(), "files", SortedPages(LinearMergeRecords{
+		"doc-1": {"title": strings.Repeat("x", 128)},
 	}, 1), ExecuteLinearMergeOptions{
 		WriteOptions: WriteOptions{
 			MaxRequestBytes:  64,
@@ -742,10 +973,10 @@ func TestExecuteLinearMergeUsesWriteOptions(t *testing.T) {
 }
 
 func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": strings.Repeat("a", 24)},
-		"b": map[string]any{"text": strings.Repeat("b", 24)},
-		"c": map[string]any{"text": strings.Repeat("c", 24)},
+	records := LinearMergeRecords{
+		"a": {"text": strings.Repeat("a", 24)},
+		"b": {"text": strings.Repeat("b", 24)},
+		"c": {"text": strings.Repeat("c", 24)},
 	}
 	allPages, err := SortedLinearMergePages(records, LinearMergePageOptions{MaxRecords: 10})
 	if err != nil {
@@ -755,13 +986,13 @@ func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
 		t.Fatalf("pages without byte limit = %d, want 1", len(allPages))
 	}
 
-	oneRecordSize, err := linearMergeRequestSize(map[string]any{
+	oneRecordSize, err := linearMergeRequestSize(LinearMergeRecords{
 		"a": records["a"],
 	}, "x", false, "")
 	if err != nil {
 		t.Fatalf("linearMergeRequestSize one record: %v", err)
 	}
-	twoRecordSize, err := linearMergeRequestSize(map[string]any{
+	twoRecordSize, err := linearMergeRequestSize(LinearMergeRecords{
 		"a": records["a"],
 		"b": records["b"],
 	}, "x", false, "")
@@ -786,8 +1017,8 @@ func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
 }
 
 func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": strings.Repeat("a", 128)},
+	records := LinearMergeRecords{
+		"a": {"text": strings.Repeat("a", 128)},
 	}
 	_, err := SortedLinearMergePages(records, LinearMergePageOptions{
 		MaxRecords:      10,
@@ -799,9 +1030,9 @@ func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
 }
 
 func TestLinearMergeRequestSizerMatchesEncodedSize(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": "alpha", "n": 1},
-		"b": map[string]any{"text": "bravo", "n": 2},
+	records := LinearMergeRecords{
+		"a": {"text": "alpha", "n": 1},
+		"b": {"text": "bravo", "n": 2},
 	}
 	sizer, err := newLinearMergeRequestSizer("cursor", true, SyncLevelFullIndex)
 	if err != nil {

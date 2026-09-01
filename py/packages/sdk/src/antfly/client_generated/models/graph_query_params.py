@@ -20,28 +20,28 @@ T = TypeVar("T", bound="GraphQueryParams")
 
 @_attrs_define
 class GraphQueryParams:
-    """Parameters for graph traversal and pathfinding
+    """Deprecated graph_searches traversal and path parameters.
 
     Attributes:
-        edge_types (list[str] | Unset): Filter by edge types
+        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node
             - both: Both outgoing and incoming edges
-        max_depth (int | Unset): Maximum traversal depth
-        min_weight (float | Unset): Minimum edge weight
-        max_weight (float | Unset): Maximum edge weight
-        max_results (int | Unset): Maximum number of results (traversal)
-        deduplicate_nodes (bool | Unset): Remove duplicate nodes (traversal)
-        include_paths (bool | Unset): Include path information (traversal)
+        max_depth (int | Unset):
+        min_weight (float | Unset):
+        max_weight (float | Unset):
+        max_results (int | Unset):
+        deduplicate_nodes (bool | Unset):
+        include_paths (bool | Unset):
         weight_mode (PathWeightMode | Unset): Path weighting algorithm for pathfinding:
             - min_hops: Minimize number of edges
-            - min_weight: Minimize sum of edge weights
-            - max_weight: Maximize product of edge weights
-        k (int | Unset): Number of paths to find (k-shortest-paths)
+            - min_weight: Minimize sum of finite non-negative edge weights
+            - max_weight: Maximize product of finite edge weights in [0,1]
+        k (int | Unset):
         node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
-        algorithm (str | Unset): Graph algorithm to run (e.g., 'pagerank', 'betweenness')
-        algorithm_params (GraphQueryParamsAlgorithmParams | Unset): Parameters for the graph algorithm
+        algorithm (str | Unset):
+        algorithm_params (GraphQueryParamsAlgorithmParams | Unset):
     """
 
     edge_types: list[str] | Unset = UNSET

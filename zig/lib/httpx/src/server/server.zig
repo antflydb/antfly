@@ -591,6 +591,13 @@ pub const Context = struct {
         return self.response.build();
     }
 
+    /// Sends a schema-aware OpenAPI JSON response. Generic `json` preserves
+    /// explicit null optionals; this method applies OpenAPI absence semantics.
+    pub fn openApiJson(self: *Self, value: anytype) !Response {
+        _ = try self.response.openApiJson(value);
+        return self.response.build();
+    }
+
     /// Sends a redirect response.
     pub fn redirect(self: *Self, url: []const u8, code: u16) !Response {
         _ = self.response.status(code);
@@ -823,13 +830,30 @@ pub const Context = struct {
             } else if (self.h2_writer) |*w| {
                 try w.write(data);
             } else if (self.h1_sock) |sock| {
-                // Write one HTTP/1.1 chunked frame: hex-size CRLF data CRLF
-                var size_buf: [18]u8 = undefined; // max "FFFFFFFFFFFFFFFF\r\n"
-                const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{data.len}) catch unreachable;
-                try sock.sendAll(size_str);
-                try sock.sendAll(data);
-                try sock.sendAll("\r\n");
+                try writeH1Chunk(sock, data);
             } else return error.StreamClosed;
+        }
+
+        /// Writes one HTTP/1.1 chunked frame: hex-size CRLF data CRLF.
+        /// Frames that fit the stack buffer go out as a single transport
+        /// write; three writes per token-sized SSE chunk is measurable
+        /// syscall overhead. The wire bytes are identical either way.
+        fn writeH1Chunk(sock: anytype, data: []const u8) !void {
+            var size_buf: [18]u8 = undefined; // max "FFFFFFFFFFFFFFFF\r\n"
+            const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{data.len}) catch unreachable;
+            // Covers writeEventTo's single-write fast path (8192) plus framing.
+            var frame_buf: [8192 + 24]u8 = undefined;
+            const frame_len = size_str.len + data.len + 2;
+            if (frame_len <= frame_buf.len) {
+                @memcpy(frame_buf[0..size_str.len], size_str);
+                @memcpy(frame_buf[size_str.len..][0..data.len], data);
+                frame_buf[frame_len - 2] = '\r';
+                frame_buf[frame_len - 1] = '\n';
+                return sock.sendAll(frame_buf[0..frame_len]);
+            }
+            try sock.sendAll(size_str);
+            try sock.sendAll(data);
+            try sock.sendAll("\r\n");
         }
 
         /// Sends the terminating chunk / END_STREAM.
@@ -5360,6 +5384,33 @@ test "stream writer preserves small SSE write density and supports oversized eve
     try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: message\ndata: "));
     try std.testing.expect(std.mem.endsWith(u8, capture.bytes.items, "\n\n"));
     try std.testing.expectEqual(@as(usize, "event: message\ndata: ".len + large.len + 2), capture.bytes.items.len);
+}
+
+test "H1 chunked frames coalesce into one write and keep wire format for oversized data" {
+    const Capture = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        writes: usize = 0,
+
+        fn sendAll(self: *@This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+            self.writes += 1;
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.bytes.deinit(std.testing.allocator);
+    try Context.StreamWriter.writeH1Chunk(&capture, "hello");
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    try std.testing.expectEqualStrings("5\r\nhello\r\n", capture.bytes.items);
+
+    capture.bytes.clearRetainingCapacity();
+    capture.writes = 0;
+    const large = [_]u8{'x'} ** 9000;
+    try Context.StreamWriter.writeH1Chunk(&capture, &large);
+    try std.testing.expectEqual(@as(usize, 3), capture.writes);
+    try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "2328\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, capture.bytes.items, "\r\n"));
+    try std.testing.expectEqual(@as(usize, "2328\r\n".len + large.len + 2), capture.bytes.items.len);
 }
 
 test "SSE rejects CR in id field" {

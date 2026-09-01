@@ -510,7 +510,10 @@ jobs:
           ) &
           unit_pid="$!"
           (
-            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-900}"
+            # A cold Zig compile can legitimately remain silent for more than
+            # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
+            # the independent hard limit without killing an active cold build.
+            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
             hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"
@@ -859,9 +862,11 @@ jobs:
         run: |
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
+          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
+          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
@@ -1016,7 +1021,9 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
+          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          mkdir -p "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache

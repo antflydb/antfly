@@ -54,6 +54,7 @@ pub const BulkBuildOptions = bulk_build.BulkBuildOptions;
 pub const PreparedBulkBuildInput = bulk_build.PreparedBulkBuildInput;
 pub const SearchResult = search_results.SearchResult;
 pub const SearchResults = search_results.SearchResults;
+pub const CandidateCoverage = search_results.CandidateCoverage;
 pub const ApproxSearchResult = search_results.ApproxSearchResult;
 pub const ApproxSearchResults = search_results.ApproxSearchResults;
 pub const SearchRequest = search_types.SearchRequest;

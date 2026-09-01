@@ -2392,6 +2392,10 @@ pub const ResourceManager = struct {
             .quantized_protected_bytes = target_bytes / 4,
             .metadata_protected_bytes = target_bytes / 32,
             .concurrent_vector_admission_stride = switch (pressure) {
+                // Normal-pressure serial searches should warm decoded
+                // residency eagerly. The cache adds an overlap-aware
+                // doorkeeper while another decoded fill is active and also
+                // samples replacement once the byte target is full.
                 .normal => 1,
                 .soft => 8,
                 .hard => 0,

@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const metadata_openapi = @import("antfly_metadata_openapi");
 const public_embedding_query_mod = @import("public_embedding_query.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 
@@ -78,6 +77,7 @@ pub fn looksLikePublicSearchRequest(value: std.json.Value) bool {
         hasNonNullField(obj, "pruner") or
         hasNonNullField(obj, "reranker") or
         hasNonNullField(obj, "hierarchy") or
+        hasNonNullField(obj, "graph_queries") or
         hasNonNullField(obj, "graph_searches") or
         hasNonNullField(obj, "expand_strategy") or
         hasNonNullField(obj, "distance_over") or
@@ -86,27 +86,34 @@ pub fn looksLikePublicSearchRequest(value: std.json.Value) bool {
 
 pub fn parseTextClausesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !ParsedTextClauses {
     return .{
         .full_text = if (request.full_text_search) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
         .filter_text = if (request.filter_query) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
         .exclusion_text = if (request.exclusion_query) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
     };
 }
 
+fn parseRawTextSpecAlloc(alloc: std.mem.Allocator, raw: anytype) !public_text_query_mod.PublicTextSpec {
+    if (@TypeOf(raw) == std.json.Value) return try public_text_query_mod.parseTextSpecAlloc(alloc, raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw.bytes, .{});
+    defer parsed.deinit();
+    return try public_text_query_mod.parseTextSpecAlloc(alloc, parsed.value);
+}
+
 pub fn parseEmbeddingsAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     default_k: u32,
 ) !ParsedEmbeddings {
     const embeddings = request.embeddings orelse return .{};
@@ -130,7 +137,7 @@ pub fn parseEmbeddingsAlloc(
 
 pub fn cloneRequestedIndexesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     parsed_embeddings: ParsedEmbeddings,
 ) !?[][]u8 {
     if (request.indexes) |indexes| {
@@ -153,7 +160,7 @@ pub fn cloneRequestedIndexesAlloc(
 
 pub fn cloneRequestedFieldsAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !?[][]u8 {
     const fields = request.fields orelse return null;
     return try cloneFieldNamesAlloc(alloc, fields);
@@ -192,7 +199,9 @@ fn cloneIndexNamesAlloc(alloc: std.mem.Allocator, indexes: []const []const u8) !
     return out;
 }
 
-fn hasNonNullField(obj: std.json.ObjectMap, key: []const u8) bool {
+/// Optional public request fields use null as the wire-equivalent of omission.
+/// Keep raw admission checks on the same rule as generated optional models.
+pub fn hasNonNullField(obj: std.json.ObjectMap, key: []const u8) bool {
     const value = obj.get(key) orelse return false;
     return value != .null;
 }

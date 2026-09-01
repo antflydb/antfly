@@ -58,7 +58,7 @@ pub const Service = struct {
         };
     }
 
-    pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchRequest) !api_types.TableIngestBatchResult {
+    pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
         var result = try self.ingestBatch(.{
             .namespace = req.table_name,
             .timestamp_ns = req.timestamp_ns,

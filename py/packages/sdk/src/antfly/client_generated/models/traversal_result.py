@@ -26,7 +26,8 @@ class TraversalResult:
         document (TraversalResultDocument | Unset): Document data (if loaded)
         path (list[str] | Unset): Sequence of keys from start to this node (if include_paths=true)
         path_edges (list[Edge] | Unset): Sequence of edges from start to this node (if include_paths=true)
-        total_weight (float | Unset): Product of edge weights along the path
+        total_weight (float | Unset): Sum of raw edge weights along the path. Path ordering still follows the selected
+            weight mode.
     """
 
     key: str

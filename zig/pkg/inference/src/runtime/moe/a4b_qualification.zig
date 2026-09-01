@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Backend-neutral identity of the one Gemma 4 A4B geometry qualified for
-//! bounded Metal inference. Artifact layout and quantization are additional
+//! bounded Metal and CUDA inference. Artifact layout and quantization are additional
 //! gates enforced by the GGUF inspector and session factory.
 
 pub const architecture = "gemma4";
@@ -24,6 +24,9 @@ pub const top_k: u8 = 8;
 pub const hidden_size: u32 = 2816;
 pub const expert_intermediate_size: u32 = 704;
 pub const encoded_expert_bytes: u64 = 3_345_408;
+/// Must remain equal to the scheduler's largest idle prefill chunk so a
+/// qualified request never escapes the device MoE path on a long prompt.
+pub const max_prefill_rows: usize = 2048;
 
 pub fn matchesGeometry(
     layers: u32,

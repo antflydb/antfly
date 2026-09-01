@@ -184,13 +184,23 @@ func TestCreateArtifactGraphIndexIncludesProducerConfig(t *testing.T) {
 	if source["artifact"] != DefaultAutographAsset || source["path"] != "$.relations[*]" {
 		t.Fatalf("unexpected source config: %#v", source)
 	}
+	if _, exists := source["kind"]; exists {
+		t.Fatalf("graph source must not contain a kind discriminator: %#v", source)
+	}
 	artifact, ok := got["artifact"].(map[string]any)
 	if !ok {
 		t.Fatalf("artifact missing from graph index: %s", encoded)
 	}
+	if _, exists := artifact["field"]; exists {
+		t.Fatalf("graph artifact producer must use source instead of root field: %#v", artifact)
+	}
 	producer, ok := artifact["producer_json"].(map[string]any)
 	if !ok {
 		t.Fatalf("producer_json missing from artifact config: %#v", artifact)
+	}
+	artifactSource, ok := artifact["source"].(map[string]any)
+	if !ok || artifactSource["type"] != "field" || artifactSource["value"] != "content" {
+		t.Fatalf("unexpected artifact producer source: %#v", artifact["source"])
 	}
 	cfg, ok := producer["config"].(map[string]any)
 	if !ok {
@@ -249,11 +259,12 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 	if len(schema["entities"].([]any)) != 2 || len(schema["relations"].([]any)) != 1 {
 		t.Fatalf("unexpected extractor schema: %#v", schema)
 	}
-	nodes := got["nodes"].(map[string]any)
+	source := got["source"].(map[string]any)
+	nodes := source["nodes"].(map[string]any)
 	if nodes["target"] != "{{ _item.target.text }}" {
 		t.Fatalf("unexpected extractor node mapping: %#v", nodes)
 	}
-	edge := got["edge"].(map[string]any)
+	edge := source["edge"].(map[string]any)
 	if edge["weight"] != "{{ _item.score }}" {
 		t.Fatalf("unexpected extractor edge mapping: %#v", edge)
 	}
@@ -265,7 +276,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if !ok || fullText["query"] != "Maxwell" {
 		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
 	}
-	graphSearches, ok := req["graph_searches"].(map[string]any)
+	graphSearches, ok := req["graph_queries"].(map[string]any)
 	if !ok {
 		t.Fatalf("graph searches missing: %#v", req)
 	}
@@ -273,63 +284,82 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if !ok {
 		t.Fatalf("relations graph search missing: %#v", graphSearches)
 	}
-	if graph["type"] != "traverse" {
-		t.Fatalf("graph type = %q, want traverse", graph["type"])
+	if graph["index"] != DefaultAutographIndex {
+		t.Fatalf("graph index = %q, want %s", graph["index"], DefaultAutographIndex)
 	}
-	if graph["index_name"] != DefaultAutographIndex {
-		t.Fatalf("graph index = %q, want %s", graph["index_name"], DefaultAutographIndex)
+	traverse, ok := graph["traverse"].(map[string]any)
+	if !ok {
+		t.Fatalf("traverse operation missing: %#v", graph)
 	}
-	startNodes, ok := graph["start_nodes"].(map[string]any)
-	if !ok || startNodes["result_ref"] != "$full_text_results" || startNodes["limit"] != 8 {
-		t.Fatalf("unexpected start nodes: %#v", graph["start_nodes"])
+	startNodes, ok := traverse["start"].(map[string]any)
+	if !ok || startNodes["result_ref"] != "$query_results" || startNodes["limit"] != 8 {
+		t.Fatalf("unexpected start nodes: %#v", traverse["start"])
 	}
-	if graph["include_documents"] != true {
-		t.Fatalf("graph query should include documents")
+	if traverse["direction"] != "both" || traverse["max_depth"] != 1 {
+		t.Fatalf("unexpected traversal: %#v", traverse)
 	}
-	params, ok := graph["params"].(map[string]any)
-	if !ok || params["direction"] != "both" || params["max_depth"] != 1 {
-		t.Fatalf("unexpected graph params: %#v", graph["params"])
+	if traverse["include_documents"] != true {
+		t.Fatalf("graph traversal must hydrate visualization documents: %#v", traverse)
+	}
+	fields, ok := traverse["fields"].([]string)
+	if !ok || len(fields) != 3 || fields[0] != "title" || fields[1] != "url" || fields[2] != "metadata" {
+		t.Fatalf("unexpected graph document fields: %#v", traverse["fields"])
 	}
 }
 
 func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
+	var graphResult antfly.GraphResult
+	err := graphResult.FromGraphNodesResult(antfly.GraphNodesResult{
+		Kind: antfly.GraphNodesResultKindNodes,
+		Nodes: []antfly.GraphResultNode{
+			{
+				Key:   "doc-a",
+				Depth: 0,
+				Document: map[string]any{
+					"title": "Alpha page",
+					"url":   "http://example.test/a.pdf",
+					"metadata": map[string]any{
+						"source_file": "court/source.pdf",
+						"page_number": float64(12),
+					},
+				},
+			},
+			{
+				Key:   "doc-b",
+				Depth: 1,
+				Document: map[string]any{
+					"title": "Beta page",
+				},
+				Path: []antfly.GraphPathEndpoint{
+					{Key: "doc-a"},
+					{Key: "doc-b"},
+				},
+				PathEdges: []antfly.GraphPathEdge{
+					{From: antfly.GraphPathEndpoint{Key: "doc-a"}, To: antfly.GraphPathEndpoint{Key: "doc-b"}, Direction: antfly.GraphPathEdgeDirectionOut, Type: "mentioned in", Weight: 0.75},
+				},
+			},
+			{
+				Key:   "Jeffrey Epstein",
+				Depth: 1,
+				Path: []antfly.GraphPathEndpoint{
+					{Key: "doc-a"},
+					{Key: "Jeffrey Epstein"},
+				},
+			},
+		},
+		Stats: antfly.GraphResultStats{ReturnedItems: 3, Truncated: false},
+	})
+	if err != nil {
+		t.Fatalf("construct graph result: %v", err)
+	}
+	if _, err := antfly.DecodeCanonicalGraphResult(graphResult); err != nil {
+		t.Fatalf("decode graph result envelope: %v", err)
+	}
 	resp := antfly.QueryResponses{
 		Responses: []antfly.QueryResult{
 			{
-				GraphResults: map[string]antfly.GraphQueryResult{
-					"relations": {
-						Type: antfly.GraphQueryTypeTraverse,
-						Nodes: []antfly.GraphResultNode{
-							{
-								Key:   "doc-a",
-								Depth: 0,
-								Document: map[string]any{
-									"title": "Alpha page",
-									"url":   "http://example.test/a.pdf",
-									"metadata": map[string]any{
-										"source_file": "court/source.pdf",
-										"page_number": float64(12),
-									},
-								},
-							},
-							{
-								Key:   "doc-b",
-								Depth: 1,
-								Document: map[string]any{
-									"title": "Beta page",
-								},
-								PathEdges: []antfly.PathEdge{
-									{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
-								},
-							},
-							{
-								Key:      "Jeffrey Epstein",
-								Depth:    1,
-								Distance: 0.5,
-								Path:     []string{"doc-a", "Jeffrey Epstein"},
-							},
-						},
-					},
+				GraphResults: map[string]antfly.GraphResult{
+					"relations": graphResult,
 				},
 			},
 		},

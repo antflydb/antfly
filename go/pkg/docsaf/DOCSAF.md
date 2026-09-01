@@ -132,9 +132,11 @@ embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 index, err := antfly.NewArtifactEmbeddingIndexConfig(
     "document_vectors",
     antfly.ArtifactEmbeddingIndexConfig{
-        SourceArtifactName: docsaf.DefaultDocumentChunksArtifact,
-        EmbeddingName:      "document_chunk_dense_v1",
-        SourceField:        "text",
+        Sources: []antfly.ArtifactEmbeddingSource{{
+            ArtifactName:       "document_chunk_dense_v1",
+            SourceArtifactName: docsaf.DefaultDocumentChunksArtifact,
+            SourceField:        "text",
+        }},
         Embedder:           *embedder,
         DistanceMetric:     antfly.DistanceMetricCosine,
     },
@@ -149,13 +151,26 @@ of assuming docsaf section rows:
 ```json
 {
   "semantic_search": "termination clause",
+  "fields": ["url", "filename"],
   "hierarchy": {
-    "return_level": "chunk",
-    "include": ["source", "unit"],
-    "rollup": "source"
+    "group_by": {
+      "level": "source",
+      "matches": {
+        "limit": 3,
+        "fields": ["text"]
+      }
+    },
+    "ancestors": {
+      "unit": {
+        "fields": []
+      }
+    }
   }
 }
 ```
 
+The top-level `fields` projection bounds each grouped source document, while
+`group_by.matches` independently bounds and projects the matching chunks.
 Results carry ancestry such as `parent_doc_key`, `parent_unit_id`, artifact
-identity, and hydrated source/unit documents when requested.
+identity, and the requested unit identity. Add unit fields to
+`hierarchy.ancestors.unit.fields` when hydrated unit content is needed.

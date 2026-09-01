@@ -30,6 +30,9 @@ const ParseError = Error || std.mem.Allocator.Error;
 
 pub const OutlineLimits = struct {
     max_operations: usize = std.math.maxInt(usize),
+    /// Optional caller-owned page/request meter. Every attempted charstring
+    /// operation is charged, including work performed before a parse error.
+    remaining_operations: ?*usize = null,
 };
 
 fn predefinedEncodingGlyphName(encoding: *const [256]u16, code: u8) ?[]const u8 {
@@ -206,7 +209,12 @@ pub const Font = struct {
         var width_seen = false;
         var hint_count: usize = 0;
         var transient: [32]f64 = [_]f64{0} ** 32;
-        var remaining_operations = limits.max_operations;
+        const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
+        var remaining_operations = @min(limits.max_operations, shared_limit);
+        const initial_operations = remaining_operations;
+        defer if (limits.remaining_operations) |remaining| {
+            remaining.* -|= initial_operations - remaining_operations;
+        };
         try self.executeCharStringAllocLimited(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0);
 
         if (contours.items.len == 0) return null;
@@ -348,6 +356,11 @@ pub const Font = struct {
                     const escaped = program[i];
                     i += 1;
                     switch (escaped) {
+                        // Obsolete Type 1 `dotsection`. Early Type1C
+                        // producers emitted it in otherwise valid Type 2
+                        // charstrings. It has no effect on modern rasterizers
+                        // and is accepted as a compatibility no-op.
+                        0 => {},
                         3 => try binaryStackOp(alloc, stack, andFloat),
                         4 => try binaryStackOp(alloc, stack, orFloat),
                         5 => try unaryStackOp(stack, notFloat),
@@ -1495,7 +1508,7 @@ test "cff executes local and global subroutines with arithmetic operators" {
     try std.testing.expectApproxEqAbs(@as(f64, 80), points[2].y, 0.001);
 }
 
-test "cff hintmask skips mask bytes and continues outline parsing" {
+test "cff accepts legacy dotsection and continues after hintmask" {
     const alloc = std.testing.allocator;
     const font = Font{
         .bytes = &.{},
@@ -1509,9 +1522,10 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     const program =
         [_]u8{
             139, 149, 1,
-            19,  0,   139,
-            139, 21,  189,
-            139, 5,   14,
+            19,  0,   12,
+            0,   139, 139,
+            21,  189, 139,
+            5,   14,
         };
 
     var contours = std.ArrayList(GlyphContour).empty;

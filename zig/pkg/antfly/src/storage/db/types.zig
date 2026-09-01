@@ -18,6 +18,7 @@ const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const fusion_mod = @import("../../search/fusion.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -303,8 +304,10 @@ pub const IndexConfig = struct {
     coverage_config_fingerprint: ?u64 = null,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
+        const name = try alloc.dupe(u8, cfg.name);
+        errdefer alloc.free(name);
         return .{
-            .name = try alloc.dupe(u8, cfg.name),
+            .name = name,
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
             .coverage_generation = cfg.coverage_generation,
@@ -426,6 +429,7 @@ pub const EnrichmentConfig = struct {
     template: []const u8 = "",
     source_artifact_name: []const u8 = "",
     expected_dims: u32 = 0,
+    vector_space: []const u8 = "",
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
@@ -442,6 +446,7 @@ pub const EnrichmentConfig = struct {
             .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
             .expected_dims = cfg.expected_dims,
+            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -457,6 +462,7 @@ pub const EnrichmentConfig = struct {
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
         if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
+        if (self.vector_space.len > 0) alloc.free(self.vector_space);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
@@ -477,6 +483,7 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashLengthPrefixedBytes(&hasher, cfg.template);
     hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
     hashU32(&hasher, cfg.expected_dims);
+    hashLengthPrefixedBytes(&hasher, cfg.vector_space);
     hashU32(&hasher, cfg.chunk_size);
     hashU32(&hasher, cfg.chunk_overlap);
     hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
@@ -1303,6 +1310,34 @@ pub const ExecutionContext = struct {
     max_parallelism: ?usize = null,
 };
 
+/// API transport metadata retained alongside the canonical graph execution
+/// plan. Compatibility is deliberately represented only at this wire boundary;
+/// graph executors continue to consume `NamedGraphQuery` exclusively.
+pub const GraphQueryWireDialect = enum { canonical, legacy };
+
+pub const GraphQueryTransport = struct {
+    dialect: GraphQueryWireDialect,
+    /// Owned, normalized JSON object containing only the admitted named graph
+    /// operations. It is safe to embed directly after a JSON field name.
+    operations_json: []const u8,
+    /// Borrowed identity of the immutable canonical operation slice produced by
+    /// public admission. Derived requests may retain the complete admitted plan
+    /// or clear it, but replacing the operations requires re-admission. This
+    /// pointer is compared by identity only and is never dereferenced.
+    admitted_operations_ptr: *const anyopaque,
+    admitted_operations_len: usize,
+
+    pub fn matchesOperations(self: GraphQueryTransport, operations: []const NamedGraphQuery) bool {
+        return self.admitted_operations_len == operations.len and
+            self.admitted_operations_ptr == @as(*const anyopaque, @ptrCast(operations.ptr));
+    }
+
+    pub fn deinit(self: *GraphQueryTransport, alloc: Allocator) void {
+        alloc.free(@constCast(self.operations_json));
+        self.* = undefined;
+    }
+};
+
 pub const SearchRequest = struct {
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
@@ -1319,6 +1354,14 @@ pub const SearchRequest = struct {
     exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
+    /// Trusted request-local row authorization predicate. Public request
+    /// parsing never populates this field. The HTTP authorization boundary
+    /// records it separately from retrieval filters so canonical graph MATCH
+    /// can enumerate the complete authorized source relation without
+    /// inheriting unrelated retrieval shaping. It is never serialized to a
+    /// shard; ordinary retrieval still receives the conjoined predicate in
+    /// `filter_query_json`.
+    authorization_filter_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
     doc_filter_bindings: []const NamedDocFilterBinding = &.{},
     dense: ?DenseKnnQuery = null,
@@ -1326,6 +1369,12 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    /// Trusted operator-owned graph admission ceilings. Public request parsing
+    /// never reads these from JSON, and shard transport must not serialize them.
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    /// Owned, validated API wire sidecar. Execution never inspects it; it is
+    /// retained only for allocation-light owner proxying and response shaping.
+    graph_query_transport: ?GraphQueryTransport = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1387,6 +1436,14 @@ pub const SearchRequest = struct {
     cancellation: ?CancellationToken = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+
+    /// Remove both representations of the admitted graph plan. Keeping this
+    /// operation centralized prevents derived requests from retaining proxy
+    /// wire state after graph execution has been disabled.
+    pub fn clearGraphQueries(self: *SearchRequest) void {
+        self.graph_queries = &.{};
+        self.graph_query_transport = null;
+    }
 };
 
 pub const max_canonical_hierarchy_groups: u32 = 100;
@@ -1412,6 +1469,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
+    "authorization_filter_query_json",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -1423,6 +1481,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "identity_read_generation",
     "execution_deadline_ns",
     "cancellation",
+    "graph_execution_limits",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
@@ -1442,6 +1501,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_query_transport",
     "merge_config",
     "reranker",
     "reranker_query_text",
@@ -1575,7 +1635,7 @@ pub fn canonicalGroupedMatchExpansionRequest(
     match_req.search_before = &.{};
     match_req.filter_doc_ids = parent_filter;
     match_req.filter_doc_ids_positive = true;
-    match_req.graph_queries = &.{};
+    match_req.clearGraphQueries();
     match_req.expand_strategy = null;
     match_req.aggregations_json = "";
     match_req.count_only = false;
@@ -1653,10 +1713,15 @@ pub const NamedGraphInputSet = struct {
 
 pub const ReturnMode = enum {
     parent,
+    /// Compatibility spelling for raw chunk/member results.
     chunk,
     parent_with_chunks,
     unit,
     unit_with_chunks,
+    /// Return each indexed source member without hierarchy grouping. This is
+    /// the precise name for raw results from heterogeneous artifact unions.
+    /// Appended to preserve the numeric ABI of the established modes.
+    member,
 };
 
 pub const HierarchyGroupLevel = enum {
@@ -2042,8 +2107,17 @@ pub const GraphSearchResult = struct {
     nodes: []graph_query_mod.GraphResultNode = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
+    aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    truncated: bool = false,
+
+    /// Detach request-scoped retained-state release hooks at the result
+    /// ownership boundary. The request budget remains consumptively charged,
+    /// while result deinit continues to own and free the allocations.
+    pub fn consumeRetainedState(self: *GraphSearchResult) void {
+        for (self.paths) |*path| path.consumeRetainedState();
+    }
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -2053,8 +2127,34 @@ pub const GraphSearchResult = struct {
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
         if (self.matches.len > 0) alloc.free(self.matches);
+        for (self.aggregates) |*aggregate| aggregate.deinit(alloc);
+        if (self.aggregates.len > 0) alloc.free(self.aggregates);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        self.* = undefined;
+    }
+};
+
+pub const GraphAggregateResult = struct {
+    name: []u8,
+    value: u128,
+    exact: bool = true,
+    /// Exact shard-merge payload for count(distinct alias). This is internal
+    /// execution data and is never exposed by the public response contract.
+    distinct_values: []graph_node_identity.Ref = &.{},
+    /// Duplicate named aggregates may share one immutable merge payload inside
+    /// a result. Exactly one aggregate owns that allocation.
+    distinct_values_owned: bool = true,
+
+    pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.distinct_values_owned) {
+            for (self.distinct_values) |value| {
+                if (value.table) |table| alloc.free(table);
+                alloc.free(value.key);
+            }
+            if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
+        }
         self.* = undefined;
     }
 };
@@ -2073,6 +2173,7 @@ pub const GraphPatternBinding = struct {
 pub const GraphPatternMatch = struct {
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
+    null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
@@ -2084,6 +2185,8 @@ pub const GraphPatternMatch = struct {
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
+        for (self.null_aliases) |alias| alloc.free(alias);
+        if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
         self.* = undefined;
     }
 };
@@ -2388,6 +2491,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 };
 
 /// Policy-independent coverage health shared by status and repair reporting.
@@ -2511,6 +2615,10 @@ pub const ArtifactRepairIssue = struct {
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
     unit_id: []const u8 = "",
+    /// Canonical artifact stream configured on the affected index. This is
+    /// deliberately distinct from `source_artifact_name` (the producer input)
+    /// and `artifact_name` (the unreadable derived value).
+    index_source_artifact_name: []const u8 = "",
     source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
@@ -2533,6 +2641,7 @@ pub const ArtifactRepairIssue = struct {
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
         if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.index_source_artifact_name.len > 0) alloc.free(@constCast(self.index_source_artifact_name));
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
@@ -2594,6 +2703,22 @@ pub const RepairCancelCheck = struct {
 
     pub fn requested(self: RepairCancelCheck) bool {
         return self.is_requested(self.ptr);
+    }
+};
+
+/// Stable adapter from restore/request cancellation to the repair subsystem's
+/// cooperative callback. The adapter must remain alive while the returned
+/// check is borrowed by a repair quantum.
+pub const RepairCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.token.isCancelled();
+    }
+
+    pub fn check(self: *@This()) RepairCancelCheck {
+        return .{ .ptr = self, .is_requested = requested };
     }
 };
 
@@ -2682,9 +2807,6 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Internal recursion fence: the durable owner has already admitted and
-    /// claimed this intent and is invoking the lower-level rebuild engine.
-    executing_durable_index_repair: bool = false,
     /// Managed operator requests persist/enqueue intent work and return
     /// immediately. Standalone callers leave this false and advance through
     /// the same state machine synchronously.
@@ -2768,7 +2890,7 @@ pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
     return switch (reason) {
         .missing_artifact => .missing_embedding_artifact,
-        .corrupt_artifact, .unreadable_artifact, .enrichment_failed => .corrupt_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed, .resource_limit_exceeded => .corrupt_embedding_artifact,
     };
 }
 
@@ -2844,9 +2966,44 @@ pub const AlgebraicProgressStatus = struct {
     target_rows: u64 = 0,
 };
 
+/// Source-specific replay watermarks for an artifact-backed index. The
+/// published watermark is the index's durable applied cursor: it proves that
+/// every configured source has been processed through that revision. The
+/// target is maintained transactionally per artifact stream by the writer.
+pub const IndexSourceReplayStatus = struct {
+    artifact_name: []const u8,
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
+    /// A terminal request failure isolated to this configured artifact stream.
+    /// Global worker/index failures remain index-level readiness facts.
+    failed: bool = false,
+    /// Durable repair debt scoped to this source. Runtime failure maps may add
+    /// diagnostics, but never replace this authoritative count.
+    repair_issue_count: u64 = 0,
+    /// False while the bounded repair-ledger summary is rebuilding. Readiness
+    /// must remain pending until absence of source-local debt is proven.
+    repair_summary_ready: bool = true,
+    // Internal distributed-status proof; not part of the public contract.
+    observation_count: u64 = 1,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Status-plane overlay used to fence one catalog target while retaining
+    // authoritative observations for unaffected sibling indexes. This is an
+    // internal observation fact and is not serialized in the public API.
+    runtime_observation_stale: bool = false,
+    // A cache merge may retain serviceability for one exact derived-index
+    // incarnation while its already-open runtime publishes catch-up status.
+    // This proof never originates in persisted DB stats and is cleared by a
+    // fresh observation, a root change, or an incarnation change.
+    runtime_observation_serviceable: bool = false,
+    // The status cache proved that this index is an untouched sibling of one
+    // exact in-place catalog target. Unlike generic derived-incarnation
+    // continuity, this proof can retain authority across table-level opening
+    // metadata and applies to every index kind. It is never persisted.
+    runtime_observation_targeted_sibling: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -2899,6 +3056,9 @@ pub const DBIndexStats = struct {
     // Compact lifecycle used when DBIndexStats crosses process boundaries.
     // The full local durable diagnostics remain authoritative when present.
     index_repair_status: ?IndexRepairStatus = null,
+    // Separate from lifecycle because a terminal scheduler checkpoint can be
+    // retryable while paused/irrecoverable states require operator action.
+    index_repair_action_required: bool = false,
     // Internal proof that the active managed-admission generation is safe to
     // query. Under progressive publication it may still have incomplete source
     // coverage; repair intent remains authoritative until full convergence.
@@ -2909,6 +3069,7 @@ pub const DBIndexStats = struct {
     projection_checkpoint_config_hash: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    source_replay: []IndexSourceReplayStatus = &.{},
     checkpoint_replay_tail_sequence_count: u64 = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -3519,6 +3680,8 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        for (item.source_replay) |source| alloc.free(source.artifact_name);
+        if (item.source_replay.len > 0) alloc.free(item.source_replay);
         if (item.load_error) |value| alloc.free(value);
         if (item.index_repair_last_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);

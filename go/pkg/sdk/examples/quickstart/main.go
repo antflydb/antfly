@@ -71,7 +71,7 @@ func main() {
 	fmt.Printf("semantic: %+v\n", results)
 
 	reranker, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
-		Model: "mixedbread-ai/mxbai-rerank-base-v1",
+		Model: "cross-encoder/ms-marco-MiniLM-L6-v2",
 	})
 	if err != nil {
 		log.Fatal(err)
