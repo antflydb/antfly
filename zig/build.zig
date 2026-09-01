@@ -168,6 +168,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/shared/generating.yaml",
     "../specs/openapi/antfly/schema.yaml",
     "../specs/openapi/antfly/indexes.yaml",
+    "../specs/openapi/antfly/generated/graph_identifier.yaml",
 };
 
 fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
@@ -1020,6 +1021,18 @@ fn addSnowballCheckStep(b: *std.Build) void {
     check_step.dependOn(&compare.step);
 }
 
+const antfly_zig_type_mapping_args = [_][]const u8{
+    "raw_json=@import(\"antfly-json\").RawValue",
+    "raw_json_object=@import(\"antfly-json\").RawObject",
+};
+
+fn addAntflyZigTypeMappings(codegen: *std.Build.Step.Run) void {
+    for (antfly_zig_type_mapping_args) |mapping| {
+        codegen.addArgs(&.{"--zig-type-mapping"});
+        codegen.addArg(mapping);
+    }
+}
+
 fn addOpenApiModuleFromYamlPath(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1047,6 +1060,7 @@ fn addOpenApiModuleFromYamlPath(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
 
@@ -1185,6 +1199,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
 
@@ -1270,6 +1285,7 @@ fn addOpenApiRegenRun(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{ "--output", generated_dir });
     return codegen;
 }
@@ -1304,12 +1320,15 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/generated/graph_identifier.yaml"), "antfly_graph_identifier_openapi", antfly_generated_root ++ "/antfly_graph_identifier_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/sort.yaml"), "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
             .{ "sort.yaml", "antfly_sort_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "chunking.yaml", "antfly_chunking_openapi" },
+            .{ "query.yaml", "antfly_query_openapi" },
+            .{ "generated/graph_identifier.yaml", "antfly_graph_identifier_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
@@ -1513,6 +1532,7 @@ pub fn build(b: *std.Build) void {
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
     const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
     const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi");
+    const graph_identifier_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_graph_identifier_openapi", antfly_generated_root ++ "/antfly_graph_identifier_openapi");
     const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
     const sort_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi");
     const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
@@ -1541,6 +1561,8 @@ pub fn build(b: *std.Build) void {
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
     indexes_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_graph_identifier_openapi", graph_identifier_openapi_mod);
     websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1723,6 +1745,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Raw OpenAPI schema overrides resolve to the shared validated JSON
+    // runtime rather than emitting a private implementation per module.
+    public_openapi_mod.addImport("antfly-json", json_mod);
+    client_openapi_mod.addImport("antfly-json", json_mod);
+    metadata_openapi_mod.addImport("antfly-json", json_mod);
     const toon_mod = b.addModule("antfly_toon", .{
         .root_source_file = b.path("lib/toon/src/mod.zig"),
         .target = target,
@@ -1813,6 +1840,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
@@ -1820,6 +1852,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    pdf_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_mod, target);
         pdf_mod.linkFramework("CoreFoundation", .{});
@@ -1835,6 +1868,11 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const wasm_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = wasm_target,
@@ -1842,6 +1880,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
+    wasm_pdf_mod.addImport("pdf_standard_fonts", wasm_pdf_standard_fonts_mod);
 
     const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
     const inference_jinja_mod = b.createModule(.{
@@ -3096,6 +3135,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
+    pdf_test_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_test_mod, target);
         pdf_test_mod.linkFramework("CoreFoundation", .{});
@@ -3162,8 +3202,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const pdf_bench_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    pdf_bench_pdf_mod.addImport("pdf_standard_fonts", pdf_bench_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
         pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
@@ -3601,8 +3647,10 @@ pub fn build(b: *std.Build) void {
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
+        "public batch parser rejects non-object documents while internal replay remains opaque",
         "batch parser safely rejects unsupported transform after initialized operations",
         "linear merge request parser accepts raw payload value under public request cap",
+        "linear merge request parser rejects non-object records",
         "linear merge uses one ordered hash scan and delegates mutations to the HA batch source",
         "internal scan content hash mode round trips without public document fields",
         "http response uses its owning allocator",
@@ -3776,6 +3824,7 @@ pub fn build(b: *std.Build) void {
         "pattern typed structured filters reject ambiguous field and path aliases",
         "pattern typed structured filters reject malformed and unbounded ranges",
         "pattern geo structured filters reject invalid coordinates",
+        "exact structured ID filters resolve without a secondary index",
         "dense and sparse search reject unsupported exact sort page options",
         "dense projected source load rejects expired deadline before load",
         "match_all sorted segment seek merges sorted segments and applies cursors",
@@ -3799,9 +3848,12 @@ pub fn build(b: *std.Build) void {
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
         "retrieval agent supports roots tree search",
+        "annotate tree document prefers graph path branch metadata",
         "retrieval agent isolates query predicates while applying accumulated filters",
         "retrieval agent installs canonical mandatory predicates once",
+        "retrieval agent authenticated row filter conjoins generated filter",
         "query builder infers graph multi hop pattern from intent",
+        "query builder maps canonical graph queries and ignores legacy expansion",
         "retrieval root scan pushes row inclusion and exclusion predicates into one filter",
         "retrieval contains filter treats wildcard operators as literals",
         "wildcard matching distinguishes operators from escaped literals",
@@ -3809,27 +3861,150 @@ pub fn build(b: *std.Build) void {
         "wildcard search plans preserve escaped exact literals and prefixes",
         "algebraic wildcard helpers preserve escaped literals",
         "algebraic traversal intersects query-scoped node admission",
+        "traverse preserves table-scoped identities across result dedup and algebraic fallback",
+        "traverse counts only target-admitted nodes toward result limit",
+        "graph query engine shares traversal work across start nodes",
+        "stored graph weights are finite and non-negative",
+        "canonical graph admission preserves and validates weight bounds",
+        "graph edge type policy is byte-bounded UTF-8",
+        "graph durable writes reject invalid edge types before mutation",
+        "graph edge encoding round-trip",
+        "canonical graph result node path is self-consistent",
+        "canonical path weight sum rejects non-finite accumulation",
+        "joining paths is allocation-failure safe",
+        "path weight overflow has a stable public diagnostic",
+        "anchor scans have an independent request-wide budget",
+        "retained expansion state has an explicit byte ceiling",
+        "retained lease accounts allocation replacement peak",
+        "retained lease rejects allocation replacement peak without leaking",
+        "traversal preflights live frontier admission before ownership transfer",
+        "traversal ancestry and returned paths share retained state budget",
+        "projected MATCH rows reserve and release retained output bytes",
+        "shortest path preflights live frontier admission",
+        "shortest path retained payloads use the shared request budget",
+        "consumed path state detaches its request-scoped release hook",
+        "distributed bounded paths retain non-dominated cost and depth labels",
+        "distributed frontier reservations precede allocation and release on deinit",
+        "anchor-only aggregate fails closed at the shared anchor scan ceiling",
+        "k shortest paths preserve parallel typed edge identities",
+        "k shortest paths share one cumulative work budget across spur searches",
+        "conjunctive fixed edges preserve self loops while variable paths remain node simple",
+        "conjunctive match supports branches anti joins inequality and optional nulls",
+        "conjunctive validation rejects disconnected and unused aliases",
+        "conjunctive validation bounds total recursive pattern shape",
+        "exact conjunctive aggregate does not inherit row expansion window",
+        "exact distinct aggregates share a fail-closed identity and byte budget",
+        "conjunctive matcher admits anchors before alias evaluation",
+        "prevalidated conjunctive anchors skip duplicate checks but reached nodes remain guarded",
+        "conjunctive anchor selection prefers filters and ignores declaration order",
+        "bounded conjunctive matches stream complete rows before the intermediate-state budget",
+        "variable length conjunctive edge preserves simple path multiplicity",
+        "conjunctive cycle closure survives node admission deduplication",
+        "conjunctive reverse expansion uses the declared cross-table source alias",
+        "cross-table reverse variable expansion fails closed before reading adjacency",
+        "cross-table both preflights every physical source before streaming",
+        "conjunctive cross-table directions use physical source routing in every execution mode",
+        "complete graph match anchors discard retrieval shaping",
+        "complete graph match anchor scan is independent per named operation",
+        "complete graph match anchor scan reports native filter coverage failures",
+        "qualified graph endpoint requires coordination for a single source group",
         "exact two-edge pattern uses typed batch probes without paths",
         "exact two-edge probe plan is equivalent to generic expansion",
         "exact two-edge probe honors incoming final direction",
+        "exact two-edge probe preserves fixed-edge self loops",
         "exact endpoint constrains the final pattern step before limiting",
         "exact pattern targets preserve table identity",
         "inapplicable exact plan does not consume generic fallback budget",
         "graph exact edge probes stay aligned and preserve payloads",
-        "query merge allocation scales with the selected page",
+        "graph bounded adjacency pages preserve order and fail before budget overflow",
+        "api http client preserves remote graph edge budget exhaustion",
+        // Own the complete fast API query module as one stable lane. Exact
+        // per-test entries let new admission and ownership regressions compile
+        // out of CI until somebody remembered to extend this list.
+        "api.query.test.",
+        "graph operation execution order is independent of declaration order",
+        "graph operation execution order rejects cycles",
+        "graph query dependency sorting enforces request-wide operation bounds",
+        "graph query dependency sorting accepts path result endpoints",
+        "stateful path results materialize endpoint nodes for result refs",
         "pattern response omits paths unless requested",
+        "canonical graph binding responses require exact projected alias sets",
+        "graph aggregate response preserves exact decimal counts",
+        "graph aggregate response fails closed on missing or inexact results",
+        "graph response encoding requires exactly one result per traversal operation",
+        "canonical path responses require one terminal node per path",
+        "canonical traversal responses keep paths on bounded result nodes",
+        "canonical graph paths preserve table-qualified node identities",
+        "canonical graph path objective exposes max weight product",
+        "canonical graph path metadata safely reads legacy non-object records",
+        "canonical graph result nodes fail closed outside the public contract",
+        "canonical graph path edges enforce durable type policy",
+        "remote canonical graph nodes reject invalid identity and depth domains",
+        "remote canonical graph result stats and aggregate exactness fail closed",
+        "api query contract preserves algebraic graph path provenance",
+        "api query contract owns the admitted graph wire for exact proxying",
+        "api query contract preserves opaque legacy graph operation names",
+        "graph wire envelope capture normalizes nulls and escaped dialect names",
+        "graph wire envelope validates dialect and exact operation set once",
+        "graph wire envelope preserves allocator failures",
+        "graph response format uses admitted metadata and fails closed on plan drift",
+        "deprecated graph search preserves its response envelope",
+        "admitted graph dialect drives the owned deprecation signal",
+        "canonical graph contract rejects modes without exact public execution",
+        "generated stateful graph result union decodes pre-discriminator legacy responses",
+        "api query contract preflight summarizes query lanes and result refs",
         "parse supported graph queries accepts pattern requests",
+        "graph node filters reject analyzer-backed text clauses",
+        "canonical graph document filter variants cross the public storage boundary",
+        "canonical graph boolean field filter has one unambiguous root",
+        "raw graph admission rejects recursive edge shapes above the contract budget",
+        "parse supported graph queries accepts branches predicates optional groups and counts",
+        "parse supported graph queries rejects distinct field on count all",
+        "graph query dependencies require compatible explicit outputs",
+        "resolve graph selector fails closed for unbounded paged result refs",
         "distributed graph edges request preserves typed graph edge access path",
-        "distributed graph edge reader carries identity generation",
+        "distributed graph edge reader routes outgoing and fans out incoming adjacency",
+        "distributed graph expand request preserves algebraic semiring planning flag",
+        "distributed graph complete anchors require the source snapshot",
+        "distributed graph complete anchor pages require strict cursor order",
+        "distributed graph paged anchors use page completion instead of cursor-relative totals",
+        "distributed graph paged execution trusts only source-filtered anchors across cursor pages",
+        "distributed graph retries once on topology change and succeeds",
+        "distributed graph stops after single retry on repeated topology churn",
+        "distributed graph duplicate distinct aggregates share one result payload",
+        "distributed graph exact distinct stream budget spans cursor pages",
+        "distributed graph exact distinct budget spans named operations",
+        "distributed graph canonical MATCH admission excludes retrieval predicates",
+        "distributed graph target refs are table exact while raw keys remain wildcard",
+        "distributed graph MATCH binding refs preserve table identity and deduplicate",
+        "distributed graph executes result dependencies before declaration order",
+        "distributed graph path materialization preserves table provenance",
+        "distributed canonical path weight is the checked raw edge sum",
+        "distributed K path identity preserves parallel typed edges",
+        "distributed Yen edge exclusions preserve table-qualified path identity",
+        "distributed graph supports legacy pattern step reverse directions exactly",
         "pattern hit shaping is lazy but preserves graph dependencies",
+        "graph result refs select one MATCH binding without duplicate seeds",
+        "distinct graph aggregates include table identity",
         "db unfiltered graph search retains algebraic execution",
         "db preflightSearchRequest validates live lane bindings",
         "db graph search filters result nodes and hidden traversal intermediates",
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
-        "db graph hydration fails closed for a not-yet-promoted entity node",
+        "db graph hydration rejects table-qualified entity nodes in local snapshots",
+        "db index repair streams graph artifact rebuild in batches",
         "api distributed graph cross-table hydrate enforces target authorization",
+        "public table query handler maps exact graph execution failures",
+        "unsupported graph diagnostics identify the rejected operation feature",
         "authenticated single-group graph queries require distributed coordination",
+        "graph table queries have one fresh-topology retry",
+        "generic shard query wire preserves admitted canonical graph operations without reparsing",
+        "generic shard query wire fails closed without an admitted graph fragment",
+        "generic shard query wire never drops graph table authorization",
+        "graph edge metadata accepts only the public object shape",
+        "unsupported graph query modes fail closed",
+        "parseRemoteSearchResult preserves typed graph rows and hydrated documents",
+        "parseRemoteSearchResult preserves canonical graph path table identities",
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
@@ -4425,9 +4600,12 @@ pub fn build(b: *std.Build) void {
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
         "remote metadata source treats superseded concurrent fenced snapshot as success",
+        "remote metadata source retries fenced snapshot generations until success",
+        "remote metadata source bounds repeated fenced snapshot generations",
         "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
-        "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
         "idle cached runtime status stays fresh only for the published root generation",
@@ -5148,8 +5326,9 @@ pub fn build(b: *std.Build) void {
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
         "batch parser accepts supported Go transform op spelling",
+        "batch parser accepts pull for exact array values",
         "batch parser rejects every recognized but unsupported transform operator",
-        "public table batch handler rejects unsupported missing-document transform before execution",
+        "public table batch handler forwards pull transforms",
         "public table contract exposes migration metadata",
         "api http client round-trips public table management routes",
         "api http server serves status",
@@ -5709,7 +5888,7 @@ pub fn build(b: *std.Build) void {
             "distributed graph rejects doc identity rebuild before cross-range fanout",
             "distributed graph rejects unstamped result refs before cross-range fanout",
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
-            "distributed graph edge reader carries identity generation",
+            "distributed graph edge reader routes outgoing and fans out incoming adjacency",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
             "match_all index sort uses doc values collector for selective native filters",
@@ -6156,6 +6335,8 @@ pub fn build(b: *std.Build) void {
             "public create index exposes unsupported deployment capability",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler maps exact graph execution failures",
+            "graph path weight error body fails closed without its diagnostic",
             "public table query handler preserves structured filter and hierarchy diagnostics",
             "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",
@@ -6219,7 +6400,7 @@ pub fn build(b: *std.Build) void {
             "distributed graph per-key authoritative incoming routes avoid shard probes",
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
-            "distributed graph edge reader carries identity generation",
+            "distributed graph traverse routes cross-table frontier by table generation",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

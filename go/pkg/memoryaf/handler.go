@@ -27,6 +27,29 @@ const (
 	embedderProvider  = "antfly"
 )
 
+func canonicalGraphTraversal(startKeys, edgeTypes []string, maxDepth, limit int, memoryFilter *query.Query) map[string]any {
+	traverse := map[string]any{
+		"start":             map[string]any{"keys": startKeys},
+		"edge_types":        edgeTypes,
+		"max_depth":         maxDepth,
+		"limit":             limit,
+		"include_documents": true,
+	}
+	if memoryFilter != nil {
+		// Entity nodes are structural intermediates. Keep them traversable while
+		// applying the caller's complete memory scope to every hydrated memory.
+		graphFilter := query.NewDisjunction([]query.Query{
+			query.NewTerm(entityDocType, "entity_type"),
+			*memoryFilter,
+		}).ToQuery()
+		traverse["filter"] = json.RawMessage(mustMarshal(graphFilter))
+	}
+	return map[string]any{
+		"index":    graphIndex,
+		"traverse": traverse,
+	}
+}
+
 // Handler implements all memoryaf operations against an Antfly instance.
 type Handler struct {
 	client    Client
@@ -38,8 +61,6 @@ type Handler struct {
 
 	mu                    sync.RWMutex
 	initializedNamespaces map[string]bool
-
-	wg sync.WaitGroup
 }
 
 // HandlerOption configures a Handler.
@@ -55,10 +76,8 @@ func WithEntityThreshold(threshold float32) HandlerOption {
 	return func(h *Handler) { h.entityThreshold = threshold }
 }
 
-// Close waits for all background entity extraction goroutines to finish.
-func (h *Handler) Close() {
-	h.wg.Wait()
-}
+// Close is retained for callers that treat handlers as closable resources.
+func (h *Handler) Close() {}
 
 // NewHandler creates a new memory handler.
 // The extractor can be nil to disable entity extraction.
@@ -501,21 +520,22 @@ func (h *Handler) StoreMemory(ctx context.Context, args StoreMemoryArgs, uctx Us
 
 	doc := buildMemoryDoc(args, uctx.UserID, now)
 	doc["created_at"] = now
+	entities, err := h.extractEntitiesResult(ctx, args.Content)
+	if err != nil {
+		return nil, fmt.Errorf("extract entities: %w", err)
+	}
+	transforms := applyMemoryEntityGraph(doc, id, entities, nil, now)
 
-	// Insert the memory document immediately; entity extraction runs async.
-	_, err := h.client.Batch(ctx, table, client.BatchRequest{
-		Inserts: map[string]any{key: doc},
+	// Keep the memory's forward edges, persisted entity snapshot, and reverse
+	// entity edges in one request. This makes subsequent update/delete cleanup
+	// deterministic instead of relying on background best-effort work.
+	_, err = h.client.Batch(ctx, table, client.BatchRequest{
+		Inserts:    map[string]any{key: doc},
+		Transforms: transforms,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("batch insert: %w", err)
 	}
-
-	// Extract entities and link graph edges in the background.
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		h.extractAndLinkEntities(context.WithoutCancel(ctx), id, args.Content, table)
-	}()
 
 	m := hitToMemory(key, doc)
 	return &m, nil
@@ -544,21 +564,24 @@ func (h *Handler) UpdateMemory(ctx context.Context, args UpdateMemoryArgs, uctx 
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	updated := mergeMemoryFields(existing, args, now)
+	entities := existing.Entities
+	var transforms []client.Transform
+	if args.Content != "" && args.Content != existing.Content {
+		entities, err = h.extractEntitiesResult(ctx, args.Content)
+		if err != nil {
+			return nil, fmt.Errorf("extract entities: %w", err)
+		}
+		transforms = applyMemoryEntityGraph(updated, args.ID, entities, existing.Entities, now)
+	} else {
+		setMemoryEntityGraph(updated, entities)
+	}
 
 	_, err = h.client.Batch(ctx, table, client.BatchRequest{
-		Inserts: map[string]any{key: updated},
+		Inserts:    map[string]any{key: updated},
+		Transforms: transforms,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("batch update: %w", err)
-	}
-
-	// Re-extract entities in the background if content changed.
-	if args.Content != "" && args.Content != existing.Content {
-		h.wg.Add(1)
-		go func() {
-			defer h.wg.Done()
-			h.extractAndLinkEntities(context.WithoutCancel(ctx), args.ID, args.Content, table)
-		}()
 	}
 
 	m := hitToMemory(key, updated)
@@ -578,7 +601,8 @@ func (h *Handler) DeleteMemory(ctx context.Context, id string, uctx UserContext)
 		return fmt.Errorf("forbidden: you can only delete your own memories")
 	}
 	_, err = h.client.Batch(ctx, table, client.BatchRequest{
-		Deletes: []string{memoryKey(id)},
+		Deletes:    []string{memoryKey(id)},
+		Transforms: entityGraphTransforms(id, nil, existing.Entities, time.Now().UTC().Format(time.RFC3339)),
 	})
 	return err
 }
@@ -684,6 +708,7 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 		reqMap["filter_query"] = json.RawMessage(mustMarshal(filter))
 	}
 
+	graphExpansion := false
 	if args.ExpandGraph && h.extractor != nil {
 		queryEntities := h.extractEntities(ctx, args.Query)
 		if len(queryEntities) > 0 {
@@ -691,22 +716,10 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 			for _, e := range queryEntities {
 				entityKeys = append(entityKeys, entityKey(e.Label, e.Text))
 			}
-			reqMap["graph_searches"] = map[string]any{
-				"entity_expansion": map[string]any{
-					"type":       "neighbors",
-					"index_name": graphIndex,
-					"start_nodes": map[string]any{
-						"keys": entityKeys,
-					},
-					"params": map[string]any{
-						"edge_types": []string{"mentions"},
-						"direction":  "in",
-						"max_depth":  1,
-					},
-					"include_documents": true,
-				},
+			reqMap["graph_queries"] = map[string]any{
+				"entity_expansion": canonicalGraphTraversal(entityKeys, []string{"mentions"}, 1, limit, filter),
 			}
-			reqMap["graph_merge_strategy"] = "union"
+			graphExpansion = true
 		}
 	}
 
@@ -715,7 +728,12 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 		return nil, fmt.Errorf("search memories: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	var hits []hit
+	if graphExpansion {
+		hits, err = hitsWithRequiredGraphNodesFromResponse(resp, "entity_expansion")
+	} else {
+		hits, err = hitsFromResponse(resp)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -751,28 +769,13 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		depth = 2
 	}
 	mKey := memoryKey(args.ID)
+	memoryFilter := buildFilterQuery(filterOpts{}, &uctx)
 
 	reqMap := map[string]any{
-		"table":            table,
-		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
-		"limit":            limit,
-		"graph_searches": map[string]any{
-			"related": map[string]any{
-				"type":       "traverse",
-				"index_name": graphIndex,
-				"start_nodes": map[string]any{
-					"keys": []string{mKey},
-				},
-				"params": map[string]any{
-					"edge_types":  []string{"mentions", "related_to"},
-					"direction":   "both",
-					"max_depth":   depth,
-					"max_results": limit,
-				},
-				"include_documents": true,
-			},
+		"table": table,
+		"graph_queries": map[string]any{
+			"related": canonicalGraphTraversal([]string{mKey}, []string{"mentions", "related_to"}, depth, limit, memoryFilter),
 		},
-		"graph_merge_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -780,7 +783,7 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		return nil, fmt.Errorf("find related: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	hits, err := hitsWithRequiredGraphNodesFromResponse(resp, "related")
 	if err != nil {
 		return nil, err
 	}
@@ -812,27 +815,13 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		limit = 20
 	}
 	eKey := entityKey(args.EntityLabel, args.EntityText)
+	memoryFilter := buildFilterQuery(filterOpts{}, &uctx)
 
 	reqMap := map[string]any{
-		"table":            table,
-		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
-		"limit":            limit,
-		"graph_searches": map[string]any{
-			"mentions": map[string]any{
-				"type":       "neighbors",
-				"index_name": graphIndex,
-				"start_nodes": map[string]any{
-					"keys": []string{eKey},
-				},
-				"params": map[string]any{
-					"edge_types": []string{"mentions"},
-					"direction":  "in",
-					"max_depth":  1,
-				},
-				"include_documents": true,
-			},
+		"table": table,
+		"graph_queries": map[string]any{
+			"mentions": canonicalGraphTraversal([]string{eKey}, []string{"mentions"}, 1, limit, memoryFilter),
 		},
-		"graph_merge_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -840,7 +829,7 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		return nil, fmt.Errorf("entity memories: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	hits, err := hitsWithRequiredGraphNodesFromResponse(resp, "mentions")
 	if err != nil {
 		return nil, err
 	}
@@ -1074,18 +1063,26 @@ func (h *Handler) ListSessions(ctx context.Context, args ListSessionsArgs, uctx 
 
 // extractEntities runs the extractor on a single text and returns filtered entities.
 func (h *Handler) extractEntities(ctx context.Context, text string) []Entity {
-	if h.extractor == nil {
+	entities, err := h.extractEntitiesResult(ctx, text)
+	if err != nil {
+		h.logger.Warn("entity extraction failed", zap.Error(err))
 		return nil
+	}
+	return entities
+}
+
+func (h *Handler) extractEntitiesResult(ctx context.Context, text string) ([]Entity, error) {
+	if h.extractor == nil {
+		return nil, nil
 	}
 	extractions, err := h.extractor.Extract(ctx, []string{text}, ExtractOptions{
 		EntityLabels: h.entityLabels,
 	})
 	if err != nil {
-		h.logger.Warn("entity extraction failed", zap.Error(err))
-		return nil
+		return nil, err
 	}
 	if len(extractions) == 0 || len(extractions[0].Entities) == 0 {
-		return nil
+		return nil, nil
 	}
 	var entities []Entity
 	for _, e := range extractions[0].Entities {
@@ -1097,87 +1094,77 @@ func (h *Handler) extractEntities(ctx context.Context, text string) []Entity {
 			})
 		}
 	}
-	return dedupeEntities(entities)
+	return dedupeEntities(entities), nil
 }
 
-func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content, table string) []Entity {
-	if h.extractor == nil {
-		return nil
-	}
+func applyMemoryEntityGraph(doc map[string]any, memoryID string, current, previous []Entity, now string) []client.Transform {
+	setMemoryEntityGraph(doc, current)
+	return entityGraphTransforms(memoryID, current, previous, now)
+}
 
-	extractions, err := h.extractor.Extract(ctx, []string{content}, ExtractOptions{
-		EntityLabels: h.entityLabels,
-	})
-	if err != nil {
-		h.logger.Warn("entity extraction failed", zap.Error(err))
-		return nil
-	}
-	if len(extractions) == 0 || len(extractions[0].Entities) == 0 {
-		return nil
-	}
-
-	var filtered []Entity
-	for _, e := range extractions[0].Entities {
-		if e.Score >= h.entityThreshold {
-			filtered = append(filtered, Entity{
-				Text:  e.Text,
-				Label: e.Label,
-				Score: float64(e.Score),
-			})
-		}
-	}
-	filtered = dedupeEntities(filtered)
-	if len(filtered) == 0 {
-		return nil
-	}
-
-	mKey := memoryKey(memoryID)
-	now := time.Now().UTC().Format(time.RFC3339)
-
-	// Build entity node inserts and transforms together to reduce round-trips.
-	inserts := make(map[string]any, len(filtered)+1)
-	var transforms []client.Transform
+func setMemoryEntityGraph(doc map[string]any, current []Entity) {
 	edgesByType := make(map[string][]map[string]any, 1)
-	for _, entity := range filtered {
-		eKey := entityKey(entity.Label, entity.Text)
-		inserts[eKey] = map[string]any{
-			"entity_type":   entityDocType,
-			"text":          entity.Text,
-			"label":         entity.Label,
-			"mention_count": 0,
-			"first_seen":    now,
-			"last_seen":     now,
-		}
+	for _, entity := range current {
 		edgesByType["mentions"] = append(edgesByType["mentions"], map[string]any{
-			"target": eKey,
+			"target": entityKey(entity.Label, entity.Text),
 			"weight": entity.Score,
 		})
+	}
+	doc["entities"] = entitiesToSlice(current)
+	doc["_edges"] = map[string]any{
+		graphIndex: edgesByType,
+	}
+}
+
+func entityGraphTransforms(memoryID string, current, previous []Entity, now string) []client.Transform {
+	return entityGraphTransformsForKey(memoryKey(memoryID), current, previous, now)
+}
+
+func entityGraphTransformsForKey(mKey string, current, previous []Entity, now string) []client.Transform {
+	currentKeys := make(map[string]struct{}, len(current))
+	previousKeys := make(map[string]struct{}, len(previous))
+	for _, entity := range current {
+		currentKeys[entityKey(entity.Label, entity.Text)] = struct{}{}
+	}
+	for _, entity := range previous {
+		previousKeys[entityKey(entity.Label, entity.Text)] = struct{}{}
+	}
+
+	transforms := make([]client.Transform, 0, len(current)+len(previous))
+	for _, entity := range current {
+		eKey := entityKey(entity.Label, entity.Text)
+		ops := []client.TransformOp{
+			{Op: client.TransformOpTypeSetOnInsert, Path: "$.entity_type", Value: entityDocType},
+			{Op: client.TransformOpTypeSetOnInsert, Path: "$.text", Value: entity.Text},
+			{Op: client.TransformOpTypeSetOnInsert, Path: "$.label", Value: entity.Label},
+			{Op: client.TransformOpTypeSetOnInsert, Path: "$.mention_count", Value: 0},
+			{Op: client.TransformOpTypeSetOnInsert, Path: "$.first_seen", Value: now},
+			{Op: client.TransformOpTypeSet, Path: "$.last_seen", Value: now},
+		}
+		if _, existed := previousKeys[eKey]; !existed {
+			ops = append(ops, client.TransformOp{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: 1})
+		}
+		ops = append(ops, client.TransformOp{
+			Op: client.TransformOpTypeAddToSet, Path: "$._edges." + graphIndex + ".mentions",
+			// Reverse-edge identity is stable across NER score changes; the score
+			// belongs on the memory's forward edge only.
+			Value: map[string]any{"target": mKey},
+		})
+		transforms = append(transforms, client.Transform{Key: eKey, Operations: ops, Upsert: true})
+	}
+	for _, entity := range previous {
+		eKey := entityKey(entity.Label, entity.Text)
+		if _, retained := currentKeys[eKey]; retained {
+			continue
+		}
 		transforms = append(transforms, client.Transform{
 			Key: eKey,
 			Operations: []client.TransformOp{
-				{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: 1},
-				{Op: client.TransformOpTypeMin, Path: "$.first_seen", Value: now},
-				{Op: client.TransformOpTypeSet, Path: "$.last_seen", Value: now},
+				{Op: client.TransformOpTypePull, Path: "$._edges." + graphIndex + ".mentions", Value: map[string]any{"target": mKey}},
+				{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: -1},
+				{Op: client.TransformOpTypeMax, Path: "$.mention_count", Value: 0},
 			},
 		})
 	}
-
-	// Batch 1: entity node upserts + mention count transforms.
-	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: inserts, Transforms: transforms}); err != nil {
-		h.logger.Warn("entity node batch failed", zap.Error(err))
-	}
-
-	// Batch 2: graph edges from memory to entity nodes (separate key structure).
-	edgeInserts := map[string]any{
-		mKey: map[string]any{
-			"_edges": map[string]any{
-				graphIndex: edgesByType,
-			},
-		},
-	}
-	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: edgeInserts}); err != nil {
-		h.logger.Warn("edge creation failed", zap.Error(err))
-	}
-
-	return filtered
+	return transforms
 }

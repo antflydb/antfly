@@ -152,7 +152,7 @@ A query request can combine several inputs:
 - `semantic_search` supplies the vector query.
 - `filter_query` is an AND condition over the main query.
 - `exclusion_query` removes matching documents.
-- `graph_searches` run graph traversals or patterns alongside document search.
+- `graph_queries` run graph traversals or patterns alongside document search.
 - `order_by`, `search_after`, and `search_before` control exact ordered pages.
 - `reranker` and `pruner` can post-process the selected search results.
 - `fields` controls the response projection.
@@ -179,6 +179,246 @@ ordering decides which page is returned.
   "profile": true
 }
 ```
+
+## Graph Queries
+
+`graph_queries` is an operation-keyed DSL. Each named query contains exactly
+one of `traverse`, `match`, `shortest_path`, or `k_shortest_paths`. A traversal
+defaults to one hop, and stored documents are returned only when the operation
+enables `include_documents`.
+
+Traversal, MATCH edges, shortest paths, and K-shortest paths all use the same
+stored-edge `direction`: `out` by default, `in` for reverse expansion, and
+`both` for undirected expansion. Store one physical relationship and select
+`both` when its query semantics are undirected; storing a reciprocal edge
+creates a second physical relationship and can therefore create a second
+binding or path.
+
+Every canonical result is self-describing through `kind`: MATCH returns
+`bindings` or `aggregates`, traversal returns `nodes`, and shortest-path
+operations return `paths`. Each `paths[]` item owns one authoritative `path`
+and, when requested, its terminal `document`; clients never need to align a
+parallel terminal-node array with the path array.
+
+Use `$query_results` to seed a graph operation from the final ranked result page,
+regardless of whether retrieval was lexical, vector, or fused:
+
+```jsonc
+{
+  "full_text_search": {"query": "database"},
+  "graph_queries": {
+    "citations": {
+      "index": "citation_graph",
+      "traverse": {
+        "start": {"result_ref": "$query_results", "limit": 20},
+        "edge_types": ["cites"],
+        "max_depth": 1,
+        "include_documents": true,
+        "fields": ["title"]
+      }
+    }
+  }
+}
+```
+
+Traversal and path outputs can seed another graph operation with
+`$graph_results.<query-name>`. A path result contributes the endpoint node of
+each returned path. MATCH produces rows with multiple aliases, so a downstream
+selector must also name the returned `binding`:
+
+```jsonc
+{"result_ref": "$graph_results.authors_and_posts", "binding": "post", "limit": 100}
+```
+
+Omit `limit` only when the referenced result is complete. Antfly rejects
+unbounded references to truncated result pages rather than returning a partial
+answer. Table-qualified identities use `{"key":"…","table":"…"}`; omitting
+`table`, or explicitly naming the queried table, has the same identity
+semantics.
+
+Canonical paths preserve that identity on both nodes and edges. Each path edge
+uses typed `from` and `to` endpoints and is ordered with the node list:
+`edges[i]` traverses from `nodes[i]` to `nodes[i + 1]`. The deprecated
+`graph_searches` response keeps its original unqualified `source` and `target`
+edge keys during the compatibility window.
+
+`match` expresses branched conjunctive patterns and can return rows or exact
+named counts. Node filters are non-scoring stored-document predicates; they do
+not run full-text analyzers. Range predicates use explicit `numeric_range` or
+`term_range` wrappers, or `date_range` with RFC 3339 bounds, so their types
+remain unambiguous in every SDK. Date bounds are normalized into Antfly's
+unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
+
+```jsonc
+{
+  "graph_queries": {
+    "authored_replies": {
+      "index": "social_graph",
+      "match": {
+        "anchor": "author",
+        "nodes": {
+          "author": {"filter": {"term": "person", "path": "/kind"}},
+          "post": {"table": "messages"},
+          "reply": {
+            "table": "messages",
+            "filter": {
+              "numeric_range": {"path": "/score", "min": 0.8}
+            }
+          }
+        },
+        "edges": [
+          {"from": "author", "to": "post", "types": ["AUTHORED"]},
+          {"from": "reply", "to": "post", "types": ["REPLIES_TO"]}
+        ],
+        "where": {
+          "not_equal": {
+            "left": {"alias": "author"},
+            "right": {"alias": "reply"}
+          }
+        }
+      },
+      "return": {
+        "aggregates": {
+          "matches": {"count": "*"},
+          "distinct_replies": {"count": "reply", "distinct": true}
+        }
+      }
+    }
+  }
+}
+```
+
+Optional groups are correlated left-outer patterns and run in array order. Each
+group must connect to an alias from the required pattern or an earlier optional
+group. A group with no match retains one row and exposes each alias introduced
+by that group as `null`. `where.not_exists` is the anti-join form: its edges may
+refer only to aliases already visible at that point and do not introduce aliases.
+
+For example, this forms authored-post bindings with optional replies. The
+anti-join excludes bindings where the author also has a `BLOCKED` relationship
+to that post:
+
+```jsonc
+{
+  "graph_queries": {
+    "post_activity": {
+      "index": "social_graph",
+      "match": {
+        "anchor": "author",
+        "nodes": {
+          "author": {},
+          "post": {"table": "messages"}
+        },
+        "edges": [
+          {"from": "author", "to": "post", "types": ["AUTHORED"]}
+        ],
+        "where": {
+          "not_exists": {
+            "edges": [
+              {"from": "author", "to": "post", "types": ["BLOCKED"]}
+            ]
+          }
+        },
+        "optional": [
+          {
+            "nodes": {"reply": {"table": "messages"}},
+            "edges": [
+              {"from": "reply", "to": "post", "types": ["REPLIES_TO"]}
+            ]
+          }
+        ]
+      },
+      "return": {
+        "aggregates": {
+          "rows": {"count": "*"},
+          "posts": {"count": "post", "distinct": true},
+          "replies": {"count": "reply"}
+        }
+      }
+    }
+  }
+}
+```
+
+`count(*)` includes the null-extended row produced when a post has no reply.
+`count(alias)` ignores rows where that alias is null, matching SQL count
+semantics. If several replies match one post, the row and reply counts observe
+each resulting binding; use `distinct: true` on an alias count when unique
+identities are required, as the `posts` aggregate does above.
+
+Use `CountGraphRows` and `CountGraphAlias` in Go, `countGraphRows` and
+`countGraphAlias` in TypeScript, or `count_graph_rows` and `count_graph_alias`
+in Python to construct validated count expressions. The alias helpers reject
+reserved or unsafe graph identifiers before a request is sent.
+
+Exact aggregation streams bindings without materializing a bounded row page.
+Row returns expose each alias as a compact `{key, table?, document?}` binding.
+Traversal-only metrics such as `depth`, `distance`, and `path` are intentionally
+absent because a node in a branched match has no single canonical traversal
+distance. Request a traversal or path operation when those metrics are the
+desired result.
+`match.anchor` names the alias enumerated from the query table. Omit a node's
+`table` for that same table; declare `table` on every cross-table alias. The
+declaration is part of the alias's identity and lets the planner safely expand a
+relationship in reverse without guessing its source table. Reached aliases
+retain their table-qualified identities, and a binding from a different table
+never satisfies the declaration. Anchor
+identities are read in stable snapshot-pinned pages, independently for each
+named graph operation. A request may contain at most eight named `match`
+operations. Put multiple counts over one pattern in a single `match` return
+object so they share one complete anchor scan and one set of bindings.
+For cross-table multi-hop MATCH patterns, declare an alias at each table
+boundary and connect those aliases with single-hop edges. Antfly fails closed
+when exact execution would otherwise need to reverse a variable-length edge
+through unnamed intermediate nodes whose source tables cannot be proven.
+Aliases and aggregate names are limited to 128 Unicode code points. A binding
+projection explicitly lists between one and 64 unique aliases; list every
+declared alias when the complete row is required. These bounds keep admission
+predictable and let the matcher compile projection membership once per operation.
+Fixed single-hop relationships preserve physical self-loops, so distinct aliases
+may bind the same node unless `where.not_equal` excludes that binding. Variable-
+length relationships remain node-simple except for explicit repeated-alias cycle
+closure.
+MATCH edge direction is relative to `from` and defaults to `out`. Use
+`direction: "in"` to traverse a stored relationship in reverse, or
+`direction: "both"` to treat one stored relationship as undirected. A physical
+self-loop still contributes only one relationship binding under `both`.
+Top-level full-text, semantic, and filter clauses shape the retrieval result only;
+they do not implicitly narrow `MATCH`. Put source constraints on the node named by
+`match.anchor`. Row-level authorization still applies to every anchor and reached
+node. An `ids` filter, or a disjunction containing only `ids` filters, resolves
+through the primary identity index and needs no secondary index. Other fields
+used by anchor or authorization filters must have native index coverage because
+exact anchors are cursor-scanned in `_id` order. Antfly returns
+`graph_anchor_filter_requires_index` when it cannot prove that complete scan;
+index the referenced fields rather than relying on stored-source fallback.
+Graph document filters address stored values with RFC 6901 JSON Pointers. For
+example, use `/kind` for a top-level field and `/author/name` for a nested field;
+escape `~` as `~0` and `/` within a key as `~1`.
+
+All graph expansion work is budgeted across the whole request, including every
+named operation and every K-shortest-path spur search. Traversal and path
+operations also retain their explicit per-operation depth and result bounds.
+The matcher also enforces a byte ceiling on retained frontier ancestry, in
+addition to its node, edge, and intermediate-state limits, so long identities
+cannot bypass the memory invariant.
+If Antfly cannot enumerate the complete authorized anchor relation or exhausts
+that budget, the request fails instead of returning a partial count.
+Exact `count(distinct alias)` sets also share a request-scoped identity and byte
+budget. Exhaustion returns `graph_distinct_budget_exceeded`; narrow the anchor
+predicate or use a non-distinct aggregate.
+
+The deprecated `graph_searches` request field remains a wire-compatibility
+adapter for the v0.2 shape. Its operation names remain opaque legacy map keys;
+the canonical GraphIdentifier policy applies only to `graph_queries`. The
+request-wide 64-operation safety limit applies to both dialects. New clients
+should generate only `graph_queries`. A successful stateful request that uses
+`graph_searches` includes the RFC 9745 deprecation date
+`Deprecation: @1787702400` (2026-08-26 UTC), and Antfly emits a stable
+low-cardinality acceptance log without table names, operation names, or query
+contents. The compatibility adapter must not be removed until fleet telemetry
+shows that legacy traffic has drained; serverless Antfly and MemoryAF remain
+canonical-only and do not emit legacy responses.
 
 ## Full-Text And Vector Search
 
@@ -253,22 +493,6 @@ There is only one physical order per index generation. Arbitrary `order_by`
 fields still use typed field values and top-N collection. Changing `index_sort`
 is a layout change; existing generations need backfill, compaction, or reindex
 before the accelerated path can be considered fully covered.
-
-## Graph Search
-
-Graph indexes materialize relationships between document ids. Graph queries can
-run traversals, pathfinding, or pattern-style queries, and node filters use the
-same query primitives as document filters.
-
-Graph search composes with document retrieval in two directions:
-
-- A document query can choose start or target nodes, then a graph traversal
-  expands through relationships.
-- A graph traversal can produce related document ids, then the response can
-  fetch documents or merge graph results with search results.
-
-This keeps relationship search in the same document engine instead of requiring
-a separate graph database for common retrieval workflows.
 
 ## Rejections And Diagnostics
 

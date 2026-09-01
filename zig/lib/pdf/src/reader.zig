@@ -18,6 +18,7 @@ const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
+const standard_fonts = @import("pdf_standard_fonts");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,6 +45,13 @@ const ImageSourceSamples = struct {
     stride: usize,
     bits_per_component: u8,
     component_offsets: [4]u8 = .{ 0, 1, 2, 3 },
+
+    fn liveBytes(self: ImageSourceSamples) usize {
+        return switch (self.data) {
+            .u8 => |bytes| bytes.len,
+            .u16 => |words| std.math.mul(usize, words.len, @sizeOf(u16)) catch std.math.maxInt(usize),
+        };
+    }
 };
 
 const MaskImageMetadata = struct {
@@ -59,6 +67,41 @@ const NativeMatte = struct {
     /// Matte components normalized to the same unit component domain used by
     /// the renderer after the image Decode array has been applied.
     components: [4]f64,
+    /// Native component domains used to map an image Decode array into the
+    /// unit domain where PDF's preblending equation is affine.
+    ranges: [4]ColorComponentRange = .{ .{}, .{}, .{}, .{} },
+    /// Indexed images are preblended in the base color space stored by their
+    /// lookup table, not in the discrete index domain. Retain the Matte index
+    /// so that path can expand and unblend palette components per pixel.
+    indexed_matte_index: ?u8 = null,
+};
+
+const ResolvedIndexedPalette = struct {
+    lookup: []const u8 = &.{},
+    lookup_owner: ?syntax.Object = null,
+    decoded_lookup: ?[]u8 = null,
+    entry_count: usize = 0,
+    component_count: usize = 0,
+
+    fn ownedBytes(self: *const ResolvedIndexedPalette) usize {
+        if (self.decoded_lookup) |bytes| return bytes.len;
+        if (self.lookup_owner) |owner| return switch (owner) {
+            .string => |bytes| bytes.len,
+            else => 0,
+        };
+        return 0;
+    }
+
+    fn deinit(self: *ResolvedIndexedPalette, alloc: Allocator) void {
+        if (self.decoded_lookup) |bytes| alloc.free(bytes);
+        if (self.lookup_owner) |*owner| owner.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const IndexedPaletteReserve = union(enum) {
+    palette_rgba,
+    matte_scratch: usize,
 };
 
 const JpxAlphaMode = enum {
@@ -451,6 +494,64 @@ const PageFont = struct {
     }
 };
 
+fn standard14LatinFontIsBold(base_font: []const u8) ?bool {
+    const name = if (std.mem.lastIndexOfScalar(u8, base_font, '+')) |separator|
+        base_font[separator + 1 ..]
+    else
+        base_font;
+    const regular = [_][]const u8{
+        "Times-Roman",
+        "Times-Italic",
+        "Helvetica",
+        "Helvetica-Oblique",
+        "Courier",
+        "Courier-Oblique",
+    };
+    for (regular) |candidate| if (std.mem.eql(u8, name, candidate)) return false;
+    const bold = [_][]const u8{
+        "Times-Bold",
+        "Times-BoldItalic",
+        "Helvetica-Bold",
+        "Helvetica-BoldOblique",
+        "Courier-Bold",
+        "Courier-BoldOblique",
+    };
+    for (bold) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return null;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var offset: usize = 0;
+    while (offset + needle.len <= haystack.len) : (offset += 1) {
+        var matched = true;
+        for (needle, 0..) |expected, i| {
+            if (std.ascii.toLower(haystack[offset + i]) != std.ascii.toLower(expected)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
+fn substituteLatinFontIsBold(base_font: []const u8) ?bool {
+    if (standard14LatinFontIsBold(base_font)) |bold| return bold;
+    const name = if (std.mem.lastIndexOfScalar(u8, base_font, '+')) |separator|
+        base_font[separator + 1 ..]
+    else
+        base_font;
+    if (containsAsciiIgnoreCase(name, "symbol") or
+        containsAsciiIgnoreCase(name, "dingbat")) return null;
+    return containsAsciiIgnoreCase(name, "bold") or
+        containsAsciiIgnoreCase(name, "black") or
+        containsAsciiIgnoreCase(name, "semibold") or
+        containsAsciiIgnoreCase(name, "demi") or
+        containsAsciiIgnoreCase(name, "heavy");
+}
+
 fn pageFontsUsedOutlineFallback(fonts: []const PageFont) bool {
     for (fonts) |font| if (font.outline_fallback) return true;
     return false;
@@ -580,7 +681,8 @@ const CidEncoding = struct {
 };
 
 const TrueTypeFont = struct {
-    bytes: []u8,
+    bytes: []const u8,
+    owns_bytes: bool = true,
     font: font_lib.sfnt.Font,
     units_per_em: u16,
     raw_code_bytes: usize = 0,
@@ -601,7 +703,7 @@ const TrueTypeFont = struct {
         if (self.pdf_widths) |widths| alloc.free(widths);
         if (self.cid_widths) |*widths| widths.deinit(alloc);
         if (self.cid_vertical_metrics) |*metrics| metrics.deinit(alloc);
-        alloc.free(self.bytes);
+        if (self.owns_bytes) alloc.free(self.bytes);
         self.* = undefined;
     }
 };
@@ -643,6 +745,13 @@ fn lookupSimpleTrueTypeGlyph(font: font_lib.sfnt.Font, decoder: *const FontDecod
 
     if (symbolic != true) {
         if (decoder.paintCodepoint(code)) |cp| if (try font.cmapGlyphIndex(cp)) |gid| return gid;
+        // A valid embedded TrueType subset may retain only its Macintosh
+        // Roman cmap. In that table the key is the encoded byte, not the
+        // Unicode scalar obtained by decoding it. PDF MacRomanEncoding has
+        // exactly the same code domain, so consult that platform cmap before
+        // declaring a glyph missing. Differences remain authoritative above.
+        if (decoder.base_encoding == .mac_roman)
+            if (try font.cmapGlyphIndexForPlatform(1, 0, code)) |gid| return gid;
     }
 
     // Windows symbol cmaps conventionally place byte codes in the F000
@@ -926,6 +1035,7 @@ const Type3Font = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *Type3Font, alloc: Allocator) void {
@@ -941,6 +1051,8 @@ const Type3Font = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -1023,6 +1135,11 @@ pub const TextRun = struct {
     text: []const u8,
     raw_text: ?[]const u8 = null,
     font_index: ?u16 = null,
+    /// Render-time font resource for text nested inside a Form XObject. Form
+    /// font indices are local to their resource dictionary and cannot be
+    /// interpreted against the page font slice. This borrow is consumed and
+    /// cleared before PageRenderRuns escapes the Reader call.
+    render_font: ?*const PageFont = null,
     vectorizable: bool = false,
     fallback_reason: ?TextFallbackReason = null,
     x: f64,
@@ -1032,6 +1149,10 @@ pub const TextRun = struct {
     b: f64 = 0,
     c: f64 = 0,
     d: f64 = 1,
+    /// Graphics CTM at the point where this text run was painted. The text
+    /// basis above is already transformed, but pattern space is defined by
+    /// the graphics CTM and must not be reconstructed from the glyph basis.
+    graphics_matrix: GraphicsMatrix = .{},
     alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     render_mode: i64 = 0,
@@ -1054,6 +1175,8 @@ pub const TextRun = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
     fill_pattern_name: ?[]const u8 = null,
     stroke_pattern_name: ?[]const u8 = null,
     clip_box: ?PageBox = null,
@@ -1127,6 +1250,7 @@ const CachedPageImage = struct {
     height: u32,
     interpolate: bool,
     bilevel: bool,
+    image_mask: bool,
 };
 
 /// A request-scoped cache for decoded indirect image XObjects. Forms and
@@ -1169,6 +1293,18 @@ pub const ImageRun = struct {
     /// only when a full-source footprint cannot afford exact integration.
     bilevel_fallback: ?[4]u8 = null,
     ocr_coverage_minify: bool = false,
+    /// PDF image masks are stencils: their decoded samples provide coverage,
+    /// while the active nonstroking color at each `Do` provides paint. Keep
+    /// that color on the occurrence instead of mutating shared decoded RGBA.
+    stencil_color: ?[4]u8 = null,
+    /// A graphics-state soft mask whose group is a single image covering the
+    /// painted image. The mask is sampled in the same normalized image space.
+    opacity_mask_rgba: ?[]u8 = null,
+    opacity_mask_shared_rgba: ?*SharedImageRgba = null,
+    opacity_mask_width: u32 = 0,
+    opacity_mask_height: u32 = 0,
+    opacity_mask_luminosity: bool = false,
+    opacity_mask_interpolate: bool = false,
     alpha: u8 = 0xff,
     paint_order: usize = 0,
     paint_phase: usize = 0,
@@ -1177,6 +1313,8 @@ pub const ImageRun = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
     clip_box: ?PageBox = null,
     clip_points: ?[]const [2]f64 = null,
     clip_fill_rule: FillRule = .nonzero,
@@ -1193,10 +1331,20 @@ pub const ImageRun = struct {
 
     pub fn deinit(self: *ImageRun, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
+        if (self.opacity_mask_shared_rgba) |shared|
+            shared.release(alloc)
+        else if (self.opacity_mask_rgba) |mask|
+            alloc.free(mask);
         if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
         self.* = undefined;
     }
 };
+
+const shading_uniform_color_sample_count: usize = 64;
+const shading_color_sample_capacity: usize = 128;
+const shading_color_sample_count = shading_uniform_color_sample_count;
+const shading_discontinuity_capacity: usize = (shading_color_sample_capacity - shading_uniform_color_sample_count) / 2;
+const shading_function_node_capacity: u16 = 128;
 
 pub const ShadingRun = struct {
     kind: enum { axial, radial },
@@ -1207,6 +1355,8 @@ pub const ShadingRun = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
     clip_box: ?PageBox = null,
     clip_points: ?[]const [2]f64 = null,
     clip_fill_rule: FillRule = .nonzero,
@@ -1218,6 +1368,12 @@ pub const ShadingRun = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
+    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
+    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_sample_count: u8 = 0,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
 
@@ -1240,6 +1396,8 @@ pub const PatternRun = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
     fill_rule: FillRule = .nonzero,
     line_cap: @FieldType(ShapeRun, "line_cap") = .butt,
     line_join: @FieldType(ShapeRun, "line_join") = .miter,
@@ -1253,6 +1411,11 @@ pub const PatternRun = struct {
     clip_fill_rule: FillRule = .nonzero,
     points: [][2]f64,
     subpath_starts: ?[]usize = null,
+    subpath_closed: ?[]bool = null,
+    /// A Pattern-colored image mask uses the image only as target coverage.
+    /// Keeping the immutable decoded mask here avoids premature rasterization
+    /// and preserves the pattern cell, transform, clip, and blend semantics.
+    stencil_mask: ?ImageRun = null,
     pattern_matrix: GraphicsMatrix = .{},
     pattern_bbox: PageBox,
     pattern_x_step: f64,
@@ -1269,7 +1432,9 @@ pub const PatternRun = struct {
         if (self.dash_array) |dash| alloc.free(dash);
         if (self.clip_points) |clip| alloc.free(clip);
         if (self.subpath_starts) |starts| alloc.free(starts);
+        if (self.subpath_closed) |closed| alloc.free(closed);
         alloc.free(self.points);
+        if (self.stencil_mask) |*mask| mask.deinit(alloc);
         if (self.shading) |*shading| shading.deinit(alloc);
         for (self.tile_text_runs) |*run| run.deinit(alloc);
         if (self.tile_text_runs.len > 0) alloc.free(self.tile_text_runs);
@@ -1312,6 +1477,8 @@ pub const ShapeRun = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
     fill_rule: FillRule = .nonzero,
     line_cap: enum { butt, round, square } = .butt,
     line_join: enum { miter, round, bevel } = .miter,
@@ -1330,11 +1497,16 @@ pub const ShapeRun = struct {
     /// glyphs need all contours painted as one path so counter contours
     /// (the holes in O, B, 8, and similar glyphs) participate in winding.
     subpath_starts: ?[]usize = null,
+    /// Per-subpath closure for compound stroked paths. Filled paths close
+    /// implicitly, but PDF permits one stroke operator to mix open and closed
+    /// contours; one page-wide `closed` bit cannot represent that faithfully.
+    subpath_closed: ?[]bool = null,
 
     pub fn deinit(self: *ShapeRun, alloc: Allocator) void {
         if (self.dash_array) |dash| alloc.free(dash);
         if (self.clip_points) |clip| alloc.free(clip);
         if (self.subpath_starts) |starts| alloc.free(starts);
+        if (self.subpath_closed) |closed| alloc.free(closed);
         alloc.free(self.points);
         self.* = undefined;
     }
@@ -1356,7 +1528,9 @@ const max_glyph_outline_cache_bytes: usize = 16 * 1024 * 1024;
 const max_glyph_outline_cache_entries: usize = 4096;
 
 const GlyphOutlineCacheKey = struct {
-    font_index: u16,
+    /// Allocation identity is unique across page, Form, Pattern, and Type 3
+    /// resource scopes for the lifetime of one render call.
+    font_identity: usize,
     glyph_index: u16,
 };
 
@@ -1543,12 +1717,25 @@ const VectorTextWorkBudget = struct {
             // the outline gate as an unmetered route back to page-wide work.
             const work = estimateVectorPaintWork(pattern.points, pattern.stroke_width, pattern.kind == .stroke, true, false, self.scale_x, self.scale_y);
             edge_tests = saturatedAddU64(edge_tests, saturatedMulU64(work, 2));
+            if (pattern.stencil_mask) |mask| {
+                if (mask.shared_rgba == null) resource_bytes = saturatedAddU64(resource_bytes, mask.rgba.len);
+                const corners = [_][2]f64{
+                    .{ mask.e, mask.f },
+                    .{ mask.a + mask.e, mask.b + mask.f },
+                    .{ mask.c + mask.e, mask.d + mask.f },
+                    .{ mask.a + mask.c + mask.e, mask.b + mask.d + mask.f },
+                };
+                edge_tests = saturatedAddU64(edge_tests, estimateVectorPaintWork(&corners, 0, false, false, false, self.scale_x, self.scale_y));
+            }
         }
         for (images) |image| {
             // Shared XObject samples were decoded before text expansion and
             // retained without copying, so only independently owned samples
             // consume the materialization allowance here.
             if (image.shared_rgba == null) resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
+            if (image.opacity_mask_shared_rgba == null) {
+                if (image.opacity_mask_rgba) |mask| resource_bytes = saturatedAddU64(resource_bytes, mask.len);
+            }
             const corners = [_][2]f64{
                 .{ image.e, image.f },
                 .{ image.a + image.e, image.b + image.f },
@@ -1559,7 +1746,10 @@ const VectorTextWorkBudget = struct {
         }
         edge_tests = saturatedAddU64(edge_tests, saturatedMulU64(self.raster_pixels, shadings.len));
         if (points > self.remaining_points or edge_tests > self.remaining_edge_tests or scanline_work > self.remaining_scanline_work or resource_bytes > self.remaining_resource_bytes) {
-            self.exhausted = true;
+            // Reject this paint operator transactionally without poisoning
+            // the rest of the page. A single pathological outline may exceed
+            // the remaining allowance while later, small operators still fit;
+            // accepted work remains strictly bounded by the same counters.
             self.exhaustion_reason = .vector_work_limit;
             return false;
         }
@@ -1695,8 +1885,11 @@ const TextRunState = struct {
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
-    fill_color_space: []const u8 = "DeviceGray",
-    stroke_color_space: []const u8 = "DeviceGray",
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
+    fill_color_space: ColorSpaceSelection = colorSpaceSelectionForKind(.device_gray),
+    stroke_color_space: ColorSpaceSelection = colorSpaceSelectionForKind(.device_gray),
+    color_spaces: []const PageColorSpace = &.{},
     fill_pattern_name: ?[]const u8 = null,
     stroke_pattern_name: ?[]const u8 = null,
     x: f64 = 0,
@@ -1737,8 +1930,11 @@ const TextRunStackEntry = struct {
     group_parent_id: ?u32,
     group_isolated: bool,
     group_knockout: bool,
-    fill_color_space: []const u8,
-    stroke_color_space: []const u8,
+    group_alpha: u8,
+    group_blend_mode: BlendMode,
+    fill_color_space: ColorSpaceSelection,
+    stroke_color_space: ColorSpaceSelection,
+    color_spaces: []const PageColorSpace,
     fill_pattern_name: ?[]const u8,
     stroke_pattern_name: ?[]const u8,
     clip_box: ?PageBox,
@@ -1760,6 +1956,526 @@ const GraphicsMatrix = struct {
     f: f64 = 0,
 };
 
+/// Content operands are released after every operator, so color-space state
+/// must not retain their name slices. Keep it as a value and make unsupported
+/// resource-backed spaces explicit.
+const ColorSpaceKind = enum {
+    device_gray,
+    device_rgb,
+    device_cmyk,
+    pattern,
+    unsupported,
+};
+
+const ColorComponentRange = struct {
+    min: f64 = 0,
+    max: f64 = 1,
+};
+
+const max_image_color_space_decode_depth: u8 = 8;
+
+/// Image samples are decoded exactly once, then constrained by each enclosing
+/// ICCBased profile before reaching its alternate color space. Keeping the
+/// small clamp chain by value avoids a per-image scratch allocation while also
+/// preserving the specified order for nested profiles with disjoint ranges.
+const ImageSampleDecode = struct {
+    decode_obj: ?*const syntax.Object = null,
+    default_decode: ?[4]ColorComponentRange = null,
+    clamp_count: u8 = 0,
+    clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
+        [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
+
+    fn encodedValue(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
+        const unit = @as(f64, @floatFromInt(sample)) / 255.0;
+        var decoded = if (self.default_decode) |ranges|
+            mapUnitToComponentRange(unit, ranges[component_index])
+        else if (self.clamp_count > 0)
+            applyDecodeUnclamped(unit, self.decode_obj, component_index)
+        else
+            applyDecodeNormalized(unit, self.decode_obj, component_index);
+        for (self.clamps[0..self.clamp_count]) |ranges|
+            decoded = clampColorComponent(decoded, ranges[component_index]);
+        return decoded;
+    }
+
+    fn colorValue(self: *const ImageSampleDecode, value: f64, component_index: usize) f64 {
+        var constrained = value;
+        for (self.clamps[0..self.clamp_count]) |ranges|
+            constrained = clampColorComponent(constrained, ranges[component_index]);
+        return constrained;
+    }
+};
+
+/// Recursive alternate color spaces can consume either encoded image bytes or
+/// real component values produced by a tint transform. Keeping the source
+/// tagged prevents non-unit Lab, Indexed, and ICC values from being clipped or
+/// quantized merely to reuse the encoded-byte conversion path.
+const ImageComponentSamples = struct {
+    source: union(enum) {
+        encoded: []const u8,
+        tint: *TintComponentSamples,
+    },
+    decode: ImageSampleDecode = .{},
+
+    fn encoded(bytes: []const u8, decode_obj: ?*const syntax.Object) ImageComponentSamples {
+        return .{ .source = .{ .encoded = bytes }, .decode = .{ .decode_obj = decode_obj } };
+    }
+
+    fn len(self: *const ImageComponentSamples) usize {
+        return switch (self.source) {
+            .encoded => |bytes| bytes.len,
+            .tint => |tint| blk: {
+                if (tint.input_components == 0) break :blk 0;
+                break :blk std.math.mul(usize, tint.pixel_count, tint.output_components) catch std.math.maxInt(usize);
+            },
+        };
+    }
+
+    fn liveBytes(self: *const ImageComponentSamples) usize {
+        return switch (self.source) {
+            .encoded => |bytes| bytes.len,
+            // Tint outputs are evaluated lazily, so only their input remains
+            // live regardless of the alternate color space's component count.
+            .tint => |tint| tint.input.liveBytes(),
+        };
+    }
+
+    fn isEncoded(self: *const ImageComponentSamples) bool {
+        return self.source == .encoded;
+    }
+
+    fn value(self: *const ImageComponentSamples, sample_index: usize, component_index: usize) f64 {
+        return switch (self.source) {
+            .encoded => |bytes| self.decode.encodedValue(bytes[sample_index], component_index),
+            .tint => |tint| blk: {
+                const pixel = sample_index / tint.output_components;
+                const output_component = sample_index % tint.output_components;
+                const component_value = tint.value(pixel, output_component);
+                break :blk self.decode.colorValue(component_value, component_index);
+            },
+        };
+    }
+
+    fn indexedValue(self: *const ImageComponentSamples, sample_index: usize, palette_entries: usize) !u8 {
+        return switch (self.source) {
+            .encoded => |bytes| try applyIndexedSampleDecode(bytes[sample_index], self.decode, palette_entries),
+            .tint => blk: {
+                if (palette_entries == 0) return error.UnsupportedPdfRendering;
+                const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+                const index_value = std.math.clamp(self.value(sample_index, 0), 0.0, max_index);
+                break :blk @intFromFloat(@round(index_value));
+            },
+        };
+    }
+};
+
+/// A one-pixel cache keeps nested spot alternates linear in their recursion
+/// depth while avoiding a full-image intermediate component buffer.
+const TintComponentSamples = struct {
+    input: *const ImageComponentSamples,
+    transform: *const ImageTintTransform,
+    pixel_count: usize,
+    input_components: usize,
+    output_components: usize,
+    cached_pixel: ?usize = null,
+    cached_values: [4]f64 = .{ 0, 0, 0, 0 },
+
+    fn value(self: *TintComponentSamples, pixel: usize, component: usize) f64 {
+        if (self.cached_pixel != pixel) {
+            const tint = self.input.value(pixel * self.input_components, 0);
+            self.transform.evaluate(tint, self.cached_values[0..self.output_components]);
+            self.cached_pixel = pixel;
+        }
+        return self.cached_values[component];
+    }
+};
+
+const ImageTintTransform = union(enum) {
+    exponential: ExponentialTintTransform,
+    sampled: *GraphicsSampledTintTransform,
+    calculator: CalculatorTintTransform,
+
+    fn deinit(self: *ImageTintTransform, alloc: Allocator) void {
+        switch (self.*) {
+            .exponential => |*transform| transform.deinit(alloc),
+            .sampled => |transform| transform.deinit(alloc),
+            .calculator => |*transform| transform.deinit(alloc),
+        }
+    }
+
+    fn evaluate(self: *const ImageTintTransform, tint: f64, output: []f64) void {
+        switch (self.*) {
+            .exponential => |*transform| {
+                for (output, 0..) |*value, component|
+                    value.* = evalExponentialTintComponent(transform, tint, component);
+            },
+            .sampled => |transform| {
+                for (output, 0..) |*value, component|
+                    value.* = evalSampledTintComponent(transform, tint, component);
+            },
+            .calculator => |*transform| transform.evaluate(tint, output),
+        }
+    }
+};
+
+const CalculatorTintInstruction = union(enum) {
+    number: f64,
+    dup,
+    exch,
+    pop,
+};
+
+const CalculatorTintTransform = struct {
+    instructions: []CalculatorTintInstruction,
+    ranges: [4]ColorComponentRange,
+
+    fn deinit(self: *CalculatorTintTransform, alloc: Allocator) void {
+        alloc.free(self.instructions);
+        self.* = undefined;
+    }
+
+    fn evaluate(self: *const CalculatorTintTransform, tint: f64, output: []f64) void {
+        var stack: [64]f64 = undefined;
+        var depth: usize = 1;
+        stack[0] = std.math.clamp(tint, 0.0, 1.0);
+        for (self.instructions) |instruction| switch (instruction) {
+            .number => |value| {
+                stack[depth] = value;
+                depth += 1;
+            },
+            .dup => {
+                stack[depth] = stack[depth - 1];
+                depth += 1;
+            },
+            .exch => std.mem.swap(f64, &stack[depth - 1], &stack[depth - 2]),
+            .pop => depth -= 1,
+        };
+        std.debug.assert(depth == output.len);
+        for (output, 0..) |*value, index|
+            value.* = clampColorComponent(stack[index], self.ranges[index]);
+    }
+};
+
+const CalibratedColorSpace = union(enum) {
+    gray: struct {
+        white_point: [3]f64,
+        black_point: [3]f64,
+        gamma: f64,
+    },
+    rgb: struct {
+        white_point: [3]f64,
+        black_point: [3]f64,
+        gamma: [3]f64,
+        matrix: [9]f64,
+    },
+};
+
+/// A one-component Separation (or one-component DeviceN) color space keeps
+/// its input arity while evaluating a bounded tint transform into a device/CIE
+/// alternate. The sampled table is owned by the page resource and graphics
+/// states retain only a borrowed pointer while parsing content.
+const GraphicsSampledTintTransform = struct {
+    values: []f64,
+    size: usize,
+    output_components: u8,
+    encode_min: f64,
+    encode_max: f64,
+    domain_min: f64,
+    domain_max: f64,
+
+    fn deinit(self: *GraphicsSampledTintTransform, alloc: Allocator) void {
+        alloc.free(self.values);
+        alloc.destroy(self);
+    }
+};
+
+const GraphicsTintFunction = union(enum) {
+    exponential: struct {
+        c0: [4]f64,
+        c1: [4]f64,
+        exponent: f64,
+        function_ranges: [4]ColorComponentRange,
+        has_function_ranges: bool,
+    },
+    sampled: *GraphicsSampledTintTransform,
+};
+
+const GraphicsTintColorSpace = struct {
+    alternate_kind: ColorSpaceKind,
+    alternate_ranges: [4]ColorComponentRange,
+    alternate_calibrated: ?CalibratedColorSpace,
+    function: GraphicsTintFunction,
+
+    fn deinit(self: *GraphicsTintColorSpace, alloc: Allocator) void {
+        switch (self.function) {
+            .exponential => {},
+            .sampled => |sampled| sampled.deinit(alloc),
+        }
+    }
+};
+
+const ColorSpaceValue = struct {
+    kind: ColorSpaceKind,
+    ranges: [4]ColorComponentRange = .{ .{}, .{}, .{}, .{} },
+    initial_components: [4]f64 = .{ 0, 0, 0, 0 },
+    /// CalGray and CalRGB retain the same operand arity as their corresponding
+    /// device spaces, but must not lose their transfer function or colorimetric
+    /// definition when selected through DefaultGray/DefaultRGB.
+    calibrated: ?CalibratedColorSpace = null,
+    tint: ?GraphicsTintColorSpace = null,
+};
+
+const ColorSpaceSelection = struct {
+    kind: ColorSpaceKind,
+    value: ColorSpaceValue,
+    pattern_base: ?ColorSpaceValue = null,
+};
+
+const PageColorSpace = struct {
+    name: []u8,
+    selection: ColorSpaceSelection,
+
+    fn deinit(self: *PageColorSpace, alloc: Allocator) void {
+        deinitColorSpaceSelection(&self.selection, alloc);
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn deinitColorSpaceSelection(selection: *ColorSpaceSelection, alloc: Allocator) void {
+    if (selection.value.tint) |*tint| tint.deinit(alloc);
+    if (selection.pattern_base) |*base| if (base.tint) |*tint| tint.deinit(alloc);
+}
+
+fn colorSpaceKindFromName(name: []const u8) ColorSpaceKind {
+    if (std.mem.eql(u8, name, "DeviceGray")) return .device_gray;
+    if (std.mem.eql(u8, name, "DeviceRGB")) return .device_rgb;
+    if (std.mem.eql(u8, name, "DeviceCMYK")) return .device_cmyk;
+    if (std.mem.eql(u8, name, "Pattern")) return .pattern;
+    return .unsupported;
+}
+
+fn colorSpaceComponentCount(kind: ColorSpaceKind) u8 {
+    return switch (kind) {
+        .device_gray => 1,
+        .device_rgb => 3,
+        .device_cmyk => 4,
+        .pattern, .unsupported => 0,
+    };
+}
+
+fn colorSpaceSelectionForKind(kind: ColorSpaceKind) ColorSpaceSelection {
+    var value: ColorSpaceValue = .{ .kind = kind };
+    if (kind == .device_cmyk) value.initial_components[3] = 1;
+    return .{ .kind = kind, .value = value };
+}
+
+fn colorSpaceSelectionForPattern(base: ?ColorSpaceValue) ColorSpaceSelection {
+    var selection = colorSpaceSelectionForKind(.pattern);
+    selection.pattern_base = base;
+    return selection;
+}
+
+fn defaultColorSpaceName(kind: ColorSpaceKind) ?[]const u8 {
+    return switch (kind) {
+        .device_gray => "DefaultGray",
+        .device_rgb => "DefaultRGB",
+        .device_cmyk => "DefaultCMYK",
+        .pattern, .unsupported => null,
+    };
+}
+
+fn isDefaultDeviceColorSpaceName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "DefaultGray") or
+        std.mem.eql(u8, name, "DefaultRGB") or
+        std.mem.eql(u8, name, "DefaultCMYK");
+}
+
+fn colorSpaceSelectionFromName(color_spaces: []const PageColorSpace, name: []const u8) ColorSpaceSelection {
+    const direct = colorSpaceKindFromName(name);
+    if (defaultColorSpaceName(direct)) |default_name| {
+        for (color_spaces) |color_space| {
+            if (!std.mem.eql(u8, color_space.name, default_name)) continue;
+            if (color_space.selection.kind != .pattern and
+                color_space.selection.kind != .unsupported and
+                colorSpaceComponentCount(color_space.selection.kind) == colorSpaceComponentCount(direct))
+                return color_space.selection;
+            // PDF default-space remapping is optional for a consumer that
+            // does not recognize the declared replacement. Preserve the
+            // original device space rather than turning a valid page into a
+            // terminal render failure.
+            return colorSpaceSelectionForKind(direct);
+        }
+        return colorSpaceSelectionForKind(direct);
+    }
+    if (direct != .unsupported) return colorSpaceSelectionForKind(direct);
+    for (color_spaces) |color_space| {
+        if (std.mem.eql(u8, color_space.name, name)) return color_space.selection;
+    }
+    return colorSpaceSelectionForKind(.unsupported);
+}
+
+fn initialGraphicsStateForColorSpaces(color_spaces: []const PageColorSpace) GraphicsState {
+    var state = GraphicsState{ .color_spaces = color_spaces };
+    const selection = colorSpaceSelectionFromName(color_spaces, "DeviceGray");
+    state.fill_color_space = selection;
+    state.stroke_color_space = selection;
+    state.fill_color = initialColorForColorSpace(selection.value);
+    state.stroke_color = state.fill_color;
+    return state;
+}
+
+fn initialTextRunStateForColorSpaces(color_spaces: []const PageColorSpace) TextRunState {
+    var state = TextRunState{ .color_spaces = color_spaces };
+    const selection = colorSpaceSelectionFromName(color_spaces, "DeviceGray");
+    state.fill_color_space = selection;
+    state.stroke_color_space = selection;
+    state.fill_color = initialColorForColorSpace(selection.value);
+    state.stroke_color = state.fill_color;
+    return state;
+}
+
+fn selectFillDeviceColorSpace(state: anytype, kind: ColorSpaceKind, components: [4]f64) void {
+    const name = switch (kind) {
+        .device_gray => "DeviceGray",
+        .device_rgb => "DeviceRGB",
+        .device_cmyk => "DeviceCMYK",
+        .pattern, .unsupported => unreachable,
+    };
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.fill_color_space = selection;
+    state.fill_pattern_name = null;
+    state.fill_color = renderColorSpaceComponents(selection.value, components);
+}
+
+fn selectStrokeDeviceColorSpace(state: anytype, kind: ColorSpaceKind, components: [4]f64) void {
+    const name = switch (kind) {
+        .device_gray => "DeviceGray",
+        .device_rgb => "DeviceRGB",
+        .device_cmyk => "DeviceCMYK",
+        .pattern, .unsupported => unreachable,
+    };
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.stroke_color_space = selection;
+    state.stroke_pattern_name = null;
+    state.stroke_color = renderColorSpaceComponents(selection.value, components);
+}
+
+fn clampColorComponent(value: f64, range: ColorComponentRange) f64 {
+    return @min(range.max, @max(range.min, value));
+}
+
+fn mapUnitToComponentRange(unit: f64, range: ColorComponentRange) f64 {
+    return range.min + std.math.clamp(unit, 0.0, 1.0) * (range.max - range.min);
+}
+
+fn renderBaseColorSpaceComponents(color_space: ColorSpaceValue, components: [4]f64) [4]u8 {
+    var clamped = components;
+    for (0..colorSpaceComponentCount(color_space.kind)) |index|
+        clamped[index] = clampColorComponent(clamped[index], color_space.ranges[index]);
+    if (color_space.calibrated) |calibrated| return calibratedColor(calibrated, clamped);
+    return switch (color_space.kind) {
+        .device_gray => grayColor(clamped[0]),
+        .device_rgb => rgbColor(clamped[0], clamped[1], clamped[2]),
+        .device_cmyk => cmykColor(clamped[0], clamped[1], clamped[2], clamped[3]),
+        .pattern, .unsupported => .{ 0, 0, 0, 0xff },
+    };
+}
+
+fn renderColorSpaceComponents(color_space: ColorSpaceValue, components: [4]f64) [4]u8 {
+    const tint = color_space.tint orelse return renderBaseColorSpaceComponents(color_space, components);
+    const t = std.math.clamp(components[0], 0.0, 1.0);
+    var alternate_components = [4]f64{ 0, 0, 0, 0 };
+    switch (tint.function) {
+        .exponential => |function| {
+            const factor = std.math.pow(f64, t, function.exponent);
+            for (0..colorSpaceComponentCount(tint.alternate_kind)) |index| {
+                const value = function.c0[index] + factor * (function.c1[index] - function.c0[index]);
+                alternate_components[index] = if (function.has_function_ranges)
+                    clampColorComponent(value, function.function_ranges[index])
+                else
+                    value;
+            }
+        },
+        .sampled => |function| {
+            for (0..function.output_components) |index| {
+                alternate_components[index] = evalSampledTintComponent(function, t, index);
+            }
+        },
+    }
+    return renderBaseColorSpaceComponents(.{
+        .kind = tint.alternate_kind,
+        .ranges = tint.alternate_ranges,
+        .calibrated = tint.alternate_calibrated,
+    }, alternate_components);
+}
+
+fn initialColorForColorSpace(color_space: ColorSpaceValue) [4]u8 {
+    return renderColorSpaceComponents(color_space, color_space.initial_components);
+}
+
+fn solidShapePaintAvailable(color_space: ColorSpaceKind) !bool {
+    return switch (color_space) {
+        .device_gray, .device_rgb, .device_cmyk => true,
+        // Pattern paint is emitted by the resource-aware pattern pass.
+        .pattern => false,
+        .unsupported => error.UnsupportedPdfRendering,
+    };
+}
+
+fn textPaintChannelAvailable(color_space: ColorSpaceKind, pattern_name: ?[]const u8) !bool {
+    return switch (color_space) {
+        .device_gray, .device_rgb, .device_cmyk => true,
+        .pattern => pattern_name != null,
+        .unsupported => error.UnsupportedPdfRendering,
+    };
+}
+
+fn effectiveTextRenderMode(state: TextRunState) !i64 {
+    const mode = @mod(state.render_mode, 8);
+    const uses_fill = mode == 0 or mode == 2 or mode == 4 or mode == 6;
+    const uses_stroke = mode == 1 or mode == 2 or mode == 5 or mode == 6;
+    const fill = uses_fill and try textPaintChannelAvailable(state.fill_color_space.kind, state.fill_pattern_name);
+    const stroke = uses_stroke and try textPaintChannelAvailable(state.stroke_color_space.kind, state.stroke_pattern_name);
+    const paint_mode: i64 = if (fill and stroke)
+        2
+    else if (fill)
+        0
+    else if (stroke)
+        1
+    else
+        3;
+    return paint_mode + if (mode >= 4) @as(i64, 4) else 0;
+}
+
+/// A selected tiling pattern owns the outer Pattern color-space state, but
+/// its cell content is a separate content stream. The current RGBA values are
+/// already resolved at `scn`/`SCN` time and are the inherited base paint for
+/// an uncolored (PaintType 2) cell. Materialize those values as device paint
+/// while parsing the cell so ordinary paths, text, and image masks remain
+/// visible. A nested `/Pattern cs` in the cell will select Pattern again.
+fn materializePatternCellColorSpace(color_space: ColorSpaceSelection) ColorSpaceSelection {
+    return switch (color_space.kind) {
+        .pattern => colorSpaceSelectionForKind(.device_rgb),
+        else => color_space,
+    };
+}
+
+fn selectFillColorSpace(state: anytype, name: []const u8) void {
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.fill_color_space = selection;
+    state.fill_color = initialColorForColorSpace(selection.value);
+    // Pattern's initial color paints nothing until scn selects a pattern.
+    state.fill_pattern_name = null;
+}
+
+fn selectStrokeColorSpace(state: anytype, name: []const u8) void {
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.stroke_color_space = selection;
+    state.stroke_color = initialColorForColorSpace(selection.value);
+    state.stroke_pattern_name = null;
+}
+
 const GraphicsState = struct {
     matrix: GraphicsMatrix = .{},
     fill_color: [4]u8 = .{ 0, 0, 0, 0xff },
@@ -1767,12 +2483,16 @@ const GraphicsState = struct {
     fill_alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     blend_mode: BlendMode = .normal,
+    soft_mask: ?PageSoftMask = null,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
     group_isolated: bool = true,
     group_knockout: bool = false,
-    fill_color_space: []const u8 = "DeviceGray",
-    stroke_color_space: []const u8 = "DeviceGray",
+    group_alpha: u8 = 0xff,
+    group_blend_mode: BlendMode = .normal,
+    fill_color_space: ColorSpaceSelection = colorSpaceSelectionForKind(.device_gray),
+    stroke_color_space: ColorSpaceSelection = colorSpaceSelectionForKind(.device_gray),
+    color_spaces: []const PageColorSpace = &.{},
     fill_pattern_name: ?[]const u8 = null,
     stroke_pattern_name: ?[]const u8 = null,
     line_cap: @FieldType(ShapeRun, "line_cap") = .butt,
@@ -1815,6 +2535,7 @@ const PageImage = struct {
     height: u32,
     interpolate: bool = false,
     bilevel: bool = false,
+    image_mask: bool = false,
 
     fn deinit(self: *PageImage, alloc: Allocator) void {
         alloc.free(self.name);
@@ -1852,15 +2573,15 @@ fn buildBilevelFallbackSample(rgba: []const u8, cancellation: CancellationProbe)
 /// never consumes these summaries and therefore avoids an additional O(pixels)
 /// pass over every one-bit image. Reused XObjects share a decoded RGBA buffer;
 /// keying by that immutable buffer computes each summary once per page.
-pub fn prepareOcrBilevelFallbacksAlloc(
+fn prepareOcrImageRunsWithSummariesAlloc(
     alloc: Allocator,
     image_runs: []ImageRun,
+    summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
     cancellation: CancellationProbe,
 ) !void {
-    var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
-    defer summaries.deinit(alloc);
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
+        run.ocr_coverage_minify = run.bilevel;
         if (!run.bilevel or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
         const entry = try summaries.getOrPut(alloc, key);
@@ -1874,6 +2595,51 @@ pub fn prepareOcrBilevelFallbacksAlloc(
     }
 }
 
+fn prepareOcrPatternRunsWithSummariesAlloc(
+    alloc: Allocator,
+    pattern_runs: []PatternRun,
+    summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    cancellation: CancellationProbe,
+    depth: u8,
+) !void {
+    // Resource collection currently retains at most two nested pattern
+    // levels. Keep a defensive ceiling so future collectors cannot turn OCR
+    // preparation into unbounded recursion.
+    if (depth >= 8) return;
+    for (pattern_runs, 0..) |*pattern, index| {
+        if (index & 63 == 0) try cancellation.check();
+        if (pattern.stencil_mask) |*mask|
+            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, cancellation);
+        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, cancellation);
+        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, cancellation, depth + 1);
+    }
+}
+
+/// Prepare every bilevel resource reachable by OCR rendering, including
+/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Shared decoded XObjects use one summary regardless of how many occurrences
+/// reference them.
+pub fn prepareOcrRenderRunsAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    pattern_runs: []PatternRun,
+    cancellation: CancellationProbe,
+) !void {
+    var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
+    defer summaries.deinit(alloc);
+    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, cancellation);
+    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, cancellation, 0);
+}
+
+/// Compatibility helper for callers that render only standalone images.
+pub fn prepareOcrBilevelFallbacksAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    cancellation: CancellationProbe,
+) !void {
+    return prepareOcrRenderRunsAlloc(alloc, image_runs, &.{}, cancellation);
+}
+
 const PageShading = struct {
     name: []u8,
     kind: @FieldType(ShadingRun, "kind"),
@@ -1885,6 +2651,12 @@ const PageShading = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
+    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
+    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_sample_count: u8 = 0,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
 
@@ -1899,9 +2671,27 @@ const PageExtGState = struct {
     fill_alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     blend_mode: BlendMode = .normal,
+    soft_mask: ?PageSoftMask = null,
+    soft_mask_specified: bool = false,
 
     fn deinit(self: *PageExtGState, alloc: Allocator) void {
+        if (self.soft_mask) |*mask| mask.deinit(alloc);
         alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const PageSoftMask = struct {
+    rgba: []u8,
+    shared_rgba: *SharedImageRgba,
+    width: u32,
+    height: u32,
+    luminosity: bool,
+    interpolate: bool,
+    matrix: GraphicsMatrix,
+
+    fn deinit(self: *PageSoftMask, alloc: Allocator) void {
+        self.shared_rgba.release(alloc);
         self.* = undefined;
     }
 };
@@ -1921,6 +2711,7 @@ const PagePattern = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *PagePattern, alloc: Allocator) void {
@@ -1937,6 +2728,8 @@ const PagePattern = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -1956,6 +2749,7 @@ const PageForm = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *PageForm, alloc: Allocator) void {
@@ -1971,6 +2765,8 @@ const PageForm = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -1979,13 +2775,158 @@ const PageForm = struct {
 
 const ExponentialTintTransform = struct {
     n: f64,
+    domain_min: f64,
+    domain_max: f64,
     c0: []f64,
     c1: []f64,
+    ranges: ?[]ColorComponentRange = null,
 
     fn deinit(self: *ExponentialTintTransform, alloc: Allocator) void {
         alloc.free(self.c0);
         alloc.free(self.c1);
+        if (self.ranges) |ranges| alloc.free(ranges);
         self.* = undefined;
+    }
+};
+
+/// Bounded representation of the one-input functions permitted by axial and
+/// radial shadings. Stitching functions own their children recursively, while
+/// sampled functions retain the already size-checked decoded table.
+const ShadingColorFunction = union(enum) {
+    exponential: ExponentialTintTransform,
+    sampled: *GraphicsSampledTintTransform,
+    stitching: *ShadingStitchingFunction,
+
+    fn deinit(self: *ShadingColorFunction, alloc: Allocator) void {
+        switch (self.*) {
+            .exponential => |*function| function.deinit(alloc),
+            .sampled => |function| function.deinit(alloc),
+            .stitching => |function| function.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+
+    fn evaluate(self: *const ShadingColorFunction, input: f64, output: []f64) void {
+        switch (self.*) {
+            .exponential => |*function| {
+                for (output, 0..) |*value, component|
+                    value.* = evalExponentialTintComponent(function, input, component);
+            },
+            .sampled => |function| {
+                for (output, 0..) |*value, component|
+                    value.* = evalSampledTintComponent(function, input, component);
+            },
+            .stitching => |function| function.evaluate(input, output),
+        }
+    }
+
+    fn domain(self: *const ShadingColorFunction) [2]f64 {
+        return switch (self.*) {
+            .exponential => |function| .{ function.domain_min, function.domain_max },
+            .sampled => |function| .{ function.domain_min, function.domain_max },
+            .stitching => |function| .{ function.domain_min, function.domain_max },
+        };
+    }
+
+    /// Append every reachable stitching boundary in the root function's input
+    /// coordinates. The affine mapping is inverted at each stitching child so
+    /// nested and reversed /Encode ranges retain their discontinuities without
+    /// growing an unbounded recursive breakpoint table.
+    fn appendDiscontinuities(
+        self: *const ShadingColorFunction,
+        out: *[shading_discontinuity_capacity]f64,
+        count: *usize,
+        root_scale: f64,
+        root_offset: f64,
+        reachable_min: f64,
+        reachable_max: f64,
+    ) !void {
+        const domain_value = self.domain();
+        const active_min = @max(reachable_min, domain_value[0]);
+        const active_max = @min(reachable_max, domain_value[1]);
+        if (!(active_min < active_max)) return;
+
+        const stitching = switch (self.*) {
+            .stitching => |function| function,
+            else => return,
+        };
+        for (stitching.bounds) |bound| {
+            if (bound <= active_min or bound >= active_max) continue;
+            try appendUniqueShadingDiscontinuity(out, count, root_scale * bound + root_offset);
+        }
+        for (stitching.functions, 0..) |*child, index| {
+            const segment_min = if (index == 0) stitching.domain_min else stitching.bounds[index - 1];
+            const segment_max = if (index == stitching.functions.len - 1) stitching.domain_max else stitching.bounds[index];
+            const child_parent_min = @max(active_min, segment_min);
+            const child_parent_max = @min(active_max, segment_max);
+            if (!(child_parent_min < child_parent_max)) continue;
+
+            const encode_min = stitching.encode[index * 2];
+            const encode_max = stitching.encode[index * 2 + 1];
+            const encode_delta = encode_max - encode_min;
+            if (encode_delta == 0) continue;
+            const segment_delta = segment_max - segment_min;
+            const encoded_active_min = encode_min +
+                ((child_parent_min - segment_min) / segment_delta) * encode_delta;
+            const encoded_active_max = encode_min +
+                ((child_parent_max - segment_min) / segment_delta) * encode_delta;
+            const child_root_scale = root_scale * segment_delta / encode_delta;
+            const child_root_offset = root_offset + root_scale *
+                (segment_min - encode_min * segment_delta / encode_delta);
+            try child.appendDiscontinuities(
+                out,
+                count,
+                child_root_scale,
+                child_root_offset,
+                @min(encoded_active_min, encoded_active_max),
+                @max(encoded_active_min, encoded_active_max),
+            );
+        }
+    }
+};
+
+fn appendUniqueShadingDiscontinuity(
+    out: *[shading_discontinuity_capacity]f64,
+    count: *usize,
+    value: f64,
+) !void {
+    if (!std.math.isFinite(value)) return error.UnsupportedPdfRendering;
+    for (out[0..count.*]) |existing| if (existing == value) return;
+    if (count.* >= out.len) return error.UnsupportedPdfRendering;
+    out[count.*] = value;
+    count.* += 1;
+}
+
+const ShadingStitchingFunction = struct {
+    functions: []ShadingColorFunction,
+    bounds: []f64,
+    encode: []f64,
+    domain_min: f64,
+    domain_max: f64,
+
+    fn deinit(self: *ShadingStitchingFunction, alloc: Allocator) void {
+        for (self.functions) |*function| function.deinit(alloc);
+        alloc.free(self.functions);
+        alloc.free(self.bounds);
+        alloc.free(self.encode);
+        alloc.destroy(self);
+    }
+
+    fn evaluate(self: *const ShadingStitchingFunction, input: f64, output: []f64) void {
+        const clamped = std.math.clamp(input, self.domain_min, self.domain_max);
+        var function_index: usize = self.functions.len - 1;
+        for (self.bounds, 0..) |bound, index| {
+            if (clamped < bound) {
+                function_index = index;
+                break;
+            }
+        }
+        const lower = if (function_index == 0) self.domain_min else self.bounds[function_index - 1];
+        const upper = if (function_index == self.functions.len - 1) self.domain_max else self.bounds[function_index];
+        const fraction = if (upper > lower) (clamped - lower) / (upper - lower) else 0;
+        const encoded = self.encode[function_index * 2] +
+            fraction * (self.encode[function_index * 2 + 1] - self.encode[function_index * 2]);
+        self.functions[function_index].evaluate(encoded, output);
     }
 };
 
@@ -2010,7 +2951,7 @@ const PositionedTextParser = struct {
     output: PositionedTextOutput,
     cancellation: CancellationProbe = .{},
     operands: std.ArrayList(syntax.Object) = .empty,
-    retained_names: std.ArrayList(syntax.Object) = .empty,
+    retained_pattern_names: ContentNameInterner = .{},
     state: TextRunState = .{},
     stack: std.ArrayList(TextRunStackEntry) = .empty,
     current_path: std.ArrayList([2]f64) = .empty,
@@ -2019,6 +2960,10 @@ const PositionedTextParser = struct {
     current_clip_fill_rule: FillRule = .nonzero,
     paint_order: usize = 0,
     next_group_id: u32 = 1,
+    /// Native page rendering can retain a short-lived borrow of a Form's
+    /// local font resources and outline its text before those resources are
+    /// released. Public text-analysis APIs leave this disabled.
+    vectorize_form_text: bool = false,
 
     fn init(
         alloc: Allocator,
@@ -2041,8 +2986,7 @@ const PositionedTextParser = struct {
     fn deinit(self: *PositionedTextParser) void {
         clearContentOperands(self.alloc, &self.operands);
         self.operands.deinit(self.alloc);
-        for (self.retained_names.items) |*name| name.deinit(self.alloc);
-        self.retained_names.deinit(self.alloc);
+        self.retained_pattern_names.deinit(self.alloc);
         for (self.stack.items) |*entry| entry.deinit(self.alloc);
         self.stack.deinit(self.alloc);
         self.current_path.deinit(self.alloc);
@@ -2076,6 +3020,7 @@ const PositionedTextParser = struct {
                     self.alloc,
                     self.output,
                     &self.state,
+                    &self.retained_pattern_names,
                     &self.stack,
                     &self.current_path,
                     &self.current_path_closed,
@@ -2087,10 +3032,11 @@ const PositionedTextParser = struct {
                     &self.paint_order,
                     &self.next_group_id,
                     self.cancellation,
+                    self.vectorize_form_text,
                     lex.keyword,
                     self.operands.items,
                 );
-                try clearContentOperandsRetainingNames(self.alloc, &self.operands, &self.retained_names);
+                clearContentOperands(self.alloc, &self.operands);
                 continue;
             }
 
@@ -2191,6 +3137,8 @@ fn extractImageRunsFromContentAppendWithStateCancelable(
     var current_path = std.ArrayList([2]f64).empty;
     defer current_path.deinit(alloc);
     var current_path_closed = false;
+    var current_subpath_start: ?[2]f64 = null;
+    var current_bridge_return: ?[2]f64 = null;
     var current_clip_points = std.ArrayList([2]f64).empty;
     defer current_clip_points.deinit(alloc);
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
@@ -2208,7 +3156,7 @@ fn extractImageRunsFromContentAppendWithStateCancelable(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyImageOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, images, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
+            try applyImageOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_subpath_start, &current_bridge_return, &current_clip_points, &current_clip_fill_rule, images, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
             for (operands.items) |*obj| obj.deinit(alloc);
             operands.clearRetainingCapacity();
             continue;
@@ -2251,17 +3199,19 @@ fn extractPatternRunsFromContentAppend(
     alloc: Allocator,
     out: *std.ArrayList(PatternRun),
     bytes: []const u8,
+    images: []const PageImage,
     patterns: []const PagePattern,
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
-    return try extractPatternRunsFromContentAppendCancelable(alloc, out, bytes, patterns, gstates, forms, .{});
+    return try extractPatternRunsFromContentAppendCancelable(alloc, out, bytes, images, patterns, gstates, forms, .{});
 }
 
 fn extractPatternRunsFromContentAppendCancelable(
     alloc: Allocator,
     out: *std.ArrayList(PatternRun),
     bytes: []const u8,
+    images: []const PageImage,
     patterns: []const PagePattern,
     gstates: []const PageExtGState,
     forms: []const PageForm,
@@ -2269,7 +3219,7 @@ fn extractPatternRunsFromContentAppendCancelable(
 ) !void {
     var paint_order: usize = 0;
     var next_group_id: u32 = 1;
-    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, patterns, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, cancellation);
+    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, images, patterns, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, cancellation);
 }
 
 fn extractShadingRunsFromContentAppend(
@@ -2382,6 +3332,7 @@ fn extractPatternRunsFromContentAppendWithState(
     alloc: Allocator,
     out: *std.ArrayList(PatternRun),
     bytes: []const u8,
+    images: []const PageImage,
     patterns: []const PagePattern,
     gstates: []const PageExtGState,
     forms: []const PageForm,
@@ -2393,13 +3344,14 @@ fn extractPatternRunsFromContentAppendWithState(
     paint_order: *usize,
     next_group_id: *u32,
 ) anyerror!void {
-    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, patterns, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, initial_dash_array, initial_dash_phase, paint_order, next_group_id, .{});
+    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, images, patterns, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, initial_dash_array, initial_dash_phase, paint_order, next_group_id, .{});
 }
 
 fn extractPatternRunsFromContentAppendWithStateCancelable(
     alloc: Allocator,
     out: *std.ArrayList(PatternRun),
     bytes: []const u8,
+    images: []const PageImage,
     patterns: []const PagePattern,
     gstates: []const PageExtGState,
     forms: []const PageForm,
@@ -2420,12 +3372,6 @@ fn extractPatternRunsFromContentAppendWithStateCancelable(
         for (operands.items) |*obj| obj.deinit(alloc);
         operands.deinit(alloc);
     }
-    var retained_names = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (retained_names.items) |*name| name.deinit(alloc);
-        retained_names.deinit(alloc);
-    }
-
     var state = initial_state;
     var stack = std.ArrayList(ShapeStackEntry).empty;
     defer {
@@ -2456,8 +3402,8 @@ fn extractPatternRunsFromContentAppendWithStateCancelable(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyPatternOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, patterns, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
-            try clearContentOperandsRetainingNames(alloc, &operands, &retained_names);
+            try applyPatternOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, images, patterns, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
+            clearContentOperands(alloc, &operands);
             continue;
         }
 
@@ -2511,12 +3457,6 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
         for (operands.items) |*obj| obj.deinit(alloc);
         operands.deinit(alloc);
     }
-    var retained_names = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (retained_names.items) |*name| name.deinit(alloc);
-        retained_names.deinit(alloc);
-    }
-
     var state = initial_state;
     var stack = std.ArrayList(ShapeStackEntry).empty;
     defer {
@@ -2529,6 +3469,10 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
     var current_dash = std.ArrayList(f64).empty;
     defer current_dash.deinit(alloc);
     var dash_phase: f64 = initial_dash_phase;
+    var current_subpath_starts = std.ArrayList(usize).empty;
+    defer current_subpath_starts.deinit(alloc);
+    var current_subpath_closed = std.ArrayList(bool).empty;
+    defer current_subpath_closed.deinit(alloc);
     var current_clip_points = std.ArrayList([2]f64).empty;
     defer current_clip_points.deinit(alloc);
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
@@ -2547,8 +3491,8 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyShapeOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
-            try clearContentOperandsRetainingNames(alloc, &operands, &retained_names);
+            try applyShapeOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_subpath_starts, &current_subpath_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
+            clearContentOperands(alloc, &operands);
             continue;
         }
 
@@ -2603,28 +3547,60 @@ fn rc4Crypt(key: []const u8, bytes: []u8) void {
     }
 }
 
-fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+fn decryptAesV2AllocWithLimits(
+    alloc: Allocator,
+    encrypted: []const u8,
+    key: [16]u8,
+    max_plaintext_bytes: usize,
+    max_working_bytes: usize,
+) ![]u8 {
     if (encrypted.len < 32 or (encrypted.len - 16) % 16 != 0) return error.InvalidEncryptedPdf;
     const ciphertext = encrypted[16..];
-    var plaintext = try alloc.alloc(u8, ciphertext.len);
-    errdefer alloc.free(plaintext);
     const aes = std.crypto.core.aes.Aes128.initDec(key);
+
+    // Determine PKCS#7 padding from the final CBC block before allocating.
+    // This makes the only heap allocation exactly the returned plaintext size;
+    // no allocator-dependent realloc/remap peak can escape the working limit.
+    const last_offset = ciphertext.len - 16;
+    const last_block: [16]u8 = ciphertext[last_offset..][0..16].*;
+    const last_previous: [16]u8 = if (last_offset == 0)
+        encrypted[0..16].*
+    else
+        ciphertext[last_offset - 16 ..][0..16].*;
+    var decoded_last: [16]u8 = undefined;
+    aes.decrypt(&decoded_last, &last_block);
+    for (&decoded_last, last_previous) |*value, prior| value.* ^= prior;
+    const padding = decoded_last[15];
+    if (padding == 0 or padding > 16) return error.InvalidEncryptedPdf;
+    for (decoded_last[16 - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
+    const plaintext_len = ciphertext.len - padding;
+    if (plaintext_len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+    if (plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
+
+    const plaintext = try alloc.alloc(u8, plaintext_len);
+    errdefer alloc.free(plaintext);
     var previous: [16]u8 = encrypted[0..16].*;
     var offset: usize = 0;
-    while (offset < ciphertext.len) : (offset += 16) {
+    while (offset < plaintext_len) : (offset += 16) {
         const block: [16]u8 = ciphertext[offset..][0..16].*;
         var decoded: [16]u8 = undefined;
         aes.decrypt(&decoded, &block);
         for (&decoded, previous) |*value, prior| value.* ^= prior;
-        plaintext[offset..][0..16].* = decoded;
+        const copy_len = @min(@as(usize, 16), plaintext_len - offset);
+        @memcpy(plaintext[offset..][0..copy_len], decoded[0..copy_len]);
         previous = block;
     }
-    const padding = plaintext[plaintext.len - 1];
-    if (padding == 0 or padding > 16 or padding > plaintext.len) return error.InvalidEncryptedPdf;
-    for (plaintext[plaintext.len - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
-    const result = try alloc.dupe(u8, plaintext[0 .. plaintext.len - padding]);
-    alloc.free(plaintext);
-    return result;
+    return plaintext;
+}
+
+fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+    return try decryptAesV2AllocWithLimits(
+        alloc,
+        encrypted,
+        key,
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+    );
 }
 
 fn decryptRc4Alloc(alloc: Allocator, encrypted: []const u8, key: ObjectEncryptionKey) ![]u8 {
@@ -2671,8 +3647,15 @@ pub const Reader = struct {
     font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
     image_cache: ?*DecodedImageCache = null,
     encryption: ?EncryptionContext = null,
-    decrypted_streams: *std.AutoHashMapUnmanaged(usize, []u8),
+    /// Stream payloads are decrypted lazily so decode limits can be applied
+    /// before allocating. The object reference is all that is retained: it is
+    /// needed to derive the per-object encryption key at raw-read time.
+    encrypted_streams: *std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
     image_decode_target: ?ImageDecodeTarget = null,
+    /// Resource dictionary that gives names and Default* substitutions their
+    /// dynamic meaning while an image XObject is decoded. Scoped Reader
+    /// copies carry this through soft/explicit mask recursion.
+    image_color_space_resources: ?*const syntax.Object = null,
     render_target: ?RenderTarget = null,
     last_render_diagnostics: ?PageRenderDiagnostics = null,
     cancellation: CancellationProbe = .{},
@@ -2802,13 +3785,13 @@ pub const Reader = struct {
         };
         image_cache.* = .{};
 
-        const decrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, []u8)) catch |err| {
+        const encrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef)) catch |err| {
             alloc.destroy(image_cache);
             alloc.destroy(font_cache);
             alloc.free(xref_entries);
             return err;
         };
-        decrypted_streams.* = .empty;
+        encrypted_streams.* = .empty;
 
         const owned_trailer = trailer.?;
         trailer = null;
@@ -2825,7 +3808,7 @@ pub const Reader = struct {
             .font_cache = font_cache,
             .image_cache = image_cache,
             .encryption = null,
-            .decrypted_streams = decrypted_streams,
+            .encrypted_streams = encrypted_streams,
             .cancellation = cancellation,
         };
         errdefer reader.deinit();
@@ -2848,10 +3831,8 @@ pub const Reader = struct {
             cache.deinit(self.alloc);
             self.alloc.destroy(cache);
         }
-        var stream_iter = self.decrypted_streams.valueIterator();
-        while (stream_iter.next()) |stream| self.alloc.free(stream.*);
-        self.decrypted_streams.deinit(self.alloc);
-        self.alloc.destroy(self.decrypted_streams);
+        self.encrypted_streams.deinit(self.alloc);
+        self.alloc.destroy(self.encrypted_streams);
         self.alloc.free(self.xref_entries);
         self.trailer.deinit(self.alloc);
         self.* = undefined;
@@ -2980,17 +3961,10 @@ pub const Reader = struct {
             .dict => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
             .stream => |stream| {
                 for (stream.header) |*entry| try self.decryptObject(&entry.value, ptr);
-                if (!self.decrypted_streams.contains(stream.data_offset)) {
-                    const data_length = try self.resolvedStreamDataLength(obj);
-                    const end = std.math.add(usize, stream.data_offset, data_length) catch return error.InvalidObjectOffset;
-                    if (end > self.bytes.len) return error.InvalidObjectOffset;
-                    const decrypted = switch (context.method) {
-                        .rc4 => try decryptRc4Alloc(self.alloc, self.bytes[stream.data_offset..end], key),
-                        .aesv2 => try decryptAesV2Alloc(self.alloc, self.bytes[stream.data_offset..end], key.bytes),
-                    };
-                    errdefer self.alloc.free(decrypted);
-                    try self.decrypted_streams.put(self.alloc, stream.data_offset, decrypted);
-                }
+                // Do not decrypt or retain stream payloads during object
+                // resolution. The downstream raw read knows both its terminal
+                // output allowance and its complete working-set allowance.
+                try self.encrypted_streams.put(self.alloc, stream.data_offset, ptr);
             },
             else => {},
         }
@@ -3012,9 +3986,13 @@ pub const Reader = struct {
         if (parsed != .obj_def) return error.ExpectedIndirectObject;
         if (parsed.obj_def.ptr.id != ptr.id or parsed.obj_def.ptr.gen != ptr.gen) return error.ObjectPointerMismatch;
 
-        const value = try parsed.obj_def.value.clone(self.alloc);
-        parsed.deinit(self.alloc);
-        var decrypted = value;
+        // Transfer the parsed value out of the indirect-object wrapper instead
+        // of deep-cloning it. Besides avoiding redundant work for every object,
+        // this keeps bounded metadata parsing from briefly retaining two full
+        // copies of attacker-controlled dictionaries or strings.
+        var decrypted = parsed.obj_def.value.*;
+        self.alloc.destroy(parsed.obj_def.value);
+        parsed = .null;
         errdefer decrypted.deinit(self.alloc);
         if (self.encryption != null) try self.decryptObject(&decrypted, ptr);
         return decrypted;
@@ -3025,17 +4003,44 @@ pub const Reader = struct {
     }
 
     fn readRawStreamDataWithLimit(self: *const Reader, obj: *const syntax.Object, max_bytes: usize) ![]u8 {
+        return try self.readRawStreamDataWithLimits(obj, max_bytes, max_bytes);
+    }
+
+    fn readRawStreamDataWithLimits(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        max_output_bytes: usize,
+        max_working_bytes: usize,
+    ) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
-        if (self.decrypted_streams.get(stream_value.data_offset)) |decrypted| {
-            if (decrypted.len > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
-            return try self.alloc.dupe(u8, decrypted);
-        }
         const data_length = try self.resolvedStreamDataLength(obj);
-        if (data_length > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
         const end = std.math.add(usize, stream_value.data_offset, data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
-        return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
+        const encoded = self.bytes[stream_value.data_offset..end];
+
+        if (self.encrypted_streams.get(stream_value.data_offset)) |ptr| {
+            const context = self.encryption orelse return error.InvalidEncryptedPdf;
+            const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
+            return switch (context.method) {
+                .rc4 => blk: {
+                    if (encoded.len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+                    if (encoded.len > max_output_bytes) return error.DecodedStreamTooLarge;
+                    break :blk try decryptRc4Alloc(self.alloc, encoded, key);
+                },
+                .aesv2 => try decryptAesV2AllocWithLimits(
+                    self.alloc,
+                    encoded,
+                    key.bytes,
+                    max_output_bytes,
+                    max_working_bytes,
+                ),
+            };
+        }
+
+        if (data_length > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+        if (data_length > max_output_bytes) return error.DecodedStreamTooLarge;
+        return try self.alloc.dupe(u8, encoded);
     }
 
     fn resolvedStreamDataLength(self: *const Reader, obj: *const syntax.Object) !usize {
@@ -3057,10 +4062,44 @@ pub const Reader = struct {
     }
 
     fn readDecodedStreamDataWithLimits(self: *const Reader, obj: *const syntax.Object, decode_limits: DecodeLimits) ![]u8 {
+        return try self.readDecodedStreamDataWithLimitsAndFinalLimit(obj, decode_limits, null);
+    }
+
+    fn readDecodedStreamDataWithLimitsAndFinalLimit(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        decode_limits: DecodeLimits,
+        final_output_limit: ?usize,
+    ) ![]u8 {
         try self.checkCancellation();
         if (obj.* != .stream) return error.NotAStream;
-        const raw = try self.readRawStreamDataWithLimit(obj, decode_limits.max_working_set_bytes);
-        const decoded = try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits, self.cancellation);
+        const filter_obj = obj.get("Filter");
+        const has_filters = if (filter_obj) |filter| switch (filter.*) {
+            .array => |items| items.len != 0,
+            else => true,
+        } else false;
+        const bounded_final_limit = if (final_output_limit) |limit|
+            @min(limit, decode_limits.max_decoded_stream_bytes)
+        else
+            null;
+        const raw_output_limit = if (!has_filters and bounded_final_limit != null)
+            @min(decode_limits.max_working_set_bytes, bounded_final_limit.?)
+        else
+            decode_limits.max_working_set_bytes;
+        const raw = try self.readRawStreamDataWithLimits(
+            obj,
+            raw_output_limit,
+            decode_limits.max_working_set_bytes,
+        );
+        const decoded = try decodeStreamFiltersOwnedAllocWithFinalLimit(
+            self.alloc,
+            raw,
+            filter_obj,
+            obj.get("DecodeParms"),
+            decode_limits,
+            bounded_final_limit,
+            self.cancellation,
+        );
         errdefer self.alloc.free(decoded);
         try self.checkCancellation();
         return decoded;
@@ -3088,44 +4127,47 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const forms = try self.collectPageTextFormsAlloc(&page);
+        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
         var canonical = std.ArrayList(u8).empty;
         defer canonical.deinit(self.alloc);
         var layout_runs = std.ArrayList(LayoutTextRun).empty;
         defer layout_runs.deinit(self.alloc);
         defer for (layout_runs.items) |*run| run.deinit(self.alloc);
-        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{}, &.{}, .nonzero);
+        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer layout_parser.deinit();
         layout_parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
+        for (stream_ranges.?) |range| {
+            const stream_content = decoded_content[range.start..range.end];
             // Keep the pre-reconstruction extraction contract as the byte
             // preservation baseline. Real-world PDFs sometimes package
             // independently generated content streams whose inherited font
             // state would otherwise decode (and drop) different glyphs.
             var text_parser = TextContentParser.init(self.alloc, &canonical);
             defer text_parser.deinit();
-            try text_parser.consume(decoded, fonts, forms, 0);
-            try layout_parser.consume(decoded, fonts, &.{}, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
+            try layout_parser.consume(stream_content, fonts, &.{}, forms);
         }
 
         var owned_text = try canonical.toOwnedSlice(self.alloc);
@@ -3152,28 +4194,37 @@ pub const Reader = struct {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const contents = page.get("Contents") orelse return .{
+            .text = try self.alloc.dupe(u8, ""),
+            .runs = try self.alloc.alloc(TextRun, 0),
+            .outline_fallback = false,
+        };
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return .{
-            .text = try self.alloc.dupe(u8, ""),
-            .runs = try self.alloc.alloc(TextRun, 0),
-            .outline_fallback = pageFontsUsedOutlineFallback(fonts),
-        };
-        var analysis = try self.extractContentsTextAnalysisAlloc(contents, fonts, gstates, forms);
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
         return analysis;
     }
@@ -3183,25 +4234,34 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(TextRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(TextRun, 0);
-        return try self.extractContentsTextRunsAlloc(contents, fonts, gstates, forms);
+        return try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
     }
 
     pub fn extractPageImageRunsAlloc(self: *Reader, page_num: usize) ![]ImageRun {
@@ -3209,25 +4269,32 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ImageRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
-        const images = try self.collectPageImagesAlloc(&page);
+        const images = try self.collectPageImagesForContentAlloc(&page, decoded_content);
         defer {
             for (images) |*image| image.deinit(self.alloc);
             self.alloc.free(images);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ImageRun, 0);
-        return try self.extractContentsImageRunsAlloc(contents, images, gstates, forms);
+        return try self.extractDecodedImageRunsAlloc(decoded_content, images, gstates, forms, color_spaces);
     }
 
     pub fn extractPageShadingRunsAlloc(self: *Reader, page_num: usize) ![]ShadingRun {
@@ -3235,25 +4302,32 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShadingRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
-        const shadings = try self.collectPageShadingsAlloc(&page);
+        const shadings = try self.collectPageShadingsForContentAlloc(&page, decoded_content);
         defer {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShadingRun, 0);
-        return try self.extractContentsShadingRunsAlloc(contents, shadings, gstates, forms);
+        return try self.extractDecodedShadingRunsAlloc(decoded_content, shadings, gstates, forms, color_spaces);
     }
 
     pub fn extractPagePatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
@@ -3261,25 +4335,37 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
-        const patterns = try self.collectPagePatternsAlloc(&page);
+        const images = try self.collectPageImagesForContentAlloc(&page, decoded_content);
+        defer {
+            for (images) |*image| image.deinit(self.alloc);
+            self.alloc.free(images);
+        }
+        const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
-        return try self.extractContentsPatternRunsAlloc(contents, patterns, gstates, forms);
+        return try self.extractDecodedPatternRunsAlloc(decoded_content, images, patterns, gstates, forms, color_spaces);
     }
 
     pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
@@ -3297,7 +4383,7 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         try self.checkCancellation();
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
@@ -3309,7 +4395,7 @@ pub const Reader = struct {
             self.alloc.free(images);
         }
         try self.checkCancellation();
-        const shadings = try self.collectPageShadingsAlloc(&page);
+        const shadings = try self.collectPageShadingsForContentAlloc(&page, decoded_content);
         defer {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
@@ -3321,7 +4407,7 @@ pub const Reader = struct {
             self.alloc.free(patterns);
         }
         try self.checkCancellation();
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -3331,6 +4417,11 @@ pub const Reader = struct {
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
         }
         try self.checkCancellation();
 
@@ -3358,12 +4449,13 @@ pub const Reader = struct {
         errdefer if (!pattern_transferred) for (pattern_out.items) |*run| run.deinit(self.alloc);
         errdefer if (!shape_transferred) for (shape_out.items) |*run| run.deinit(self.alloc);
 
-        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{}, &.{}, .nonzero);
+        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer text_parser.deinit();
         text_parser.cancellation = self.cancellation;
+        text_parser.vectorize_form_text = true;
 
         if (decoded_content.len > 0) {
-            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
+            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms, color_spaces);
         }
         try self.checkCancellation();
         var vector_budget = VectorTextWorkBudget.init(self.render_target, page_box);
@@ -3386,6 +4478,11 @@ pub const Reader = struct {
         result.diagnostics.remaining_resource_bytes = vector_budget.remaining_resource_bytes;
         result.diagnostics.remaining_materialization_bytes = vector_budget.remaining_materialization_bytes;
         result.diagnostics.remaining_font_operations = vector_budget.remaining_font_operations;
+
+        // Form font resources are owned only until this render call returns.
+        // All native outline work is complete, so do not expose those borrows
+        // through the public PageRenderRuns value (including fallback runs).
+        for (text_out.items) |*run| run.render_font = null;
 
         result.text_runs = try text_out.toOwnedSlice(self.alloc);
         text_transferred = true;
@@ -3454,18 +4551,25 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
-        return try self.extractContentsShapeRunsAlloc(contents, gstates, forms);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+        return try self.extractDecodedShapeRunsAlloc(decoded_content, gstates, forms, color_spaces);
     }
 
     pub fn extractPageType3TextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
@@ -3477,14 +4581,34 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
 
-        const text_runs = try self.extractPageTextRunsAlloc(page_num);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+        const text_runs = try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         defer {
             for (text_runs) |*run| run.deinit(self.alloc);
             self.alloc.free(text_runs);
@@ -3550,27 +4674,34 @@ pub const Reader = struct {
         font_operations: ?*usize,
         glyph_cache: ?*GlyphOutlineCache,
     ) !bool {
-        const font_index = run.font_index orelse return false;
-        if (font_index >= fonts.len) return false;
-        if (fonts[font_index].type3) |type3| {
+        const font = fontForTextRun(fonts, run) orelse return false;
+        const font_identity = @intFromPtr(font);
+        if (font.type3) |type3| {
             const raw = run.raw_text orelse return false;
             return try appendType3RunShapesAlloc(alloc, out, run, type3, raw, type3_paint_phase);
         }
-        if (fonts[font_index].type1) |type1| {
+        if (font.type1) |type1| {
             const raw = run.raw_text orelse return false;
-            return try appendType1RunShapesAlloc(alloc, out, run, type1, raw, font_index, font_operations, glyph_cache);
+            return try appendType1RunShapesAlloc(alloc, out, run, type1, raw, font_identity, font_operations, glyph_cache);
         }
-        if (fonts[font_index].truetype) |truetype|
-            return try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text, font_index, glyph_cache);
-        if (fonts[font_index].cff_otf) |cff_otf| {
+        if (font.truetype) |truetype|
+            return try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text, font_identity, glyph_cache);
+        if (font.cff_otf) |cff_otf| {
             const raw = run.raw_text orelse return false;
-            return try appendCffRunShapesAlloc(alloc, out, run, cff_otf, raw, font_index, font_operations, glyph_cache);
+            return try appendCffRunShapesAlloc(alloc, out, run, cff_otf, raw, font_identity, font_operations, glyph_cache);
         }
-        if (fonts[font_index].cff) |cff| {
+        if (font.cff) |cff| {
             const raw = run.raw_text orelse return false;
-            return try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw, font_index, font_operations, glyph_cache);
+            return try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw, font_identity, font_operations, glyph_cache);
         }
         return false;
+    }
+
+    fn fontForTextRun(fonts: []const PageFont, run: TextRun) ?*const PageFont {
+        if (run.render_font) |font| return font;
+        const index = run.font_index orelse return null;
+        if (index >= fonts.len) return null;
+        return &fonts[index];
     }
 
     fn patternNameForTextShape(run: TextRun, shape: ShapeRun) ?[]const u8 {
@@ -3615,7 +4746,7 @@ pub const Reader = struct {
         for (shapes) |shape| {
             const pattern_name = patternNameForTextShape(run, shape) orelse continue;
             const pattern = findPagePattern(patterns, pattern_name) orelse return error.MissingPdfPattern;
-            try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunFromShapeAlloc(alloc, pattern, shape));
+            try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunFromShapeAlloc(alloc, pattern, shape, run));
         }
     }
 
@@ -3812,19 +4943,15 @@ pub const Reader = struct {
                 failure_reason.* = run.fallback_reason orelse .unsupported_font;
                 return false;
             }
-            const font_index = run.font_index orelse {
+            const font = fontForTextRun(fonts, run) orelse {
                 failure_reason.* = .missing_font;
                 return false;
             };
-            if (font_index >= fonts.len) {
-                failure_reason.* = .missing_font;
-                return false;
-            }
             const image_start = group_images.items.len;
             const shading_start = group_shadings.items.len;
             const pattern_start = group_patterns.items.len;
             const shape_start = group_shapes.items.len;
-            if (fonts[font_index].type3) |type3| {
+            if (font.type3) |type3| {
                 const raw = run.raw_text orelse {
                     failure_reason.* = .missing_text_data;
                     return false;
@@ -3932,18 +5059,38 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const patterns = try self.collectPagePatternsAlloc(&page);
+        const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
-        const text_runs = try self.extractPageTextRunsAlloc(page_num);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+        const text_runs = try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         defer {
             for (text_runs) |*run| run.deinit(self.alloc);
             self.alloc.free(text_runs);
@@ -4025,72 +5172,64 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsTextRunsAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm) ![]TextRun {
+    fn extractDecodedTextRunsAlloc(self: *const Reader, decoded: []const u8, ranges: []const ContentStreamRange, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]TextRun {
         var out = std.ArrayList(TextRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
-        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{}, &.{}, .nonzero);
+        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer parser.deinit();
         parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
-            try parser.consume(decoded, fonts, gstates, forms);
-        }
+        for (ranges) |range|
+            try parser.consume(decoded[range.start..range.end], fonts, gstates, forms);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsImageRunsAlloc(self: *const Reader, contents: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) ![]ImageRun {
+    fn extractDecodedImageRunsAlloc(self: *const Reader, decoded: []const u8, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ImageRun {
         var out = std.ArrayList(ImageRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
-        try extractImageRunsFromContentAppendCancelable(self.alloc, &out, decoded, images, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, images, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShadingRunsAlloc(self: *const Reader, contents: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm) ![]ShadingRun {
+    fn extractDecodedShadingRunsAlloc(self: *const Reader, decoded: []const u8, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShadingRun {
         var out = std.ArrayList(ShadingRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
-        try extractShadingRunsFromContentAppendCancelable(self.alloc, &out, decoded, shadings, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, shadings, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShapeRunsAlloc(self: *const Reader, contents: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm) ![]ShapeRun {
+    fn extractDecodedShapeRunsAlloc(self: *const Reader, decoded: []const u8, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShapeRun {
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
-        try extractShapeRunsFromContentAppendCancelable(self.alloc, &out, decoded, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsPatternRunsAlloc(self: *const Reader, contents: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) ![]PatternRun {
+    fn extractDecodedPatternRunsAlloc(self: *const Reader, decoded: []const u8, images: []const PageImage, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]PatternRun {
         var out = std.ArrayList(PatternRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
-        try extractPatternRunsFromContentAppendCancelable(self.alloc, &out, decoded, patterns, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, images, patterns, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -4109,6 +5248,7 @@ pub const Reader = struct {
         patterns: []const PagePattern,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        color_spaces: []const PageColorSpace,
     ) !void {
         try text_parser.consume(decoded, fonts, gstates, forms);
         const has_do = contentMayContainOperator(decoded, "Do");
@@ -4116,16 +5256,24 @@ pub const Reader = struct {
         const has_shading_paint = contentMayContainOperator(decoded, "sh");
 
         if ((images.len > 0 or forms.len > 0) and has_do) {
-            try extractImageRunsFromContentAppendCancelable(self.alloc, image_out, decoded, images, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, image_out, decoded, images, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
         if ((shadings.len > 0 and has_shading_paint) or (forms.len > 0 and has_do)) {
-            try extractShadingRunsFromContentAppendCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
-        if ((patterns.len > 0 and has_shape_paint) or (forms.len > 0 and has_do)) {
-            try extractPatternRunsFromContentAppendCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, self.cancellation);
+        if ((patterns.len > 0 and (has_shape_paint or has_do)) or (forms.len > 0 and has_do)) {
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, pattern_out, decoded, images, patterns, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
         if (has_shape_paint or (forms.len > 0 and has_do)) {
-            try extractShapeRunsFromContentAppendCancelable(self.alloc, shape_out, decoded, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, shape_out, decoded, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
     }
 
@@ -4270,7 +5418,25 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    const ContentStreamRange = struct {
+        start: usize,
+        end: usize,
+    };
+
     fn readCombinedContentStreamsAlloc(self: *const Reader, contents: *const syntax.Object) ![]u8 {
+        return try self.readCombinedContentStreamsWithRangesAlloc(contents, null);
+    }
+
+    /// Decode a page's content streams once while retaining their logical
+    /// boundaries. The combined buffer is used for resource reachability and
+    /// stateful parsing; ranges let canonical text extraction preserve its
+    /// historical per-stream parser reset without decoding the streams again.
+    fn readCombinedContentStreamsWithRangesAlloc(
+        self: *const Reader,
+        contents: *const syntax.Object,
+        ranges_out: ?*?[]ContentStreamRange,
+    ) ![]u8 {
+        if (ranges_out) |out| out.* = null;
         try self.checkCancellation();
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -4281,8 +5447,16 @@ pub const Reader = struct {
         // The decoder already returns an owned buffer. Preserve that ownership
         // for the overwhelmingly common single-stream page instead of copying
         // it into a second equally sized aggregation buffer at peak memory.
-        if (streams.len == 1)
-            return try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
+        if (streams.len == 1) {
+            const decoded = try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
+            errdefer self.alloc.free(decoded);
+            if (ranges_out) |out| {
+                const ranges = try self.alloc.alloc(ContentStreamRange, 1);
+                ranges[0] = .{ .start = 0, .end = decoded.len };
+                out.* = ranges;
+            }
+            return decoded;
+        }
 
         const Part = struct {
             decoded_len: usize = 0,
@@ -4359,6 +5533,11 @@ pub const Reader = struct {
             return error.PdfDecodeWorkingSetTooLarge;
         const combined = try self.alloc.alloc(u8, total_len);
         errdefer self.alloc.free(combined);
+        const ranges: ?[]ContentStreamRange = if (ranges_out != null)
+            try self.alloc.alloc(ContentStreamRange, streams.len)
+        else
+            null;
+        errdefer if (ranges) |owned| self.alloc.free(owned);
         var cursor: usize = 0;
         for (streams, parts, 0..) |*stream, *part, stream_index| {
             try self.checkCancellation();
@@ -4377,10 +5556,13 @@ pub const Reader = struct {
             };
             defer if (part.retained == null) self.alloc.free(decoded);
             if (decoded.len != part.decoded_len) return error.InvalidContents;
+            if (ranges) |owned| owned[stream_index].start = cursor;
             @memcpy(combined[cursor .. cursor + decoded.len], decoded);
             cursor += decoded.len;
+            if (ranges) |owned| owned[stream_index].end = cursor;
         }
         std.debug.assert(cursor == combined.len);
+        if (ranges_out) |out| out.* = ranges.?;
         return combined;
     }
 
@@ -4401,12 +5583,14 @@ pub const Reader = struct {
         }
     }
 
-    fn extractContentsTextAnalysisAlloc(
+    fn extractDecodedTextAnalysisAlloc(
         self: *const Reader,
-        contents: *const syntax.Object,
+        decoded: []const u8,
+        ranges: []const ContentStreamRange,
         fonts: []const PageFont,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        color_spaces: []const PageColorSpace,
     ) !PageTextAnalysis {
         var text = std.ArrayList(u8).empty;
         errdefer text.deinit(self.alloc);
@@ -4415,25 +5599,19 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{}, &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
+        for (ranges) |range| {
+            const stream_content = decoded[range.start..range.end];
             // Runs retain cross-stream graphics/text state for geometry, while
             // canonical bytes retain the legacy per-stream decoding behavior.
             // Reconstruction is accepted only when it preserves those bytes.
             var text_parser = TextContentParser.init(self.alloc, &text);
             defer text_parser.deinit();
-            try text_parser.consume(decoded, fonts, forms, 0);
-            try run_parser.consume(decoded, fonts, gstates, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
+            try run_parser.consume(stream_content, fonts, gstates, forms);
         }
 
         var owned_text = try text.toOwnedSlice(self.alloc);
@@ -4470,10 +5648,10 @@ pub const Reader = struct {
         try extractShapeRunsFromContentAppendCancelable(self.alloc, out, decoded, gstates, forms, self.cancellation);
     }
 
-    fn extractSingleContentPatternRunsAppend(self: *const Reader, out: *std.ArrayList(PatternRun), obj: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) !void {
+    fn extractSingleContentPatternRunsAppend(self: *const Reader, out: *std.ArrayList(PatternRun), obj: *const syntax.Object, images: []const PageImage, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) !void {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        try extractPatternRunsFromContentAppendCancelable(self.alloc, out, decoded, patterns, gstates, forms, self.cancellation);
+        try extractPatternRunsFromContentAppendCancelable(self.alloc, out, decoded, images, patterns, gstates, forms, self.cancellation);
     }
 
     fn appendType3RunShapesAlloc(
@@ -4595,6 +5773,9 @@ pub const Reader = struct {
             .group_parent_id = run.group_parent_id,
             .group_isolated = run.group_isolated,
             .group_knockout = run.group_knockout,
+            .group_alpha = run.group_alpha,
+            .group_blend_mode = run.group_blend_mode,
+            .color_spaces = type3.color_spaces,
             .stroke_width = run.stroke_width,
             .clip_box = run.clip_box,
         };
@@ -4662,7 +5843,7 @@ pub const Reader = struct {
             const cancellation = if (work_budget) |budget| budget.cancellation else CancellationProbe{};
             try extractImageRunsFromContentAppendWithStateCancelable(alloc, &glyph_images, glyph.content, type3.images, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &image_order, &next_image_group, cancellation);
             try extractShadingRunsFromContentAppendWithStateCancelable(alloc, &glyph_shadings, glyph.content, type3.shadings, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &shading_order, &next_shading_group, cancellation);
-            try extractPatternRunsFromContentAppendWithStateCancelable(alloc, &glyph_patterns, glyph.content, type3.patterns, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &pattern_order, &next_pattern_group, cancellation);
+            try extractPatternRunsFromContentAppendWithStateCancelable(alloc, &glyph_patterns, glyph.content, type3.images, type3.patterns, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &pattern_order, &next_pattern_group, cancellation);
             try extractShapeRunsFromContentAppendWithStateCancelable(alloc, &glyph_shapes, glyph.content, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &shape_order, &next_shape_group, cancellation);
             const next_non_text_group_id = @max(@max(next_image_group, next_shading_group), @max(next_shape_group, next_pattern_group));
             var text_parser = try PositionedTextParser.init(alloc, .{ .render = &glyph_text }, .{
@@ -4676,11 +5857,15 @@ pub const Reader = struct {
                 .group_parent_id = run.group_parent_id,
                 .group_isolated = run.group_isolated,
                 .group_knockout = run.group_knockout,
+                .group_alpha = run.group_alpha,
+                .group_blend_mode = run.group_blend_mode,
+                .color_spaces = type3.color_spaces,
                 .matrix = initial_state.matrix,
                 .clip_box = run.clip_box,
             }, initial_clip, run.clip_fill_rule);
             defer text_parser.deinit();
             text_parser.cancellation = cancellation;
+            text_parser.vectorize_form_text = true;
             text_parser.next_group_id = glyph_group_base;
             try text_parser.consume(glyph.content, type3.fonts, type3.gstates, type3.forms);
             next_resource_group_id.* = @max(next_non_text_group_id, text_parser.next_group_id);
@@ -4767,6 +5952,8 @@ pub const Reader = struct {
         errdefer if (clip_points) |clip| alloc.free(clip);
         const subpath_starts = if (shape.subpath_starts) |starts| try alloc.dupe(usize, starts) else null;
         errdefer if (subpath_starts) |starts| alloc.free(starts);
+        const subpath_closed = if (shape.subpath_closed) |closed| try alloc.dupe(bool, closed) else null;
+        errdefer if (subpath_closed) |closed| alloc.free(closed);
 
         return .{
             .paint_order = run.paint_order,
@@ -4780,6 +5967,8 @@ pub const Reader = struct {
             .group_parent_id = run.group_parent_id,
             .group_isolated = run.group_isolated,
             .group_knockout = run.group_knockout,
+            .group_alpha = run.group_alpha,
+            .group_blend_mode = run.group_blend_mode,
             .kind = switch (shape.kind) {
                 .fill => .fill,
                 .stroke => .stroke,
@@ -4804,6 +5993,7 @@ pub const Reader = struct {
             .clip_fill_rule = run.clip_fill_rule,
             .points = points,
             .subpath_starts = subpath_starts,
+            .subpath_closed = subpath_closed,
             .antialias = shape.antialias,
         };
     }
@@ -4839,6 +6029,8 @@ pub const Reader = struct {
             .group_parent_id = run.group_parent_id,
             .group_isolated = run.group_isolated,
             .group_knockout = run.group_knockout,
+            .group_alpha = run.group_alpha,
+            .group_blend_mode = run.group_blend_mode,
             .kind = kind,
             .fill_rule = .nonzero,
             .color = if (kind == .fill)
@@ -4957,7 +6149,7 @@ pub const Reader = struct {
         run: TextRun,
         truetype: TrueTypeFont,
         raw: ?[]const u8,
-        font_index: u16,
+        font_identity: usize,
         glyph_cache: ?*GlyphOutlineCache,
     ) !bool {
         const raw_bytes = raw orelse return false;
@@ -5035,7 +6227,7 @@ pub const Reader = struct {
                 null;
             const glyph_x = cursor_x - if (vertical_metric) |metric| metric.v1_x * run.font_size / 1000.0 else 0;
             const glyph_y = cursor_y - if (vertical_metric) |metric| metric.v1_y * run.font_size / 1000.0 else 0;
-            const cache_key = GlyphOutlineCacheKey{ .font_index = font_index, .glyph_index = glyph_index };
+            const cache_key = GlyphOutlineCacheKey{ .font_identity = font_identity, .glyph_index = glyph_index };
             if (if (glyph_cache) |cache| cache.get(cache_key) else null) |outline| {
                 try appendFontOutlineShapesAlloc(alloc, out, run, glyph_x, scale, outline.*, mode, glyph_y);
             } else if (try truetype.font.glyphOutlineAllocLimited(alloc, glyph_index, .{ .max_points = max_source_glyph_points })) |outline_value| {
@@ -5062,7 +6254,7 @@ pub const Reader = struct {
         run: TextRun,
         type1: Type1Font,
         raw: []const u8,
-        font_index: u16,
+        font_identity: usize,
         font_operations: ?*usize,
         glyph_cache: ?*GlyphOutlineCache,
     ) !bool {
@@ -5080,7 +6272,7 @@ pub const Reader = struct {
                 cursor_x += estimateType1MissingAdvance(run, code, type1.missing_width);
                 continue;
             };
-            const cache_key = GlyphOutlineCacheKey{ .font_index = font_index, .glyph_index = code };
+            const cache_key = GlyphOutlineCacheKey{ .font_identity = font_identity, .glyph_index = code };
             if (if (glyph_cache) |cache| cache.get(cache_key) else null) |outline| {
                 try appendFontOutlineShapesAlloc(alloc, out, run, cursor_x, scale, outline.*, mode, 0);
                 const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
@@ -5187,7 +6379,7 @@ pub const Reader = struct {
         run: TextRun,
         cff_otf: CffOpenTypeFont,
         raw: []const u8,
-        font_index: u16,
+        font_identity: usize,
         font_operations: ?*usize,
         glyph_cache: ?*GlyphOutlineCache,
     ) !bool {
@@ -5218,7 +6410,7 @@ pub const Reader = struct {
                 null;
             const glyph_x = cursor_x - if (vertical_metric) |metric| metric.v1_x * run.font_size / 1000.0 else 0;
             const glyph_y = cursor_y - if (vertical_metric) |metric| metric.v1_y * run.font_size / 1000.0 else 0;
-            const cache_key = GlyphOutlineCacheKey{ .font_index = font_index, .glyph_index = glyph.glyph_index };
+            const cache_key = GlyphOutlineCacheKey{ .font_identity = font_identity, .glyph_index = glyph.glyph_index };
             if (if (glyph_cache) |cache| cache.get(cache_key) else null) |outline| {
                 try appendFontOutlineShapesAlloc(alloc, out, run, glyph_x, scale, outline.*, mode, glyph_y);
             } else if (try cff_otf.cff.glyphOutlineAllocLimited(alloc, glyph.glyph_index, .{
@@ -5248,7 +6440,7 @@ pub const Reader = struct {
         run: TextRun,
         cff: EmbeddedCffFont,
         raw: []const u8,
-        font_index: u16,
+        font_identity: usize,
         font_operations: ?*usize,
         glyph_cache: ?*GlyphOutlineCache,
     ) !bool {
@@ -5284,7 +6476,7 @@ pub const Reader = struct {
                 null;
             const glyph_x = cursor_x - if (vertical_metric) |metric| metric.v1_x * run.font_size / 1000.0 else 0;
             const glyph_y = cursor_y - if (vertical_metric) |metric| metric.v1_y * run.font_size / 1000.0 else 0;
-            const cache_key = GlyphOutlineCacheKey{ .font_index = font_index, .glyph_index = glyph.glyph_index };
+            const cache_key = GlyphOutlineCacheKey{ .font_identity = font_identity, .glyph_index = glyph.glyph_index };
             if (if (glyph_cache) |cache| cache.get(cache_key) else null) |outline| {
                 try appendFontOutlineShapesAlloc(alloc, out, run, glyph_x, scale, outline.*, mode, glyph_y);
             } else if (try cff.font.glyphOutlineAllocLimited(alloc, glyph.glyph_index, .{
@@ -5308,11 +6500,323 @@ pub const Reader = struct {
         return true;
     }
 
-    fn collectPageFontsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageFont {
+    fn collectPageFontsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageFont {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageFont, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectFontsFromResourcesAlloc(&resources.?);
+        return try self.collectFontsFromResourcesAlloc(&resources.?, content);
+    }
+
+    fn classifyColorSpaceResource(
+        self: *const Reader,
+        value: *const syntax.Object,
+        resource_entries: []const syntax.DictEntry,
+        depth: u8,
+        allow_default_remap: bool,
+    ) anyerror!ColorSpaceSelection {
+        if (depth >= 8) return colorSpaceSelectionForKind(.unsupported);
+        var resolved = try self.resolveValue(value);
+        defer resolved.deinit(self.alloc);
+        if (resolved.asName()) |name| {
+            const direct = colorSpaceKindFromName(name);
+            if (direct != .unsupported) {
+                if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
+                    for (resource_entries) |entry| {
+                        if (!std.mem.eql(u8, entry.key, default_name)) continue;
+                        const remapped = try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, false);
+                        if (remapped.kind != .pattern and remapped.kind != .unsupported and
+                            colorSpaceComponentCount(remapped.kind) == colorSpaceComponentCount(direct))
+                            return remapped;
+                        break;
+                    }
+                };
+                return colorSpaceSelectionForKind(direct);
+            }
+            for (resource_entries) |entry| {
+                if (std.mem.eql(u8, entry.key, name))
+                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, allow_default_remap);
+            }
+            return colorSpaceSelectionForKind(.unsupported);
+        }
+        if (resolved != .array or resolved.array.len == 0) return colorSpaceSelectionForKind(.unsupported);
+        const family = resolved.array[0].asName() orelse return colorSpaceSelectionForKind(.unsupported);
+        if (std.mem.eql(u8, family, "Pattern")) {
+            if (resolved.array.len == 1) return colorSpaceSelectionForKind(.pattern);
+            const base = try self.classifyColorSpaceResource(&resolved.array[1], resource_entries, depth + 1, allow_default_remap);
+            if (base.kind == .pattern or base.kind == .unsupported)
+                return colorSpaceSelectionForKind(.unsupported);
+            return colorSpaceSelectionForPattern(base.value);
+        }
+        if ((std.mem.eql(u8, family, "CalGray") or std.mem.eql(u8, family, "CalRGB")) and resolved.array.len >= 2) {
+            return try self.classifyCalibratedColorSpace(family, &resolved.array[1]);
+        }
+        if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len >= 2) {
+            var profile = try self.resolveValue(&resolved.array[1]);
+            defer profile.deinit(self.alloc);
+            const components_integer = if (profile.get("N")) |count| try self.resolvedIntegerObjectValue(count) else null;
+            const components: u8 = switch (components_integer orelse 0) {
+                1, 3, 4 => @intCast(components_integer.?),
+                else => return colorSpaceSelectionForKind(.unsupported),
+            };
+
+            // PDF defines the corresponding device space as the fallback when
+            // an ICC profile omits Alternate. Honor that fallback without
+            // introducing a platform color-management dependency.
+            var selection = if (profile.get("Alternate")) |alternate|
+                try self.classifyColorSpaceResource(alternate, resource_entries, depth + 1, allow_default_remap)
+            else
+                colorSpaceSelectionForKind(switch (components) {
+                    1 => .device_gray,
+                    3 => .device_rgb,
+                    4 => .device_cmyk,
+                    else => unreachable,
+                });
+            if (selection.kind == .pattern or
+                selection.kind == .unsupported or
+                colorSpaceComponentCount(selection.kind) != components)
+                return colorSpaceSelectionForKind(.unsupported);
+
+            // ICCBased starts with zero for every component, clamped to the
+            // nearest legal value when /Range excludes zero. Keep this state
+            // with the selected alternate so sc/SC use the same bounds.
+            selection.value.initial_components = .{ 0, 0, 0, 0 };
+            if (profile.get("Range")) |range_obj| {
+                var resolved_range = try self.resolveValue(range_obj);
+                defer resolved_range.deinit(self.alloc);
+                if (resolved_range != .array or resolved_range.array.len != @as(usize, components) * 2)
+                    return colorSpaceSelectionForKind(.unsupported);
+                for (0..components) |index| {
+                    const min = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2])) orelse
+                        return colorSpaceSelectionForKind(.unsupported);
+                    const max = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2 + 1])) orelse
+                        return colorSpaceSelectionForKind(.unsupported);
+                    if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                        return colorSpaceSelectionForKind(.unsupported);
+                    selection.value.ranges[index] = .{ .min = min, .max = max };
+                }
+            }
+            return selection;
+        }
+        if ((std.mem.eql(u8, family, "Separation") or std.mem.eql(u8, family, "DeviceN")) and resolved.array.len >= 4) {
+            const input_components: usize = if (std.mem.eql(u8, family, "Separation"))
+                1
+            else blk: {
+                var names = try self.resolveValue(&resolved.array[1]);
+                defer names.deinit(self.alloc);
+                if (names != .array) return colorSpaceSelectionForKind(.unsupported);
+                break :blk names.array.len;
+            };
+            // This bounded implementation accepts one-input functions.
+            // Multi-ink DeviceN stays on the explicit unsupported path until
+            // its multi-dimensional interpolation is implemented.
+            if (input_components != 1) return colorSpaceSelectionForKind(.unsupported);
+
+            var alternate = try self.classifyColorSpaceResource(&resolved.array[2], resource_entries, depth + 1, allow_default_remap);
+            if (alternate.value.tint != null or (alternate.pattern_base != null and alternate.pattern_base.?.tint != null)) {
+                deinitColorSpaceSelection(&alternate, self.alloc);
+                return colorSpaceSelectionForKind(.unsupported);
+            }
+            if (alternate.kind == .pattern or alternate.kind == .unsupported)
+                return colorSpaceSelectionForKind(.unsupported);
+            const alternate_components = colorSpaceComponentCount(alternate.kind);
+            if (alternate_components == 0 or alternate_components > 4)
+                return colorSpaceSelectionForKind(.unsupported);
+
+            var selection = colorSpaceSelectionForKind(.device_gray);
+            // Separation and DeviceN initialize every tint component to 1.0.
+            selection.value.initial_components[0] = 1;
+            const function_type = self.colorFunctionType(&resolved.array[3]) catch |err| switch (err) {
+                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                else => return colorSpaceSelectionForKind(.unsupported),
+            };
+            if (function_type == 2) {
+                var transform = self.parseExponentialTintTransform(&resolved.array[3], alternate_components) catch |err| switch (err) {
+                    error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                    else => return colorSpaceSelectionForKind(.unsupported),
+                };
+                defer transform.deinit(self.alloc);
+                var c0 = [4]f64{ 0, 0, 0, 0 };
+                var c1 = [4]f64{ 0, 0, 0, 0 };
+                var function_ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+                for (0..alternate_components) |index| {
+                    c0[index] = transform.c0[index];
+                    c1[index] = transform.c1[index];
+                    if (transform.ranges) |ranges| function_ranges[index] = ranges[index];
+                }
+                selection.value.tint = .{
+                    .alternate_kind = alternate.value.kind,
+                    .alternate_ranges = alternate.value.ranges,
+                    .alternate_calibrated = alternate.value.calibrated,
+                    .function = .{ .exponential = .{
+                        .c0 = c0,
+                        .c1 = c1,
+                        .exponent = transform.n,
+                        .function_ranges = function_ranges,
+                        .has_function_ranges = transform.ranges != null,
+                    } },
+                };
+            } else if (function_type == 0) {
+                const sampled = self.parseSampledTintTransform(&resolved.array[3], alternate_components) catch |err| switch (err) {
+                    error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                    else => return colorSpaceSelectionForKind(.unsupported),
+                };
+                selection.value.tint = .{
+                    .alternate_kind = alternate.value.kind,
+                    .alternate_ranges = alternate.value.ranges,
+                    .alternate_calibrated = alternate.value.calibrated,
+                    .function = .{ .sampled = sampled },
+                };
+            } else {
+                return colorSpaceSelectionForKind(.unsupported);
+            }
+            return selection;
+        }
+        return colorSpaceSelectionForKind(.unsupported);
+    }
+
+    fn calibratedDictTriple(
+        self: *const Reader,
+        dict: *const syntax.Object,
+        key: []const u8,
+        default: [3]f64,
+    ) !?[3]f64 {
+        const value = dict.get(key) orelse return default;
+        var resolved = try self.resolveValue(value);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .array or resolved.array.len != 3) return null;
+        var result: [3]f64 = undefined;
+        for (0..3) |index| {
+            result[index] = (try self.resolvedNumericObjectValue(&resolved.array[index])) orelse return null;
+            if (!std.math.isFinite(result[index])) return null;
+        }
+        return result;
+    }
+
+    fn classifyCalibratedColorSpace(
+        self: *const Reader,
+        family: []const u8,
+        parameters: *const syntax.Object,
+    ) !ColorSpaceSelection {
+        var dict = try self.resolveValue(parameters);
+        defer dict.deinit(self.alloc);
+        if (dict != .dict and dict != .stream) return colorSpaceSelectionForKind(.unsupported);
+
+        const white = (try self.calibratedDictTriple(&dict, "WhitePoint", .{ 0, 0, 0 })) orelse
+            return colorSpaceSelectionForKind(.unsupported);
+        const black = (try self.calibratedDictTriple(&dict, "BlackPoint", .{ 0, 0, 0 })) orelse
+            return colorSpaceSelectionForKind(.unsupported);
+        if (white[0] <= 0 or @abs(white[1] - 1.0) > 0.000001 or white[2] <= 0 or
+            black[0] < 0 or black[1] < 0 or black[2] < 0)
+            return colorSpaceSelectionForKind(.unsupported);
+        const white_lms = [3]f64{
+            0.8951 * white[0] + 0.2664 * white[1] - 0.1614 * white[2],
+            -0.7502 * white[0] + 1.7135 * white[1] + 0.0367 * white[2],
+            0.0389 * white[0] - 0.0685 * white[1] + 1.0296 * white[2],
+        };
+        if (!std.math.isFinite(white_lms[0]) or !std.math.isFinite(white_lms[1]) or !std.math.isFinite(white_lms[2]) or
+            @abs(white_lms[0]) < 0.000001 or @abs(white_lms[1]) < 0.000001 or @abs(white_lms[2]) < 0.000001)
+            return colorSpaceSelectionForKind(.unsupported);
+
+        if (std.mem.eql(u8, family, "CalGray")) {
+            const gamma = if (dict.get("Gamma")) |value|
+                (try self.resolvedNumericObjectValue(value)) orelse return colorSpaceSelectionForKind(.unsupported)
+            else
+                1.0;
+            if (!std.math.isFinite(gamma) or gamma <= 0) return colorSpaceSelectionForKind(.unsupported);
+            var selection = colorSpaceSelectionForKind(.device_gray);
+            selection.value.calibrated = .{ .gray = .{
+                .white_point = white,
+                .black_point = black,
+                .gamma = gamma,
+            } };
+            return selection;
+        }
+
+        const gamma = (try self.calibratedDictTriple(&dict, "Gamma", .{ 1, 1, 1 })) orelse
+            return colorSpaceSelectionForKind(.unsupported);
+        if (gamma[0] <= 0 or gamma[1] <= 0 or gamma[2] <= 0)
+            return colorSpaceSelectionForKind(.unsupported);
+
+        var matrix: [9]f64 = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        if (dict.get("Matrix")) |matrix_value| {
+            var resolved_matrix = try self.resolveValue(matrix_value);
+            defer resolved_matrix.deinit(self.alloc);
+            if (resolved_matrix != .array or resolved_matrix.array.len != 9)
+                return colorSpaceSelectionForKind(.unsupported);
+            for (0..9) |index| {
+                matrix[index] = (try self.resolvedNumericObjectValue(&resolved_matrix.array[index])) orelse
+                    return colorSpaceSelectionForKind(.unsupported);
+                if (!std.math.isFinite(matrix[index])) return colorSpaceSelectionForKind(.unsupported);
+            }
+        }
+        var selection = colorSpaceSelectionForKind(.device_rgb);
+        selection.value.calibrated = .{ .rgb = .{
+            .white_point = white,
+            .black_point = black,
+            .gamma = gamma,
+            .matrix = matrix,
+        } };
+        return selection;
+    }
+
+    fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, referenced_content: []const u8) ![]PageColorSpace {
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, referenced_content, &.{ "cs", "CS" });
+        defer references.deinit(self.alloc);
+        {
+            const content = referenced_content;
+            const used = &references;
+            // DeviceGray is the initial stroking and nonstroking space, so a
+            // nonempty stream makes its default reachable even without an
+            // explicit color operator. The other defaults are reachable only
+            // through their abbreviated or explicit selection operators.
+            if (content.len > 0) try used.add(self.alloc, "DefaultGray");
+            if (used.uses_device_rgb) try used.add(self.alloc, "DefaultRGB");
+            if (used.uses_device_cmyk) try used.add(self.alloc, "DefaultCMYK");
+        }
+        if (references.names.count() == 0) return try self.alloc.alloc(PageColorSpace, 0);
+
+        const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
+        var resolved_color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+            else => return try self.alloc.alloc(PageColorSpace, 0),
+        };
+        defer resolved_color_spaces.deinit(self.alloc);
+        if (resolved_color_spaces != .dict) return try self.alloc.alloc(PageColorSpace, 0);
+
+        var out = std.ArrayList(PageColorSpace).empty;
+        defer out.deinit(self.alloc);
+        errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
+        for (resolved_color_spaces.dict) |entry| {
+            try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
+            var selection = self.classifyColorSpaceResource(
+                &entry.value,
+                resolved_color_spaces.dict,
+                0,
+                !isDefaultDeviceColorSpaceName(entry.key),
+            ) catch |err| switch (err) {
+                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                else => colorSpaceSelectionForKind(.unsupported),
+            };
+            var selection_owned = true;
+            errdefer if (selection_owned) deinitColorSpaceSelection(&selection, self.alloc);
+            try out.append(self.alloc, .{
+                .name = name.?,
+                .selection = selection,
+            });
+            selection_owned = false;
+            name = null;
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectPageColorSpacesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageColorSpace {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageColorSpace, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectColorSpacesFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPageImagesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageImage {
@@ -5331,11 +6835,11 @@ pub const Reader = struct {
         return try self.collectImagesFromResourcesAlloc(&resources.?, content);
     }
 
-    fn collectPageShadingsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageShading {
+    fn collectPageShadingsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageShading {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageShading, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectShadingsFromResourcesAlloc(&resources.?);
+        return try self.collectShadingsFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPagePatternsAlloc(self: *const Reader, page: *const syntax.Object) ![]PagePattern {
@@ -5354,11 +6858,11 @@ pub const Reader = struct {
         return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
-    fn collectPageExtGStatesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageExtGState {
+    fn collectPageExtGStatesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageExtGState {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageExtGState, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectExtGStatesFromResourcesAlloc(&resources.?);
+        return try self.collectExtGStatesFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPageFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
@@ -5386,6 +6890,13 @@ pub const Reader = struct {
         return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
+    fn collectPageTextFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageForm {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageForm, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    }
+
     fn collectPageContentAlloc(self: *const Reader, page: *const syntax.Object) ![]u8 {
         const contents = page.get("Contents") orelse return try self.alloc.alloc(u8, 0);
         // Resource discovery needs the same logical concatenation as the
@@ -5395,11 +6906,13 @@ pub const Reader = struct {
         return try self.readCombinedContentStreamsAlloc(contents);
     }
 
-    fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageFont {
+    fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -5408,6 +6921,7 @@ pub const Reader = struct {
         }
         for (resolved_fonts.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             if (entry.value == .obj_ref) {
                 const ptr = entry.value.obj_ref;
                 const cache_key = (@as(u64, ptr.id) << 16) | @as(u64, ptr.gen);
@@ -5446,11 +6960,13 @@ pub const Reader = struct {
     /// Type3 CharProcs may paint text with ordinary embedded fonts. Resolve
     /// those fonts without recursively rebuilding Type3 fonts that reference
     /// their own resource dictionary.
-    fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) anyerror![]PageFont {
+    fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) anyerror![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -5459,6 +6975,7 @@ pub const Reader = struct {
         }
         for (resolved_fonts.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             var font_obj = try self.resolveValue(&entry.value);
             defer font_obj.deinit(self.alloc);
             if (font_obj != .dict) continue;
@@ -5472,6 +6989,144 @@ pub const Reader = struct {
             try out.append(self.alloc, font);
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn imageColorSpaceDependsOnResources(
+        self: *const Reader,
+        image: *const syntax.Object,
+        resources: *const syntax.Object,
+    ) !bool {
+        const value = image.get("ColorSpace") orelse return false;
+        const color_spaces_obj = resources.get("ColorSpace") orelse return false;
+        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+            else => return false,
+        };
+        defer color_spaces.deinit(self.alloc);
+        if (color_spaces != .dict) return false;
+        return try self.imageColorSpaceValueDependsOnResources(value, color_spaces.dict, 0);
+    }
+
+    fn imageColorSpaceValueDependsOnResources(
+        self: *const Reader,
+        value: *const syntax.Object,
+        resource_entries: []const syntax.DictEntry,
+        depth: u8,
+    ) anyerror!bool {
+        if (depth >= 8) return true;
+        var resolved = try self.resolveValue(value);
+        defer resolved.deinit(self.alloc);
+        if (resolved.asName()) |name| {
+            const direct = colorSpaceKindFromName(name);
+            const resource_name = if (defaultColorSpaceName(direct)) |default_name| default_name else name;
+            for (resource_entries) |entry|
+                if (std.mem.eql(u8, entry.key, resource_name)) return true;
+            return false;
+        }
+        if (resolved != .array or resolved.array.len == 0) return false;
+        const family = resolved.array[0].asName() orelse return false;
+        const nested_index: ?usize = if ((std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) and resolved.array.len > 1)
+            1
+        else if (std.mem.eql(u8, family, "Separation") and resolved.array.len > 2)
+            2
+        else if (std.mem.eql(u8, family, "DeviceN") and resolved.array.len > 2)
+            2
+        else if (std.mem.eql(u8, family, "Pattern") and resolved.array.len > 1)
+            1
+        else
+            null;
+        if (nested_index) |index|
+            return try self.imageColorSpaceValueDependsOnResources(&resolved.array[index], resource_entries, depth + 1);
+        if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len > 1) {
+            var profile = try self.resolveValue(&resolved.array[1]);
+            defer profile.deinit(self.alloc);
+            if (profile.get("Alternate")) |alternate|
+                return try self.imageColorSpaceValueDependsOnResources(alternate, resource_entries, depth + 1);
+        }
+        return false;
+    }
+
+    fn resolveImageColorSpaceValueAlloc(
+        self: *const Reader,
+        value: *const syntax.Object,
+        resource_entries: []const syntax.DictEntry,
+        depth: u8,
+        allow_default_remap: bool,
+    ) anyerror!syntax.Object {
+        var resolved = try self.resolveValue(value);
+        errdefer resolved.deinit(self.alloc);
+        if (depth >= 8) return resolved;
+        if (resolved == .array and resolved.array.len > 0) {
+            const family = resolved.array[0].asName() orelse return resolved;
+            const nested_index: ?usize = if ((std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) and resolved.array.len > 1)
+                1
+            else if (std.mem.eql(u8, family, "Separation") and resolved.array.len > 2)
+                2
+            else if (std.mem.eql(u8, family, "DeviceN") and resolved.array.len > 2)
+                2
+            else if (std.mem.eql(u8, family, "Pattern") and resolved.array.len > 1)
+                1
+            else
+                null;
+            if (nested_index) |index| {
+                const replacement = try self.resolveImageColorSpaceValueAlloc(&resolved.array[index], resource_entries, depth + 1, true);
+                resolved.array[index].deinit(self.alloc);
+                resolved.array[index] = replacement;
+            }
+            return resolved;
+        }
+        const name = resolved.asName() orelse return resolved;
+        const direct = colorSpaceKindFromName(name);
+        if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
+            for (resource_entries) |entry| {
+                if (!std.mem.eql(u8, entry.key, default_name)) continue;
+                var replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, false);
+                errdefer replacement.deinit(self.alloc);
+                const component_count = self.colorSpaceInputComponentCount(&replacement) catch |err| switch (err) {
+                    error.UnsupportedPdfRendering => 0,
+                    else => return err,
+                };
+                if (component_count == colorSpaceComponentCount(direct)) {
+                    resolved.deinit(self.alloc);
+                    return replacement;
+                }
+                replacement.deinit(self.alloc);
+                return resolved;
+            }
+        };
+        if (direct != .unsupported) return resolved;
+        for (resource_entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, name)) continue;
+            const replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, allow_default_remap);
+            resolved.deinit(self.alloc);
+            return replacement;
+        }
+        return resolved;
+    }
+
+    fn resolveImageColorSpaceForDecodeAlloc(self: *const Reader, value: *const syntax.Object) anyerror!syntax.Object {
+        var resolved = try self.resolveImageColorSpaceForDecodeRawAlloc(value);
+        if (resolved == .array and resolved.array.len == 1) {
+            const name = resolved.array[0].asName();
+            if (name != null and colorSpaceKindFromName(name.?) != .unsupported) {
+                const normalized = try resolved.array[0].clone(self.alloc);
+                resolved.deinit(self.alloc);
+                return normalized;
+            }
+        }
+        return resolved;
+    }
+
+    fn resolveImageColorSpaceForDecodeRawAlloc(self: *const Reader, value: *const syntax.Object) anyerror!syntax.Object {
+        const resources = self.image_color_space_resources orelse return try self.resolveValue(value);
+        const color_spaces_obj = resources.get("ColorSpace") orelse return try self.resolveValue(value);
+        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+            else => return try self.resolveValue(value),
+        };
+        defer color_spaces.deinit(self.alloc);
+        if (color_spaces != .dict) return try self.resolveValue(value);
+        return try self.resolveImageColorSpaceValueAlloc(value, color_spaces.dict, 0, true);
     }
 
     fn collectImagesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageImage {
@@ -5494,8 +7149,15 @@ pub const Reader = struct {
                 (@as(u64, entry.value.obj_ref.id) << 16) | entry.value.obj_ref.gen
             else
                 null;
+            var xobj = try self.resolveValue(&entry.value);
+            defer xobj.deinit(self.alloc);
+            if (xobj != .stream) continue;
+            const subtype = xobj.get("Subtype") orelse continue;
+            if (!std.mem.eql(u8, subtype.asName() orelse continue, "Image")) continue;
+            const contextual_color_space = try self.imageColorSpaceDependsOnResources(&xobj, resources);
+            const effective_cache_key = if (contextual_color_space) null else cache_key;
             const active_cache = if (self.image_cache) |cache| if (cache.scope_depth > 0) cache else null else null;
-            if (active_cache) |cache| if (cache_key) |key| if (cache.entries.get(key)) |cached| {
+            if (active_cache) |cache| if (effective_cache_key) |key| if (cache.entries.get(key)) |cached| {
                 var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
                 errdefer if (name) |owned| self.alloc.free(owned);
                 cached.shared_rgba.retain();
@@ -5509,20 +7171,16 @@ pub const Reader = struct {
                     .height = cached.height,
                     .interpolate = cached.interpolate,
                     .bilevel = cached.bilevel,
+                    .image_mask = cached.image_mask,
                 });
                 name = null;
                 image_reference_owned = false;
                 continue;
             };
-            var xobj = try self.resolveValue(&entry.value);
-            defer xobj.deinit(self.alloc);
-            if (xobj != .stream) continue;
-            const subtype = xobj.get("Subtype") orelse continue;
-            if (!std.mem.eql(u8, subtype.asName() orelse continue, "Image")) continue;
             const decoded = if (active_cache) |cache|
-                try self.decodeImageToRgbaWithInitialLiveBytesAlloc(&xobj, cache.retained_bytes)
+                try self.decodeImageToRgbaWithInitialLiveBytesAlloc(&xobj, cache.retained_bytes, resources)
             else
-                try self.decodeImageToRgbaAlloc(&xobj);
+                try self.decodeImageToRgbaWithInitialLiveBytesAlloc(&xobj, 0, resources);
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
             var rgba_owned = true;
@@ -5538,7 +7196,7 @@ pub const Reader = struct {
                 streamHasFilter(xobj.get("Filter"), "JBIG2Decode");
             var shared_reference_owned = true;
             errdefer if (shared_reference_owned) shared.release(self.alloc);
-            if (active_cache) |cache| if (cache_key) |key| {
+            if (active_cache) |cache| if (effective_cache_key) |key| {
                 const retained_bytes = std.math.add(usize, cache.retained_bytes, decoded.rgba.len) catch return error.PdfDecodeWorkingSetTooLarge;
                 if (retained_bytes > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
                 try cache.entries.put(self.alloc, key, .{
@@ -5547,6 +7205,7 @@ pub const Reader = struct {
                     .height = decoded.height,
                     .interpolate = interpolate,
                     .bilevel = bilevel,
+                    .image_mask = image_mask,
                 });
                 cache.retained_bytes = retained_bytes;
                 // The cache owns the initial reference; the PageImage owns a
@@ -5563,6 +7222,7 @@ pub const Reader = struct {
                 .height = decoded.height,
                 .interpolate = interpolate,
                 .bilevel = bilevel,
+                .image_mask = image_mask,
             });
             name = null;
             shared_reference_owned = false;
@@ -5570,45 +7230,50 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectShadingsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageShading {
+    fn collectShadingsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageShading {
         const shadings_obj = resources.get("Shading") orelse return try self.alloc.alloc(PageShading, 0);
         var resolved_shadings = try self.resolveValue(shadings_obj);
         defer resolved_shadings.deinit(self.alloc);
         if (resolved_shadings != .dict) return try self.alloc.alloc(PageShading, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"sh"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageShading).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*shading| shading.deinit(self.alloc);
         for (resolved_shadings.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             var shading_obj = try self.resolveValue(&entry.value);
             defer shading_obj.deinit(self.alloc);
-            var shading = self.buildPageShading(entry.key, &shading_obj) catch |err| switch (err) {
-                error.UnsupportedPdfRendering => continue,
-                else => return err,
-            };
+            var shading = try self.buildPageShading(entry.key, &shading_obj);
             errdefer shading.deinit(self.alloc);
             try out.append(self.alloc, shading);
         }
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageExtGState {
+    fn collectExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageExtGState {
         const ext_obj = resources.get("ExtGState") orelse return try self.alloc.alloc(PageExtGState, 0);
         var resolved_ext = try self.resolveValue(ext_obj);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"gs"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageExtGState).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*gstate| gstate.deinit(self.alloc);
         for (resolved_ext.dict) |entry| {
+            if (!references.contains(entry.key)) continue;
             var gs = try self.resolveValue(&entry.value);
             defer gs.deinit(self.alloc);
             if (gs != .dict) continue;
             const fill_alpha = if (gs.get("ca")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
             const stroke_alpha = if (gs.get("CA")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
             const blend_mode = if (gs.get("BM")) |obj| parseBlendModeObject(obj) else BlendMode.normal;
+            var soft_mask = try self.buildImageExtGStateSoftMaskAlloc(&gs);
+            errdefer if (soft_mask) |*mask| mask.deinit(self.alloc);
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
@@ -5616,10 +7281,170 @@ pub const Reader = struct {
                 .fill_alpha = fill_alpha,
                 .stroke_alpha = stroke_alpha,
                 .blend_mode = blend_mode,
+                .soft_mask = soft_mask,
+                .soft_mask_specified = gs.get("SMask") != null,
             });
+            soft_mask = null;
             name = null;
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn buildImageExtGStateSoftMaskAlloc(self: *const Reader, gs: *const syntax.Object) !?PageSoftMask {
+        const smask_obj = gs.get("SMask") orelse return null;
+        if (smask_obj.asName()) |name| {
+            if (std.mem.eql(u8, name, "None")) return null;
+            return error.UnsupportedPdfRendering;
+        }
+        var smask = try self.resolveValue(smask_obj);
+        defer smask.deinit(self.alloc);
+        if (smask != .dict) return error.UnsupportedPdfRendering;
+        const subtype = (smask.get("S") orelse return error.UnsupportedPdfRendering).asName() orelse
+            return error.UnsupportedPdfRendering;
+        const luminosity = if (std.mem.eql(u8, subtype, "Luminosity"))
+            true
+        else if (std.mem.eql(u8, subtype, "Alpha"))
+            false
+        else
+            return error.UnsupportedPdfRendering;
+
+        if (smask.get("TR")) |transfer_obj| {
+            var transfer = try self.resolveValue(transfer_obj);
+            defer transfer.deinit(self.alloc);
+            if (!std.mem.eql(u8, transfer.asName() orelse "", "Identity"))
+                return error.UnsupportedPdfRendering;
+        }
+        if (luminosity) if (smask.get("BC")) |backdrop_obj| {
+            var backdrop = try self.resolveValue(backdrop_obj);
+            defer backdrop.deinit(self.alloc);
+            if (backdrop != .array) return error.UnsupportedPdfRendering;
+            for (backdrop.array) |*component| {
+                const value = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+                // The image-only profile covers the complete group bounds.
+                // Reject non-default backdrops until partial group coverage is
+                // represented, rather than silently changing mask luminance.
+                if (!std.math.isFinite(value) or @abs(value) > 0.000001)
+                    return error.UnsupportedPdfRendering;
+            }
+        };
+
+        var group = try self.resolveValue(smask.get("G") orelse return error.UnsupportedPdfRendering);
+        defer group.deinit(self.alloc);
+        if (group != .stream or !std.mem.eql(u8, (group.get("Subtype") orelse return error.UnsupportedPdfRendering).asName() orelse "", "Form"))
+            return error.UnsupportedPdfRendering;
+        var group_attributes = try self.resolveValue(group.get("Group") orelse return error.UnsupportedPdfRendering);
+        defer group_attributes.deinit(self.alloc);
+        if (group_attributes != .dict or
+            !std.mem.eql(u8, (group_attributes.get("S") orelse return error.UnsupportedPdfRendering).asName() orelse "", "Transparency"))
+            return error.UnsupportedPdfRendering;
+        if (luminosity) if (group_attributes.get("CS")) |color_space| {
+            var resolved_color_space = try self.resolveValue(color_space);
+            defer resolved_color_space.deinit(self.alloc);
+            const name = resolved_color_space.asName() orelse return error.UnsupportedPdfRendering;
+            if (!std.mem.eql(u8, name, "DeviceGray") and !std.mem.eql(u8, name, "DeviceRGB"))
+                return error.UnsupportedPdfRendering;
+        };
+        const bbox = try self.resolveSoftMaskPageBox(group.get("BBox") orelse return error.UnsupportedPdfRendering);
+        const group_matrix = if (group.get("Matrix")) |matrix_obj|
+            try self.resolveSoftMaskMatrix(matrix_obj)
+        else
+            GraphicsMatrix{};
+        const resources_obj = group.get("Resources") orelse return error.UnsupportedPdfRendering;
+        var resources = try self.resolveValue(resources_obj);
+        defer resources.deinit(self.alloc);
+        if (resources != .dict) return error.UnsupportedPdfRendering;
+        const content = try self.readDecodedStreamData(&group);
+        defer self.alloc.free(content);
+        if (!try contentIsSingleImageSoftMaskAlloc(self.alloc, content))
+            return error.UnsupportedPdfRendering;
+
+        const images = try self.collectImagesFromResourcesAlloc(&resources, content);
+        defer {
+            for (images) |*image| image.deinit(self.alloc);
+            self.alloc.free(images);
+        }
+        var runs = std.ArrayList(ImageRun).empty;
+        defer {
+            for (runs.items) |*run| run.deinit(self.alloc);
+            runs.deinit(self.alloc);
+        }
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractImageRunsFromContentAppendWithStateCancelable(
+            self.alloc,
+            &runs,
+            content,
+            images,
+            &.{},
+            &.{},
+            .{ .matrix = group_matrix },
+            &.{},
+            .nonzero,
+            &paint_order,
+            &next_group_id,
+            self.cancellation,
+        );
+        if (runs.items.len != 1 or runs.items[0].stencil_color != null)
+            return error.UnsupportedPdfRendering;
+        const run = &runs.items[0];
+        const run_bounds = transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .{
+            .a = run.a,
+            .b = run.b,
+            .c = run.c,
+            .d = run.d,
+            .e = run.e,
+            .f = run.f,
+        });
+        const group_bounds = transformPageBox(bbox, group_matrix);
+        if (!pageBoxesApproxEqual(run_bounds, group_bounds))
+            return error.UnsupportedPdfRendering;
+        const shared = run.shared_rgba orelse return error.UnsupportedPdfRendering;
+        shared.retain();
+        return .{
+            .rgba = shared.bytes,
+            .shared_rgba = shared,
+            .width = run.width,
+            .height = run.height,
+            .luminosity = luminosity,
+            .interpolate = run.interpolate,
+            .matrix = .{ .a = run.a, .b = run.b, .c = run.c, .d = run.d, .e = run.e, .f = run.f },
+        };
+    }
+
+    fn resolveSoftMaskPageBox(self: *const Reader, obj: *const syntax.Object) !PageBox {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .array or resolved.array.len != 4) return error.UnsupportedPdfRendering;
+        var values: [4]f64 = undefined;
+        for (resolved.array, 0..) |*component, index| {
+            values[index] = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(values[index])) return error.UnsupportedPdfRendering;
+        }
+        return .{
+            .min_x = @min(values[0], values[2]),
+            .min_y = @min(values[1], values[3]),
+            .max_x = @max(values[0], values[2]),
+            .max_y = @max(values[1], values[3]),
+        };
+    }
+
+    fn resolveSoftMaskMatrix(self: *const Reader, obj: *const syntax.Object) !GraphicsMatrix {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .array or resolved.array.len != 6) return error.UnsupportedPdfRendering;
+        var values: [6]f64 = undefined;
+        for (resolved.array, 0..) |*component, index| {
+            values[index] = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(values[index])) return error.UnsupportedPdfRendering;
+        }
+        return .{
+            .a = values[0],
+            .b = values[1],
+            .c = values[2],
+            .d = values[3],
+            .e = values[4],
+            .f = values[5],
+        };
     }
 
     fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PagePattern {
@@ -5660,10 +7485,7 @@ pub const Reader = struct {
                 const shading_obj = pat.get("Shading") orelse continue;
                 var resolved_shading = try self.resolveValue(shading_obj);
                 defer resolved_shading.deinit(self.alloc);
-                var shading: ?PageShading = self.buildPageShading(entry.key, &resolved_shading) catch |err| switch (err) {
-                    error.UnsupportedPdfRendering => continue,
-                    else => return err,
-                };
+                var shading: ?PageShading = try self.buildPageShading(entry.key, &resolved_shading);
                 errdefer if (shading) |*owned| owned.deinit(self.alloc);
                 var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
                 errdefer if (name) |owned| self.alloc.free(owned);
@@ -5705,7 +7527,7 @@ pub const Reader = struct {
                 resolved_pattern_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_pattern_resources) |*pattern_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(pattern_resources) else try self.collectFontsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_pattern_resources) |*pattern_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(pattern_resources, content) else try self.collectFontsFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -5715,7 +7537,7 @@ pub const Reader = struct {
                 for (images) |*image| image.deinit(self.alloc);
                 if (images.len > 0) self.alloc.free(images);
             }
-            const shadings = if (resolved_pattern_resources) |*pattern_resources| try self.collectShadingsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageShading, 0);
+            const shadings = if (resolved_pattern_resources) |*pattern_resources| try self.collectShadingsFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageShading, 0);
             errdefer {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
@@ -5725,10 +7547,15 @@ pub const Reader = struct {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
             }
-            const gstates = if (resolved_pattern_resources) |*pattern_resources| try self.collectExtGStatesFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageExtGState, 0);
+            const gstates = if (resolved_pattern_resources) |*pattern_resources| try self.collectExtGStatesFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageExtGState, 0);
             errdefer {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
+            }
+            const color_spaces = if (resolved_pattern_resources) |*pattern_resources| try self.collectColorSpacesFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageColorSpace, 0);
+            errdefer {
+                for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+                if (color_spaces.len > 0) self.alloc.free(color_spaces);
             }
             const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
@@ -5751,6 +7578,7 @@ pub const Reader = struct {
                 .shadings = shadings,
                 .patterns = patterns,
                 .gstates = gstates,
+                .color_spaces = color_spaces,
                 .forms = forms,
             });
             name = null;
@@ -5790,7 +7618,7 @@ pub const Reader = struct {
                 resolved_form_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_form_resources) |*form_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(form_resources) else try self.collectFontsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_form_resources) |*form_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(form_resources, content) else try self.collectFontsFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -5800,7 +7628,7 @@ pub const Reader = struct {
                 for (images) |*image| image.deinit(self.alloc);
                 if (images.len > 0) self.alloc.free(images);
             }
-            const shadings = if (resolved_form_resources) |*form_resources| try self.collectShadingsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageShading, 0);
+            const shadings = if (resolved_form_resources) |*form_resources| try self.collectShadingsFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageShading, 0);
             errdefer {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
@@ -5810,10 +7638,15 @@ pub const Reader = struct {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
             }
-            const gstates = if (resolved_form_resources) |*form_resources| try self.collectExtGStatesFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageExtGState, 0);
+            const gstates = if (resolved_form_resources) |*form_resources| try self.collectExtGStatesFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageExtGState, 0);
             errdefer {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
+            }
+            const color_spaces = if (resolved_form_resources) |*form_resources| try self.collectColorSpacesFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageColorSpace, 0);
+            errdefer {
+                for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+                if (color_spaces.len > 0) self.alloc.free(color_spaces);
             }
             const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
@@ -5874,6 +7707,7 @@ pub const Reader = struct {
                 .shadings = shadings,
                 .patterns = patterns,
                 .gstates = gstates,
+                .color_spaces = color_spaces,
                 .forms = forms,
             });
             name = null;
@@ -5919,7 +7753,7 @@ pub const Reader = struct {
             }
 
             var fonts: ?[]PageFont = if (resolved_form_resources) |*form_resources|
-                try self.collectFontsFromResourcesAlloc(form_resources)
+                try self.collectFontsFromResourcesAlloc(form_resources, content.?)
             else
                 try self.alloc.alloc(PageFont, 0);
             errdefer if (fonts) |owned| {
@@ -5932,6 +7766,14 @@ pub const Reader = struct {
                 try self.alloc.alloc(PageForm, 0);
             errdefer if (forms) |owned| {
                 for (owned) |*form| form.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
+            var color_spaces: ?[]PageColorSpace = if (resolved_form_resources) |*form_resources|
+                try self.collectColorSpacesFromResourcesAlloc(form_resources, content.?)
+            else
+                try self.alloc.alloc(PageColorSpace, 0);
+            errdefer if (color_spaces) |owned| {
+                for (owned) |*color_space| color_space.deinit(self.alloc);
                 if (owned.len > 0) self.alloc.free(owned);
             };
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
@@ -5953,14 +7795,126 @@ pub const Reader = struct {
                     };
                 },
                 .fonts = fonts.?,
+                .color_spaces = color_spaces.?,
                 .forms = forms.?,
             });
             name = null;
             content = null;
             fonts = null;
+            color_spaces = null;
             forms = null;
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn shadingColorSpaceKind(self: *const Reader, obj: *const syntax.Object) !ColorSpaceKind {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved.asName()) |name| {
+            const kind = colorSpaceKindFromName(name);
+            return switch (kind) {
+                .device_gray, .device_rgb, .device_cmyk => kind,
+                else => error.UnsupportedPdfRendering,
+            };
+        }
+        if (resolved != .array or resolved.array.len < 2) return error.UnsupportedPdfRendering;
+        const family = resolved.array[0].asName() orelse return error.UnsupportedPdfRendering;
+        if (!std.mem.eql(u8, family, "ICCBased")) return error.UnsupportedPdfRendering;
+        var profile = try self.resolveValue(&resolved.array[1]);
+        defer profile.deinit(self.alloc);
+        if (profile != .stream) return error.UnsupportedPdfRendering;
+        if (profile.get("Alternate")) |alternate| return try self.shadingColorSpaceKind(alternate);
+        const components = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return error.UnsupportedPdfRendering)) orelse
+            return error.UnsupportedPdfRendering;
+        return switch (components) {
+            1 => .device_gray,
+            3 => .device_rgb,
+            4 => .device_cmyk,
+            else => error.UnsupportedPdfRendering,
+        };
+    }
+
+    fn parseShadingColorFunction(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        output_components: usize,
+        depth: u8,
+        remaining_nodes: *u16,
+    ) !ShadingColorFunction {
+        if (depth >= 8 or remaining_nodes.* == 0) return error.UnsupportedPdfRendering;
+        remaining_nodes.* -= 1;
+        return switch (try self.colorFunctionType(obj)) {
+            0 => .{ .sampled = try self.parseSampledTintTransform(obj, output_components) },
+            2 => .{ .exponential = try self.parseExponentialTintTransform(obj, output_components) },
+            3 => blk: {
+                var resolved = try self.resolveValue(obj);
+                defer resolved.deinit(self.alloc);
+                const dict: []const syntax.DictEntry = switch (resolved) {
+                    .dict => |entries| entries,
+                    .stream => |stream| stream.header,
+                    else => return error.UnsupportedPdfRendering,
+                };
+
+                var domain = try self.resolveValue(dictGetObject(dict, "Domain") orelse return error.UnsupportedPdfRendering);
+                defer domain.deinit(self.alloc);
+                if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
+                const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
+                const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min >= domain_max)
+                    return error.UnsupportedPdfRendering;
+
+                var function_objects = try self.resolveValue(dictGetObject(dict, "Functions") orelse return error.UnsupportedPdfRendering);
+                defer function_objects.deinit(self.alloc);
+                if (function_objects != .array or function_objects.array.len == 0 or function_objects.array.len > 32)
+                    return error.UnsupportedPdfRendering;
+                const functions = try self.alloc.alloc(ShadingColorFunction, function_objects.array.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (functions[0..initialized]) |*function| function.deinit(self.alloc);
+                    self.alloc.free(functions);
+                }
+                for (function_objects.array) |*child| {
+                    functions[initialized] = try self.parseShadingColorFunction(child, output_components, depth + 1, remaining_nodes);
+                    initialized += 1;
+                }
+
+                var bounds_object = try self.resolveValue(dictGetObject(dict, "Bounds") orelse return error.UnsupportedPdfRendering);
+                defer bounds_object.deinit(self.alloc);
+                if (bounds_object != .array or bounds_object.array.len != functions.len - 1)
+                    return error.UnsupportedPdfRendering;
+                const bounds = try self.alloc.alloc(f64, bounds_object.array.len);
+                errdefer self.alloc.free(bounds);
+                var previous = domain_min;
+                for (bounds_object.array, bounds) |*source, *bound| {
+                    bound.* = (try self.resolvedNumericObjectValue(source)) orelse return error.UnsupportedPdfRendering;
+                    if (!std.math.isFinite(bound.*) or bound.* <= previous or bound.* >= domain_max)
+                        return error.UnsupportedPdfRendering;
+                    previous = bound.*;
+                }
+
+                var encode_object = try self.resolveValue(dictGetObject(dict, "Encode") orelse return error.UnsupportedPdfRendering);
+                defer encode_object.deinit(self.alloc);
+                if (encode_object != .array or encode_object.array.len != functions.len * 2)
+                    return error.UnsupportedPdfRendering;
+                const encode = try self.alloc.alloc(f64, encode_object.array.len);
+                errdefer self.alloc.free(encode);
+                for (encode_object.array, encode) |*source, *value| {
+                    value.* = (try self.resolvedNumericObjectValue(source)) orelse return error.UnsupportedPdfRendering;
+                    if (!std.math.isFinite(value.*)) return error.UnsupportedPdfRendering;
+                }
+
+                const stitching = try self.alloc.create(ShadingStitchingFunction);
+                stitching.* = .{
+                    .functions = functions,
+                    .bounds = bounds,
+                    .encode = encode,
+                    .domain_min = domain_min,
+                    .domain_max = domain_max,
+                };
+                break :blk .{ .stitching = stitching };
+            },
+            else => error.UnsupportedPdfRendering,
+        };
     }
 
     fn buildPageShading(self: *const Reader, name: []const u8, obj: *const syntax.Object) !PageShading {
@@ -5973,40 +7927,110 @@ pub const Reader = struct {
         const shading_type = dictGetInteger(dict, "ShadingType") orelse return error.UnsupportedPdfRendering;
         if (shading_type != 2 and shading_type != 3) return error.UnsupportedPdfRendering;
 
-        const color_space_name = if (dictGetArray(dict, "ColorSpace")) |arr|
-            arr[0].asName() orelse return error.UnsupportedPdfRendering
-        else blk: {
-            for (dict) |entry| {
-                if (std.mem.eql(u8, entry.key, "ColorSpace")) {
-                    break :blk entry.value.asName() orelse return error.UnsupportedPdfRendering;
-                }
-            }
-            return error.UnsupportedPdfRendering;
-        };
-        const components: usize = if (std.mem.eql(u8, color_space_name, "DeviceGray"))
-            1
-        else if (std.mem.eql(u8, color_space_name, "DeviceRGB"))
-            3
-        else if (std.mem.eql(u8, color_space_name, "DeviceCMYK"))
-            4
-        else
-            return error.UnsupportedPdfRendering;
+        const color_space_kind = try self.shadingColorSpaceKind(dictGetObject(dict, "ColorSpace") orelse return error.UnsupportedPdfRendering);
+        const components = colorSpaceComponentCount(color_space_kind);
 
         const coords = dictGetArray(dict, "Coords") orelse return error.UnsupportedPdfRendering;
         if ((shading_type == 2 and coords.len < 4) or (shading_type == 3 and coords.len < 6)) return error.UnsupportedPdfRendering;
 
-        var transform = try self.parseExponentialTintTransform(dictGetObject(dict, "Function") orelse return error.UnsupportedPdfRendering, components);
-        defer transform.deinit(self.alloc);
-
-        var c0_components: [4]u8 = .{ 0, 0, 0, 0xff };
-        var c1_components: [4]u8 = .{ 0, 0, 0, 0xff };
-        for (0..components) |i| {
-            c0_components[i] = floatChannel(evalExponentialTintComponent(&transform, 0.0, i));
-            c1_components[i] = floatChannel(evalExponentialTintComponent(&transform, 1.0, i));
+        var remaining_function_nodes = shading_function_node_capacity;
+        var function = try self.parseShadingColorFunction(
+            dictGetObject(dict, "Function") orelse return error.UnsupportedPdfRendering,
+            components,
+            0,
+            &remaining_function_nodes,
+        );
+        defer function.deinit(self.alloc);
+        const function_domain = function.domain();
+        var shading_domain = [2]f64{ 0, 1 };
+        if (dictGetObject(dict, "Domain")) |domain_obj| {
+            var resolved_domain = try self.resolveValue(domain_obj);
+            defer resolved_domain.deinit(self.alloc);
+            if (resolved_domain != .array or resolved_domain.array.len != 2)
+                return error.UnsupportedPdfRendering;
+            shading_domain[0] = (try self.resolvedNumericObjectValue(&resolved_domain.array[0])) orelse return error.UnsupportedPdfRendering;
+            shading_domain[1] = (try self.resolvedNumericObjectValue(&resolved_domain.array[1])) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(shading_domain[0]) or !std.math.isFinite(shading_domain[1]) or shading_domain[0] >= shading_domain[1])
+                return error.UnsupportedPdfRendering;
         }
-
-        const c0 = colorFromComponents(color_space_name, c0_components, components) orelse return error.UnsupportedPdfRendering;
-        const c1 = colorFromComponents(color_space_name, c1_components, components) orelse return error.UnsupportedPdfRendering;
+        // PDF clips function inputs to the function's declared domain. Doing
+        // that in the evaluator is exact, including a shading domain that is
+        // wider than the function domain.
+        const SamplePoint = struct { position: f64, input: f64, side: u8 };
+        var sample_points: [shading_color_sample_capacity]SamplePoint = undefined;
+        var sample_count: usize = 0;
+        for (0..shading_uniform_color_sample_count) |sample_index| {
+            const position = @as(f64, @floatFromInt(sample_index)) / @as(f64, @floatFromInt(shading_uniform_color_sample_count - 1));
+            sample_points[sample_count] = .{
+                .position = position,
+                .input = shading_domain[0] + position * (shading_domain[1] - shading_domain[0]),
+                .side = 1,
+            };
+            sample_count += 1;
+        }
+        var discontinuities: [shading_discontinuity_capacity]f64 = undefined;
+        var discontinuity_count: usize = 0;
+        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity;
+        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity;
+        var exact_boundary_count: usize = 0;
+        try function.appendDiscontinuities(
+            &discontinuities,
+            &discontinuity_count,
+            1,
+            0,
+            shading_domain[0],
+            shading_domain[1],
+        );
+        var discontinuity_sort_index: usize = 1;
+        while (discontinuity_sort_index < discontinuity_count) : (discontinuity_sort_index += 1) {
+            const value = discontinuities[discontinuity_sort_index];
+            var insert = discontinuity_sort_index;
+            while (insert > 0 and discontinuities[insert - 1] > value) : (insert -= 1)
+                discontinuities[insert] = discontinuities[insert - 1];
+            discontinuities[insert] = value;
+        }
+        for (discontinuities[0..discontinuity_count], 0..) |bound, index| {
+            if (bound <= shading_domain[0] or bound >= shading_domain[1]) continue;
+            if (sample_count + 2 > shading_color_sample_capacity) return error.UnsupportedPdfRendering;
+            const previous = if (index == 0) shading_domain[0] else discontinuities[index - 1];
+            const next = if (index + 1 == discontinuity_count) shading_domain[1] else discontinuities[index + 1];
+            const base_delta = @max(1.0, @abs(bound)) * 0.000000000001;
+            const left_delta = @min(base_delta, (bound - previous) / 4.0);
+            const right_delta = @min(base_delta, (next - bound) / 4.0);
+            const position = (bound - shading_domain[0]) / (shading_domain[1] - shading_domain[0]);
+            var exact_values = [4]f64{ 0, 0, 0, 0 };
+            function.evaluate(std.math.clamp(bound, function_domain[0], function_domain[1]), exact_values[0..components]);
+            exact_boundary_colors[exact_boundary_count] = renderBaseColorSpaceComponents(.{ .kind = color_space_kind }, exact_values);
+            exact_boundary_positions[exact_boundary_count] = position;
+            exact_boundary_count += 1;
+            sample_points[sample_count] = .{ .position = position, .input = bound - left_delta, .side = 0 };
+            sample_count += 1;
+            sample_points[sample_count] = .{ .position = position, .input = bound + right_delta, .side = 2 };
+            sample_count += 1;
+        }
+        // The fixed table is tiny; insertion sort is deterministic and keeps
+        // left/right samples at identical breakpoint positions in side order.
+        var sort_index: usize = 1;
+        while (sort_index < sample_count) : (sort_index += 1) {
+            const value = sample_points[sort_index];
+            var insert = sort_index;
+            while (insert > 0 and (sample_points[insert - 1].position > value.position or
+                (sample_points[insert - 1].position == value.position and sample_points[insert - 1].side > value.side))) : (insert -= 1)
+                sample_points[insert] = sample_points[insert - 1];
+            sample_points[insert] = value;
+        }
+        var color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity;
+        var color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity;
+        for (sample_points[0..sample_count], 0..) |sample, sample_index| {
+            var values = [4]f64{ 0, 0, 0, 0 };
+            // Clamp explicitly here as well so custom evaluator additions
+            // cannot accidentally escape the function's declared domain.
+            function.evaluate(std.math.clamp(sample.input, function_domain[0], function_domain[1]), values[0..components]);
+            color_samples[sample_index] = renderBaseColorSpaceComponents(.{ .kind = color_space_kind }, values);
+            color_sample_positions[sample_index] = sample.position;
+        }
+        const c0 = color_samples[0];
+        const c1 = color_samples[sample_count - 1];
         const extend = dictGetArray(dict, "Extend");
 
         return .{
@@ -6020,6 +8044,12 @@ pub const Reader = struct {
             .r1 = if (shading_type == 3) numericObjectValue(&coords[5]) orelse 0 else 0,
             .c0 = c0,
             .c1 = c1,
+            .color_samples = color_samples,
+            .color_sample_positions = color_sample_positions,
+            .color_sample_count = @intCast(sample_count),
+            .exact_boundary_colors = exact_boundary_colors,
+            .exact_boundary_positions = exact_boundary_positions,
+            .exact_boundary_count = @intCast(exact_boundary_count),
             .extend_start = if (extend) |arr| if (arr.len >= 1) switch (arr[0]) {
                 .boolean => |b| b,
                 else => false,
@@ -6031,11 +8061,86 @@ pub const Reader = struct {
         };
     }
 
-    fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!DecodedRgbaImage {
-        return try self.decodeImageToRgbaWithInitialLiveBytesAlloc(obj, 0);
+    fn canonicalDctCmykModeAlloc(
+        self: *const Reader,
+        decode_obj: ?*const syntax.Object,
+    ) !?image_lib.jpeg.FourComponentMode {
+        const value = decode_obj orelse return .pdf_device_cmyk;
+        var decode = try self.resolveValue(value);
+        defer decode.deinit(self.alloc);
+        if (decode != .array or decode.array.len != 8) return null;
+
+        var mode: ?image_lib.jpeg.FourComponentMode = null;
+        for (0..4) |component| {
+            const low = (try self.resolvedNumericObjectValue(&decode.array[component * 2])) orelse return null;
+            const high = (try self.resolvedNumericObjectValue(&decode.array[component * 2 + 1])) orelse return null;
+            const component_mode: image_lib.jpeg.FourComponentMode = if (low == 0 and high == 1)
+                .pdf_device_cmyk
+            else if (low == 1 and high == 0)
+                .jpeg_display
+            else
+                return null;
+            if (mode) |existing| {
+                if (existing != component_mode) return null;
+            } else {
+                mode = component_mode;
+            }
+        }
+        return mode;
     }
 
-    fn decodeImageToRgbaWithInitialLiveBytesAlloc(self: *const Reader, obj: *const syntax.Object, initial_live_bytes: usize) anyerror!DecodedRgbaImage {
+    /// A four-component DCT stream can stay on the decoder's bounded RGBA
+    /// path when its PDF color space is semantically DeviceCMYK. PDF ICCBased
+    /// profiles use DeviceCMYK as the default alternate for N=4; the renderer
+    /// intentionally implements that alternate rather than a general ICC
+    /// engine. Restrict the fast path to the same unit component domain and a
+    /// direct DeviceCMYK alternate so no custom Range or alternate transform
+    /// is silently skipped.
+    fn dctDeviceCmykCompatibleAlloc(
+        self: *const Reader,
+        color_space: *const syntax.Object,
+    ) !bool {
+        if (color_space.asName()) |name|
+            return std.mem.eql(u8, name, "DeviceCMYK") or std.mem.eql(u8, name, "CMYK");
+        if (color_space.* != .array or color_space.array.len < 2) return false;
+        const family = color_space.array[0].asName() orelse return false;
+        if (!std.mem.eql(u8, family, "ICCBased")) return false;
+
+        var profile = try self.resolveValue(&color_space.array[1]);
+        defer profile.deinit(self.alloc);
+        if (profile != .stream) return false;
+        const component_count = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return false)) orelse return false;
+        if (component_count != 4) return false;
+
+        if (profile.get("Range")) |range_obj| {
+            var range = try self.resolveValue(range_obj);
+            defer range.deinit(self.alloc);
+            if (range != .array or range.array.len != 8) return false;
+            for (0..4) |component| {
+                const low = (try self.resolvedNumericObjectValue(&range.array[component * 2])) orelse return false;
+                const high = (try self.resolvedNumericObjectValue(&range.array[component * 2 + 1])) orelse return false;
+                if (low != 0 or high != 1) return false;
+            }
+        }
+        if (profile.get("Alternate")) |alternate_obj| {
+            var alternate = try self.resolveValue(alternate_obj);
+            defer alternate.deinit(self.alloc);
+            const name = alternate.asName() orelse return false;
+            if (!std.mem.eql(u8, name, "DeviceCMYK") and !std.mem.eql(u8, name, "CMYK")) return false;
+        }
+        return true;
+    }
+
+    fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!DecodedRgbaImage {
+        return try self.decodeImageToRgbaWithInitialLiveBytesAlloc(obj, 0, null);
+    }
+
+    fn decodeImageToRgbaWithInitialLiveBytesAlloc(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        initial_live_bytes: usize,
+        color_space_resources: ?*const syntax.Object,
+    ) anyerror!DecodedRgbaImage {
         // Use one allocator budget for the complete image tree, including
         // codec scratch space and nested masks. The wrapper delegates to the
         // Reader allocator, so the detached RGBA result remains caller-owned.
@@ -6043,6 +8148,7 @@ pub const Reader = struct {
         var budget = DecodeBudgetAllocator.init(self.alloc, initial_live_bytes, self.decode_limits.max_working_set_bytes);
         var scoped_reader = self.*;
         scoped_reader.alloc = budget.allocator();
+        scoped_reader.image_color_space_resources = color_space_resources;
         var context = ImageDecodeContext{};
         defer context.deinit(scoped_reader.alloc);
         return scoped_reader.decodeImageToRgbaGuardedAlloc(obj, &context, 0, 0) catch |err| {
@@ -6075,6 +8181,7 @@ pub const Reader = struct {
         const has_ccitt = streamHasFilter(obj.get("Filter"), "CCITTFaxDecode");
         const has_jbig2 = streamHasFilter(obj.get("Filter"), "JBIG2Decode");
         const has_jpx = streamHasFilter(obj.get("Filter"), "JPXDecode");
+        const has_dct = streamHasFilter(obj.get("Filter"), "DCTDecode");
         const jpx_alpha_mode = try parseJpxAlphaMode(obj, has_jpx);
         if (!image_mask and !has_ccitt and !has_jbig2 and !has_jpx and bits_i != 1 and bits_i != 2 and bits_i != 4 and bits_i != 8) return error.UnsupportedPdfRendering;
         if (!image_mask and has_ccitt and bits_i != 1) return error.UnsupportedPdfRendering;
@@ -6083,15 +8190,17 @@ pub const Reader = struct {
 
         const width = std.math.cast(u32, width_i) orelse return error.RenderedPageTooLarge;
         const height = std.math.cast(u32, height_i) orelse return error.RenderedPageTooLarge;
-        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
-        if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
-        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        const pixel_count = std.math.mul(usize, width, height) catch return error.RenderedPageTooLarge;
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
         if (ancestor_live_bytes >= self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
         const available_working_set = self.decode_limits.max_working_set_bytes - ancestor_live_bytes;
         var transparency_plan = try self.buildImageTransparencyPlanAlloc(obj, width, height, image_mask, jpx_alpha_mode);
         defer transparency_plan.deinit(self.alloc);
         const can_reduce_resolution = self.image_decode_target != null and
-            transparency_plan.allowsResolutionReduction() and (has_jbig2 or has_jpx);
+            transparency_plan.allowsResolutionReduction() and (has_ccitt or has_jbig2 or has_jpx or has_dct);
+        const codec_reduces_before_full_raster_allocation = has_dct or has_jbig2 or has_jpx;
+        if (pixel_count > 100_000_000 and !(can_reduce_resolution and codec_reduces_before_full_raster_allocation))
+            return error.RenderedPageTooLarge;
         // Every successful path must retain its RGBA result. Reject impossible
         // dimensions before invoking an attacker-controlled image codec.
         if (rgba_len > available_working_set and !can_reduce_resolution) return error.PdfDecodeWorkingSetTooLarge;
@@ -6105,7 +8214,7 @@ pub const Reader = struct {
                 true
             else blk: {
                 const color_space_obj = obj.get("ColorSpace") orelse break :blk false;
-                var color_space = try self.resolveValue(color_space_obj);
+                var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
                 defer color_space.deinit(self.alloc);
                 const name = color_space.asName() orelse break :blk false;
                 break :blk std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G");
@@ -6205,14 +8314,15 @@ pub const Reader = struct {
             }
 
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-            var resolved_color_space = try self.resolveValue(color_space_obj);
+            var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
+            const indexed_color_space = isIndexedColorSpace(&resolved_color_space);
             var source_samples: ?[]u8 = null;
             defer if (source_samples) |samples| self.alloc.free(samples);
             var source_view: ?ImageSourceSamples = null;
             if (resolved_color_space.asName()) |color_space| {
                 if (!std.mem.eql(u8, color_space, "DeviceGray")) return error.UnsupportedPdfRendering;
-                if (transparency_plan.needsNativeSamples()) {
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                     source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, source_bitmap, render_width, render_height);
                     source_view = .{
                         .data = .{ .u8 = source_samples.? },
@@ -6226,7 +8336,7 @@ pub const Reader = struct {
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ input_live_bytes, decoded.pixels.len, render_rgba_len, render_pixel_count });
                 source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, source_bitmap, render_width, render_height);
                 const samples = source_samples.?;
-                if (transparency_plan.needsNativeSamples()) {
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                     const component_count = try self.colorSpaceInputComponentCount(&resolved_color_space);
                     if (component_count != 1) return error.UnsupportedPdfRendering;
                     source_view = .{
@@ -6269,33 +8379,59 @@ pub const Reader = struct {
                 } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, render_pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else {
-                    try self.decodeIndexedImageToRgba(rgba, render_pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        rgba,
+                        render_width,
+                        render_height,
+                        samples,
+                        source_view,
+                        resolved_color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
                 }
             }
             try self.applyImageTransparencyPlanAlloc(rgba, render_width, render_height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{ .rgba = rgba, .width = render_width, .height = render_height };
         }
         if (has_ccitt) {
+            const render_dimensions = if (can_reduce_resolution)
+                imageDimensionsForTarget(width, height, self.image_decode_target)
+            else
+                ReducedImageDimensions{ .width = width, .height = height };
+            const render_width = render_dimensions.width;
+            const render_height = render_dimensions.height;
+            const render_pixel_count = std.math.mul(usize, render_width, render_height) catch
+                return error.PdfDecodeWorkingSetTooLarge;
+            const render_rgba_len = std.math.mul(usize, render_pixel_count, 4) catch
+                return error.PdfDecodeWorkingSetTooLarge;
             const raw = try self.readRawStreamDataWithLimit(obj, local_decode_limits.max_working_set_bytes);
             defer self.alloc.free(raw);
             const filter_param = streamFilterParamFor(obj.get("Filter"), obj.get("DecodeParms"), "CCITTFaxDecode");
             const gray = try decodeCcittGrayAlloc(self.alloc, raw, width, height, filter_param);
             defer self.alloc.free(gray);
+            var reduced_gray: ?[]u8 = null;
+            defer if (reduced_gray) |samples| self.alloc.free(samples);
+            if (render_width != width or render_height != height)
+                reduced_gray = try reduceGrayCoverageAlloc(self.alloc, gray, width, height, render_width, render_height, self.cancellation);
+            const render_gray = reduced_gray orelse gray;
 
-            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, gray.len, rgba_len });
-            const rgba = try self.alloc.alloc(u8, rgba_len);
+            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, gray.len, if (reduced_gray) |samples| samples.len else 0, render_rgba_len });
+            const rgba = try self.alloc.alloc(u8, render_rgba_len);
             errdefer self.alloc.free(rgba);
             if (image_mask) {
-                try decodeGrayMaskToRgba(rgba, gray, obj.get("Decode"), self.cancellation);
-                return .{ .rgba = rgba, .width = width, .height = height };
+                try decodeGrayMaskToRgba(rgba, render_gray, obj.get("Decode"), self.cancellation);
+                return .{ .rgba = rgba, .width = render_width, .height = render_height };
             }
 
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-            var resolved_color_space = try self.resolveValue(color_space_obj);
+            var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
             const source_view = ImageSourceSamples{
-                .data = .{ .u8 = gray },
-                .pixel_count = pixel_count,
+                .data = .{ .u8 = render_gray },
+                .pixel_count = render_pixel_count,
                 .component_count = 1,
                 .stride = 1,
                 .bits_per_component = 1,
@@ -6303,27 +8439,38 @@ pub const Reader = struct {
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
                 ancestor_live_bytes,
-                &.{ raw.len, gray.len, rgba_len },
+                &.{ raw.len, gray.len, if (reduced_gray) |samples| samples.len else 0, render_rgba_len },
             );
-            var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, obj.get("Decode"), width, height, context, transparency_live_bytes, mask_depth);
+            var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, obj.get("Decode"), render_width, render_height, context, transparency_live_bytes, mask_depth);
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
             if (resolved_color_space.asName()) |color_space| {
-                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, gray, color_space, obj.get("Decode"), self.cancellation);
+                try decodeDeviceColorSpaceToRgba(rgba, render_pixel_count, render_gray, color_space, obj.get("Decode"), self.cancellation);
             } else if (resolved_color_space == .array) {
-                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"))) {
+                if (try self.tryDecodeIccBasedImageToRgba(rgba, render_pixel_count, render_gray, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
-                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"))) {
+                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, render_pixel_count, render_gray, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
-                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"))) {
+                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, render_pixel_count, render_gray, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else {
-                    try self.decodeIndexedImageToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"));
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        rgba,
+                        render_width,
+                        render_height,
+                        render_gray,
+                        source_view,
+                        resolved_color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
                 }
             } else {
                 return error.UnsupportedPdfRendering;
             }
-            try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
-            return .{ .rgba = rgba, .width = width, .height = height };
+            try self.applyImageTransparencyPlanAlloc(rgba, render_width, render_height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
+            return .{ .rgba = rgba, .width = render_width, .height = render_height };
         }
         if (has_jpx) {
             var resolved_decode_parms: ?syntax.Object = null;
@@ -6414,10 +8561,12 @@ pub const Reader = struct {
                 if (decoded_u16.width != width or decoded_u16.height != height) return error.UnsupportedPdfRendering;
                 const sample_bytes = std.math.mul(usize, decoded_u16.pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
                 const normalized_len = if (indexed_color_space) 0 else decoded_u16.pixels.len;
-                const renderer_scratch_len = if (decoded_u16.jp2_color.alphaLayout(decoded_u16.components)) |alpha_layout|
-                    std.math.mul(usize, pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
-                else
-                    0;
+                const renderer_scratch_len = try jpeg2000RendererScratchLen(
+                    pixel_count,
+                    decoded_u16.jp2_color,
+                    decoded_u16.components,
+                    indexed_color_space,
+                );
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, sample_bytes, normalized_len, rgba_len, renderer_scratch_len });
                 const layout = try self.jpeg2000SourceLayout(obj, decoded_u16.components, decoded_u16.jp2_color);
                 const source_view = ImageSourceSamples{
@@ -6437,8 +8586,35 @@ pub const Reader = struct {
                 // preblended samples therefore stay in the JPX component domain.
                 var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, null, width, height, context, transparency_live_bytes, mask_depth);
                 defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
-                const rgba = if (indexed_color_space)
-                    try self.jpeg2000IndexedU16ToRgbaAlloc(decoded_u16.pixels, width, height, decoded_u16.components, header.bits_per_component, decoded_u16.jp2_color, obj, jpx_alpha_mode)
+                const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
+                    matte.indexed_matte_index != null
+                else
+                    false;
+                const rgba = if (indexed_color_space and indexed_matte) blk: {
+                    const mask_plan = switch (transparency_plan) {
+                        .soft_mask => |value| value,
+                        else => return error.UnsupportedPdfRendering,
+                    };
+                    break :blk try self.decodeIndexedMatteImageAlloc(
+                        width,
+                        height,
+                        source_view,
+                        obj,
+                        if (prepared_matte) |*prepared| prepared else return error.UnsupportedPdfRendering,
+                        transparency_plan.nativeMatte().?,
+                        mask_plan.metadata.interpolate,
+                        transparency_live_bytes,
+                    );
+                } else if (indexed_color_space)
+                    try self.jpeg2000IndexedSourceToRgbaAlloc(
+                        source_view,
+                        width,
+                        height,
+                        decoded_u16.jp2_color,
+                        obj,
+                        jpx_alpha_mode,
+                        transparency_live_bytes,
+                    )
                 else blk: {
                     const normalized = try normalizeU16SamplesToU8Alloc(self.alloc, decoded_u16.pixels, header.bits_per_component, self.cancellation);
                     defer self.alloc.free(normalized);
@@ -6475,10 +8651,12 @@ pub const Reader = struct {
                 return error.UnsupportedPdfRendering;
             const decoded_pixel_count = std.math.mul(usize, decoded_u8.width, decoded_u8.height) catch return error.PdfDecodeWorkingSetTooLarge;
             const decoded_rgba_len = std.math.mul(usize, decoded_pixel_count, 4) catch return error.PdfDecodeWorkingSetTooLarge;
-            const renderer_scratch_len = if (decoded_u8.jp2_color.alphaLayout(decoded_u8.components)) |alpha_layout|
-                std.math.mul(usize, decoded_pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
-            else
-                0;
+            const renderer_scratch_len = try jpeg2000RendererScratchLen(
+                decoded_pixel_count,
+                decoded_u8.jp2_color,
+                decoded_u8.components,
+                indexed_color_space,
+            );
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, decoded_u8.pixels.len, decoded_rgba_len, renderer_scratch_len });
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
@@ -6486,7 +8664,7 @@ pub const Reader = struct {
                 &.{ encoded.len, decoded_u8.pixels.len, decoded_rgba_len, renderer_scratch_len },
             );
             var source_view: ?ImageSourceSamples = null;
-            if (transparency_plan.needsNativeSamples()) {
+            if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                 const layout = try self.jpeg2000SourceLayout(obj, decoded_u8.components, decoded_u8.jp2_color);
                 source_view = .{
                     .data = .{ .u8 = decoded_u8.pixels },
@@ -6502,28 +8680,70 @@ pub const Reader = struct {
             else
                 null;
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
-            const rgba = try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
+            const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
+                matte.indexed_matte_index != null
+            else
+                false;
+            const rgba = if (indexed_color_space and indexed_matte) blk: {
+                const mask_plan = switch (transparency_plan) {
+                    .soft_mask => |value| value,
+                    else => return error.UnsupportedPdfRendering,
+                };
+                break :blk try self.decodeIndexedMatteImageAlloc(
+                    decoded_u8.width,
+                    decoded_u8.height,
+                    source_view orelse return error.UnsupportedPdfRendering,
+                    obj,
+                    if (prepared_matte) |*prepared| prepared else return error.UnsupportedPdfRendering,
+                    transparency_plan.nativeMatte().?,
+                    mask_plan.metadata.interpolate,
+                    transparency_live_bytes,
+                );
+            } else if (indexed_color_space) try self.jpeg2000IndexedSourceToRgbaAlloc(
+                source_view orelse return error.UnsupportedPdfRendering,
+                decoded_u8.width,
+                decoded_u8.height,
+                decoded_u8.jp2_color,
+                obj,
+                jpx_alpha_mode,
+                transparency_live_bytes,
+            ) else try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
             errdefer self.alloc.free(rgba);
             try self.applyImageTransparencyPlanAlloc(rgba, decoded_u8.width, decoded_u8.height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{ .rgba = rgba, .width = decoded_u8.width, .height = decoded_u8.height };
         }
         if (!image_mask and streamHasFilter(obj.get("Filter"), "DCTDecode")) {
-            const needs_sample_pipeline = transparency_plan.needsNativeSamples() or obj.get("Decode") != null;
-            var source_component_count: usize = 0;
-            var source_device_space: []const u8 = "";
+            if (bits_i != 8) return error.UnsupportedPdfRendering;
+            const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+            var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
+            defer color_space.deinit(self.alloc);
+            const indexed_color_space = isIndexedColorSpace(&color_space);
+            const source_component_count = try self.colorSpaceInputComponentCount(&color_space);
+            const direct_device_space = if (color_space.asName()) |name|
+                colorSpaceKindFromName(name) != .unsupported
+            else
+                false;
+            const device_cmyk_compatible = source_component_count == 4 and
+                try self.dctDeviceCmykCompatibleAlloc(&color_space);
+            const canonical_cmyk_mode = if (device_cmyk_compatible and !transparency_plan.needsNativeSamples())
+                try self.canonicalDctCmykModeAlloc(obj.get("Decode"))
+            else
+                null;
+            // The JPEG decoder provides RGBA, using direct PDF DeviceCMYK
+            // semantics when no later sample-domain operation is required.
+            // Reconstruct one- or three-component samples only when /Decode,
+            // calibrated/ICC/spot color, or transparency still needs them.
+            // Four-component source samples cannot be recovered losslessly
+            // from RGBA. Canonical identity/full-reversal DeviceCMYK Decode
+            // arrays are applied by selecting the decoder polarity; other
+            // sample-domain operations are rejected instead of silently
+            // changing color or mask semantics.
+            const needs_sample_pipeline = transparency_plan.needsNativeSamples() or
+                (obj.get("Decode") != null and canonical_cmyk_mode == null) or
+                (!direct_device_space and canonical_cmyk_mode == null);
             if (needs_sample_pipeline) {
-                if (bits_i != 8) return error.UnsupportedPdfRendering;
-                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-                var color_space = try self.resolveValue(color_space_obj);
-                defer color_space.deinit(self.alloc);
-                const name = color_space.asName() orelse return error.UnsupportedPdfRendering;
-                if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) {
-                    source_component_count = 1;
-                    source_device_space = "DeviceGray";
-                } else if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) {
-                    source_component_count = 3;
-                    source_device_space = "DeviceRGB";
-                } else return error.UnsupportedPdfRendering;
+                if (source_component_count != 1 and source_component_count != 3)
+                    return error.UnsupportedPdfRendering;
                 if (transparency_plan.nativeMatte()) |matte| {
                     if (matte.component_count != source_component_count) return error.UnsupportedPdfRendering;
                 }
@@ -6546,11 +8766,45 @@ pub const Reader = struct {
                 self.cancellation,
             );
             defer self.alloc.free(encoded);
-            const jpeg_decoded = try image_lib.jpeg.decodeRgba(self.alloc, encoded);
+            const jpeg_info = try image_lib.jpeg.probe(encoded);
+            var jpeg_options = image_lib.jpeg.DecodeOptions{
+                .max_dimension = if (can_reduce_resolution) self.image_decode_target.?.max_dimension else null,
+                .four_component_mode = canonical_cmyk_mode orelse .jpeg_display,
+            };
+            var planned_dimensions = try image_lib.jpeg.plannedDecodeDimensions(encoded, jpeg_options);
+            while (true) {
+                const planned_pixels = std.math.mul(usize, planned_dimensions.width, planned_dimensions.height) catch
+                    return error.PdfDecodeWorkingSetTooLarge;
+                const component_bytes_per_pixel: usize = switch (jpeg_info.frame_kind) {
+                    .progressive_dct, .arithmetic_progressive_dct => 4,
+                    else => 2,
+                };
+                const decoder_bytes_per_pixel = std.math.add(usize, 4, std.math.mul(usize, jpeg_info.component_count, component_bytes_per_pixel) catch
+                    return error.PdfDecodeWorkingSetTooLarge) catch return error.PdfDecodeWorkingSetTooLarge;
+                const decoder_peak = std.math.mul(usize, planned_pixels, decoder_bytes_per_pixel) catch
+                    return error.PdfDecodeWorkingSetTooLarge;
+                const total_peak = std.math.add(usize, encoded.len, decoder_peak) catch
+                    return error.PdfDecodeWorkingSetTooLarge;
+                if (total_peak <= local_decode_limits.max_working_set_bytes) break;
+                if (!can_reduce_resolution) return error.PdfDecodeWorkingSetTooLarge;
+                const current_max = @max(planned_dimensions.width, planned_dimensions.height);
+                const next_target = @max(1, (current_max -| 1) / 2);
+                if (jpeg_options.max_dimension != null and next_target >= jpeg_options.max_dimension.?)
+                    return error.PdfDecodeWorkingSetTooLarge;
+                jpeg_options.max_dimension = next_target;
+                const next_dimensions = try image_lib.jpeg.plannedDecodeDimensions(encoded, jpeg_options);
+                if (next_dimensions.width == planned_dimensions.width and next_dimensions.height == planned_dimensions.height)
+                    return error.PdfDecodeWorkingSetTooLarge;
+                planned_dimensions = next_dimensions;
+            }
+            const jpeg_decoded = try image_lib.jpeg.decodeRgbaWithOptions(self.alloc, encoded, jpeg_options);
             errdefer self.alloc.free(jpeg_decoded.rgba);
-            if (jpeg_decoded.width != width or jpeg_decoded.height != height) return error.UnsupportedPdfRendering;
+            if (jpeg_decoded.width != planned_dimensions.width or jpeg_decoded.height != planned_dimensions.height)
+                return error.UnsupportedPdfRendering;
+            const decoded_pixel_count = std.math.mul(usize, jpeg_decoded.width, jpeg_decoded.height) catch
+                return error.PdfDecodeWorkingSetTooLarge;
             const source_len = if (needs_sample_pipeline)
-                std.math.mul(usize, pixel_count, source_component_count) catch return error.PdfDecodeWorkingSetTooLarge
+                std.math.mul(usize, decoded_pixel_count, source_component_count) catch return error.PdfDecodeWorkingSetTooLarge
             else
                 0;
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, jpeg_decoded.rgba.len, source_len });
@@ -6559,7 +8813,7 @@ pub const Reader = struct {
             defer if (source_samples) |samples| self.alloc.free(samples);
             if (needs_sample_pipeline) {
                 source_samples = try self.alloc.alloc(u8, source_len);
-                for (0..pixel_count) |pixel| {
+                for (0..decoded_pixel_count) |pixel| {
                     const rgba_offset = pixel * 4;
                     const source_offset = pixel * source_component_count;
                     source_samples.?[source_offset] = jpeg_decoded.rgba[rgba_offset];
@@ -6568,9 +8822,9 @@ pub const Reader = struct {
                         source_samples.?[source_offset + 2] = jpeg_decoded.rgba[rgba_offset + 2];
                     }
                 }
-                if (transparency_plan.needsNativeSamples()) source_view = .{
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) source_view = .{
                     .data = .{ .u8 = source_samples.? },
-                    .pixel_count = pixel_count,
+                    .pixel_count = decoded_pixel_count,
                     .component_count = source_component_count,
                     .stride = source_component_count,
                     .bits_per_component = 8,
@@ -6582,22 +8836,39 @@ pub const Reader = struct {
                 &.{ encoded.len, jpeg_decoded.rgba.len, source_len },
             );
             var prepared_matte = if (source_view) |view|
-                try self.prepareMatteSoftMaskAlloc(&transparency_plan, view, obj.get("Decode"), width, height, context, transparency_live_bytes, mask_depth)
+                try self.prepareMatteSoftMaskAlloc(&transparency_plan, view, obj.get("Decode"), jpeg_decoded.width, jpeg_decoded.height, context, transparency_live_bytes, mask_depth)
             else
                 null;
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
             // Matte reversal mutates encoded parent samples. Apply /Decode only
             // afterward, matching the ordinary image pipeline and avoiding a
             // second decode transform during soft-mask processing.
-            if (source_samples) |samples| try decodeDeviceColorSpaceToRgba(
-                jpeg_decoded.rgba,
-                pixel_count,
-                samples,
-                source_device_space,
-                obj.get("Decode"),
-                self.cancellation,
-            );
-            try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
+            if (source_samples) |samples| {
+                if (indexed_color_space) {
+                    if (color_space != .array) return error.UnsupportedPdfRendering;
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        jpeg_decoded.rgba,
+                        jpeg_decoded.width,
+                        jpeg_decoded.height,
+                        samples,
+                        source_view,
+                        color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
+                } else {
+                    try self.decodeResolvedImageColorSpaceToRgba(
+                        jpeg_decoded.rgba,
+                        decoded_pixel_count,
+                        samples,
+                        &color_space,
+                        obj.get("Decode"),
+                    );
+                }
+            }
+            try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, jpeg_decoded.width, jpeg_decoded.height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{
                 .rgba = jpeg_decoded.rgba,
                 .width = jpeg_decoded.width,
@@ -6616,28 +8887,31 @@ pub const Reader = struct {
         }
 
         const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-        var resolved_color_space = try self.resolveValue(color_space_obj);
+        var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer resolved_color_space.deinit(self.alloc);
+        const indexed_color_space = isIndexedColorSpace(&resolved_color_space);
         var unpacked: ?[]u8 = null;
         defer if (unpacked) |bytes| self.alloc.free(bytes);
         const samples = if (bits_i == 8)
             decoded
         else blk: {
             // Packed low-bit images are only unambiguous here for one-component
-            // gray spaces (the common soft-mask representation).
-            const gray_space = if (resolved_color_space.asName()) |name|
+            // gray spaces or discrete Indexed samples.
+            const one_component_space = if (indexed_color_space)
+                true
+            else if (resolved_color_space.asName()) |name|
                 std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")
             else if (resolved_color_space == .array and resolved_color_space.array.len > 0)
                 try self.isOneComponentColorSpace(&resolved_color_space)
             else
                 false;
-            if (!gray_space) return error.UnsupportedPdfRendering;
+            if (!one_component_space) return error.UnsupportedPdfRendering;
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ decoded.len, rgba_len, pixel_count });
             unpacked = try unpackPackedGraySamplesAlloc(self.alloc, decoded, width, height, @intCast(bits_i));
             break :blk unpacked.?;
         };
         const component_count = try self.colorSpaceInputComponentCount(&resolved_color_space);
-        const source_view: ?ImageSourceSamples = if (transparency_plan.needsNativeSamples()) .{
+        const source_view: ?ImageSourceSamples = if (transparency_plan.needsNativeSamples() or indexed_color_space) .{
             .data = .{ .u8 = samples },
             .pixel_count = pixel_count,
             .component_count = component_count,
@@ -6665,7 +8939,18 @@ pub const Reader = struct {
             } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                 // handled
             } else {
-                try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
+                try self.decodeIndexedImageWithOptionalMatteToRgba(
+                    rgba,
+                    width,
+                    height,
+                    samples,
+                    source_view,
+                    resolved_color_space.array,
+                    obj.get("Decode"),
+                    &transparency_plan,
+                    if (prepared_matte) |*prepared| prepared else null,
+                    transparency_live_bytes,
+                );
             }
         } else {
             return error.UnsupportedPdfRendering;
@@ -6683,7 +8968,7 @@ pub const Reader = struct {
         jp2_color: image_lib.jpeg2000.Jp2ColorMetadata,
     ) !struct { component_count: usize, offsets: [4]u8 } {
         const component_count = if (image_obj.get("ColorSpace")) |color_space_obj| blk: {
-            var color_space = try self.resolveValue(color_space_obj);
+            var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer color_space.deinit(self.alloc);
             break :blk try self.colorSpaceInputComponentCount(&color_space);
         } else if (jp2_color.alphaLayout(components) != null)
@@ -6701,7 +8986,7 @@ pub const Reader = struct {
 
     fn imageUsesIndexedColorSpace(self: *const Reader, image_obj: *const syntax.Object) !bool {
         const color_space_obj = image_obj.get("ColorSpace") orelse return false;
-        var color_space = try self.resolveValue(color_space_obj);
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer color_space.deinit(self.alloc);
         if (color_space != .array or color_space.array.len == 0) return false;
         const family = color_space.array[0].asName() orelse return false;
@@ -6728,42 +9013,69 @@ pub const Reader = struct {
         if (pixels.len != sample_count) return error.UnsupportedPdfRendering;
         const layout = try self.jpeg2000SourceLayout(image_obj, components, jp2_color);
         if (layout.component_count != 1) return error.UnsupportedPdfRendering;
-        const alpha_layout = jp2_color.alphaLayout(components);
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const sample_bytes = std.math.mul(usize, pixels.len, @sizeOf(u16)) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const parent_live_bytes = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            0,
+            &.{ sample_bytes, rgba_len },
+        );
+        return try self.jpeg2000IndexedSourceToRgbaAlloc(.{
+            .data = .{ .u16 = @constCast(pixels) },
+            .pixel_count = pixel_count,
+            .component_count = 1,
+            .stride = components,
+            .bits_per_component = bits_per_component,
+            .component_offsets = layout.offsets,
+        }, width, height, jp2_color, image_obj, alpha_mode, parent_live_bytes);
+    }
+
+    fn jpeg2000IndexedSourceToRgbaAlloc(
+        self: *const Reader,
+        samples: ImageSourceSamples,
+        width: u32,
+        height: u32,
+        jp2_color: image_lib.jpeg2000.Jp2ColorMetadata,
+        image_obj: *const syntax.Object,
+        alpha_mode: JpxAlphaMode,
+        parent_live_bytes: usize,
+    ) ![]u8 {
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        if (samples.pixel_count != pixel_count or samples.component_count != 1 or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+            return error.UnsupportedPdfRendering;
+        const alpha_layout = jp2_color.alphaLayout(@intCast(samples.stride));
         if (alpha_mode != .ignore and alpha_layout == null) return error.UnsupportedPdfRendering;
         // An associated-alpha transform cannot be meaningfully inverted in
         // palette-index space. Reject it rather than selecting the wrong entry.
         if (alpha_mode == .premultiplied) return error.UnsupportedPdfRendering;
 
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
-        const sample_bytes = std.math.mul(usize, pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
-        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ sample_bytes, pixel_count, rgba_len });
-        const indexes = try self.alloc.alloc(u8, pixel_count);
-        defer self.alloc.free(indexes);
-        const max_sample: u32 = (@as(u32, 1) << @intCast(bits_per_component)) - 1;
-        for (indexes, 0..) |*index, pixel| {
-            if (pixel & 4095 == 0) try self.checkCancellation();
-            const sample = pixels[pixel * components + layout.offsets[0]];
-            if (sample > max_sample or sample > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
-            index.* = @intCast(sample);
-        }
-
-        const color_space_obj = image_obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-        var color_space = try self.resolveValue(color_space_obj);
-        defer color_space.deinit(self.alloc);
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ samples.liveBytes(), rgba_len });
         const rgba = try self.alloc.alloc(u8, rgba_len);
         errdefer self.alloc.free(rgba);
-        try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, indexes, &color_space, null);
-        if (alpha_layout) |embedded| {
+        const color_space_obj = image_obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
+        defer color_space.deinit(self.alloc);
+        if (color_space != .array) return error.UnsupportedPdfRendering;
+        try self.decodeIndexedImageSourceToRgbaGuarded(
+            rgba,
+            samples,
+            color_space.array,
+            null,
+            parent_live_bytes,
+            0,
+        );
+
+        if (alpha_layout) |embedded| if (alpha_mode != .ignore) {
+            const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
             for (0..pixel_count) |pixel| {
                 if (pixel & 4095 == 0) try self.checkCancellation();
-                const alpha = pixels[pixel * components + embedded.alpha];
-                if (alpha > max_sample) return error.UnsupportedPdfRendering;
-                rgba[pixel * 4 + 3] = if (alpha_mode == .ignore)
-                    0xff
-                else
-                    @intCast((@as(u32, alpha) * 255 + max_sample / 2) / max_sample);
+                const alpha = try rawImageSourceSample(samples, pixel, embedded.alpha, max_sample);
+                rgba[pixel * 4 + 3] = @intCast((alpha * 255 + max_sample / 2) / max_sample);
             }
-        }
+        };
         return rgba;
     }
 
@@ -6821,7 +9133,7 @@ pub const Reader = struct {
         const color_component_count: usize = if (alpha_layout) |layout| layout.color_count else components;
 
         if (image_obj.get("ColorSpace")) |color_space_obj| {
-            var resolved_color_space = try self.resolveValue(color_space_obj);
+            var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
             if (try self.colorSpaceInputComponentCount(&resolved_color_space) != color_component_count)
                 return error.UnsupportedPdfRendering;
@@ -6858,18 +9170,36 @@ pub const Reader = struct {
         samples: []const u8,
         resolved_color_space: *const syntax.Object,
         decode_obj: ?*const syntax.Object,
-    ) !void {
+    ) anyerror!void {
+        return try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(samples, decode_obj),
+            resolved_color_space,
+            0,
+        );
+    }
+
+    fn decodeResolvedImageColorSpaceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        resolved_color_space: *const syntax.Object,
+        depth: u8,
+    ) anyerror!void {
+        if (depth >= max_image_color_space_decode_depth) return error.UnsupportedPdfRendering;
         if (resolved_color_space.asName()) |color_space| {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj, self.cancellation);
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, samples, color_space, self.cancellation);
         } else if (resolved_color_space.* == .array) {
-            if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            if (try self.tryDecodeIccBasedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth)) {
                 // handled
-            } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            } else if (try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(rgba, pixel_count, samples, resolved_color_space.array)) {
                 // handled
-            } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            } else if (try self.tryDecodeSpotColorSpaceToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth)) {
                 // handled
             } else {
-                try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj);
+                try self.decodeIndexedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth);
             }
         } else return error.UnsupportedPdfRendering;
     }
@@ -6941,6 +9271,23 @@ pub const Reader = struct {
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) !bool {
+        return try self.tryDecodeIccBasedImageToRgbaGuarded(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(decoded, decode_obj),
+            color_space,
+            0,
+        );
+    }
+
+    fn tryDecodeIccBasedImageToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        color_space: []const syntax.Object,
+        depth: u8,
+    ) !bool {
         if (color_space.len < 2) return false;
         const color_space_name = color_space[0].asName() orelse return false;
         if (!std.mem.eql(u8, color_space_name, "ICCBased")) return false;
@@ -6949,19 +9296,63 @@ pub const Reader = struct {
         defer profile.deinit(self.alloc);
         if (profile != .stream) return error.UnsupportedPdfRendering;
 
-        const device_name = if (profile.get("Alternate")) |alternate|
-            alternate.asName() orelse return error.UnsupportedPdfRendering
-        else if (profile.get("N")) |components|
-            switch (components.asInteger() orelse return error.UnsupportedPdfRendering) {
+        const components_obj = profile.get("N") orelse return error.UnsupportedPdfRendering;
+        const components_i = (try self.resolvedIntegerObjectValue(components_obj)) orelse
+            return error.UnsupportedPdfRendering;
+        if (components_i <= 0 or components_i > 4) return error.UnsupportedPdfRendering;
+        const component_count: usize = @intCast(components_i);
+
+        var constrained_samples = samples;
+        if (constrained_samples.decode.clamp_count >= max_image_color_space_decode_depth)
+            return error.UnsupportedPdfRendering;
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        if (profile.get("Range")) |range_obj| {
+            var resolved_range = try self.resolveValue(range_obj);
+            defer resolved_range.deinit(self.alloc);
+            if (resolved_range != .array or resolved_range.array.len != component_count * 2)
+                return error.UnsupportedPdfRendering;
+            for (0..component_count) |component| {
+                const min = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2])) orelse
+                    return error.UnsupportedPdfRendering;
+                const max = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2 + 1])) orelse
+                    return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                    return error.UnsupportedPdfRendering;
+                ranges[component] = .{ .min = min, .max = max };
+            }
+        }
+        // ICCBased uses the profile Range as its default image Decode array.
+        // Once an outer color space has converted encoded samples into color
+        // values, nested alternates only constrain those values; they must not
+        // decode the same bytes a second time.
+        if (constrained_samples.isEncoded() and
+            constrained_samples.decode.decode_obj == null and
+            constrained_samples.decode.default_decode == null)
+            constrained_samples.decode.default_decode = ranges;
+        constrained_samples.decode.clamps[constrained_samples.decode.clamp_count] = ranges;
+        constrained_samples.decode.clamp_count += 1;
+
+        if (profile.get("Alternate")) |alternate| {
+            var resolved_alternate = try self.resolveImageColorSpaceForDecodeAlloc(alternate);
+            defer resolved_alternate.deinit(self.alloc);
+            const alternate_components = try self.colorSpaceInputComponentCount(&resolved_alternate);
+            if (alternate_components != component_count) return error.UnsupportedPdfRendering;
+            try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+                rgba,
+                pixel_count,
+                constrained_samples,
+                &resolved_alternate,
+                depth + 1,
+            );
+        } else {
+            const device_name: []const u8 = switch (components_i) {
                 1 => "DeviceGray",
                 3 => "DeviceRGB",
                 4 => "DeviceCMYK",
                 else => return error.UnsupportedPdfRendering,
-            }
-        else
-            return error.UnsupportedPdfRendering;
-
-        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, device_name, decode_obj, self.cancellation);
+            };
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, constrained_samples, device_name, self.cancellation);
+        }
         return true;
     }
 
@@ -6992,30 +9383,86 @@ pub const Reader = struct {
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) !bool {
+        return try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(decoded, decode_obj),
+            color_space,
+        );
+    }
+
+    fn tryDecodeCalibratedImageToRgbaWithSampleDecode(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        color_space: []const syntax.Object,
+    ) !bool {
         if (color_space.len < 2) return false;
         const name = color_space[0].asName() orelse return false;
         if (std.mem.eql(u8, name, "CalGray")) {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceGray", decode_obj, self.cancellation);
+            if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
+            const selection = try self.classifyCalibratedColorSpace(name, &color_space[1]);
+            if (selection.kind == .unsupported) return error.UnsupportedPdfRendering;
+            for (0..pixel_count) |pixel| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
+                const color = renderColorSpaceComponents(selection.value, .{ samples.value(pixel, 0), 0, 0, 0 });
+                @memcpy(rgba[pixel * 4 ..][0..4], &color);
+            }
             return true;
         }
         if (std.mem.eql(u8, name, "CalRGB")) {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceRGB", decode_obj, self.cancellation);
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
+            const selection = try self.classifyCalibratedColorSpace(name, &color_space[1]);
+            if (selection.kind == .unsupported) return error.UnsupportedPdfRendering;
+            for (0..pixel_count) |pixel| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
+                const src = pixel * 3;
+                const color = renderColorSpaceComponents(selection.value, .{
+                    samples.value(src, 0),
+                    samples.value(src + 1, 1),
+                    samples.value(src + 2, 2),
+                    0,
+                });
+                @memcpy(rgba[pixel * 4 ..][0..4], &color);
+            }
             return true;
         }
         if (std.mem.eql(u8, name, "Lab")) {
-            if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
             const params = if (color_space[1] == .dict) color_space[1].dict else return error.UnsupportedPdfRendering;
             const range_a = parseLabRange(params, "Range", 0, -100.0, 100.0);
             const range_b = parseLabRange(params, "Range", 2, -100.0, 100.0);
+            if (!std.math.isFinite(range_a[0]) or !std.math.isFinite(range_a[1]) or range_a[0] >= range_a[1] or
+                !std.math.isFinite(range_b[0]) or !std.math.isFinite(range_b[1]) or range_b[0] >= range_b[1])
+                return error.UnsupportedPdfRendering;
             const white = parseLabWhitePoint(params);
+            const lab_ranges = [4]ColorComponentRange{
+                .{ .min = 0, .max = 100 },
+                .{ .min = range_a[0], .max = range_a[1] },
+                .{ .min = range_b[0], .max = range_b[1] },
+                .{},
+            };
+            var lab_samples = samples;
+            if (lab_samples.decode.clamp_count >= max_image_color_space_decode_depth)
+                return error.UnsupportedPdfRendering;
+            // A direct Lab image's default Decode is the Lab component range.
+            // Recursive alternates already contain color values, so they only
+            // need validation/clamping in that same native domain.
+            if (lab_samples.isEncoded() and
+                lab_samples.decode.decode_obj == null and
+                lab_samples.decode.default_decode == null)
+                lab_samples.decode.default_decode = lab_ranges;
+            lab_samples.decode.clamps[lab_samples.decode.clamp_count] = lab_ranges;
+            lab_samples.decode.clamp_count += 1;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try self.checkCancellation();
                 const src = i * 3;
                 const dst = i * 4;
-                const l = applyDecodeUnit(decoded[src + 0], decode_obj, 0) * 100.0;
-                const a = mapUnitToRange(applyDecodeUnit(decoded[src + 1], decode_obj, 1), range_a[0], range_a[1]);
-                const b = mapUnitToRange(applyDecodeUnit(decoded[src + 2], decode_obj, 2), range_b[0], range_b[1]);
+                const l = lab_samples.value(src + 0, 0);
+                const a = lab_samples.value(src + 1, 1);
+                const b = lab_samples.value(src + 2, 2);
                 const color = labColor(l, a, b, white);
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -7035,75 +9482,385 @@ pub const Reader = struct {
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) !void {
+        return try self.decodeIndexedImageToRgbaGuarded(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(decoded, decode_obj),
+            color_space,
+            0,
+        );
+    }
+
+    fn decodeIndexedImageToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        color_space: []const syntax.Object,
+        depth: u8,
+    ) !void {
         if (color_space.len < 4) return error.UnsupportedPdfRendering;
         const indexed_name = color_space[0].asName() orelse return error.UnsupportedPdfRendering;
         if (!std.mem.eql(u8, indexed_name, "Indexed") and !std.mem.eql(u8, indexed_name, "I"))
             return error.UnsupportedPdfRendering;
 
-        const base_name = color_space[1].asName() orelse return error.UnsupportedPdfRendering;
-        const hi_val = color_space[2].asInteger() orelse return error.UnsupportedPdfRendering;
-        if (hi_val < 0 or hi_val > std.math.maxInt(u8) or decoded.len < pixel_count)
-            return error.UnsupportedPdfRendering;
-        const comps: usize = if (std.mem.eql(u8, base_name, "DeviceRGB"))
-            3
-        else if (std.mem.eql(u8, base_name, "DeviceGray"))
-            1
-        else if (std.mem.eql(u8, base_name, "DeviceCMYK"))
-            4
-        else
-            return error.UnsupportedPdfRendering;
-
-        var lookup_holder: ?syntax.Object = null;
-        defer if (lookup_holder) |*obj| obj.deinit(self.alloc);
-        const lookup_obj: *const syntax.Object = blk: {
-            const candidate = &color_space[3];
-            if (candidate.* == .obj_ref) {
-                lookup_holder = try self.resolveValue(candidate);
-                break :blk &lookup_holder.?;
-            }
-            break :blk candidate;
-        };
-        var decoded_lookup: ?[]u8 = null;
-        defer if (decoded_lookup) |bytes| self.alloc.free(bytes);
-        const lookup = switch (lookup_obj.*) {
-            .string => lookup_obj.string,
-            .stream => blk: {
-                decoded_lookup = try self.readDecodedStreamData(lookup_obj);
-                break :blk decoded_lookup.?;
-            },
-            else => return error.UnsupportedPdfRendering,
-        };
-        const palette_entries: usize = @intCast(hi_val + 1);
-        if (lookup.len < palette_entries * comps) return error.UnsupportedPdfRendering;
+        if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
+        const palette_parent_live = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            0,
+            &.{ rgba.len, samples.liveBytes() },
+        );
+        var palette = try self.resolveIndexedPaletteAlloc(color_space, palette_parent_live, .palette_rgba);
+        defer palette.deinit(self.alloc);
+        const palette_rgba_len = std.math.mul(usize, palette.entry_count, 4) catch return error.UnsupportedPdfRendering;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, samples.liveBytes(), palette.ownedBytes(), palette_rgba_len });
+        const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
+        defer self.alloc.free(palette_rgba);
+        var resolved_base = try self.resolveValue(&color_space[1]);
+        defer resolved_base.deinit(self.alloc);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            palette_rgba,
+            palette.entry_count,
+            .{ .source = .{ .encoded = palette.lookup } },
+            &resolved_base,
+            depth + 1,
+        );
 
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
             if (i & 4095 == 0) try self.checkCancellation();
-            const idx = try applyIndexedDecode(decoded[i], decode_obj, palette_entries);
-            if (idx >= palette_entries) return error.UnsupportedPdfRendering;
-            const src = @as(usize, idx) * comps;
+            const idx = try samples.indexedValue(i, palette.entry_count);
+            if (idx >= palette.entry_count) return error.UnsupportedPdfRendering;
+            const src = @as(usize, idx) * 4;
             const dst = i * 4;
-            if (comps == 1) {
-                rgba[dst + 0] = lookup[src];
-                rgba[dst + 1] = lookup[src];
-                rgba[dst + 2] = lookup[src];
-                rgba[dst + 3] = 0xff;
-            } else if (comps == 3) {
-                rgba[dst + 0] = lookup[src + 0];
-                rgba[dst + 1] = lookup[src + 1];
-                rgba[dst + 2] = lookup[src + 2];
-                rgba[dst + 3] = 0xff;
-            } else {
-                const color = cmykColor(
-                    @as(f64, @floatFromInt(lookup[src + 0])) / 255.0,
-                    @as(f64, @floatFromInt(lookup[src + 1])) / 255.0,
-                    @as(f64, @floatFromInt(lookup[src + 2])) / 255.0,
-                    @as(f64, @floatFromInt(lookup[src + 3])) / 255.0,
+            @memcpy(rgba[dst..][0..4], palette_rgba[src..][0..4]);
+        }
+    }
+
+    fn decodeIndexedImageSourceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        samples: ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        parent_live_bytes: usize,
+        depth: u8,
+    ) !void {
+        if (rgba.len % 4 != 0 or samples.component_count != 1 or samples.stride == 0)
+            return error.UnsupportedPdfRendering;
+        const pixel_count = rgba.len / 4;
+        if (samples.pixel_count != pixel_count or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+            return error.UnsupportedPdfRendering;
+        const required_samples = std.math.mul(usize, pixel_count, samples.stride) catch
+            return error.UnsupportedPdfRendering;
+        switch (samples.data) {
+            .u8 => |bytes| if (bytes.len < required_samples or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering,
+            .u16 => |words| if (words.len < required_samples) return error.UnsupportedPdfRendering,
+        }
+        if (samples.component_offsets[0] >= samples.stride) return error.UnsupportedPdfRendering;
+
+        var palette = try self.resolveIndexedPaletteAlloc(color_space, parent_live_bytes, .palette_rgba);
+        defer palette.deinit(self.alloc);
+        const palette_rgba_len = std.math.mul(usize, palette.entry_count, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{
+            parent_live_bytes,
+            palette.ownedBytes(),
+            palette_rgba_len,
+        });
+        const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
+        defer self.alloc.free(palette_rgba);
+        var resolved_base = try self.resolveValue(&color_space[1]);
+        defer resolved_base.deinit(self.alloc);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            palette_rgba,
+            palette.entry_count,
+            .{ .source = .{ .encoded = palette.lookup } },
+            &resolved_base,
+            depth + 1,
+        );
+
+        for (0..pixel_count) |pixel| {
+            if (pixel & 4095 == 0) try self.checkCancellation();
+            const index = try indexedImageSourceValue(samples, pixel, decode_obj, palette.entry_count);
+            const source = @as(usize, index) * 4;
+            @memcpy(rgba[pixel * 4 ..][0..4], palette_rgba[source..][0..4]);
+        }
+    }
+
+    fn resolveIndexedPaletteAlloc(
+        self: *const Reader,
+        color_space: []const syntax.Object,
+        parent_live_bytes: usize,
+        reserve: IndexedPaletteReserve,
+    ) !ResolvedIndexedPalette {
+        if (color_space.len < 4) return error.UnsupportedPdfRendering;
+        const indexed_name = color_space[0].asName() orelse return error.UnsupportedPdfRendering;
+        if (!std.mem.eql(u8, indexed_name, "Indexed") and !std.mem.eql(u8, indexed_name, "I"))
+            return error.UnsupportedPdfRendering;
+        var resolved_base = try self.resolveValue(&color_space[1]);
+        defer resolved_base.deinit(self.alloc);
+        if (!isDeviceOrCieBasedColorSpace(&resolved_base))
+            return error.UnsupportedPdfRendering;
+
+        const hi_val = (try self.resolvedIntegerObjectValue(&color_space[2])) orelse
+            return error.UnsupportedPdfRendering;
+        if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
+        const component_count = try self.colorSpaceInputComponentCount(&resolved_base);
+        if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
+
+        var result = ResolvedIndexedPalette{
+            .entry_count = @intCast(hi_val + 1),
+            .component_count = component_count,
+        };
+        errdefer result.deinit(self.alloc);
+        const lookup_len = std.math.mul(usize, result.entry_count, component_count) catch
+            return error.UnsupportedPdfRendering;
+        const reserve_bytes = switch (reserve) {
+            .palette_rgba => std.math.mul(usize, result.entry_count, 4) catch
+                return error.PdfDecodeWorkingSetTooLarge,
+            .matte_scratch => |pixel_count| std.math.mul(
+                usize,
+                @min(pixel_count, 16 * 1024),
+                component_count,
+            ) catch return error.PdfDecodeWorkingSetTooLarge,
+        };
+        const retained_live_bytes = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            parent_live_bytes,
+            &.{reserve_bytes},
+        );
+        var lookup_owner_live_bytes: usize = 0;
+        const lookup_obj: *const syntax.Object = blk: {
+            const candidate = &color_space[3];
+            if (candidate.* == .obj_ref) {
+                // Both string data and stream dictionaries are attacker-owned.
+                // Charge parser temporaries and retained metadata against the
+                // same aggregate image budget before allocating stream payload.
+                var resolve_budget = DecodeBudgetAllocator.init(
+                    self.alloc,
+                    retained_live_bytes,
+                    self.decode_limits.max_working_set_bytes,
                 );
-                rgba[dst + 0] = color[0];
-                rgba[dst + 1] = color[1];
-                rgba[dst + 2] = color[2];
-                rgba[dst + 3] = color[3];
+                var bounded_reader = self.*;
+                bounded_reader.alloc = resolve_budget.allocator();
+                result.lookup_owner = bounded_reader.resolveValue(candidate) catch |err| {
+                    if (err == error.OutOfMemory and resolve_budget.limit_exceeded)
+                        return error.PdfDecodeWorkingSetTooLarge;
+                    return err;
+                };
+                lookup_owner_live_bytes = resolve_budget.live_bytes - retained_live_bytes;
+                break :blk &result.lookup_owner.?;
+            }
+            break :blk candidate;
+        };
+        const lookup = switch (lookup_obj.*) {
+            .string => lookup_obj.string,
+            .stream => blk: {
+                const stream_parent_live_bytes = try decodeWorkingSetTotal(
+                    self.decode_limits.max_working_set_bytes,
+                    retained_live_bytes,
+                    &.{lookup_owner_live_bytes},
+                );
+                if (stream_parent_live_bytes >= self.decode_limits.max_working_set_bytes)
+                    return error.PdfDecodeWorkingSetTooLarge;
+                result.decoded_lookup = try self.readDecodedStreamDataWithLimitsAndFinalLimit(lookup_obj, .{
+                    .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
+                    .max_working_set_bytes = self.decode_limits.max_working_set_bytes - stream_parent_live_bytes,
+                }, lookup_len);
+                // The decoded lookup is self-contained. Release the indirect
+                // stream dictionary before later color conversion allocations
+                // and keep only the precisely bounded terminal bytes.
+                if (result.lookup_owner) |*owner| owner.deinit(self.alloc);
+                result.lookup_owner = null;
+                break :blk result.decoded_lookup.?;
+            },
+            else => return error.UnsupportedPdfRendering,
+        };
+        if (lookup.len < lookup_len) return error.UnsupportedPdfRendering;
+        result.lookup = lookup[0..lookup_len];
+        return result;
+    }
+
+    fn decodeIndexedImageWithOptionalMatteToRgba(
+        self: *const Reader,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        decoded: []const u8,
+        source_view: ?ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        plan: *const ImageTransparencyPlan,
+        prepared_matte: ?*const PreparedMatteMask,
+        parent_live_bytes: usize,
+    ) !void {
+        if (plan.nativeMatte()) |matte| if (matte.indexed_matte_index != null) {
+            const mask_plan = switch (plan.*) {
+                .soft_mask => |value| value,
+                else => return error.UnsupportedPdfRendering,
+            };
+            const prepared = prepared_matte orelse return error.UnsupportedPdfRendering;
+            return try self.decodeIndexedMatteImageToRgba(
+                rgba,
+                width,
+                height,
+                source_view orelse return error.UnsupportedPdfRendering,
+                color_space,
+                decode_obj,
+                prepared,
+                matte,
+                mask_plan.metadata.interpolate,
+                parent_live_bytes,
+                0,
+            );
+        };
+        if (source_view) |samples| {
+            return try self.decodeIndexedImageSourceToRgbaGuarded(
+                rgba,
+                samples,
+                color_space,
+                decode_obj,
+                parent_live_bytes,
+                0,
+            );
+        }
+        return try self.decodeIndexedImageToRgba(rgba, @as(usize, width) * height, decoded, color_space, decode_obj);
+    }
+
+    fn decodeIndexedMatteImageAlloc(
+        self: *const Reader,
+        width: u32,
+        height: u32,
+        samples: ImageSourceSamples,
+        image_obj: *const syntax.Object,
+        prepared: *const PreparedMatteMask,
+        matte: NativeMatte,
+        interpolate: bool,
+        parent_live_bytes: usize,
+    ) ![]u8 {
+        const rgba_len = std.math.mul(usize, @as(usize, width) * height, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const rgba = try self.alloc.alloc(u8, rgba_len);
+        errdefer self.alloc.free(rgba);
+        const color_space_obj = image_obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
+        defer color_space.deinit(self.alloc);
+        if (color_space != .array) return error.UnsupportedPdfRendering;
+        try self.decodeIndexedMatteImageToRgba(
+            rgba,
+            width,
+            height,
+            samples,
+            color_space.array,
+            null,
+            prepared,
+            matte,
+            interpolate,
+            parent_live_bytes,
+            0,
+        );
+        return rgba;
+    }
+
+    fn decodeIndexedMatteImageToRgba(
+        self: *const Reader,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        samples: ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        prepared: *const PreparedMatteMask,
+        matte: NativeMatte,
+        interpolate: bool,
+        parent_live_bytes: usize,
+        depth: u8,
+    ) !void {
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        if (rgba.len != rgba_len or samples.pixel_count != pixel_count or samples.component_count != 1 or samples.stride == 0)
+            return error.UnsupportedPdfRendering;
+        if (samples.bits_per_component == 0 or samples.bits_per_component > 16 or samples.component_offsets[0] >= samples.stride)
+            return error.UnsupportedPdfRendering;
+        const required_samples = std.math.mul(usize, pixel_count, samples.stride) catch return error.UnsupportedPdfRendering;
+        switch (samples.data) {
+            .u8 => |bytes| if (bytes.len < required_samples or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering,
+            .u16 => |words| if (words.len < required_samples) return error.UnsupportedPdfRendering,
+        }
+        if (prepared.image.rgba.len != @as(usize, prepared.image.width) * prepared.image.height * 4)
+            return error.InvalidPdfImageMask;
+
+        const palette_parent_live = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            parent_live_bytes,
+            &.{prepared.image.rgba.len},
+        );
+        var palette = try self.resolveIndexedPaletteAlloc(
+            color_space,
+            palette_parent_live,
+            .{ .matte_scratch = pixel_count },
+        );
+        defer palette.deinit(self.alloc);
+        const matte_index = matte.indexed_matte_index orelse return error.UnsupportedPdfRendering;
+        if (matte_index >= palette.entry_count) return error.InvalidPdfImageMask;
+        const chunk_capacity = @min(pixel_count, 16 * 1024);
+        const scratch_len = std.math.mul(usize, chunk_capacity, palette.component_count) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{
+            parent_live_bytes,
+            prepared.image.rgba.len,
+            palette.ownedBytes(),
+            scratch_len,
+        });
+        const scratch = try self.alloc.alloc(u8, scratch_len);
+        defer self.alloc.free(scratch);
+
+        const matte_base = @as(usize, matte_index) * palette.component_count;
+        const x_template = MaskAxisIterator.init(width, prepared.image.width, interpolate);
+        var y_iterator = MaskAxisIterator.init(height, prepared.image.height, interpolate);
+        var chunk_start: usize = 0;
+        var chunk_pixels: usize = 0;
+        var pixel: usize = 0;
+        for (0..height) |_| {
+            const ys = y_iterator.next();
+            var x_iterator = x_template;
+            for (0..width) |_| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
+                const xs = x_iterator.next();
+                const alpha = if (interpolate)
+                    bilinearMaskValue(prepared.image.rgba, prepared.image.width, 0, xs, ys)
+                else
+                    prepared.image.rgba[(ys.low * @as(usize, prepared.image.width) + xs.low) * 4];
+                const palette_index = try indexedImageSourceValue(
+                    samples,
+                    pixel,
+                    decode_obj,
+                    palette.entry_count,
+                );
+                const palette_base = @as(usize, palette_index) * palette.component_count;
+                const scratch_base = chunk_pixels * palette.component_count;
+                for (0..palette.component_count) |component| {
+                    const preblended = @as(f64, @floatFromInt(palette.lookup[palette_base + component])) / 255.0;
+                    const matte_component = @as(f64, @floatFromInt(palette.lookup[matte_base + component])) / 255.0;
+                    scratch[scratch_base + component] = floatChannel(unblendNativeComponent(preblended, alpha, matte_component));
+                }
+                chunk_pixels += 1;
+                pixel += 1;
+                if (chunk_pixels == chunk_capacity or pixel == pixel_count) {
+                    const sample_len = chunk_pixels * palette.component_count;
+                    try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+                        rgba[chunk_start * 4 ..][0 .. chunk_pixels * 4],
+                        chunk_pixels,
+                        ImageComponentSamples.encoded(scratch[0..sample_len], null),
+                        &color_space[1],
+                        depth + 1,
+                    );
+                    chunk_start = pixel;
+                    chunk_pixels = 0;
+                }
             }
         }
     }
@@ -7115,6 +9872,23 @@ pub const Reader = struct {
         decoded: []const u8,
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
+    ) !bool {
+        return try self.tryDecodeSpotColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(decoded, decode_obj),
+            color_space,
+            0,
+        );
+    }
+
+    fn tryDecodeSpotColorSpaceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        color_space: []const syntax.Object,
+        depth: u8,
     ) !bool {
         if (color_space.len < 4) return false;
         const cs_name = color_space[0].asName() orelse return false;
@@ -7134,34 +9908,246 @@ pub const Reader = struct {
             return false;
         }
 
-        if (decoded.len < pixel_count * tint_components) return error.UnsupportedPdfRendering;
-        const alt_name = color_space[alt_index].asName() orelse return error.UnsupportedPdfRendering;
-        const alt_components: usize = if (std.mem.eql(u8, alt_name, "DeviceGray"))
-            1
-        else if (std.mem.eql(u8, alt_name, "DeviceRGB"))
-            3
-        else if (std.mem.eql(u8, alt_name, "DeviceCMYK"))
-            4
-        else
+        if (samples.len() < pixel_count * tint_components) return error.UnsupportedPdfRendering;
+        if (!isDeviceOrCieBasedColorSpace(&color_space[alt_index]))
             return error.UnsupportedPdfRendering;
+        const alt_components = try self.colorSpaceInputComponentCount(&color_space[alt_index]);
+        if (alt_components == 0 or alt_components > 32) return error.UnsupportedPdfRendering;
 
-        var transform = try self.parseExponentialTintTransform(&color_space[fn_index], alt_components);
+        var transform: ImageTintTransform = switch (try self.colorFunctionType(&color_space[fn_index])) {
+            0 => .{ .sampled = try self.parseSampledTintTransform(&color_space[fn_index], alt_components) },
+            2 => .{ .exponential = try self.parseExponentialTintTransform(&color_space[fn_index], alt_components) },
+            4 => .{ .calculator = try self.parseCalculatorTintTransform(&color_space[fn_index], alt_components) },
+            else => return error.UnsupportedPdfRendering,
+        };
         defer transform.deinit(self.alloc);
 
-        const alt_bytes = try self.alloc.alloc(u8, pixel_count * alt_components);
-        defer self.alloc.free(alt_bytes);
+        const alt_len = std.math.mul(usize, pixel_count, alt_components) catch return error.PdfDecodeWorkingSetTooLarge;
+        var tint_samples = TintComponentSamples{
+            .input = &samples,
+            .transform = &transform,
+            .pixel_count = pixel_count,
+            .input_components = tint_components,
+            .output_components = alt_components,
+        };
+        const transformed_samples = ImageComponentSamples{ .source = .{ .tint = &tint_samples } };
+        std.debug.assert(transformed_samples.len() == alt_len);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            transformed_samples,
+            &color_space[alt_index],
+            depth + 1,
+        );
+        return true;
+    }
 
-        var i: usize = 0;
-        while (i < pixel_count) : (i += 1) {
-            if (i & 4095 == 0) try self.checkCancellation();
-            const tint = applyDecodeUnit(decoded[i], decode_obj, 0);
-            for (0..alt_components) |component| {
-                alt_bytes[i * alt_components + component] = floatChannel(evalExponentialTintComponent(&transform, tint, component));
+    fn colorFunctionType(self: *const Reader, obj: *const syntax.Object) !i64 {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        const dict: []const syntax.DictEntry = switch (resolved) {
+            .dict => |entries| entries,
+            .stream => |stream| stream.header,
+            else => return error.UnsupportedPdfRendering,
+        };
+        const value = dictGetObject(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        return (try self.resolvedIntegerObjectValue(value)) orelse error.UnsupportedPdfRendering;
+    }
+
+    fn parseSampledTintTransform(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        output_components: usize,
+    ) !*GraphicsSampledTintTransform {
+        if (output_components == 0 or output_components > 4) return error.UnsupportedPdfRendering;
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .stream) return error.UnsupportedPdfRendering;
+        const dict = resolved.stream.header;
+
+        const function_type = dictGetObject(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        if ((try self.resolvedIntegerObjectValue(function_type)) != 0) return error.UnsupportedPdfRendering;
+
+        const domain_obj = dictGetObject(dict, "Domain") orelse return error.UnsupportedPdfRendering;
+        var domain = try self.resolveValue(domain_obj);
+        defer domain.deinit(self.alloc);
+        if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
+        const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
+        const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
+        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min >= domain_max)
+            return error.UnsupportedPdfRendering;
+
+        const size_obj = dictGetObject(dict, "Size") orelse return error.UnsupportedPdfRendering;
+        var resolved_size = try self.resolveValue(size_obj);
+        defer resolved_size.deinit(self.alloc);
+        if (resolved_size != .array or resolved_size.array.len != 1) return error.UnsupportedPdfRendering;
+        const size_integer = (try self.resolvedIntegerObjectValue(&resolved_size.array[0])) orelse return error.UnsupportedPdfRendering;
+        if (size_integer <= 0 or size_integer > 4096) return error.UnsupportedPdfRendering;
+        const size: usize = @intCast(size_integer);
+
+        const bits_obj = dictGetObject(dict, "BitsPerSample") orelse return error.UnsupportedPdfRendering;
+        const bits_integer = (try self.resolvedIntegerObjectValue(bits_obj)) orelse return error.UnsupportedPdfRendering;
+        const bits_per_sample: u8 = switch (bits_integer) {
+            1, 2, 4, 8, 12, 16, 24, 32 => @intCast(bits_integer),
+            else => return error.UnsupportedPdfRendering,
+        };
+
+        const range_obj = dictGetObject(dict, "Range") orelse return error.UnsupportedPdfRendering;
+        var resolved_range = try self.resolveValue(range_obj);
+        defer resolved_range.deinit(self.alloc);
+        if (resolved_range != .array or resolved_range.array.len != output_components * 2)
+            return error.UnsupportedPdfRendering;
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        for (0..output_components) |index| {
+            const min = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2])) orelse return error.UnsupportedPdfRendering;
+            const max = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2 + 1])) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max) return error.UnsupportedPdfRendering;
+            ranges[index] = .{ .min = min, .max = max };
+        }
+
+        var decode_ranges = ranges;
+        if (dictGetObject(dict, "Decode")) |decode_obj| {
+            var decode = try self.resolveValue(decode_obj);
+            defer decode.deinit(self.alloc);
+            if (decode != .array or decode.array.len != output_components * 2)
+                return error.UnsupportedPdfRendering;
+            for (0..output_components) |index| {
+                const min = (try self.resolvedNumericObjectValue(&decode.array[index * 2])) orelse return error.UnsupportedPdfRendering;
+                const max = (try self.resolvedNumericObjectValue(&decode.array[index * 2 + 1])) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(min) or !std.math.isFinite(max)) return error.UnsupportedPdfRendering;
+                decode_ranges[index] = .{ .min = min, .max = max };
             }
         }
 
-        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, alt_bytes, alt_name, null, self.cancellation);
-        return true;
+        var encode_min: f64 = 0;
+        var encode_max: f64 = @floatFromInt(size - 1);
+        if (dictGetObject(dict, "Encode")) |encode_obj| {
+            var encode = try self.resolveValue(encode_obj);
+            defer encode.deinit(self.alloc);
+            if (encode != .array or encode.array.len != 2) return error.UnsupportedPdfRendering;
+            encode_min = (try self.resolvedNumericObjectValue(&encode.array[0])) orelse return error.UnsupportedPdfRendering;
+            encode_max = (try self.resolvedNumericObjectValue(&encode.array[1])) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(encode_min) or !std.math.isFinite(encode_max)) return error.UnsupportedPdfRendering;
+        }
+
+        const value_count = std.math.mul(usize, size, output_components) catch return error.PdfDecodeWorkingSetTooLarge;
+        const expected_bits = std.math.mul(usize, value_count, bits_per_sample) catch return error.PdfDecodeWorkingSetTooLarge;
+        const rounded_bits = std.math.add(usize, expected_bits, 7) catch return error.PdfDecodeWorkingSetTooLarge;
+        const packed_bytes = rounded_bits / 8;
+        const decoded = try self.readDecodedStreamDataWithLimitsAndFinalLimit(&resolved, self.decode_limits, packed_bytes);
+        defer self.alloc.free(decoded);
+        if (decoded.len != packed_bytes) return error.UnsupportedPdfRendering;
+
+        const values = try self.alloc.alloc(f64, value_count);
+        errdefer self.alloc.free(values);
+        const sample_max: u64 = (@as(u64, 1) << @as(u6, @intCast(bits_per_sample))) - 1;
+        var bit_offset: usize = 0;
+        for (values, 0..) |*value, sample_index| {
+            if (sample_index % 4096 == 0) try self.checkCancellation();
+            var raw: u64 = 0;
+            for (0..bits_per_sample) |_| {
+                const byte = decoded[bit_offset / 8];
+                raw = (raw << 1) | ((byte >> @intCast(7 - (bit_offset % 8))) & 1);
+                bit_offset += 1;
+            }
+            const component = sample_index % output_components;
+            const unit = @as(f64, @floatFromInt(raw)) / @as(f64, @floatFromInt(sample_max));
+            const decoded_value = decode_ranges[component].min + unit * (decode_ranges[component].max - decode_ranges[component].min);
+            value.* = clampColorComponent(decoded_value, ranges[component]);
+        }
+
+        const transform = try self.alloc.create(GraphicsSampledTintTransform);
+        transform.* = .{
+            .values = values,
+            .size = size,
+            .output_components = @intCast(output_components),
+            .encode_min = encode_min,
+            .encode_max = encode_max,
+            .domain_min = domain_min,
+            .domain_max = domain_max,
+        };
+        return transform;
+    }
+
+    fn parseCalculatorTintTransform(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        output_components: usize,
+    ) !CalculatorTintTransform {
+        if (output_components == 0 or output_components > 4) return error.UnsupportedPdfRendering;
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .stream) return error.UnsupportedPdfRendering;
+        const dict = resolved.stream.header;
+        const function_type = dictGetObject(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        if ((try self.resolvedIntegerObjectValue(function_type)) != 4) return error.UnsupportedPdfRendering;
+
+        const domain_obj = dictGetObject(dict, "Domain") orelse return error.UnsupportedPdfRendering;
+        var domain = try self.resolveValue(domain_obj);
+        defer domain.deinit(self.alloc);
+        if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
+        const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
+        const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
+        if (domain_min != 0 or domain_max != 1) return error.UnsupportedPdfRendering;
+
+        const range_obj = dictGetObject(dict, "Range") orelse return error.UnsupportedPdfRendering;
+        var resolved_range = try self.resolveValue(range_obj);
+        defer resolved_range.deinit(self.alloc);
+        if (resolved_range != .array or resolved_range.array.len != output_components * 2)
+            return error.UnsupportedPdfRendering;
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        for (0..output_components) |index| {
+            const min = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2])) orelse return error.UnsupportedPdfRendering;
+            const max = (try self.resolvedNumericObjectValue(&resolved_range.array[index * 2 + 1])) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                return error.UnsupportedPdfRendering;
+            ranges[index] = .{ .min = min, .max = max };
+        }
+
+        const program = try self.readDecodedStreamDataWithLimitsAndFinalLimit(&resolved, self.decode_limits, 4096);
+        defer self.alloc.free(program);
+        const trimmed = std.mem.trim(u8, program, " \t\r\n\x0c\x00");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}')
+            return error.UnsupportedPdfRendering;
+
+        var instructions = std.ArrayList(CalculatorTintInstruction).empty;
+        defer instructions.deinit(self.alloc);
+        var stack_depth: usize = 1;
+        var cursor: usize = 1;
+        while (cursor < trimmed.len - 1) {
+            while (cursor < trimmed.len - 1 and std.ascii.isWhitespace(trimmed[cursor])) cursor += 1;
+            if (cursor >= trimmed.len - 1) break;
+            if (trimmed[cursor] == '%') {
+                while (cursor < trimmed.len - 1 and trimmed[cursor] != '\n' and trimmed[cursor] != '\r') cursor += 1;
+                continue;
+            }
+            if (trimmed[cursor] == '{' or trimmed[cursor] == '}') return error.UnsupportedPdfRendering;
+            const start = cursor;
+            while (cursor < trimmed.len - 1 and
+                !std.ascii.isWhitespace(trimmed[cursor]) and
+                trimmed[cursor] != '%' and trimmed[cursor] != '{' and trimmed[cursor] != '}') cursor += 1;
+            const token = trimmed[start..cursor];
+            const instruction: CalculatorTintInstruction = if (std.fmt.parseFloat(f64, token)) |number| blk: {
+                if (!std.math.isFinite(number) or stack_depth >= 64) return error.UnsupportedPdfRendering;
+                stack_depth += 1;
+                break :blk .{ .number = number };
+            } else |_| if (std.mem.eql(u8, token, "dup")) blk: {
+                if (stack_depth == 0 or stack_depth >= 64) return error.UnsupportedPdfRendering;
+                stack_depth += 1;
+                break :blk .dup;
+            } else if (std.mem.eql(u8, token, "exch")) blk: {
+                if (stack_depth < 2) return error.UnsupportedPdfRendering;
+                break :blk .exch;
+            } else if (std.mem.eql(u8, token, "pop")) blk: {
+                if (stack_depth == 0) return error.UnsupportedPdfRendering;
+                stack_depth -= 1;
+                break :blk .pop;
+            } else return error.UnsupportedPdfRendering;
+            if (instructions.items.len >= 256) return error.UnsupportedPdfRendering;
+            try instructions.append(self.alloc, instruction);
+        }
+        if (stack_depth != output_components) return error.UnsupportedPdfRendering;
+        return .{ .instructions = try instructions.toOwnedSlice(self.alloc), .ranges = ranges };
     }
 
     fn parseExponentialTintTransform(
@@ -7178,10 +10164,21 @@ pub const Reader = struct {
             else => return error.UnsupportedPdfRendering,
         };
 
-        const fn_type = dictGetInteger(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        const fn_type_obj = dictGetObject(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        const fn_type = (try self.resolvedIntegerObjectValue(fn_type_obj)) orelse return error.UnsupportedPdfRendering;
         if (fn_type != 2) return error.UnsupportedPdfRendering;
-        const exponent = dictGetNumber(dict, "N") orelse return error.UnsupportedPdfRendering;
-        if (exponent <= 0) return error.UnsupportedPdfRendering;
+        const exponent_obj = dictGetObject(dict, "N") orelse return error.UnsupportedPdfRendering;
+        const exponent = (try self.resolvedNumericObjectValue(exponent_obj)) orelse return error.UnsupportedPdfRendering;
+        if (!std.math.isFinite(exponent) or exponent <= 0) return error.UnsupportedPdfRendering;
+
+        const domain_obj = dictGetObject(dict, "Domain") orelse return error.UnsupportedPdfRendering;
+        var domain = try self.resolveValue(domain_obj);
+        defer domain.deinit(self.alloc);
+        if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
+        const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
+        const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
+        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min >= domain_max)
+            return error.UnsupportedPdfRendering;
 
         var c0 = try self.alloc.alloc(f64, alt_components);
         errdefer self.alloc.free(c0);
@@ -7192,19 +10189,48 @@ pub const Reader = struct {
             c1[i] = 1.0;
         }
 
-        if (dictGetArray(dict, "C0")) |values| {
-            if (values.len < alt_components) return error.UnsupportedPdfRendering;
-            for (0..alt_components) |i| c0[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+        if (dictGetObject(dict, "C0")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components) return error.UnsupportedPdfRendering;
+            for (0..alt_components) |i| {
+                c0[i] = (try self.resolvedNumericObjectValue(&values.array[i])) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(c0[i])) return error.UnsupportedPdfRendering;
+            }
         }
-        if (dictGetArray(dict, "C1")) |values| {
-            if (values.len < alt_components) return error.UnsupportedPdfRendering;
-            for (0..alt_components) |i| c1[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+        if (dictGetObject(dict, "C1")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components) return error.UnsupportedPdfRendering;
+            for (0..alt_components) |i| {
+                c1[i] = (try self.resolvedNumericObjectValue(&values.array[i])) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(c1[i])) return error.UnsupportedPdfRendering;
+            }
+        }
+
+        var ranges: ?[]ColorComponentRange = null;
+        if (dictGetObject(dict, "Range")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components * 2) return error.UnsupportedPdfRendering;
+            ranges = try self.alloc.alloc(ColorComponentRange, alt_components);
+            errdefer self.alloc.free(ranges.?);
+            for (ranges.?, 0..) |*range, component| {
+                const min = (try self.resolvedNumericObjectValue(&values.array[component * 2])) orelse return error.UnsupportedPdfRendering;
+                const max = (try self.resolvedNumericObjectValue(&values.array[component * 2 + 1])) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                    return error.UnsupportedPdfRendering;
+                range.* = .{ .min = min, .max = max };
+            }
         }
 
         return .{
             .n = exponent,
+            .domain_min = domain_min,
+            .domain_max = domain_max,
             .c0 = c0,
             .c1 = c1,
+            .ranges = ranges,
         };
     }
 
@@ -7216,27 +10242,43 @@ pub const Reader = struct {
         decode_obj: ?*const syntax.Object,
         cancellation: CancellationProbe,
     ) !void {
+        return try decodeDeviceColorSpaceToRgbaWithSampleDecode(
+            rgba,
+            pixel_count,
+            ImageComponentSamples.encoded(decoded, decode_obj),
+            color_space,
+            cancellation,
+        );
+    }
+
+    fn decodeDeviceColorSpaceToRgbaWithSampleDecode(
+        rgba: []u8,
+        pixel_count: usize,
+        samples: ImageComponentSamples,
+        color_space: []const u8,
+        cancellation: CancellationProbe,
+    ) !void {
         if (std.mem.eql(u8, color_space, "DeviceRGB")) {
-            if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const src = i * 3;
                 const dst = i * 4;
-                rgba[dst + 0] = applyDecodeByte(decoded[src + 0], decode_obj, 0);
-                rgba[dst + 1] = applyDecodeByte(decoded[src + 1], decode_obj, 1);
-                rgba[dst + 2] = applyDecodeByte(decoded[src + 2], decode_obj, 2);
+                rgba[dst + 0] = floatChannel(samples.value(src + 0, 0));
+                rgba[dst + 1] = floatChannel(samples.value(src + 1, 1));
+                rgba[dst + 2] = floatChannel(samples.value(src + 2, 2));
                 rgba[dst + 3] = 0xff;
             }
             return;
         }
         if (std.mem.eql(u8, color_space, "DeviceGray")) {
-            if (decoded.len < pixel_count) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const dst = i * 4;
-                const gray = applyDecodeByte(decoded[i], decode_obj, 0);
+                const gray = floatChannel(samples.value(i, 0));
                 rgba[dst + 0] = gray;
                 rgba[dst + 1] = gray;
                 rgba[dst + 2] = gray;
@@ -7245,17 +10287,17 @@ pub const Reader = struct {
             return;
         }
         if (std.mem.eql(u8, color_space, "DeviceCMYK")) {
-            if (decoded.len < pixel_count * 4) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 4) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const src = i * 4;
                 const dst = i * 4;
                 const color = cmykColor(
-                    applyDecodeUnit(decoded[src + 0], decode_obj, 0),
-                    applyDecodeUnit(decoded[src + 1], decode_obj, 1),
-                    applyDecodeUnit(decoded[src + 2], decode_obj, 2),
-                    applyDecodeUnit(decoded[src + 3], decode_obj, 3),
+                    samples.value(src + 0, 0),
+                    samples.value(src + 1, 1),
+                    samples.value(src + 2, 2),
+                    samples.value(src + 3, 3),
                 );
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -7341,7 +10383,7 @@ pub const Reader = struct {
             errdefer resolved.deinit(self.alloc);
             if (resolved == .array) {
                 const component_count = if (obj.get("ColorSpace")) |color_space_obj| blk: {
-                    var color_space = try self.resolveValue(color_space_obj);
+                    var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
                     defer color_space.deinit(self.alloc);
                     break :blk try self.colorSpaceInputComponentCount(&color_space);
                 } else try colorKeyComponentCountFromArray(resolved.array);
@@ -7382,7 +10424,7 @@ pub const Reader = struct {
         if (mask.get("Mask") != null or mask.get("SMask") != null) return error.InvalidPdfImageMask;
 
         const color_space_obj = mask.get("ColorSpace") orelse return error.InvalidPdfImageMask;
-        var color_space = try self.resolveValue(color_space_obj);
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer color_space.deinit(self.alloc);
         const color_space_name = color_space.asName() orelse return error.InvalidPdfImageMask;
         if (!std.mem.eql(u8, color_space_name, "DeviceGray") and !std.mem.eql(u8, color_space_name, "G"))
@@ -7447,38 +10489,67 @@ pub const Reader = struct {
             }
             return .{ .component_count = matte.len, .components = components };
         };
-        var color_space = try self.resolveValue(color_space_obj);
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer color_space.deinit(self.alloc);
         const component_count = try self.colorSpaceInputComponentCount(&color_space);
         if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
         if (matte.len != component_count) return error.InvalidPdfImageMask;
 
+        if (color_space == .array and color_space.array.len >= 3) {
+            const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
+            if (std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) {
+                if (!isDeviceOrCieBasedColorSpace(&color_space.array[1]))
+                    return error.UnsupportedPdfRendering;
+                const hi_val = (try self.resolvedIntegerObjectValue(&color_space.array[2])) orelse
+                    return error.UnsupportedPdfRendering;
+                if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
+                const component = (try self.resolvedNumericObjectValue(&matte[0])) orelse
+                    return error.InvalidPdfImageMask;
+                if (!std.math.isFinite(component) or component < 0 or component > @as(f64, @floatFromInt(hi_val)))
+                    return error.InvalidPdfImageMask;
+                return .{
+                    .component_count = 1,
+                    .components = .{ 0, 0, 0, 0 },
+                    .indexed_matte_index = @intFromFloat(@round(component)),
+                };
+            }
+        }
+        const ranges = try self.nativeColorSpaceComponentRanges(&color_space, component_count);
+
         var components: [4]f64 = .{ 0, 0, 0, 0 };
         for (matte, 0..) |value, index| {
-            const component = numericObjectValue(&value) orelse return error.InvalidPdfImageMask;
+            const component = (try self.resolvedNumericObjectValue(&value)) orelse return error.InvalidPdfImageMask;
             if (!std.math.isFinite(component)) return error.InvalidPdfImageMask;
-            components[index] = try self.normalizeMatteComponent(&color_space, index, component);
+            const range = ranges[index];
+            const span = range.max - range.min;
+            if (!std.math.isFinite(span) or span <= std.math.floatEps(f64) or component < range.min or component > range.max)
+                return error.InvalidPdfImageMask;
+            components[index] = (component - range.min) / span;
         }
-        return .{ .component_count = component_count, .components = components };
+        return .{ .component_count = component_count, .components = components, .ranges = ranges };
     }
 
-    fn normalizeMatteComponent(self: *const Reader, color_space: *const syntax.Object, component_index: usize, value: f64) !f64 {
-        if (color_space.asName() != null) {
-            if (value < 0 or value > 1) return error.InvalidPdfImageMask;
-            return value;
-        }
+    fn nativeColorSpaceComponentRanges(
+        self: *const Reader,
+        color_space: *const syntax.Object,
+        component_count: usize,
+    ) ![4]ColorComponentRange {
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        if (color_space.asName() != null) return ranges;
         if (color_space.* != .array or color_space.array.len == 0) return error.UnsupportedPdfRendering;
         const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
         if (std.mem.eql(u8, family, "Lab")) {
-            if (color_space.array.len < 2 or color_space.array[1] != .dict) return error.UnsupportedPdfRendering;
-            if (component_index == 0) {
-                if (value < 0 or value > 100) return error.InvalidPdfImageMask;
-                return value / 100.0;
-            }
-            const range_offset: usize = if (component_index == 1) 0 else 2;
-            const range = parseLabRange(color_space.array[1].dict, "Range", range_offset, -100.0, 100.0);
-            if (value < range[0] or value > range[1] or range[0] == range[1]) return error.InvalidPdfImageMask;
-            return (value - range[0]) / (range[1] - range[0]);
+            if (component_count != 3 or color_space.array.len < 2 or color_space.array[1] != .dict)
+                return error.UnsupportedPdfRendering;
+            const range_a = parseLabRange(color_space.array[1].dict, "Range", 0, -100.0, 100.0);
+            const range_b = parseLabRange(color_space.array[1].dict, "Range", 2, -100.0, 100.0);
+            if (!std.math.isFinite(range_a[0]) or !std.math.isFinite(range_a[1]) or range_a[0] >= range_a[1] or
+                !std.math.isFinite(range_b[0]) or !std.math.isFinite(range_b[1]) or range_b[0] >= range_b[1])
+                return error.InvalidPdfImageMask;
+            ranges[0] = .{ .min = 0, .max = 100 };
+            ranges[1] = .{ .min = range_a[0], .max = range_a[1] };
+            ranges[2] = .{ .min = range_b[0], .max = range_b[1] };
+            return ranges;
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
@@ -7488,17 +10559,25 @@ pub const Reader = struct {
             if (profile.get("Range")) |range_obj| {
                 var resolved_range = try self.resolveValue(range_obj);
                 defer resolved_range.deinit(self.alloc);
-                if (resolved_range != .array or resolved_range.array.len < (component_index + 1) * 2)
+                if (resolved_range != .array or resolved_range.array.len != component_count * 2)
                     return error.InvalidPdfImageMask;
-                const min_value = numericObjectValue(&resolved_range.array[component_index * 2]) orelse return error.InvalidPdfImageMask;
-                const max_value = numericObjectValue(&resolved_range.array[component_index * 2 + 1]) orelse return error.InvalidPdfImageMask;
-                if (!std.math.isFinite(min_value) or !std.math.isFinite(max_value) or min_value >= max_value or value < min_value or value > max_value)
-                    return error.InvalidPdfImageMask;
-                return (value - min_value) / (max_value - min_value);
+                for (0..component_count) |component| {
+                    const min = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2])) orelse
+                        return error.InvalidPdfImageMask;
+                    const max = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2 + 1])) orelse
+                        return error.InvalidPdfImageMask;
+                    if (!std.math.isFinite(min) or !std.math.isFinite(max) or min >= max)
+                        return error.InvalidPdfImageMask;
+                    ranges[component] = .{ .min = min, .max = max };
+                }
             }
+            return ranges;
         }
-        if (value < 0 or value > 1) return error.InvalidPdfImageMask;
-        return value;
+        if (std.mem.eql(u8, family, "CalGray") or
+            std.mem.eql(u8, family, "CalRGB") or
+            std.mem.eql(u8, family, "Separation") or
+            std.mem.eql(u8, family, "DeviceN")) return ranges;
+        return error.UnsupportedPdfRendering;
     }
 
     fn prepareMatteSoftMaskAlloc(
@@ -7522,17 +10601,19 @@ pub const Reader = struct {
         const mask = try self.decodeImageToRgbaGuardedAlloc(&mask_plan.object, context, parent_live_bytes, mask_depth + 1);
         errdefer self.alloc.free(mask.rgba);
         if (!decodedMaskDimensionsValid(mask.width, mask.height, mask_plan.metadata, self.image_decode_target)) return error.InvalidPdfImageMask;
-        try applyResampledMatteToSamples(
-            samples,
-            width,
-            height,
-            mask.rgba,
-            mask.width,
-            mask.height,
-            mask_plan.metadata.interpolate,
-            matte,
-            parent_decode,
-        );
+        if (matte.indexed_matte_index == null) {
+            try applyResampledMatteToSamples(
+                samples,
+                width,
+                height,
+                mask.rgba,
+                mask.width,
+                mask.height,
+                mask_plan.metadata.interpolate,
+                matte,
+                parent_decode,
+            );
+        }
         return .{ .image = mask };
     }
 
@@ -7644,6 +10725,15 @@ pub const Reader = struct {
             },
         };
         try self.checkCancellation();
+        if (font.type3 == null and font.type1 == null and font.truetype == null and font.cff_otf == null and font.cff == null) {
+            font.truetype = self.buildLatinFontSubstitute(font_obj, &font.decoder) catch |err| switch (err) {
+                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                else => blk: {
+                    font.outline_fallback = true;
+                    break :blk null;
+                },
+            };
+        }
         // Outline builders probe mutually exclusive embedded formats. A
         // missing `glyf` table in OpenType CFF (or missing `CFF ` in
         // TrueType) is not a user-visible fallback when another native
@@ -7653,9 +10743,58 @@ pub const Reader = struct {
         return font;
     }
 
+    /// PDF's Latin Standard-14 fonts and explicitly nonsymbolic simple fonts
+    /// are valid even when their programs are not embedded. Keep rendering
+    /// deterministic and platform-independent by mapping them to bundled
+    /// regular/bold SFNT faces. PDF widths still drive placement, so
+    /// substitution changes outlines without reflowing the document. Symbol
+    /// and ZapfDingbats stay on the explicit fallback path until complete
+    /// native symbol faces and encodings are bundled.
+    fn buildLatinFontSubstitute(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder) !?TrueTypeFont {
+        const subtype = font_obj.get("Subtype") orelse return null;
+        const subtype_name = subtype.asName() orelse return null;
+        if (!std.mem.eql(u8, subtype_name, "Type1") and !std.mem.eql(u8, subtype_name, "TrueType")) return null;
+        const base_font_obj = font_obj.get("BaseFont") orelse return null;
+        const base_font = base_font_obj.asName() orelse return null;
+        const standard14_bold = standard14LatinFontIsBold(base_font);
+        if (standard14_bold == null and (try self.simpleFontSymbolicAlloc(font_obj)) != false) return null;
+        const bold = standard14_bold orelse substituteLatinFontIsBold(base_font) orelse return null;
+
+        var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
+        const alloc = budget.allocator();
+        const bundled = if (bold) standard_fonts.bold else standard_fonts.regular;
+        var sfnt = font_lib.sfnt.Font.init(alloc, bundled) catch |err| {
+            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
+            return err;
+        };
+        errdefer sfnt.deinit(alloc);
+        const head = sfnt.head() catch |err| {
+            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
+            return err;
+        };
+        var substitute = self.buildTrueTypeFontFromSfnt(font_obj, decoder, bundled, sfnt, head.units_per_em) catch |err| {
+            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
+            return err;
+        };
+        // Standard-14 dictionaries normally omit FontDescriptor and Widths.
+        // In that valid case, use the substitute face's metrics instead of
+        // treating the descriptor parser's sentinel zero as a real advance.
+        if (font_obj.get("FontDescriptor") == null) substitute.pdf_missing_width = null;
+        // Bundled faces are immutable process-lifetime data. Every substitute
+        // owns only its parsed directory/mappings, not another ~100 KiB copy.
+        substitute.owns_bytes = false;
+        return substitute;
+    }
+
     fn buildFontDecoder(self: *const Reader, font_obj: *const syntax.Object) !FontDecoder {
         var decoder = FontDecoder{};
         errdefer decoder.deinit(self.alloc);
+
+        if (font_obj.get("Encoding") == null) {
+            if (font_obj.get("Subtype")) |subtype| {
+                if (std.mem.eql(u8, subtype.asName() orelse "", "Type1")) decoder.base_encoding = .standard;
+            }
+        }
 
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
@@ -7802,9 +10941,10 @@ pub const Reader = struct {
                     try resource_content.append(self.alloc, '\n');
                 }
                 font.images = try self.collectImagesFromResourcesAlloc(&resources, resource_content.items);
-                font.shadings = try self.collectShadingsFromResourcesAlloc(&resources);
-                font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources);
-                font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources);
+                font.shadings = try self.collectShadingsFromResourcesAlloc(&resources, resource_content.items);
+                font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources, resource_content.items);
+                font.color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources, resource_content.items);
+                font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources, resource_content.items);
                 font.patterns = try self.collectPatternsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
                 font.forms = try self.collectFormsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
             }
@@ -7868,7 +11008,7 @@ pub const Reader = struct {
         self: *const Reader,
         font_obj: *const syntax.Object,
         decoder: *const FontDecoder,
-        bytes: []u8,
+        bytes: []const u8,
         font: font_lib.sfnt.Font,
         units_per_em: u16,
     ) !TrueTypeFont {
@@ -9321,6 +12461,53 @@ fn reduceJbig2CoverageAlloc(
     return out;
 }
 
+fn reduceGrayCoverageAlloc(
+    alloc: Allocator,
+    source: []const u8,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    cancellation: CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
+    if (target_width == 0 or target_height == 0 or target_width > source_width or target_height > source_height)
+        return error.UnsupportedPdfRendering;
+    const source_len = std.math.mul(usize, source_width, source_height) catch return error.UnsupportedPdfRendering;
+    if (source.len < source_len) return error.UnsupportedPdfRendering;
+    const target_len = std.math.mul(usize, target_width, target_height) catch return error.UnsupportedPdfRendering;
+    const out = try alloc.alloc(u8, target_len);
+    errdefer alloc.free(out);
+    var samples_since_cancellation_check: usize = 0;
+    for (0..target_height) |target_y| {
+        try cancellation.check();
+        const source_y_start = (@as(u64, target_y) * source_height) / target_height;
+        const source_y_end = @max(source_y_start + 1, (@as(u64, target_y + 1) * source_height + target_height - 1) / target_height);
+        for (0..target_width) |target_x| {
+            const source_x_start = (@as(u64, target_x) * source_width) / target_width;
+            const source_x_end = @max(source_x_start + 1, (@as(u64, target_x + 1) * source_width + target_width - 1) / target_width);
+            var gray_sum: u64 = 0;
+            var sample_count: u64 = 0;
+            var source_y = source_y_start;
+            while (source_y < @min(source_y_end, source_height)) : (source_y += 1) {
+                var source_x = source_x_start;
+                while (source_x < @min(source_x_end, source_width)) : (source_x += 1) {
+                    gray_sum += source[source_y * source_width + source_x];
+                    sample_count += 1;
+                    samples_since_cancellation_check += 1;
+                    if (samples_since_cancellation_check >= 4096) {
+                        try cancellation.check();
+                        samples_since_cancellation_check = 0;
+                    }
+                }
+            }
+            if (sample_count == 0) return error.UnsupportedPdfRendering;
+            out[target_y * @as(usize, target_width) + target_x] = @intCast((gray_sum + sample_count / 2) / sample_count);
+        }
+    }
+    return out;
+}
+
 fn decodeJbig2CoverageMaskToRgba(rgba: []u8, black_coverage: []const u8, decode_obj: ?*const syntax.Object, cancellation: CancellationProbe) !void {
     if (rgba.len != black_coverage.len * 4) return error.UnsupportedPdfRendering;
     const decode_reversed = parseMaskDecodeReversed(decode_obj);
@@ -9561,6 +12748,26 @@ fn decodeStreamFiltersOwnedAlloc(
     decode_limits: DecodeLimits,
     cancellation: CancellationProbe,
 ) ![]u8 {
+    return try decodeStreamFiltersOwnedAllocWithFinalLimit(
+        alloc,
+        raw,
+        filter_obj,
+        decode_parms_obj,
+        decode_limits,
+        null,
+        cancellation,
+    );
+}
+
+fn decodeStreamFiltersOwnedAllocWithFinalLimit(
+    alloc: Allocator,
+    raw: []u8,
+    filter_obj: ?*const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    decode_limits: DecodeLimits,
+    final_output_limit: ?usize,
+    cancellation: CancellationProbe,
+) ![]u8 {
     decode_limits.validate() catch |err| {
         alloc.free(raw);
         return err;
@@ -9578,6 +12785,7 @@ fn decodeStreamFiltersOwnedAlloc(
         filter_obj,
         decode_parms_obj,
         decode_limits.max_decoded_stream_bytes,
+        final_output_limit,
         cancellation,
     ) catch |err| {
         if (err == error.OutOfMemory and budget.limit_exceeded)
@@ -9592,21 +12800,42 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
     filter_obj: ?*const syntax.Object,
     decode_parms_obj: ?*const syntax.Object,
     max_decoded_stream_bytes: usize,
+    final_output_limit: ?usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
-    if (filter_obj == null) return raw;
+    const terminal_limit = if (final_output_limit) |limit|
+        @min(limit, max_decoded_stream_bytes)
+    else
+        max_decoded_stream_bytes;
+    if (filter_obj == null) return if (final_output_limit != null)
+        try enforceDecodedStreamLimit(alloc, raw, terminal_limit)
+    else
+        raw;
 
     var current = raw;
     errdefer alloc.free(current);
 
     switch (filter_obj.?.*) {
         .name => |name| {
-            const next = try applyStreamFilterAlloc(alloc, current, name, decode_parms_obj, max_decoded_stream_bytes, cancellation);
+            const next = try applyStreamFilterAlloc(
+                alloc,
+                current,
+                name,
+                decode_parms_obj,
+                max_decoded_stream_bytes,
+                terminal_limit,
+                cancellation,
+            );
             alloc.free(current);
             return next;
         },
         .array => |items| {
+            if (items.len == 0) {
+                if (final_output_limit != null and current.len > terminal_limit)
+                    return error.DecodedStreamTooLarge;
+                return current;
+            }
             for (items, 0..) |item, i| {
                 const name = item.asName() orelse return error.UnsupportedStreamFilter;
                 const param = if (decode_parms_obj) |parms|
@@ -9617,7 +12846,16 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes, cancellation);
+                const output_limit = if (i + 1 == items.len) terminal_limit else max_decoded_stream_bytes;
+                const next = try applyStreamFilterAlloc(
+                    alloc,
+                    current,
+                    name,
+                    param,
+                    max_decoded_stream_bytes,
+                    output_limit,
+                    cancellation,
+                );
                 alloc.free(current);
                 current = next;
             }
@@ -9711,7 +12949,15 @@ fn decodeStreamFiltersBeforeOwnedBudgetAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes, cancellation);
+                const next = try applyStreamFilterAlloc(
+                    alloc,
+                    current,
+                    name,
+                    param,
+                    max_decoded_stream_bytes,
+                    max_decoded_stream_bytes,
+                    cancellation,
+                );
                 alloc.free(current);
                 current = next;
             }
@@ -9726,7 +12972,8 @@ fn applyStreamFilterAlloc(
     input: []const u8,
     name: []const u8,
     param: ?*const syntax.Object,
-    max_decoded_stream_bytes: usize,
+    max_intermediate_bytes: usize,
+    max_output_bytes: usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
@@ -9744,26 +12991,26 @@ fn applyStreamFilterAlloc(
                 return error.InvalidFlateStream;
             };
             if (n == 0) break;
-            if (inflated_list.items.len > max_decoded_stream_bytes -| n) return error.DecodedStreamTooLarge;
+            if (inflated_list.items.len > max_intermediate_bytes -| n) return error.DecodedStreamTooLarge;
             try inflated_list.appendSlice(alloc, read_buf[0..n]);
         }
         const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
-        const decoded = try applyPredictorAlloc(alloc, inflated, param, max_decoded_stream_bytes, cancellation);
-        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
+        const decoded = try applyPredictorAlloc(alloc, inflated, param, max_output_bytes, cancellation);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_output_bytes);
     }
     if (std.mem.eql(u8, name, "ASCIIHexDecode")) {
         const decoded = try asciiHexDecodeAlloc(alloc, input, cancellation);
-        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_output_bytes);
     }
     if (std.mem.eql(u8, name, "ASCII85Decode")) {
-        return try ascii85DecodeAlloc(alloc, input, max_decoded_stream_bytes, cancellation);
+        return try ascii85DecodeAlloc(alloc, input, max_output_bytes, cancellation);
     }
     if (std.mem.eql(u8, name, "LZWDecode")) {
-        return try lzwDecodeAlloc(alloc, input, param, max_decoded_stream_bytes, cancellation);
+        return try lzwDecodeAlloc(alloc, input, param, max_intermediate_bytes, max_output_bytes, cancellation);
     }
     if (std.mem.eql(u8, name, "RunLengthDecode")) {
-        return try runLengthDecodeAlloc(alloc, input, max_decoded_stream_bytes, cancellation);
+        return try runLengthDecodeAlloc(alloc, input, max_output_bytes, cancellation);
     }
     return error.UnsupportedStreamFilter;
 }
@@ -9838,7 +13085,14 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, can
     return try out.toOwnedSlice(alloc);
 }
 
-fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object, max_bytes: usize, cancellation: CancellationProbe) ![]u8 {
+fn lzwDecodeAlloc(
+    alloc: Allocator,
+    input: []const u8,
+    param: ?*const syntax.Object,
+    max_intermediate_bytes: usize,
+    max_output_bytes: usize,
+    cancellation: CancellationProbe,
+) ![]u8 {
     const early_change: u16 = blk: {
         if (param) |obj| {
             if (obj.* == .dict) {
@@ -9900,7 +13154,8 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
         } else return error.MalformedLzw;
         defer alloc.free(entry);
 
-        if (out.items.len > max_bytes or entry.len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
+        if (out.items.len > max_intermediate_bytes or entry.len > max_intermediate_bytes - out.items.len)
+            return error.DecodedStreamTooLarge;
         try out.appendSlice(alloc, entry);
 
         if (prev_code) |prev| {
@@ -9922,8 +13177,8 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
 
     const decoded = try out.toOwnedSlice(alloc);
     defer alloc.free(decoded);
-    const predicted = try applyPredictorAlloc(alloc, decoded, param, max_bytes, cancellation);
-    return try enforceDecodedStreamLimit(alloc, predicted, max_bytes);
+    const predicted = try applyPredictorAlloc(alloc, decoded, param, max_output_bytes, cancellation);
+    return try enforceDecodedStreamLimit(alloc, predicted, max_output_bytes);
 }
 
 fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, cancellation: CancellationProbe) ![]u8 {
@@ -10050,10 +13305,22 @@ fn applyPredictorAlloc(
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
-    if (param == null or param.?.* != .dict) return try alloc.dupe(u8, decoded);
-    const predictor_obj = param.?.get("Predictor") orelse return try alloc.dupe(u8, decoded);
-    const predictor = predictor_obj.asInteger() orelse return try alloc.dupe(u8, decoded);
-    if (predictor <= 1) return try alloc.dupe(u8, decoded);
+    if (param == null or param.?.* != .dict) {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    }
+    const predictor_obj = param.?.get("Predictor") orelse {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    };
+    const predictor = predictor_obj.asInteger() orelse {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    };
+    if (predictor <= 1) {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    }
 
     const columns_i = if (param.?.get("Columns")) |obj| obj.asInteger() orelse 1 else 1;
     const colors_i = if (param.?.get("Colors")) |obj| obj.asInteger() orelse 1 else 1;
@@ -10081,6 +13348,7 @@ fn applyPredictorAlloc(
         // corresponding sample in the preceding pixel. PDF image streams in
         // the wild commonly use this with 8-bit RGB and grayscale data.
         if (bits != 8 or decoded.len % row_len != 0) return error.UnsupportedPredictor;
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
         const out = try alloc.dupe(u8, decoded);
         var row_start: usize = 0;
         while (row_start < out.len) : (row_start += row_len) {
@@ -10096,9 +13364,14 @@ fn applyPredictorAlloc(
     if (predictor < 10 or predictor > 15) return error.UnsupportedPredictor;
     const encoded_row_len = std.math.add(usize, row_len, 1) catch return error.UnsupportedPredictor;
     if (decoded.len % encoded_row_len != 0) return error.MalformedPredictorData;
+    const row_count = decoded.len / encoded_row_len;
+    const output_len = std.math.mul(usize, row_count, row_len) catch
+        return error.DecodedStreamTooLarge;
+    if (output_len > max_bytes) return error.DecodedStreamTooLarge;
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
+    try out.ensureTotalCapacityPrecise(alloc, output_len);
     const prev = try alloc.alloc(u8, row_len);
     defer alloc.free(prev);
     @memset(prev, 0);
@@ -11107,19 +14380,58 @@ fn appendOwnedSyntaxObject(alloc: Allocator, out: *std.ArrayList(syntax.Object),
     try out.append(alloc, owned);
 }
 
-fn clearContentOperandsRetainingNames(
-    alloc: Allocator,
-    operands: *std.ArrayList(syntax.Object),
-    retained_names: *std.ArrayList(syntax.Object),
-) !void {
-    for (operands.items) |*obj| {
-        if (obj.* == .name) {
-            try retained_names.append(alloc, obj.*);
-            obj.* = .null;
-        }
-        obj.deinit(alloc);
+const ContentNameInterner = struct {
+    const max_names: usize = 4096;
+    const max_name_bytes: usize = 1024 * 1024;
+
+    names: std.StringHashMapUnmanaged([]u8) = .empty,
+    name_bytes: usize = 0,
+
+    fn deinit(self: *ContentNameInterner, alloc: Allocator) void {
+        var iterator = self.names.keyIterator();
+        while (iterator.next()) |name| alloc.free(name.*);
+        self.names.deinit(alloc);
+        self.* = undefined;
     }
-    operands.clearRetainingCapacity();
+};
+
+fn internContentNameAlloc(
+    alloc: Allocator,
+    retained_names: *ContentNameInterner,
+    name: []const u8,
+) !?[]const u8 {
+    // A hash lookup keeps repeated `scn`/`SCN` selection O(1). Bound both
+    // cardinality and payload so adversarial streams cannot retain an
+    // unbounded set of names merely by changing graphics state.
+    if (retained_names.names.get(name)) |retained| return retained;
+    if (retained_names.names.count() >= ContentNameInterner.max_names or
+        name.len > ContentNameInterner.max_name_bytes -| retained_names.name_bytes)
+        return null;
+    const owned = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned);
+    try retained_names.names.put(alloc, owned, owned);
+    retained_names.name_bytes += owned.len;
+    return owned;
+}
+
+test "content pattern names are interned once" {
+    const alloc = std.testing.allocator;
+    var retained_names = ContentNameInterner{};
+    defer retained_names.deinit(alloc);
+
+    const first = (try internContentNameAlloc(alloc, &retained_names, "P1")).?;
+    const repeated = (try internContentNameAlloc(alloc, &retained_names, "P1")).?;
+    const second = (try internContentNameAlloc(alloc, &retained_names, "P2")).?;
+
+    try std.testing.expectEqual(@as(usize, 2), retained_names.names.count());
+    try std.testing.expectEqual(first.ptr, repeated.ptr);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+
+    const oversized = try alloc.alloc(u8, ContentNameInterner.max_name_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'P');
+    try std.testing.expect((try internContentNameAlloc(alloc, &retained_names, oversized)) == null);
+    try std.testing.expectEqual(@as(usize, 2), retained_names.names.count());
 }
 
 fn isRecoverableContentSyntaxError(err: anyerror) bool {
@@ -11215,6 +14527,7 @@ fn applyTextRunOperator(
     alloc: Allocator,
     out: PositionedTextOutput,
     state: *TextRunState,
+    retained_pattern_names: *ContentNameInterner,
     stack: *std.ArrayList(TextRunStackEntry),
     current_path: *std.ArrayList([2]f64),
     current_path_closed: *bool,
@@ -11226,6 +14539,7 @@ fn applyTextRunOperator(
     paint_order: *usize,
     next_group_id: *u32,
     cancellation: CancellationProbe,
+    vectorize_form_text: bool,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -11262,8 +14576,11 @@ fn applyTextRunOperator(
             .group_parent_id = state.group_parent_id,
             .group_isolated = state.group_isolated,
             .group_knockout = state.group_knockout,
+            .group_alpha = state.group_alpha,
+            .group_blend_mode = state.group_blend_mode,
             .fill_color_space = state.fill_color_space,
             .stroke_color_space = state.stroke_color_space,
+            .color_spaces = state.color_spaces,
             .fill_pattern_name = state.fill_pattern_name,
             .stroke_pattern_name = state.stroke_pattern_name,
             .clip_box = state.clip_box,
@@ -11299,8 +14616,11 @@ fn applyTextRunOperator(
             state.group_parent_id = entry.group_parent_id;
             state.group_isolated = entry.group_isolated;
             state.group_knockout = entry.group_knockout;
+            state.group_alpha = entry.group_alpha;
+            state.group_blend_mode = entry.group_blend_mode;
             state.fill_color_space = entry.fill_color_space;
             state.stroke_color_space = entry.stroke_color_space;
+            state.color_spaces = entry.color_spaces;
             state.fill_pattern_name = entry.fill_pattern_name;
             state.stroke_pattern_name = entry.stroke_pattern_name;
             state.clip_box = entry.clip_box;
@@ -11500,103 +14820,95 @@ fn applyTextRunOperator(
     }
     if (std.mem.eql(u8, op, "rg")) {
         if (operands.len >= 3) {
-            state.fill_color_space = "DeviceRGB";
-            state.fill_pattern_name = null;
-            state.fill_color = rgbColor(
+            selectFillDeviceColorSpace(state, .device_rgb, .{
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+                0,
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "RG")) {
         if (operands.len >= 3) {
-            state.stroke_color_space = "DeviceRGB";
-            state.stroke_pattern_name = null;
-            state.stroke_color = rgbColor(
+            selectStrokeDeviceColorSpace(state, .device_rgb, .{
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+                0,
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "g")) {
         if (operands.len >= 1) {
-            state.fill_color_space = "DeviceGray";
-            state.fill_pattern_name = null;
-            state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+            selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         }
         return;
     }
     if (std.mem.eql(u8, op, "G")) {
         if (operands.len >= 1) {
-            state.stroke_color_space = "DeviceGray";
-            state.stroke_pattern_name = null;
-            state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+            selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         }
         return;
     }
     if (std.mem.eql(u8, op, "k")) {
         if (operands.len >= 4) {
-            state.fill_color_space = "DeviceCMYK";
-            state.fill_pattern_name = null;
-            state.fill_color = cmykColor(
+            selectFillDeviceColorSpace(state, .device_cmyk, .{
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "K")) {
         if (operands.len >= 4) {
-            state.stroke_color_space = "DeviceCMYK";
-            state.stroke_pattern_name = null;
-            state.stroke_color = cmykColor(
+            selectStrokeDeviceColorSpace(state, .device_cmyk, .{
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "cs")) {
         if (operands.len >= 1 and operands[operands.len - 1] == .name) {
-            state.fill_color_space = operands[operands.len - 1].name;
-            if (!std.mem.eql(u8, state.fill_color_space, "Pattern")) state.fill_pattern_name = null;
+            selectFillColorSpace(state, operands[operands.len - 1].name);
         }
         return;
     }
     if (std.mem.eql(u8, op, "CS")) {
         if (operands.len >= 1 and operands[operands.len - 1] == .name) {
-            state.stroke_color_space = operands[operands.len - 1].name;
-            if (!std.mem.eql(u8, state.stroke_color_space, "Pattern")) state.stroke_pattern_name = null;
+            selectStrokeColorSpace(state, operands[operands.len - 1].name);
         }
         return;
     }
     if (std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) {
-        if (std.mem.eql(u8, state.fill_color_space, "Pattern")) {
+        if (state.fill_color_space.kind == .pattern) {
             if (operands.len >= 1 and operands[operands.len - 1] == .name) {
-                state.fill_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+                // A bounded interner overflow keeps the channel marked as
+                // Pattern paint. The empty sentinel cannot resolve and sends
+                // vector text through the existing raster fallback instead
+                // of silently dropping visible glyphs.
+                state.fill_pattern_name = (try internContentNameAlloc(alloc, retained_pattern_names, operands[operands.len - 1].name)) orelse "";
+                if (try decodePatternBaseColorOperands(state.fill_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
             }
-        } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
+        } else if (try decodeShapeColorOperands(state.fill_color_space.value, operands)) |color| {
             state.fill_pattern_name = null;
             state.fill_color = color;
         }
         return;
     }
     if (std.mem.eql(u8, op, "SC") or std.mem.eql(u8, op, "SCN")) {
-        if (std.mem.eql(u8, state.stroke_color_space, "Pattern")) {
+        if (state.stroke_color_space.kind == .pattern) {
             if (operands.len >= 1 and operands[operands.len - 1] == .name) {
-                state.stroke_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+                state.stroke_pattern_name = (try internContentNameAlloc(alloc, retained_pattern_names, operands[operands.len - 1].name)) orelse "";
+                if (try decodePatternBaseColorOperands(state.stroke_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
             }
-        } else if (try decodeShapeColorOperands(state.stroke_color_space, operands)) |color| {
+        } else if (try decodeShapeColorOperands(state.stroke_color_space.value, operands)) |color| {
             state.stroke_pattern_name = null;
             state.stroke_color = color;
         }
@@ -11700,31 +15012,85 @@ fn applyTextRunOperator(
         const form = findPageForm(forms, name) orelse return;
         const start_len = out.len();
         var nested_state = buildFormTextState(state.*, form);
-        if (form.transparency_group) {
-            nested_state.group_parent_id = state.group_id;
-            nested_state.group_id = next_group_id.*;
-            nested_state.group_isolated = form.group_isolated;
-            nested_state.group_knockout = form.group_knockout;
-            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
-        }
+        if (form.transparency_group)
+            try enterTextTransparencyGroup(state.*, &nested_state, form, next_group_id);
         const nested_clip = if (out.isLayout()) &.{} else current_clip_points.items;
         var nested_parser = try PositionedTextParser.init(alloc, out, nested_state, nested_clip, current_clip_fill_rule.*);
         defer nested_parser.deinit();
         nested_parser.cancellation = cancellation;
         nested_parser.paint_order = paint_order.*;
         nested_parser.next_group_id = next_group_id.*;
+        nested_parser.vectorize_form_text = vectorize_form_text;
         try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms);
         paint_order.* = nested_parser.paint_order;
         next_group_id.* = nested_parser.next_group_id;
         switch (out) {
             .layout => {},
             .render => |render_out| for (render_out.items[start_len..]) |*run| {
-                run.vectorizable = false;
+                if (vectorize_form_text) {
+                    // Recursively nested runs already hold the innermost
+                    // resource borrow. Otherwise translate this Form-local
+                    // index before discarding its ambiguous numeric scope.
+                    if (run.render_font == null) if (run.font_index) |index| {
+                        if (index < form.fonts.len) run.render_font = &form.fonts[index];
+                    };
+                } else {
+                    run.vectorizable = false;
+                }
                 run.font_index = null;
             },
         }
         return;
     }
+}
+
+fn samePathPoint(a: [2]f64, b: [2]f64) bool {
+    return a[0] == b[0] and a[1] == b[1];
+}
+
+/// Encode independent closed clip contours into one polygon by adding a
+/// doubled bridge. Both even-odd parity and nonzero winding cancel across the
+/// bridge, while the existing bounded clip rasterizer can keep its compact
+/// single-slice representation.
+fn closeCompoundClipSubpath(
+    alloc: Allocator,
+    path: *std.ArrayList([2]f64),
+    closed: *bool,
+    subpath_start: *?[2]f64,
+    bridge_return: *?[2]f64,
+) !void {
+    const start = subpath_start.* orelse return;
+    if (path.items.len == 0 or !samePathPoint(path.items[path.items.len - 1], start))
+        try path.append(alloc, start);
+    if (bridge_return.*) |anchor| {
+        if (!samePathPoint(path.items[path.items.len - 1], anchor)) try path.append(alloc, anchor);
+        subpath_start.* = anchor;
+    }
+    bridge_return.* = null;
+    closed.* = true;
+}
+
+fn beginCompoundClipSubpath(
+    alloc: Allocator,
+    path: *std.ArrayList([2]f64),
+    closed: *bool,
+    subpath_start: *?[2]f64,
+    bridge_return: *?[2]f64,
+    point: [2]f64,
+) !void {
+    if (path.items.len == 0) {
+        try path.append(alloc, point);
+        subpath_start.* = point;
+        bridge_return.* = null;
+        closed.* = false;
+        return;
+    }
+    try closeCompoundClipSubpath(alloc, path, closed, subpath_start, bridge_return);
+    const anchor = path.items[path.items.len - 1];
+    try path.append(alloc, point);
+    subpath_start.* = point;
+    bridge_return.* = anchor;
+    closed.* = false;
 }
 
 fn applyImageOperator(
@@ -11734,6 +15100,8 @@ fn applyImageOperator(
     stack: *std.ArrayList(ImageStackEntry),
     current_path: *std.ArrayList([2]f64),
     current_path_closed: *bool,
+    current_subpath_start: *?[2]f64,
+    current_bridge_return: *?[2]f64,
     current_clip_points: *std.ArrayList([2]f64),
     current_clip_fill_rule: *FillRule,
     images: []const PageImage,
@@ -11745,7 +15113,731 @@ fn applyImageOperator(
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
-    if (isTextShowOperator(op) or isShapePaintOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
+    if (state.soft_mask != null and
+        (isShapePaintOperator(op) or isTextShowOperator(op) or std.mem.eql(u8, op, "sh")))
+    {
+        return error.UnsupportedPdfRendering;
+    }
+    if (isShapePaintOperator(op)) {
+        paint_order.* += 1;
+        // Painting consumes the current path. This resource-only pass must
+        // mirror that state transition even though it does not emit shapes;
+        // otherwise a later W/W* accidentally joins already-painted geometry
+        // into the image clip and can hide a valid XObject completely.
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_start.* = null;
+        current_bridge_return.* = null;
+        return;
+    }
+    if (isTextShowOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
+    if (std.mem.eql(u8, op, "q")) {
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
+        try stack.append(alloc, .{
+            .state = state.*,
+            .clip_points = clip_points,
+            .clip_fill_rule = current_clip_fill_rule.*,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "Q")) {
+        if (stack.items.len > 0) {
+            var entry = stack.pop().?;
+            defer entry.deinit(alloc);
+            state.* = entry.state;
+            current_clip_points.clearRetainingCapacity();
+            try current_clip_points.appendSlice(alloc, entry.clip_points);
+            current_clip_fill_rule.* = entry.clip_fill_rule;
+        }
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_start.* = null;
+        current_bridge_return.* = null;
+        return;
+    }
+    if (std.mem.eql(u8, op, "cm")) {
+        if (operands.len >= 6) {
+            const m = GraphicsMatrix{
+                .a = numericObjectValue(&operands[operands.len - 6]) orelse 1,
+                .b = numericObjectValue(&operands[operands.len - 5]) orelse 0,
+                .c = numericObjectValue(&operands[operands.len - 4]) orelse 0,
+                .d = numericObjectValue(&operands[operands.len - 3]) orelse 1,
+                .e = numericObjectValue(&operands[operands.len - 2]) orelse 0,
+                .f = numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            };
+            state.matrix = multiplyGraphicsMatrix(m, state.matrix);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
+            state.fill_alpha = gstate.fill_alpha;
+            state.stroke_alpha = gstate.stroke_alpha;
+            state.blend_mode = gstate.blend_mode;
+            if (gstate.soft_mask_specified) {
+                state.soft_mask = if (gstate.soft_mask) |mask| blk: {
+                    var placed = mask;
+                    // A soft-mask Form is established in the user space in
+                    // effect at `gs`; later CTM changes do not move it.
+                    placed.matrix = multiplyGraphicsMatrix(mask.matrix, state.matrix);
+                    break :blk placed;
+                } else null;
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
+        selectFillDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
+        return;
+    }
+    if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        selectFillColorSpace(state, operands[operands.len - 1].name);
+        return;
+    }
+    if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
+        if (state.fill_color_space.kind == .pattern) {
+            if (operands[operands.len - 1] == .name) {
+                // This extraction pass only needs to distinguish Pattern from
+                // solid paint. The resource-aware pattern pass owns the name.
+                state.fill_pattern_name = "";
+                if (try decodePatternBaseColorOperands(state.fill_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+            }
+        } else if (try decodeShapeColorOperands(state.fill_color_space.value, operands)) |color| {
+            state.fill_pattern_name = null;
+            state.fill_color = color;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
+        try beginCompoundClipSubpath(alloc, current_path, current_path_closed, current_subpath_start, current_bridge_return, applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        ));
+        return;
+    }
+    if (std.mem.eql(u8, op, "l") and operands.len >= 2) {
+        try current_path.append(alloc, applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        ));
+        return;
+    }
+    if (std.mem.eql(u8, op, "c") and operands.len >= 6 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c1 = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 6]) orelse 0, numericObjectValue(&operands[operands.len - 5]) orelse 0);
+        const c2 = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 4]) orelse 0, numericObjectValue(&operands[operands.len - 3]) orelse 0);
+        const end = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 2]) orelse 0, numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "v") and operands.len >= 4 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c2 = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 4]) orelse 0, numericObjectValue(&operands[operands.len - 3]) orelse 0);
+        const end = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 2]) orelse 0, numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        try appendFlattenedCubicBezier(alloc, current_path, start, start, c2, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "y") and operands.len >= 4 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c1 = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 4]) orelse 0, numericObjectValue(&operands[operands.len - 3]) orelse 0);
+        const end = applyMatrixToPoint(state.matrix, numericObjectValue(&operands[operands.len - 2]) orelse 0, numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        try appendFlattenedCubicBezier(alloc, current_path, start, c1, end, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "h")) {
+        try closeCompoundClipSubpath(alloc, current_path, current_path_closed, current_subpath_start, current_bridge_return);
+        return;
+    }
+    if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
+        const x = numericObjectValue(&operands[operands.len - 4]) orelse 0;
+        const y = numericObjectValue(&operands[operands.len - 3]) orelse 0;
+        const w = numericObjectValue(&operands[operands.len - 2]) orelse 0;
+        const h = numericObjectValue(&operands[operands.len - 1]) orelse 0;
+        try beginCompoundClipSubpath(alloc, current_path, current_path_closed, current_subpath_start, current_bridge_return, applyMatrixToPoint(state.matrix, x, y));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y + h));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y + h));
+        try closeCompoundClipSubpath(alloc, current_path, current_path_closed, current_subpath_start, current_bridge_return);
+        return;
+    }
+    if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
+        try closeCompoundClipSubpath(alloc, current_path, current_path_closed, current_subpath_start, current_bridge_return);
+        if (current_path.items.len >= 2) {
+            const next_clip = pathBounds(current_path.items);
+            state.clip_box = if (state.clip_box) |current_clip|
+                intersectPageBoxes(current_clip, next_clip)
+            else
+                next_clip;
+            if (current_clip_points.items.len == 0) {
+                try current_clip_points.appendSlice(alloc, current_path.items);
+                current_clip_fill_rule.* = if (std.mem.eql(u8, op, "W*")) .even_odd else .nonzero;
+            } else {
+                if (try tryIntersectRectClipPoints(alloc, current_clip_points.items, current_path.items)) |intersection| {
+                    defer alloc.free(intersection);
+                    current_clip_points.clearRetainingCapacity();
+                    try current_clip_points.appendSlice(alloc, intersection);
+                    current_clip_fill_rule.* = .nonzero;
+                } else {
+                    current_clip_points.clearRetainingCapacity();
+                }
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "n")) {
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_start.* = null;
+        current_bridge_return.* = null;
+        return;
+    }
+    if (std.mem.eql(u8, op, "Do")) {
+        if (operands.len == 0 or operands[operands.len - 1] != .name) return;
+        const name = operands[operands.len - 1].name;
+        for (images) |image| {
+            if (!std.mem.eql(u8, image.name, name)) continue;
+            const stencil_color: ?[4]u8 = if (image.image_mask) blk: {
+                break :blk switch (state.fill_color_space.kind) {
+                    .device_gray, .device_rgb, .device_cmyk => state.fill_color,
+                    // The resource-aware pattern pass owns this occurrence.
+                    // Consume its paint slot here so later image occurrences
+                    // retain deterministic cross-pass ordering.
+                    .pattern => {
+                        paint_order.* += 1;
+                        return;
+                    },
+                    .unsupported => return error.UnsupportedPdfRendering,
+                };
+            } else null;
+            const rgba = if (image.shared_rgba) |shared| blk: {
+                shared.retain();
+                break :blk shared.bytes;
+            } else try alloc.dupe(u8, image.rgba);
+            errdefer if (image.shared_rgba) |shared| shared.release(alloc) else alloc.free(rgba);
+            const opacity_mask_rgba = if (state.soft_mask) |mask| blk: {
+                // The bounded native profile accepts image-backed soft-mask
+                // groups when both images share sample geometry. This covers
+                // producer-generated transparency pairs without pretending a
+                // general vector soft-mask group is image-local.
+                if (mask.width != image.width or mask.height != image.height or
+                    !graphicsMatricesApproxEqual(mask.matrix, state.matrix))
+                    return error.UnsupportedPdfRendering;
+                mask.shared_rgba.retain();
+                break :blk mask.rgba;
+            } else null;
+            errdefer if (state.soft_mask) |mask| mask.shared_rgba.release(alloc);
+            const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
+            errdefer if (clip_points) |clip| alloc.free(clip);
+            try out.append(alloc, .{
+                .rgba = rgba,
+                .shared_rgba = image.shared_rgba,
+                .width = image.width,
+                .height = image.height,
+                .interpolate = image.interpolate,
+                .bilevel = image.bilevel,
+                .stencil_color = stencil_color,
+                .opacity_mask_rgba = opacity_mask_rgba,
+                .opacity_mask_shared_rgba = if (state.soft_mask) |mask| mask.shared_rgba else null,
+                .opacity_mask_width = if (state.soft_mask) |mask| mask.width else 0,
+                .opacity_mask_height = if (state.soft_mask) |mask| mask.height else 0,
+                .opacity_mask_luminosity = if (state.soft_mask) |mask| mask.luminosity else false,
+                .opacity_mask_interpolate = if (state.soft_mask) |mask| mask.interpolate else false,
+                .alpha = state.fill_alpha,
+                .paint_order = paint_order.*,
+                .blend_mode = state.blend_mode,
+                .group_id = state.group_id,
+                .group_parent_id = state.group_parent_id,
+                .group_isolated = state.group_isolated,
+                .group_knockout = state.group_knockout,
+                .group_alpha = state.group_alpha,
+                .group_blend_mode = state.group_blend_mode,
+                .clip_box = state.clip_box,
+                .clip_points = clip_points,
+                .clip_fill_rule = current_clip_fill_rule.*,
+                .a = state.matrix.a,
+                .b = state.matrix.b,
+                .c = state.matrix.c,
+                .d = state.matrix.d,
+                .e = state.matrix.e,
+                .f = state.matrix.f,
+                .x = state.matrix.e,
+                .y = state.matrix.f,
+                .draw_width = @abs(state.matrix.a),
+                .draw_height = @abs(state.matrix.d),
+            });
+            paint_order.* += 1;
+            return;
+        }
+        const form = findPageForm(forms, name) orelse return;
+        var nested_state = buildFormGraphicsState(state.*, form);
+        if (form.transparency_group)
+            try enterGraphicsTransparencyGroup(state.*, &nested_state, form, next_group_id);
+        try extractImageRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.images, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id, cancellation);
+    }
+}
+
+fn applyShapeOperator(
+    alloc: Allocator,
+    out: *std.ArrayList(ShapeRun),
+    state: *GraphicsState,
+    stack: *std.ArrayList(ShapeStackEntry),
+    current_path: *std.ArrayList([2]f64),
+    current_path_closed: *bool,
+    current_subpath_starts: *std.ArrayList(usize),
+    current_subpath_closed: *std.ArrayList(bool),
+    current_dash: *std.ArrayList(f64),
+    dash_phase: *f64,
+    current_clip_points: *std.ArrayList([2]f64),
+    current_clip_fill_rule: *@FieldType(ShapeRun, "fill_rule"),
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
+    op: []const u8,
+    operands: []const syntax.Object,
+) anyerror!void {
+    if (isTextShowOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
+    if (std.mem.eql(u8, op, "Do") and
+        (operands.len == 0 or operands[operands.len - 1] != .name or findPageForm(forms, operands[operands.len - 1].name) == null))
+    {
+        paint_order.* += 1;
+    }
+    if (std.mem.eql(u8, op, "q")) {
+        const dash_array = try alloc.dupe(f64, current_dash.items);
+        errdefer alloc.free(dash_array);
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
+        try stack.append(alloc, .{
+            .state = state.*,
+            .dash_phase = dash_phase.*,
+            .dash_array = dash_array,
+            .clip_points = clip_points,
+            .clip_fill_rule = current_clip_fill_rule.*,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "Q")) {
+        if (stack.items.len > 0) {
+            var entry = stack.pop().?;
+            defer entry.deinit(alloc);
+            state.* = entry.state;
+            dash_phase.* = entry.dash_phase;
+            current_dash.clearRetainingCapacity();
+            try current_dash.appendSlice(alloc, entry.dash_array);
+            current_clip_points.clearRetainingCapacity();
+            try current_clip_points.appendSlice(alloc, entry.clip_points);
+            current_clip_fill_rule.* = entry.clip_fill_rule;
+        }
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_starts.clearRetainingCapacity();
+        current_subpath_closed.clearRetainingCapacity();
+        return;
+    }
+    if (std.mem.eql(u8, op, "cm")) {
+        if (operands.len >= 6) {
+            const m = GraphicsMatrix{
+                .a = numericObjectValue(&operands[operands.len - 6]) orelse 1,
+                .b = numericObjectValue(&operands[operands.len - 5]) orelse 0,
+                .c = numericObjectValue(&operands[operands.len - 4]) orelse 0,
+                .d = numericObjectValue(&operands[operands.len - 3]) orelse 1,
+                .e = numericObjectValue(&operands[operands.len - 2]) orelse 0,
+                .f = numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            };
+            state.matrix = multiplyGraphicsMatrix(m, state.matrix);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
+            state.fill_alpha = gstate.fill_alpha;
+            state.stroke_alpha = gstate.stroke_alpha;
+            state.blend_mode = gstate.blend_mode;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "Do")) {
+        if (operands.len == 0 or operands[operands.len - 1] != .name) return;
+        const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
+        var nested_state = buildFormGraphicsState(state.*, form);
+        if (form.transparency_group)
+            try enterGraphicsTransparencyGroup(state.*, &nested_state, form, next_group_id);
+        try extractShapeRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
+        return;
+    }
+    if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
+        selectFillDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
+        selectStrokeDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
+        return;
+    }
+    if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
+        selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
+        return;
+    }
+    if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
+        selectStrokeDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
+        return;
+    }
+    if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        selectFillColorSpace(state, operands[operands.len - 1].name);
+        return;
+    }
+    if (std.mem.eql(u8, op, "CS") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        selectStrokeColorSpace(state, operands[operands.len - 1].name);
+        return;
+    }
+    if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
+        if (state.fill_color_space.kind == .pattern) {
+            if (operands[operands.len - 1] == .name) {
+                state.fill_pattern_name = "";
+                if (try decodePatternBaseColorOperands(state.fill_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+            }
+        } else if (try decodeShapeColorOperands(state.fill_color_space.value, operands)) |color| {
+            state.fill_pattern_name = null;
+            state.fill_color = color;
+        }
+        return;
+    }
+    if ((std.mem.eql(u8, op, "SC") or std.mem.eql(u8, op, "SCN")) and operands.len >= 1) {
+        if (state.stroke_color_space.kind == .pattern) {
+            if (operands[operands.len - 1] == .name) {
+                state.stroke_pattern_name = "";
+                if (try decodePatternBaseColorOperands(state.stroke_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+            }
+        } else if (try decodeShapeColorOperands(state.stroke_color_space.value, operands)) |color| {
+            state.stroke_pattern_name = null;
+            state.stroke_color = color;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "w") and operands.len >= 1) {
+        state.stroke_width = @max(0.1, numericObjectValue(&operands[operands.len - 1]) orelse state.stroke_width);
+        return;
+    }
+    if (std.mem.eql(u8, op, "J") and operands.len >= 1) {
+        const cap = operands[operands.len - 1].asInteger() orelse return;
+        state.line_cap = switch (cap) {
+            0 => .butt,
+            1 => .round,
+            2 => .square,
+            else => state.line_cap,
+        };
+        return;
+    }
+    if (std.mem.eql(u8, op, "j") and operands.len >= 1) {
+        const join = operands[operands.len - 1].asInteger() orelse return;
+        state.line_join = switch (join) {
+            0 => .miter,
+            1 => .round,
+            2 => .bevel,
+            else => state.line_join,
+        };
+        return;
+    }
+    if (std.mem.eql(u8, op, "M") and operands.len >= 1) {
+        state.miter_limit = @max(1.0, numericObjectValue(&operands[operands.len - 1]) orelse state.miter_limit);
+        return;
+    }
+    if (std.mem.eql(u8, op, "d") and operands.len >= 2) {
+        const dash_array_obj = &operands[operands.len - 2];
+        const phase = numericObjectValue(&operands[operands.len - 1]) orelse 0;
+        if (dash_array_obj.* != .array) return;
+        current_dash.clearRetainingCapacity();
+        for (dash_array_obj.array) |item| {
+            const value = numericObjectValue(&item) orelse continue;
+            if (value > 0) try current_dash.append(alloc, value);
+        }
+        dash_phase.* = phase;
+        return;
+    }
+    if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
+        try current_subpath_starts.append(alloc, current_path.items.len);
+        try current_subpath_closed.append(alloc, false);
+        current_path_closed.* = false;
+        try current_path.append(alloc, applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        ));
+        return;
+    }
+    if (std.mem.eql(u8, op, "l") and operands.len >= 2) {
+        try current_path.append(alloc, applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        ));
+        return;
+    }
+    if (std.mem.eql(u8, op, "c") and operands.len >= 6 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c1 = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 6]) orelse 0,
+            numericObjectValue(&operands[operands.len - 5]) orelse 0,
+        );
+        const c2 = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+        );
+        const end = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        );
+        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "v") and operands.len >= 4 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c1 = start;
+        const c2 = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+        );
+        const end = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        );
+        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "y") and operands.len >= 4 and current_path.items.len > 0) {
+        const start = current_path.items[current_path.items.len - 1];
+        const c1 = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+        );
+        const end = applyMatrixToPoint(
+            state.matrix,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        );
+        const c2 = end;
+        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
+        return;
+    }
+    if (std.mem.eql(u8, op, "h")) {
+        current_path_closed.* = true;
+        if (current_subpath_closed.items.len > 0)
+            current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
+        return;
+    }
+    if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
+        try current_subpath_starts.append(alloc, current_path.items.len);
+        try current_subpath_closed.append(alloc, true);
+        current_path_closed.* = true;
+        const x = numericObjectValue(&operands[operands.len - 4]) orelse 0;
+        const y = numericObjectValue(&operands[operands.len - 3]) orelse 0;
+        const w = numericObjectValue(&operands[operands.len - 2]) orelse 0;
+        const h = numericObjectValue(&operands[operands.len - 1]) orelse 0;
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y + h));
+        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y + h));
+        return;
+    }
+    if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
+        if (current_path.items.len >= 2) {
+            const next_clip = pathBounds(current_path.items);
+            state.clip_box = if (state.clip_box) |current_clip|
+                intersectPageBoxes(current_clip, next_clip)
+            else
+                next_clip;
+            if (current_clip_points.items.len == 0) {
+                try current_clip_points.appendSlice(alloc, current_path.items);
+                current_clip_fill_rule.* = if (std.mem.eql(u8, op, "W*")) .even_odd else .nonzero;
+            } else {
+                if (try tryIntersectRectClipPoints(alloc, current_clip_points.items, current_path.items)) |intersection| {
+                    defer alloc.free(intersection);
+                    current_clip_points.clearRetainingCapacity();
+                    try current_clip_points.appendSlice(alloc, intersection);
+                    current_clip_fill_rule.* = .nonzero;
+                } else {
+                    current_clip_points.clearRetainingCapacity();
+                }
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "f") or std.mem.eql(u8, op, "F") or std.mem.eql(u8, op, "f*")) {
+        if (current_path.items.len >= 3) {
+            const order = paint_order.*;
+            if (try solidShapePaintAvailable(state.fill_color_space.kind)) {
+                try emitPolygonShapeRun(
+                    alloc,
+                    out,
+                    order,
+                    state.*,
+                    current_path.items,
+                    current_subpath_starts.items,
+                    current_subpath_closed.items,
+                    .fill,
+                    true,
+                    if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero,
+                    current_dash.items,
+                    dash_phase.*,
+                    current_clip_points.items,
+                    current_clip_fill_rule.*,
+                );
+            }
+            paint_order.* += 1;
+        }
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_starts.clearRetainingCapacity();
+        current_subpath_closed.clearRetainingCapacity();
+        return;
+    }
+    if (std.mem.eql(u8, op, "S") or std.mem.eql(u8, op, "s")) {
+        if (std.mem.eql(u8, op, "s")) {
+            current_path_closed.* = true;
+            if (current_subpath_closed.items.len > 0)
+                current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
+        }
+        if (current_path.items.len >= 2) {
+            const order = paint_order.*;
+            if (try solidShapePaintAvailable(state.stroke_color_space.kind))
+                try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, current_subpath_starts.items, current_subpath_closed.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
+            paint_order.* += 1;
+        }
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_starts.clearRetainingCapacity();
+        current_subpath_closed.clearRetainingCapacity();
+        return;
+    }
+    if (std.mem.eql(u8, op, "B") or std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) {
+        const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
+        if ((std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) and current_subpath_closed.items.len > 0)
+            current_subpath_closed.items[current_subpath_closed.items.len - 1] = true;
+        if (current_path.items.len >= 3) {
+            const order = paint_order.*;
+            if (try solidShapePaintAvailable(state.fill_color_space.kind)) {
+                try emitPolygonShapeRun(
+                    alloc,
+                    out,
+                    order,
+                    state.*,
+                    current_path.items,
+                    current_subpath_starts.items,
+                    current_subpath_closed.items,
+                    .fill,
+                    true,
+                    if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero,
+                    current_dash.items,
+                    dash_phase.*,
+                    current_clip_points.items,
+                    current_clip_fill_rule.*,
+                );
+            }
+            if (try solidShapePaintAvailable(state.stroke_color_space.kind))
+                try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, current_subpath_starts.items, current_subpath_closed.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
+            paint_order.* += 1;
+        }
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_starts.clearRetainingCapacity();
+        current_subpath_closed.clearRetainingCapacity();
+        return;
+    }
+    if (std.mem.eql(u8, op, "n")) {
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        current_subpath_starts.clearRetainingCapacity();
+        current_subpath_closed.clearRetainingCapacity();
+    }
+}
+
+fn applyShadingOperator(
+    alloc: Allocator,
+    out: *std.ArrayList(ShadingRun),
+    state: *GraphicsState,
+    stack: *std.ArrayList(ImageStackEntry),
+    current_path: *std.ArrayList([2]f64),
+    current_path_closed: *bool,
+    current_clip_points: *std.ArrayList([2]f64),
+    current_clip_fill_rule: *FillRule,
+    shadings: []const PageShading,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
+    op: []const u8,
+    operands: []const syntax.Object,
+) anyerror!void {
+    if (isShapePaintOperator(op)) {
+        paint_order.* += 1;
+        // Shape painting consumes the current path in every extraction pass,
+        // including this shading-only pass.
+        current_path.clearRetainingCapacity();
+        current_path_closed.* = false;
+        return;
+    }
+    if (isTextShowOperator(op)) paint_order.* += 1;
+    if (std.mem.eql(u8, op, "Do") and
+        (operands.len == 0 or operands[operands.len - 1] != .name or findPageForm(forms, operands[operands.len - 1].name) == null))
+    {
+        paint_order.* += 1;
+    }
     if (std.mem.eql(u8, op, "q")) {
         const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
         errdefer alloc.free(clip_points);
@@ -11878,597 +15970,10 @@ fn applyImageOperator(
     }
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
-        const name = operands[operands.len - 1].name;
-        for (images) |image| {
-            if (!std.mem.eql(u8, image.name, name)) continue;
-            const rgba = if (image.shared_rgba) |shared| blk: {
-                shared.retain();
-                break :blk shared.bytes;
-            } else try alloc.dupe(u8, image.rgba);
-            errdefer if (image.shared_rgba) |shared| shared.release(alloc) else alloc.free(rgba);
-            const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
-            errdefer if (clip_points) |clip| alloc.free(clip);
-            try out.append(alloc, .{
-                .rgba = rgba,
-                .shared_rgba = image.shared_rgba,
-                .width = image.width,
-                .height = image.height,
-                .interpolate = image.interpolate,
-                .bilevel = image.bilevel,
-                .alpha = state.fill_alpha,
-                .paint_order = paint_order.*,
-                .blend_mode = state.blend_mode,
-                .group_id = state.group_id,
-                .group_parent_id = state.group_parent_id,
-                .group_isolated = state.group_isolated,
-                .group_knockout = state.group_knockout,
-                .clip_box = state.clip_box,
-                .clip_points = clip_points,
-                .clip_fill_rule = current_clip_fill_rule.*,
-                .a = state.matrix.a,
-                .b = state.matrix.b,
-                .c = state.matrix.c,
-                .d = state.matrix.d,
-                .e = state.matrix.e,
-                .f = state.matrix.f,
-                .x = state.matrix.e,
-                .y = state.matrix.f,
-                .draw_width = @abs(state.matrix.a),
-                .draw_height = @abs(state.matrix.d),
-            });
-            paint_order.* += 1;
-            return;
-        }
-        const form = findPageForm(forms, name) orelse return;
-        var nested_state = buildFormGraphicsState(state.*, form);
-        if (form.transparency_group) {
-            nested_state.group_parent_id = state.group_id;
-            nested_state.group_id = next_group_id.*;
-            nested_state.group_isolated = form.group_isolated;
-            nested_state.group_knockout = form.group_knockout;
-            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
-        }
-        try extractImageRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.images, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id, cancellation);
-    }
-}
-
-fn applyShapeOperator(
-    alloc: Allocator,
-    out: *std.ArrayList(ShapeRun),
-    state: *GraphicsState,
-    stack: *std.ArrayList(ShapeStackEntry),
-    current_path: *std.ArrayList([2]f64),
-    current_path_closed: *bool,
-    current_dash: *std.ArrayList(f64),
-    dash_phase: *f64,
-    current_clip_points: *std.ArrayList([2]f64),
-    current_clip_fill_rule: *@FieldType(ShapeRun, "fill_rule"),
-    gstates: []const PageExtGState,
-    forms: []const PageForm,
-    paint_order: *usize,
-    next_group_id: *u32,
-    cancellation: CancellationProbe,
-    op: []const u8,
-    operands: []const syntax.Object,
-) anyerror!void {
-    if (isTextShowOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
-    if (std.mem.eql(u8, op, "Do") and
-        (operands.len == 0 or operands[operands.len - 1] != .name or findPageForm(forms, operands[operands.len - 1].name) == null))
-    {
-        paint_order.* += 1;
-    }
-    if (std.mem.eql(u8, op, "q")) {
-        const dash_array = try alloc.dupe(f64, current_dash.items);
-        errdefer alloc.free(dash_array);
-        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
-        errdefer alloc.free(clip_points);
-        try stack.append(alloc, .{
-            .state = state.*,
-            .dash_phase = dash_phase.*,
-            .dash_array = dash_array,
-            .clip_points = clip_points,
-            .clip_fill_rule = current_clip_fill_rule.*,
-        });
-        return;
-    }
-    if (std.mem.eql(u8, op, "Q")) {
-        if (stack.items.len > 0) {
-            var entry = stack.pop().?;
-            defer entry.deinit(alloc);
-            state.* = entry.state;
-            dash_phase.* = entry.dash_phase;
-            current_dash.clearRetainingCapacity();
-            try current_dash.appendSlice(alloc, entry.dash_array);
-            current_clip_points.clearRetainingCapacity();
-            try current_clip_points.appendSlice(alloc, entry.clip_points);
-            current_clip_fill_rule.* = entry.clip_fill_rule;
-        }
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "cm")) {
-        if (operands.len >= 6) {
-            const m = GraphicsMatrix{
-                .a = numericObjectValue(&operands[operands.len - 6]) orelse 1,
-                .b = numericObjectValue(&operands[operands.len - 5]) orelse 0,
-                .c = numericObjectValue(&operands[operands.len - 4]) orelse 0,
-                .d = numericObjectValue(&operands[operands.len - 3]) orelse 1,
-                .e = numericObjectValue(&operands[operands.len - 2]) orelse 0,
-                .f = numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            };
-            state.matrix = multiplyGraphicsMatrix(m, state.matrix);
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "Do")) {
-        if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
         var nested_state = buildFormGraphicsState(state.*, form);
-        if (form.transparency_group) {
-            nested_state.group_parent_id = state.group_id;
-            nested_state.group_id = next_group_id.*;
-            nested_state.group_isolated = form.group_isolated;
-            nested_state.group_knockout = form.group_knockout;
-            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
-        }
-        try extractShapeRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
-        return;
-    }
-    if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
-        state.fill_color_space = "DeviceRGB";
-        state.fill_pattern_name = null;
-        state.fill_color = rgbColor(
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        return;
-    }
-    if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
-        state.stroke_color_space = "DeviceRGB";
-        state.stroke_pattern_name = null;
-        state.stroke_color = rgbColor(
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        return;
-    }
-    if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
-        state.fill_color_space = "DeviceGray";
-        state.fill_pattern_name = null;
-        state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
-        return;
-    }
-    if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
-        state.stroke_color_space = "DeviceGray";
-        state.stroke_pattern_name = null;
-        state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
-        return;
-    }
-    if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
-        state.fill_color_space = "DeviceCMYK";
-        state.fill_pattern_name = null;
-        state.fill_color = cmykColor(
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        return;
-    }
-    if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
-        state.stroke_color_space = "DeviceCMYK";
-        state.stroke_pattern_name = null;
-        state.stroke_color = cmykColor(
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        return;
-    }
-    if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        state.fill_color_space = operands[operands.len - 1].name;
-        if (!std.mem.eql(u8, state.fill_color_space, "Pattern")) state.fill_pattern_name = null;
-        return;
-    }
-    if (std.mem.eql(u8, op, "CS") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        state.stroke_color_space = operands[operands.len - 1].name;
-        if (!std.mem.eql(u8, state.stroke_color_space, "Pattern")) state.stroke_pattern_name = null;
-        return;
-    }
-    if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
-        if (std.mem.eql(u8, state.fill_color_space, "Pattern")) {
-            if (operands[operands.len - 1] == .name) {
-                state.fill_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
-            }
-        } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
-            state.fill_pattern_name = null;
-            state.fill_color = color;
-        }
-        return;
-    }
-    if ((std.mem.eql(u8, op, "SC") or std.mem.eql(u8, op, "SCN")) and operands.len >= 1) {
-        if (std.mem.eql(u8, state.stroke_color_space, "Pattern")) {
-            if (operands[operands.len - 1] == .name) {
-                state.stroke_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
-            }
-        } else if (try decodeShapeColorOperands(state.stroke_color_space, operands)) |color| {
-            state.stroke_pattern_name = null;
-            state.stroke_color = color;
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "w") and operands.len >= 1) {
-        state.stroke_width = @max(0.1, numericObjectValue(&operands[operands.len - 1]) orelse state.stroke_width);
-        return;
-    }
-    if (std.mem.eql(u8, op, "J") and operands.len >= 1) {
-        const cap = operands[operands.len - 1].asInteger() orelse return;
-        state.line_cap = switch (cap) {
-            0 => .butt,
-            1 => .round,
-            2 => .square,
-            else => state.line_cap,
-        };
-        return;
-    }
-    if (std.mem.eql(u8, op, "j") and operands.len >= 1) {
-        const join = operands[operands.len - 1].asInteger() orelse return;
-        state.line_join = switch (join) {
-            0 => .miter,
-            1 => .round,
-            2 => .bevel,
-            else => state.line_join,
-        };
-        return;
-    }
-    if (std.mem.eql(u8, op, "M") and operands.len >= 1) {
-        state.miter_limit = @max(1.0, numericObjectValue(&operands[operands.len - 1]) orelse state.miter_limit);
-        return;
-    }
-    if (std.mem.eql(u8, op, "d") and operands.len >= 2) {
-        const dash_array_obj = &operands[operands.len - 2];
-        const phase = numericObjectValue(&operands[operands.len - 1]) orelse 0;
-        if (dash_array_obj.* != .array) return;
-        current_dash.clearRetainingCapacity();
-        for (dash_array_obj.array) |item| {
-            const value = numericObjectValue(&item) orelse continue;
-            if (value > 0) try current_dash.append(alloc, value);
-        }
-        dash_phase.* = phase;
-        return;
-    }
-    if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        try current_path.append(alloc, applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        ));
-        return;
-    }
-    if (std.mem.eql(u8, op, "l") and operands.len >= 2) {
-        try current_path.append(alloc, applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        ));
-        return;
-    }
-    if (std.mem.eql(u8, op, "c") and operands.len >= 6 and current_path.items.len > 0) {
-        const start = current_path.items[current_path.items.len - 1];
-        const c1 = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 6]) orelse 0,
-            numericObjectValue(&operands[operands.len - 5]) orelse 0,
-        );
-        const c2 = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-        );
-        const end = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
-        return;
-    }
-    if (std.mem.eql(u8, op, "v") and operands.len >= 4 and current_path.items.len > 0) {
-        const start = current_path.items[current_path.items.len - 1];
-        const c1 = start;
-        const c2 = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-        );
-        const end = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
-        return;
-    }
-    if (std.mem.eql(u8, op, "y") and operands.len >= 4 and current_path.items.len > 0) {
-        const start = current_path.items[current_path.items.len - 1];
-        const c1 = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-        );
-        const end = applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-        const c2 = end;
-        try appendFlattenedCubicBezier(alloc, current_path, start, c1, c2, end);
-        return;
-    }
-    if (std.mem.eql(u8, op, "h")) {
-        current_path_closed.* = true;
-        return;
-    }
-    if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = true;
-        const x = numericObjectValue(&operands[operands.len - 4]) orelse 0;
-        const y = numericObjectValue(&operands[operands.len - 3]) orelse 0;
-        const w = numericObjectValue(&operands[operands.len - 2]) orelse 0;
-        const h = numericObjectValue(&operands[operands.len - 1]) orelse 0;
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y + h));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y + h));
-        return;
-    }
-    if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
-        if (current_path.items.len >= 2) {
-            const next_clip = pathBounds(current_path.items);
-            state.clip_box = if (state.clip_box) |current_clip|
-                intersectPageBoxes(current_clip, next_clip)
-            else
-                next_clip;
-            if (current_clip_points.items.len == 0) {
-                try current_clip_points.appendSlice(alloc, current_path.items);
-                current_clip_fill_rule.* = if (std.mem.eql(u8, op, "W*")) .even_odd else .nonzero;
-            } else {
-                if (try tryIntersectRectClipPoints(alloc, current_clip_points.items, current_path.items)) |intersection| {
-                    defer alloc.free(intersection);
-                    current_clip_points.clearRetainingCapacity();
-                    try current_clip_points.appendSlice(alloc, intersection);
-                    current_clip_fill_rule.* = .nonzero;
-                } else {
-                    current_clip_points.clearRetainingCapacity();
-                }
-            }
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "f") or std.mem.eql(u8, op, "F") or std.mem.eql(u8, op, "f*")) {
-        if (current_path.items.len >= 3) {
-            const order = paint_order.*;
-            try emitPolygonShapeRun(
-                alloc,
-                out,
-                order,
-                state.*,
-                current_path.items,
-                .fill,
-                true,
-                if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero,
-                current_dash.items,
-                dash_phase.*,
-                current_clip_points.items,
-                current_clip_fill_rule.*,
-            );
-            paint_order.* += 1;
-        }
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "S") or std.mem.eql(u8, op, "s")) {
-        if (std.mem.eql(u8, op, "s")) current_path_closed.* = true;
-        if (current_path.items.len >= 2) {
-            const order = paint_order.*;
-            try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
-            paint_order.* += 1;
-        }
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "B") or std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*")) {
-        const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
-        if (current_path.items.len >= 3) {
-            const order = paint_order.*;
-            try emitPolygonShapeRun(
-                alloc,
-                out,
-                order,
-                state.*,
-                current_path.items,
-                .fill,
-                true,
-                if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero,
-                current_dash.items,
-                dash_phase.*,
-                current_clip_points.items,
-                current_clip_fill_rule.*,
-            );
-            try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
-            paint_order.* += 1;
-        }
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "n")) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-    }
-}
-
-fn applyShadingOperator(
-    alloc: Allocator,
-    out: *std.ArrayList(ShadingRun),
-    state: *GraphicsState,
-    stack: *std.ArrayList(ImageStackEntry),
-    current_path: *std.ArrayList([2]f64),
-    current_path_closed: *bool,
-    current_clip_points: *std.ArrayList([2]f64),
-    current_clip_fill_rule: *FillRule,
-    shadings: []const PageShading,
-    gstates: []const PageExtGState,
-    forms: []const PageForm,
-    paint_order: *usize,
-    next_group_id: *u32,
-    cancellation: CancellationProbe,
-    op: []const u8,
-    operands: []const syntax.Object,
-) anyerror!void {
-    if (isTextShowOperator(op) or isShapePaintOperator(op)) paint_order.* += 1;
-    if (std.mem.eql(u8, op, "Do") and
-        (operands.len == 0 or operands[operands.len - 1] != .name or findPageForm(forms, operands[operands.len - 1].name) == null))
-    {
-        paint_order.* += 1;
-    }
-    if (std.mem.eql(u8, op, "q")) {
-        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
-        errdefer alloc.free(clip_points);
-        try stack.append(alloc, .{
-            .state = state.*,
-            .clip_points = clip_points,
-            .clip_fill_rule = current_clip_fill_rule.*,
-        });
-        return;
-    }
-    if (std.mem.eql(u8, op, "Q")) {
-        if (stack.items.len > 0) {
-            var entry = stack.pop().?;
-            defer entry.deinit(alloc);
-            state.* = entry.state;
-            current_clip_points.clearRetainingCapacity();
-            try current_clip_points.appendSlice(alloc, entry.clip_points);
-            current_clip_fill_rule.* = entry.clip_fill_rule;
-        }
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "cm")) {
-        if (operands.len >= 6) {
-            const m = GraphicsMatrix{
-                .a = numericObjectValue(&operands[operands.len - 6]) orelse 1,
-                .b = numericObjectValue(&operands[operands.len - 5]) orelse 0,
-                .c = numericObjectValue(&operands[operands.len - 4]) orelse 0,
-                .d = numericObjectValue(&operands[operands.len - 3]) orelse 1,
-                .e = numericObjectValue(&operands[operands.len - 2]) orelse 0,
-                .f = numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            };
-            state.matrix = multiplyGraphicsMatrix(m, state.matrix);
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        try current_path.append(alloc, applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        ));
-        return;
-    }
-    if (std.mem.eql(u8, op, "l") and operands.len >= 2) {
-        try current_path.append(alloc, applyMatrixToPoint(
-            state.matrix,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        ));
-        return;
-    }
-    if (std.mem.eql(u8, op, "h")) {
-        current_path_closed.* = true;
-        return;
-    }
-    if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = true;
-        const x = numericObjectValue(&operands[operands.len - 4]) orelse 0;
-        const y = numericObjectValue(&operands[operands.len - 3]) orelse 0;
-        const w = numericObjectValue(&operands[operands.len - 2]) orelse 0;
-        const h = numericObjectValue(&operands[operands.len - 1]) orelse 0;
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x + w, y + h));
-        try current_path.append(alloc, applyMatrixToPoint(state.matrix, x, y + h));
-        return;
-    }
-    if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
-        if (current_path.items.len >= 2) {
-            const next_clip = pathBounds(current_path.items);
-            state.clip_box = if (state.clip_box) |current_clip|
-                intersectPageBoxes(current_clip, next_clip)
-            else
-                next_clip;
-            if (current_clip_points.items.len == 0) {
-                try current_clip_points.appendSlice(alloc, current_path.items);
-                current_clip_fill_rule.* = if (std.mem.eql(u8, op, "W*")) .even_odd else .nonzero;
-            } else {
-                if (try tryIntersectRectClipPoints(alloc, current_clip_points.items, current_path.items)) |intersection| {
-                    defer alloc.free(intersection);
-                    current_clip_points.clearRetainingCapacity();
-                    try current_clip_points.appendSlice(alloc, intersection);
-                    current_clip_fill_rule.* = .nonzero;
-                } else {
-                    current_clip_points.clearRetainingCapacity();
-                }
-            }
-        }
-        return;
-    }
-    if (std.mem.eql(u8, op, "n")) {
-        current_path.clearRetainingCapacity();
-        current_path_closed.* = false;
-        return;
-    }
-    if (std.mem.eql(u8, op, "Do")) {
-        if (operands.len == 0 or operands[operands.len - 1] != .name) return;
-        const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
-        var nested_state = buildFormGraphicsState(state.*, form);
-        if (form.transparency_group) {
-            nested_state.group_parent_id = state.group_id;
-            nested_state.group_id = next_group_id.*;
-            nested_state.group_isolated = form.group_isolated;
-            nested_state.group_knockout = form.group_knockout;
-            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
-        }
+        if (form.transparency_group)
+            try enterGraphicsTransparencyGroup(state.*, &nested_state, form, next_group_id);
         try extractShadingRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.shadings, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id, cancellation);
         return;
     }
@@ -12488,6 +15993,8 @@ fn applyShadingOperator(
                 .group_parent_id = state.group_parent_id,
                 .group_isolated = state.group_isolated,
                 .group_knockout = state.group_knockout,
+                .group_alpha = state.group_alpha,
+                .group_blend_mode = state.group_blend_mode,
                 .clip_box = state.clip_box,
                 .clip_points = clip_points,
                 .clip_fill_rule = current_clip_fill_rule.*,
@@ -12499,6 +16006,12 @@ fn applyShadingOperator(
                 .r1 = shading.r1 * graphicsStrokeScale(state.matrix),
                 .c0 = colorWithAlpha(shading.c0, state.fill_alpha),
                 .c1 = colorWithAlpha(shading.c1, state.fill_alpha),
+                .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
+                .color_sample_positions = shading.color_sample_positions,
+                .color_sample_count = shading.color_sample_count,
+                .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, state.fill_alpha),
+                .exact_boundary_positions = shading.exact_boundary_positions,
+                .exact_boundary_count = shading.exact_boundary_count,
                 .extend_start = shading.extend_start,
                 .extend_end = shading.extend_end,
             });
@@ -12519,6 +16032,7 @@ fn applyPatternOperator(
     dash_phase: *f64,
     current_clip_points: *std.ArrayList([2]f64),
     current_clip_fill_rule: *@FieldType(ShapeRun, "fill_rule"),
+    images: []const PageImage,
     patterns: []const PagePattern,
     gstates: []const PageExtGState,
     forms: []const PageForm,
@@ -12528,6 +16042,7 @@ fn applyPatternOperator(
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
+    if (isTextShowOperator(op) or isShapePaintOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
     if (std.mem.eql(u8, op, "q")) {
         const dash_array = try alloc.dupe(f64, current_dash.items);
         errdefer alloc.free(dash_array);
@@ -12582,72 +16097,99 @@ fn applyPatternOperator(
     }
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
-        const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
-        var nested_state = buildFormGraphicsState(state.*, form);
-        if (form.transparency_group) {
-            nested_state.group_parent_id = state.group_id;
-            nested_state.group_id = next_group_id.*;
-            nested_state.group_isolated = form.group_isolated;
-            nested_state.group_knockout = form.group_knockout;
-            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
+        const name = operands[operands.len - 1].name;
+        for (images) |image| {
+            if (!std.mem.eql(u8, image.name, name)) continue;
+            defer paint_order.* += 1;
+            if (!image.image_mask) return;
+            if (state.fill_color_space.kind == .unsupported) return error.UnsupportedPdfRendering;
+            if (state.fill_color_space.kind != .pattern) return;
+            const pattern_name = state.fill_pattern_name orelse return;
+            const pattern = findPagePattern(patterns, pattern_name) orelse return error.UnsupportedPdfRendering;
+            try appendOwnedValue(PatternRun, alloc, out, try buildPatternStencilRunAlloc(
+                alloc,
+                pattern,
+                image,
+                state.*,
+                current_clip_points.items,
+                current_clip_fill_rule.*,
+                paint_order.*,
+            ));
+            return;
         }
-        try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.patterns, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
+        const form = findPageForm(forms, name) orelse return;
+        var nested_state = buildFormGraphicsState(state.*, form);
+        if (form.transparency_group)
+            try enterGraphicsTransparencyGroup(state.*, &nested_state, form, next_group_id);
+        try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.images, form.patterns, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
-        state.fill_color_space = "DeviceRGB";
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
-        state.stroke_color_space = "DeviceRGB";
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
-        state.fill_color_space = "DeviceGray";
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
-        state.stroke_color_space = "DeviceGray";
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
-        state.fill_color_space = "DeviceCMYK";
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
-        state.stroke_color_space = "DeviceCMYK";
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        state.fill_color_space = operands[operands.len - 1].name;
-        if (!std.mem.eql(u8, state.fill_color_space, "Pattern")) state.fill_pattern_name = null;
+        selectFillColorSpace(state, operands[operands.len - 1].name);
         return;
     }
     if (std.mem.eql(u8, op, "CS") and operands.len >= 1 and operands[operands.len - 1] == .name) {
-        state.stroke_color_space = operands[operands.len - 1].name;
-        if (!std.mem.eql(u8, state.stroke_color_space, "Pattern")) state.stroke_pattern_name = null;
+        selectStrokeColorSpace(state, operands[operands.len - 1].name);
         return;
     }
     if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
-        if (std.mem.eql(u8, state.fill_color_space, "Pattern") and operands[operands.len - 1] == .name) {
-            state.fill_pattern_name = operands[operands.len - 1].name;
-            if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
-        } else if (!std.mem.eql(u8, state.fill_color_space, "Pattern")) {
+        if (state.fill_color_space.kind == .pattern and operands[operands.len - 1] == .name) {
+            state.fill_pattern_name = if (findPagePattern(patterns, operands[operands.len - 1].name)) |pattern| pattern.name else null;
+            if (try decodePatternBaseColorOperands(state.fill_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+        } else if (state.fill_color_space.kind != .pattern) {
             state.fill_pattern_name = null;
         }
         return;
     }
     if ((std.mem.eql(u8, op, "SC") or std.mem.eql(u8, op, "SCN")) and operands.len >= 1) {
-        if (std.mem.eql(u8, state.stroke_color_space, "Pattern") and operands[operands.len - 1] == .name) {
-            state.stroke_pattern_name = operands[operands.len - 1].name;
-            if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
-        } else if (!std.mem.eql(u8, state.stroke_color_space, "Pattern")) {
+        if (state.stroke_color_space.kind == .pattern and operands[operands.len - 1] == .name) {
+            state.stroke_pattern_name = if (findPagePattern(patterns, operands[operands.len - 1].name)) |pattern| pattern.name else null;
+            if (try decodePatternBaseColorOperands(state.stroke_color_space.pattern_base, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+        } else if (state.stroke_color_space.kind != .pattern) {
             state.stroke_pattern_name = null;
         }
         return;
@@ -12774,7 +16316,6 @@ fn applyPatternOperator(
                 } else if (pattern.kind == .shading) {
                     try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                 }
-                paint_order.* += 1;
             }
         }
         current_path.clearRetainingCapacity();
@@ -12790,8 +16331,11 @@ fn applyPatternOperator(
                     current_path_closed.* = false;
                     return;
                 };
-                try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
-                paint_order.* += 1;
+                if (pattern.kind == .tiling) {
+                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                } else if (pattern.kind == .shading) {
+                    try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                }
             }
         }
         current_path.clearRetainingCapacity();
@@ -12814,12 +16358,13 @@ fn applyPatternOperator(
         if (current_path.items.len >= 2) {
             if (state.stroke_pattern_name) |stroke_pattern_name| {
                 if (findPagePattern(patterns, stroke_pattern_name)) |pattern| {
-                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    if (pattern.kind == .tiling) {
+                        try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    } else if (pattern.kind == .shading) {
+                        try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    }
                 }
             }
-        }
-        if ((state.fill_pattern_name != null and current_path.items.len >= 3) or (state.stroke_pattern_name != null and current_path.items.len >= 2)) {
-            paint_order.* += 1;
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -12831,29 +16376,17 @@ fn applyPatternOperator(
     }
 }
 
-fn decodeShapeColorOperands(color_space: []const u8, operands: []const syntax.Object) !?[4]u8 {
-    if (std.mem.eql(u8, color_space, "DeviceGray")) {
-        if (operands.len < 1) return null;
-        return grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
-    }
-    if (std.mem.eql(u8, color_space, "DeviceRGB")) {
-        if (operands.len < 3) return null;
-        return rgbColor(
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-    }
-    if (std.mem.eql(u8, color_space, "DeviceCMYK")) {
-        if (operands.len < 4) return null;
-        return cmykColor(
-            numericObjectValue(&operands[operands.len - 4]) orelse 0,
-            numericObjectValue(&operands[operands.len - 3]) orelse 0,
-            numericObjectValue(&operands[operands.len - 2]) orelse 0,
-            numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
-    }
-    return null;
+fn decodeShapeColorOperands(color_space: ColorSpaceValue, operands: []const syntax.Object) !?[4]u8 {
+    const component_count = colorSpaceComponentCount(color_space.kind);
+    if (component_count == 0 or operands.len < component_count) return null;
+    var components = [4]f64{ 0, 0, 0, 0 };
+    const start = operands.len - component_count;
+    for (0..component_count) |index|
+        components[index] = numericObjectValue(&operands[start + index]) orelse 0;
+    return switch (color_space.kind) {
+        .device_gray, .device_rgb, .device_cmyk => renderColorSpaceComponents(color_space, components),
+        .pattern, .unsupported => null,
+    };
 }
 
 fn emitPatternShadingRun(
@@ -12893,12 +16426,25 @@ fn emitPatternShadingRun(
         .r1 = shading.r1 * scale,
         .c0 = colorWithAlpha(shading.c0, state.fill_alpha),
         .c1 = colorWithAlpha(shading.c1, state.fill_alpha),
+        .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
+        .color_sample_positions = shading.color_sample_positions,
+        .color_sample_count = shading.color_sample_count,
+        .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, state.fill_alpha),
+        .exact_boundary_positions = shading.exact_boundary_positions,
+        .exact_boundary_count = shading.exact_boundary_count,
         .extend_start = shading.extend_start,
         .extend_end = shading.extend_end,
     });
 }
 
-fn decodePatternBaseColorOperands(operands: []const syntax.Object) ?[4]u8 {
+fn decodePatternBaseColorOperands(base_color_space: ?ColorSpaceValue, operands: []const syntax.Object) !?[4]u8 {
+    if (base_color_space) |base| return switch (base.kind) {
+        .device_gray, .device_rgb, .device_cmyk => try decodeShapeColorOperands(base, operands),
+        .pattern, .unsupported => error.UnsupportedPdfRendering,
+    };
+    // Be liberal with older producers that put base components directly in
+    // the named Pattern space. Standards-compliant PaintType 2 streams carry
+    // an explicit underlying color space and take the exact path above.
     return switch (operands.len) {
         1 => grayColor(numericObjectValue(&operands[0]) orelse return null),
         3 => rgbColor(
@@ -12989,7 +16535,11 @@ fn appendTextRunDecodedString(
     else
         estimateDecodedAdvance(decoded, state.*);
     const vertical = if (state.current_font_index) |font_idx| fonts[font_idx].isVertical() else false;
-    if (state.render_mode != 3) switch (out) {
+    const render_mode = switch (out) {
+        .layout => state.render_mode,
+        .render => try effectiveTextRenderMode(state.*),
+    };
+    if (render_mode != 3) switch (out) {
         .layout => |layout_out| {
             const text = try alloc.dupe(u8, decoded);
             errdefer alloc.free(text);
@@ -13039,9 +16589,10 @@ fn appendTextRunDecodedString(
                 .b = basis_x[1],
                 .c = basis_y[0],
                 .d = basis_y[1],
+                .graphics_matrix = state.matrix,
                 .alpha = state.alpha,
                 .stroke_alpha = state.stroke_alpha,
-                .render_mode = state.render_mode,
+                .render_mode = render_mode,
                 .fill_color = state.fill_color,
                 .stroke_color = state.stroke_color,
                 .stroke_width = state.stroke_width,
@@ -13058,6 +16609,8 @@ fn appendTextRunDecodedString(
                 .group_parent_id = state.group_parent_id,
                 .group_isolated = state.group_isolated,
                 .group_knockout = state.group_knockout,
+                .group_alpha = state.group_alpha,
+                .group_blend_mode = state.group_blend_mode,
                 .fill_pattern_name = fill_pattern_name,
                 .stroke_pattern_name = stroke_pattern_name,
                 .clip_box = state.clip_box,
@@ -13158,6 +16711,23 @@ fn measureSimpleTrueTypePdfAdvance(raw: []const u8, pdf_widths: ?[]f64, missing_
     return advance;
 }
 
+fn measureSimpleTrueTypeAdvance(raw: []const u8, truetype: TrueTypeFont, state: TextRunState) !f64 {
+    const map = truetype.simple_code_to_gid orelse return estimateDecodedAdvance(raw, state);
+    const units_per_em = @max(truetype.units_per_em, 1);
+    var advance: f64 = 0;
+    for (raw) |code| {
+        const width = simpleTrueTypePdfWidth(truetype.pdf_widths, truetype.pdf_missing_width, code) orelse blk: {
+            const glyph_index = map[code];
+            if (glyph_index == missing_simple_truetype_gid) break :blk 600.0;
+            const native_width = truetype.font.advanceWidth(glyph_index) catch break :blk 600.0;
+            break :blk @as(f64, @floatFromInt(native_width)) * 1000.0 / @as(f64, @floatFromInt(units_per_em));
+        };
+        const spacing = state.char_spacing + if (code == ' ') state.word_spacing else 0.0;
+        advance += (width * state.font_size / 1000.0 + spacing) * state.horizontal_scale;
+    }
+    return advance;
+}
+
 fn measureFontAdvanceAlloc(
     alloc: Allocator,
     fonts: []const PageFont,
@@ -13213,9 +16783,7 @@ fn measureFontAdvanceAlloc(
             }
             return advance;
         }
-        if (truetype.raw_code_bytes == 0 and truetype.pdf_missing_width != null) {
-            return measureSimpleTrueTypePdfAdvance(raw, truetype.pdf_widths, truetype.pdf_missing_width.?, state);
-        }
+        if (truetype.raw_code_bytes == 0) return try measureSimpleTrueTypeAdvance(raw, truetype, state);
         return try measureSfntAdvanceAlloc(alloc, decoded, state, truetype.font, truetype.units_per_em);
     }
     if (font.cff_otf) |cff_otf| {
@@ -13544,8 +17112,40 @@ fn contentMayContainOperator(bytes: []const u8, operator: []const u8) bool {
     return false;
 }
 
+/// The native soft-mask fast path deliberately supports only a Form whose
+/// painting is one image. Graphics-state structure and matrix composition are
+/// harmless; any other painting operator requires a general transparency
+/// surface and must fail closed.
+fn contentIsSingleImageSoftMaskAlloc(alloc: Allocator, bytes: []const u8) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var image_count: usize = 0;
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse return false;
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return image_count == 1,
+            .keyword => |operator| {
+                if (std.mem.eql(u8, operator, "Do")) {
+                    image_count += 1;
+                    if (image_count > 1) return false;
+                } else if (!std.mem.eql(u8, operator, "q") and
+                    !std.mem.eql(u8, operator, "Q") and
+                    !std.mem.eql(u8, operator, "cm"))
+                {
+                    return false;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 const ReferencedResourceNames = struct {
     names: std.StringHashMapUnmanaged(void) = .empty,
+    uses_device_gray: bool = false,
+    uses_device_rgb: bool = false,
+    uses_device_cmyk: bool = false,
 
     fn deinit(self: *ReferencedResourceNames, alloc: Allocator) void {
         var iterator = self.names.iterator();
@@ -13556,6 +17156,13 @@ const ReferencedResourceNames = struct {
 
     fn contains(self: *const ReferencedResourceNames, name: []const u8) bool {
         return self.names.contains(name);
+    }
+
+    fn add(self: *ReferencedResourceNames, alloc: Allocator, name: []const u8) !void {
+        if (self.names.contains(name)) return;
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try self.names.put(alloc, owned, {});
     }
 };
 
@@ -13589,6 +17196,17 @@ fn collectReferencedResourceNamesAlloc(
                 previous_name = try alloc.dupe(u8, name);
             },
             .keyword => |keyword| {
+                if (std.mem.eql(u8, keyword, "g") or std.mem.eql(u8, keyword, "G")) result.uses_device_gray = true;
+                if (std.mem.eql(u8, keyword, "rg") or std.mem.eql(u8, keyword, "RG")) result.uses_device_rgb = true;
+                if (std.mem.eql(u8, keyword, "k") or std.mem.eql(u8, keyword, "K")) result.uses_device_cmyk = true;
+                if ((std.mem.eql(u8, keyword, "cs") or std.mem.eql(u8, keyword, "CS")) and previous_name != null) {
+                    switch (colorSpaceKindFromName(previous_name.?)) {
+                        .device_gray => result.uses_device_gray = true,
+                        .device_rgb => result.uses_device_rgb = true,
+                        .device_cmyk => result.uses_device_cmyk = true,
+                        .pattern, .unsupported => {},
+                    }
+                }
                 if (previous_name) |name| {
                     for (operators) |operator| {
                         if (!std.mem.eql(u8, keyword, operator)) continue;
@@ -13608,6 +17226,47 @@ fn collectReferencedResourceNamesAlloc(
                 if (previous_name) |name| alloc.free(name);
                 previous_name = null;
             },
+        }
+    }
+}
+
+/// `Tf` takes a font name followed by a numeric size, so the generic
+/// immediate-name collector cannot identify it. Retain the last name in the
+/// current operator's operand list and clear it at every operator boundary.
+fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !ReferencedResourceNames {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var result = ReferencedResourceNames{};
+    errdefer result.deinit(alloc);
+    var operand_name: ?[]u8 = null;
+    defer if (operand_name) |name| alloc.free(name);
+
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            if (operand_name) |name| alloc.free(name);
+            operand_name = null;
+            continue;
+        };
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return result,
+            .name => |name| {
+                if (operand_name) |owned| alloc.free(owned);
+                operand_name = try alloc.dupe(u8, name);
+            },
+            .keyword => |operator| {
+                if (std.mem.eql(u8, operator, "Tf")) if (operand_name) |name| {
+                    if (result.names.contains(name)) {
+                        alloc.free(name);
+                    } else {
+                        try result.names.put(alloc, name, {});
+                    }
+                    operand_name = null;
+                };
+                if (operand_name) |name| alloc.free(name);
+                operand_name = null;
+            },
+            else => {},
         }
     }
 }
@@ -13669,6 +17328,20 @@ fn colorWithAlpha(color: [4]u8, alpha: u8) [4]u8 {
     };
 }
 
+fn shadingColorSamplesWithAlpha(shading: PageShading, alpha: u8) [shading_color_sample_capacity][4]u8 {
+    var samples = shading.color_samples;
+    for (samples[0..shading.color_sample_count]) |*color|
+        color.* = colorWithAlpha(color.*, alpha);
+    return samples;
+}
+
+fn shadingExactBoundaryColorsWithAlpha(shading: PageShading, alpha: u8) [shading_discontinuity_capacity][4]u8 {
+    var samples = shading.exact_boundary_colors;
+    for (samples[0..shading.exact_boundary_count]) |*color|
+        color.* = colorWithAlpha(color.*, alpha);
+    return samples;
+}
+
 fn findExtGState(gstates: []const PageExtGState, name: []const u8) ?PageExtGState {
     for (gstates) |gstate| {
         if (std.mem.eql(u8, gstate.name, name)) return gstate;
@@ -13693,11 +17366,40 @@ fn findPagePattern(patterns: []const PagePattern, name: []const u8) ?*const Page
 fn buildFormGraphicsState(state: GraphicsState, form: *const PageForm) GraphicsState {
     var next = state;
     next.matrix = multiplyGraphicsMatrix(form.matrix, state.matrix);
+    next.color_spaces = form.color_spaces;
     if (form.bbox) |bbox| {
         const transformed = transformPageBox(bbox, next.matrix);
         next.clip_box = if (next.clip_box) |current| intersectPageBoxes(current, transformed) else transformed;
     }
     return next;
+}
+
+fn enterGraphicsTransparencyGroup(parent: GraphicsState, nested: *GraphicsState, form: *const PageForm, next_group_id: *u32) !void {
+    nested.group_parent_id = parent.group_id;
+    nested.group_id = next_group_id.*;
+    nested.group_isolated = form.group_isolated;
+    nested.group_knockout = form.group_knockout;
+    nested.group_alpha = parent.fill_alpha;
+    nested.group_blend_mode = parent.blend_mode;
+    // The invocation transparency parameters composite the completed group;
+    // they are not an extra paint operation inside the group's content.
+    nested.fill_alpha = 0xff;
+    nested.stroke_alpha = 0xff;
+    nested.blend_mode = .normal;
+    next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
+}
+
+fn enterTextTransparencyGroup(parent: TextRunState, nested: *TextRunState, form: *const PageForm, next_group_id: *u32) !void {
+    nested.group_parent_id = parent.group_id;
+    nested.group_id = next_group_id.*;
+    nested.group_isolated = form.group_isolated;
+    nested.group_knockout = form.group_knockout;
+    nested.group_alpha = parent.alpha;
+    nested.group_blend_mode = parent.blend_mode;
+    nested.alpha = 0xff;
+    nested.stroke_alpha = 0xff;
+    nested.blend_mode = .normal;
+    next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
 }
 
 fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
@@ -13723,8 +17425,11 @@ fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
+        .group_alpha = state.group_alpha,
+        .group_blend_mode = state.group_blend_mode,
         .fill_color_space = state.fill_color_space,
         .stroke_color_space = state.stroke_color_space,
+        .color_spaces = form.color_spaces,
         .fill_pattern_name = state.fill_pattern_name,
         .stroke_pattern_name = state.stroke_pattern_name,
         .x = 0,
@@ -13742,7 +17447,7 @@ fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
     return next;
 }
 
-fn buildPatternTextState(state: GraphicsState) TextRunState {
+fn buildPatternTextState(state: GraphicsState, color_spaces: []const PageColorSpace) TextRunState {
     return .{
         .alpha = state.fill_alpha,
         .stroke_alpha = state.stroke_alpha,
@@ -13754,19 +17459,25 @@ fn buildPatternTextState(state: GraphicsState) TextRunState {
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
-        .fill_color_space = state.fill_color_space,
-        .stroke_color_space = state.stroke_color_space,
+        .group_alpha = state.group_alpha,
+        .group_blend_mode = state.group_blend_mode,
+        .fill_color_space = materializePatternCellColorSpace(state.fill_color_space),
+        .stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space),
+        .color_spaces = color_spaces,
         .fill_pattern_name = null,
         .stroke_pattern_name = null,
     };
 }
 
-fn buildPatternGraphicsState(state: GraphicsState) GraphicsState {
+fn buildPatternGraphicsState(state: GraphicsState, color_spaces: []const PageColorSpace) GraphicsState {
     var next = state;
     next.matrix = .{};
     next.group_isolated = state.group_isolated;
     next.group_knockout = state.group_knockout;
     next.group_parent_id = state.group_parent_id;
+    next.fill_color_space = materializePatternCellColorSpace(state.fill_color_space);
+    next.stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space);
+    next.color_spaces = color_spaces;
     next.fill_pattern_name = null;
     next.stroke_pattern_name = null;
     next.clip_box = null;
@@ -13777,109 +17488,66 @@ fn buildPatternRunFromShapeAlloc(
     alloc: Allocator,
     pattern: *const PagePattern,
     shape: ShapeRun,
+    text_run: TextRun,
 ) !PatternRun {
-    if (pattern.kind == .shading) {
-        const shading = pattern.shading orelse return error.UnsupportedPdfRendering;
-        const owned_dash = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null;
-        errdefer if (owned_dash) |dash| alloc.free(dash);
-        const owned_clip = if (shape.clip_points) |clip| try alloc.dupe([2]f64, clip) else null;
-        errdefer if (owned_clip) |clip| alloc.free(clip);
-        const owned_points = try alloc.dupe([2]f64, shape.points);
-        errdefer alloc.free(owned_points);
-        const owned_subpath_starts = if (shape.subpath_starts) |starts| try alloc.dupe(usize, starts) else null;
-        errdefer if (owned_subpath_starts) |starts| alloc.free(starts);
-        return .{
-            .kind = switch (shape.kind) {
-                .fill => .fill,
-                .stroke => .stroke,
-            },
-            .mode = .shading,
-            .paint_order = shape.paint_order,
-            .paint_phase = shape.paint_phase,
-            .blend_mode = shape.blend_mode,
-            .group_id = shape.group_id,
-            .group_parent_id = shape.group_parent_id,
-            .group_isolated = shape.group_isolated,
-            .group_knockout = shape.group_knockout,
-            .fill_rule = shape.fill_rule,
-            .line_cap = shape.line_cap,
-            .line_join = shape.line_join,
-            .miter_limit = shape.miter_limit,
-            .dash_array = owned_dash,
-            .dash_phase = shape.dash_phase,
-            .stroke_width = shape.stroke_width,
-            .closed = shape.closed,
-            .clip_box = shape.clip_box,
-            .clip_points = owned_clip,
-            .clip_fill_rule = shape.clip_fill_rule,
-            .points = owned_points,
-            .subpath_starts = owned_subpath_starts,
-            .pattern_matrix = pattern.matrix,
-            .pattern_bbox = pattern.bbox,
-            .pattern_x_step = pattern.x_step,
-            .pattern_y_step = pattern.y_step,
-            .base_color = null,
-            .shading = .{
-                .kind = shading.kind,
-                .paint_order = shape.paint_order,
-                .blend_mode = shape.blend_mode,
-                .group_id = shape.group_id,
-                .group_parent_id = shape.group_parent_id,
-                .group_isolated = shape.group_isolated,
-                .group_knockout = shape.group_knockout,
-                .clip_box = null,
-                .clip_points = null,
-                .clip_fill_rule = shape.fill_rule,
-                .x0 = shading.x0,
-                .y0 = shading.y0,
-                .r0 = shading.r0,
-                .x1 = shading.x1,
-                .y1 = shading.y1,
-                .r1 = shading.r1,
-                .c0 = shading.c0,
-                .c1 = shading.c1,
-                .extend_start = shading.extend_start,
-                .extend_end = shading.extend_end,
-            },
-        };
-    }
-
+    const selected_color = if (shape.kind == .fill) text_run.fill_color else text_run.stroke_color;
+    const selected_alpha = if (shape.kind == .fill) text_run.alpha else text_run.stroke_alpha;
+    const effective_alpha = colorWithAlpha(selected_color, selected_alpha)[3];
+    const opaque_color = [4]u8{ selected_color[0], selected_color[1], selected_color[2], 0xff };
     const state = GraphicsState{
-        .fill_color = shape.color,
-        .stroke_color = shape.color,
-        .fill_alpha = shape.color[3],
-        .stroke_alpha = shape.color[3],
+        .matrix = text_run.graphics_matrix,
+        .fill_color = opaque_color,
+        .stroke_color = opaque_color,
+        .fill_alpha = effective_alpha,
+        .stroke_alpha = effective_alpha,
         .blend_mode = shape.blend_mode,
         .group_id = shape.group_id,
         .group_parent_id = shape.group_parent_id,
         .group_isolated = shape.group_isolated,
         .group_knockout = shape.group_knockout,
+        .group_alpha = shape.group_alpha,
+        .group_blend_mode = shape.group_blend_mode,
         .line_cap = shape.line_cap,
         .line_join = shape.line_join,
         .miter_limit = shape.miter_limit,
-        .stroke_width = shape.stroke_width,
+        .stroke_width = text_run.stroke_width,
         .clip_box = shape.clip_box,
     };
-    var run = try buildPatternRunAlloc(
-        alloc,
-        pattern,
-        state,
-        shape.points,
-        switch (shape.kind) {
-            .fill => .fill,
-            .stroke => .stroke,
-        },
-        shape.closed,
-        shape.fill_rule,
-        if (shape.dash_array) |dash| dash else &.{},
-        shape.dash_phase,
-        if (shape.clip_points) |clip| clip else &.{},
-        shape.clip_fill_rule,
-        shape.paint_order,
-    );
+    const kind: @FieldType(PatternRun, "kind") = if (shape.kind == .fill) .fill else .stroke;
+    var run = if (pattern.kind == .tiling)
+        try buildPatternRunAlloc(
+            alloc,
+            pattern,
+            state,
+            shape.points,
+            kind,
+            shape.closed,
+            shape.fill_rule,
+            if (shape.dash_array) |dash| dash else &.{},
+            shape.dash_phase,
+            if (shape.clip_points) |clip| clip else &.{},
+            shape.clip_fill_rule,
+            shape.paint_order,
+        )
+    else
+        try buildShadingPatternRunAlloc(
+            alloc,
+            pattern,
+            state,
+            shape.points,
+            kind,
+            shape.closed,
+            shape.fill_rule,
+            if (shape.dash_array) |dash| dash else &.{},
+            shape.dash_phase,
+            if (shape.clip_points) |clip| clip else &.{},
+            shape.clip_fill_rule,
+            shape.paint_order,
+        );
     errdefer run.deinit(alloc);
     run.paint_phase = shape.paint_phase;
     if (shape.subpath_starts) |starts| run.subpath_starts = try alloc.dupe(usize, starts);
+    if (shape.subpath_closed) |closed| run.subpath_closed = try alloc.dupe(bool, closed);
     return run;
 }
 
@@ -13903,7 +17571,7 @@ fn buildPatternRunAlloc(
     var tile_text_list = std.ArrayList(TextRun).empty;
     defer tile_text_list.deinit(alloc);
     errdefer for (tile_text_list.items) |*run| run.deinit(alloc);
-    const text_state = buildPatternTextState(state);
+    const text_state = buildPatternTextState(state, pattern.color_spaces);
     var text_parser = try PositionedTextParser.init(alloc, .{ .render = &tile_text_list }, text_state, &.{}, .nonzero);
     defer text_parser.deinit();
     text_parser.paint_order = tile_paint_order;
@@ -13922,7 +17590,7 @@ fn buildPatternRunAlloc(
     var tile_image_list = std.ArrayList(ImageRun).empty;
     defer tile_image_list.deinit(alloc);
     errdefer for (tile_image_list.items) |*run| run.deinit(alloc);
-    const image_state = buildPatternGraphicsState(state);
+    const image_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractImageRunsFromContentAppendWithState(alloc, &tile_image_list, pattern.content, pattern.images, pattern.gstates, pattern.forms, image_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
@@ -13930,20 +17598,20 @@ fn buildPatternRunAlloc(
     var tile_shading_list = std.ArrayList(ShadingRun).empty;
     defer tile_shading_list.deinit(alloc);
     errdefer for (tile_shading_list.items) |*run| run.deinit(alloc);
-    const shading_state = buildPatternGraphicsState(state);
+    const shading_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractShadingRunsFromContentAppendWithState(alloc, &tile_shading_list, pattern.content, pattern.shadings, pattern.gstates, pattern.forms, shading_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
     tile_group_id = 1;
-    const pattern_state = buildPatternGraphicsState(state);
-    try extractPatternRunsFromContentAppendWithState(alloc, &tile_pattern_list, pattern.content, pattern.patterns, pattern.gstates, pattern.forms, pattern_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
+    const pattern_state = buildPatternGraphicsState(state, pattern.color_spaces);
+    try extractPatternRunsFromContentAppendWithState(alloc, &tile_pattern_list, pattern.content, pattern.images, pattern.patterns, pattern.gstates, pattern.forms, pattern_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
     tile_group_id = 1;
     var tile_shape_list = std.ArrayList(ShapeRun).empty;
     defer tile_shape_list.deinit(alloc);
     errdefer for (tile_shape_list.items) |*run| run.deinit(alloc);
-    const shape_state = buildPatternGraphicsState(state);
+    const shape_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractShapeRunsFromContentAppendWithState(alloc, &tile_shape_list, pattern.content, pattern.gstates, pattern.forms, shape_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
 
     const owned_dash = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null;
@@ -13988,6 +17656,8 @@ fn buildPatternRunAlloc(
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
+        .group_alpha = state.group_alpha,
+        .group_blend_mode = state.group_blend_mode,
         .fill_rule = fill_rule,
         .line_cap = state.line_cap,
         .line_join = state.line_join,
@@ -14007,15 +17677,87 @@ fn buildPatternRunAlloc(
         .base_color = if (pattern.colored)
             null
         else if (kind == .fill)
-            colorWithAlpha(state.fill_color, state.fill_alpha)
+            // Tile paint already carries the graphics-state alpha. The base
+            // color only recolors an uncolored pattern, so it must be opaque.
+            .{ state.fill_color[0], state.fill_color[1], state.fill_color[2], 0xff }
         else
-            colorWithAlpha(state.stroke_color, state.stroke_alpha),
+            .{ state.stroke_color[0], state.stroke_color[1], state.stroke_color[2], 0xff },
         .tile_text_runs = tile_text_runs,
         .tile_image_runs = tile_image_runs,
         .tile_shading_runs = tile_shading_runs,
         .tile_pattern_runs = tile_pattern_runs,
         .tile_shape_runs = tile_shape_runs,
     };
+}
+
+fn buildPatternStencilRunAlloc(
+    alloc: Allocator,
+    pattern: *const PagePattern,
+    image: PageImage,
+    state: GraphicsState,
+    clip_points: []const [2]f64,
+    clip_fill_rule: FillRule,
+    paint_order: usize,
+) !PatternRun {
+    var run = if (pattern.kind == .tiling)
+        try buildPatternRunAlloc(
+            alloc,
+            pattern,
+            state,
+            &.{},
+            .fill,
+            true,
+            .nonzero,
+            &.{},
+            0,
+            clip_points,
+            clip_fill_rule,
+            paint_order,
+        )
+    else
+        try buildShadingPatternRunAlloc(
+            alloc,
+            pattern,
+            state,
+            &.{},
+            .fill,
+            true,
+            .nonzero,
+            &.{},
+            0,
+            clip_points,
+            clip_fill_rule,
+            paint_order,
+        );
+    errdefer run.deinit(alloc);
+
+    const rgba = if (image.shared_rgba) |shared| blk: {
+        shared.retain();
+        break :blk shared.bytes;
+    } else try alloc.dupe(u8, image.rgba);
+    errdefer if (image.shared_rgba) |shared| shared.release(alloc) else alloc.free(rgba);
+    run.stencil_mask = .{
+        .rgba = rgba,
+        .shared_rgba = image.shared_rgba,
+        .width = image.width,
+        .height = image.height,
+        .interpolate = image.interpolate,
+        .bilevel = image.bilevel,
+        .alpha = 0xff,
+        .paint_order = paint_order,
+        .blend_mode = .normal,
+        .a = state.matrix.a,
+        .b = state.matrix.b,
+        .c = state.matrix.c,
+        .d = state.matrix.d,
+        .e = state.matrix.e,
+        .f = state.matrix.f,
+        .x = state.matrix.e,
+        .y = state.matrix.f,
+        .draw_width = @abs(state.matrix.a),
+        .draw_height = @abs(state.matrix.d),
+    };
+    return run;
 }
 
 fn buildShadingPatternRunAlloc(
@@ -14033,6 +17775,7 @@ fn buildShadingPatternRunAlloc(
     paint_order: usize,
 ) !PatternRun {
     const shading = pattern.shading orelse return error.UnsupportedPdfRendering;
+    const paint_alpha = if (kind == .fill) state.fill_alpha else state.stroke_alpha;
     const shading_matrix = multiplyGraphicsMatrix(pattern.matrix, state.matrix);
     const p0 = applyMatrixToPoint(shading_matrix, shading.x0, shading.y0);
     const p1 = applyMatrixToPoint(shading_matrix, shading.x1, shading.y1);
@@ -14051,6 +17794,8 @@ fn buildShadingPatternRunAlloc(
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
+        .group_alpha = state.group_alpha,
+        .group_blend_mode = state.group_blend_mode,
         .fill_rule = fill_rule,
         .line_cap = state.line_cap,
         .line_join = state.line_join,
@@ -14075,6 +17820,8 @@ fn buildShadingPatternRunAlloc(
             .group_parent_id = state.group_parent_id,
             .group_isolated = state.group_isolated,
             .group_knockout = state.group_knockout,
+            .group_alpha = state.group_alpha,
+            .group_blend_mode = state.group_blend_mode,
             .clip_box = null,
             .clip_points = null,
             .clip_fill_rule = fill_rule,
@@ -14084,8 +17831,14 @@ fn buildShadingPatternRunAlloc(
             .x1 = p1[0],
             .y1 = p1[1],
             .r1 = shading.r1 * graphicsStrokeScale(shading_matrix),
-            .c0 = colorWithAlpha(shading.c0, state.fill_alpha),
-            .c1 = colorWithAlpha(shading.c1, state.fill_alpha),
+            .c0 = colorWithAlpha(shading.c0, paint_alpha),
+            .c1 = colorWithAlpha(shading.c1, paint_alpha),
+            .color_samples = shadingColorSamplesWithAlpha(shading, paint_alpha),
+            .color_sample_positions = shading.color_sample_positions,
+            .color_sample_count = shading.color_sample_count,
+            .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, paint_alpha),
+            .exact_boundary_positions = shading.exact_boundary_positions,
+            .exact_boundary_count = shading.exact_boundary_count,
             .extend_start = shading.extend_start,
             .extend_end = shading.extend_end,
         },
@@ -14239,6 +17992,8 @@ fn emitPolygonShapeRun(
     paint_order: usize,
     state: GraphicsState,
     points: []const [2]f64,
+    subpath_starts: []const usize,
+    subpath_closed: []const bool,
     kind: @FieldType(ShapeRun, "kind"),
     closed: bool,
     fill_rule: FillRule,
@@ -14253,6 +18008,10 @@ fn emitPolygonShapeRun(
     errdefer if (owned_clip) |clip| alloc.free(clip);
     const owned_points = try alloc.dupe([2]f64, points);
     errdefer alloc.free(owned_points);
+    const owned_subpath_starts = if (subpath_starts.len > 1) try alloc.dupe(usize, subpath_starts) else null;
+    errdefer if (owned_subpath_starts) |starts| alloc.free(starts);
+    const owned_subpath_closed = if (subpath_starts.len > 1) try alloc.dupe(bool, subpath_closed) else null;
+    errdefer if (owned_subpath_closed) |values| alloc.free(values);
     try out.append(alloc, .{
         .paint_order = paint_order,
         .blend_mode = state.blend_mode,
@@ -14261,6 +18020,8 @@ fn emitPolygonShapeRun(
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
+        .group_alpha = state.group_alpha,
+        .group_blend_mode = state.group_blend_mode,
         .fill_rule = fill_rule,
         .line_cap = state.line_cap,
         .line_join = state.line_join,
@@ -14278,13 +18039,21 @@ fn emitPolygonShapeRun(
         .clip_points = owned_clip,
         .clip_fill_rule = clip_fill_rule,
         .points = owned_points,
+        .subpath_starts = owned_subpath_starts,
+        .subpath_closed = owned_subpath_closed,
     });
 }
 
 fn graphicsStrokeScale(matrix: GraphicsMatrix) f64 {
     const sx = @sqrt(matrix.a * matrix.a + matrix.b * matrix.b);
     const sy = @sqrt(matrix.c * matrix.c + matrix.d * matrix.d);
-    return @max(0.0001, (sx + sy) / 2.0);
+    // Content generators commonly pair very large user-space line widths with
+    // very small CTMs. A device-space floor here magnifies those valid strokes
+    // (especially inside an already-scaled Form XObject) and turns curved
+    // strokes into page-sized cap discs. Preserve the complete composed CTM;
+    // singular transforms naturally produce no painted area.
+    const scale = (sx + sy) / 2.0;
+    return if (std.math.isFinite(scale)) scale else 0.0;
 }
 
 fn scaleDashArrayAlloc(alloc: Allocator, dash_array: []const f64, matrix: GraphicsMatrix) ![]f64 {
@@ -14292,6 +18061,16 @@ fn scaleDashArrayAlloc(alloc: Allocator, dash_array: []const f64, matrix: Graphi
     var out = try alloc.alloc(f64, dash_array.len);
     for (dash_array, 0..) |value, i| out[i] = value * scale;
     return out;
+}
+
+test "stroke scale preserves small composed form transforms" {
+    const scale = graphicsStrokeScale(.{
+        .a = -0.000075598,
+        .b = -0.00002202166,
+        .c = -0.00002202166,
+        .d = 0.000075598,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00007874016), scale, 0.000000001);
 }
 
 fn appendFlattenedCubicBezier(
@@ -14326,17 +18105,25 @@ fn applyMatrixToPoint(m: GraphicsMatrix, x: f64, y: f64) [2]f64 {
     };
 }
 
-fn parseFormMatrix(obj: *const syntax.Object) GraphicsMatrix {
-    const matrix_obj = obj.get("Matrix") orelse return .{};
-    if (matrix_obj.* != .array or matrix_obj.array.len < 6) return .{};
-    return .{
-        .a = numericObjectValue(&matrix_obj.array[0]) orelse 1,
-        .b = numericObjectValue(&matrix_obj.array[1]) orelse 0,
-        .c = numericObjectValue(&matrix_obj.array[2]) orelse 0,
-        .d = numericObjectValue(&matrix_obj.array[3]) orelse 1,
-        .e = numericObjectValue(&matrix_obj.array[4]) orelse 0,
-        .f = numericObjectValue(&matrix_obj.array[5]) orelse 0,
-    };
+fn approximatelyEqualPdfCoordinate(lhs: f64, rhs: f64) bool {
+    if (!std.math.isFinite(lhs) or !std.math.isFinite(rhs)) return false;
+    return @abs(lhs - rhs) <= 0.000001 * @max(1.0, @max(@abs(lhs), @abs(rhs)));
+}
+
+fn graphicsMatricesApproxEqual(lhs: GraphicsMatrix, rhs: GraphicsMatrix) bool {
+    return approximatelyEqualPdfCoordinate(lhs.a, rhs.a) and
+        approximatelyEqualPdfCoordinate(lhs.b, rhs.b) and
+        approximatelyEqualPdfCoordinate(lhs.c, rhs.c) and
+        approximatelyEqualPdfCoordinate(lhs.d, rhs.d) and
+        approximatelyEqualPdfCoordinate(lhs.e, rhs.e) and
+        approximatelyEqualPdfCoordinate(lhs.f, rhs.f);
+}
+
+fn pageBoxesApproxEqual(lhs: PageBox, rhs: PageBox) bool {
+    return approximatelyEqualPdfCoordinate(lhs.min_x, rhs.min_x) and
+        approximatelyEqualPdfCoordinate(lhs.min_y, rhs.min_y) and
+        approximatelyEqualPdfCoordinate(lhs.max_x, rhs.max_x) and
+        approximatelyEqualPdfCoordinate(lhs.max_y, rhs.max_y);
 }
 
 fn transformPageBox(box: PageBox, matrix: GraphicsMatrix) PageBox {
@@ -14388,6 +18175,92 @@ fn cmykColor(c: f64, m: f64, y: f64, k: f64) [4]u8 {
     const yk = std.math.clamp(y, 0.0, 1.0);
     const kk = std.math.clamp(k, 0.0, 1.0);
     return rgbColor((1.0 - ck) * (1.0 - kk), (1.0 - mk) * (1.0 - kk), (1.0 - yk) * (1.0 - kk));
+}
+
+fn calibratedColor(space: CalibratedColorSpace, components: [4]f64) [4]u8 {
+    const colorimetry = switch (space) {
+        .gray => |gray| blk: {
+            const ag = std.math.pow(f64, std.math.clamp(components[0], 0.0, 1.0), gray.gamma);
+            break :blk .{
+                [3]f64{
+                    gray.white_point[0] * ag,
+                    gray.white_point[1] * ag,
+                    gray.white_point[2] * ag,
+                },
+                gray.white_point,
+                gray.black_point,
+            };
+        },
+        .rgb => |rgb| blk: {
+            const a = std.math.pow(f64, std.math.clamp(components[0], 0.0, 1.0), rgb.gamma[0]);
+            const b = std.math.pow(f64, std.math.clamp(components[1], 0.0, 1.0), rgb.gamma[1]);
+            const c = std.math.pow(f64, std.math.clamp(components[2], 0.0, 1.0), rgb.gamma[2]);
+            // PDF stores the CalRGB matrix by input component: XA YA ZA,
+            // XB YB ZB, XC YC ZC.
+            // Matrix ABC maps the gamma-decoded components directly to final
+            // CIE XYZ. WhitePoint and BlackPoint describe the source gamut;
+            // they are not another scale/offset applied to the matrix output.
+            const xyz = [3]f64{
+                rgb.matrix[0] * a + rgb.matrix[3] * b + rgb.matrix[6] * c,
+                rgb.matrix[1] * a + rgb.matrix[4] * b + rgb.matrix[7] * c,
+                rgb.matrix[2] * a + rgb.matrix[5] * b + rgb.matrix[8] * c,
+            };
+            break :blk .{
+                xyz,
+                rgb.white_point,
+                rgb.black_point,
+            };
+        },
+    };
+    return xyzColorAdaptedToSrgb(colorimetry[0], colorimetry[1], colorimetry[2]);
+}
+
+fn bradfordAdaptXyzToD65(xyz: [3]f64, source_white: [3]f64) [3]f64 {
+    const source_lms = [3]f64{
+        0.8951 * source_white[0] + 0.2664 * source_white[1] - 0.1614 * source_white[2],
+        -0.7502 * source_white[0] + 1.7135 * source_white[1] + 0.0367 * source_white[2],
+        0.0389 * source_white[0] - 0.0685 * source_white[1] + 1.0296 * source_white[2],
+    };
+    const d65_lms = [3]f64{ 0.9414285, 1.0404175, 1.0895327 };
+    const lms = [3]f64{
+        (0.8951 * xyz[0] + 0.2664 * xyz[1] - 0.1614 * xyz[2]) * d65_lms[0] / source_lms[0],
+        (-0.7502 * xyz[0] + 1.7135 * xyz[1] + 0.0367 * xyz[2]) * d65_lms[1] / source_lms[1],
+        (0.0389 * xyz[0] - 0.0685 * xyz[1] + 1.0296 * xyz[2]) * d65_lms[2] / source_lms[2],
+    };
+    return .{
+        0.9869929 * lms[0] - 0.1470543 * lms[1] + 0.1599627 * lms[2],
+        0.4323053 * lms[0] + 0.5183603 * lms[1] + 0.0492912 * lms[2],
+        -0.0085287 * lms[0] + 0.0400428 * lms[1] + 0.9684867 * lms[2],
+    };
+}
+
+fn xyzColorAdaptedToSrgb(xyz: [3]f64, source_white: [3]f64, source_black: [3]f64) [4]u8 {
+    // Use a deterministic native relative-colorimetric transform. Bradford
+    // adapts the source white to sRGB D65; per-channel black-point
+    // compensation maps the declared diffuse black to the destination black
+    // without altering the CalGray/CalRGB decode equations above.
+    const d65 = [3]f64{ 0.95047, 1.0, 1.08883 };
+    const adapted = bradfordAdaptXyzToD65(xyz, source_white);
+    const adapted_black = bradfordAdaptXyzToD65(source_black, source_white);
+    var compensated = adapted;
+    for (0..3) |channel| {
+        // Syntactically finite PDF numbers can still overflow the matrix
+        // arithmetic. Never allow an adversarial color space to carry NaN
+        // into float-to-byte conversion.
+        if (!std.math.isFinite(adapted[channel]) or !std.math.isFinite(adapted_black[channel])) {
+            compensated[channel] = 0;
+            continue;
+        }
+        const span = d65[channel] - adapted_black[channel];
+        if (!std.math.isFinite(span) or @abs(span) <= 0.000001) continue;
+        const channel_value = (adapted[channel] - adapted_black[channel]) * d65[channel] / span;
+        compensated[channel] = if (std.math.isFinite(channel_value)) channel_value else 0;
+    }
+    return rgbColor(
+        linearToSrgb(3.2406 * compensated[0] - 1.5372 * compensated[1] - 0.4986 * compensated[2]),
+        linearToSrgb(-0.9689 * compensated[0] + 1.8758 * compensated[1] + 0.0415 * compensated[2]),
+        linearToSrgb(0.0557 * compensated[0] - 0.2040 * compensated[1] + 1.0570 * compensated[2]),
+    );
 }
 
 fn labColor(l: f64, a: f64, b: f64, white: [3]f64) [4]u8 {
@@ -14482,6 +18355,29 @@ fn dictGetObject(dict: []const syntax.DictEntry, key: []const u8) ?*const syntax
     return null;
 }
 
+fn isDeviceOrCieBasedColorSpace(color_space: *const syntax.Object) bool {
+    if (color_space.asName()) |name| {
+        return std.mem.eql(u8, name, "DeviceGray") or
+            std.mem.eql(u8, name, "G") or
+            std.mem.eql(u8, name, "DeviceRGB") or
+            std.mem.eql(u8, name, "RGB") or
+            std.mem.eql(u8, name, "DeviceCMYK") or
+            std.mem.eql(u8, name, "CMYK");
+    }
+    if (color_space.* != .array or color_space.array.len == 0) return false;
+    const family = color_space.array[0].asName() orelse return false;
+    return std.mem.eql(u8, family, "CalGray") or
+        std.mem.eql(u8, family, "CalRGB") or
+        std.mem.eql(u8, family, "Lab") or
+        std.mem.eql(u8, family, "ICCBased");
+}
+
+fn isIndexedColorSpace(color_space: *const syntax.Object) bool {
+    if (color_space.* != .array or color_space.array.len == 0) return false;
+    const family = color_space.array[0].asName() orelse return false;
+    return std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I");
+}
+
 fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: usize) ?[4]u8 {
     if (std.mem.eql(u8, color_space_name, "DeviceGray") and count >= 1) {
         return .{ components[0], components[0], components[0], 0xff };
@@ -14501,12 +18397,30 @@ fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: u
 }
 
 fn evalExponentialTintComponent(transform: *const ExponentialTintTransform, tint: f64, component: usize) f64 {
-    const t = std.math.clamp(tint, 0.0, 1.0);
-    return std.math.clamp(
-        transform.c0[component] + std.math.pow(f64, t, transform.n) * (transform.c1[component] - transform.c0[component]),
-        0.0,
-        1.0,
+    const t = std.math.clamp(tint, transform.domain_min, transform.domain_max);
+    const value = transform.c0[component] + std.math.pow(f64, t, transform.n) * (transform.c1[component] - transform.c0[component]);
+    return if (transform.ranges) |ranges|
+        clampColorComponent(value, ranges[component])
+    else
+        value;
+}
+
+fn evalSampledTintComponent(transform: *const GraphicsSampledTintTransform, tint: f64, component: usize) f64 {
+    std.debug.assert(transform.size > 0);
+    std.debug.assert(component < transform.output_components);
+    const clamped = std.math.clamp(tint, transform.domain_min, transform.domain_max);
+    const t = (clamped - transform.domain_min) / (transform.domain_max - transform.domain_min);
+    const encoded = std.math.clamp(
+        transform.encode_min + t * (transform.encode_max - transform.encode_min),
+        0,
+        @as(f64, @floatFromInt(transform.size - 1)),
     );
+    const lower: usize = @intFromFloat(@floor(encoded));
+    const upper = @min(lower + 1, transform.size - 1);
+    const fraction = encoded - @as(f64, @floatFromInt(lower));
+    const lhs = transform.values[lower * transform.output_components + component];
+    const rhs = transform.values[upper * transform.output_components + component];
+    return lhs + fraction * (rhs - lhs);
 }
 
 fn applyDecodeByte(value: u8, decode_obj: ?*const syntax.Object, component_index: usize) u8 {
@@ -14519,11 +18433,70 @@ fn applyDecodeUnit(value: u8, decode_obj: ?*const syntax.Object, component_index
 }
 
 fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entries: usize) !u8 {
-    if (palette_entries == 0) return error.UnsupportedPdfRendering;
+    if (palette_entries == 0 or palette_entries > 256) return error.UnsupportedPdfRendering;
     const max_index = @as(f64, @floatFromInt(palette_entries - 1));
     const unit = @as(f64, @floatFromInt(value)) / 255.0;
-    const range = decodeRange(decode_obj, 0) orelse return value;
+    const range = decodeRange(decode_obj, 0) orelse return @min(value, @as(u8, @intCast(palette_entries - 1)));
     const mapped = std.math.clamp(range.min + unit * (range.max - range.min), 0.0, max_index);
+    return @intFromFloat(@round(mapped));
+}
+
+fn rawImageSourceSample(
+    samples: ImageSourceSamples,
+    pixel: usize,
+    component_offset: u8,
+    max_sample: u32,
+) !u32 {
+    if (component_offset >= samples.stride) return error.UnsupportedPdfRendering;
+    const sample_index = std.math.add(
+        usize,
+        std.math.mul(usize, pixel, samples.stride) catch return error.UnsupportedPdfRendering,
+        component_offset,
+    ) catch return error.UnsupportedPdfRendering;
+    const raw: u32 = switch (samples.data) {
+        .u8 => |bytes| blk: {
+            if (sample_index >= bytes.len or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering;
+            break :blk if (samples.bits_per_component == 8)
+                bytes[sample_index]
+            else
+                (@as(u32, bytes[sample_index]) * max_sample + 127) / 255;
+        },
+        .u16 => |words| blk: {
+            if (sample_index >= words.len) return error.UnsupportedPdfRendering;
+            break :blk words[sample_index];
+        },
+    };
+    if (raw > max_sample) return error.UnsupportedPdfRendering;
+    return raw;
+}
+
+fn indexedImageSourceValue(
+    samples: ImageSourceSamples,
+    pixel: usize,
+    decode_obj: ?*const syntax.Object,
+    palette_entries: usize,
+) !u8 {
+    if (palette_entries == 0 or palette_entries > 256 or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+        return error.UnsupportedPdfRendering;
+    const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
+    const raw_sample = try rawImageSourceSample(samples, pixel, samples.component_offsets[0], max_sample);
+    const decoded_index = if (decodeRange(decode_obj, 0)) |range|
+        range.min + (@as(f64, @floatFromInt(raw_sample)) / @as(f64, @floatFromInt(max_sample))) * (range.max - range.min)
+    else
+        @as(f64, @floatFromInt(raw_sample));
+    if (!std.math.isFinite(decoded_index)) return error.UnsupportedPdfRendering;
+    const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+    return @intFromFloat(@round(std.math.clamp(decoded_index, 0, max_index)));
+}
+
+fn applyIndexedSampleDecode(value: u8, sample_decode: ImageSampleDecode, palette_entries: usize) !u8 {
+    if (palette_entries == 0 or palette_entries > 256) return error.UnsupportedPdfRendering;
+    if (sample_decode.default_decode == null and
+        sample_decode.clamp_count == 0)
+        return try applyIndexedDecode(value, sample_decode.decode_obj, palette_entries);
+    const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+    const mapped = std.math.clamp(sample_decode.encodedValue(value, 0), 0.0, max_index);
     return @intFromFloat(@round(mapped));
 }
 
@@ -14741,6 +18714,21 @@ fn readIccS15Fixed16(bytes: []const u8, offset: usize) f64 {
     return @as(f64, @floatFromInt(raw)) / 65536.0;
 }
 
+fn jpeg2000RendererScratchLen(
+    pixel_count: usize,
+    metadata: image_lib.jpeg2000.Jp2ColorMetadata,
+    components: u8,
+    indexed_color_space: bool,
+) !usize {
+    // Direct Indexed rendering consumes the native index channel in place and
+    // reads embedded alpha from that same sample view. Only continuous-color
+    // rendering compacts alpha-interleaved samples into a separate buffer.
+    if (indexed_color_space) return 0;
+    const alpha_layout = metadata.alphaLayout(components) orelse return 0;
+    return std.math.mul(usize, pixel_count, alpha_layout.color_count) catch
+        return error.PdfDecodeWorkingSetTooLarge;
+}
+
 fn jpeg2000InferredColorSpace(metadata: image_lib.jpeg2000.Jp2ColorMetadata, components: u8) !Jpeg2000ColorSpace {
     if (metadata.has_icc_profile) return error.UnsupportedPdfRendering;
     if (metadata.enumerated_color_space) |color_space| return switch (color_space) {
@@ -14836,6 +18824,11 @@ fn applyDecodeNormalized(unit: f64, decode_obj: ?*const syntax.Object, component
     return std.math.clamp(range.min + unit * (range.max - range.min), 0.0, 1.0);
 }
 
+fn applyDecodeUnclamped(unit: f64, decode_obj: ?*const syntax.Object, component_index: usize) f64 {
+    const range = decodeRange(decode_obj, component_index) orelse return std.math.clamp(unit, 0.0, 1.0);
+    return range.min + std.math.clamp(unit, 0.0, 1.0) * (range.max - range.min);
+}
+
 fn invertDecodeNormalized(value: f64, decode_obj: ?*const syntax.Object, component_index: usize) !f64 {
     const range = decodeRange(decode_obj, component_index) orelse return std.math.clamp(value, 0.0, 1.0);
     const span = range.max - range.min;
@@ -14910,9 +18903,24 @@ fn applyResampledMatteToSamples(
                     .u8 => |bytes| @as(f64, @floatFromInt(bytes[sample_index])) / 255.0,
                     .u16 => |words| @as(f64, @floatFromInt(words[sample_index])) / @as(f64, @floatFromInt(max_sample)),
                 };
-                const preblended = applyDecodeNormalized(raw_unit, decode_obj, component);
+                const component_range = matte.ranges[component];
+                const component_span = component_range.max - component_range.min;
+                if (!std.math.isFinite(component_span) or component_span <= std.math.floatEps(f64))
+                    return error.UnsupportedPdfRendering;
+                const explicit_decode = decodeRange(decode_obj, component);
+                const decoded_component = if (explicit_decode) |range|
+                    range.min + std.math.clamp(raw_unit, 0.0, 1.0) * (range.max - range.min)
+                else
+                    mapUnitToComponentRange(raw_unit, component_range);
+                const preblended = (clampColorComponent(decoded_component, component_range) - component_range.min) / component_span;
                 const unblended = unblendNativeComponent(preblended, alpha, matte.components[component]);
-                const encoded_unit = try invertDecodeNormalized(unblended, decode_obj, component);
+                const encoded_unit = if (explicit_decode) |range| blk: {
+                    const decode_span = range.max - range.min;
+                    if (!std.math.isFinite(decode_span) or @abs(decode_span) <= std.math.floatEps(f64))
+                        return error.UnsupportedPdfRendering;
+                    const native_component = mapUnitToComponentRange(unblended, component_range);
+                    break :blk std.math.clamp((native_component - range.min) / decode_span, 0.0, 1.0);
+                } else unblended;
                 switch (samples.data) {
                     .u8 => |bytes| bytes[sample_index] = @intFromFloat(@round(encoded_unit * 255.0)),
                     .u16 => |words| words[sample_index] = @intFromFloat(@round(encoded_unit * @as(f64, @floatFromInt(max_sample)))),
@@ -15179,6 +19187,59 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try prepareOcrBilevelFallbacksAlloc(std.testing.allocator, &runs, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &runs[0].bilevel_fallback.?);
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
+    try std.testing.expect(runs[0].ocr_coverage_minify);
+    try std.testing.expect(runs[1].ocr_coverage_minify);
+}
+
+test "OCR preparation reaches retained pattern stencils and tile images" {
+    var stencil_rgba = [_]u8{ 0xff, 0xff, 0xff, 0x80 };
+    var tile_rgba = [_]u8{ 0, 0, 0, 0xff };
+    var tile_images = [_]ImageRun{.{
+        .rgba = &tile_rgba,
+        .width = 1,
+        .height = 1,
+        .bilevel = true,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    }};
+    var patterns = [_]PatternRun{.{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &stencil_rgba,
+            .width = 1,
+            .height = 1,
+            .bilevel = true,
+            .a = 1,
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 1,
+            .draw_height = 1,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_image_runs = &tile_images,
+    }};
+
+    try prepareOcrRenderRunsAlloc(std.testing.allocator, &.{}, &patterns, .{});
+    try std.testing.expect(patterns[0].stencil_mask.?.ocr_coverage_minify);
+    try std.testing.expectEqual(@as(u8, 0x80), patterns[0].stencil_mask.?.bilevel_fallback.?[3]);
+    try std.testing.expect(patterns[0].tile_image_runs[0].ocr_coverage_minify);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &patterns[0].tile_image_runs[0].bilevel_fallback.?);
 }
 
 test "decode allocator enforces cumulative churn before allocating" {
@@ -15623,6 +19684,7 @@ test "lzw cancellation polling is amortized across short code sequences" {
         &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 },
         null,
         64,
+        64,
         .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
     );
     defer std.testing.allocator.free(decoded);
@@ -15659,7 +19721,7 @@ test "stream decoders enforce the decoded byte budget before growth" {
     try std.testing.expectError(error.DecodedStreamTooLarge, ascii85DecodeAlloc(alloc, "zz~>", 7, .{}));
 
     const lzw = &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 };
-    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5, .{}));
+    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5, 5, .{}));
 
     const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
     try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5, .{}));
@@ -15710,6 +19772,27 @@ test "predictor dimensions reject overflow and oversized rows before allocation"
     );
 }
 
+test "predictor exact output fits an exact working-set reservation" {
+    const alloc = std.testing.allocator;
+    const predicted = [_]u8{ 0, 0x12, 0x34, 0x56 };
+    var entries = [_]syntax.DictEntry{
+        .{ .key = @constCast("Predictor"), .value = .{ .integer = 12 } },
+        .{ .key = @constCast("Columns"), .value = .{ .integer = 1 } },
+        .{ .key = @constCast("Colors"), .value = .{ .integer = 3 } },
+        .{ .key = @constCast("BitsPerComponent"), .value = .{ .integer = 8 } },
+    };
+    var params: syntax.Object = .{ .dict = &entries };
+
+    // Account the retained predictor input plus the exact output, previous
+    // row, and current-row buffers without capacity-growth slack.
+    var budget = DecodeBudgetAllocator.init(alloc, predicted.len, predicted.len + 9);
+    const decode_alloc = budget.allocator();
+    const decoded = try applyPredictorAlloc(decode_alloc, &predicted, &params, 3, .{});
+    defer decode_alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56 }, decoded);
+    try std.testing.expectEqual(@as(usize, predicted.len + decoded.len), budget.live_bytes);
+}
+
 test "reader can extract plain text from simple page content" {
     const alloc = std.testing.allocator;
     const content = "BT\n(Hello World) Tj\nET\n";
@@ -15757,7 +19840,7 @@ test "recursive page and content collectors are allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
             var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
-            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
+            var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
             var reader = Reader{
                 .alloc = alloc,
                 .bytes = "",
@@ -15767,7 +19850,7 @@ test "recursive page and content collectors are allocation-failure safe" {
                 .xref_entries = &.{},
                 .trailer = .null,
                 .font_cache = &font_cache,
-                .decrypted_streams = &decrypted_streams,
+                .encrypted_streams = &encrypted_streams,
             };
 
             var page_entries = [_]syntax.DictEntry{
@@ -15817,9 +19900,15 @@ test "reader resource collectors release owned elements on allocation failure" {
                 .{ .key = @constCast("ca"), .value = .{ .real = 0.25 } },
                 .{ .key = @constCast("BM"), .value = .{ .name = @constCast("Multiply") } },
             };
+            var bad_state_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("SMask"), .value = .{ .integer = 42 } },
+            };
             var state_entries = [_]syntax.DictEntry{
                 .{ .key = @constCast("GS1"), .value = .{ .dict = &first_state_entries } },
                 .{ .key = @constCast("GS2"), .value = .{ .dict = &second_state_entries } },
+                // An unreachable malformed soft mask must not make otherwise
+                // valid page content fail during resource discovery.
+                .{ .key = @constCast("Unused"), .value = .{ .dict = &bad_state_entries } },
             };
             var resource_entries = [_]syntax.DictEntry{
                 .{ .key = @constCast("ExtGState"), .value = .{ .dict = &state_entries } },
@@ -15828,8 +19917,8 @@ test "reader resource collectors release owned elements on allocation failure" {
 
             var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
             defer font_cache.deinit(alloc);
-            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
-            defer decrypted_streams.deinit(alloc);
+            var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+            defer encrypted_streams.deinit(alloc);
             var reader = Reader{
                 .alloc = alloc,
                 .bytes = "",
@@ -15839,10 +19928,10 @@ test "reader resource collectors release owned elements on allocation failure" {
                 .xref_entries = &.{},
                 .trailer = .null,
                 .font_cache = &font_cache,
-                .decrypted_streams = &decrypted_streams,
+                .encrypted_streams = &encrypted_streams,
             };
 
-            const states = try reader.collectExtGStatesFromResourcesAlloc(&resources);
+            const states = try reader.collectExtGStatesFromResourcesAlloc(&resources, "/GS1 gs /GS2 gs");
             defer {
                 for (states) |*state| state.deinit(alloc);
                 if (states.len > 0) alloc.free(states);
@@ -15852,6 +19941,53 @@ test "reader resource collectors release owned elements on allocation failure" {
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "resource reachability recognizes Tf operands and soft mask paint profiles" {
+    const alloc = std.testing.allocator;
+    var fonts = try collectReferencedFontNamesAlloc(alloc, "/F1 12 Tf /NotAFont gs /F2 9.5 Tf");
+    defer fonts.deinit(alloc);
+    try std.testing.expect(fonts.contains("F1"));
+    try std.testing.expect(fonts.contains("F2"));
+    try std.testing.expect(!fonts.contains("NotAFont"));
+
+    try std.testing.expect(try contentIsSingleImageSoftMaskAlloc(alloc, "q 2 0 0 2 0 0 cm /Mask Do Q"));
+    try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/Mask Do 0 0 1 1 re f"));
+    try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/One Do /Two Do"));
+}
+
+test "graphics-state soft masks resolve indirect BBox and Matrix arrays" {
+    const alloc = std.testing.allocator;
+    const page_content = "q /GS gs /Img Do Q\n";
+    const mask_content = "/Mask Do\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << /XObject << /Img 5 0 R >> /ExtGState << /GS 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\x20\x40\x60\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /ExtGState /SMask << /S /Luminosity /G 7 0 R >> >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox 8 0 R /Matrix 9 0 R /Resources << /XObject << /Mask 10 0 R >> >> /Group << /S /Transparency /CS /DeviceGray >> /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ mask_content.len, mask_content }),
+        "8 0 obj\n[0 0 1 1]\nendobj\n",
+        "9 0 obj\n[1 0 0 1 0 0]\nendobj\n",
+        "10 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[6]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    var runs = try pdf_reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), runs.image_runs.len);
+    const run = runs.image_runs[0];
+    try std.testing.expect(run.opacity_mask_rgba != null);
+    try std.testing.expectEqual(@as(u32, 1), run.opacity_mask_width);
+    try std.testing.expectEqual(@as(u32, 1), run.opacity_mask_height);
+    try std.testing.expect(run.opacity_mask_luminosity);
+    try std.testing.expectEqual(@as(u8, 0x80), run.opacity_mask_rgba.?[0]);
 }
 
 test "reader ignores an invalid xref sentinel and repairs a stale zero page count" {
@@ -16258,6 +20394,68 @@ test "AESV2 object data decrypts and removes PKCS7 padding" {
     const decrypted = try decryptAesV2Alloc(alloc, &encrypted, key);
     defer alloc.free(decrypted);
     try std.testing.expectEqualStrings("hello encrypted pdf", decrypted);
+}
+
+test "unfiltered terminal read decrypts AES lazily within working limits" {
+    const alloc = std.testing.allocator;
+    var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
+    defer font_cache.deinit(alloc);
+    var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+    defer encrypted_streams.deinit(alloc);
+    const ptr: syntax.ObjRef = .{ .id = 42, .gen = 3 };
+    const context = EncryptionContext{
+        .file_key = .{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f },
+        .file_key_len = 16,
+        .method = .aesv2,
+    };
+    const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
+    var encrypted: [32]u8 = undefined;
+    encrypted[0..16].* = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
+    var padded = [_]u8{13} ** 16;
+    @memcpy(padded[0..3], "abc");
+    for (&padded, encrypted[0..16]) |*value, iv| value.* ^= iv;
+    const aes = std.crypto.core.aes.Aes128.initEnc(key.bytes);
+    var ciphertext: [16]u8 = undefined;
+    aes.encrypt(&ciphertext, &padded);
+    encrypted[16..32].* = ciphertext;
+    try encrypted_streams.put(alloc, 0, ptr);
+
+    var reader = Reader{
+        .alloc = alloc,
+        .bytes = &encrypted,
+        .decode_limits = .{},
+        .version_minor = 7,
+        .startxref_offset = 0,
+        .xref_entries = &.{},
+        .trailer = .null,
+        .font_cache = &font_cache,
+        .encryption = context,
+        .encrypted_streams = &encrypted_streams,
+    };
+    var header = [_]syntax.DictEntry{
+        .{ .key = @constCast("Length"), .value = .{ .integer = 32 } },
+    };
+    var stream: syntax.Object = .{ .stream = .{
+        .header = &header,
+        .data_offset = 0,
+        .data_length = 32,
+    } };
+
+    // AESV2 /Length includes the 16-byte IV and block padding, but the
+    // terminal palette limit applies to plaintext. Only one block of scratch
+    // is needed and no decrypted payload is retained on the Reader.
+    const limits = DecodeLimits{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 16 };
+    const decoded = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(&stream, limits, 3);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("abc", decoded);
+    try std.testing.expectEqual(@as(usize, 1), encrypted_streams.count());
+    const exact = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(
+        &stream,
+        .{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 3 },
+        3,
+    );
+    defer alloc.free(exact);
+    try std.testing.expectEqualStrings("abc", exact);
 }
 
 test "RC4 object data decrypts with the unsalted object key" {
@@ -17195,6 +21393,19 @@ test "simple TrueType PDF widths fall back to MissingWidth" {
     defer alloc.free(paint_map);
     try std.testing.expectEqual(@as(u16, 1), paint_map['A']);
 
+    // The same table under Macintosh Roman platform/encoding identifiers is
+    // intentionally ignored by generic Unicode lookup but is authoritative
+    // for a PDF MacRomanEncoding simple font.
+    var mac_sfnt_bytes = sfnt_bytes;
+    mac_sfnt_bytes[33] = 1;
+    mac_sfnt_bytes[35] = 0;
+    var mac_sfnt = try font_lib.sfnt.Font.init(alloc, &mac_sfnt_bytes);
+    defer mac_sfnt.deinit(alloc);
+    const mac_decoder = FontDecoder{ .base_encoding = .mac_roman };
+    const mac_paint_map = try buildSimpleTrueTypeGlyphMapAlloc(alloc, mac_sfnt, &mac_decoder, false);
+    defer alloc.free(mac_paint_map);
+    try std.testing.expectEqual(@as(u16, 1), mac_paint_map['A']);
+
     const state = TextRunState{ .font_size = 10, .horizontal_scale = 0.5, .char_spacing = 2, .word_spacing = 4 };
     // Extraction expands A to two scalars, but paint measurement remains one
     // raw code: (600 * 10 / 1000 + 2) * 0.5 = 4.
@@ -17572,8 +21783,8 @@ test "PDF render run ownership is allocation-failure safe" {
                 for (shape_runs.items) |*item| item.deinit(alloc);
                 shape_runs.deinit(alloc);
             }
-            try emitPolygonShapeRun(alloc, &shape_runs, 1, .{}, &clip, .stroke, true, .nonzero, &.{ 1, 2 }, 0, &clip, .nonzero);
-            try emitPolygonShapeRun(alloc, &shape_runs, 2, .{}, &clip, .fill, true, .nonzero, &.{}, 0, &clip, .nonzero);
+            try emitPolygonShapeRun(alloc, &shape_runs, 1, .{}, &clip, &.{0}, &.{true}, .stroke, true, .nonzero, &.{ 1, 2 }, 0, &clip, .nonzero);
+            try emitPolygonShapeRun(alloc, &shape_runs, 2, .{}, &clip, &.{0}, &.{true}, .fill, true, .nonzero, &.{}, 0, &clip, .nonzero);
 
             const pattern = PagePattern{
                 .name = @constCast("P1"),
@@ -17885,6 +22096,296 @@ test "reader decodes ICCBased alternate image xobject draw" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
 }
 
+test "reader clips decoded ICCBased image samples to profile range" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00\xff";
+    const content = "q\n2 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Decode [-1 2] /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, 64), runs[0].rgba[0]);
+    try std.testing.expectEqual(@as(u8, 191), runs[0].rgba[4]);
+}
+
+test "reader uses ICC profile range as the default image Decode" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00\x40\xff";
+    const content = "q\n3 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, 64), runs[0].rgba[0]);
+    try std.testing.expectEqual(@as(u8, 96), runs[0].rgba[4]);
+    try std.testing.expectEqual(@as(u8, 191), runs[0].rgba[8]);
+}
+
+test "indexed Decode preserves the complete palette index range" {
+    var decode_values = [_]syntax.Object{ .{ .integer = 0 }, .{ .integer = 2 } };
+    const decode = syntax.Object{ .array = &decode_values };
+
+    try std.testing.expectEqual(@as(u8, 0), try applyIndexedDecode(0, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 1), try applyIndexedDecode(128, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try applyIndexedDecode(255, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try applyIndexedDecode(255, null, 3));
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        try applyIndexedSampleDecode(255, .{ .decode_obj = &decode }, 3),
+    );
+
+    const packed_samples = ImageSourceSamples{
+        .data = .{ .u8 = @constCast(&[_]u8{ 0, 85, 255 }) },
+        .pixel_count = 3,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 2,
+    };
+    try std.testing.expectEqual(@as(u8, 0), try indexedImageSourceValue(packed_samples, 0, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 1), try indexedImageSourceValue(packed_samples, 1, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try indexedImageSourceValue(packed_samples, 2, &decode, 3));
+}
+
+test "spot tint transforms preserve non-unit Lab alternate values" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var scanner = syntax.Scanner.init(
+        alloc,
+        "[/Separation /Spot [/Lab << /WhitePoint [1 1 1] /Range [-100 100 -100 100] >>] << /FunctionType 2 /Domain [0 1] /C0 [0 -100 -100] /C1 [100 100 100] /N 1 >>]",
+    );
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var rgba: [4]u8 = undefined;
+    try std.testing.expect(try reader.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{255}, color_space.array, null));
+    const expected = labColor(100, 100, 100, .{ 1, 1, 1 });
+    try std.testing.expectEqualSlices(u8, &expected, &rgba);
+}
+
+test "spot tint transforms reject special alternate color spaces" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var scanner = syntax.Scanner.init(
+        alloc,
+        "[/Separation /Spot [/Indexed /DeviceRGB 1 <000000ffffff>] << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>]",
+    );
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var rgba: [4]u8 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        reader.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{255}, color_space.array, null),
+    );
+}
+
+test "type 2 tint transform resolves indirect numeric arrays" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n[0 1]\nendobj\n",
+        "4 0 obj\n[0 0 0]\nendobj\n",
+        "5 0 obj\n[1 2 3]\nendobj\n",
+        "6 0 obj\n[0 0.5 0 1 0 2]\nendobj\n",
+        "7 0 obj\n2\nendobj\n",
+        "8 0 obj\n1\nendobj\n",
+        "9 0 obj\n<< /FunctionType 7 0 R /Domain 3 0 R /C0 4 0 R /C1 5 0 R /Range 6 0 R /N 8 0 R >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    const function = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var transform = try reader.parseExponentialTintTransform(&function, 3);
+    defer transform.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, &.{ 0, 0, 0 }, transform.c0);
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, transform.c1);
+    try std.testing.expectEqual(@as(f64, 0.5), transform.ranges.?[0].max);
+    try std.testing.expectEqual(@as(f64, 2), transform.ranges.?[2].max);
+    try std.testing.expectEqual(@as(f64, 2), evalExponentialTintComponent(&transform, 1, 2));
+}
+
+test "type 4 image tint transform executes bounded stack program" {
+    const alloc = std.testing.allocator;
+    const program = "{0 exch 0 exch 0 exch}";
+    const function_object = try std.fmt.allocPrint(
+        alloc,
+        "3 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ program.len, program },
+    );
+    defer alloc.free(function_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        function_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    const function = syntax.Object{ .obj_ref = .{ .id = 3, .gen = 0 } };
+    var transform = try reader.parseCalculatorTintTransform(&function, 4);
+    defer transform.deinit(alloc);
+    var output: [4]f64 = undefined;
+    transform.evaluate(0.75, &output);
+    try std.testing.expectEqualSlices(f64, &.{ 0, 0, 0, 0.75 }, &output);
+}
+
+test "ICCBased Lab alternate consumes native component values once" {
+    const alloc = std.testing.allocator;
+    const image_data = &.{ 128, 128, 128 };
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 3 /Alternate [/Lab << /WhitePoint [0.95047 1 1.08883] /Range [-100 100 -100 100] >>] /Range [0 100 -100 100 -100 100] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    const unit = 128.0 / 255.0;
+    const expected = labColor(
+        unit * 100.0,
+        -100.0 + unit * 200.0,
+        -100.0 + unit * 200.0,
+        .{ 0.95047, 1, 1.08883 },
+    );
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqualSlices(u8, &expected, runs[0].rgba[0..4]);
+}
+
+test "reader rejects cyclic ICCBased image alternates" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00";
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /CS1 /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /CS1 [/ICCBased 5 0 R] >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /CS1 /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.UnsupportedPdfRendering, reader.extractPageImageRunsAlloc(1));
+}
+
 test "reader decodes packed one-bit ICCBased gray image" {
     const alloc = std.testing.allocator;
     const image_data = &.{0b1010_0000};
@@ -17942,11 +22443,11 @@ test "reader decodes CalRGB image xobject draw" {
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /CS1 [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalRGB << /WhitePoint [1 1 1] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /CS1 /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ image_data.len, image_data },
         ),
     };
@@ -17982,9 +22483,158 @@ test "reader decodes CalRGB image xobject draw" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), runs.len);
-    try std.testing.expectEqual(@as(u8, 255), runs[0].rgba[0]);
-    try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[1]);
-    try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
+    try std.testing.expect(runs[0].rgba[0] > 250);
+    try std.testing.expect(runs[0].rgba[1] < 5);
+    try std.testing.expect(runs[0].rgba[2] < 5);
+}
+
+test "reader applies DefaultRGB to image xobject device samples" {
+    const alloc = std.testing.allocator;
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const image_data = &.{ 128, 0, 0 };
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << /ColorSpace << /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    const expected = calibratedColor(.{ .rgb = .{
+        .white_point = .{ 0.95047, 1, 1.08883 },
+        .black_point = .{ 0, 0, 0 },
+        .gamma = .{ 2, 2, 2 },
+        .matrix = .{ 0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041 },
+    } }, .{ 128.0 / 255.0, 0, 0, 0 });
+    try std.testing.expectEqual(expected, runs[0].rgba[0..4].*);
+    try std.testing.expect(runs[0].rgba[0] != 128);
+}
+
+test "reader resolves resource-backed Indexed base color spaces" {
+    const alloc = std.testing.allocator;
+    const content = "/Im1 Do\n";
+    const image_data = [_]u8{1};
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/Indexed /CS1 1 <000000800000>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, &image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << /ColorSpace << /CS1 [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    const expected = calibratedColor(.{ .rgb = .{
+        .white_point = .{ 0.95047, 1, 1.08883 },
+        .black_point = .{ 0, 0, 0 },
+        .gamma = .{ 2, 2, 2 },
+        .matrix = .{ 0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041 },
+    } }, .{ 128.0 / 255.0, 0, 0, 0 });
+    try std.testing.expectEqual(expected, runs[0].rgba[0..4].*);
+}
+
+test "image cache keeps resource-scoped DefaultRGB decodes distinct" {
+    const alloc = std.testing.allocator;
+    const page_content = "/Fm1 Do\n/Fm2 Do\n";
+    const form_content = "/Im1 Do\n";
+    const image_data = &.{ 128, 0, 0 };
+    const page_stream = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content });
+    defer alloc.free(page_stream);
+    const calibrated_form = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /ColorSpace << /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> /XObject << /Im1 7 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ form_content.len, form_content },
+    );
+    defer alloc.free(calibrated_form);
+    const device_form = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /XObject << /Im1 7 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ form_content.len, form_content },
+    );
+    defer alloc.free(device_form);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "7 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << /XObject << /Fm1 5 0 R /Fm2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        page_stream,
+        calibrated_form,
+        device_form,
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expect(runs[0].shared_rgba != runs[1].shared_rgba);
+    const expected_calibrated = calibratedColor(.{ .rgb = .{
+        .white_point = .{ 0.95047, 1, 1.08883 },
+        .black_point = .{ 0, 0, 0 },
+        .gamma = .{ 2, 2, 2 },
+        .matrix = .{ 0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041 },
+    } }, .{ 128.0 / 255.0, 0, 0, 0 });
+    var saw_calibrated = false;
+    var saw_device = false;
+    for (runs) |run| {
+        saw_calibrated = saw_calibrated or std.mem.eql(u8, run.rgba[0..4], &expected_calibrated);
+        saw_device = saw_device or std.mem.eql(u8, run.rgba[0..4], &.{ 128, 0, 0, 255 });
+    }
+    try std.testing.expect(saw_calibrated);
+    try std.testing.expect(saw_device);
 }
 
 test "reader decodes CalGray image xobject draw" {
@@ -17998,7 +22648,7 @@ test "reader decodes CalGray image xobject draw" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalGray << /WhitePoint [1 1 1] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalGray << /WhitePoint [0.95047 1 1.08883] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ image_data.len, image_data },
         ),
     };
@@ -18034,9 +22684,9 @@ test "reader decodes CalGray image xobject draw" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), runs.len);
-    try std.testing.expectEqual(@as(u8, 127), runs[0].rgba[0]);
-    try std.testing.expectEqual(@as(u8, 127), runs[0].rgba[1]);
-    try std.testing.expectEqual(@as(u8, 127), runs[0].rgba[2]);
+    try std.testing.expect(runs[0].rgba[0] >= 180 and runs[0].rgba[0] <= 195);
+    try std.testing.expectEqual(runs[0].rgba[0], runs[0].rgba[1]);
+    try std.testing.expectEqual(runs[0].rgba[0], runs[0].rgba[2]);
 }
 
 test "reader decodes indexed image with indirect stream lookup" {
@@ -18092,6 +22742,30 @@ test "reader decodes indexed image with indirect stream lookup" {
     try std.testing.expectEqual(@as(u8, 255), runs[0].rgba[0]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[1]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
+}
+
+test "reader preserves packed native Indexed samples and clamps hival" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 2 /Length 1 >>\nstream\n\x1c\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+    }, decoded.rgba);
 }
 
 test "reader decodes Lab image xobject draw" {
@@ -18314,6 +22988,113 @@ test "reader applies PDF Decode after DCTDecode" {
     try std.testing.expect(runs[0].rgba[2] < 55);
 }
 
+test "reader applies resource DefaultRGB to DCTDecode samples" {
+    const alloc = std.testing.allocator;
+    const jpeg_base64 =
+        "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAEAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AD//Z";
+    const jpeg_size = try std.base64.standard.Decoder.calcSizeForSlice(jpeg_base64);
+    const jpeg_bytes = try alloc.alloc(u8, jpeg_size);
+    defer alloc.free(jpeg_bytes);
+    try std.base64.standard.Decoder.decode(jpeg_bytes, jpeg_base64);
+    const decoder_result = try image_lib.jpeg.decodeRgba(alloc, jpeg_bytes);
+    defer alloc.free(decoder_result.rgba);
+
+    const content = "/Im0 Do\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ jpeg_bytes.len, jpeg_bytes },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf = try Reader.init(alloc, sample);
+    defer pdf.deinit();
+    const runs = try pdf.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    for (0..2) |pixel| {
+        const source = pixel * 4;
+        const expected = calibratedColor(.{ .rgb = .{
+            .white_point = .{ 0.95047, 1, 1.08883 },
+            .black_point = .{ 0, 0, 0 },
+            .gamma = .{ 2, 2, 2 },
+            .matrix = .{ 0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041 },
+        } }, .{
+            @as(f64, @floatFromInt(decoder_result.rgba[source])) / 255.0,
+            @as(f64, @floatFromInt(decoder_result.rgba[source + 1])) / 255.0,
+            @as(f64, @floatFromInt(decoder_result.rgba[source + 2])) / 255.0,
+            0,
+        });
+        try std.testing.expectEqual(expected, runs[0].rgba[source..][0..4].*);
+    }
+}
+
+test "reader decodes unit-range four-component ICC DCT through native CMYK alternate" {
+    const alloc = std.testing.allocator;
+    const jpeg_base64 =
+        "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgAAQADBEMRAE0RAFkRAEsRAP/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD+P7/grF/ylN/4KWf9n/8A7ZH/AK0V8Rq/j+/4KWf8nFfDn/swD/gk7/66y/Y3r9+v+DXH/lBR+wz/AN3M/wDrYf7QVf38V//Z";
+    const jpeg_size = try std.base64.standard.Decoder.calcSizeForSlice(jpeg_base64);
+    const jpeg_bytes = try alloc.alloc(u8, jpeg_size);
+    defer alloc.free(jpeg_bytes);
+    try std.base64.standard.Decoder.decode(jpeg_bytes, jpeg_base64);
+    const expected = try image_lib.jpeg.decodeRgbaWithOptions(alloc, jpeg_bytes, .{ .four_component_mode = .jpeg_display });
+    defer alloc.free(expected.rgba);
+
+    const content = "/Im0 Do\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Decode [1 0 1 0 1 0 1 0] /Filter /DCTDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ jpeg_bytes.len, jpeg_bytes },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 4 /Range [0 1 0 1 0 1 0 1] /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf = try Reader.init(alloc, sample);
+    defer pdf.deinit();
+    const runs = try pdf.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(expected.width, runs[0].width);
+    try std.testing.expectEqual(expected.height, runs[0].height);
+    try std.testing.expectEqualSlices(u8, expected.rgba, runs[0].rgba);
+}
+
 test "reader ignores PDF Decode for JPXDecode image xobject draw" {
     const alloc = std.testing.allocator;
     const pixels = [_]u8{
@@ -18507,12 +23288,12 @@ test "reader resolves indirect predictor parameters before JPXDecode" {
 
 test "reader preserves native JPX samples for Indexed color spaces" {
     const alloc = std.testing.allocator;
-    const pixels = [_]u16{ 0, 1, 2 };
+    const pixels = [_]u16{ 0, 1, 4095 };
     const params = image_lib.jpeg2000.EncodeParams{
         .width = 3,
         .height = 1,
         .components = 1,
-        .bits_per_component = 4,
+        .bits_per_component = 12,
         .decomposition_levels = 0,
         .wavelet_transform = 1,
         .multiple_component_transform = false,
@@ -18527,7 +23308,7 @@ test "reader preserves native JPX samples for Indexed color spaces" {
         "4 0 obj\nnull\nendobj\n",
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 4 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 12 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ jp2_bytes.len, jp2_bytes },
         ),
     };
@@ -18545,6 +23326,15 @@ test "reader preserves native JPX samples for Indexed color spaces" {
         0,   255, 0,   255,
         0,   0,   255, 255,
     }, decoded.rgba);
+}
+
+test "Indexed JPX rendering does not reserve continuous alpha scratch" {
+    var metadata = image_lib.jpeg2000.Jp2ColorMetadata{};
+    metadata.channel_definitions[0] = .{ .channel = 0, .kind = .color, .association = 1 };
+    metadata.channel_definitions[1] = .{ .channel = 1, .kind = .opacity, .association = 0 };
+
+    try std.testing.expectEqual(@as(usize, 0), try jpeg2000RendererScratchLen(4096, metadata, 2, true));
+    try std.testing.expectEqual(@as(usize, 4096), try jpeg2000RendererScratchLen(4096, metadata, 2, false));
 }
 
 test "reader bounds full-resolution JPX fallback when reduced multi-tile decode is unsupported" {
@@ -18946,7 +23736,7 @@ fn packBitsMsbAlloc(alloc: Allocator, bits: []const u8) ![]u8 {
     return out;
 }
 
-test "reader decodes CCITTFaxDecode image xobject draw" {
+test "reader decodes CCITTFaxDecode with singleton device color-space array" {
     const alloc = std.testing.allocator;
     const bits =
         "000000000001" ++
@@ -18970,7 +23760,7 @@ test "reader decodes CCITTFaxDecode image xobject draw" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 /Rows 1 >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 1 /ColorSpace [/DeviceGray] /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 /Rows 1 >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ image_data.len, image_data },
         ),
     };
@@ -19209,7 +23999,7 @@ test "reader decodes 1-bit image mask xobject" {
     const alloc = std.testing.allocator;
     // PDF's default stencil Decode [0 1] paints zero samples.
     const image_data = &.{0b00000000};
-    const content = "q\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
+    const content = "q\n/DeviceRGB cs\n0.2 0.4 0.6 sc\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
@@ -19257,6 +24047,577 @@ test "reader decodes 1-bit image mask xobject" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[1]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
     try std.testing.expectEqual(@as(u8, 0xff), runs[0].rgba[3]);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 51, 102, 153, 255 }), runs[0].stencil_color);
+}
+
+test "color space selection uses value state and PDF initial colors" {
+    var rgb_name = [_]u8{ 'R', 'e', 's', 'o', 'u', 'r', 'c', 'e', 'R', 'G', 'B' };
+    var short_alias_name = [_]u8{ 'R', 'G', 'B' };
+    var pattern_name = [_]u8{ 'R', 'e', 's', 'o', 'u', 'r', 'c', 'e', 'P', 'a', 't', 't', 'e', 'r', 'n' };
+    const color_spaces = [_]PageColorSpace{
+        .{ .name = &rgb_name, .selection = colorSpaceSelectionForKind(.device_rgb) },
+        .{ .name = &short_alias_name, .selection = colorSpaceSelectionForKind(.device_gray) },
+        .{ .name = &pattern_name, .selection = colorSpaceSelectionForPattern(colorSpaceSelectionForKind(.device_cmyk).value) },
+    };
+    var state = GraphicsState{
+        .fill_color = .{ 255, 0, 0, 255 },
+        .stroke_color = .{ 255, 255, 255, 255 },
+        .color_spaces = &color_spaces,
+        .fill_pattern_name = "FillPattern",
+        .stroke_pattern_name = "StrokePattern",
+    };
+
+    selectFillColorSpace(&state, "DeviceCMYK");
+    try std.testing.expectEqual(ColorSpaceKind.device_cmyk, state.fill_color_space.kind);
+    try std.testing.expectEqual(cmykColor(0, 0, 0, 1), state.fill_color);
+    try std.testing.expectEqual(@as(?[]const u8, null), state.fill_pattern_name);
+
+    selectStrokeColorSpace(&state, "ResourceRGB");
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, state.stroke_color_space.kind);
+    try std.testing.expectEqual(@as([4]u8, .{ 0, 0, 0, 255 }), state.stroke_color);
+    try std.testing.expectEqual(@as(?[]const u8, null), state.stroke_pattern_name);
+
+    selectFillColorSpace(&state, "ResourcePattern");
+    try std.testing.expectEqual(ColorSpaceKind.pattern, state.fill_color_space.kind);
+    try std.testing.expectEqual(ColorSpaceKind.device_cmyk, state.fill_color_space.pattern_base.?.kind);
+
+    // G/RGB/CMYK are inline-image abbreviations, not global cs/CS aliases.
+    selectFillColorSpace(&state, "RGB");
+    try std.testing.expectEqual(ColorSpaceKind.device_gray, state.fill_color_space.kind);
+
+    selectFillColorSpace(&state, "ResourceBacked");
+    try std.testing.expectEqual(ColorSpaceKind.unsupported, state.fill_color_space.kind);
+}
+
+test "unused dangling color space resources do not abort page rendering" {
+    const alloc = std.testing.allocator;
+    const content = "1 0 0 rg\n0 0 10 10 re\nf\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /Unused 99 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var runs = try reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), runs.shape_runs.len);
+    try std.testing.expectEqual([4]u8{ 0xff, 0, 0, 0xff }, runs.shape_runs[0].color);
+
+    const shape_runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (shape_runs) |*run| run.deinit(alloc);
+        alloc.free(shape_runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), shape_runs.len);
+
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 0), text.len);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), analysis.runs.len);
+    const text_runs = try reader.extractPageTextRunsAlloc(1);
+    defer alloc.free(text_runs);
+    try std.testing.expectEqual(@as(usize, 0), text_runs.len);
+    const image_runs = try reader.extractPageImageRunsAlloc(1);
+    defer alloc.free(image_runs);
+    try std.testing.expectEqual(@as(usize, 0), image_runs.len);
+    const shading_runs = try reader.extractPageShadingRunsAlloc(1);
+    defer alloc.free(shading_runs);
+    try std.testing.expectEqual(@as(usize, 0), shading_runs.len);
+    const pattern_runs = try reader.extractPagePatternRunsAlloc(1);
+    defer alloc.free(pattern_runs);
+    try std.testing.expectEqual(@as(usize, 0), pattern_runs.len);
+}
+
+test "sampled Separation color space interpolates non-byte-aligned tint samples" {
+    const alloc = std.testing.allocator;
+    const content =
+        "/Spot cs\n" ++
+        "0 0 2 2 re f\n" ++
+        "0 scn 2 0 2 2 re f\n" ++
+        "0.5 scn 4 0 2 2 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 6 2] /Resources << /ColorSpace << /Spot [/Separation /Ink /DeviceRGB 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        // Two RGB samples packed at four bits/component: white then red.
+        "5 0 obj\n<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 4 /Length 3 >>\nstream\n\xff\xff\x00\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 3), runs.len);
+    try std.testing.expectEqual(rgbColor(1, 0, 0), runs[0].color);
+    try std.testing.expectEqual(rgbColor(1, 1, 1), runs[1].color);
+    try std.testing.expectEqual(rgbColor(1, 0.5, 0.5), runs[2].color);
+}
+
+test "ICCBased shading evaluates a stitched sampled function" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace [/ICCBased 7 0 R] /Coords [0 0 10 0] /Function 6 0 R /Extend [true true] >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [8 0 R] /Bounds [] /Encode [0 1] >>\nendobj\n",
+        "7 0 obj\n<< /N 3 /Length 0 >>\nstream\nendstream\nendobj\n",
+        "8 0 obj\n<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 8 /Length 6 >>\nstream\n\xff\x00\x00\x00\x00\xff\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShadingRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, shading_color_sample_count), runs[0].color_sample_count);
+    try std.testing.expectEqual([4]u8{ 0xff, 0, 0, 0xff }, runs[0].color_samples[0]);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[shading_color_sample_count - 1]);
+    try std.testing.expect(runs[0].color_samples[shading_color_sample_count / 2][0] < 0xff);
+    try std.testing.expect(runs[0].color_samples[shading_color_sample_count / 2][2] > 0);
+}
+
+test "one-ink DeviceN color space applies exponential tint transform" {
+    const alloc = std.testing.allocator;
+    const content = "/Ink cs\n0.25 scn\n0 0 2 2 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2 2] /Resources << /ColorSpace << /Ink [/DeviceN [/Black] /DeviceGray 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [1] /C1 [0] /N 2 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(grayColor(0.9375), runs[0].color);
+}
+
+test "sampled graphics tint tables are bounded before stream decoding" {
+    const alloc = std.testing.allocator;
+    const content = "/Spot cs\n0 scn\n0 0 2 2 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2 2] /Resources << /ColorSpace << /Spot [/Separation /Ink /DeviceRGB 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [4097] /BitsPerSample 8 /Length 0 >>\nstream\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.UnsupportedPdfRendering, reader.extractPageShapeRunsAlloc(1));
+}
+
+test "unembedded Latin Standard-14 fonts use deterministic native outlines" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n10 20 Td\n(Hello) Tj\nET\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 40] /Resources << /Font << /F1 5 0 R /Unused 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n",
+        "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var runs = try reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), runs.text_runs.len);
+    try std.testing.expect(runs.text_runs[0].vectorizable);
+    try std.testing.expect(runs.shape_runs.len > 0);
+    try std.testing.expectEqual(@as(u32, 1), runs.diagnostics.vector_text_groups);
+    try std.testing.expectEqual(@as(u32, 0), runs.diagnostics.fallback_text_groups);
+    try std.testing.expectEqual(@as(usize, 1), reader.font_cache.count());
+    var cached_fonts = reader.font_cache.valueIterator();
+    const cached_font = cached_fonts.next().?;
+    try std.testing.expect(cached_font.truetype != null);
+    try std.testing.expect(!cached_font.truetype.?.owns_bytes);
+    try std.testing.expectEqual(@intFromPtr(standard_fonts.regular.ptr), @intFromPtr(cached_font.truetype.?.bytes.ptr));
+    try std.testing.expectEqual(@as(?bool, false), standard14LatinFontIsBold("ABCDEF+Times-Italic"));
+    try std.testing.expectEqual(@as(?bool, true), standard14LatinFontIsBold("Helvetica-BoldOblique"));
+    try std.testing.expectEqual(@as(?bool, null), standard14LatinFontIsBold("Symbol"));
+}
+
+test "unembedded nonsymbolic simple fonts use deterministic native substitutes" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 12 Tf 10 30 Td (Regular) Tj /F2 12 Tf 0 -15 Td (Bold) Tj ET\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /ExampleSans /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /Type /FontDescriptor /FontName /ExampleSans /Flags 32 >>\nendobj\n",
+        "7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /ExampleSans-Semibold /Encoding /WinAnsiEncoding /FontDescriptor 8 0 R >>\nendobj\n",
+        "8 0 obj\n<< /Type /FontDescriptor /FontName /ExampleSans-Semibold /Flags 32 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var runs = try reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), runs.text_runs.len);
+    try std.testing.expect(runs.text_runs[0].vectorizable);
+    try std.testing.expect(runs.text_runs[1].vectorizable);
+    try std.testing.expect(runs.shape_runs.len > 0);
+    try std.testing.expectEqual(@as(u32, 2), runs.diagnostics.vector_text_groups);
+    try std.testing.expectEqual(@as(u32, 0), runs.diagnostics.fallback_text_groups);
+    try std.testing.expectEqual(@as(?bool, true), substituteLatinFontIsBold("ABCDEF+StoneSans-Semibold"));
+    try std.testing.expectEqual(@as(?bool, false), substituteLatinFontIsBold("TimesNewRomanPSMT"));
+    try std.testing.expectEqual(@as(?bool, null), substituteLatinFontIsBold("CustomSymbol"));
+}
+
+test "shading domain and stitching discontinuity survive bounded sampling" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Domain [2 4] /Function 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [2 4] /Functions [7 0 R 8 0 R] /Bounds [3] /Encode [0 1 0 1] >>\nendobj\n",
+        "7 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
+        "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    const runs = try pdf_reader.extractPageShadingRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, shading_uniform_color_sample_count + 2), runs[0].color_sample_count);
+    var boundary_index: ?usize = null;
+    for (runs[0].color_sample_positions[0..runs[0].color_sample_count], 0..) |position, index| {
+        if (position == 0.5 and index + 1 < runs[0].color_sample_count and
+            runs[0].color_sample_positions[index + 1] == 0.5)
+        {
+            boundary_index = index;
+            break;
+        }
+    }
+    const index = boundary_index orelse return error.TestExpectedEqual;
+    try std.testing.expect(runs[0].color_samples[index][0] > 0xf0);
+    try std.testing.expect(runs[0].color_samples[index][2] == 0);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index + 1]);
+}
+
+test "nested stitching discontinuities remain reachable and unused shadings stay lazy" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R /Unused 10 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [7 0 R] /Bounds [] /Encode [1 0] >>\nendobj\n",
+        "7 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [8 0 R 9 0 R] /Bounds [0.5] /Encode [0 1 0 1] >>\nendobj\n",
+        "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
+        "9 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
+        "10 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function << /FunctionType 4 >> >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    const runs = try pdf_reader.extractPageShadingRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, shading_uniform_color_sample_count + 2), runs[0].color_sample_count);
+    var boundary_index: ?usize = null;
+    for (runs[0].color_sample_positions[0..runs[0].color_sample_count], 0..) |position, index| {
+        if (position == 0.5 and index + 1 < runs[0].color_sample_count and
+            runs[0].color_sample_positions[index + 1] == 0.5)
+        {
+            boundary_index = index;
+            break;
+        }
+    }
+    const index = boundary_index orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index]);
+    try std.testing.expect(runs[0].color_samples[index + 1][0] > 0xf0);
+    try std.testing.expect(runs[0].color_samples[index + 1][2] == 0);
+    try std.testing.expectEqual(@as(u8, 1), runs[0].exact_boundary_count);
+    try std.testing.expectEqual(@as(f64, 0.5), runs[0].exact_boundary_positions[0]);
+    // The nested function chooses its right-hand child at equality. A reversed
+    // parent Encode maps that exact value to the root-left color, not the
+    // root-right interpolation sample.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].exact_boundary_colors[0]);
+}
+
+test "default device color spaces remap abbreviated explicit and initial selections" {
+    const alloc = std.testing.allocator;
+    const content =
+        "0 0 3 3 re f\n" ++
+        "0 0 1 rg 3 0 3 3 re f\n" ++
+        "/DeviceRGB cs 1 0 0 sc 6 0 3 3 re f\n" ++
+        "0 0 0 0 k 9 0 3 3 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 3] /Resources << /ColorSpace << /DefaultGray [/ICCBased 5 0 R] /DefaultRGB [/ICCBased 6 0 R] /DefaultCMYK [/ICCBased 7 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        "6 0 obj\n<< /N 3 /Alternate /DeviceRGB /Range [0.25 0.75 0.25 0.75 0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        "7 0 obj\n<< /N 4 /Alternate /DeviceCMYK /Range [0.25 0.75 0.25 0.75 0.25 0.75 0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 4), runs.len);
+    try std.testing.expectEqual(grayColor(0.25), runs[0].color);
+    try std.testing.expectEqual(rgbColor(0.25, 0.25, 0.75), runs[1].color);
+    try std.testing.expectEqual(rgbColor(0.75, 0.25, 0.25), runs[2].color);
+    try std.testing.expectEqual(cmykColor(0.25, 0.25, 0.25, 0.25), runs[3].color);
+}
+
+test "default device color spaces preserve native calibrated transforms" {
+    const alloc = std.testing.allocator;
+    const content = "0.5 g 0 0 3 3 re f\n0.5 0.5 0.5 rg 3 0 3 3 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 6 3] /Resources << /ColorSpace << /DefaultGray [/CalGray << /WhitePoint [0.95047 1 1.08883] /Gamma 2 >>] /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expect(runs[0].color[0] >= 130 and runs[0].color[0] <= 145);
+    try std.testing.expectEqual(runs[0].color[0], runs[0].color[1]);
+    try std.testing.expectEqual(runs[0].color[0], runs[0].color[2]);
+    try std.testing.expectEqual(runs[0].color, runs[1].color);
+    try std.testing.expect(runs[0].color[0] != grayColor(0.5)[0]);
+}
+
+test "declared unsupported default device color space preserves device fallback" {
+    const alloc = std.testing.allocator;
+    const content = "0.5 g 0 0 3 3 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /DefaultGray [/Separation /Spot /DeviceGray 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(grayColor(0.5), runs[0].color);
+}
+
+test "ICCBased graphics state honors range for initial and explicit colors" {
+    const alloc = std.testing.allocator;
+    const content = "/ICC cs\n0 0 4 4 re\nf\n-1 0.5 2 sc\n5 0 4 4 re\nf\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /ICC [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 3 /Alternate /DeviceRGB /Range [0.25 0.75 0.25 0.75 0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expectEqual([4]u8{ 64, 64, 64, 0xff }, runs[0].color);
+    try std.testing.expectEqual([4]u8{ 64, 128, 191, 0xff }, runs[1].color);
+}
+
+test "pattern color space without scn emits no solid shape" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractShapeRunsFromContentAppend(alloc, &runs, "/Pattern cs\n0 0 10 10 re\nf\n", &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), runs.items.len);
+}
+
+test "unsupported shape color space fails closed when painted" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        extractShapeRunsFromContentAppend(alloc, &runs, "/CS1 cs\n0 0 10 10 re\nf\n", &.{}, &.{}),
+    );
+}
+
+test "pattern color space without scn suppresses only its text paint channel" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractTextRunsFromContentAppend(
+        alloc,
+        &runs,
+        "/Pattern cs\nBT\n(No fill) Tj\n/DeviceGray CS\n2 Tr\n(Stroke) Tj\nET\n",
+        &.{},
+        &.{},
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqualStrings("Stroke", runs.items[0].text);
+    try std.testing.expectEqual(@as(i64, 1), runs.items[0].render_mode);
+}
+
+test "unsupported text color space fails closed when painted" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        extractTextRunsFromContentAppend(alloc, &runs, "/CS1 cs\nBT\n(Unsupported) Tj\nET\n", &.{}, &.{}, &.{}),
+    );
 }
 
 test "reader applies soft mask image alpha" {
@@ -19326,6 +24687,207 @@ test "reader applies soft mask image alpha" {
     var image = try constrained.readIndirectObject(.{ .id = 5, .gen = 0 });
     defer image.deinit(alloc);
     try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, constrained.decodeImageToRgbaAlloc(&image));
+}
+
+test "Indexed palette stream decode reserves retained image working set" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 32,
+        .max_working_set_bytes = 32,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    // The retained image consumes 28 bytes and the palette RGBA reserve uses
+    // the remaining four, so stream decoding must fail before allocating.
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 28, .palette_rgba),
+    );
+}
+
+test "Indexed palette stream metadata is bounded before payload decode" {
+    const alloc = std.testing.allocator;
+    const oversized_header_value = "x" ** 4096;
+    const palette_object = try std.fmt.allocPrint(
+        alloc,
+        "3 0 obj\n<< /Length 3 /Unused ({s}) >>\nstream\nabc\nendstream\nendobj\n",
+        .{oversized_header_value},
+    );
+    defer alloc.free(palette_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        palette_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 2048,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
+test "Indexed indirect lookup strings resolve within the aggregate working set" {
+    const alloc = std.testing.allocator;
+    const valid_objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n(abc)\nendobj\n",
+    };
+    const valid_sample = try buildImageDecodeTestPdfAlloc(alloc, &valid_objects);
+    defer alloc.free(valid_sample);
+    var valid_reader = try Reader.initWithDecodeLimits(alloc, valid_sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 1024,
+    });
+    defer valid_reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var palette = try valid_reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba);
+    defer palette.deinit(alloc);
+    try std.testing.expectEqualStrings("abc", palette.lookup);
+
+    const oversized_lookup = "a" ** 128;
+    const oversized_object = try std.fmt.allocPrint(
+        alloc,
+        "3 0 obj\n({s})\nendobj\n",
+        .{oversized_lookup},
+    );
+    defer alloc.free(oversized_object);
+    const oversized_objects = [_][]const u8{
+        valid_objects[0],
+        valid_objects[1],
+        oversized_object,
+    };
+    const oversized_sample = try buildImageDecodeTestPdfAlloc(alloc, &oversized_objects);
+    defer alloc.free(oversized_sample);
+    var constrained_reader = try Reader.initWithDecodeLimits(alloc, oversized_sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 64,
+    });
+    defer constrained_reader.deinit();
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        constrained_reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
+test "Indexed palette terminal limit permits larger intermediate filters" {
+    const alloc = std.testing.allocator;
+    const lookup = [_]u8{ 0x12, 0x34, 0x56 };
+    const predicted = [_]u8{ 0, lookup[0], lookup[1], lookup[2] };
+    var compressed_storage: [256]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&compressed_storage);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output, history[0..], .zlib, .default);
+    try compressor.writer.writeAll(&predicted);
+    try compressor.finish();
+    const compressed = output.buffered();
+    try std.testing.expect(compressed.len > lookup.len);
+
+    const encoded_len = try std.math.add(usize, try std.math.mul(usize, compressed.len, 2), 1);
+    const ascii_hex = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(ascii_hex);
+    const digits = "0123456789ABCDEF";
+    for (compressed, 0..) |byte, index| {
+        ascii_hex[index * 2] = digits[byte >> 4];
+        ascii_hex[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    ascii_hex[ascii_hex.len - 1] = '>';
+
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        try std.fmt.allocPrint(
+            alloc,
+            "3 0 obj\n<< /Length {d} /Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Colors 3 /BitsPerComponent 8 /Columns 1 >>] >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ ascii_hex.len, ascii_hex },
+        ),
+    };
+    defer alloc.free(objects[2]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 4096,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var palette = try reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba);
+    defer palette.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &lookup, palette.lookup);
+}
+
+test "Indexed unfiltered palette is rejected before copying excess data" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DecodedStreamTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
+test "Indexed empty filter array is preflighted as an unfiltered stream" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 6 /Filter [] >>\nstream\nabcdef\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DecodedStreamTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
 }
 
 fn buildImageDecodeTestPdfAlloc(alloc: Allocator, objects: []const []const u8) ![]u8 {
@@ -19487,6 +25049,27 @@ test "soft-mask Matte reverses parent sample preblending" {
         "4 0 obj\nnull\nendobj\n",
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\n\x80\x00\x00\nendstream\nendobj\n",
         "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0 0 0] /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00, 0x80 }, decoded.rgba);
+}
+
+test "soft-mask Matte reverses Indexed lookup colors before base conversion" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 <000000800000>] /BitsPerComponent 8 /SMask 6 0 R /Length 1 >>\nstream\n\x01\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0] /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
@@ -20212,6 +25795,25 @@ test "native Matte reversal precedes PDF Decode mapping" {
     try std.testing.expectEqual(@as(u8, 0xff), rgba[3]);
 }
 
+test "native Matte reversal uses non-unit ICC Decode domain" {
+    var samples = [_]u8{128};
+    const mask = [_]u8{ 128, 128, 128, 255 };
+    const decode_values = [_]syntax.Object{ .{ .integer = 2 }, .{ .integer = 4 } };
+    const decode = syntax.Object{ .array = @constCast(&decode_values) };
+    try applyResampledMatteToSamples(.{
+        .data = .{ .u8 = &samples },
+        .pixel_count = 1,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 8,
+    }, 1, 1, &mask, 1, 1, false, .{
+        .component_count = 1,
+        .components = .{ 0, 0, 0, 0 },
+        .ranges = .{ .{ .min = 2, .max = 4 }, .{}, .{}, .{} },
+    }, &decode);
+    try std.testing.expect(samples[0] > 253);
+}
+
 test "mask decode context rejects an active reference immediately" {
     const alloc = std.testing.allocator;
     var context = ImageDecodeContext{};
@@ -20602,6 +26204,50 @@ test "reader preserves polygon clip on shape runs" {
     try std.testing.expect(runs.items[0].clip_points != null);
     try std.testing.expectEqual(@as(usize, 3), runs.items[0].clip_points.?.len);
     try std.testing.expectEqual(FillRule.even_odd, runs.items[0].clip_fill_rule);
+}
+
+test "reader preserves compound nonzero fill contours" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    // Opposite rectangle winding produces a frame under the nonzero rule.
+    try extractShapeRunsFromContentAppend(
+        alloc,
+        &runs,
+        "90 90 -80 -80 re 20 80 60 -60 re f",
+        &.{},
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4 }, runs.items[0].subpath_starts.?);
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, runs.items[0].subpath_closed.?);
+    try std.testing.expectEqual(@as(usize, 8), runs.items[0].points.len);
+}
+
+test "reader preserves mixed open and closed stroked subpaths" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractShapeRunsFromContentAppend(
+        alloc,
+        &runs,
+        "0 0 m 10 0 l 20 0 m 20 10 l h S",
+        &.{},
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, runs.items[0].subpath_starts.?);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, runs.items[0].subpath_closed.?);
 }
 
 test "reader intersects repeated clips on shape runs" {
@@ -21523,6 +27169,8 @@ test "reader extracts text and shapes through form xobject" {
         for (shape_runs) |*run| run.deinit(alloc);
         alloc.free(shape_runs);
     }
+    var render_runs = try reader.extractPageRenderRunsForRasterAlloc(1, 200, 200);
+    defer render_runs.deinit(alloc);
 
     try std.testing.expect(std.mem.indexOf(u8, page_text, "Hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hi") != null);
@@ -21532,12 +27180,17 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expectEqualStrings("Hi", text_runs[0].text);
     try std.testing.expectEqual(@as(usize, 1), shape_runs.len);
     try std.testing.expect(shape_runs[0].paint_order < text_runs[0].paint_order);
+    try std.testing.expectEqual(@as(u32, 1), render_runs.diagnostics.vector_text_groups);
+    try std.testing.expectEqual(@as(u32, 0), render_runs.diagnostics.fallback_text_groups);
+    try std.testing.expect(render_runs.shape_runs.len > shape_runs.len);
+    try std.testing.expectEqual(@as(?*const PageFont, null), render_runs.text_runs[0].render_font);
 }
 
-test "reader shares one decoded image across independent form xobjects" {
+test "reader shares one decoded image mask while preserving per-use stencil color" {
     const alloc = std.testing.allocator;
-    const image_data = [_]u8{ 0xff, 0, 0 };
-    const form_content = "q\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
+    const image_data = [_]u8{0};
+    const red_form_content = "/CSRGB cs\n1 0 0 sc\nq\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
+    const blue_form_content = "0 0 1 rg\nq\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
     const page_content = "q\n/Fm1 Do\n/Fm2 Do\nQ\n";
     const obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
     const obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
@@ -21546,20 +27199,20 @@ test "reader shares one decoded image across independent form xobjects" {
     defer alloc.free(obj4);
     const obj5 = try std.fmt.allocPrint(
         alloc,
-        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
-        .{ form_content.len, form_content },
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /ColorSpace << /CSRGB /DeviceRGB >> /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ red_form_content.len, red_form_content },
     );
     defer alloc.free(obj5);
     const obj6 = try std.fmt.allocPrint(
         alloc,
-        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
         .{ image_data.len, image_data },
     );
     defer alloc.free(obj6);
     const obj7 = try std.fmt.allocPrint(
         alloc,
         "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
-        .{ form_content.len, form_content },
+        .{ blue_form_content.len, blue_form_content },
     );
     defer alloc.free(obj7);
 
@@ -21606,6 +27259,8 @@ test "reader shares one decoded image across independent form xobjects" {
     try std.testing.expect(image_runs[0].shared_rgba != null);
     try std.testing.expectEqual(image_runs[0].shared_rgba, image_runs[1].shared_rgba);
     try std.testing.expectEqual(image_runs[0].rgba.ptr, image_runs[1].rgba.ptr);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 255, 0, 0, 255 }), image_runs[0].stencil_color);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 0, 0, 255, 255 }), image_runs[1].stencil_color);
 }
 
 test "reader does not decode images below an unused form xobject" {
@@ -21748,7 +27403,7 @@ test "reader assigns group ids for isolated transparency form runs" {
 
 test "reader extracts colored tiling pattern runs" {
     const alloc = std.testing.allocator;
-    const pattern_content = "1 0 0 rg\n0 0 5 10 re\nf\n";
+    const pattern_content = "/TileRGB cs\n1 0 0 sc\n0 0 5 10 re\nf\n";
     const page_content = "/Pattern cs\n/P1 scn\n0 0 40 20 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -21757,7 +27412,7 @@ test "reader extracts colored tiling pattern runs" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /ColorSpace << /TileRGB /DeviceRGB >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
             .{ pattern_content.len, pattern_content },
         ),
     };
@@ -21792,6 +27447,7 @@ test "reader extracts colored tiling pattern runs" {
     }
     try std.testing.expectEqual(@as(usize, 1), runs.len);
     try std.testing.expectEqual(@as(usize, 1), runs[0].tile_shape_runs.len);
+    try std.testing.expectEqual(@as([4]u8, .{ 0xff, 0x00, 0x00, 0xff }), runs[0].tile_shape_runs[0].color);
     try std.testing.expectApproxEqAbs(@as(f64, 0), runs[0].pattern_bbox.min_x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), runs[0].pattern_bbox.min_y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 10), runs[0].pattern_bbox.max_x, 0.0001);
@@ -21803,11 +27459,11 @@ test "reader extracts colored tiling pattern runs" {
 test "reader extracts uncolored tiling pattern base color" {
     const alloc = std.testing.allocator;
     const pattern_content = "0 0 5 10 re\nf\n";
-    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 40 20 re\nf\n";
+    const page_content = "/GS gs\n/CS1 cs\n0 1 0 /P1 scn\n0 0 40 20 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS << /ca 0.5 >> >> /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,
@@ -21845,26 +27501,156 @@ test "reader extracts uncolored tiling pattern base color" {
         alloc.free(runs);
     }
     try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs[0].tile_shape_runs.len);
     try std.testing.expect(runs[0].base_color != null);
     try std.testing.expectEqual([4]u8{ 0x00, 0xff, 0x00, 0xff }, runs[0].base_color.?);
+    try std.testing.expectEqual(@as(u8, 0x80), runs[0].tile_shape_runs[0].color[3]);
+}
+
+test "pattern cell materializes inherited paint for every content parser" {
+    const outer = GraphicsState{
+        .fill_color = .{ 0x11, 0x22, 0x33, 0xff },
+        .stroke_color = .{ 0x44, 0x55, 0x66, 0xff },
+        .fill_color_space = colorSpaceSelectionForKind(.pattern),
+        .stroke_color_space = colorSpaceSelectionForKind(.pattern),
+        .fill_pattern_name = "FillPattern",
+        .stroke_pattern_name = "StrokePattern",
+    };
+
+    const graphics = buildPatternGraphicsState(outer, &.{});
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.fill_color_space.kind);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.stroke_color_space.kind);
+    try std.testing.expect(graphics.fill_pattern_name == null);
+    try std.testing.expect(graphics.stroke_pattern_name == null);
+    try std.testing.expectEqual(outer.fill_color, graphics.fill_color);
+    try std.testing.expectEqual(outer.stroke_color, graphics.stroke_color);
+    try std.testing.expect(try solidShapePaintAvailable(graphics.fill_color_space.kind));
+
+    var text = buildPatternTextState(outer, &.{});
+    text.render_mode = 2;
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.fill_color_space.kind);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.stroke_color_space.kind);
+    try std.testing.expectEqual(@as(i64, 2), try effectiveTextRenderMode(text));
+}
+
+test "reader applies uncolored tiling pattern base color to image masks" {
+    const alloc = std.testing.allocator;
+    const page_content = "/CS1 cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const pattern_content = "q\n5 0 0 5 0 0 cm\n/Im1 Do\nQ\n";
+    const image_data = [_]u8{0};
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ pattern_content.len, pattern_content },
+        ),
+        try std.fmt.allocPrint(
+            alloc,
+            "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ image_data.len, image_data },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[5]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    const runs = try parsed.extractPagePatternRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs[0].tile_image_runs.len);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 0x00, 0xff, 0x00, 0xff }), runs[0].tile_image_runs[0].stencil_color);
+}
+
+test "reader represents pattern-painted image masks as stencil pattern runs" {
+    const alloc = std.testing.allocator;
+    const page_content = "/Pattern cs\n/P1 scn\nq\n10 0 0 10 2 3 cm\n/Im1 Do\nQ\n";
+    const pattern_content = "1 0 0 rg\n0 0 2 2 re\nf\n";
+    const image_data = [_]u8{0};
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /Pattern << /P1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 2 2] /XStep 2 /YStep 2 /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ pattern_content.len, pattern_content },
+        ),
+        try std.fmt.allocPrint(
+            alloc,
+            "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ image_data.len, image_data },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[5]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    var runs = try parsed.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runs.image_runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs.pattern_runs.len);
+    const stencil = runs.pattern_runs[0].stencil_mask orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 1), stencil.width);
+    try std.testing.expectEqual(@as(u32, 1), stencil.height);
+    try std.testing.expectEqual(@as(f64, 10), stencil.a);
+    try std.testing.expectEqual(@as(f64, 10), stencil.d);
+    try std.testing.expectEqual(@as(f64, 2), stencil.e);
+    try std.testing.expectEqual(@as(f64, 3), stencil.f);
 }
 
 test "reader extracts vector text pattern runs" {
     const alloc = std.testing.allocator;
     const page_content =
+        "q\n" ++
+        "/GS gs\n" ++
+        "2 0 0 3 4 5 cm\n" ++
         "BT\n" ++
         "/F1 20 Tf\n" ++
         "/Pattern cs\n" ++
         "/P1 scn\n" ++
         "10 10 Td\n" ++
         "(A) Tj\n" ++
-        "ET\n";
+        "ET\n" ++
+        "Q\n";
     const pattern_content = "1 0 0 rg\n0 0 5 10 re\nf\n";
     const glyph_content = "1000 0 d0\n0 0 1000 1000 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS << /ca 0.5 >> >> /Font << /F1 5 0 R >> /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         "5 0 obj\n<< /Type /Font /Subtype /Type3 /PaintType 2 /FontMatrix [0.001 0 0 0.001 0 0] /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [1000] /CharProcs << /A 7 0 R >> >>\nendobj\n",
         try std.fmt.allocPrint(
@@ -21910,6 +27696,61 @@ test "reader extracts vector text pattern runs" {
     try std.testing.expectEqual(@FieldType(PatternRun, "mode").tiling, runs[0].mode);
     try std.testing.expect(runs[0].points.len >= 3);
     try std.testing.expectEqual(@as(usize, 1), runs[0].tile_shape_runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), runs[0].pattern_matrix.a, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), runs[0].pattern_matrix.d, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 4), runs[0].pattern_matrix.e, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_matrix.f, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x80), runs[0].tile_shape_runs[0].color[3]);
+}
+
+test "vector text shading patterns preserve graphics CTM and stroke alpha" {
+    const alloc = std.testing.allocator;
+    const pattern = PagePattern{
+        .name = @constCast("P1"),
+        .kind = .shading,
+        .content = @constCast(""),
+        .bbox = .{ .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 },
+        .x_step = 0,
+        .y_step = 0,
+        .matrix = .{ .e = 5 },
+        .shading = .{
+            .name = @constCast("S1"),
+            .kind = .axial,
+            .x0 = 0,
+            .y0 = 0,
+            .x1 = 10,
+            .y1 = 0,
+            .c0 = .{ 0xff, 0, 0, 0xff },
+            .c1 = .{ 0, 0, 0xff, 0xff },
+        },
+    };
+    var points = [_][2]f64{ .{ 4, 5 }, .{ 24, 5 } };
+    const shape = ShapeRun{
+        .kind = .stroke,
+        .color = .{ 0, 0, 0, 0x80 },
+        .stroke_width = 2,
+        .closed = false,
+        .points = &points,
+    };
+    const text_run = TextRun{
+        .text = "A",
+        .x = 4,
+        .y = 5,
+        .font_size = 10,
+        .graphics_matrix = .{ .a = 2, .d = 3, .e = 4, .f = 5 },
+        .stroke_color = .{ 0, 0, 0, 0xff },
+        .stroke_alpha = 0x80,
+        .stroke_width = 2,
+    };
+    var run = try buildPatternRunFromShapeAlloc(alloc, &pattern, shape, text_run);
+    defer run.deinit(alloc);
+
+    try std.testing.expectEqual(@FieldType(PatternRun, "kind").stroke, run.kind);
+    try std.testing.expectEqual(@FieldType(PatternRun, "mode").shading, run.mode);
+    try std.testing.expectApproxEqAbs(@as(f64, 14), run.shading.?.x0, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 34), run.shading.?.x1, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x80), run.shading.?.c0[3]);
+    try std.testing.expectEqual(@as(u8, 0x80), run.shading.?.c1[3]);
 }
 
 test "reader preserves nested tiling patterns" {
@@ -22037,11 +27878,13 @@ test "reader preserves vector text pattern paint inside tiling patterns" {
 
 test "reader emits shading runs for shading patterns" {
     const alloc = std.testing.allocator;
-    const page_content = "/Pattern cs\n/P1 scn\n0 0 40 20 re\nf\n";
+    const page_content =
+        "/Pattern cs\n/P1 scn\n0 0 40 20 re\nf\n" ++
+        "/GS gs\n/Pattern CS\n/P1 SCN\n5 w\n0 30 m\n40 30 l\nS\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS << /CA 0.25 >> >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         "5 0 obj\n<< /Type /Pattern /PatternType 2 /Matrix [1 0 0 1 5 0] /Shading 6 0 R >>\nendobj\n",
         "6 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 7 0 R /Extend [true true] >>\nendobj\n",
@@ -22075,10 +27918,14 @@ test "reader emits shading runs for shading patterns" {
         for (runs) |*run| run.deinit(alloc);
         alloc.free(runs);
     }
-    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
     try std.testing.expect(runs[0].mode == .shading);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].shading.?.x0, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 15), runs[0].shading.?.x1, 0.0001);
+    try std.testing.expectEqual(@FieldType(PatternRun, "kind").stroke, runs[1].kind);
+    try std.testing.expectEqual(@FieldType(PatternRun, "mode").shading, runs[1].mode);
+    try std.testing.expectEqual(@as(u8, 0x40), runs[1].shading.?.c0[3]);
+    try std.testing.expectEqual(@as(u8, 0x40), runs[1].shading.?.c1[3]);
 }
 
 test "reader assigns non isolated transparency form group flag" {
@@ -22371,7 +28218,7 @@ test "Type3 combined renderer charges repeated form expansion before commit" {
     var phase: usize = 0;
     var next_group_id: u32 = 1;
     try std.testing.expect(!try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id, &budget));
-    try std.testing.expect(budget.exhausted);
+    try std.testing.expect(!budget.exhausted);
     try std.testing.expectEqual(@as(usize, 0), shapes.items.len);
 }
 
@@ -22388,6 +28235,8 @@ test "vector text admission is raster relative and transactional" {
     const expensive = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = &expensive_points, .antialias = true };
     try std.testing.expect(!budget.admit((&expensive)[0..1], &.{}, &.{}, &.{}));
     try std.testing.expectEqual(remaining, budget.remaining_edge_tests);
+    try std.testing.expect(!budget.exhausted);
+    try std.testing.expect(budget.admit((&small)[0..1], &.{}, &.{}, &.{}));
 }
 
 test "vector text cancellation propagates before glyph materialization" {
@@ -22422,15 +28271,15 @@ test "glyph outline cache charges the shared page resource meter" {
     var remaining: u64 = 1024;
     var cache = GlyphOutlineCache.init(std.testing.allocator, 1024, &remaining, .{});
     defer cache.deinit();
-    try cache.putClone(.{ .font_index = 1, .glyph_index = 2 }, outline);
+    try cache.putClone(.{ .font_identity = 1, .glyph_index = 2 }, outline);
     try std.testing.expectEqual(@as(u64, 1024 - cache.retained_bytes), remaining);
-    try std.testing.expect(cache.get(.{ .font_index = 1, .glyph_index = 2 }) != null);
+    try std.testing.expect(cache.get(.{ .font_identity = 1, .glyph_index = 2 }) != null);
     try std.testing.expectEqual(@as(u32, 1), cache.hits);
 
     var insufficient: u64 = 1;
     var skipped = GlyphOutlineCache.init(std.testing.allocator, 1024, &insufficient, .{});
     defer skipped.deinit();
-    try skipped.putClone(.{ .font_index = 1, .glyph_index = 2 }, outline);
+    try skipped.putClone(.{ .font_identity = 1, .glyph_index = 2 }, outline);
     try std.testing.expectEqual(@as(usize, 0), skipped.entries.count());
     try std.testing.expectEqual(@as(u64, 1), insufficient);
 }
@@ -22486,8 +28335,8 @@ test "vector text bounds materialization and charges measured work" {
     const too_many_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 } };
     const too_large = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = @constCast(&too_many_points) };
     try std.testing.expect(!constrained.admit((&too_large)[0..1], &.{}, &.{}, &.{}));
-    try std.testing.expect(constrained.exhausted);
-    try std.testing.expect(constrained.textMaterializationByteLimit() == null);
+    try std.testing.expect(!constrained.exhausted);
+    try std.testing.expect(constrained.textMaterializationByteLimit() != null);
 }
 
 test "dense low complexity Type1 text remains native within measured budget" {
@@ -22609,6 +28458,72 @@ test "image XObject occurrences retain one decoded sample buffer" {
     try std.testing.expectEqual(runs.items[0].rgba.ptr, runs.items[1].rgba.ptr);
 }
 
+test "image XObject preserves compound even-odd clip contours" {
+    const alloc = std.testing.allocator;
+    var rgba = [_]u8{ 255, 255, 255, 255 };
+    var image = PageImage{
+        .name = @constCast("Im"),
+        .rgba = &rgba,
+        .width = 1,
+        .height = 1,
+    };
+    var runs = std.ArrayList(ImageRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractImageRunsFromContentAppend(
+        alloc,
+        &runs,
+        "0 0 100 100 re 20 20 20 20 re W* n /Im Do",
+        (&image)[0..1],
+        &.{},
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(FillRule.even_odd, runs.items[0].clip_fill_rule);
+    const clip = runs.items[0].clip_points orelse return error.TestExpectedEqual;
+    // Two closed rectangles plus a doubled bridge, whose two traversals
+    // cancel under both PDF clipping fill rules.
+    try std.testing.expectEqual(@as(usize, 11), clip.len);
+    try std.testing.expectEqual([2]f64{ 0, 0 }, clip[0]);
+    try std.testing.expectEqual([2]f64{ 20, 20 }, clip[5]);
+    try std.testing.expectEqual([2]f64{ 0, 0 }, clip[10]);
+}
+
+test "image extraction discards painted paths before a later clip" {
+    const alloc = std.testing.allocator;
+    var rgba = [_]u8{ 255, 255, 255, 255 };
+    var image = PageImage{
+        .name = @constCast("Im"),
+        .rgba = &rgba,
+        .width = 1,
+        .height = 1,
+    };
+    var runs = std.ArrayList(ImageRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractImageRunsFromContentAppend(
+        alloc,
+        &runs,
+        "0 0 100 100 re f 20 20 m 80 20 l 80 80 l 20 80 l W n /Im Do",
+        (&image)[0..1],
+        &.{},
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    const clip = runs.items[0].clip_points orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 5), clip.len);
+    try std.testing.expectEqual([2]f64{ 20, 20 }, clip[0]);
+    try std.testing.expectEqual([2]f64{ 20, 20 }, clip[4]);
+}
+
 test "uncolored Type3 accepts path-only forms and inherits caller color" {
     const alloc = std.testing.allocator;
     var form = PageForm{ .name = @constCast("Fm"), .content = @constCast("0 0 4 5 re f") };
@@ -22638,6 +28553,19 @@ test "content resource discovery requires the name as the immediate operand" {
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge 0 Do", "Huge"));
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge [] Do", "Huge"));
     try std.testing.expect(try contentReferencesPatternNameAlloc(alloc, "0.5 /Pattern scn", "Pattern"));
+}
+
+test "color resource discovery recognizes device operators but ignores strings and comments" {
+    const alloc = std.testing.allocator;
+    var references = try collectReferencedResourceNamesAlloc(
+        alloc,
+        "(rg k /DeviceCMYK cs) Tj % RG\n/DeviceRGB cs 0 G",
+        &.{ "cs", "CS" },
+    );
+    defer references.deinit(alloc);
+    try std.testing.expect(references.uses_device_gray);
+    try std.testing.expect(references.uses_device_rgb);
+    try std.testing.expect(!references.uses_device_cmyk);
 }
 
 test "content resource discovery is allocation-failure safe" {

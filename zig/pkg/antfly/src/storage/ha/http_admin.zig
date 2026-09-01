@@ -486,7 +486,7 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
         defer parsed.deinit();
 
-        const initial_lsn: ?u64 = if (parsed.value.initial_lsn) |value| blk: {
+        const initial_lsn: ?u64 = if (parsed.value.initial_lsn.valueOrNull()) |value| blk: {
             if (value < 0) return try textResponse(self.alloc, 400, "invalid HA replication slot request");
             break :blk @intCast(value);
         } else null;
@@ -941,7 +941,7 @@ pub const Server = struct {
                 .receipt_sha256 = entry.receipt_sha256,
                 .receipt_json = entry.receipt_json,
                 .recorded_at_unix_ns = try adminI64(entry.recorded_at_unix_ns),
-                .pod_uid = entry.pod_uid,
+                .pod_uid = if (entry.pod_uid) |pod_uid| .{ .value = pod_uid } else .null_value,
                 .authoritative_state = @tagName(entry.authoritative_state),
             };
         }
@@ -955,9 +955,9 @@ pub const Server = struct {
             .gap = page.gap,
             .has_more = page.has_more,
             .runtime = .{
-                .node_id = page.runtime.node_id,
+                .node_id = if (page.runtime.node_id) |node_id| .{ .value = node_id } else .null_value,
                 .role = @tagName(page.runtime.role),
-                .pod_uid = page.runtime.pod_uid,
+                .pod_uid = if (page.runtime.pod_uid) |pod_uid| .{ .value = pod_uid } else .null_value,
                 .fenced = page.runtime.fenced,
                 .observed_at_unix_ns = try adminI64(page.runtime.observed_at_unix_ns),
             },
@@ -1032,7 +1032,7 @@ pub const Server = struct {
         const manifest_path = validateAdminHAPath(parsed.value.manifest_path, .manifest) catch |err| {
             return try textResponse(self.alloc, 400, @errorName(err));
         };
-        const content_root = if (parsed.value.content_root) |root|
+        const content_root = if (parsed.value.content_root.valueOrNull()) |root|
             validateAdminHAPath(root, .content_root) catch |err| {
                 return try textResponse(self.alloc, 400, @errorName(err));
             }
@@ -1654,13 +1654,13 @@ fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
     return .{
         .action = @tagName(decision.action),
         .consistency = @tagName(decision.consistency),
-        .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
-        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
+        .required_lsn = if (decision.required_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
         .received_lsn = try adminI64(decision.received_lsn),
         .applied_lsn = try adminI64(decision.applied_lsn),
         .safe_read_lsn = try adminI64(decision.safe_read_lsn),
-        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| try adminI64(value) else null,
-        .serve_lsn = if (decision.serve_lsn) |value| try adminI64(value) else null,
+        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .serve_lsn = if (decision.serve_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
         .missing_lsn_count = try adminI64(decision.missing_lsn_count),
         .metadata_missing_lsn_count = try adminI64(decision.metadata_missing_lsn_count),
     };
@@ -1717,14 +1717,14 @@ fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u
         .received_lsn = try adminI64(snapshot.received_lsn),
         .applied_lsn = try adminI64(snapshot.applied_lsn),
         .safe_read_lsn = try adminI64(snapshot.safe_read_lsn),
-        .upstream_lsn = if (snapshot.upstream_lsn) |value| try adminI64(value) else null,
-        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
-        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
-        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
-        .last_error = snapshot.last_error,
-        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| try adminI64(value) else null,
-        .last_success_ns = if (snapshot.last_success_ns) |value| try adminI64(value) else null,
-        .replication_failures_total = if (snapshot.replication_failures_total) |value| try adminI64(value) else null,
+        .upstream_lsn = if (snapshot.upstream_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .last_error = if (snapshot.last_error) |last_error| .{ .value = last_error } else .null_value,
+        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| .{ .value = try adminI64(value) } else .null_value,
+        .last_success_ns = if (snapshot.last_success_ns) |value| .{ .value = try adminI64(value) } else .null_value,
+        .replication_failures_total = if (snapshot.replication_failures_total) |value| .{ .value = try adminI64(value) } else .null_value,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,
@@ -1749,7 +1749,7 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status_mod.SlotSnapshot) 
             .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
             .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
             .status = @tagName(slot.status),
-            .last_error = slot.last_error,
+            .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
         };
     }
     return admin_slots;
@@ -1877,7 +1877,7 @@ fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]
             .safe_read_lsn = try adminI64(slot.safe_read_lsn),
             .active = slot.active,
             .reseed_required = slot.reseed_required,
-            .last_error = slot.last_error,
+            .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
             .current_lsn = try adminI64(snapshot.current_lsn),
         };
     }
@@ -1912,9 +1912,9 @@ fn slotActionDocument(
             .safe_read_lsn = try adminI64(slot.safe_read_lsn),
             .active = slot.active,
             .reseed_required = slot.reseed_required,
-            .last_error = slot.last_error,
+            .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
             .current_lsn = try adminI64(slot.current_lsn),
-            .dropped = dropped,
+            .dropped = if (dropped) |value| .{ .value = value } else .null_value,
         },
     };
 }
@@ -2129,9 +2129,9 @@ fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy
 fn readRequestFromOpenApi(request: admin_api.ReadCheckRequest) !read_gate.Request {
     return .{
         .consistency = if (request.consistency) |raw| try parseReadConsistency(raw) else .stale_ok,
-        .required_lsn = if (request.required_lsn) |value| try uint64FromJson(value) else null,
-        .required_metadata_lsn = if (request.required_metadata_lsn) |value| try uint64FromJson(value) else null,
-        .metadata_applied_lsn = if (request.metadata_applied_lsn) |value| try uint64FromJson(value) else null,
+        .required_lsn = if (request.required_lsn.valueOrNull()) |value| try uint64FromJson(value) else null,
+        .required_metadata_lsn = if (request.required_metadata_lsn.valueOrNull()) |value| try uint64FromJson(value) else null,
+        .metadata_applied_lsn = if (request.metadata_applied_lsn.valueOrNull()) |value| try uint64FromJson(value) else null,
     };
 }
 

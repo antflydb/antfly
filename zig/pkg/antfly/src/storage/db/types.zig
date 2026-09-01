@@ -18,6 +18,7 @@ const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const fusion_mod = @import("../../search/fusion.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -1307,6 +1308,34 @@ pub const ExecutionContext = struct {
     max_parallelism: ?usize = null,
 };
 
+/// API transport metadata retained alongside the canonical graph execution
+/// plan. Compatibility is deliberately represented only at this wire boundary;
+/// graph executors continue to consume `NamedGraphQuery` exclusively.
+pub const GraphQueryWireDialect = enum { canonical, legacy };
+
+pub const GraphQueryTransport = struct {
+    dialect: GraphQueryWireDialect,
+    /// Owned, normalized JSON object containing only the admitted named graph
+    /// operations. It is safe to embed directly after a JSON field name.
+    operations_json: []const u8,
+    /// Borrowed identity of the immutable canonical operation slice produced by
+    /// public admission. Derived requests may retain the complete admitted plan
+    /// or clear it, but replacing the operations requires re-admission. This
+    /// pointer is compared by identity only and is never dereferenced.
+    admitted_operations_ptr: *const anyopaque,
+    admitted_operations_len: usize,
+
+    pub fn matchesOperations(self: GraphQueryTransport, operations: []const NamedGraphQuery) bool {
+        return self.admitted_operations_len == operations.len and
+            self.admitted_operations_ptr == @as(*const anyopaque, @ptrCast(operations.ptr));
+    }
+
+    pub fn deinit(self: *GraphQueryTransport, alloc: Allocator) void {
+        alloc.free(@constCast(self.operations_json));
+        self.* = undefined;
+    }
+};
+
 pub const SearchRequest = struct {
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
@@ -1323,6 +1352,14 @@ pub const SearchRequest = struct {
     exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
+    /// Trusted request-local row authorization predicate. Public request
+    /// parsing never populates this field. The HTTP authorization boundary
+    /// records it separately from retrieval filters so canonical graph MATCH
+    /// can enumerate the complete authorized source relation without
+    /// inheriting unrelated retrieval shaping. It is never serialized to a
+    /// shard; ordinary retrieval still receives the conjoined predicate in
+    /// `filter_query_json`.
+    authorization_filter_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
     doc_filter_bindings: []const NamedDocFilterBinding = &.{},
     dense: ?DenseKnnQuery = null,
@@ -1330,6 +1367,12 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    /// Trusted operator-owned graph admission ceilings. Public request parsing
+    /// never reads these from JSON, and shard transport must not serialize them.
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    /// Owned, validated API wire sidecar. Execution never inspects it; it is
+    /// retained only for allocation-light owner proxying and response shaping.
+    graph_query_transport: ?GraphQueryTransport = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1391,6 +1434,14 @@ pub const SearchRequest = struct {
     cancellation: ?CancellationToken = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+
+    /// Remove both representations of the admitted graph plan. Keeping this
+    /// operation centralized prevents derived requests from retaining proxy
+    /// wire state after graph execution has been disabled.
+    pub fn clearGraphQueries(self: *SearchRequest) void {
+        self.graph_queries = &.{};
+        self.graph_query_transport = null;
+    }
 };
 
 pub const max_canonical_hierarchy_groups: u32 = 100;
@@ -1416,6 +1467,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
+    "authorization_filter_query_json",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -1427,6 +1479,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "identity_read_generation",
     "execution_deadline_ns",
     "cancellation",
+    "graph_execution_limits",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
@@ -1446,6 +1499,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_query_transport",
     "merge_config",
     "reranker",
     "reranker_query_text",
@@ -1579,7 +1633,7 @@ pub fn canonicalGroupedMatchExpansionRequest(
     match_req.search_before = &.{};
     match_req.filter_doc_ids = parent_filter;
     match_req.filter_doc_ids_positive = true;
-    match_req.graph_queries = &.{};
+    match_req.clearGraphQueries();
     match_req.expand_strategy = null;
     match_req.aggregations_json = "";
     match_req.count_only = false;
@@ -2051,8 +2105,17 @@ pub const GraphSearchResult = struct {
     nodes: []graph_query_mod.GraphResultNode = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
+    aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    truncated: bool = false,
+
+    /// Detach request-scoped retained-state release hooks at the result
+    /// ownership boundary. The request budget remains consumptively charged,
+    /// while result deinit continues to own and free the allocations.
+    pub fn consumeRetainedState(self: *GraphSearchResult) void {
+        for (self.paths) |*path| path.consumeRetainedState();
+    }
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -2062,8 +2125,34 @@ pub const GraphSearchResult = struct {
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
         if (self.matches.len > 0) alloc.free(self.matches);
+        for (self.aggregates) |*aggregate| aggregate.deinit(alloc);
+        if (self.aggregates.len > 0) alloc.free(self.aggregates);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        self.* = undefined;
+    }
+};
+
+pub const GraphAggregateResult = struct {
+    name: []u8,
+    value: u128,
+    exact: bool = true,
+    /// Exact shard-merge payload for count(distinct alias). This is internal
+    /// execution data and is never exposed by the public response contract.
+    distinct_values: []graph_node_identity.Ref = &.{},
+    /// Duplicate named aggregates may share one immutable merge payload inside
+    /// a result. Exactly one aggregate owns that allocation.
+    distinct_values_owned: bool = true,
+
+    pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.distinct_values_owned) {
+            for (self.distinct_values) |value| {
+                if (value.table) |table| alloc.free(table);
+                alloc.free(value.key);
+            }
+            if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
+        }
         self.* = undefined;
     }
 };
@@ -2082,6 +2171,7 @@ pub const GraphPatternBinding = struct {
 pub const GraphPatternMatch = struct {
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
+    null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
@@ -2093,6 +2183,8 @@ pub const GraphPatternMatch = struct {
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
+        for (self.null_aliases) |alias| alloc.free(alias);
+        if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
         self.* = undefined;
     }
 };

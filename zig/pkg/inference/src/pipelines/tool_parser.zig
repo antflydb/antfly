@@ -21,7 +21,7 @@ var tool_call_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub const FunctionDefinition = struct {
     name: []const u8,
     description: []const u8 = "",
-    parameters: ?std.json.Value = null,
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
     strict: bool = false,
 };
 
@@ -207,13 +207,11 @@ const FunctionGemmaParser = struct {
         return try buf.toOwnedSlice(allocator);
     }
 
-    fn formatParams(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, parameters: ?std.json.Value) !void {
-        if (parameters == null or parameters.? != .object) {
+    fn formatParams(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, parameters: ?std.json.ArrayHashMap(std.json.Value)) !void {
+        const params = (parameters orelse {
             try buf.appendSlice(allocator, "{}");
             return;
-        }
-
-        const params = parameters.?.object;
+        }).map;
         const props_val = params.get("properties") orelse {
             try buf.appendSlice(allocator, "{}");
             return;
@@ -547,7 +545,7 @@ const JsonToolParser = struct {
             }
             try buf.appendSlice(allocator, " parameters=");
             if (tool.function.parameters) |parameters| {
-                try appendJsonValueFromValue(&buf, allocator, parameters);
+                try appendJsonValueFromValue(&buf, allocator, .{ .object = parameters.map });
             } else {
                 try buf.appendSlice(allocator, "{}");
             }
@@ -1246,6 +1244,9 @@ fn loadToolTokensFromGguf(allocator: std.mem.Allocator, model_dir: []const u8) !
 
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
+    // Tool-token discovery reads GGUF metadata only and must not evict model
+    // payload pages prepared for a following or replacement CUDA worker.
+    region.preserveFileCacheOnDeinit();
 
     var parsed = try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);
@@ -1458,7 +1459,7 @@ test "functiongemma parser formats prompt and parses tool call" {
     } };
     defer parser.deinit();
 
-    const params_json = try std.json.parseFromSlice(std.json.Value, allocator,
+    const params_json = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator,
         \\{"properties":{"location":{"type":"string"}},"required":["location"]}
     , .{});
     defer params_json.deinit();
@@ -1509,7 +1510,7 @@ test "gemma4 tool tokens format prompt and parse tool call" {
     } };
     defer parser.deinit();
 
-    const params_json = try std.json.parseFromSlice(std.json.Value, allocator,
+    const params_json = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator,
         \\{"properties":{"id":{"type":"integer"}},"required":["id"]}
     , .{});
     defer params_json.deinit();
@@ -1593,7 +1594,7 @@ test "loadParser detects tool token convention from GGUF tokenizer metadata" {
     var parser = (try loadParser(allocator, model_dir)) orelse return error.TestUnexpectedResult;
     defer parser.deinit();
 
-    const params_json = try std.json.parseFromSlice(std.json.Value, allocator,
+    const params_json = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator,
         \\{"properties":{"id":{"type":"integer"}},"required":["id"]}
     , .{});
     defer params_json.deinit();
@@ -1704,7 +1705,7 @@ test "json parser formats prompt and parses tool call objects" {
     } };
     defer parser.deinit();
 
-    const params_json = try std.json.parseFromSlice(std.json.Value, allocator,
+    const params_json = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator,
         \\{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}
     , .{});
     defer params_json.deinit();

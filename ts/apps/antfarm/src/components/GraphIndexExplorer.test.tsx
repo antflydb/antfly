@@ -73,15 +73,25 @@ describe("GraphIndexExplorer", () => {
         {
           graph_results: {
             explorer: {
-              type: "traverse",
-              total: 1,
+              kind: "nodes",
               nodes: [
                 {
                   key: "bob",
                   depth: 1,
-                  path_edges: [{ source: "alice", target: "bob", type: "cites", weight: 0.8 }],
+                  path: [{ key: "alice" }, { key: "bob" }],
+                  path_edges: [
+                    {
+                      from: { key: "alice" },
+                      to: { key: "bob" },
+                      direction: "out",
+                      type: "cites",
+                      weight: 0.8,
+                    },
+                  ],
                 },
               ],
+              paths: [],
+              stats: { returned_items: 1, truncated: false },
             },
           },
         },
@@ -103,21 +113,100 @@ describe("GraphIndexExplorer", () => {
     expect(mocks.query).toHaveBeenCalledWith(
       "papers",
       expect.objectContaining({
-        graph_searches: {
+        graph_queries: {
           explorer: expect.objectContaining({
-            type: "traverse",
-            index_name: "graph_idx",
-            start_nodes: { keys: ["alice"] },
-            include_documents: true,
-            include_edges: true,
-            params: expect.objectContaining({
+            index: "graph_idx",
+            traverse: expect.objectContaining({
+              start: { keys: ["alice"] },
               include_paths: true,
-              deduplicate_nodes: true,
               max_depth: 2,
             }),
           }),
         },
       })
     );
+  });
+
+  it("keeps same-key path endpoints distinct across tables", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={{
+          kind: "paths",
+          paths: [
+            {
+              path: {
+                nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
+                edges: [
+                  {
+                    from: { key: "shared" },
+                    to: { key: "shared", table: "entities" },
+                    direction: "out",
+                    type: "mentions",
+                    weight: 1,
+                  },
+                ],
+                length: 1,
+                objective: "min_hops",
+                weight_sum: 1,
+                objective_value: 1,
+              },
+            },
+          ],
+          stats: { returned_items: 1 },
+        }}
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("2 nodes / 1 edges");
+  });
+
+  it("uses traversal path identities for edges inside a foreign table", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={{
+          kind: "nodes",
+          nodes: [
+            {
+              key: "carol",
+              table: "entities",
+              depth: 2,
+              path: [
+                { key: "alice" },
+                { key: "bob", table: "entities" },
+                { key: "carol", table: "entities" },
+              ],
+              path_edges: [
+                {
+                  from: { key: "alice" },
+                  to: { key: "bob", table: "entities" },
+                  direction: "out",
+                  type: "mentions",
+                  weight: 1,
+                  metadata: { target_table: "entities" },
+                },
+                {
+                  from: { key: "bob", table: "entities" },
+                  to: { key: "carol", table: "entities" },
+                  direction: "out",
+                  type: "related",
+                  weight: 1,
+                },
+              ],
+            },
+          ],
+          stats: { returned_items: 1, truncated: false },
+        }}
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("3 nodes / 2 edges");
   });
 });

@@ -199,21 +199,21 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     const reranker_json = options.reranker_json;
     const pruner_json = options.pruner_json;
 
-    var full_text_value: ?std.json.Parsed(std.json.Value) = null;
+    var full_text_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
     defer if (full_text_value) |*parsed| parsed.deinit();
     if (full_text_search) |q| {
         full_text_value = buildFullTextSearchValue(allocator, q);
     } else if (full_text_search_json) |q| {
-        full_text_value = parseJsonArg(std.json.Value, allocator, "--full-text-search-json", q);
+        full_text_value = parseJsonArg(antfly_client.types.RawQuery, allocator, "--full-text-search-json", q);
     }
 
-    var filter_value: ?std.json.Parsed(std.json.Value) = null;
+    var filter_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
     defer if (filter_value) |*parsed| parsed.deinit();
-    if (filter_query) |raw| filter_value = parseJsonArg(std.json.Value, allocator, "--filter-query", raw);
+    if (filter_query) |raw| filter_value = parseJsonArg(antfly_client.types.RawQuery, allocator, "--filter-query", raw);
 
-    var exclusion_value: ?std.json.Parsed(std.json.Value) = null;
+    var exclusion_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
     defer if (exclusion_value) |*parsed| parsed.deinit();
-    if (exclusion_query) |raw| exclusion_value = parseJsonArg(std.json.Value, allocator, "--exclusion-query", raw);
+    if (exclusion_query) |raw| exclusion_value = parseJsonArg(antfly_client.types.RawQuery, allocator, "--exclusion-query", raw);
 
     var aggregations_value: ?std.json.Parsed(std.json.ArrayHashMap(antfly_client.types.AggregationRequest)) = null;
     defer if (aggregations_value) |*parsed| parsed.deinit();
@@ -589,7 +589,7 @@ test "lookup parser accepts read consistency and rejects invalid options" {
     try std.testing.expectEqualStrings("eventual", invalid_consistency.issue.invalid_read_consistency);
 }
 
-fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(std.json.Value) {
+fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(antfly_client.types.RawQuery) {
     const escaped = std.json.Stringify.valueAlloc(allocator, query, .{}) catch |err| {
         cli.fatal("failed to encode --full-text-search: {}", .{err});
     };
@@ -600,7 +600,7 @@ fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std
     };
     defer allocator.free(json_body);
 
-    return parseJsonArg(std.json.Value, allocator, "--full-text-search", json_body);
+    return parseJsonArg(antfly_client.types.RawQuery, allocator, "--full-text-search", json_body);
 }
 
 fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8, raw: []const u8) std.json.Parsed(T) {

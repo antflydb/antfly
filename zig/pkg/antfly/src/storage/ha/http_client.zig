@@ -280,7 +280,10 @@ pub const Client = struct {
             self.alloc,
             admin_api.ReplicationSlotCreateRequest{
                 .slot_name = slot_name,
-                .initial_lsn = if (initial_lsn) |lsn| try i64FromU64(lsn) else null,
+                .initial_lsn = if (initial_lsn) |lsn|
+                    .{ .value = try i64FromU64(lsn) }
+                else
+                    .absent,
             },
             .{},
         );
@@ -1433,7 +1436,7 @@ test "storage.ha http client round trips admin commands" {
     var typed_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby-typed");
     defer typed_dropped.deinit(alloc);
     try std.testing.expectEqualStrings("drop", typed_dropped.parsed.value.slot_action);
-    try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped);
+    try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped.valueOrNull());
 
     var encoded_created = try client.createReplicationSlot("http://ha-admin.test", "standby:a.b", 0);
     defer encoded_created.deinit(alloc);
@@ -1456,7 +1459,7 @@ test "storage.ha http client round trips admin commands" {
     defer encoded_dropped.deinit(alloc);
     try std.testing.expectEqualStrings("drop", encoded_dropped.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby:a.b", encoded_dropped.parsed.value.slot.slot_name);
-    try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped);
+    try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped.valueOrNull());
 
     var stream_slot = try client.createReplicationSlot("http://ha-admin.test/", "standby-a", 0);
     defer stream_slot.deinit(alloc);
@@ -1483,8 +1486,8 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.schema_version);
     try std.testing.expectEqualStrings("standby", typed_standby_status.parsed.value.snapshot.role);
     try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.snapshot.applied_lsn);
-    try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn);
-    try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn);
+    try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn.valueOrNull());
+    try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn.valueOrNull());
 
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
         "operator",
@@ -1698,15 +1701,15 @@ test "storage.ha http client round trips typed gate operations" {
 
     var ready_read = try client.checkRead("http://ha-admin.test", .{
         .consistency = "at_least_lsn",
-        .required_lsn = 1,
+        .required_lsn = .{ .value = 1 },
     });
     defer ready_read.deinit(alloc);
     try std.testing.expectEqualStrings("serve_standby", ready_read.parsed.value.decision.action);
-    try std.testing.expectEqual(@as(?i64, 1), ready_read.parsed.value.decision.serve_lsn);
+    try std.testing.expectEqual(@as(?i64, 1), ready_read.parsed.value.decision.serve_lsn.valueOrNull());
 
     var waiting_read = try client.checkRead("http://ha-admin.test", .{
         .consistency = "at_least_lsn",
-        .required_lsn = 2,
+        .required_lsn = .{ .value = 2 },
     });
     defer waiting_read.deinit(alloc);
     try std.testing.expectEqualStrings("wait_for_apply", waiting_read.parsed.value.decision.action);
@@ -1792,7 +1795,7 @@ test "storage.ha http client round trips typed seed operations" {
 
     var bootstrap = try client.bootstrapStandby("http://ha-admin.test", .{
         .manifest_path = manifest_path,
-        .content_root = paths.backup_root,
+        .content_root = .{ .value = paths.backup_root },
     });
     defer bootstrap.deinit(alloc);
     try std.testing.expectEqualStrings("base-http-client", bootstrap.parsed.value.manifest_id);
