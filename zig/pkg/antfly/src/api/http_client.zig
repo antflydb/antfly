@@ -2657,7 +2657,19 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, cancellation);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, null, cancellation);
+    }
+
+    pub fn fetchGroupTxnResolveWithControlAndTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, timeout_ms, cancellation);
     }
 
     pub fn fetchGroupTxnAcknowledge(
@@ -2667,7 +2679,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
     }
 
     pub fn fetchGroupTxnStatus(
@@ -2784,6 +2796,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         suffix_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
@@ -2802,6 +2815,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
@@ -5057,6 +5071,7 @@ test "api http client maps group txn resolve decision conflicts" {
 test "api http client transports txn resolve cancellation and visibility reason" {
     const ResolveExecutor = struct {
         body: []const u8,
+        expected_timeout_ms: ?u32 = null,
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -5065,6 +5080,7 @@ test "api http client transports txn resolve cancellation and visibility reason"
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(req.cancellation != null);
+            try std.testing.expectEqual(self.expected_timeout_ms, req.timeout_ms);
             return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
         }
     };
@@ -5080,5 +5096,10 @@ test "api http client transports txn resolve cancellation and visibility reason"
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
         client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
+    executor.expected_timeout_ms = 137;
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        client.fetchGroupTxnResolveWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 137, &cancellation),
     );
 }

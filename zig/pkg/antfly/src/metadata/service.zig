@@ -10314,29 +10314,120 @@ fn completeRestoreIntentsForService(
     provided_placements: ?[]const raft_reconciler.PlacementIntent,
     provided_progress: ?[]const metadata_table_manager.RestoreProgressRecord,
 ) !void {
-    const tables = if (provided_tables) |tables| tables else try service.listProjectedTables(service.alloc);
-    defer if (provided_tables == null) service.freeProjectedTables(service.alloc, @constCast(tables));
     const ranges = if (provided_ranges) |ranges| ranges else try service.listProjectedRanges(service.alloc);
     defer if (provided_ranges == null) service.freeProjectedRanges(service.alloc, @constCast(ranges));
+
+    // Restore completion runs in the 100 ms metadata control loop. Most
+    // rounds have no active restore, so load only ranges before the fast-path
+    // return. Tables, placements, progress, and their indexes are needed only
+    // while an intent is live.
+    var active_range_count: usize = 0;
+    for (ranges) |range| {
+        if (range.restore_backup_id.len != 0 and range.restore_location.len != 0)
+            active_range_count += 1;
+    }
+    if (active_range_count == 0) return;
+
+    const tables = if (provided_tables) |tables| tables else try service.listProjectedTables(service.alloc);
+    defer if (provided_tables == null) service.freeProjectedTables(service.alloc, @constCast(tables));
+
+    const RestoreProgressKey = struct { table_id: u64, node_id: u64, group_id: u64 };
+    const CompletionState = struct { found_placement: bool = false, complete: bool = true };
+
+    var table_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer table_ids.deinit(service.alloc);
+    try table_ids.ensureTotalCapacity(service.alloc, @intCast(tables.len));
+    for (tables) |table| table_ids.putAssumeCapacity(table.table_id, {});
+
+    var active_ranges = std.AutoHashMapUnmanaged(u64, *const metadata_table_manager.RangeRecord).empty;
+    defer active_ranges.deinit(service.alloc);
+    try active_ranges.ensureTotalCapacity(service.alloc, @intCast(active_range_count));
+    for (ranges) |*range| {
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        if (!table_ids.contains(range.table_id)) continue;
+        const entry = active_ranges.getOrPutAssumeCapacity(range.group_id);
+        if (entry.found_existing) return error.InvalidRestoreProgressProjection;
+        entry.value_ptr.* = range;
+    }
+    if (active_ranges.count() == 0) return;
+
+    // A dangling range whose table has already disappeared is not actionable.
+    // Do not copy placement or progress projections until at least one live
+    // table/range restore join survives.
     const placements = if (provided_placements) |placements| placements else try service.listProjectedPlacementIntents(service.alloc);
     defer if (provided_placements == null) service.freeProjectedPlacementIntents(service.alloc, @constCast(placements));
     const progress = if (provided_progress) |progress| progress else try service.listProjectedRestoreProgress(service.alloc);
     defer if (provided_progress == null) service.freeProjectedRestoreProgress(service.alloc, @constCast(progress));
 
-    for (ranges) |range| {
-        const table = findProjectedTableById(tables, range.table_id) orelse continue;
-        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
-        if (!rangeRestoreIntentComplete(
-            table.table_id,
-            range,
+    var progress_by_replica = std.AutoHashMapUnmanaged(RestoreProgressKey, *const metadata_table_manager.RestoreProgressRecord).empty;
+    defer progress_by_replica.deinit(service.alloc);
+    try progress_by_replica.ensureTotalCapacity(service.alloc, @intCast(@min(progress.len, placements.len)));
+    for (progress) |*record| {
+        if (!active_ranges.contains(record.group_id)) continue;
+        const entry = try progress_by_replica.getOrPut(service.alloc, .{
+            .table_id = record.table_id,
+            .node_id = record.node_id,
+            .group_id = record.group_id,
+        });
+        if (entry.found_existing) return error.InvalidRestoreProgressProjection;
+        entry.value_ptr.* = record;
+    }
+
+    var completion_by_group = std.AutoHashMapUnmanaged(u64, CompletionState).empty;
+    defer completion_by_group.deinit(service.alloc);
+    try completion_by_group.ensureTotalCapacity(service.alloc, active_ranges.count());
+    var active_iterator = active_ranges.iterator();
+    while (active_iterator.next()) |entry|
+        completion_by_group.putAssumeCapacity(entry.key_ptr.*, .{});
+
+    // Join placements and replica progress once. This keeps an active restore
+    // O(ranges + placements + progress) instead of rescanning both global
+    // slices for every range.
+    for (placements) |intent| {
+        const range = active_ranges.get(intent.record.group_id) orelse continue;
+        const completion = completion_by_group.getPtr(intent.record.group_id).?;
+        completion.found_placement = true;
+        if (!completion.complete) continue;
+        const restored = progress_by_replica.get(.{
+            .table_id = range.table_id,
+            .node_id = intent.record.local_node_id,
+            .group_id = range.group_id,
+        }) orelse {
+            completion.complete = false;
+            continue;
+        };
+        completion.complete = restoreProgressMatchesRange(
+            restored.*,
+            range.*,
             range.restore_backup_id,
             range.restore_location,
-            placements,
-            progress,
-        )) continue;
+        );
+    }
+
+    // Preserve catalog range order so proposal order and diagnostics remain
+    // deterministic across metadata voters.
+    for (ranges) |range| {
+        const completion = completion_by_group.get(range.group_id) orelse continue;
+        if (!completion.found_placement or !completion.complete) continue;
 
         try service.completeRestoreRange(metadata_table_manager.restoreIntentIdentity(range));
     }
+}
+
+fn restoreProgressMatchesRange(
+    restored: metadata_table_manager.RestoreProgressRecord,
+    range: metadata_table_manager.RangeRecord,
+    restore_backup_id: []const u8,
+    restore_location: []const u8,
+) bool {
+    return std.mem.eql(u8, restored.backup_id, restore_backup_id) and
+        std.mem.eql(u8, restored.artifact_backup_id, range.restore_artifact_backup_id) and
+        std.mem.eql(u8, restored.location, restore_location) and
+        std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path) and
+        std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256) and
+        restored.native_manifest_size_bytes == range.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, restored.native_manifest_sha256, range.restore_native_manifest_sha256) and
+        restored.primary_restored and restored.runtime_repair_complete;
 }
 
 fn rangeRestoreIntentComplete(
@@ -10352,14 +10443,7 @@ fn rangeRestoreIntentComplete(
         if (intent.record.group_id != range.group_id) continue;
         found_any_placement = true;
         const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, range.group_id) orelse return false;
-        if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
-        if (!std.mem.eql(u8, restored.artifact_backup_id, range.restore_artifact_backup_id)) return false;
-        if (!std.mem.eql(u8, restored.location, restore_location)) return false;
-        if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
-        if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
-        if (restored.native_manifest_size_bytes != range.restore_native_manifest_size_bytes) return false;
-        if (!std.mem.eql(u8, restored.native_manifest_sha256, range.restore_native_manifest_sha256)) return false;
-        if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
+        if (!restoreProgressMatchesRange(restored, range, restore_backup_id, restore_location)) return false;
     }
     return found_any_placement;
 }
@@ -16451,6 +16535,10 @@ test "metadata service clears restore intent once all placement replicas report 
         progress: []const metadata_table_manager.RestoreProgressRecord,
         upserted_table: ?metadata_table_manager.TableRecord = null,
         completed_restore: ?metadata_table_manager.RestoreIntentIdentity = null,
+        table_reads: usize = 0,
+        range_reads: usize = 0,
+        placement_reads: usize = 0,
+        progress_reads: usize = 0,
 
         fn deinit(self: *@This()) void {
             if (self.upserted_table) |record| metadata_table_manager.freeTable(self.alloc, record);
@@ -16458,6 +16546,7 @@ test "metadata service clears restore intent once all placement replicas report 
         }
 
         fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            self.table_reads += 1;
             const out = try alloc.alloc(metadata_table_manager.TableRecord, 1);
             out[0] = try metadata_table_manager.cloneTable(alloc, self.table);
             return out;
@@ -16469,6 +16558,7 @@ test "metadata service clears restore intent once all placement replicas report 
         }
 
         fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+            self.range_reads += 1;
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
             for (self.ranges, 0..) |record, i| out[i] = try metadata_table_manager.cloneRange(alloc, record);
             return out;
@@ -16480,6 +16570,7 @@ test "metadata service clears restore intent once all placement replicas report 
         }
 
         fn listProjectedPlacementIntents(self: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            self.placement_reads += 1;
             const out = try alloc.alloc(raft_reconciler.PlacementIntent, self.placements.len);
             for (self.placements, 0..) |intent, i| {
                 out[i] = .{
@@ -16497,6 +16588,7 @@ test "metadata service clears restore intent once all placement replicas report 
         }
 
         fn listProjectedRestoreProgress(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RestoreProgressRecord {
+            self.progress_reads += 1;
             const out = try alloc.alloc(metadata_table_manager.RestoreProgressRecord, self.progress.len);
             for (self.progress, 0..) |record, i| out[i] = try metadata_table_manager.cloneRestoreProgress(alloc, record);
             return out;
@@ -16556,6 +16648,29 @@ test "metadata service clears restore intent once all placement replicas report 
     try std.testing.expectEqualStrings("snap/groups/7001", service.completed_restore.?.snapshot_path);
     try std.testing.expectEqualStrings("backups", service.completed_restore.?.connection);
     try std.testing.expect(service.upserted_table == null);
+    try std.testing.expectEqual(@as(usize, 1), service.table_reads);
+    try std.testing.expectEqual(@as(usize, 1), service.range_reads);
+    try std.testing.expectEqual(@as(usize, 1), service.placement_reads);
+    try std.testing.expectEqual(@as(usize, 1), service.progress_reads);
+
+    // The steady-state control round reads only ranges and returns before
+    // copying the other global projections when no restore intent is active.
+    const inactive_ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    service.ranges = &inactive_ranges;
+    service.table_reads = 0;
+    service.range_reads = 0;
+    service.placement_reads = 0;
+    service.progress_reads = 0;
+    try completeRestoreIntentsForService(&service, null, null, null, null);
+    try std.testing.expectEqual(@as(usize, 0), service.table_reads);
+    try std.testing.expectEqual(@as(usize, 1), service.range_reads);
+    try std.testing.expectEqual(@as(usize, 0), service.placement_reads);
+    try std.testing.expectEqual(@as(usize, 0), service.progress_reads);
 }
 
 test "metadata service keeps restore intent until runtime repair completes" {

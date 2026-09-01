@@ -22455,34 +22455,27 @@ pub const HostedProvisionedTableWriteSource = struct {
             for (shards[0..initialized]) |shard| shard.deinit(alloc);
             alloc.free(shards);
         }
+
+        const group_ids = try alloc.alloc(u64, ranges.len);
+        defer alloc.free(group_ids);
+        for (ranges, 0..) |range, index| group_ids[index] = range.group_id;
+        const resolved_routes = try table_router.resolveGroupRoutes(
+            alloc,
+            self.catalog,
+            self.router,
+            group_ids,
+            .prefer_leader,
+        );
+        const routes = resolved_routes orelse return error.GroupLeaderUnavailable;
+        defer table_router.freeGroupRoutes(alloc, routes);
+
         const io_impl = if (self.backend_runtime) |runtime| runtime.apiIoImpl() else null;
         if (io_impl == null or ranges.len <= 1) {
-            for (ranges, 0..) |range, i| {
-                shards[i] = try self.fetchHostedBackupRange(alloc, range, table_name, body, fence);
+            for (ranges, routes, 0..) |range, route, i| {
+                shards[i] = try self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence);
                 initialized += 1;
             }
         } else {
-            // Route discovery may itself use the shared metadata HTTP client.
-            // Resolve every route before borrowing API-runtime fibers; doing
-            // this inside a fiber can recursively wait on the same bounded I/O
-            // scheduler and deadlock the fanout.
-            const routes = try alloc.alloc(table_router.GroupRoute, ranges.len);
-            var routes_initialized: usize = 0;
-            defer {
-                for (routes[0..routes_initialized]) |*route| route.deinit(alloc);
-                alloc.free(routes);
-            }
-            for (ranges, 0..) |range, i| {
-                routes[i] = (try table_router.resolveGroupRoute(
-                    alloc,
-                    self.catalog,
-                    self.router,
-                    range.group_id,
-                    .prefer_leader,
-                )) orelse return error.GroupLeaderUnavailable;
-                routes_initialized += 1;
-            }
-
             const Slot = struct {
                 arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
                 shard: ?backups_api.ShardSnapshot = null,

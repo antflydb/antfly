@@ -120,6 +120,26 @@ pub const ParticipantWorker = struct {
             req: TxnResolveRequest,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!void = null,
+        /// Post-decision recovery must not inherit client cancellation, but it
+        /// must retain a hard operational bound. The absolute monotonic
+        /// deadline is propagated through routing and transport rather than
+        /// checked only between potentially blocking attempts.
+        resolve_group_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: TxnResolveRequest,
+            deadline_ns: u64,
+        ) anyerror!void = null,
+        status_group_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!db_mod.types.TxnStatus = null,
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -142,6 +162,21 @@ pub const ParticipantWorker = struct {
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn resolveGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        // A legacy implementation cannot prove that its routing or transport
+        // honors this deadline. Fail closed instead of turning a bounded
+        // recovery operation back into an unbounded request.
+        const resolve = self.vtable.resolve_group_until orelse return error.CommitDecisionUnknown;
+        try resolve(self.ptr, alloc, group_id, table_name, req, deadline_ns);
+    }
+
+    pub fn statusGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        const status = self.vtable.status_group_until orelse return error.CommitDecisionUnknown;
+        return try status(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -248,7 +283,9 @@ pub const HostedParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .resolve_group_with_cancellation = resolveGroupWithCancellation,
+                .resolve_group_until = resolveGroupUntil,
                 .status_group = statusGroup,
+                .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
             },
         };
@@ -569,11 +606,23 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn resolveGroupWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
+        try resolveGroupWithin(ptr, alloc, group_id, table_name, req, cancellation, null);
+    }
+
+    fn resolveGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+        try resolveGroupWithin(ptr, alloc, group_id, table_name, req, .none, deadline_ns);
+    }
+
+    fn resolveGroupWithin(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, deadline_ns: ?u64) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns orelse 0 };
+        const operation_cancellation = if (deadline_ns != null) deadline_cancellation.token() else cancellation;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         switch (route) {
-            .local => _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, operation_cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -583,30 +632,59 @@ pub const HostedParticipantWorker = struct {
                 // RPC also signals the remote request context. If delivery is
                 // ambiguous, the coordinator probes the same transaction ID
                 // before deciding whether abort is still legal.
-                var request_cancellation = http_common.RequestCancellation.fromToken(cancellation);
-                var response = try client.fetchGroupTxnResolveWithControl(
-                    remote.base_uri,
-                    group_id,
-                    table_name,
-                    body,
-                    if (cancellation.ptr != null) &request_cancellation else null,
-                );
+                var request_cancellation = http_common.RequestCancellation.fromToken(operation_cancellation);
+                var response = if (deadline_ns) |deadline|
+                    try client.fetchGroupTxnResolveWithControlAndTimeout(
+                        remote.base_uri,
+                        group_id,
+                        table_name,
+                        body,
+                        try remainingDeadlineTimeoutMs(deadline),
+                        &request_cancellation,
+                    )
+                else
+                    try client.fetchGroupTxnResolveWithControl(
+                        remote.base_uri,
+                        group_id,
+                        table_name,
+                        body,
+                        if (operation_cancellation.ptr != null) &request_cancellation else null,
+                    );
                 response.deinit(alloc);
             },
         }
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+        return try statusGroupWithin(ptr, alloc, group_id, table_name, txn_id, null);
+    }
+
+    fn statusGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+        return try statusGroupWithin(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn statusGroupWithin(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: ?u64) !db_mod.types.TxnStatus {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         return switch (route) {
             .local => (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnStatusRequest(alloc, txn_id);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnStatus(remote.base_uri, group_id, table_name, body);
+                var response = if (deadline_ns) |deadline|
+                    try client.fetchGroupTxnStatusWithTimeout(
+                        remote.base_uri,
+                        group_id,
+                        table_name,
+                        body,
+                        try remainingDeadlineTimeoutMs(deadline),
+                    )
+                else
+                    try client.fetchGroupTxnStatus(remote.base_uri, group_id, table_name, body);
                 defer response.deinit(alloc);
                 const parsed = try parseTxnStatusResponse(alloc, response.body);
                 break :blk parsed.status;
@@ -716,12 +794,33 @@ fn ensurePreDecisionDeadline(deadline_ns: u64) !void {
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
 
-fn remainingPreDecisionTimeoutMs(deadline_ns: u64) !u32 {
+fn ensureDecisionRecoveryDeadline(deadline_ns: u64) !void {
+    if (platform_time.monotonicNs() >= deadline_ns) return error.CommitDecisionUnknown;
+}
+
+const DecisionRecoveryCancellation = struct {
+    deadline_ns: u64,
+
+    fn token(self: *const DecisionRecoveryCancellation) db_mod.types.CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const DecisionRecoveryCancellation = @ptrCast(@alignCast(ptr));
+        return platform_time.monotonicNs() >= self.deadline_ns;
+    }
+};
+
+fn remainingDeadlineTimeoutMs(deadline_ns: u64) !u32 {
     const now_ns = platform_time.monotonicNs();
     if (now_ns >= deadline_ns) return error.Timeout;
     const remaining_ns = deadline_ns - now_ns;
     const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
     return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
+
+fn remainingPreDecisionTimeoutMs(deadline_ns: u64) !u32 {
+    return try remainingDeadlineTimeoutMs(deadline_ns);
 }
 
 pub const LocalTableWriteParticipantWorker = struct {
@@ -739,7 +838,9 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .resolve_group_with_cancellation = resolveGroupWithCancellation,
+                .resolve_group_until = resolveGroupUntil,
                 .status_group = statusGroup,
+                .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
             },
         };
@@ -764,9 +865,20 @@ pub const LocalTableWriteParticipantWorker = struct {
         _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation)) orelse return error.UnknownGroup;
     }
 
+    fn resolveGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns };
+        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, deadline_cancellation.token());
+    }
+
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
         return (try self.writes.txnStatusGroupLinearizable(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
+    }
+
+    fn statusGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+        try ensureDecisionRecoveryDeadline(deadline_ns);
+        return try statusGroup(ptr, alloc, group_id, table_name, txn_id);
     }
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -2156,11 +2268,12 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
     var last_resolve_error = initial_resolve_error;
     var last_status_error: ?anyerror = null;
     while (true) {
-        const status: ?db_mod.types.TxnStatus = worker.statusGroup(
+        const status: ?db_mod.types.TxnStatus = worker.statusGroupUntil(
             alloc,
             participant.group_id,
             participant.table_name,
             txn_id,
+            deadline_ns,
         ) catch |status_err| status_failure: {
             last_status_error = status_err;
             break :status_failure null;
@@ -2184,13 +2297,13 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
         // cancellation cannot prove the first commit was not accepted. This
         // bounded recovery loop has its own deadline and repeats only the
         // exact same idempotent decision.
-        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
+        worker.resolveGroupUntil(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
             .topology_epoch = participant.topology_epoch,
             .sync_level = sync_level,
-        }, .none) catch |retry_err| {
+        }, deadline_ns) catch |retry_err| {
             last_resolve_error = retry_err;
             const now_ns = platform_time.monotonicNs();
             if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
@@ -2479,6 +2592,8 @@ test "distributed txn retries an ambiguous coordinator decision under the same i
                 .prepare_group = prepare,
                 .resolve_group = resolve,
                 .status_group = status,
+                .resolve_group_until = resolveUntil,
+                .status_group_until = statusUntil,
             } };
         }
 
@@ -2495,6 +2610,14 @@ test "distributed txn retries an ambiguous coordinator decision under the same i
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status_calls += 1;
             return error.InjectedStatusFailure;
+        }
+        fn resolveUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try resolve(ptr, alloc, group_id, table_name, req);
+        }
+        fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try status(ptr, alloc, group_id, table_name, txn_id);
         }
     };
 
@@ -2528,6 +2651,8 @@ test "distributed txn bounds unresolved coordinator decision retries" {
                 .prepare_group = prepare,
                 .resolve_group = resolve,
                 .status_group = status,
+                .resolve_group_until = resolveUntil,
+                .status_group_until = statusUntil,
             } };
         }
 
@@ -2542,6 +2667,14 @@ test "distributed txn bounds unresolved coordinator decision retries" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status_calls += 1;
             return error.InjectedStatusFailure;
+        }
+        fn resolveUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try resolve(ptr, alloc, group_id, table_name, req);
+        }
+        fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try status(ptr, alloc, group_id, table_name, txn_id);
         }
     };
 
@@ -2559,6 +2692,62 @@ test "distributed txn bounds unresolved coordinator decision retries" {
     ));
     try std.testing.expect(recorder.status_calls > 0);
     try std.testing.expect(recorder.resolve_calls > 0);
+}
+
+test "distributed txn propagates one absolute deadline through ambiguous decision recovery" {
+    const Recorder = struct {
+        expected_deadline_ns: u64,
+        status_until_calls: usize = 0,
+        resolve_until_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+                .resolve_group_until = resolveUntil,
+                .status_group_until = statusUntil,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            return error.LegacyResolveMustNotRun;
+        }
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return error.LegacyStatusMustNotRun;
+        }
+        fn statusUntil(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_until_calls += 1;
+            try std.testing.expectEqual(self.expected_deadline_ns, deadline_ns);
+            return error.InjectedStatusFailure;
+        }
+        fn resolveUntil(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_until_calls += 1;
+            try std.testing.expectEqual(self.expected_deadline_ns, deadline_ns);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+        }
+    };
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    var recorder = Recorder{ .expected_deadline_ns = deadline_ns };
+    const status = try resolveCoordinatorDecisionAfterFailureUntil(
+        std.testing.allocator,
+        recorder.worker(),
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
+        try parseTxnIdHex("00112233445566778899aabbccddeeff"),
+        10_001,
+        .write,
+        error.InjectedResolveFailure,
+        deadline_ns,
+    );
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
+    try std.testing.expectEqual(@as(usize, 1), recorder.status_until_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_until_calls);
 }
 
 test "distributed txn participant fanout is bounded and concurrent" {
@@ -4447,6 +4636,8 @@ test "distributed txn coordinator never aborts after durable commit decision" {
                 .prepare_group = prepare,
                 .resolve_group = resolve,
                 .status_group = status,
+                .resolve_group_until = resolveUntil,
+                .status_group_until = statusUntil,
                 .acknowledge_group = acknowledge,
             } };
         }
@@ -4480,6 +4671,14 @@ test "distributed txn coordinator never aborts after durable commit decision" {
             if (group_id == 7001 and self.retry_ambiguous_coordinator) return .pending;
             if (group_id == 7001 and self.first_committed) return .committed;
             return .pending;
+        }
+        fn resolveUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try resolve(ptr, alloc, group_id, table_name, req);
+        }
+        fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+            try ensureDecisionRecoveryDeadline(deadline_ns);
+            return try status(ptr, alloc, group_id, table_name, txn_id);
         }
         fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
