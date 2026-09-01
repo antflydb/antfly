@@ -160,6 +160,12 @@ pub const AppendOptions = struct {
     sync: bool = true,
 };
 
+pub const ReclaimStats = struct {
+    observed_debt: usize = 0,
+    removed: usize = 0,
+    remaining_debt: usize = 0,
+};
+
 pub const ShardBlock = struct {
     shard_id: u32,
     bytes: []const u8,
@@ -770,10 +776,9 @@ pub const Store = struct {
         defer self.alloc.free(encoded);
         const next_wal_path = try self.walPathAlloc(next_wal_generation);
         defer self.alloc.free(next_wal_path);
-        // Allocate every piece of post-publication cleanup state before the
-        // CURRENT commit point. Once CURRENT is replaced, returning an
-        // allocator error would report failure for a generation that is
-        // already the crash-recovery authority and invite an unsafe retry.
+        // Allocate post-publication cleanup state before the CURRENT commit
+        // point so no allocator failure can make a committed generation look
+        // retryable to the caller.
         const previous_wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(previous_wal_path);
         try atomicReplace(self.alloc, self.storage, next_wal_path, next_wal_bytes);
@@ -784,11 +789,6 @@ pub const Store = struct {
             return err;
         };
 
-        // CURRENT is now the crash-recovery authority. Replacement bases do
-        // not reference any prior block, so unlink those generations before
-        // releasing their descriptors. Existing POSIX mmap leases remain
-        // valid; platforms that cannot unlink a mapped file leave harmless
-        // startup-cleanup debt instead of compromising publication.
         const obsolete_start: usize = switch (mode) {
             .replace_base => 0,
             .append_delta => self.manifest_segments.len,
@@ -799,6 +799,7 @@ pub const Store = struct {
             defer self.alloc.free(obsolete_path);
             self.storage.deleteFileAbsolute(obsolete_path) catch {};
         }
+        self.storage.deleteFileAbsolute(previous_wal_path) catch {};
         if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
         if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
         self.manifest_segments = next_segments;
@@ -813,7 +814,58 @@ pub const Store = struct {
         self.last_committed_batch = next_wal_last_batch;
         self.covered_source_sequence = next_covered_source_sequence;
         self.segment_covered_source_sequence = covered_source_sequence;
-        self.storage.deleteFileAbsolute(previous_wal_path) catch {};
+        self.reclaimUnreferencedFilesBestEffort();
+    }
+
+    /// Reconciles immutable blocks and WAL generations against CURRENT. This
+    /// recovers both pre-publication staged orphans and post-publication unlink
+    /// failures. Active native mmap leases remain valid on POSIX; providers
+    /// which cannot unlink an open file leave it for the next retry/open.
+    /// The caller must own startup/publication exclusion from unpublished
+    /// block builders; observational Store.open calls never invoke this.
+    pub fn reclaimUnreferencedFiles(self: *const Store) !ReclaimStats {
+        const names = try self.storage.listFileNamesAlloc(self.alloc, self.root_dir);
+        defer lsm_backend.Storage.freeFileNames(self.alloc, names);
+        var stats: ReclaimStats = .{};
+        for (names) |name| {
+            if (!isManagedArtifactName(name) or self.artifactNameIsLive(name)) continue;
+            stats.observed_debt += 1;
+            const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            defer self.alloc.free(path);
+            self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    stats.remaining_debt += 1;
+                    continue;
+                },
+            };
+            stats.removed += 1;
+        }
+        return stats;
+    }
+
+    fn reclaimUnreferencedFilesBestEffort(self: *const Store) void {
+        const stats = self.reclaimUnreferencedFiles() catch |err| {
+            std.log.warn("vector-block generation cleanup deferred root={s} err={s}", .{ self.root_dir, @errorName(err) });
+            return;
+        };
+        if (stats.remaining_debt != 0)
+            std.log.warn("vector-block generation cleanup retained root={s} observed={} removed={} remaining={}", .{
+                self.root_dir,
+                stats.observed_debt,
+                stats.removed,
+                stats.remaining_debt,
+            });
+    }
+
+    fn artifactNameIsLive(self: *const Store, name: []const u8) bool {
+        if (parseWalGeneration(name)) |generation| return generation == self.wal_generation;
+        const identity = parseBlockIdentity(name) orelse return false;
+        for (self.manifest_segments) |descriptor| {
+            if (descriptor.generation == identity.generation and descriptor.shard_id == identity.shard_id)
+                return true;
+        }
+        return false;
     }
 
     /// Builds a complete shared base from authoritative embedding artifacts
@@ -2710,6 +2762,59 @@ fn openInternal(
         .wal = wal,
         .wal_order = wal_order,
     };
+}
+
+const BlockIdentity = struct {
+    generation: u64,
+    shard_id: u32,
+};
+
+fn isManagedArtifactName(name: []const u8) bool {
+    return parseWalGeneration(name) != null or parseBlockIdentity(name) != null;
+}
+
+fn parseWalGeneration(name: []const u8) ?u64 {
+    return parseSingleNumberName(name, "wal-", ".afvw");
+}
+
+fn parseBlockIdentity(name: []const u8) ?BlockIdentity {
+    const prefix = "block-";
+    const suffix = ".afvb";
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
+    const body = name[prefix.len .. name.len - suffix.len];
+    const separator = std.mem.indexOfScalar(u8, body, '-') orelse return null;
+    if (separator == 0 or separator + 1 == body.len or std.mem.indexOfScalar(u8, body[separator + 1 ..], '-') != null)
+        return null;
+    return .{
+        .generation = std.fmt.parseInt(u64, body[0..separator], 10) catch return null,
+        .shard_id = std.fmt.parseInt(u32, body[separator + 1 ..], 10) catch return null,
+    };
+}
+
+fn parseSingleNumberName(name: []const u8, prefix: []const u8, suffix: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
+    const digits = name[prefix.len .. name.len - suffix.len];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(u64, digits, 10) catch null;
+}
+
+test "vector block store reclaims crash orphans from CURRENT" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const storage = memory.storage();
+    try storage.writeFileAbsolute("/vector-gc/block-99-0.afvb", "orphan");
+    try storage.writeFileAbsolute("/vector-gc/wal-99.afvw", "orphan");
+    try storage.writeFileAbsolute("/vector-gc/unmanaged", "keep");
+
+    var store = try Store.open(alloc, storage, "/vector-gc");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, "orphan".len), try storage.fileSize("/vector-gc/block-99-0.afvb"));
+    _ = try store.reclaimUnreferencedFiles();
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/vector-gc/block-99-0.afvb"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/vector-gc/wal-99.afvw"));
+    try std.testing.expectEqual(@as(u64, 0), try storage.fileSize("/vector-gc/wal-1.afvw"));
+    try std.testing.expectEqual(@as(u64, "keep".len), try storage.fileSize("/vector-gc/unmanaged"));
 }
 
 fn reusableBlockIndex(previous: *const Opened, descriptor: vector_manifest.Segment) ?usize {

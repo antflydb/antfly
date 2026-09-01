@@ -88,6 +88,12 @@ pub const AppendOptions = struct {
     sync: bool = true,
 };
 
+pub const ReclaimStats = struct {
+    observed_debt: usize = 0,
+    removed: usize = 0,
+    remaining_debt: usize = 0,
+};
+
 pub const CheckpointPolicy = struct {
     min_wal_bytes: u64 = 1 * 1024 * 1024,
     max_wal_bytes: u64 = 64 * 1024 * 1024,
@@ -700,19 +706,23 @@ pub const Store = struct {
         self.covered_source_sequence = tail_covered_source_sequence;
         self.segment_bytes = next_segment_bytes;
 
+        // Preserve deterministic retirement for providers which do not yet
+        // support directory inventory; the reconciliation sweep additionally
+        // catches crash orphans and retries failed unlinks.
         if (mode == .full) {
             if (previous) |old| {
                 for (0..old.segmentCount()) |index| {
                     const old_segment_path = self.segmentPathAlloc(old.segment(index).generation) catch continue;
                     defer self.alloc.free(old_segment_path);
-                    deleteFileBestEffort(self.storage, old_segment_path);
+                    self.storage.deleteFileAbsolute(old_segment_path) catch {};
                 }
             }
         }
         if (self.walPathAlloc(previous_wal_generation)) |old_wal_path| {
             defer self.alloc.free(old_wal_path);
-            deleteFileBestEffort(self.storage, old_wal_path);
+            self.storage.deleteFileAbsolute(old_wal_path) catch {};
         } else |_| {}
+        self.reclaimUnreferencedFilesBestEffort();
     }
 
     pub fn recoverWal(self: *Store) !RecoveredWal {
@@ -731,6 +741,61 @@ pub const Store = struct {
             .bytes = bytes,
             .replay = try posting_wal.Replay.parse(self.alloc, bytes),
         };
+    }
+
+    /// Reconciles the flat generation directory against CURRENT. A crash at
+    /// any point around publication can leave an unreferenced staged segment,
+    /// while Windows may defer unlink until old mmap leases close. Retrying on
+    /// startup and publication reconciliation make both cases bounded without
+    /// ever
+    /// deriving liveness from mutable in-memory state.
+    /// The caller must own startup/publication exclusion from unpublished
+    /// checkpoint builders; observational Store.open calls never invoke this.
+    pub fn reclaimUnreferencedFiles(self: *const Store) !ReclaimStats {
+        const names = try self.storage.listFileNamesAlloc(self.alloc, self.root_dir);
+        defer lsm_backend.Storage.freeFileNames(self.alloc, names);
+        var stats: ReclaimStats = .{};
+        for (names) |name| {
+            if (!isManagedArtifactName(name) or self.artifactNameIsLive(name)) continue;
+            stats.observed_debt += 1;
+            const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            defer self.alloc.free(path);
+            self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    stats.remaining_debt += 1;
+                    continue;
+                },
+            };
+            stats.removed += 1;
+        }
+        return stats;
+    }
+
+    fn reclaimUnreferencedFilesBestEffort(self: *const Store) void {
+        const stats = self.reclaimUnreferencedFiles() catch |err| {
+            std.log.warn("posting generation cleanup deferred root={s} err={s}", .{ self.root_dir, @errorName(err) });
+            return;
+        };
+        if (stats.remaining_debt != 0)
+            std.log.warn("posting generation cleanup retained root={s} observed={} removed={} remaining={}", .{
+                self.root_dir,
+                stats.observed_debt,
+                stats.removed,
+                stats.remaining_debt,
+            });
+    }
+
+    fn artifactNameIsLive(self: *const Store, name: []const u8) bool {
+        if (parseManagedGeneration(name, "wal-", ".afpw")) |generation|
+            return generation == self.wal_generation;
+        if (parseManagedGeneration(name, "segment-", ".afps")) |generation| {
+            const checkpoint = self.checkpoint orelse return false;
+            for (0..checkpoint.segmentCount()) |index| {
+                if (checkpoint.segment(index).generation == generation) return true;
+            }
+        }
+        return false;
     }
 
     pub fn readSegmentAlloc(self: *Store) ![]u8 {
@@ -850,8 +915,37 @@ fn atomicReplace(alloc: Allocator, storage: lsm_backend.Storage, path: []const u
     try generation_publication.replaceImmutable(alloc, storage, path, contents);
 }
 
-fn deleteFileBestEffort(storage: lsm_backend.Storage, path: []const u8) void {
-    storage.deleteFileAbsolute(path) catch {};
+fn isManagedArtifactName(name: []const u8) bool {
+    return parseManagedGeneration(name, "wal-", ".afpw") != null or
+        parseManagedGeneration(name, "segment-", ".afps") != null;
+}
+
+fn parseManagedGeneration(name: []const u8, prefix: []const u8, suffix: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
+    const digits = name[prefix.len .. name.len - suffix.len];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(u64, digits, 10) catch null;
+}
+
+test "storage.posting segment store reclaims crash orphans from CURRENT" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const storage = memory.storage();
+    try storage.writeFileAbsolute("/posting-gc/segment-99.afps", "orphan");
+    try storage.writeFileAbsolute("/posting-gc/wal-99.afpw", "orphan");
+    try storage.writeFileAbsolute("/posting-gc/unmanaged", "keep");
+
+    var store = try Store.open(alloc, storage, "/posting-gc");
+    defer store.deinit();
+    // Ordinary opens may race an off-lock checkpoint build and are therefore
+    // observational. Only the startup/publication owner reconciles orphans.
+    try std.testing.expectEqual(@as(u64, "orphan".len), try storage.fileSize("/posting-gc/segment-99.afps"));
+    _ = try store.reclaimUnreferencedFiles();
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/posting-gc/segment-99.afps"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/posting-gc/wal-99.afpw"));
+    try std.testing.expectEqual(@as(u64, 0), try storage.fileSize("/posting-gc/wal-1.afpw"));
+    try std.testing.expectEqual(@as(u64, "keep".len), try storage.fileSize("/posting-gc/unmanaged"));
 }
 
 test "storage.posting segment store publishes checkpoint and committed WAL generations" {

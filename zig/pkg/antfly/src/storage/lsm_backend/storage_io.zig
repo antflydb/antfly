@@ -489,6 +489,7 @@ pub const Storage = struct {
         rename_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
+        list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         now_ns: *const fn (*anyopaque) u64,
         root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
         /// The host guarantees that rename_absolute is an atomic replacement
@@ -621,6 +622,16 @@ pub const Storage = struct {
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
 
+    /// Acquires a descriptor/handle bound to the currently opened file, not a
+    /// path which may later be atomically replaced. Generation capture uses
+    /// this stronger contract so materialization can safely outlive mutation
+    /// admission and CURRENT rotation.
+    pub fn beginStableSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        const begin = self.vtable.begin_cold_sequential_read orelse
+            return error.StableFileLeaseUnsupported;
+        return try begin(self.ptr, allocator, path);
+    }
+
     pub fn beginSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
@@ -658,6 +669,19 @@ pub const Storage = struct {
 
     pub fn deleteTree(self: Storage, path: []const u8) !void {
         return self.vtable.delete_tree(self.ptr, path);
+    }
+
+    /// Returns owned basenames for regular files immediately below `path`.
+    /// Native generation stores use this to reconcile immutable files against
+    /// their authoritative CURRENT record after crashes and failed unlinks.
+    pub fn listFileNamesAlloc(self: Storage, allocator: Allocator, path: []const u8) ![][]u8 {
+        const list = self.vtable.list_file_names_alloc orelse return error.DirectoryListingUnsupported;
+        return try list(self.ptr, allocator, path);
+    }
+
+    pub fn freeFileNames(allocator: Allocator, names: [][]u8) void {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
     }
 
     pub fn nowNs(self: Storage) u64 {
@@ -1877,6 +1901,7 @@ else blk: {
                 .rename_absolute = renameAbsolute,
                 .delete_file_absolute = deleteFileAbsolute,
                 .delete_tree = deleteTree,
+                .list_file_names_alloc = listFileNamesAlloc,
                 .now_ns = nowNs,
                 .root_identity_alloc = nativeRootIdentityAlloc,
                 .rename_is_atomic = true,
@@ -2102,6 +2127,14 @@ else blk: {
                 }
             }
 
+            fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                return switch (self.runtime) {
+                    .threaded => |*threaded| try listFileNamesWithIo(allocator, threaded.io(), path),
+                    .evented => |*evented| try listFileNamesWithIo(allocator, evented.io(), path),
+                };
+            }
+
             fn nowNs(ptr: *anyopaque) u64 {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 return switch (self.runtime) {
@@ -2161,6 +2194,7 @@ else blk: {
             .rename_absolute = renameAbsolute,
             .delete_file_absolute = deleteFileAbsolute,
             .delete_tree = deleteTree,
+            .list_file_names_alloc = listFileNamesAlloc,
             .now_ns = nowNs,
             .root_identity_alloc = rootIdentityAlloc,
             .rename_is_atomic = true,
@@ -2382,6 +2416,13 @@ else blk: {
             try std.Io.Dir.cwd().deleteTreeMinStackSize(permit.io, path);
         }
 
+        fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            var permit = try state.acquireFdPermit();
+            defer permit.release();
+            return try listFileNamesWithIo(allocator, permit.io, path);
+        }
+
         fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             var permit = try state.acquireFdPermit();
@@ -2418,6 +2459,27 @@ fn writeFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8) 
         std.log.err("lsm writeFileAbsolute finish failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(actual) });
         return actual;
     };
+}
+
+fn listFileNamesWithIo(allocator: Allocator, io: anytype, path: []const u8) ![][]u8 {
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try names.append(allocator, name);
+    }
+    return try names.toOwnedSlice(allocator);
 }
 
 fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8, sync: bool) !void {
@@ -3291,6 +3353,7 @@ const memory_vtable: Storage.VTable = .{
     .rename_absolute = memoryRenameAbsolute,
     .delete_file_absolute = memoryDeleteFileAbsolute,
     .delete_tree = memoryDeleteTree,
+    .list_file_names_alloc = memoryListFileNamesAlloc,
     .now_ns = memoryNowNs,
     .rename_is_atomic = true,
 };
@@ -3307,6 +3370,26 @@ test "native path locking does not imply host generation publication" {
 }
 
 fn memoryCreateDirPath(_: *anyopaque, _: []const u8) !void {}
+
+fn memoryListFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    var iterator = self.files.keyIterator();
+    while (iterator.next()) |stored_path| {
+        const parent = std.fs.path.dirname(stored_path.*) orelse continue;
+        if (!std.mem.eql(u8, parent, path)) continue;
+        const name = try allocator.dupe(u8, std.fs.path.basename(stored_path.*));
+        errdefer allocator.free(name);
+        try names.append(allocator, name);
+    }
+    return try names.toOwnedSlice(allocator);
+}
 
 fn memoryReadFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));

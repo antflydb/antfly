@@ -4130,6 +4130,7 @@ pub const HBCIndex = struct {
 
     pub const NativeBackupGeneration = struct {
         alloc: Allocator,
+        storage: lsm_backend.Storage,
         root_dir: []u8,
         current_bytes: []u8,
         segment_generations: []u64,
@@ -4173,6 +4174,7 @@ pub const HBCIndex = struct {
         const root_dir = try alloc.dupe(u8, store.root_dir);
         return .{
             .alloc = alloc,
+            .storage = store.storage,
             .root_dir = root_dir,
             .current_bytes = current_bytes,
             .segment_generations = segment_generations,
@@ -4512,6 +4514,9 @@ pub const HBCIndex = struct {
         defer alloc.free(posting_root);
         var opened = try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
         defer opened.deinit();
+        _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+            std.log.warn("posting startup cleanup deferred root={s} err={s}", .{ posting_root, @errorName(err) });
+        };
         var current: ?[]const u8 = null;
         var segment_index = opened.segments.len;
         while (segment_index > 0) {

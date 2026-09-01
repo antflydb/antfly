@@ -18294,9 +18294,9 @@ pub const DB = struct {
         }.lessThan);
 
         // Ask each backend to retain its exact manifested generation. Pinning
-        // is bounded by backend/run metadata: it hardlinks only manifest-named
-        // immutable files and copies bounded committed WAL tails without
-        // walking or reading corpus segments under the mutation fence.
+        // is bounded by backend/run metadata: it hardlinks manifest-named
+        // immutable files and opens stable committed-WAL descriptor leases
+        // without reading corpus or WAL payloads under the mutation fence.
         const generated_native_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-native-pin", .{staging_root});
         defer self.alloc.free(generated_native_pin_root);
         var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints(

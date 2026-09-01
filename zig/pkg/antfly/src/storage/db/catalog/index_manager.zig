@@ -3322,13 +3322,30 @@ pub const IndexManager = struct {
         defer self.alloc.free(root);
         const current_path = try std.fs.path.join(self.alloc, &.{ root, "CURRENT" });
         defer self.alloc.free(current_path);
-        _ = self.vector_block_storage.?.fileSize(current_path) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
+        const current_exists = blk: {
+            _ = self.vector_block_storage.?.fileSize(current_path) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
         };
+        if (!current_exists) {
+            // A crash may leave first-generation blocks before CURRENT. Avoid
+            // creating vector state for tables that have never staged it, but
+            // still enter recovery when the native root contains debt.
+            const names = self.vector_block_storage.?.listFileNamesAlloc(self.alloc, root) catch |err| switch (err) {
+                error.FileNotFound, error.DirectoryListingUnsupported => return,
+                else => return err,
+            };
+            defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
+            if (names.len == 0) return;
+        }
         var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
+        _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+            std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
+        };
         if (opened.store.manifest == null) {
             opened.deinit();
             opened_owned = false;
@@ -6143,8 +6160,8 @@ pub const IndexManager = struct {
 
     /// Pins the exact immutable generations owned by the opened index
     /// backends. No directory walk or immutable corpus-byte copy occurs here;
-    /// only bounded committed WAL prefixes are copied before the caller can
-    /// release revision/mutation fences.
+    /// stable descriptor leases capture committed WAL prefixes before the
+    /// caller releases revision/mutation fences.
     pub fn pinNativeBackupCheckpoints(
         self: *IndexManager,
         io: std.Io,
@@ -6272,6 +6289,7 @@ pub const IndexManager = struct {
                 try native_specs.append(self.alloc, .{
                     .relative_path = wal_relative,
                     .source = .{ .committed_prefix = .{
+                        .storage = generation.storage,
                         .path = wal_source,
                         .bytes = generation.wal_committed_bytes,
                     } },
@@ -6349,6 +6367,7 @@ pub const IndexManager = struct {
                         try native_specs.append(self.alloc, .{
                             .relative_path = wal_relative,
                             .source = .{ .committed_prefix = .{
+                                .storage = store.storage,
                                 .path = wal_source,
                                 .bytes = store.wal_committed_bytes,
                             } },

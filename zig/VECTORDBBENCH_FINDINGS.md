@@ -3657,6 +3657,34 @@ discarded: repeat controlled lifecycles remain the gate for a precise RSS
 claim. The load-time, recall, query-latency, and throughput acceptance gates all
 pass.
 
+## Native generation lifecycle hardening
+
+The post-r126 PR review found three lifecycle gaps and the implementation now
+uses the durable shape rather than benchmark-only workarounds:
+
+- Native backup manifest v5 authenticates both the portable snapshot path and
+  an explicit runtime `install_path`. Shared vector acceleration remains under
+  the snapshot ownership namespace `indexes/vector-blocks`, but installs at
+  the runtime-owned `vector-blocks` root. Duplicate or noncanonical install
+  targets are rejected before any generated state is admitted.
+- Snapshot admission acquires stable file-descriptor leases for exact committed
+  posting/vector WAL prefixes. WAL copying, hashing, and fsync now happen after
+  apply, replay, and structural mutation admission reopen. A deterministic test
+  unlinks and replaces the live WAL before materialization and still recovers
+  the selected committed prefix.
+- Posting and vector generation directories reconcile strict native filenames
+  against `CURRENT` at startup and publication boundaries. Known retirees are
+  still deleted directly for storage-provider compatibility; inventory sweeps
+  recover crash-before-publication orphans and retry failed unlinks. Cleanup
+  reports `observed_debt`, `removed`, and `remaining_debt`, preserves unrelated
+  files, and ordinary observational opens never reclaim concurrently staged
+  generations.
+
+These changes are outside the query and mutation hot paths. Snapshot fence work
+is reduced from O(committed WAL bytes) to descriptor acquisition plus immutable
+hardlink metadata. Publication adds one flat, filename-only inventory scan; it
+does not read segment contents or recurse through the database tree.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
