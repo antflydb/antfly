@@ -35831,7 +35831,7 @@ test "provisioned table write source publishes direct storage owner data changes
     try std.testing.expectEqualStrings("docs", hook.table_name.?);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 
-    source.publishStorageOwnerRuntimeStatusChange("docs");
+    source.publishStorageOwnerRuntimeStatusChange(std.testing.allocator, 7001, "docs");
 
     try std.testing.expectEqual(@as(usize, 2), hook.calls);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
