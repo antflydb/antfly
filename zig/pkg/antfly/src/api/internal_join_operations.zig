@@ -37,18 +37,24 @@ pub const Operations = struct {
             error.InvalidQueryRequest => error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
             error.TableNotFound, error.UnknownGroup => error.NotFound,
-            error.Timeout => error.Timeout,
+            error.Timeout, error.DeadlineExceeded, error.CatalogRoutingSnapshotTimeout => error.Timeout,
+            error.Cancelled, error.Canceled => error.Canceled,
+            error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => error.Unavailable,
             error.TopologyChanged => error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             else => error.Internal,
         };
     }
 
-    fn executionDependencies(self: Operations) Error!struct {
+    fn executionDependencies(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64) Error!struct {
         context: distributed_join.JoinContext,
         reads: table_reads.TableReadSource,
     } {
-        const reads = self.reads orelse return error.NotFound;
+        var reads = self.reads orelse return error.NotFound;
+        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id, request.deadline_ns, request.cancellation) catch |err| switch (err) {
+            error.UnsupportedCatalogRouteFence => return error.Unsupported,
+            else => return error.InvalidArgument,
+        };
         const context = self.join_context orelse return error.Unavailable;
         return .{
             .context = context,
@@ -84,7 +90,7 @@ pub const Operations = struct {
         input: distributed_join.JoinFinalizeRequest,
     ) Error!distributed_join.JoinPartitionExecutionResult {
         try request.ensureActive();
-        const deps = try self.executionDependencies();
+        const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinFinalizeWorkerLocalTyped(
             deps.context,
             self.job_store,
@@ -105,7 +111,7 @@ pub const Operations = struct {
         input: distributed_join.JoinRowsRequest,
     ) Error![]std.json.Value {
         try request.ensureActive();
-        const deps = try self.executionDependencies();
+        const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinRowsLocalTyped(
             deps.context,
             alloc,
@@ -125,7 +131,7 @@ pub const Operations = struct {
         input: distributed_join.JoinUnmatchedRequest,
     ) Error!distributed_join.EncodedJoinUnmatchedResponse {
         try request.ensureActive();
-        const deps = try self.executionDependencies();
+        const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinUnmatchedLocalTyped(
             deps.context,
             alloc,
@@ -145,7 +151,7 @@ pub const Operations = struct {
         input: distributed_join.JoinPartitionRequest,
     ) Error!distributed_join.JoinPartitionExecutionResult {
         try request.ensureActive();
-        const deps = try self.executionDependencies();
+        const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinPartitionWorkerLocalTyped(
             deps.context,
             self.job_store,

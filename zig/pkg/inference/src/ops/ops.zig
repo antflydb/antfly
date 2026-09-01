@@ -509,6 +509,8 @@ pub const A4bMappedLayer0PrewarmResult = struct {
 };
 
 pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bLoadStrategy = backend_contracts.A4bLoadStrategy;
+pub const A4bPreparedPackMode = backend_contracts.A4bPreparedPackMode;
 pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
 pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
 pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
@@ -647,6 +649,11 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_route_select_attempts: u64 = 0,
     a4b_moe_route_select_successes: u64 = 0,
     a4b_moe_route_select_fallbacks: u64 = 0,
+    a4b_cuda_resident_source_bytes: u64 = 0,
+    a4b_cuda_resident_source_count: u64 = 0,
+    a4b_cuda_route_calls: u64 = 0,
+    a4b_cuda_decode_calls: u64 = 0,
+    a4b_cuda_prefill_calls: u64 = 0,
     a4b_moe_slot_lookup_attempts: u64 = 0,
     a4b_moe_slot_route_hits: u64 = 0,
     a4b_moe_slot_route_misses: u64 = 0,
@@ -850,6 +857,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_decode_gqa_split_calls: u64 = 0,
+    metal_runtime_decode_gqa_split_min_kv_tokens: u64 = 0,
+    metal_runtime_decode_gqa_split_below_min_kv_calls: u64 = 0,
     metal_runtime_decode_gqa_split_fallback_calls: u64 = 0,
     metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
@@ -966,6 +975,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
     metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
+    metal_runtime_lm_head_q4_resident_sampling_rejections: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
     /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
     metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
