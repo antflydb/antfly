@@ -704,6 +704,8 @@ pub fn adminCommandForAction(
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
             try appendArg(alloc, &argv, "--new-epoch");
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
+            try appendArg(alloc, &argv, "--generation");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.fence_generation orelse return error.FenceGenerationMissing});
             try appendArg(alloc, &argv, "--required-lsn");
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
             try appendArg(alloc, &argv, "--observed-lsn");
@@ -739,6 +741,8 @@ pub fn adminCommandForAction(
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
                 try appendArg(alloc, &argv, "--new-epoch");
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
+                try appendArg(alloc, &argv, "--generation");
+                try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.fence_generation orelse return error.FenceGenerationMissing});
                 try appendArg(alloc, &argv, "--required-lsn");
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
                 try appendArg(alloc, &argv, "--observed-lsn");
@@ -2156,6 +2160,7 @@ test "storage.ha operator renders executable admin command for fenced promotion"
         .old_primary_id = "primary-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .fence_generation = 6,
         .reason = "operator-approved",
     })).?;
     defer acquire.deinit(alloc);
@@ -2167,6 +2172,7 @@ test "storage.ha operator renders executable admin command for fenced promotion"
     try std.testing.expectEqualStrings("primary-a", acquire_fence.old_primary_id);
     try std.testing.expectEqualStrings("standby-a", acquire_fence.promoted_node_id);
     try std.testing.expectEqual(@as(u64, 2), acquire_fence.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 6), acquire_fence.generation);
     try std.testing.expectEqual(@as(u64, 12), acquire_fence.required_lsn);
     try std.testing.expectEqual(@as(u64, 12), acquire_fence.observed_lsn);
     try std.testing.expectEqualStrings("operator-approved", acquire_fence.reason);
@@ -2207,6 +2213,7 @@ test "storage.ha operator renders executable admin command for fenced promotion"
         .old_primary_id = "primary-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .fence_generation = 6,
         .reason = "operator-approved",
     })).?;
     defer command.deinit(alloc);
@@ -2228,6 +2235,7 @@ test "storage.ha operator renders executable admin command for fenced promotion"
         .old_primary_id = "primary-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .fence_generation = 6,
         .reason = "operator-approved",
     })).?;
     defer explicit_command.deinit(alloc);
@@ -2239,6 +2247,7 @@ test "storage.ha operator renders executable admin command for fenced promotion"
     try std.testing.expectEqualStrings("primary-a", fence.old_primary_id);
     try std.testing.expectEqualStrings("standby-a", fence.promoted_node_id);
     try std.testing.expectEqual(@as(u64, 2), fence.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 6), fence.generation);
     try std.testing.expectEqual(@as(u64, 12), fence.required_lsn);
     try std.testing.expectEqual(@as(u64, 12), fence.observed_lsn);
     try std.testing.expectEqualStrings("operator-approved", fence.reason);

@@ -830,18 +830,6 @@ pub const HAMutationPolicySnapshot = struct {
     remote_apply_mutations_enabled: bool = false,
 };
 
-/// Live HA ingress policy owned by the process runtime. Promotion changes the
-/// authority role without rebuilding the HTTP router, so policy cannot be a
-/// startup-only boolean.
-pub const HAMutationPolicySource = struct {
-    ptr: *const anyopaque,
-    snapshot_fn: *const fn (ptr: *const anyopaque) HAMutationPolicySnapshot,
-
-    pub fn snapshot(self: HAMutationPolicySource) HAMutationPolicySnapshot {
-        return self.snapshot_fn(self.ptr);
-    }
-};
-
 /// Optional request-count admission owner for an embedded inference runtime.
 /// API-only processes omit this and use their local fallback admission gate.
 pub const InferenceRequestAdmissionSource = struct {
@@ -947,9 +935,6 @@ pub const ApiHttpServerConfig = struct {
     /// synchronous RemoteApply. The route classifier alone cannot establish
     /// the active durability policy.
     ha_remote_apply_mutations_enabled: bool = false,
-    /// Optional live source supplied by HA-aware runtimes. Static fields above
-    /// remain the policy for kernels and tests without a mutable role.
-    ha_mutation_policy_source: ?HAMutationPolicySource = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -2595,7 +2580,6 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn haMutationPolicy(self: *const ApiHttpServer) HAMutationPolicySnapshot {
-        if (self.cfg.ha_mutation_policy_source) |source| return source.snapshot();
         return .{
             .failover_safe_mutations_only = self.cfg.ha_failover_safe_mutations_only,
             .remote_apply_mutations_enabled = self.cfg.ha_remote_apply_mutations_enabled,

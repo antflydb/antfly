@@ -36,6 +36,17 @@ pub const StdHttpExecutorConfig = struct {
     /// connection cancels the remaining attempts. This transport avoids that
     /// cancellation path and is required for long-lived HA replication loops.
     resolve_before_connect: bool = false,
+    /// Retain a successfully connected DNS result across requests. Keep this
+    /// disabled for Kubernetes headless Services: an old Pod can remain
+    /// connectable after the Service authority has moved to a new endpoint.
+    cache_resolved_addresses: bool = false,
+    /// Default end-to-end request deadline, including DNS lookup and connect,
+    /// when the individual request does not provide a tighter deadline. Zero
+    /// preserves the caller's unbounded behavior.
+    request_timeout_ms: u32 = 0,
+    /// Independent DNS-and-connect deadline for the resolved transport.
+    /// Unlike request_timeout_ms, this does not expire an established request.
+    connect_timeout_ms: u32 = 30_000,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -182,12 +193,16 @@ pub const StdHttpExecutor = struct {
         try self.beginRequest();
         defer self.endRequest();
 
-        if (req.cancellation) |cancellation| {
+        var effective_req = req;
+        if (effective_req.timeout_ms == null and self.cfg.request_timeout_ms > 0) {
+            effective_req.timeout_ms = self.cfg.request_timeout_ms;
+        }
+        if (effective_req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
-        if (req.timeout_ms != null or req.cancellation != null)
-            return try self.executeWithControl(alloc, req);
-        return try self.executeTransport(alloc, req);
+        if (effective_req.timeout_ms != null or effective_req.cancellation != null)
+            return try self.executeWithControl(alloc, effective_req);
+        return try self.executeTransport(alloc, effective_req);
     }
 
     fn executeTransport(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -295,15 +310,16 @@ pub const StdHttpExecutor = struct {
     fn resolvedClientConfig(cfg: StdHttpExecutorConfig) httpx.ClientConfig {
         return .{
             .timeouts = .{
-                .connect_ms = 30_000,
+                .connect_ms = cfg.connect_timeout_ms,
                 .read_ms = 30_000,
                 .write_ms = 30_000,
+                .request_ms = cfg.request_timeout_ms,
             },
             .retry_policy = .{ .max_retries = 0 },
             .redirect_policy = .{ .follow_redirects = false },
             .max_response_size = cfg.max_response_bytes,
             .keep_alive = false,
-            .cache_resolved_addresses = true,
+            .cache_resolved_addresses = cfg.cache_resolved_addresses,
         };
     }
 
@@ -672,6 +688,35 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "resolved executor does not retain DNS authority unless explicitly enabled" {
+    try std.testing.expect(!StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+    }).cache_resolved_addresses);
+    try std.testing.expect(StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+        .cache_resolved_addresses = true,
+    }).cache_resolved_addresses);
+}
+
+test "executor request deadline bounds resolved transport by default" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .request_timeout_ms = 7_500,
+    };
+    try std.testing.expectEqual(@as(u64, 7_500), StdHttpExecutor.resolvedClientConfig(cfg).timeouts.request_ms);
+}
+
+test "executor connect deadline is independent of whole request deadline" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .connect_timeout_ms = 7_500,
+        .request_timeout_ms = 0,
+    };
+    const resolved = StdHttpExecutor.resolvedClientConfig(cfg);
+    try std.testing.expectEqual(@as(u64, 7_500), resolved.timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u64, 0), resolved.timeouts.request_ms);
 }
 
 test "std http executor owns a finite controlled request worker budget" {

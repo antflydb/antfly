@@ -39,6 +39,7 @@ pub const Client = struct {
         stat_object_with_options: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, types.StatOptions) anyerror!types.ObjectMetadata = null,
         delete_object: *const fn (*anyopaque, []const u8, []const u8, types.DeleteOptions) anyerror!void,
         list_objects: *const fn (*anyopaque, Allocator, []const u8, types.ListOptions) anyerror!types.ListResult,
+        list_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, types.ListObjectVersionsOptions) anyerror!types.ListObjectVersionsResult = null,
     };
 
     pub fn deinit(self: *Client) void {
@@ -189,6 +190,16 @@ pub const Client = struct {
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
         return try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
+    }
+
+    pub fn listObjectVersions(self: *Client, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        if (opts.max_keys == 0) return error.InvalidPageSize;
+        if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
+        if (opts.version_id_marker != null and opts.key_marker == null)
+            return error.InvalidVersionPagination;
+        const list_versions = self.vtable.list_object_versions orelse
+            return error.ObjectVersionListingUnsupported;
+        return try list_versions(self.ptr, self.allocator, bucket, opts);
     }
 };
 

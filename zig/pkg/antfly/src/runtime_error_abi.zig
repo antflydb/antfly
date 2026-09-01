@@ -297,6 +297,14 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    // A locally committed RemoteApply write can cross the independently
+    // generated storage/runtime boundary before its standby acknowledgement
+    // is available. Preserve the exact reason so the public API can return
+    // its explicit pending-durability contract instead of a generic 500.
+    ha_sync_commit_would_block,
+    ha_sync_commit_wait_limit_exceeded,
+    ha_sync_commit_wait_missing_context,
+    ha_sync_commit_wait_standby_not_in_policy,
     deadline_exceeded,
     pre_decision_deadline_exceeded,
     graph_distinct_budget_exceeded,
@@ -386,6 +394,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
         error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
+        error.HASyncCommitWouldBlock => status(.unavailable, .ha_sync_commit_would_block),
+        error.HASyncCommitWaitLimitExceeded => status(.unavailable, .ha_sync_commit_wait_limit_exceeded),
+        error.HASyncCommitWaitMissingContext => status(.unavailable, .ha_sync_commit_wait_missing_context),
+        error.HASyncCommitWaitStandbyNotInPolicy => status(.unavailable, .ha_sync_commit_wait_standby_not_in_policy),
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
@@ -909,6 +921,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .ha_sync_commit_would_block => "HASyncCommitWouldBlock",
+        .ha_sync_commit_wait_limit_exceeded => "HASyncCommitWaitLimitExceeded",
+        .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
+        .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
@@ -949,6 +965,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
     try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
     try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
+    try std.testing.expectEqual(error.HASyncCommitWouldBlock, errorFromStatus(statusFromError(error.HASyncCommitWouldBlock)));
+    try std.testing.expectEqual(error.HASyncCommitWaitLimitExceeded, errorFromStatus(statusFromError(error.HASyncCommitWaitLimitExceeded)));
+    try std.testing.expectEqual(error.HASyncCommitWaitMissingContext, errorFromStatus(statusFromError(error.HASyncCommitWaitMissingContext)));
+    try std.testing.expectEqual(error.HASyncCommitWaitStandbyNotInPolicy, errorFromStatus(statusFromError(error.HASyncCommitWaitStandbyNotInPolicy)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

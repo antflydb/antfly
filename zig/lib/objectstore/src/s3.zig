@@ -1057,6 +1057,24 @@ pub const Client = struct {
         }
     }
 
+    fn listObjectVersions(self: *Client, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const query = try buildListObjectVersionsQueryAlloc(alloc, opts);
+        defer freeQueryPairs(alloc, query);
+        var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
+        defer target.deinit(alloc);
+
+        var response = try self.perform(.GET, target, &.{}, null, null);
+        defer response.deinit(alloc);
+        switch (response.status) {
+            200 => return try parseListObjectVersionsResponse(alloc, response.body),
+            404 => return .{
+                .entries = try alloc.alloc(types.ObjectVersionEntry, 0),
+                .is_truncated = false,
+            },
+            else => return unexpectedStatusError(response.status),
+        }
+    }
+
     fn perform(
         self: *Client,
         method: HttpMethod,
@@ -1176,6 +1194,7 @@ pub const Client = struct {
         .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
+        .list_object_versions = erasedListObjectVersions,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -1231,6 +1250,11 @@ pub const Client = struct {
     fn erasedListObjects(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return try self.listObjects(alloc, bucket, opts);
+    }
+
+    fn erasedListObjectVersions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return try self.listObjectVersions(alloc, bucket, opts);
     }
 };
 
@@ -1400,6 +1424,22 @@ fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     if (!opts.recursive and opts.delimiter.len > 0) try appendQueryPair(alloc, &query, "delimiter", opts.delimiter);
     if (opts.start_after) |value| try appendQueryPair(alloc, &query, "start-after", value);
     if (opts.continuation_token) |value| try appendQueryPair(alloc, &query, "continuation-token", value);
+    if (opts.max_keys != 1000) {
+        const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
+        defer alloc.free(value);
+        try appendQueryPair(alloc, &query, "max-keys", value);
+    }
+    return try query.toOwnedSlice(alloc);
+}
+
+fn buildListObjectVersionsQueryAlloc(alloc: Allocator, opts: types.ListObjectVersionsOptions) ![]QueryPair {
+    var query = std.ArrayListUnmanaged(QueryPair).empty;
+    errdefer deinitQueryList(alloc, &query);
+
+    try appendQueryPair(alloc, &query, "versions", "");
+    if (opts.prefix.len > 0) try appendQueryPair(alloc, &query, "prefix", opts.prefix);
+    if (opts.key_marker) |value| try appendQueryPair(alloc, &query, "key-marker", value);
+    if (opts.version_id_marker) |value| try appendQueryPair(alloc, &query, "version-id-marker", value);
     if (opts.max_keys != 1000) {
         const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
         defer alloc.free(value);
@@ -2003,6 +2043,64 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
     };
 }
 
+fn parseListObjectVersionsResponse(alloc: Allocator, xml: []const u8) !types.ListObjectVersionsResult {
+    var entries = std.ArrayListUnmanaged(types.ObjectVersionEntry).empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+
+    try appendObjectVersionBlocks(alloc, &entries, xml, "Version", false);
+    try appendObjectVersionBlocks(alloc, &entries, xml, "DeleteMarker", true);
+
+    const truncated_raw = try requiredTagAlloc(alloc, xml, "IsTruncated");
+    defer alloc.free(truncated_raw);
+    const is_truncated = if (std.mem.eql(u8, truncated_raw, "true"))
+        true
+    else if (std.mem.eql(u8, truncated_raw, "false"))
+        false
+    else
+        return error.InvalidListVersionsResponse;
+
+    const next_key_marker = try optionalDecodedXmlAlloc(alloc, xml, "NextKeyMarker");
+    errdefer if (next_key_marker) |value| alloc.free(value);
+    const next_version_id_marker = try optionalDecodedXmlAlloc(alloc, xml, "NextVersionIdMarker");
+    errdefer if (next_version_id_marker) |value| alloc.free(value);
+    if (is_truncated and next_key_marker == null)
+        return error.InvalidListVersionsResponse;
+    if (!is_truncated and (next_key_marker != null or next_version_id_marker != null))
+        return error.InvalidListVersionsResponse;
+
+    return .{
+        .entries = try entries.toOwnedSlice(alloc),
+        .is_truncated = is_truncated,
+        .next_key_marker = next_key_marker,
+        .next_version_id_marker = next_version_id_marker,
+    };
+}
+
+fn appendObjectVersionBlocks(
+    alloc: Allocator,
+    entries: *std.ArrayListUnmanaged(types.ObjectVersionEntry),
+    xml: []const u8,
+    tag: []const u8,
+    is_delete_marker: bool,
+) !void {
+    var search_from: usize = 0;
+    while (findBlock(xml, tag, search_from)) |block| {
+        search_from = block.end;
+        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
+        errdefer alloc.free(key);
+        const version_id = try decodeXmlAlloc(alloc, block.inner, "VersionId");
+        errdefer alloc.free(version_id);
+        try entries.append(alloc, .{
+            .key = key,
+            .version_id = version_id,
+            .is_delete_marker = is_delete_marker,
+        });
+    }
+}
+
 const XmlBlock = struct {
     inner: []const u8,
     end: usize,
@@ -2030,6 +2128,14 @@ fn requiredTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) ![]u8 {
 fn optionalTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
     const block = findBlock(xml, tag, 0) orelse return null;
     return try alloc.dupe(u8, block.inner);
+}
+
+fn optionalDecodedXmlAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
+    if (findBlock(xml, tag, 0) == null) return null;
+    const value = try decodeXmlAlloc(alloc, xml, tag);
+    if (value.len != 0) return value;
+    alloc.free(value);
+    return null;
 }
 
 fn completeMultipartXmlAlloc(alloc: Allocator, etags: []const []u8) ![]u8 {
@@ -2242,6 +2348,74 @@ test "s3 list parser extracts entries and prefixes" {
     try std.testing.expectEqualStrings("nested/", parsed.common_prefixes[0]);
 }
 
+test "s3 version-list query preserves paired pagination authority" {
+    const alloc = std.testing.allocator;
+    const query = try buildListObjectVersionsQueryAlloc(alloc, .{
+        .prefix = "instances/a & b/",
+        .key_marker = "key/one",
+        .version_id_marker = "version+one",
+        .max_keys = 17,
+    });
+    defer freeQueryPairs(alloc, query);
+    const rendered = try canonicalQueryStringAlloc(alloc, query);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "key-marker=key%2Fone&max-keys=17&prefix=instances%2Fa%20%26%20b%2F&version-id-marker=version%2Bone&versions=",
+        rendered,
+    );
+}
+
+test "s3 version-list parser returns object versions and delete markers" {
+    const alloc = std.testing.allocator;
+    const xml =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<ListVersionsResult>
+        \\  <IsTruncated>true</IsTruncated>
+        \\  <Version><Key>prefix/a&amp;b</Key><VersionId>v1</VersionId></Version>
+        \\  <Version><Key>prefix/a&amp;b</Key><VersionId>v0</VersionId></Version>
+        \\  <DeleteMarker><Key>prefix/deleted</Key><VersionId>marker-1</VersionId></DeleteMarker>
+        \\  <NextKeyMarker>prefix/a&amp;b</NextKeyMarker>
+        \\  <NextVersionIdMarker>v0</NextVersionIdMarker>
+        \\</ListVersionsResult>
+    ;
+    var parsed = try parseListObjectVersionsResponse(alloc, xml);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.is_truncated);
+    try std.testing.expectEqual(@as(usize, 3), parsed.entries.len);
+    try std.testing.expectEqualStrings("prefix/a&b", parsed.entries[0].key);
+    try std.testing.expectEqualStrings("v1", parsed.entries[0].version_id);
+    try std.testing.expect(!parsed.entries[0].is_delete_marker);
+    try std.testing.expect(parsed.entries[2].is_delete_marker);
+    try std.testing.expectEqualStrings("marker-1", parsed.entries[2].version_id);
+    try std.testing.expectEqualStrings("prefix/a&b", parsed.next_key_marker.?);
+    try std.testing.expectEqualStrings("v0", parsed.next_version_id_marker.?);
+}
+
+test "s3 version-list parser fails closed on unusable pagination" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidListVersionsResponse,
+        parseListObjectVersionsResponse(alloc, "<ListVersionsResult><IsTruncated>true</IsTruncated></ListVersionsResult>"),
+    );
+    try std.testing.expectError(
+        error.InvalidListVersionsResponse,
+        parseListObjectVersionsResponse(alloc, "<ListVersionsResult><IsTruncated>false</IsTruncated><NextKeyMarker>unexpected</NextKeyMarker></ListVersionsResult>"),
+    );
+}
+
+test "s3 version-list parser normalizes empty terminal markers" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseListObjectVersionsResponse(
+        alloc,
+        "<ListVersionsResult><NextVersionIdMarker></NextVersionIdMarker><IsTruncated>false</IsTruncated></ListVersionsResult>",
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(!parsed.is_truncated);
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.len);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_key_marker);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_version_id_marker);
+}
+
 test "s3 object query includes version and part selectors" {
     const alloc = std.testing.allocator;
     const query = try buildObjectQueryAlloc(alloc, "v123", 7);
@@ -2301,6 +2475,18 @@ test "s3 query and signing builders clean up every allocation failure" {
                 "<ListBucketResult><Contents><Key>backup/a</Key><ETag>\"a\"</ETag><Size>1</Size></Contents><Contents><Key>backup/b</Key><ETag>\"b\"</ETag><Size>2</Size></Contents><CommonPrefixes><Prefix>backup/nested/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
             );
             defer listed.deinit(alloc);
+            const version_query = try buildListObjectVersionsQueryAlloc(alloc, .{
+                .prefix = "backup/",
+                .key_marker = "backup/a",
+                .version_id_marker = "v1",
+                .max_keys = 17,
+            });
+            defer freeQueryPairs(alloc, version_query);
+            var versions = try parseListObjectVersionsResponse(
+                alloc,
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><Version><Key>backup/a</Key><VersionId>v1</VersionId></Version><DeleteMarker><Key>backup/b</Key><VersionId>m1</VersionId></DeleteMarker><NextKeyMarker>backup/b</NextKeyMarker><NextVersionIdMarker>m1</NextVersionIdMarker></ListVersionsResult>",
+            );
+            defer versions.deinit(alloc);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -2463,6 +2649,8 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
+        .{ .method = .GET, .url_contains = "versions=", .status = 200, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
+        .{ .method = .DELETE, .url_contains = "versionId=v1", .status = 204 },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
     var fake = Fake{ .steps = &steps };
@@ -2527,6 +2715,11 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqual(@as(usize, 1), listed.entries.len);
     try std.testing.expectEqualStrings("docs/a.txt", listed.entries[0].key);
 
+    var versions = try client.listObjectVersions("bucket", .{ .prefix = "docs/" });
+    defer versions.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), versions.entries.len);
+    try std.testing.expectEqualStrings("v1", versions.entries[0].version_id);
+    try client.deleteObject("bucket", "docs/a.txt", .{ .version_id = "v1" });
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
 }

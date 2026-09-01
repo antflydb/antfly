@@ -70,6 +70,7 @@ spec:
       currentPrimaryID: primary-a
     admin:
       primaryURL: http://antfly-primary-public-api.default.svc.cluster.local:80
+      primaryActionURL: http://antfly-primary-standalone.default.svc.cluster.local:8080
       executePlannedActions: true
       tokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
     runtime:

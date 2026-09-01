@@ -6546,6 +6546,14 @@ test "HA mutation middleware fails closed for unregistered HTTP methods" {
     try std.testing.expect(AntflyApiHandler.classifyHaMutation(.HEAD, "/tables/docs") == null);
     try std.testing.expect(AntflyApiHandler.classifyHaMutation(.OPTIONS, "/tables/docs") == null);
 
+    const global_query = AntflyApiHandler.classifyHaMutation(.POST, routes.global_query).?;
+    try std.testing.expectEqual(ha_mutation_inventory.Surface.read_like_post, global_query.surface);
+    try std.testing.expectEqual(ha_mutation_inventory.Disposition.read_only, global_query.disposition);
+
+    const unknown_query_suffix = AntflyApiHandler.classifyHaMutation(.POST, "/query/future-action").?;
+    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
+    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
+
     const patch = AntflyApiHandler.classifyHaMutation(.PATCH, "/tables/docs").?;
     try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, patch.surface);
     try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, patch.disposition);

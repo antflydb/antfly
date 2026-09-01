@@ -29,6 +29,7 @@ pub const Routes = struct {
     pub const auth_subjects = "/auth/v1/subjects";
     pub const auth_subjects_prefix = "/auth/v1/subjects/";
     pub const eval = "/eval";
+    pub const global_query = "/query";
     pub const agents_query_builder = "/agents/query-builder";
     pub const agents_retrieval = "/agents/retrieval";
     pub const mcp_v1 = "/mcp/v1";
