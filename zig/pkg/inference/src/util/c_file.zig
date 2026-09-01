@@ -785,8 +785,7 @@ test "mmapTempCopy maps unlinked temp data" {
 }
 
 test "prefetchFile reads every byte with bounded workers" {
-    if (!comptime build_options.link_libc or builtin.os.tag != .linux)
-        return error.SkipZigTest;
+    if (comptime !supports_posix_file_advice) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const path = try std.fmt.allocPrint(
         allocator,
