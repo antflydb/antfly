@@ -3685,6 +3685,16 @@ is reduced from O(committed WAL bytes) to descriptor acquisition plus immutable
 hardlink metadata. Publication adds one flat, filename-only inventory scan; it
 does not read segment contents or recurse through the database tree.
 
+A fresh post-merge r128 50K public-API lifecycle qualified correctness under
+heavy host contention: recall was 0.9876 live, cold-reopened, and warm-reopened;
+the published generation covered all 50,000 vectors; and no capture, generation,
+recovery, or cleanup error was emitted. Restart RSS peaked at 350.8 MB and the
+restart physical-footprint ledger at 124.2 MB. The host simultaneously ran two
+unrelated CPU-saturating Zig test jobs, inflating insert to 207.68 seconds and
+profiled server query time to 24.60 ms, so r128 is deliberately not timing
+evidence. The uncontended r126 30.09-second lifecycle and 3.23 ms mean server
+time remain the applicable performance baseline.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
