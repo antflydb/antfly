@@ -11,6 +11,203 @@ const std = @import("std");
 const httpx = @import("httpx");
 const work = @import("work.zig");
 
+const capability_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
+const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;
+const capability_cache_max_entries: usize = 64;
+
+fn monotonicNowNs(io: std.Io) u64 {
+    const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return if (raw <= 0) 0 else @intCast(raw);
+}
+
+const CachedCapability = struct {
+    value: ?work.InferenceCapabilities,
+    expires_at_ns: u64,
+    stale_until_ns: u64,
+};
+
+const CapabilityFlight = struct {
+    key: []u8,
+    refs: usize = 1,
+    done: bool = false,
+    value: ?work.InferenceCapabilities = null,
+    err: ?anyerror = null,
+    ready: std.Io.Event = .unset,
+};
+
+/// Runtime-owned, task/model/auth-keyed capability snapshots. Catalog lookups
+/// are single-flight, fresh values are reused across planner and executor
+/// boundaries, and a previously validated snapshot survives a short catalog
+/// outage. Authentication material is represented only by a one-way digest in
+/// cache keys.
+pub const Cache = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    entries: std.StringHashMapUnmanaged(CachedCapability) = .empty,
+    flights: std.StringHashMapUnmanaged(*CapabilityFlight) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, io: std.Io) Cache {
+        return .{ .alloc = alloc, .io = io };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        self.mutex.lockUncancelable(self.io);
+        std.debug.assert(self.flights.count() == 0);
+        var entries = self.entries.iterator();
+        while (entries.next()) |entry| self.alloc.free(@constCast(entry.key_ptr.*));
+        self.entries.deinit(self.alloc);
+        self.flights.deinit(self.alloc);
+        self.mutex.unlock(self.io);
+        self.* = undefined;
+    }
+
+    pub fn getOrDiscover(
+        self: *Cache,
+        http: *httpx.Client,
+        inference_url: []const u8,
+        model: []const u8,
+        task: work.Task,
+        headers: []const [2][]const u8,
+    ) !?work.InferenceCapabilities {
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
+        defer self.alloc.free(key);
+        const now_ns = monotonicNowNs(self.io);
+
+        self.mutex.lockUncancelable(self.io);
+        if (self.entries.get(key)) |entry| {
+            if (now_ns < entry.expires_at_ns) {
+                self.mutex.unlock(self.io);
+                return entry.value;
+            }
+        }
+        if (self.flights.get(key)) |flight| {
+            flight.refs += 1;
+            self.mutex.unlock(self.io);
+            flight.ready.waitUncancelable(self.io);
+            const value = flight.value;
+            const flight_err = flight.err;
+            self.mutex.lockUncancelable(self.io);
+            self.releaseFlightLocked(flight);
+            self.mutex.unlock(self.io);
+            if (flight_err) |err| return err;
+            return value;
+        }
+
+        const flight = self.alloc.create(CapabilityFlight) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        flight.* = .{ .key = self.alloc.dupe(u8, key) catch |err| {
+            self.alloc.destroy(flight);
+            self.mutex.unlock(self.io);
+            return err;
+        } };
+        self.flights.put(self.alloc, flight.key, flight) catch |err| {
+            self.alloc.free(flight.key);
+            self.alloc.destroy(flight);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+
+        const discovered = discover(self.alloc, http, inference_url, model, task, headers);
+        if (discovered) |value| {
+            self.mutex.lockUncancelable(self.io);
+            self.admitLocked(key, value, monotonicNowNs(self.io)) catch {};
+            flight.value = value;
+            flight.done = true;
+            flight.ready.set(self.io);
+            self.releaseFlightLocked(flight);
+            self.mutex.unlock(self.io);
+            return value;
+        } else |err| {
+            self.mutex.lockUncancelable(self.io);
+            const stale = self.entries.get(key);
+            if (stale != null and monotonicNowNs(self.io) < stale.?.stale_until_ns) {
+                flight.value = stale.?.value;
+            } else {
+                flight.err = err;
+            }
+            flight.done = true;
+            flight.ready.set(self.io);
+            const value = flight.value;
+            const flight_err = flight.err;
+            self.releaseFlightLocked(flight);
+            self.mutex.unlock(self.io);
+            if (flight_err) |flight_error| return flight_error;
+            return value;
+        }
+    }
+
+    fn admitLocked(self: *Cache, key: []const u8, value: ?work.InferenceCapabilities, now_ns: u64) !void {
+        const cached = CachedCapability{
+            .value = value,
+            .expires_at_ns = now_ns +| capability_cache_ttl_ns,
+            .stale_until_ns = now_ns +| capability_cache_stale_ns,
+        };
+        if (self.entries.getPtr(key)) |entry| {
+            entry.* = cached;
+            return;
+        }
+        if (self.entries.count() >= capability_cache_max_entries) self.evictOldestLocked();
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        try self.entries.put(self.alloc, owned_key, cached);
+    }
+
+    fn evictOldestLocked(self: *Cache) void {
+        var oldest_key: ?[]const u8 = null;
+        var oldest_expiry: u64 = std.math.maxInt(u64);
+        var entries = self.entries.iterator();
+        while (entries.next()) |entry| {
+            if (entry.value_ptr.expires_at_ns < oldest_expiry) {
+                oldest_expiry = entry.value_ptr.expires_at_ns;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |key| {
+            const removed = self.entries.fetchRemove(key) orelse return;
+            self.alloc.free(@constCast(removed.key));
+        }
+    }
+
+    fn releaseFlightLocked(self: *Cache, flight: *CapabilityFlight) void {
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        if (flight.refs != 0) return;
+        std.debug.assert(flight.done);
+        _ = self.flights.remove(flight.key);
+        self.alloc.free(flight.key);
+        self.alloc.destroy(flight);
+    }
+};
+
+fn capabilityCacheKeyAlloc(
+    alloc: std.mem.Allocator,
+    inference_url: []const u8,
+    model: []const u8,
+    task: work.Task,
+    headers: []const [2][]const u8,
+) ![]u8 {
+    var auth_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (headers) |header| {
+        auth_hasher.update(header[0]);
+        auth_hasher.update(&.{0});
+        auth_hasher.update(header[1]);
+        auth_hasher.update(&.{0xff});
+    }
+    var auth_digest: [32]u8 = undefined;
+    auth_hasher.final(&auth_digest);
+    const auth_hex = std.fmt.bytesToHex(auth_digest, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}", .{
+        inference_url,
+        model,
+        @tagName(task),
+        &auth_hex,
+    });
+}
+
 fn trimOperationSuffix(value: []const u8) []const u8 {
     var out = std.mem.trimEnd(u8, value, "/");
     for ([_][]const u8{ "/read", "/generate", "/generate/batch", "/embeddings" }) |suffix| {
@@ -151,8 +348,8 @@ pub fn discover(
     defer alloc.free(url);
     var response = try http.get(url, .{ .headers = headers });
     defer response.deinit();
-    if (!response.ok()) return null;
-    return try parseModelCapabilities(alloc, response.body orelse return null, model, task);
+    if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
+    return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
 }
 
 test "remote Antfly capabilities resolve model modalities and batch mode" {

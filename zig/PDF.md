@@ -1,7 +1,8 @@
 # Bounded document preparation and multimodal inference
 
 Status: bounded document preparation, indexed reader execution, multimodal
-generation transport, and durable page-image embedding implemented
+generation transport, durable page-image embedding, and post-review batching
+hardening implemented
 
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
@@ -244,6 +245,58 @@ document. They are architectural requirements, not Florence-specific cleanup:
 10. **Production integration coverage was Florence-shaped.** Add the same
     bounded render fixture through generic fake reader, generator, and embedder
     executors, plus real-model opt-in tests for Florence, Gemma4, and ClipClap.
+11. **Remote reader batches lost page identity.** HTTP reader responses are
+    indexed but do not echo Antfly's internal provenance. The transport adapter
+    must validate response indexes and cardinality, then reattach the original
+    item, source, and page identity before returning to enrichment. Identity is
+    never inferred from response completion order.
+12. **PDF staging keys used concatenated user strings.** A textual marker plus
+    substring scanning could alias another artifact/embedding pair or match a
+    legitimate asset-state key. Staging needs a dedicated internal key kind and
+    independently length-encoded document, artifact, embedding, and unit
+    components. Cleanup scans only that exact typed prefix.
+13. **Page-vector publication was not an exact set when a PDF shrank.** Current
+    page artifacts, stale artifact deletion, reverse-source markers, and dense
+    artifact counters must change in the same storage transaction. Vector
+    additions, stale vector deletions, and coverage then publish in one
+    generated replay window, so query-visible vectors remain the prior complete
+    set until the replacement set is committed.
+14. **Capability discovery was repeated on hot paths.** A runtime-owned cache
+    must key snapshots by endpoint, model, task, and an authentication digest;
+    coalesce concurrent misses; bound entry count; refresh on a short TTL; and
+    use a previously validated snapshot briefly during catalog outages. Raw
+    authentication material must not become a cache key.
+15. **Remote model limits were advisory.** Reader, generator, and embedder
+    executor boundaries must partition calls by resolved item and encoded-byte
+    limits, then validate MIME, modality, media cardinality, pixels where known,
+    and aggregate bytes on every concrete provider invocation. Planner windows
+    remain an optimization, not the security or memory boundary.
+16. **Generator item errors aborted successful siblings.** Batched production
+    returns `WorkItemResult(T)` per request. A deterministic item error remains
+    attached to that item; valid siblings are applied once and are not rerun
+    serially. Compatibility callers that cannot represent item errors may fail
+    the outer call, but must still free successful sibling outputs.
+
+### Post-review implementation contract
+
+The hardening above follows four long-term rules:
+
+- A capability snapshot is resolved once per runtime/model/task/auth scope and
+  reused by planning and execution. The current implementation uses a bounded
+  30-second fresh cache, five-minute stale-if-error interval, and single-flight
+  refresh. Discovery failure falls back to compatibility execution; it never
+  upgrades an unknown model to native batching.
+- Every executor owns final admission. Remote read and generation calls and
+  multimodal embedding calls are split at both model item and encoded-byte
+  ceilings. A single item larger than the model ceiling fails before transport.
+- Every logical result carries the request identity. Remote indexed responses
+  are reordered and validated at the transport boundary, then enriched with
+  the original identity. Enrichment rejects any remaining identity mismatch.
+- Durable publication is generation-shaped. Private typed stage records are
+  invisible; complete current-page promotion and stale-page artifact deletion
+  are one transaction; vector/coverage replay is the public generation commit.
+  A future storage backend that cannot provide the artifact transaction must
+  instead publish through an atomic active-generation manifest pointer.
 
 ## Migration sequence and implementation status
 
@@ -306,6 +359,18 @@ document. They are architectural requirements, not Florence-specific cleanup:
     real Florence, Gemma4, and ClipClap release gate; it requires the endpoint,
     three resolved model names, and embedding dimensions listed under Testing.
     Model bundles and accelerator backends remain outside hermetic CI.
+11. **Implemented after review:** remote capability snapshots are cached and
+    single-flight in both the asset producer runtime and managed multimodal
+    embedder. Reader, generator, and per-page embed calls enforce the resolved
+    limits at the executor boundary and partition oversized valid windows.
+12. **Implemented after review:** `ProducedBatch` contains typed per-item
+    values or failures with exact work identity. Remote read adapters restore
+    page provenance, remote generator failures no longer discard successful
+    siblings, and enrichment consumes each item exactly once.
+13. **Implemented after review:** PDF page embedding stages use a dedicated
+    typed internal namespace. Complete promotion removes stale page artifacts
+    in the same transaction, while stale vector deletion and replacement
+    vectors remain in the atomic generated replay window.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

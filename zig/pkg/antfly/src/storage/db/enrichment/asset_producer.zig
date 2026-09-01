@@ -95,16 +95,66 @@ pub const EncodedMedia = struct {
     mime_type: []const u8,
 };
 
+pub const ProducedItem = inference_work.WorkItemResult([]u8);
+
 pub const ProducedBatch = struct {
-    items: [][]u8,
+    items: []ProducedItem,
     execution: inference_work.ExecutionReport,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.items) |item| alloc.free(item);
-        alloc.free(self.items);
+        for (self.items) |item| switch (item.result) {
+            .value => |value| if (value.len > 0) alloc.free(value),
+            .item_error => {},
+        };
+        if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
     }
+
+    /// Compatibility transfer for callers that cannot represent per-item
+    /// failures. No successful sibling is leaked when one item failed.
+    pub fn intoOutputs(self: *@This(), alloc: Allocator) ![][]u8 {
+        for (self.items) |item| switch (item.result) {
+            .value => {},
+            .item_error => |err| return err,
+        };
+        const out = try alloc.alloc([]u8, self.items.len);
+        for (self.items, 0..) |*item, i| switch (item.result) {
+            .value => |value| {
+                out[i] = value;
+                item.result = .{ .value = &.{} };
+            },
+            .item_error => unreachable,
+        };
+        return out;
+    }
 };
+
+pub fn producedBatchFromOutputs(
+    alloc: Allocator,
+    requests: []const Request,
+    outputs: [][]u8,
+    execution: inference_work.ExecutionReport,
+) !ProducedBatch {
+    var outputs_owned = true;
+    defer if (outputs_owned) {
+        for (outputs) |output| alloc.free(output);
+        alloc.free(outputs);
+    };
+    if (outputs.len != requests.len) return error.InvalidProducedBatchCardinality;
+    const items = try alloc.alloc(ProducedItem, outputs.len);
+    errdefer alloc.free(items);
+    for (outputs, requests, 0..) |output, request, i| items[i] = .{
+        .identity = .{
+            .item_id = request.item_id,
+            .source_fingerprint = request.source_fingerprint,
+            .page_number = request.page_number,
+        },
+        .result = .{ .value = output },
+    };
+    alloc.free(outputs);
+    outputs_owned = false;
+    return .{ .items = items, .execution = execution };
+}
 
 pub const Producer = struct {
     ptr: *anyopaque,
@@ -144,8 +194,11 @@ pub const Producer = struct {
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
-        if (self.vtable.produce_batch_reported) |reported|
-            return (try reported(self.ptr, alloc, requests)).items;
+        if (self.vtable.produce_batch_reported) |reported| {
+            var batch = try reported(self.ptr, alloc, requests);
+            defer batch.deinit(alloc);
+            return try batch.intoOutputs(alloc);
+        }
         if (self.vtable.produce_batch) |produce_batch| return try produce_batch(self.ptr, alloc, requests);
 
         const out = try alloc.alloc([]u8, requests.len);
@@ -177,7 +230,7 @@ pub const Producer = struct {
             return batch;
         }
         const items = try self.produceBatch(alloc, requests);
-        return .{ .items = items, .execution = inference_work.ExecutionReport.compatibility(requests.len) };
+        return try producedBatchFromOutputs(alloc, requests, items, inference_work.ExecutionReport.compatibility(requests.len));
     }
 
     /// Describes how the request set will execute. This preserves the important

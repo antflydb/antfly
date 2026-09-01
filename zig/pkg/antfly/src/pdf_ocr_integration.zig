@@ -196,6 +196,7 @@ pub fn main(init: std.process.Init) !void {
         &client,
         .{ .antfly_provider = local.provider() },
     );
+    defer runtime.deinit();
     try enrichment_runtime.runNativePdfOcrCoordinatorIntegration(
         alloc,
         fixture.two_page_pdf,
@@ -270,8 +271,11 @@ pub fn main(init: std.process.Init) !void {
     defer generated.deinit(alloc);
     if (generated.execution.serial_items != 2 or generated.execution.native_items != 0)
         return error.InvalidIntegrationGeneratorExecutionReport;
-    for (generated.items) |output| if (!std.mem.eql(u8, output, "generated page OCR"))
-        return error.InvalidIntegrationGeneratorOutput;
+    for (generated.items) |item| switch (item.result) {
+        .value => |output| if (!std.mem.eql(u8, output, "generated page OCR"))
+            return error.InvalidIntegrationGeneratorOutput,
+        .item_error => return error.InvalidIntegrationGeneratorOutput,
+    };
     if (local.generator_calls != 2) return error.IntegrationGeneratorWasNotInvoked;
 
     const indexes_json =
@@ -322,6 +326,7 @@ fn runRealModelQualification(alloc: std.mem.Allocator, client: *httpx.Client) !v
     defer rendered.deinit(alloc);
 
     var runtime = asset_producer_runtime.Runtime.initWithOptions(alloc, client, .{});
+    defer runtime.deinit();
     const producer = runtime.producer();
     const reader_config = try std.json.Stringify.valueAlloc(alloc, .{
         .provider = "antfly",
@@ -350,8 +355,11 @@ fn runRealModelQualification(alloc: std.mem.Allocator, client: *httpx.Client) !v
     var read = try producer.produceBatchReported(alloc, &reader_requests);
     defer read.deinit(alloc);
     if (read.items.len != 2) return error.InvalidQualificationReaderCardinality;
-    for (read.items) |value| if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0)
-        return error.EmptyQualificationReaderOutput;
+    for (read.items) |item| switch (item.result) {
+        .value => |value| if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0)
+            return error.EmptyQualificationReaderOutput,
+        .item_error => return error.EmptyQualificationReaderOutput,
+    };
 
     const generator_config = try std.json.Stringify.valueAlloc(alloc, .{
         .provider = "antfly",
@@ -379,8 +387,11 @@ fn runRealModelQualification(alloc: std.mem.Allocator, client: *httpx.Client) !v
     var generated = try producer.produceBatchReported(alloc, &generator_requests);
     defer generated.deinit(alloc);
     if (generated.items.len != 2) return error.InvalidQualificationGeneratorCardinality;
-    for (generated.items) |value| if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0)
-        return error.EmptyQualificationGeneratorOutput;
+    for (generated.items) |item| switch (item.result) {
+        .value => |value| if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0)
+            return error.EmptyQualificationGeneratorOutput,
+        .item_error => return error.EmptyQualificationGeneratorOutput,
+    };
 
     const indexes_json = try std.json.Stringify.valueAlloc(alloc, .{
         .visual = .{

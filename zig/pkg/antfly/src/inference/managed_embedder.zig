@@ -456,6 +456,7 @@ pub const ManagedEmbeddingEntry = struct {
     burst: u32 = default_pacing_burst,
     pacer: ?*RequestPacer = null,
     antfly_provider: ?AntflyProvider = null,
+    remote_capability_cache: ?remote_capabilities.Cache = null,
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
@@ -471,6 +472,7 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.input_type.len > 0) alloc.free(self.input_type);
         if (self.truncate.len > 0) alloc.free(self.truncate);
         self.bedrock_credentials.deinit(alloc);
+        if (self.remote_capability_cache) |*cache| cache.deinit();
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
         self.* = undefined;
@@ -1101,8 +1103,32 @@ pub const ManagedEmbedder = struct {
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
         const capabilities = try denseCapabilities(ptr, alloc, embedding_name);
-        try validateDensePartItemInvocation(capabilities, items);
-        return try embedPartItemsWithEntry(alloc, entry, items, dims);
+        if (items.len == 0) return try alloc.alloc([]const f32, 0);
+
+        // The planner normally forms capability-sized windows, but this is
+        // also a public executor boundary. Partition here so direct callers
+        // cannot accidentally turn a valid large document window into an
+        // oversized provider invocation.
+        const vectors = try alloc.alloc([]const f32, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (vectors[0..initialized]) |vector| alloc.free(vector);
+            alloc.free(vectors);
+        }
+        var offset: usize = 0;
+        while (offset < items.len) {
+            const end = try densePartBatchEnd(capabilities, items, offset);
+            const chunk = items[offset..end];
+            try validateDensePartItemInvocation(capabilities, chunk);
+            const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims);
+            defer alloc.free(chunk_vectors);
+            for (chunk_vectors) |vector| {
+                vectors[initialized] = vector;
+                initialized += 1;
+            }
+            offset = end;
+        }
+        return vectors;
     }
 
     fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
@@ -1138,8 +1164,8 @@ pub const ManagedEmbedder = struct {
                 header_storage[0] = .{ "Authorization", auth_header.? };
                 break :blk &header_storage;
             } else &.{};
-            if (remote_capabilities.discover(
-                alloc,
+            const cache = &@constCast(entry).remote_capability_cache.?;
+            if (cache.getOrDiscover(
                 &http,
                 entry.base_url,
                 entry.model,
@@ -3389,6 +3415,10 @@ fn buildManagedEmbeddingEntry(
         .requests_per_minute = requests_per_minute,
         .burst = burst,
         .antfly_provider = antfly_provider,
+        .remote_capability_cache = if (provider == .antfly and antfly_provider == null)
+            remote_capabilities.Cache.init(alloc, options.io orelse std.Io.Threaded.global_single_threaded.io())
+        else
+            null,
     };
 }
 
@@ -4065,6 +4095,34 @@ fn validateDensePartItemInvocation(
         },
     };
     try capabilities.validateInvocation(.embed, shape);
+}
+
+fn densePartBatchEnd(
+    capabilities: inference_work.InferenceCapabilities,
+    items: []const template_mod.ContentPart,
+    start: usize,
+) !usize {
+    if (start >= items.len) return start;
+    const max_items = capabilities.batch.max_items;
+    var encoded_bytes: usize = 0;
+    var end = start;
+    while (end < items.len and end - start < max_items) : (end += 1) {
+        const item_bytes: usize = switch (items[end]) {
+            .text => |value| value.len,
+            .binary => |value| value.data.len,
+            .media_url => 0,
+        };
+        const next_bytes = std.math.add(usize, encoded_bytes, item_bytes) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (capabilities.batch.max_encoded_bytes > 0 and
+            next_bytes > capabilities.batch.max_encoded_bytes)
+        {
+            if (end == start) return error.InferenceEncodedBytesExceeded;
+            break;
+        }
+        encoded_bytes = next_bytes;
+    }
+    return end;
 }
 
 /// Embed a bounded window of independently addressable document assets. Each
@@ -6540,6 +6598,20 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             return try alloc.alloc(db_embedder.SparseEmbedding, 0);
         }
 
+        fn capabilities(_: *anyopaque, _: std.mem.Allocator, model: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(inference_work.Task.embed, task);
+            return .{
+                .task = .embed,
+                .input_modalities = .{ .text = true, .image = true },
+                .accepted_mime_types = .{ .text_plain = true, .image_png = true, .image_jpeg = true },
+                .input_granularity = .page,
+                .batch = .{ .mode = .native, .preferred_items = 3, .max_items = 3, .max_media_parts_per_item = 1 },
+                .output = .embedding,
+                .borrowed_attachments = true,
+            };
+        }
+
         fn parts(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, parts_slice: []const template_mod.ContentPart) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("local-model", model);
@@ -6567,6 +6639,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
         .embed_dense_texts = Local.dense,
         .embed_sparse_texts = Local.sparse,
         .embed_dense_parts = Local.parts,
+        .model_capabilities = Local.capabilities,
     };
 
     const indexes_json =

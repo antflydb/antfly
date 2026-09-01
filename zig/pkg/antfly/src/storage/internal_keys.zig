@@ -36,6 +36,10 @@ pub const document_unit_navigation_block_kind: u8 = 0x38;
 /// Private reverse ownership index for graph-edge precedence. Records are
 /// grouped by logical edge, then by the source-state that emitted it.
 pub const graph_edge_contender_kind: u8 = 0x39;
+/// Private PDF page-vector staging. Components are encoded independently so
+/// arbitrary document, artifact, embedding, and unit names cannot alias a
+/// user-visible asset-state key or another staging generation.
+pub const pdf_page_embedding_stage_kind: u8 = 0x40;
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
@@ -296,6 +300,37 @@ pub fn assetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     defer list.deinit(alloc);
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, asset_state_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, pdf_page_embedding_stage_kind);
+    try appendEncodedComponent(&list, alloc, page_artifact_name);
+    try appendEncodedComponent(&list, alloc, embedding_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    unit_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, unit_id);
     return try list.toOwnedSlice(alloc);
 }
 

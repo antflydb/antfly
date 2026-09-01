@@ -6485,7 +6485,7 @@ fn flushRuntimeGeneratedTextBatch(
 
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
-    const produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, working_alloc, requests) catch |err| {
+    var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, working_alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isUnavailableOcrModelError(kind, err)) {
             for (unit_indices) |unit_idx| {
@@ -6499,12 +6499,8 @@ fn flushRuntimeGeneratedTextBatch(
         for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
-    var produced = produced_batch.items;
-    if (produced.len != requests.len) {
-        for (produced) |item| {
-            if (item.len > 0) working_alloc.free(item);
-        }
-        working_alloc.free(produced);
+    defer produced_batch.deinit(working_alloc);
+    if (produced_batch.items.len != requests.len) {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
     }
@@ -6520,19 +6516,28 @@ fn flushRuntimeGeneratedTextBatch(
         null;
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, execution, fallback_reason, started_ns);
 
-    defer working_alloc.free(produced);
-    errdefer {
-        for (produced) |item| {
-            if (item.len > 0) working_alloc.free(item);
-        }
-    }
-    for (produced, unit_indices, 0..) |item, unit_idx, i| {
-        produced[i] = &.{};
-        applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
-            if (shouldYieldRequestError(runtime, err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+    for (produced_batch.items, requests, unit_indices) |*item, request, unit_idx| {
+        const expected_identity = inference_work.WorkIdentity{
+            .item_id = request.item_id,
+            .source_fingerprint = request.source_fingerprint,
+            .page_number = request.page_number,
         };
+        if (!item.identity.eql(expected_identity)) return error.InvalidAssetProducerResponseIdentity;
+        switch (item.result) {
+            .item_error => |err| {
+                if (shouldYieldRequestError(runtime, err)) return err;
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+            },
+            .value => |output| {
+                item.result = .{ .value = &.{} };
+                applyRuntimeGeneratedUnitText(alloc, working_alloc, &units[unit_idx], output, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+                    try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+                };
+            },
+        }
     }
     clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
@@ -10820,13 +10825,6 @@ fn processPdfPageImageEmbedding(
         first_page += count;
     }
 
-    try promotePdfPageEmbeddingStages(
-        runtime,
-        desired_page_keys.items,
-        staged_page_keys.items,
-        embedding_name,
-    );
-
     var stale = try deleteStalePageEmbeddingArtifacts(
         runtime,
         request.doc_key,
@@ -10835,6 +10833,15 @@ fn processPdfPageImageEmbedding(
         desired_page_keys.items,
     );
     errdefer stale.deinit(runtime.alloc);
+    try promotePdfPageEmbeddingStages(
+        runtime,
+        desired_page_keys.items,
+        staged_page_keys.items,
+        embedding_name,
+        stale.artifact_delete_keys,
+    );
+    freeKeyList(runtime.alloc, stale.artifact_delete_keys);
+    stale.artifact_delete_keys = &.{};
     try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
     if (base_embeddings.items.len == 0) {
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
@@ -10856,26 +10863,12 @@ fn pdfPageEmbeddingStageKeyAlloc(
     embedding_name: []const u8,
     unit_id: []const u8,
 ) ![]u8 {
-    const marker = try pdfPageEmbeddingStageMarkerAlloc(alloc, page_artifact_name, embedding_name);
-    defer alloc.free(marker);
-    const stage_name = try std.fmt.allocPrint(
+    return try internal_keys.pdfPageEmbeddingStageKeyAlloc(
         alloc,
-        "{s}{s}",
-        .{ marker, unit_id },
-    );
-    defer alloc.free(stage_name);
-    return try assetStateKeyAlloc(alloc, doc_key, stage_name);
-}
-
-fn pdfPageEmbeddingStageMarkerAlloc(
-    alloc: Allocator,
-    page_artifact_name: []const u8,
-    embedding_name: []const u8,
-) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "__pdf_page_embedding_stage_v1:{s}:{s}:",
-        .{ page_artifact_name, embedding_name },
+        doc_key,
+        page_artifact_name,
+        embedding_name,
+        unit_id,
     );
 }
 
@@ -10885,10 +10878,13 @@ fn clearPdfPageEmbeddingStages(
     page_artifact_name: []const u8,
     embedding_name: []const u8,
 ) !void {
-    const root = try internal_keys.assetStateRootPrefixAlloc(runtime.alloc, doc_key);
+    const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(
+        runtime.alloc,
+        doc_key,
+        page_artifact_name,
+        embedding_name,
+    );
     defer runtime.alloc.free(root);
-    const marker = try pdfPageEmbeddingStageMarkerAlloc(runtime.alloc, page_artifact_name, embedding_name);
-    defer runtime.alloc.free(marker);
     const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, root);
     defer backend_scan.freeResults(runtime.alloc, existing);
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -10896,10 +10892,7 @@ fn clearPdfPageEmbeddingStages(
         for (deletes.items) |key| runtime.alloc.free(@constCast(key));
         deletes.deinit(runtime.alloc);
     }
-    for (existing) |entry| {
-        if (std.mem.indexOf(u8, entry.key, marker) == null) continue;
-        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-    }
+    for (existing) |entry| try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
     if (deletes.items.len > 0) try storePutBatchWithRetry(runtime, &.{}, deletes.items);
 }
 
@@ -10908,6 +10901,7 @@ fn promotePdfPageEmbeddingStages(
     desired_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
+    stale_artifact_keys: []const []const u8,
 ) !void {
     if (staged_page_keys.len != desired_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
     // Promotion starts only after every page rendered and embedded, and the
@@ -10921,6 +10915,7 @@ fn promotePdfPageEmbeddingStages(
             desired_page_keys,
             staged_page_keys,
             embedding_name,
+            stale_artifact_keys,
         ) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -10940,11 +10935,26 @@ fn promotePdfPageEmbeddingStagesOnce(
     desired_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
+    stale_artifact_keys: []const []const u8,
 ) !usize {
     var batch = try runtime.store.beginBatch();
     var committed = false;
     defer if (!committed) batch.abort();
     var promoted_bytes: usize = 0;
+    try updateDenseArtifactTargetCountersTxn(runtime, &batch, &.{}, stale_artifact_keys);
+    for (stale_artifact_keys) |artifact_key| {
+        batch.delete(artifact_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, artifact_key)) |marker_key| {
+            defer runtime.alloc.free(marker_key);
+            batch.delete(marker_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
     for (desired_page_keys, staged_page_keys) |page_key, stage_key| {
         const staged_payload = try batch.get(stage_key);
         const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
@@ -11006,6 +11016,23 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
     );
     defer std.testing.allocator.free(retry_stage);
     try std.testing.expectEqualStrings(first_stage, retry_stage);
+    const colon_left = try pdfPageEmbeddingStageKeyAlloc(
+        std.testing.allocator,
+        "doc:1",
+        "pdf:pages",
+        "visual",
+        "page:000001",
+    );
+    defer std.testing.allocator.free(colon_left);
+    const colon_right = try pdfPageEmbeddingStageKeyAlloc(
+        std.testing.allocator,
+        "doc:1",
+        "pdf",
+        "pages:visual",
+        "page:000001",
+    );
+    defer std.testing.allocator.free(colon_right);
+    try std.testing.expect(!std.mem.eql(u8, colon_left, colon_right));
 }
 
 test "durable enrichment PDF page embedding publishes only complete staged generations" {
@@ -11043,10 +11070,14 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
     defer alloc.free(page_one);
     const page_two = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "page:000002");
     defer alloc.free(page_two);
+    const page_three = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "page:000003");
+    defer alloc.free(page_three);
     const final_one = try embeddingArtifactKey(&runtime, page_one, "visual_v1");
     defer alloc.free(final_one);
     const final_two = try embeddingArtifactKey(&runtime, page_two, "visual_v1");
     defer alloc.free(final_two);
+    const final_three = try embeddingArtifactKey(&runtime, page_three, "visual_v1");
+    defer alloc.free(final_three);
     const stage_one = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "page:000001");
     defer alloc.free(stage_one);
     const stage_two = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "page:000002");
@@ -11059,7 +11090,15 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
     const new_two = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 3, &.{ 3.0, 4.0 });
     defer alloc.free(new_two);
     try storePutWithRetry(&runtime, final_one, old_one);
+    try storePutWithRetry(&runtime, final_three, old_one);
     try storePutWithRetry(&runtime, stage_one, new_one);
+    const unrelated_state = try assetStateKeyAlloc(
+        alloc,
+        "doc:1",
+        "__pdf_page_embedding_stage_v1:pdf_pages_v1:visual_v1:user",
+    );
+    defer alloc.free(unrelated_state);
+    try storePutWithRetry(&runtime, unrelated_state, "unrelated");
 
     // A later page failure returns before promotion; the previously published
     // page remains byte-for-byte intact across the retry boundary.
@@ -11079,6 +11118,9 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
     const old_after_retry_start = try storeGetAlloc(&runtime, final_one);
     defer alloc.free(old_after_retry_start);
     try std.testing.expectEqualSlices(u8, old_one, old_after_retry_start);
+    const unrelated_after_retry_start = try storeGetAlloc(&runtime, unrelated_state);
+    defer alloc.free(unrelated_after_retry_start);
+    try std.testing.expectEqualStrings("unrelated", unrelated_after_retry_start);
 
     try storePutWithRetry(&runtime, stage_one, new_one);
     try storePutWithRetry(&runtime, stage_two, new_two);
@@ -11087,6 +11129,7 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
         &.{ page_one, page_two },
         &.{ stage_one, stage_two },
         "visual_v1",
+        &.{final_three},
     );
     const published_one = try storeGetAlloc(&runtime, final_one);
     defer alloc.free(published_one);
@@ -11096,6 +11139,7 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
     try std.testing.expectEqualSlices(u8, new_two, published_two);
     try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, stage_one));
     try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, stage_two));
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, final_three));
 }
 
 fn processDenseEmbedding(
