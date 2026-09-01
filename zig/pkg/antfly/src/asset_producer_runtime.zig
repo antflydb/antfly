@@ -29,53 +29,40 @@ const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
 const default_local_reader_batch_images: usize = 8;
 const max_asset_provider_timeout_ms: u64 = 300_000;
-const ReaderItemExecution = enum { native, serial, fallback };
-
-fn summarizeReaderExecution(
-    image_counts: []const usize,
-    execution_by_image: []const ReaderItemExecution,
-    native_batches: usize,
-    fallback_reason: ?[]const u8,
-) inference_work.ExecutionReport {
-    var report = inference_work.ExecutionReport{
-        .requested_items = image_counts.len,
-        .native_batches = native_batches,
-    };
-    var offset: usize = 0;
-    for (image_counts) |count| {
-        var request_execution: ReaderItemExecution = .native;
-        for (execution_by_image[offset .. offset + count]) |item_execution| {
-            if (item_execution == .fallback) {
-                request_execution = .fallback;
-                break;
-            }
-            if (item_execution == .serial) request_execution = .serial;
-        }
-        switch (request_execution) {
-            .native => report.native_items += 1,
-            .serial => report.serial_items += 1,
-            .fallback => {
-                report.serial_items += 1;
-                report.fallback_items += 1;
-            },
-        }
-        offset += count;
-    }
-    std.debug.assert(offset == execution_by_image.len);
-    if (report.fallback_items > 0) report.fallback_reason = fallback_reason orelse "reader_fallback";
-    return report;
+fn mergeReaderExecution(report: *inference_work.ExecutionReport, chunk: readers.BatchExecution) !void {
+    report.requested_items = std.math.add(usize, report.requested_items, chunk.requested_items) catch
+        return error.InvalidReadExecutionReport;
+    report.native_batches = std.math.add(usize, report.native_batches, chunk.native_batches) catch
+        return error.InvalidReadExecutionReport;
+    report.native_items = std.math.add(usize, report.native_items, chunk.native_items) catch
+        return error.InvalidReadExecutionReport;
+    report.serial_items = std.math.add(usize, report.serial_items, chunk.serial_items) catch
+        return error.InvalidReadExecutionReport;
+    report.fallback_items = std.math.add(usize, report.fallback_items, chunk.fallback_items) catch
+        return error.InvalidReadExecutionReport;
+    if (chunk.fallback_items > 0)
+        report.fallback_reason = chunk.fallback_reason orelse "reader_fallback";
 }
 
 test "reader execution report preserves mixed native and fallback completion" {
-    const report = summarizeReaderExecution(
-        &.{ 2, 1, 1 },
-        &.{ .native, .fallback, .serial, .native },
-        2,
-        "native_batch_failed",
-    );
+    var report = inference_work.ExecutionReport{};
+    try mergeReaderExecution(&report, .{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 1,
+        .serial_items = 1,
+        .fallback_items = 1,
+        .fallback_reason = "native_batch_failed",
+    });
+    try mergeReaderExecution(&report, .{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 1,
+        .serial_items = 1,
+    });
     try report.validate();
-    try std.testing.expectEqual(@as(usize, 3), report.requested_items);
-    try std.testing.expectEqual(@as(usize, 1), report.native_items);
+    try std.testing.expectEqual(@as(usize, 4), report.requested_items);
+    try std.testing.expectEqual(@as(usize, 2), report.native_items);
     try std.testing.expectEqual(@as(usize, 2), report.serial_items);
     try std.testing.expectEqual(@as(usize, 1), report.fallback_items);
     try std.testing.expectEqual(@as(usize, 2), report.native_batches);
@@ -864,11 +851,8 @@ pub const Runtime = struct {
         std.debug.assert(flat_source_fingerprints.items.len == total_images);
 
         const results = try alloc.alloc(readers.Result, total_images);
-        const execution_by_image = try alloc.alloc(ReaderItemExecution, total_images);
-        defer alloc.free(execution_by_image);
         var results_filled: usize = 0;
-        var native_batches: usize = 0;
-        var fallback_reason: ?[]const u8 = null;
+        var reader_execution = inference_work.ExecutionReport{};
         var results_errdefer_active = true;
         errdefer if (results_errdefer_active) {
             for (results[0..results_filled]) |*result| readers.deinitResult(alloc, result);
@@ -914,23 +898,16 @@ pub const Runtime = struct {
                 });
             };
             const chunk_results = chunk_batch.items;
-            const chunk_execution: ReaderItemExecution = switch (chunk_batch.execution.mode) {
-                .native => blk: {
-                    native_batches += chunk_batch.execution.native_batches;
-                    break :blk .native;
-                },
-                .serial => .serial,
-                .fallback => blk: {
-                    fallback_reason = chunk_batch.execution.fallback_reason;
-                    break :blk .fallback;
-                },
-            };
-            @memset(execution_by_image[image_offset..image_end], chunk_execution);
             if (chunk_results.len != image_end - image_offset) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
                 alloc.free(chunk_results);
                 return error.InvalidReaderResponse;
             }
+            mergeReaderExecution(&reader_execution, chunk_batch.execution) catch |err| {
+                for (chunk_results) |*result| readers.deinitResult(alloc, result);
+                alloc.free(chunk_results);
+                return err;
+            };
             for (chunk_results, 0..) |result, j| {
                 if (uses_encoded_media and !readerResultMatchesImageIdentity(result, flat_encoded.items[image_offset + j])) {
                     for (chunk_results) |*item| readers.deinitResult(alloc, item);
@@ -962,8 +939,8 @@ pub const Runtime = struct {
             out[i] = try encodeReaderResults(alloc, request.content_type, results[offset .. offset + count]);
             offset += count;
         }
-        const report = summarizeReaderExecution(image_counts, execution_by_image, native_batches, fallback_reason);
-        return try asset_producer.producedBatchFromOutputs(alloc, requests, out, report);
+        try reader_execution.validate();
+        return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -1103,7 +1080,7 @@ pub const Runtime = struct {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             const items = try read_images(local.ptr, alloc, cfg.model orelse "", request);
-            return .{ .items = items, .execution = .{ .mode = .serial, .requested_items = items.len } };
+            return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
         var registry = readers.Registry.init(alloc);
@@ -1188,7 +1165,7 @@ pub const Runtime = struct {
                 }
                 return .{
                     .items = items,
-                    .execution = .{ .mode = .serial, .requested_items = request.images.len },
+                    .execution = .{ .requested_items = request.images.len, .serial_items = request.images.len },
                 };
             }
         }

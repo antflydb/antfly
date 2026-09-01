@@ -8,6 +8,7 @@
 //! advertise native batching.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const work = @import("work.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
@@ -19,8 +20,11 @@ const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
 
 fn monotonicNowNs(io: std.Io) u64 {
-    const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-    return if (raw <= 0) 0 else @intCast(raw);
+    _ = io;
+    // Callers pass absolute deadlines produced by antfly_platform.time. Keep
+    // every comparison in that clock domain; std.Io's `.awake` clock maps to
+    // CLOCK_UPTIME_RAW on Darwin and cannot be compared with CLOCK_MONOTONIC.
+    return platform_time.monotonicNs();
 }
 
 const CachedCapability = struct {
@@ -160,6 +164,10 @@ pub const Cache = struct {
 
         const discovered = discoverWithDeadline(self.alloc, self.io, http, inference_url, model, task, headers, wait_context.deadline_ns);
         if (discovered) |value| {
+            const owner_context_error: ?anyerror = blk: {
+                wait_context.check(monotonicNowNs(self.io)) catch |err| break :blk err;
+                break :blk null;
+            };
             self.mutex.lockUncancelable(self.io);
             self.admitLocked(key, value, monotonicNowNs(self.io)) catch {};
             flight.value = value;
@@ -167,8 +175,13 @@ pub const Cache = struct {
             flight.ready.set(self.io);
             self.releaseFlightLocked(flight);
             self.mutex.unlock(self.io);
+            if (owner_context_error) |err| return err;
             return value;
         } else |err| {
+            const owner_context_error: ?anyerror = blk: {
+                wait_context.check(monotonicNowNs(self.io)) catch |context_err| break :blk context_err;
+                break :blk null;
+            };
             self.mutex.lockUncancelable(self.io);
             const stale = self.entries.get(key);
             if (stale != null and monotonicNowNs(self.io) < stale.?.stale_until_ns) {
@@ -182,6 +195,7 @@ pub const Cache = struct {
             const flight_err = flight.err;
             self.releaseFlightLocked(flight);
             self.mutex.unlock(self.io);
+            if (owner_context_error) |context_err| return context_err;
             if (flight_err) |flight_error| return flight_error;
             return value;
         }

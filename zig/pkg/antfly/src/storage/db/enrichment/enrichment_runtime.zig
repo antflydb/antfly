@@ -165,7 +165,22 @@ test "enrichment foreground catch up reconciles retry state after checkpoint app
     );
 }
 
-pub const GeneratedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) anyerror!u64;
+pub const GeneratedArtifactPromotion = struct {
+    staged_key: []const u8,
+    final_key: []const u8,
+};
+
+pub const GeneratedRecordCommit = struct {
+    sequence: u64,
+    promoted_artifact_bytes: usize = 0,
+};
+
+pub const GeneratedRecordWriter = *const fn (
+    ptr: *anyopaque,
+    batch: derived_types.DerivedBatch,
+    artifact_promotions: []const GeneratedArtifactPromotion,
+    artifact_delete_keys: []const []const u8,
+) anyerror!GeneratedRecordCommit;
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
     index_name: []const u8,
@@ -234,7 +249,7 @@ const generated_ocr_default_render_inflight_pixels: u64 = 50_000_000;
 const generated_ocr_default_render_inflight_bytes: usize = 256 * 1024 * 1024;
 const generated_pdf_default_max_document_pages: usize = 2048;
 const generated_pdf_absolute_max_document_pages: usize = 16_384;
-const generated_pdf_artifact_scan_max_keys: usize = generated_pdf_absolute_max_document_pages * 8;
+const generated_pdf_artifact_scan_work_max_keys: usize = generated_pdf_absolute_max_document_pages * 8;
 const generated_pdf_stage_cleanup_page_keys: usize = 512;
 const maximum_ocr_inline_png_bytes: usize = 8 * 1024 * 1024;
 const minimum_ocr_inline_render_dimension: u32 = 512;
@@ -302,6 +317,7 @@ const GeneratedReplayWindow = struct {
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
     deleted_keys: std.ArrayListUnmanaged([]u8) = .empty,
     artifact_delete_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    artifact_promotions: std.ArrayListUnmanaged(GeneratedArtifactPromotion) = .empty,
     changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
@@ -312,6 +328,7 @@ const GeneratedReplayWindow = struct {
         return self.documents.items.len != 0 or
             self.deleted_keys.items.len != 0 or
             self.artifact_delete_keys.items.len != 0 or
+            self.artifact_promotions.items.len != 0 or
             self.changed_artifact_keys.items.len != 0 or
             self.dense_embeddings.items.len != 0 or
             self.sparse_embeddings.items.len != 0;
@@ -325,6 +342,7 @@ const GeneratedReplayWindow = struct {
         return self.documents.items.len +
             self.deleted_keys.items.len +
             self.artifact_delete_keys.items.len +
+            self.artifact_promotions.items.len +
             self.changed_artifact_keys.items.len +
             self.dense_embeddings.items.len +
             self.sparse_embeddings.items.len +
@@ -357,6 +375,12 @@ const GeneratedReplayWindow = struct {
 
         for (self.artifact_delete_keys.items) |key| self.alloc.free(key);
         self.artifact_delete_keys.deinit(self.alloc);
+
+        for (self.artifact_promotions.items) |promotion| {
+            self.alloc.free(@constCast(promotion.staged_key));
+            self.alloc.free(@constCast(promotion.final_key));
+        }
+        self.artifact_promotions.deinit(self.alloc);
 
         for (self.changed_artifact_keys.items) |key| self.alloc.free(key);
         self.changed_artifact_keys.deinit(self.alloc);
@@ -418,6 +442,21 @@ fn generatedPdfMaxDocumentPages() usize {
     const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch
         return generated_pdf_default_max_document_pages;
     return std.math.clamp(parsed, 1, generated_pdf_absolute_max_document_pages);
+}
+
+fn effectivePdfMaxDocumentPages(requested: ?usize, operator_max: usize) usize {
+    const hard_max = @min(@max(@as(usize, 1), operator_max), generated_pdf_absolute_max_document_pages);
+    return @min(requested orelse hard_max, hard_max);
+}
+
+test "PDF document policy cannot raise operator page ceiling" {
+    try std.testing.expectEqual(@as(usize, 100), effectivePdfMaxDocumentPages(10_000, 100));
+    try std.testing.expectEqual(@as(usize, 64), effectivePdfMaxDocumentPages(64, 100));
+    try std.testing.expectEqual(@as(usize, 100), effectivePdfMaxDocumentPages(null, 100));
+    try std.testing.expectEqual(
+        generated_pdf_absolute_max_document_pages,
+        effectivePdfMaxDocumentPages(null, std.math.maxInt(usize)),
+    );
 }
 
 fn generatedOcrBatchMaxItems() usize {
@@ -943,6 +982,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.DecodedStreamTooLarge,
         error.PdfDecodeWorkingSetTooLarge,
         error.InvalidPdfDecodeLimits,
+        error.PdfDocumentPageLimitExceeded,
+        error.PdfEmbeddingArtifactFanoutExceeded,
+        error.PdfEmbeddingArtifactScanBudgetExceeded,
         // Crossing a stable runtime boundary without a transportable error
         // identity is not evidence of transience. Provider boundaries should
         // normally return InferenceProviderFailure after logging the owner-side
@@ -1198,6 +1240,9 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.RuntimeBoundaryFailure));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InferenceBatchTooLarge));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedInferenceMimeType));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfDocumentPageLimitExceeded));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactFanoutExceeded));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactScanBudgetExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnexpectedToken));
 }
 
@@ -7869,6 +7914,7 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     var total: usize = window.documents.capacity *| @sizeOf(derived_types.DerivedDocument);
     total = addUsizeSaturating(total, window.deleted_keys.capacity *| @sizeOf([]const u8));
     total = addUsizeSaturating(total, window.artifact_delete_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.artifact_promotions.capacity *| @sizeOf(GeneratedArtifactPromotion));
     total = addUsizeSaturating(total, window.changed_artifact_keys.capacity *| @sizeOf([]const u8));
     total = addUsizeSaturating(total, window.dense_embeddings.capacity *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
     total = addUsizeSaturating(total, window.sparse_embeddings.capacity *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
@@ -7881,6 +7927,10 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     }
     for (window.deleted_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.artifact_delete_keys.items) |key| total = addUsizeSaturating(total, key.len);
+    for (window.artifact_promotions.items) |promotion| {
+        total = addUsizeSaturating(total, promotion.staged_key.len);
+        total = addUsizeSaturating(total, promotion.final_key.len);
+    }
     for (window.changed_artifact_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.dense_embeddings.items) |embedding| {
         total = addUsizeSaturating(total, embedding.index_name.len);
@@ -10345,14 +10395,18 @@ fn flushGeneratedReplayWindow(
 
     const artifact_delete_keys = try window.artifact_delete_keys.toOwnedSlice(runtime.alloc);
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys);
+    const artifact_promotions = try window.artifact_promotions.toOwnedSlice(runtime.alloc);
+    errdefer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
     var batch = try window.toOwnedBatch();
     defer derived_types.deinitDerivedBatch(runtime.alloc, &batch);
     defer freeKeyList(runtime.alloc, artifact_delete_keys);
-    const sequence = try appendGeneratedBatchWithRetry(runtime, batch, artifact_delete_keys);
+    defer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
+    const commit = try appendGeneratedBatchWithRetry(runtime, batch, artifact_promotions, artifact_delete_keys);
+    recordArtifactBytes(runtime, .dense_embedding, commit.promoted_artifact_bytes);
     try applyQueuedCoverageTransitionsAfterReplayAppend(runtime, window.coverage_transitions.items);
     clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
     try rememberPublishedGeneratedBatch(runtime, batch);
-    runtime.notify_fn(runtime.notify_ctx, sequence);
+    runtime.notify_fn(runtime.notify_ctx, commit.sequence);
     try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
     succeeded = true;
 }
@@ -10725,9 +10779,9 @@ fn processPdfPageImageEmbedding(
     }
 
     const policy = try enrichment_types.parseExecutionPolicyJson(runtime.alloc, request.execution_json);
-    const max_document_pages = @min(
-        policy.max_document_pages orelse generatedPdfMaxDocumentPages(),
-        generated_pdf_absolute_max_document_pages,
+    const max_document_pages = effectivePdfMaxDocumentPages(
+        policy.max_document_pages,
+        generatedPdfMaxDocumentPages(),
     );
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
@@ -10864,26 +10918,24 @@ fn processPdfPageImageEmbedding(
         desired_page_keys.items,
     );
     errdefer stale.deinit(runtime.alloc);
-    try promotePdfPageEmbeddingStages(
-        runtime,
-        desired_page_keys.items,
-        staged_page_keys.items,
-        embedding_name,
-        stale.artifact_delete_keys,
-    );
-    freeKeyList(runtime.alloc, stale.artifact_delete_keys);
-    stale.artifact_delete_keys = &.{};
-    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
     if (base_embeddings.items.len == 0) {
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     }
-    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
     var expanded = try expandDenseEmbeddingsForConsumers(runtime, base_embeddings.items, consumer_indexes);
     defer {
         for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (expanded.len > 0) runtime.alloc.free(expanded);
     }
+    try queuePdfPageEmbeddingPromotions(
+        runtime,
+        window,
+        desired_page_keys.items,
+        staged_page_keys.items,
+        embedding_name,
+    );
+    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
+    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
 }
 
@@ -10933,85 +10985,24 @@ fn clearPdfPageEmbeddingStages(
     }
 }
 
-fn promotePdfPageEmbeddingStages(
+fn queuePdfPageEmbeddingPromotions(
     runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
     desired_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
-    stale_artifact_keys: []const []const u8,
 ) !void {
     if (staged_page_keys.len != desired_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
-    // Promotion starts only after every page rendered and embedded, and the
-    // public page-vector generation changes in one storage transaction. The
-    // transaction reads staged values directly, avoiding an unbounded second
-    // in-memory copy of every vector in a large document.
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        const promoted_bytes = promotePdfPageEmbeddingStagesOnce(
-            runtime,
-            desired_page_keys,
-            staged_page_keys,
-            embedding_name,
-            stale_artifact_keys,
-        ) catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        try runtime.store.sync(false);
-        recordArtifactBytes(runtime, .dense_embedding, promoted_bytes);
-        return;
-    }
-}
-
-fn promotePdfPageEmbeddingStagesOnce(
-    runtime: *EnrichmentRuntime,
-    desired_page_keys: []const []const u8,
-    staged_page_keys: []const []const u8,
-    embedding_name: []const u8,
-    stale_artifact_keys: []const []const u8,
-) !usize {
-    var batch = try runtime.store.beginBatch();
-    var committed = false;
-    defer if (!committed) batch.abort();
-    var promoted_bytes: usize = 0;
-    try updateDenseArtifactTargetCountersTxn(runtime, &batch, &.{}, stale_artifact_keys);
-    for (stale_artifact_keys) |artifact_key| {
-        batch.delete(artifact_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, artifact_key)) |marker_key| {
-            defer runtime.alloc.free(marker_key);
-            batch.delete(marker_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-        }
-    }
     for (desired_page_keys, staged_page_keys) |page_key, stage_key| {
-        const staged_payload = try batch.get(stage_key);
         const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
-        defer runtime.alloc.free(final_key);
-        const write = KVPair{ .key = final_key, .value = staged_payload };
-        try updateDenseArtifactTargetCountersTxn(runtime, &batch, &.{write}, &.{stage_key});
-        try batch.put(final_key, staged_payload);
-        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, final_key)) |marker_key| {
-            defer runtime.alloc.free(marker_key);
-            try batch.put(marker_key, final_key);
-        }
-        batch.delete(stage_key) catch |err| switch (err) {
-            error.NotFound => return error.InvalidPdfPageEmbeddingStage,
-            else => return err,
-        };
-        promoted_bytes +|= staged_payload.len;
+        errdefer runtime.alloc.free(final_key);
+        const owned_stage_key = try runtime.alloc.dupe(u8, stage_key);
+        errdefer runtime.alloc.free(owned_stage_key);
+        try window.artifact_promotions.append(runtime.alloc, .{
+            .staged_key = owned_stage_key,
+            .final_key = final_key,
+        });
     }
-    try batch.commit();
-    committed = true;
-    return promoted_bytes;
 }
 
 test "durable enrichment PDF page embedding rejects partial and missing results" {
@@ -11072,7 +11063,7 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
     try std.testing.expect(!std.mem.eql(u8, colon_left, colon_right));
 }
 
-test "durable enrichment PDF page embedding publishes only complete staged generations" {
+test "durable enrichment PDF page embedding queues complete staged generations without publishing" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
     defer backend.close();
@@ -11161,22 +11152,56 @@ test "durable enrichment PDF page embedding publishes only complete staged gener
 
     try storePutWithRetry(&runtime, stage_one, new_one);
     try storePutWithRetry(&runtime, stage_two, new_two);
-    try promotePdfPageEmbeddingStages(
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    try queuePdfPageEmbeddingPromotions(
         &runtime,
+        &window,
         &.{ page_one, page_two },
         &.{ stage_one, stage_two },
         "visual_v1",
-        &.{final_three},
     );
-    const published_one = try storeGetAlloc(&runtime, final_one);
-    defer alloc.free(published_one);
-    const published_two = try storeGetAlloc(&runtime, final_two);
-    defer alloc.free(published_two);
-    try std.testing.expectEqualSlices(u8, new_one, published_one);
-    try std.testing.expectEqualSlices(u8, new_two, published_two);
-    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, stage_one));
-    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, stage_two));
-    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, final_three));
+    try std.testing.expectEqual(@as(usize, 2), window.artifact_promotions.items.len);
+    try std.testing.expectEqualStrings(stage_one, window.artifact_promotions.items[0].staged_key);
+    try std.testing.expectEqualStrings(final_one, window.artifact_promotions.items[0].final_key);
+    const unpublished_one = try storeGetAlloc(&runtime, final_one);
+    defer alloc.free(unpublished_one);
+    try std.testing.expectEqualSlices(u8, old_one, unpublished_one);
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, final_two));
+    const staged_one = try storeGetAlloc(&runtime, stage_one);
+    defer alloc.free(staged_one);
+    try std.testing.expectEqualSlices(u8, new_one, staged_one);
+    const stale_still_visible = try storeGetAlloc(&runtime, final_three);
+    defer alloc.free(stale_still_visible);
+    try std.testing.expectEqualSlices(u8, old_one, stale_still_visible);
+
+    const unrelated_embedding = try embeddingArtifactKey(&runtime, page_two, "other_visual_v1");
+    defer alloc.free(unrelated_embedding);
+    try storePutWithRetry(&runtime, unrelated_embedding, old_one);
+    var stale = try deleteStalePageEmbeddingArtifactsWithLimit(
+        &runtime,
+        "doc:1",
+        "pdf_pages_v1",
+        "visual_v1",
+        &.{page_one},
+        2,
+    );
+    defer stale.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), stale.vector_keys.len);
+    try std.testing.expectEqualStrings(page_three, stale.vector_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), stale.artifact_delete_keys.len);
+    try std.testing.expectEqualStrings(final_three, stale.artifact_delete_keys[0]);
+    try std.testing.expectError(
+        error.PdfEmbeddingArtifactFanoutExceeded,
+        deleteStalePageEmbeddingArtifactsWithLimit(
+            &runtime,
+            "doc:1",
+            "pdf_pages_v1",
+            "visual_v1",
+            &.{page_one},
+            1,
+        ),
+    );
 }
 
 fn processDenseEmbedding(
@@ -11794,8 +11819,8 @@ fn publishDeletedKeys(runtime: *EnrichmentRuntime, deleted_keys: []const []const
     };
     var cloned = try derived_types.cloneBatch(runtime.alloc, batch);
     defer derived_types.deinitDerivedBatch(runtime.alloc, &cloned);
-    const sequence = try appendGeneratedBatchWithRetry(runtime, cloned, &.{});
-    runtime.notify_fn(runtime.notify_ctx, sequence);
+    const commit = try appendGeneratedBatchWithRetry(runtime, cloned, &.{}, &.{});
+    runtime.notify_fn(runtime.notify_ctx, commit.sequence);
 }
 
 fn embeddingArtifactKey(runtime: *EnrichmentRuntime, base_key: []const u8, artifact_name: []const u8) ![]u8 {
@@ -13490,33 +13515,81 @@ fn deleteStalePageEmbeddingArtifacts(
     embedding_artifact_name: []const u8,
     desired_page_keys: []const []const u8,
 ) !StaleEmbeddingDeletes {
+    return try deleteStalePageEmbeddingArtifactsWithLimit(
+        runtime,
+        doc_key,
+        page_artifact_name,
+        embedding_artifact_name,
+        desired_page_keys,
+        generated_pdf_absolute_max_document_pages,
+    );
+}
+
+fn deleteStalePageEmbeddingArtifactsWithLimit(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_artifact_name: []const u8,
+    desired_page_keys: []const []const u8,
+    max_matching_artifacts: usize,
+) !StaleEmbeddingDeletes {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", page_artifact_name);
     defer runtime.alloc.free(prefix);
-    const existing = backend_scan.scanPrefixKeysLimited(
-        runtime.alloc,
-        &runtime.store,
-        prefix,
-        generated_pdf_artifact_scan_max_keys,
-    ) catch |err| switch (err) {
-        error.ScanLimitExceeded => return error.PdfDocumentPageLimitExceeded,
-        else => return err,
-    };
-    defer freeKeyList(runtime.alloc, existing);
-    if (existing.len == 0) return .{};
-
     var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
-    for (existing) |key| {
-        if (!internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
-        if (!internal_keys.matchesDerivedEmbeddingArtifactName(key, embedding_artifact_name)) continue;
-        if (derivedEmbeddingBelongsToDesiredChunk(key, desired_page_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
+    var desired_page_key_set = std.StringHashMapUnmanaged(void).empty;
+    defer desired_page_key_set.deinit(runtime.alloc);
+    const desired_page_capacity = std.math.cast(u32, desired_page_keys.len) orelse
+        return error.PdfEmbeddingArtifactFanoutExceeded;
+    try desired_page_key_set.ensureTotalCapacity(runtime.alloc, desired_page_capacity);
+    for (desired_page_keys) |key| desired_page_key_set.putAssumeCapacity(key, {});
+
+    const ScanState = struct {
+        alloc: Allocator,
+        prefix: []const u8,
+        embedding_artifact_name: []const u8,
+        desired_page_key_set: *const std.StringHashMapUnmanaged(void),
+        max_matching_artifacts: usize,
+        scanned_artifacts: usize = 0,
+        matching_artifacts: usize = 0,
+        stale_vector_keys: *std.ArrayListUnmanaged([]u8),
+        artifact_delete_keys: *std.ArrayListUnmanaged([]u8),
+
+        fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!backend_scan.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (!std.mem.startsWith(u8, key, state.prefix)) return .stop;
+            state.scanned_artifacts = std.math.add(usize, state.scanned_artifacts, 1) catch
+                return error.PdfEmbeddingArtifactScanBudgetExceeded;
+            if (state.scanned_artifacts > generated_pdf_artifact_scan_work_max_keys)
+                return error.PdfEmbeddingArtifactScanBudgetExceeded;
+            if (!internal_keys.isDerivedEmbeddingArtifactKey(key) or
+                !internal_keys.matchesDerivedEmbeddingArtifactName(key, state.embedding_artifact_name))
+                return .@"continue";
+            state.matching_artifacts = std.math.add(usize, state.matching_artifacts, 1) catch
+                return error.PdfEmbeddingArtifactFanoutExceeded;
+            if (state.matching_artifacts > state.max_matching_artifacts)
+                return error.PdfEmbeddingArtifactFanoutExceeded;
+            if (try derivedEmbeddingBelongsToDesiredChunkSet(state.alloc, key, state.desired_page_key_set))
+                return .@"continue";
+            if (try internal_keys.derivedEmbeddingBaseKeyAlloc(state.alloc, key)) |base_key| {
+                try appendUniqueOwnedKey(state.alloc, state.stale_vector_keys, base_key);
+            }
+            try appendUniqueDupeKey(state.alloc, state.artifact_delete_keys, key);
+            return .@"continue";
         }
-        try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, key);
-    }
+    };
+    var state = ScanState{
+        .alloc = runtime.alloc,
+        .prefix = prefix,
+        .embedding_artifact_name = embedding_artifact_name,
+        .desired_page_key_set = &desired_page_key_set,
+        .max_matching_artifacts = max_matching_artifacts,
+        .stale_vector_keys = &stale_vector_keys,
+        .artifact_delete_keys = &artifact_delete_keys,
+    };
+    try backend_scan.scanWithContext(&runtime.store, prefix, "", .{}, &state, ScanState.visit);
     return .{
         .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),
         .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(runtime.alloc),
@@ -13713,6 +13786,17 @@ fn chunkKeysForChunks(alloc: Allocator, doc_key: []const u8, artifact_name: []co
 fn freeKeyList(alloc: Allocator, keys: []const []u8) void {
     for (keys) |key| alloc.free(key);
     alloc.free(keys);
+}
+
+fn freeGeneratedArtifactPromotions(
+    alloc: Allocator,
+    promotions: []const GeneratedArtifactPromotion,
+) void {
+    for (promotions) |promotion| {
+        alloc.free(@constCast(promotion.staged_key));
+        alloc.free(@constCast(promotion.final_key));
+    }
+    if (promotions.len > 0) alloc.free(promotions);
 }
 
 fn freeOwnedKeySet(alloc: Allocator, keys: *std.StringHashMapUnmanaged(void)) void {
@@ -14744,11 +14828,12 @@ test "durable enrichment retry progress preserves unrelated request debt across 
 fn appendGeneratedBatchWithRetry(
     runtime: *EnrichmentRuntime,
     batch: derived_types.DerivedBatch,
+    artifact_promotions: []const GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
-) !u64 {
+) !GeneratedRecordCommit {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_delete_keys) catch |err| switch (err) {
+        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_promotions, artifact_delete_keys) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();

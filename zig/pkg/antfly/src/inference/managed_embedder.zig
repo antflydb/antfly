@@ -1176,7 +1176,7 @@ pub const ManagedEmbedder = struct {
                     .cancellation = entry.cancellation orelse .none,
                 },
             ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
+                error.OutOfMemory, error.Canceled, error.Timeout => return err,
                 else => null,
             }) |result| return result;
         }

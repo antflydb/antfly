@@ -181,11 +181,20 @@ pub fn main(init: std.process.Init) !void {
             const items = try readEncodedImages(ptr, result_alloc, model, request);
             if (self.read_calls == 3) return .{
                 .items = items,
-                .execution = .{ .mode = .fallback, .requested_items = request.images.len, .fallback_reason = "integration_fallback" },
+                .execution = .{
+                    .requested_items = request.images.len,
+                    .serial_items = request.images.len,
+                    .fallback_items = request.images.len,
+                    .fallback_reason = "integration_fallback",
+                },
             };
             return .{
                 .items = items,
-                .execution = .{ .mode = .native, .requested_items = request.images.len, .native_batches = 1 },
+                .execution = .{
+                    .requested_items = request.images.len,
+                    .native_batches = 1,
+                    .native_items = request.images.len,
+                },
             };
         }
     };

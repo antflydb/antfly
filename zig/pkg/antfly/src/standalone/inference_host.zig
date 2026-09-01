@@ -814,7 +814,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             if (operation == .read_encoded_images_reported) {
                 var batch = antfly.readers.BatchResult{
                     .items = result,
-                    .execution = .{ .mode = .serial, .requested_items = result.len },
+                    .execution = .{ .requested_items = result.len, .serial_items = result.len },
                 };
                 defer batch.deinit(alloc);
                 break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});

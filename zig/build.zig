@@ -4986,6 +4986,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
+            "storage.db.db.test.db generated replay atomically promotes staged artifacts",
         },
     });
     const run_lib_db_enrichment_replay_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_replay_tests);

@@ -256,11 +256,12 @@ document. They are architectural requirements, not Florence-specific cleanup:
     independently length-encoded document, artifact, embedding, and unit
     components. Cleanup scans only that exact typed prefix.
 13. **Page-vector publication was not an exact set when a PDF shrank.** Current
-    page artifacts, stale artifact deletion, reverse-source markers, and dense
-    artifact counters must change in the same storage transaction. Vector
-    additions, stale vector deletions, and coverage then publish in one
-    generated replay window, so query-visible vectors remain the prior complete
-    set until the replacement set is committed.
+    page artifacts, stale artifact deletion, dense artifact counters, and the
+    durable replay record for vector replacement must change in the same
+    document-store transaction. Stage promotion is
+    therefore an input to the generated-record writer, not an earlier
+    enrichment-side transaction. A missing stage or replay-append failure
+    changes neither generation.
 14. **Capability discovery was repeated on hot paths.** A runtime-owned cache
     must key snapshots by endpoint, model, task, and an authentication digest;
     coalesce concurrent misses; bound entry count; refresh on a short TTL; and
@@ -286,8 +287,14 @@ document. They are architectural requirements, not Florence-specific cleanup:
     generation-aware index filtering. The implemented safe boundary admits a
     configurable `max_document_pages` before staging, clamps it to an absolute
     16,384-page ceiling, cleans invisible staging records in fixed-size delete
-    windows, and uses a key-only bounded scan for page assets plus derived
-    artifacts. The default is 2,048 pages. Lifting the absolute limit requires
+    windows. Stale discovery streams the page namespace, retains only artifacts
+    for the selected embedding, and applies the fanout ceiling after that
+    filter; unrelated embedders cannot consume the limit. A separate total
+    scan-work ceiling bounds malformed or adversarial namespaces without
+    misreporting them as source page-count failures. Fanout overflow, scan-work
+    exhaustion, and source page-count admission have distinct errors and are
+    stable terminal request failures. The default is 2,048 pages. Lifting the
+    absolute limit requires
     adding an active generation to vector records and query filtering first; an
     artifact manifest pointer by itself is insufficient.
 19. **Per-page accumulation had ambiguous allocation ownership.** Page keys,
@@ -302,12 +309,19 @@ document. They are architectural requirements, not Florence-specific cleanup:
 21. **Remote execution telemetry was predicted from capabilities.** Read and
     generation responses now optionally carry an observed execution report.
     New clients validate and use it; old servers without the field are treated
-    conservatively as serial compatibility. The generation batch endpoint
-    reports serial items while it schedules independent decode invocations.
+    conservatively as serial compatibility. Mixed native/serial/fallback
+    reports retain their exact counters. Aggregate counters are not converted
+    into invented per-item modes; the report's requested-item unit remains the
+    concrete reader work item (an image). The generation batch endpoint reports
+    serial items while it schedules independent decode invocations.
 22. **Capability single-flight waits ignored cancellation and shutdown.** Waits
     now poll a semantic cancellation token, honor the request deadline, and
     bound the catalog HTTP request. Cache shutdown closes admission and drains
-    outstanding flights before destroying their events or keys.
+    outstanding flights before destroying their events or keys. Cancellation
+    and timeout are control flow, not discovery failure: they propagate through
+    the managed embedder instead of selecting conservative execution or stale
+    cache data. All absolute comparisons use `antfly_platform.time`'s monotonic
+    clock; `std.Io` clocks are used only for relative waits.
 23. **Generator modality admission omitted raw documents.**
     `application/pdf` maps to the document modality and is accepted only when
     the resolved generator advertises document input and PDF MIME support.
@@ -322,6 +336,8 @@ The hardening above follows four long-term rules:
   refresh. Discovery failure falls back to compatibility execution; it never
   upgrades an unknown model to native batching. Discovery and single-flight
   waits are deadline-bounded and cancelable; runtime shutdown drains owners.
+  Valid catalog failures may use stale or conservative capabilities, but an
+  expired or canceled caller never does.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
@@ -329,8 +345,16 @@ The hardening above follows four long-term rules:
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.
 - Durable publication is generation-shaped. Private typed stage records are
-  invisible; complete current-page promotion and stale-page artifact deletion
-  are one transaction; vector/coverage replay is the public generation commit.
+  invisible; complete current-page promotion, stale-page artifact deletion,
+  dense artifact counters, and vector replay append are one atomic
+  document-store commit. The replay record is the public generation boundary,
+  so no promoted artifact set can exist without its durable vector replacement.
+  Stage payloads are borrowed from the write transaction during promotion; the
+  commit does not retain a second document-sized heap copy. An active split
+  still materializes the exact promoted writes required by its durable handoff.
+  Coverage counters remain idempotent post-append metadata: failure prevents
+  the enrichment source watermark from advancing, so retry reconciles them
+  from the already durable generation.
   A future storage backend that cannot provide the artifact transaction must
   instead publish through an atomic active-generation manifest pointer. The
   current vector index is not generation-filtered, so request atomicity is
@@ -380,8 +404,8 @@ The hardening above follows four long-term rules:
    pipeline through the standalone boundary. OCR telemetry distinguishes
    native completion, compatibility serialization, and native-to-serial
    fallback instead of logging the preflight prediction. Mixed completion
-   retains native batch counts and classifies only the affected logical items
-   as serial/fallback.
+   retains exact native, serial, fallback, and native-batch counters; aggregate
+   reports are never forced into a single invocation mode.
 8. **Implemented locally:** prompt policy is resolved during configuration
    parsing, and execution no longer guesses prompt semantics from a model name.
    Model-name detection is confined to backward-compatible config migration.
@@ -407,18 +431,22 @@ The hardening above follows four long-term rules:
     page provenance, remote generator failures no longer discard successful
     siblings, and enrichment consumes each item exactly once.
 13. **Implemented after review:** PDF page embedding stages use a dedicated
-    typed internal namespace. Complete promotion removes stale page artifacts
-    in the same transaction, while stale vector deletion and replacement
-    vectors remain in the atomic generated replay window.
+    typed internal namespace. The generated-record writer reads complete stage
+    values and atomically commits their canonical keys, stale artifact deletes,
+    counter changes, and the replacement replay record. Stage keys are deleted
+    only by that commit, and their values remain transaction-borrowed during
+    ordinary publication instead of being accumulated in memory.
 14. **Implemented after review:** request-atomic PDF publication has explicit
     page-count admission (`execution.max_document_pages`, default 2,048,
-    absolute maximum 16,384). Invisible stage cleanup uses fixed-size delete
-    pages, stale-artifact maintenance uses a bounded key-only scan, and
-    allocation transfer is failure-safe.
+    absolute maximum 16,384). The effective limit is the minimum of the public
+    request, operator ceiling, and absolute ceiling; a request cannot raise an
+    operator setting. Invisible stage cleanup uses fixed-size delete pages,
+    stale-artifact maintenance streams keys and counts only the selected
+    embedding, and allocation transfer is failure-safe.
 15. **Implemented after review:** remote read and generation responses carry
-    optional observed execution reports. Clients validate the report, preserve
-    backward compatibility as serial execution, and never upgrade telemetry
-    from a capability prediction.
+    optional observed execution reports. Clients validate and preserve mixed
+    execution counters, preserve backward compatibility as serial execution,
+    and never upgrade telemetry from a capability prediction.
 16. **Implemented after review:** reader URI admission measures decoded base64
     data URIs and validates MIME before local callback or remote adaptation.
     Generator admission recognizes PDF as the
@@ -426,6 +454,9 @@ The hardening above follows four long-term rules:
 17. **Implemented after review:** capability single-flight waiters observe
     cancellation/deadlines, catalog fetches have a finite timeout, and cache
     teardown drains in-flight owners instead of asserting they do not exist.
+    Owners recheck context after discovery, cancellation/timeout propagate
+    through managed embedders, and every absolute deadline shares one monotonic
+    clock domain on Darwin and other platforms.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -981,7 +1012,9 @@ waiting for render workers.
 ## Configuration and operator caps
 
 The public execution policy should express desired batching while operator
-settings impose hard ceilings. A possible configuration shape is:
+settings impose hard ceilings. In particular, the page limit is
+`min(requested max_document_pages, operator max_document_pages, 16384)`; an
+omitted request uses the operator ceiling. A possible configuration shape is:
 
 ```yaml
 execution:

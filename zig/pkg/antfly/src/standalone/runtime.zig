@@ -5308,7 +5308,7 @@ fn inferenceProviderReadEncodedImagesReported(
 ) anyerror!antfly.readers.BatchResult {
     if (request.images.len == 0) return .{
         .items = try alloc.alloc(antfly.readers.Result, 0),
-        .execution = .{ .mode = .serial, .requested_items = 0 },
+        .execution = .{},
     };
     var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
     defer encoded.deinit(alloc);

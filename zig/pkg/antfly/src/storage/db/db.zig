@@ -23810,6 +23810,34 @@ pub const DB = struct {
         owned_keys: *std.ArrayListUnmanaged([]u8),
         owned_values: *std.ArrayListUnmanaged([]u8),
     ) !void {
+        try appendDenseArtifactCounterMutationsWithPromotions(
+            alloc,
+            store,
+            index_manager,
+            store_writes,
+            delete_keys,
+            &.{},
+            owned_keys,
+            owned_values,
+        );
+    }
+
+    const FinalDenseArtifactMutation = union(enum) {
+        deleted,
+        write: usize,
+        promotion: usize,
+    };
+
+    fn appendDenseArtifactCounterMutationsWithPromotions(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *const index_manager_mod.IndexManager,
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        delete_keys: []const []const u8,
+        promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+    ) !void {
         var may_mutate_embedding_artifact = false;
         for (delete_keys) |key| {
             if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
@@ -23825,6 +23853,16 @@ pub const DB = struct {
                 }
             }
         }
+        if (!may_mutate_embedding_artifact) {
+            for (promotions) |promotion| {
+                if (internal_keys.isEmbeddingArtifactKey(promotion.final_key) or
+                    internal_keys.isDerivedEmbeddingArtifactKey(promotion.final_key))
+                {
+                    may_mutate_embedding_artifact = true;
+                    break;
+                }
+            }
+        }
         // Ordinary document-only writes stay allocation-free in counter
         // routing. Build the catalog lookup only for commits that can actually
         // change embedding-artifact coverage.
@@ -23835,18 +23873,22 @@ pub const DB = struct {
         if (catalog.targets.items.len == 0) return;
         var mutations = std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation){};
         defer mutations.deinit(alloc);
-        const deleted_sentinel = std.math.maxInt(usize);
-        var final_artifact_mutations = std.StringHashMapUnmanaged(usize).empty;
+        var final_artifact_mutations = std.StringHashMapUnmanaged(FinalDenseArtifactMutation).empty;
         defer final_artifact_mutations.deinit(alloc);
 
         for (delete_keys) |key| {
             if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
             const gop = try final_artifact_mutations.getOrPut(alloc, key);
-            if (!gop.found_existing) gop.value_ptr.* = deleted_sentinel;
+            if (!gop.found_existing) gop.value_ptr.* = .deleted;
         }
         for (store_writes.items, 0..) |write, write_idx| {
             if (!internal_keys.isEmbeddingArtifactKey(write.key) and !internal_keys.isDerivedEmbeddingArtifactKey(write.key)) continue;
-            try final_artifact_mutations.put(alloc, write.key, write_idx);
+            try final_artifact_mutations.put(alloc, write.key, .{ .write = write_idx });
+        }
+        for (promotions, 0..) |promotion, promotion_idx| {
+            if (!internal_keys.isEmbeddingArtifactKey(promotion.final_key) and
+                !internal_keys.isDerivedEmbeddingArtifactKey(promotion.final_key)) continue;
+            try final_artifact_mutations.put(alloc, promotion.final_key, .{ .promotion = promotion_idx });
         }
 
         var final_it = final_artifact_mutations.iterator();
@@ -23860,9 +23902,21 @@ pub const DB = struct {
             if (old_value) |value| {
                 try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
             }
-            if (entry.value_ptr.* != deleted_sentinel) {
-                const write = store_writes.items[entry.value_ptr.*];
-                try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+            switch (entry.value_ptr.*) {
+                .deleted => {},
+                .write => |write_idx| {
+                    const write = store_writes.items[write_idx];
+                    try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+                },
+                .promotion => |promotion_idx| {
+                    const promotion = promotions[promotion_idx];
+                    const staged_value = store.get(alloc, promotion.staged_key) catch |err| switch (err) {
+                        error.NotFound => return error.InvalidGeneratedArtifactPromotion,
+                        else => return err,
+                    };
+                    defer alloc.free(staged_value);
+                    try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, promotion.final_key, staged_value, 1);
+                },
             }
         }
 
@@ -42540,8 +42594,14 @@ fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
     async_ctx.artifact_repair_issue_mutex.unlock();
 }
 
-fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
-    if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
+fn appendGeneratedBatchFromEnrichment(
+    ctx_ptr: *anyopaque,
+    batch: derived_types.DerivedBatch,
+    artifact_promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
+    artifact_delete_keys: []const []const u8,
+) !enrichment_runtime_mod.GeneratedRecordCommit {
+    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0)
+        return .{ .sequence = try appendDerivedBatchFromEnrichment(ctx_ptr, batch) };
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
@@ -42555,14 +42615,87 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     var replay_batch = batch;
     replay_batch.deleted_keys = replay_deleted_keys;
 
+    var staged_key_set = std.StringHashMapUnmanaged(void).empty;
+    defer staged_key_set.deinit(batch_ctx.alloc);
+    var final_key_set = std.StringHashMapUnmanaged(void).empty;
+    defer final_key_set.deinit(batch_ctx.alloc);
+    const promotion_capacity = std.math.cast(u32, artifact_promotions.len) orelse
+        return error.InvalidGeneratedArtifactPromotion;
+    try staged_key_set.ensureTotalCapacity(batch_ctx.alloc, promotion_capacity);
+    try final_key_set.ensureTotalCapacity(batch_ctx.alloc, promotion_capacity);
+    for (artifact_promotions) |promotion| {
+        if (promotion.staged_key.len == 0 or promotion.final_key.len == 0 or
+            std.mem.eql(u8, promotion.staged_key, promotion.final_key) or
+            containsDeleteKey(artifact_delete_keys, promotion.final_key))
+            return error.InvalidGeneratedArtifactPromotion;
+        const staged = staged_key_set.getOrPutAssumeCapacity(promotion.staged_key);
+        const final = final_key_set.getOrPutAssumeCapacity(promotion.final_key);
+        if (staged.found_existing or final.found_existing)
+            return error.InvalidGeneratedArtifactPromotion;
+    }
+    var staged_it = staged_key_set.iterator();
+    while (staged_it.next()) |entry| {
+        if (final_key_set.contains(entry.key_ptr.*))
+            return error.InvalidGeneratedArtifactPromotion;
+    }
+
+    var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer store_writes.deinit(batch_ctx.alloc);
+    const staged_delete_keys = try batch_ctx.alloc.alloc([]const u8, artifact_promotions.len);
+    defer if (staged_delete_keys.len > 0) batch_ctx.alloc.free(staged_delete_keys);
+    const store_promotions = try batch_ctx.alloc.alloc(docstore_mod.DocStore.KeyPromotion, artifact_promotions.len);
+    defer if (store_promotions.len > 0) batch_ctx.alloc.free(store_promotions);
+    for (artifact_promotions, 0..) |promotion, i| {
+        staged_delete_keys[i] = promotion.staged_key;
+        store_promotions[i] = .{
+            .source_key = promotion.staged_key,
+            .destination_key = promotion.final_key,
+        };
+    }
+    var store_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer store_delete_keys.deinit(batch_ctx.alloc);
+    try store_delete_keys.appendSlice(batch_ctx.alloc, artifact_delete_keys);
+    try store_delete_keys.appendSlice(batch_ctx.alloc, staged_delete_keys);
+    var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_keys.items) |key| batch_ctx.alloc.free(key);
+        owned_store_keys.deinit(batch_ctx.alloc);
+    }
+    var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_values.items) |value| batch_ctx.alloc.free(value);
+        owned_store_values.deinit(batch_ctx.alloc);
+    }
+    var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_delete_keys.items) |key| batch_ctx.alloc.free(key);
+        owned_delete_keys.deinit(batch_ctx.alloc);
+    }
+    try appendAssetArtifactSourceIndexMutations(
+        batch_ctx.alloc,
+        &store_writes,
+        artifact_delete_keys,
+        &store_delete_keys,
+        &owned_store_keys,
+        &owned_store_values,
+        &owned_delete_keys,
+    );
+    for (artifact_promotions) |promotion| {
+        try appendAssetArtifactSourceIndexWrite(
+            batch_ctx.alloc,
+            promotion.final_key,
+            &store_writes,
+            &owned_store_keys,
+            &owned_store_values,
+        );
+    }
+
     batch_ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
     const sequence = batch_ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, sequence);
     defer batch_ctx.alloc.free(payload);
-    var counter_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-    defer counter_writes.deinit(batch_ctx.alloc);
     var owned_counter_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (owned_counter_keys.items) |key| batch_ctx.alloc.free(key);
@@ -42573,21 +42706,48 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
-    try DB.appendDenseArtifactCounterMutations(
+    try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,
         batch_ctx.index_manager,
-        &counter_writes,
-        artifact_delete_keys,
+        &store_writes,
+        store_delete_keys.items,
+        artifact_promotions,
         &owned_counter_keys,
         &owned_counter_values,
     );
-    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, counter_writes.items, artifact_delete_keys, .{
+    const append_split_delta = shouldAppendSplitDeltaForContext(&batch_ctx);
+    var split_delta_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer split_delta_writes.deinit(batch_ctx.alloc);
+    var split_promotion_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (split_promotion_values.items) |value| batch_ctx.alloc.free(value);
+        split_promotion_values.deinit(batch_ctx.alloc);
+    }
+    if (append_split_delta) {
+        try split_delta_writes.appendSlice(batch_ctx.alloc, store_writes.items);
+        for (artifact_promotions) |promotion| {
+            const value = batch_ctx.store.get(batch_ctx.alloc, promotion.staged_key) catch |err| switch (err) {
+                error.NotFound => return error.InvalidGeneratedArtifactPromotion,
+                else => return err,
+            };
+            split_promotion_values.append(batch_ctx.alloc, value) catch |err| {
+                batch_ctx.alloc.free(value);
+                return err;
+            };
+            try split_delta_writes.append(batch_ctx.alloc, .{ .key = promotion.final_key, .value = value });
+        }
+    }
+    const promoted_artifact_bytes = batch_ctx.store.putBatchWithPromotionsAndReplay(batch_ctx.io, store_writes.items, store_delete_keys.items, store_promotions, .{
         .sequence = sequence,
         .payload = payload,
-    });
-    if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
-        try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
+    }) catch |err| switch (err) {
+        error.InvalidKeyPromotion => return error.InvalidGeneratedArtifactPromotion,
+        error.KeyPromotionBytesOverflow => return error.GeneratedArtifactPromotionBytesOverflow,
+        else => return err,
+    };
+    if (append_split_delta) {
+        try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), split_delta_writes.items, store_delete_keys.items);
     }
     var deferred_ha_gates = HADeferredCommitGates.begin(&batch_ctx);
     defer deferred_ha_gates.releaseTransition();
@@ -42603,13 +42763,13 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
-        return sequence;
+        return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
     }
 
     var applied_batch = replay_batch;
     applied_batch.sequence = sequence;
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
-    return sequence;
+    return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
 }
 
 fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
@@ -79444,6 +79604,65 @@ test "db thin replay marks artifact deletes for managed index replay" {
     try std.testing.expect(journalRecordHasHint(decoded.record, .sparse_vector));
     try std.testing.expect(journalRecordHasHint(decoded.record, .algebraic));
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+}
+
+test "db generated replay atomically promotes staged artifacts and deletes stale generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    const append_ctx = db.enrichment_append_context orelse return error.TestExpectedEnrichmentRuntime;
+
+    const stage_key = "private:pdf-stage:1";
+    const final_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:new", "visual_v1");
+    defer alloc.free(final_key);
+    const stale_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "visual_v1");
+    defer alloc.free(stale_key);
+    try db.core.store.putBatch(&.{
+        .{ .key = stage_key, .value = "new-vector" },
+        .{ .key = final_key, .value = "old-vector" },
+        .{ .key = stale_key, .value = "stale-vector" },
+    }, &.{});
+
+    _ = try appendGeneratedBatchFromEnrichment(
+        append_ctx,
+        .{},
+        &.{.{ .staged_key = stage_key, .final_key = final_key }},
+        &.{stale_key},
+    );
+    const promoted = try db.core.store.get(alloc, final_key);
+    defer alloc.free(promoted);
+    try std.testing.expectEqualStrings("new-vector", promoted);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+
+    const missing_stage = "private:pdf-stage:missing";
+    try db.core.store.putBatch(&.{
+        .{ .key = final_key, .value = "stable-vector" },
+        .{ .key = stale_key, .value = "stable-stale-vector" },
+    }, &.{});
+    try std.testing.expectError(
+        error.InvalidGeneratedArtifactPromotion,
+        appendGeneratedBatchFromEnrichment(
+            append_ctx,
+            .{},
+            &.{.{ .staged_key = missing_stage, .final_key = final_key }},
+            &.{stale_key},
+        ),
+    );
+    const stable_final = try db.core.store.get(alloc, final_key);
+    defer alloc.free(stable_final);
+    const stable_stale = try db.core.store.get(alloc, stale_key);
+    defer alloc.free(stable_stale);
+    try std.testing.expectEqualStrings("stable-vector", stable_final);
+    try std.testing.expectEqualStrings("stable-stale-vector", stable_stale);
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {

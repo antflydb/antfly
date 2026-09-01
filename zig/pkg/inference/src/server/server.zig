@@ -4756,7 +4756,7 @@ pub const Node = struct {
     ) !readers_api.BatchResult {
         if (request.images.len == 0) return .{
             .items = try allocator.alloc(readers_api.Result, 0),
-            .execution = .{ .mode = .serial, .requested_items = 0 },
+            .execution = .{},
         };
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try readers_api.validateEncodedRequest(request);
@@ -4884,15 +4884,23 @@ pub const Node = struct {
         }
         return .{
             .items = out,
-            .execution = .{
-                .mode = switch (batch.mode) {
-                    .native => .native,
-                    .serial => .serial,
-                    .fallback => .fallback,
+            .execution = switch (batch.mode) {
+                .native => .{
+                    .requested_items = image_datas.len,
+                    .native_batches = batch.native_batches,
+                    .native_items = image_datas.len,
                 },
-                .requested_items = image_datas.len,
-                .native_batches = batch.native_batches,
-                .fallback_reason = batch.fallback_reason,
+                .serial => .{
+                    .requested_items = image_datas.len,
+                    .serial_items = image_datas.len,
+                },
+                .fallback => .{
+                    .requested_items = image_datas.len,
+                    .native_batches = batch.native_batches,
+                    .serial_items = image_datas.len,
+                    .fallback_items = image_datas.len,
+                    .fallback_reason = batch.fallback_reason,
+                },
             },
         };
     }
