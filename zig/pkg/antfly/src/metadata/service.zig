@@ -1237,6 +1237,16 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     }
 }
 
+fn stripRuntimePublicationStatus(record: *metadata_table_manager.StoreRecord) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            index_status.publication_target_count = 0;
+            index_status.publication_target_ready = false;
+            index_status.serving_snapshot_ready = false;
+        }
+    }
+}
+
 fn stripRuntimeEmbeddingActivity(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
         for (runtime_status.indexes) |*index_status| {
@@ -1267,11 +1277,7 @@ fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
 }
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.native_generation_restore_version != 0 or
-        record.artifact_sources_protocol_version != 0 or
-        storeHasRuntimeRepairStatus(record) or
-        storeHasRuntimeArtifactSourceStatus(record) or
-        record.reporter_incarnation != 0 or record.status_generation != 0)
+    if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
         return metadata_runtime_status_protocol.current_record_version;
     return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
@@ -1289,6 +1295,7 @@ fn stripRuntimeStatusAboveVersion(
     supported_version: u16,
 ) void {
     if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    stripRuntimePublicationStatus(record);
     stripRuntimeRepairStatus(record);
     stripRuntimeArtifactSourceStatus(alloc, record);
     stripRuntimeReporterFence(record);
@@ -7730,6 +7737,9 @@ test "metadata service transition commands negotiate runtime status payload vers
         .kind = "dense_vector",
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
+        .publication_target_count = 17,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
         .embedding_activity_observed = true,
         .embedding_activity = .{ .epoch = 9, .embeddings_computed = 17 },
         .source_replay = source_replay[0..],
@@ -7759,6 +7769,12 @@ test "metadata service transition commands negotiate runtime status payload vers
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
     try std.testing.expect(!storeHasRuntimeArtifactSourceStatus(safe_command.register_store));
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(safe_command.register_store));
+    try std.testing.expect(!safe_command.register_store.runtime_statuses[0].indexes[0].publication_target_ready);
+    try std.testing.expect(!safe_command.register_store.runtime_statuses[0].indexes[0].serving_snapshot_ready);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        safe_command.register_store.runtime_statuses[0].indexes[0].publication_target_count,
+    );
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
     try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.artifact_sources_protocol_version);
     try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.native_generation_restore_version);
@@ -7802,6 +7818,8 @@ test "metadata service transition commands negotiate runtime status payload vers
     );
     try std.testing.expect(storeHasRuntimeRepairStatus(repair_command.upsert_store));
     try std.testing.expect(storeHasRuntimeArtifactSourceStatus(repair_command.upsert_store));
+    try std.testing.expect(repair_command.upsert_store.runtime_statuses[0].indexes[0].publication_target_ready);
+    try std.testing.expect(repair_command.upsert_store.runtime_statuses[0].indexes[0].serving_snapshot_ready);
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(repair_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), repair_command.upsert_store.reporter_incarnation);
 

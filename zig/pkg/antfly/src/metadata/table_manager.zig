@@ -970,6 +970,11 @@ pub const RuntimeIndexStatusReport = struct {
     /// Missing proof is deliberately false so current readers fail closed.
     publication_target_count: u64 = 0,
     publication_target_ready: bool = false,
+    /// Exact owner-side proof that the current incarnation has an installed
+    /// snapshot which passes the same resident admission gate as search. This
+    /// is independent of cardinality: a published empty snapshot is ready.
+    /// Missing proof fails closed on mixed-version readers.
+    serving_snapshot_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -993,6 +998,32 @@ pub const RuntimeIndexStatusReport = struct {
     /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
 };
+
+/// V15 is one atomic runtime-status profile. Keep profile selection next to the
+/// domain record so transport negotiation and durable encoding cannot evolve
+/// separate lists of current-only facts.
+pub fn runtimeIndexRequiresCurrentProfile(record: RuntimeIndexStatusReport) bool {
+    return record.publication_target_ready or
+        record.serving_snapshot_ready or
+        record.repair_status != null or
+        record.source_replay.len != 0;
+}
+
+pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
+    if (record.native_generation_restore_version != 0 or
+        record.artifact_sources_protocol_version != 0 or
+        record.reporter_incarnation != 0 or
+        record.status_generation != 0)
+    {
+        return true;
+    }
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (runtimeIndexRequiresCurrentProfile(index_status)) return true;
+        }
+    }
+    return false;
+}
 
 pub const RuntimeIndexSourceReplayStatusReport = struct {
     artifact_name: []const u8 = "",
@@ -2441,6 +2472,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .root_node = record.root_node,
         .publication_target_count = record.publication_target_count,
         .publication_target_ready = record.publication_target_ready,
+        .serving_snapshot_ready = record.serving_snapshot_ready,
         .coverage_produced_count = record.coverage_produced_count,
         .coverage_skipped_count = record.coverage_skipped_count,
         .coverage_terminal_failed_count = record.coverage_terminal_failed_count,

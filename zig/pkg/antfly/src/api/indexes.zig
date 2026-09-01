@@ -2121,6 +2121,10 @@ const AggregatedIndexStatus = struct {
     publication_target_count: u64 = 0,
     publication_target_ready: bool = false,
     publication_target_observation_count: u64 = 0,
+    // AND-reduced, exact-incarnation query-admission proof. Count is separate
+    // so a missing V15 observation cannot become the boolean identity value.
+    serving_snapshot_ready: bool = false,
+    serving_snapshot_observation_count: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -2480,6 +2484,13 @@ fn aggregateIndexStatusIndexed(
         // transiently stale in-place observation so sibling index DDL cannot
         // revoke a generation that the query gate still serves.
         if (coverageIdentityMatches(item, coverage_generation, coverage_config_hash)) {
+            if (item.kind == .dense_vector or item.kind == .sparse_vector) {
+                aggregate.serving_snapshot_ready = if (aggregate.serving_snapshot_observation_count == 0)
+                    item.serving_snapshot_ready
+                else
+                    aggregate.serving_snapshot_ready and item.serving_snapshot_ready;
+                aggregate.serving_snapshot_observation_count +|= 1;
+            }
             if (publicIndexRepairState(item)) |state| {
                 aggregate.repair_active_generation_serviceable = if (aggregate.repair_observation_count == 0)
                     item.index_repair_active_generation_serviceable
@@ -2644,6 +2655,11 @@ fn aggregateIndexStatusIndexed(
             aggregate.expected_group_count != aggregate.fresh_group_count))
     {
         aggregate.publication_target_ready = false;
+    }
+    if ((aggregate.kind == .dense_vector or aggregate.kind == .sparse_vector) and
+        aggregate.serving_snapshot_observation_count != aggregate.expected_group_count)
+    {
+        aggregate.serving_snapshot_ready = false;
     }
     if (aggregate.expected_group_count != aggregate.fresh_group_count) {
         aggregate.enrichment.projection_checkpoint_identity_consistent = false;
@@ -3123,6 +3139,7 @@ test "dense publication target requires every expected shard observation" {
         .doc_count = 5,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .publication_target_count = 5,
         .publication_target_ready = true,
         .coverage_generation = 42,
@@ -3408,7 +3425,7 @@ test "runnable repair owns its load error without becoming a terminal aggregate 
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"milestones\":{\"queryable\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]},\"complete\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]}},\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"repair\",\"backfill\"]}}",
+        "{\"milestones\":{\"queryable\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]},\"complete\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]}},\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"repair\",\"backfill\",\"publication\"]}}",
         encoded.items,
     );
 }
@@ -3490,6 +3507,7 @@ test "complete partial embeddings coverage is ready after active generation proo
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_skipped_count = 1,
         .coverage_generation = 42,
@@ -3558,6 +3576,7 @@ test "actionable repair remains visible while retained generation stays queryabl
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .publication_target_count = 1,
         .publication_target_ready = true,
         .coverage_generation = 42,
@@ -3640,6 +3659,7 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         // Publication remains independently useful when a crash loses the
         // source-outcome ledger before it records this published member.
         .coverage_produced_count = 0,
@@ -3690,8 +3710,8 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     );
 }
 
-test "serviceable empty embeddings generation remains pending until first published member" {
-    const item = db_mod.types.DBIndexStats{
+test "empty embeddings readiness distinguishes gated installation from a published snapshot" {
+    var item = db_mod.types.DBIndexStats{
         .name = "semantic_idx",
         .kind = .dense_vector,
         .coverage_generation = 42,
@@ -3737,6 +3757,36 @@ test "serviceable empty embeddings generation remains pending until first publis
         "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":0,\"complete\":false}}",
         encoded.items,
     );
+
+    encoded.clearRetainingCapacity();
+    item.serving_snapshot_ready = true;
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        2,
+        .strict,
+        false,
+        42,
+        99,
+        .{},
+        .{
+            .enabled = true,
+            .target_sequence = 11,
+            .applied_sequence = 7,
+        },
+        null,
+        null,
+        .{},
+        .{ .source = .live_writer_publish, .freshness = .fresh },
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"searchable_vectors\":0,\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\"}}",
+        encoded.items,
+    );
 }
 
 test "published embeddings snapshot remains queryable while completion checkpoint rebuilds" {
@@ -3749,6 +3799,7 @@ test "published embeddings snapshot remains queryable while completion checkpoin
         .doc_count = 440,
         .node_count = 10,
         .root_node = 8,
+        .serving_snapshot_ready = true,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
@@ -3797,6 +3848,7 @@ test "stale in-place status preserves an incarnation-scoped serviceability proof
         .doc_count = 2,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
@@ -3860,6 +3912,7 @@ test "identity-proven embeddings stay current during sibling startup catch-up" {
         .name = "semantic_idx",
         .kind = .dense_vector,
         .runtime_observation_serviceable = true,
+        .serving_snapshot_ready = true,
         .doc_count = 2,
         .node_count = 1,
         .publication_target_count = 2,
@@ -4145,6 +4198,7 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -4219,6 +4273,7 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -4238,6 +4293,7 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -4334,6 +4390,7 @@ test "serviceable repair cannot mask sibling shard serving failures" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -4888,6 +4945,7 @@ test "chunked dense completion follows the physical publication target" {
         .root_node = 1,
         .publication_target_count = 2500,
         .publication_target_ready = true,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 500,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -5438,7 +5496,12 @@ fn appendSingleIndexRuntimeStatus(
         const coverage_complete = coverage.complete;
         const source_coverage_complete = source_coverage.complete;
         source_coverage_complete_for_readiness = embeddings_coverage_policy == .external or source_coverage_complete;
-        const publication_complete = embeddings_materialization_current and
+        // Publication is not complete until the exact resident generation is
+        // admitted by search. Cardinality/target equality alone cannot prove
+        // this for an empty index or while startup is still fencing access.
+        const serving_snapshot_ready = embeddings_materialization_current and
+            (if (@hasField(@TypeOf(item), "serving_snapshot_ready")) item.serving_snapshot_ready else false);
+        const publication_complete = serving_snapshot_ready and
             embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count);
         artifact_publish_pending = !publication_complete;
         const embedding_activity = if (embeddings_materialization_current and @hasField(@TypeOf(item), "embedding_activity"))
@@ -5765,8 +5828,14 @@ fn appendIndexReadinessStatus(
     const serving_failed = aggregate_query_blocked or
         ((terminal_load_failure or terminal_enrichment_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable));
+    // Search admission owns this proof. It is deliberately independent of
+    // cardinality: zero is a valid published result set, while a newly installed
+    // but still gated empty generation remains false.
+    const serving_snapshot_ready = index_type == .embeddings and
+        (if (@hasField(Item, "serving_snapshot_ready")) item.serving_snapshot_ready else false);
     const publication_pending = index_type == .embeddings and incarnation_current and
-        (replay_target_sequence > replay_applied_sequence or artifact_publish_pending);
+        (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or
+            !serving_snapshot_ready);
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
     const sources_complete = if (@hasField(Item, "source_replay")) blk: {
@@ -5779,30 +5848,16 @@ fn appendIndexReadinessStatus(
     const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or !sources_complete or
         backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
-    const published_member_visible = index_type == .embeddings and
-        (if (@hasField(Item, "doc_count")) item.doc_count > 0 else false);
-    // Publication and source coverage answer different questions. The dense
-    // adapter's doc_count is its atomically published search snapshot, while
-    // durable source outcomes prove whether generation work is complete. A
-    // crash may preserve the former while losing the latter, so coverage=0
-    // must not hide a safely published partial generation. Incarnation,
-    // topology, and repair serviceability fences below prevent an interrupted
-    // or stale generation from being admitted.
-    const published_generation_has_results = published_member_visible;
     const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
         if (@hasField(Item, "repair_observation_count") and @hasField(Item, "expected_group_count"))
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
         else
             true;
-    // A repair lifecycle's serviceability bit proves that an existing active
-    // generation may remain mounted; it does not prove that the generation
-    // contains any published result. Dense indexes therefore need both the
-    // current-generation publication evidence above and a valid serving
-    // lifecycle. This keeps an already-published partial generation online,
-    // while a crash before the first checkpoint remains honestly pending.
+    // The exact resident gate already incorporates repair admission, physical
+    // installation, and load quarantine. Do not independently reconstruct it
+    // from repair lifecycle or result count here.
     const partial_generation_serviceable = if (index_type == .embeddings)
-        published_generation_has_results and
-            (repair_state == null or active_generation_serviceable)
+        serving_snapshot_ready
     else
         active_generation_serviceable;
     const queryable_partial = !serving_failed and (pending or failed) and
@@ -6584,7 +6639,7 @@ test "index encoders expose metadata-backed configs" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}",
+            .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"external\":true}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -6604,7 +6659,7 @@ test "index encoders expose metadata-backed configs" {
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"name\":\"embed_idx\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"type\":\"embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"status\":{\"index_type\":\"embeddings\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"runtime_present\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"pending_reasons\":[\"runtime_unavailable\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "\"shard_status\":{}") != null);
 }
 
@@ -7730,7 +7785,7 @@ test "index status keeps generic catch-up lag pending when replay sequence is eq
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_target_sequence\":100") != null);
 }
 
-test "index encoders aggregate preserved synthetic shard counters" {
+test "index encoders fence preserved synthetic shard counters" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -7780,12 +7835,12 @@ test "index encoders aggregate preserved synthetic shard counters" {
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "dense_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":{\"rebuilding\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_indexed\":1000000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_visible_doc_count\":1000000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"published_node_count\":8837") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"runtime_present\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator, "{\"status\":{\"rebuilding\":true}}", encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":{\"total_indexed\":0,\"query_visible_doc_count\":0,\"published_node_count\":0,\"runtime_present\":true},\"shard_status\":{\"7\":{\"total_indexed\":0}}}",
+        encoded,
+    );
 }
 
 test "single embeddings index encoder fences stale runtime materialization" {
@@ -7927,6 +7982,7 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .serving_snapshot_ready = true,
         .backfill_active = true,
         .backfill_progress = 0.2,
         .coverage_produced_count = 1,
@@ -7995,6 +8051,7 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         \\{
+        \\  "status": {
         \\  "backfill_active": true,
         \\  "backfill_progress": 1.0,
         \\  "backfill_state": "retrying",
@@ -8032,6 +8089,7 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         \\    "retryable_error_count": 2,
         \\    "retrying": true
         \\  }
+        \\  }
         \\}
     ,
         encoded,
@@ -8051,6 +8109,7 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .serving_snapshot_ready = true,
         .coverage_produced_count = 1,
         .coverage_generation = 42,
         .coverage_config_hash = config_hash,
@@ -8102,6 +8161,7 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         \\{
+        \\  "status": {
         \\  "backfill_active": true,
         \\  "backfill_progress": 0.2,
         \\  "backfill_state": "retrying",
@@ -8113,6 +8173,7 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
         \\    "applied_sequence": 1,
         \\    "pending_sequence_count": 4,
         \\    "retryable_error_count": 2
+        \\  }
         \\  }
         \\}
     ,
@@ -8656,6 +8717,7 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
         .root_node = 1,
         .publication_target_count = 217_500,
         .publication_target_ready = true,
+        .serving_snapshot_ready = true,
         .coverage_generation = identity.incarnation,
         .coverage_config_hash = identity.config_hash,
         .coverage_identity_ready = true,
@@ -8934,6 +8996,10 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
 }
 
 test "managed embeddings readiness prefers replay completion once docs are indexed" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"}}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "semantic_idx", parsed_config.value)).?;
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -8941,6 +9007,12 @@ test "managed embeddings readiness prefers replay completion once docs are index
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .publication_target_count = 1,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 2,
         .replay_target_sequence = 2,
         .replay_catch_up_required = false,
@@ -8953,6 +9025,7 @@ test "managed embeddings readiness prefers replay completion once docs are index
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .background_refresh, .freshness = .fresh },
         .stats = .{
             .doc_count = 2,
             .index_count = 1,
@@ -8970,7 +9043,7 @@ test "managed embeddings readiness prefers replay completion once docs are index
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -8989,6 +9062,10 @@ test "managed embeddings readiness prefers replay completion once docs are index
 }
 
 test "managed embeddings readiness does not require table doc count once replay is complete" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"}}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "semantic_idx", parsed_config.value)).?;
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -8996,6 +9073,12 @@ test "managed embeddings readiness does not require table doc count once replay 
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .publication_target_count = 1,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 2,
         .replay_target_sequence = 2,
         .replay_catch_up_required = false,
@@ -9008,6 +9091,7 @@ test "managed embeddings readiness does not require table doc count once replay 
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .background_refresh, .freshness = .fresh },
         .stats = .{
             .doc_count = 0,
             .index_count = 1,
@@ -9024,7 +9108,7 @@ test "managed embeddings readiness does not require table doc count once replay 
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -9043,6 +9127,10 @@ test "managed embeddings readiness does not require table doc count once replay 
 }
 
 test "embeddings index replay completion without artifact visibility is not ready" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":512,\"external\":true}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "vec", parsed_config.value)).?;
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -9051,6 +9139,10 @@ test "embeddings index replay completion without artifact visibility is not read
         .doc_count = 0,
         .node_count = 0,
         .root_node = 0,
+        .publication_target_ready = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 4000,
         .replay_target_sequence = 4000,
         .replay_catch_up_required = false,
@@ -9080,7 +9172,7 @@ test "embeddings index replay completion without artifact visibility is not read
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":512,\"external\":true}}",
+            .indexes_json = "{\"vec\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -9092,13 +9184,11 @@ test "embeddings index replay completion without artifact visibility is not read
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "vec", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"running\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":4000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":4000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"publication\":{\"target_vectors\":0,\"searchable_vectors\":0,\"complete\":false},\"dense_publish_pending\":true,\"replay_applied_sequence\":4000,\"replay_target_sequence\":4000,\"replay_catch_up_required\":false,\"milestones\":{\"queryable\":{\"reached\":false,\"blockers\":[\"publication\"]}}}}",
+        encoded,
+    );
 }
 
 test "empty embeddings index status is ready without dense artifact visibility" {
@@ -9117,6 +9207,7 @@ test "empty embeddings index status is ready without dense artifact visibility" 
         .root_node = 0,
         .publication_target_count = 0,
         .publication_target_ready = true,
+        .serving_snapshot_ready = true,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 1,
         .replay_catch_up_required = false,

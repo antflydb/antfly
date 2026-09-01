@@ -3984,6 +3984,7 @@ pub const ApiHttpServer = struct {
                 .root_node = index.root_node,
                 .publication_target_count = index.publication_target_count,
                 .publication_target_ready = index.publication_target_ready,
+                .serving_snapshot_ready = index.serving_snapshot_ready,
                 .coverage_produced_count = index.coverage_produced_count,
                 .coverage_skipped_count = index.coverage_skipped_count,
                 .coverage_terminal_failed_count = index.coverage_terminal_failed_count,

@@ -1153,13 +1153,13 @@ fn preserveArtifactVisibilityOnReplayRegression(
             previous_observation_serviceable and
             !cached.runtime_observation_stale and
             cached.coverage_summary_ready and
-            indexHasPublishedGenerationVisibility(cached, previous.stats.source_doc_count);
+            indexHasPublishedGenerationVisibility(cached);
         const serviceable_continuity = serviceable_catch_up_continuity or targeted_sibling_continuity;
         dst.runtime_observation_serviceable = serviceable_continuity;
         dst.runtime_observation_targeted_sibling = targeted_sibling_continuity;
         const visibility_regressed_without_newer_replay = serviceable_continuity and
             target_not_older and
-            !indexHasPublishedGenerationVisibility(dst.*, incoming.stats.source_doc_count) and
+            !indexHasPublishedGenerationVisibility(dst.*) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
         if (!targeted_sibling_continuity and !applied_regressed and !projection_regressed and !visibility_regressed_without_newer_replay) continue;
 
@@ -1290,14 +1290,10 @@ fn indexHasPublishedArtifactVisibility(index: db_mod.types.DBIndexStats) bool {
         index.root_node > 0;
 }
 
-fn indexHasPublishedGenerationVisibility(index: db_mod.types.DBIndexStats, source_doc_count: u64) bool {
-    if (indexHasPublishedArtifactVisibility(index)) return true;
-    if (index.kind != .dense_vector and index.kind != .sparse_vector) return false;
-    if (!index.coverage_identity_ready or !index.coverage_summary_ready) return false;
-    const settled = index.coverage_produced_count +|
-        index.coverage_skipped_count +|
-        index.coverage_terminal_failed_count;
-    return settled >= source_doc_count;
+fn indexHasPublishedGenerationVisibility(index: db_mod.types.DBIndexStats) bool {
+    if (index.kind == .dense_vector or index.kind == .sparse_vector)
+        return index.serving_snapshot_ready;
+    return indexHasPublishedArtifactVisibility(index);
 }
 
 fn findIndexStatusByName(
@@ -1320,7 +1316,7 @@ fn targetObservationHandsOffAuthority(
     if (item.kind == .dense_vector or item.kind == .sparse_vector) {
         return item.coverage_identity_ready and
             item.coverage_summary_ready and
-            indexHasPublishedGenerationVisibility(item, status.stats.source_doc_count);
+            indexHasPublishedGenerationVisibility(item);
     }
     return indexHasPublishedArtifactVisibility(item);
 }
@@ -1333,6 +1329,7 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.root_node = cached.root_node;
     dst.publication_target_count = cached.publication_target_count;
     dst.publication_target_ready = cached.publication_target_ready;
+    dst.serving_snapshot_ready = cached.serving_snapshot_ready;
     dst.text_merge = cached.text_merge;
     dst.hbc_cache = cached.hbc_cache;
     dst.hbc_posting = cached.hbc_posting;
@@ -1801,6 +1798,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .root_node = item.root_node,
             .publication_target_count = item.publication_target_count,
             .publication_target_ready = item.publication_target_ready,
+            .serving_snapshot_ready = item.serving_snapshot_ready,
             .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,

@@ -25544,6 +25544,21 @@ pub const DB = struct {
         };
     }
 
+    /// Project the exact O(1) predicate used by query admission. Presence alone
+    /// is insufficient because managed admission installs a gated empty dense
+    /// generation before its first safe snapshot; cardinality is insufficient
+    /// because a published empty snapshot is valid and searchable.
+    fn vectorServingSnapshotReady(self: *DB, kind: types.IndexKind, index_name: []const u8) bool {
+        const installed = switch (kind) {
+            .dense_vector => self.core.denseIndex(index_name) != null,
+            .sparse_vector => self.core.sparseIndex(index_name) != null,
+            else => false,
+        };
+        return installed and
+            self.core.index_manager.loadFailure(index_name) == null and
+            !self.core.index_manager.repairUnavailable(index_name);
+    }
+
     fn applyDurableIndexRepairStats(
         self: *DB,
         alloc: Allocator,
@@ -26874,6 +26889,9 @@ pub const DB = struct {
                 },
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
             }
+            if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(cfg.kind, cfg.name);
+            }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
             index_count += 1;
@@ -27077,6 +27095,9 @@ pub const DB = struct {
                     }
                 },
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, true),
+            }
+            if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(cfg.kind, cfg.name);
             }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
@@ -79388,6 +79409,7 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
         try std.testing.expectEqual(types.IndexRepairStatus.failed, index_stats.index_repair_status.?);
         try std.testing.expect(index_stats.index_repair_action_required);
         try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+        try std.testing.expect(index_stats.serving_snapshot_ready);
     }
     try std.testing.expect(observed_terminal_repair);
     try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
@@ -82142,6 +82164,15 @@ test "db dense artifact surplus uses quarantined generation replacement" {
         @as(u64, 2),
         db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
+    const blocked_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, blocked_stats);
+    var observed_blocked_snapshot = false;
+    for (blocked_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dense_idx")) continue;
+        observed_blocked_snapshot = true;
+        try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    try std.testing.expect(observed_blocked_snapshot);
     try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
         .index_name = "dense_idx",
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },

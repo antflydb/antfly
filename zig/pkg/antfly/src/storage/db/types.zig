@@ -3067,6 +3067,9 @@ pub const DBIndexStats = struct {
     // where one source document can publish multiple searchable vectors.
     publication_target_count: u64 = 0,
     publication_target_ready: bool = false,
+    // Authoritative O(1) projection of the resident search-admission gate for
+    // this exact dense incarnation. Zero members is still a valid snapshot.
+    serving_snapshot_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,

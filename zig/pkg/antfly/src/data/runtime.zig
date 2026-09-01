@@ -17948,6 +17948,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .root_node = index.root_node,
         .publication_target_count = index.publication_target_count,
         .publication_target_ready = index.publication_target_ready,
+        .serving_snapshot_ready = index.serving_snapshot_ready,
         .coverage_produced_count = index.coverage_produced_count,
         .coverage_skipped_count = index.coverage_skipped_count,
         .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
@@ -17992,6 +17993,7 @@ test "data runtime report preserves compact managed repair admission state" {
         .kind = .dense_vector,
         .publication_target_count = 2500,
         .publication_target_ready = true,
+        .serving_snapshot_ready = true,
         .embedding_activity_observed = true,
         .embedding_activity_sample_fresh = true,
         .embedding_activity = .{
@@ -18013,12 +18015,13 @@ test "data runtime report preserves compact managed repair admission state" {
     try std.testing.expect(!report.repair_active_generation_serviceable);
     try std.testing.expect(report.publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), report.publication_target_count);
+    try std.testing.expect(report.serving_snapshot_ready);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"serving_snapshot_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }

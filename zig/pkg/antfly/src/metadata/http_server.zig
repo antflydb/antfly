@@ -2689,6 +2689,7 @@ const ParsedRuntimeIndexStatus = struct {
     root_node: ?u64 = null,
     publication_target_count: ?u64 = null,
     publication_target_ready: ?bool = null,
+    serving_snapshot_ready: ?bool = null,
     coverage_produced_count: ?u64 = null,
     coverage_skipped_count: ?u64 = null,
     coverage_terminal_failed_count: ?u64 = null,
@@ -3111,6 +3112,7 @@ fn cloneParsedRuntimeIndexStatus(
         .root_node = parsed.root_node orelse 0,
         .publication_target_count = parsed.publication_target_count orelse 0,
         .publication_target_ready = parsed.publication_target_ready orelse false,
+        .serving_snapshot_ready = parsed.serving_snapshot_ready orelse false,
         .coverage_produced_count = parsed.coverage_produced_count orelse 0,
         .coverage_skipped_count = parsed.coverage_skipped_count orelse 0,
         .coverage_terminal_failed_count = parsed.coverage_terminal_failed_count orelse 0,
@@ -3144,7 +3146,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -3155,6 +3157,7 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
     try std.testing.expect(indexes[0].publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
+    try std.testing.expect(indexes[0].serving_snapshot_ready);
     try std.testing.expect(indexes[0].embedding_activity_observed);
     try std.testing.expectEqual(@as(u64, 7), indexes[0].embedding_activity.epoch);
     try std.testing.expectEqual(@as(u64, 2), indexes[0].embedding_activity.sample_sequence);
