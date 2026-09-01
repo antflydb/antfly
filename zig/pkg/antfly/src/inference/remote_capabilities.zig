@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: ELv2
 
 //! Capability discovery for a remote Antfly inference service. The public
-//! model catalog is the source of truth for resolved model modalities and
-//! manifest capability flags; transport/resource ceilings are the stable
-//! Antfly HTTP contract and remain conservative when a backend does not
-//! advertise native batching.
+//! model catalog is the source of truth for resolved model modalities,
+//! execution behavior, and live transport/resource ceilings. Legacy catalogs
+//! fail closed instead of making limits up in the client.
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
@@ -32,6 +31,28 @@ const CachedCapability = struct {
     expires_at_ns: u64,
     stale_until_ns: u64,
 };
+
+const FailedDiscoveryCompletion = struct {
+    value: ?work.InferenceCapabilities = null,
+    err: ?anyerror = null,
+};
+
+fn classifyFailedDiscovery(
+    stale: ?CachedCapability,
+    now_ns: u64,
+    owner_context_error: ?anyerror,
+    discovery_error: anyerror,
+) FailedDiscoveryCompletion {
+    // Request cancellation/expiry is control flow owned by the discovering
+    // caller. It must retire the flight even when a valid stale entry exists,
+    // allowing independent waiters to retry with their own contexts.
+    if (owner_context_error != null)
+        return .{ .err = error.CapabilityDiscoveryOwnerAbandoned };
+    if (stale) |entry| {
+        if (now_ns < entry.stale_until_ns) return .{ .value = entry.value };
+    }
+    return .{ .err = discovery_error };
+}
 
 const CapabilityFlight = struct {
     key: []u8,
@@ -206,18 +227,14 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
-                const stale = self.entries.get(key);
-                if (stale != null and monotonicNowNs(self.io) < stale.?.stale_until_ns) {
-                    flight.value = stale.?.value;
-                } else {
-                    // The transport is canceled by its owning caller. Do
-                    // not poison unrelated waiters; one of them retries as
-                    // the next owner under its own context.
-                    flight.err = if (owner_context_error != null)
-                        error.CapabilityDiscoveryOwnerAbandoned
-                    else
-                        err;
-                }
+                const completion = classifyFailedDiscovery(
+                    self.entries.get(key),
+                    monotonicNowNs(self.io),
+                    owner_context_error,
+                    err,
+                );
+                flight.value = completion.value;
+                flight.err = completion.err;
                 flight.done = true;
                 flight.ready.set(self.io);
                 const value = flight.value;
@@ -363,14 +380,47 @@ fn hasString(items: std.json.Array, expected: []const u8) bool {
     return false;
 }
 
-fn nativeBatchFor(task: work.Task, capabilities: ?std.json.Array) bool {
-    if (task == .embed) return true;
-    const values = capabilities orelse return false;
-    return hasString(values, switch (task) {
-        .read => "native_batch_read",
-        .generate => "native_batch_generate_multimodal",
-        .embed => unreachable,
-    });
+fn jsonCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !usize {
+    const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
+    if (value != .integer or value.integer < 0) return error.InvalidInferenceCapabilities;
+    return std.math.cast(usize, value.integer) orelse error.InvalidInferenceCapabilities;
+}
+
+fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities {
+    if (value != .object) return error.InvalidInferenceCapabilities;
+    const mode_value = value.object.get("mode") orelse return error.InvalidInferenceCapabilities;
+    if (mode_value != .string) return error.InvalidInferenceCapabilities;
+    const mode: work.BatchMode = if (std.mem.eql(u8, mode_value.string, "native"))
+        .native
+    else if (std.mem.eql(u8, mode_value.string, "serial_compatibility"))
+        .serial_compatibility
+    else if (std.mem.eql(u8, mode_value.string, "none"))
+        .none
+    else
+        return error.InvalidInferenceCapabilities;
+    const per_item_value = value.object.get("per_item_failures") orelse return error.InvalidInferenceCapabilities;
+    if (per_item_value != .bool) return error.InvalidInferenceCapabilities;
+    return .{
+        .mode = mode,
+        .preferred_items = try jsonCapabilityUsize(value.object, "preferred_items"),
+        .max_items = try jsonCapabilityUsize(value.object, "max_items"),
+        .max_encoded_bytes = try jsonCapabilityUsize(value.object, "max_encoded_bytes"),
+        .max_decoded_pixels = try jsonCapabilityUsize(value.object, "max_decoded_pixels"),
+        .max_media_parts_per_item = try jsonCapabilityUsize(value.object, "max_media_parts_per_item"),
+        .per_item_failures = per_item_value.bool,
+    };
+}
+
+fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?work.BatchCapabilities {
+    const value = info.get("inference_capabilities") orelse return null;
+    if (value != .object) return error.InvalidInferenceCapabilities;
+    const task_value = value.object.get("task") orelse return error.InvalidInferenceCapabilities;
+    if (task_value != .string or !std.mem.eql(u8, task_value.string, @tagName(task)))
+        return error.InvalidInferenceCapabilities;
+    const batch_value = value.object.get("batch") orelse return error.InvalidInferenceCapabilities;
+    const batch = try parseResolvedBatchCapabilities(batch_value);
+    try batch.validate();
+    return batch;
 }
 
 pub fn parseModelCapabilities(
@@ -401,10 +451,7 @@ pub fn parseModelCapabilities(
         if (values != .array) return error.InvalidInferenceCapabilities;
         break :blk values.array;
     } else null;
-    const max_items: usize = switch (task) {
-        .read, .embed => 64,
-        .generate => 128,
-    };
+    const resolved_batch = try parseResolvedCapabilities(info.object, task);
     var result = work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
@@ -423,25 +470,28 @@ pub fn parseModelCapabilities(
             .page
         else
             .chunk,
-        .batch = .{
-            .mode = if (nativeBatchFor(task, capability_values)) .native else .serial_compatibility,
-            .preferred_items = @min(@as(usize, 8), max_items),
-            .max_items = max_items,
-            .max_encoded_bytes = 64 * 1024 * 1024,
-            .max_decoded_pixels = 50_000_000,
-            .max_media_parts_per_item = if (task == .generate) 8 else 1,
-            .per_item_failures = task == .generate,
+        // Older catalogs cannot prove live executor or request-limit facts.
+        // Preserve compatibility safely as a singleton until the server
+        // publishes the resolved descriptor below.
+        .batch = resolved_batch orelse .{
+            .mode = .none,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_bytes = 0,
+            .max_decoded_pixels = 0,
+            .max_media_parts_per_item = if (modalities.image or modalities.audio) 1 else 0,
+            .per_item_failures = false,
         },
         .output = outputForTask(task),
         .result_cardinality = .one_per_item,
         .prompt_policy = .explicit,
         .borrowed_attachments = false,
     };
-    if (capability_values) |values| {
+    if (resolved_batch == null) if (capability_values) |values| {
         for (values.items) |value| {
             if (value == .string) try result.batch.applyManifestCapability(value.string);
         }
-    }
+    };
     result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);
     try result.validate();
     return result;
@@ -502,7 +552,7 @@ fn discoverWithContext(
 
 test "remote Antfly capabilities resolve model modalities and batch mode" {
     const payload =
-        \\{"readers":{"florence":{"inputs":["text","image"],"capabilities":["native_batch_read","inference.batch.max_items=12"]}},"embedders":{"clipclap":{"inputs":["text","image","audio"]}}}
+        \\{"readers":{"florence":{"inputs":["text","image"],"inference_capabilities":{"task":"read","batch":{"mode":"native","preferred_items":8,"max_items":12,"max_encoded_bytes":33554432,"max_decoded_pixels":0,"max_media_parts_per_item":1,"per_item_failures":false}}}},"embedders":{"clipclap":{"inputs":["text","image","audio"],"inference_capabilities":{"task":"embed","batch":{"mode":"native","preferred_items":8,"max_items":64,"max_encoded_bytes":33554432,"max_decoded_pixels":0,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
     ;
     const reader = (try parseModelCapabilities(std.testing.allocator, payload, "florence", .read)).?;
     try std.testing.expect(reader.supports(.{ .image = true }));
@@ -512,6 +562,15 @@ test "remote Antfly capabilities resolve model modalities and batch mode" {
     try std.testing.expect(embedder.supports(.{ .image = true, .audio = true }));
     try std.testing.expectEqual(work.BatchMode.native, embedder.batch.mode);
     try std.testing.expect((try parseModelCapabilities(std.testing.allocator, payload, "missing", .embed)) == null);
+}
+
+test "remote Antfly capabilities fail closed for legacy execution claims" {
+    const payload =
+        \\{"generators":{"gemma4":{"inputs":["text","image"],"capabilities":["native_batch_generate_multimodal"]}}}
+    ;
+    const generator = (try parseModelCapabilities(std.testing.allocator, payload, "gemma4", .generate)).?;
+    try std.testing.expectEqual(work.BatchMode.none, generator.batch.mode);
+    try std.testing.expectEqual(@as(usize, 1), generator.batch.max_items);
 }
 
 test "remote Antfly model catalog URL normalizes service and operation URLs" {
@@ -553,4 +612,20 @@ test "remote Antfly completed capability flight remains tracked until all waiter
 
     cache.releaseFlightLocked(flight);
     try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+}
+
+test "canceled capability owner cannot publish stale success to waiters" {
+    const stale = CachedCapability{
+        .value = null,
+        .expires_at_ns = 0,
+        .stale_until_ns = 10_000,
+    };
+    const completion = classifyFailedDiscovery(
+        stale,
+        1,
+        error.Canceled,
+        error.RemoteCapabilityDiscoveryFailed,
+    );
+    try std.testing.expect(completion.value == null);
+    try std.testing.expectEqual(error.CapabilityDiscoveryOwnerAbandoned, completion.err.?);
 }

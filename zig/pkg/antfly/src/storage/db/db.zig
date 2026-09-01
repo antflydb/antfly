@@ -42599,8 +42599,9 @@ fn appendGeneratedBatchFromEnrichment(
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
+    fence: ?enrichment_runtime_mod.GeneratedWriteFence,
 ) !enrichment_runtime_mod.GeneratedRecordCommit {
-    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0)
+    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and fence == null)
         return .{ .sequence = try appendDerivedBatchFromEnrichment(ctx_ptr, batch) };
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
@@ -42740,7 +42741,10 @@ fn appendGeneratedBatchFromEnrichment(
                 const reservation_bytes = std.math.cast(u64, encoded_size) orelse
                     return error.ResourceLimitExceeded;
                 if (self.reservation.* == null) {
-                    self.reservation.* = manager.reserve(
+                    // This callback runs under the storage/apply transaction.
+                    // Reclaimers can acquire unrelated subsystem locks, so use
+                    // the explicitly non-reclaiming admission primitive here.
+                    self.reservation.* = manager.reserveWithoutReclaim(
                         .shard_transition_working_set,
                         reservation_bytes,
                     ) catch return error.ResourceLimitExceeded;
@@ -42762,12 +42766,38 @@ fn appendGeneratedBatchFromEnrichment(
             };
         }
     };
+    const LeaseFenceGuard = struct {
+        fence: enrichment_runtime_mod.GeneratedWriteFence,
+
+        fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const raw = txn.get(self.fence.lease_key) catch |err| switch (err) {
+                error.NotFound => return error.EnrichmentLeaseFenceLost,
+                else => return err,
+            };
+            var parsed = std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{ .allocate = .alloc_always }) catch
+                return error.EnrichmentLeaseFenceLost;
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.owner_id, self.fence.owner_id) or
+                parsed.value.epoch != self.fence.epoch or
+                parsed.value.expires_at_ms <= platform_clock.Clock.real().nowRealtimeMs())
+            {
+                return error.EnrichmentLeaseFenceLost;
+            }
+        }
+    };
     var split_delta_key_buf: [19]u8 = undefined;
+    const append_split_delta = shouldAppendSplitDeltaForContext(&batch_ctx);
     var split_delta_reservation: ?resource_manager_mod.Reservation = null;
     defer if (split_delta_reservation) |*reservation| reservation.release();
     var split_delta_builder: SplitDeltaBuilder = undefined;
+    var lease_fence_guard: LeaseFenceGuard = undefined;
+    const transactional_guard: ?docstore_mod.DocStore.TransactionalGuard = if (fence) |active_fence| blk: {
+        lease_fence_guard = .{ .fence = active_fence };
+        break :blk .{ .ptr = &lease_fence_guard, .validate = LeaseFenceGuard.validate };
+    } else null;
     var transactional_split_delta: ?docstore_mod.DocStore.TransactionalWriteBuilder = null;
-    if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+    if (append_split_delta) {
         const split_delta_key = batch_ctx.shard_manager.reserveSplitDeltaKey(&split_delta_key_buf) catch |err| switch (err) {
             error.SplitDeltaSequenceOverflow => return error.ResourceLimitExceeded,
             else => return err,
@@ -42796,6 +42826,7 @@ fn appendGeneratedBatchFromEnrichment(
             .payload = payload,
         },
         transactional_split_delta,
+        transactional_guard,
     ) catch |err| switch (err) {
         error.InvalidKeyPromotion => return error.InvalidGeneratedArtifactPromotion,
         error.KeyPromotionBytesOverflow => return error.GeneratedArtifactPromotionBytesOverflow,
@@ -79693,6 +79724,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         .{},
         &.{.{ .staged_key = stage_key, .final_key = final_key }},
         &.{stale_key},
+        null,
     );
     try std.testing.expectEqual(
         transition_bytes_before,
@@ -79727,6 +79759,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
             .{},
             &.{.{ .staged_key = missing_stage, .final_key = final_key }},
             &.{stale_key},
+            null,
         ),
     );
     const stable_final = try db.core.store.get(alloc, final_key);
@@ -79738,6 +79771,43 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
     const deltas_after_failed_promotion = try db.core.shard_manager.listDeltasAfter(alloc, 0);
     defer shard_mod.freeDeltas(alloc, deltas_after_failed_promotion);
     try std.testing.expectEqual(@as(usize, 1), deltas_after_failed_promotion.len);
+
+    const fence_key = "\x00\x00__metadata__:generated_replay_fence_test";
+    var lease = try lease_mod.Lease.init(alloc, db.core.store, fence_key);
+    defer lease.deinit();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const acquired = try lease.tryAcquireFenced("worker-a", now_ms, 60_000);
+    try std.testing.expect(acquired.acquired);
+    try db.core.store.putBatch(&.{.{ .key = stage_key, .value = "fenced-vector" }}, &.{});
+
+    try std.testing.expectError(
+        error.EnrichmentLeaseFenceLost,
+        appendGeneratedBatchFromEnrichment(
+            append_ctx,
+            .{},
+            &.{.{ .staged_key = stage_key, .final_key = final_key }},
+            &.{},
+            .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch - 1 },
+        ),
+    );
+    const staged_after_fence_rejection = try db.core.store.get(alloc, stage_key);
+    defer alloc.free(staged_after_fence_rejection);
+    try std.testing.expectEqualStrings("fenced-vector", staged_after_fence_rejection);
+    const final_after_fence_rejection = try db.core.store.get(alloc, final_key);
+    defer alloc.free(final_after_fence_rejection);
+    try std.testing.expectEqualStrings("stable-vector", final_after_fence_rejection);
+
+    _ = try appendGeneratedBatchFromEnrichment(
+        append_ctx,
+        .{},
+        &.{.{ .staged_key = stage_key, .final_key = final_key }},
+        &.{},
+        .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch },
+    );
+    const fenced_promoted = try db.core.store.get(alloc, final_key);
+    defer alloc.free(fenced_promoted);
+    try std.testing.expectEqualStrings("fenced-vector", fenced_promoted);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage_key));
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {

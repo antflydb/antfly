@@ -1,8 +1,9 @@
 # Bounded document preparation and multimodal inference
 
 Status: bounded document preparation, indexed reader execution, multimodal
-generation transport, durable page-image embedding, observed remote execution,
-and post-review batching hardening implemented
+generation transport, distributed model-aware routing, lease-fenced durable
+page-image embedding, observed remote execution, and post-review batching
+hardening implemented
 
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
@@ -158,13 +159,19 @@ needed for throughput, belongs above the executor: partition into independent
 bounded requests, preserve per-item identity and failure, and aggregate their
 observed execution reports without assuming completion order.
 
-The current Go inference proxy is not yet a complete endpoint for this path. It
-routes `/ai/v1/embed` but does not expose the capability catalog, read, or
-generation-batch routes required here (`GET /ai/v1/models`,
-`POST /ai/v1/read`, and `POST /ai/v1/generate/batch`). Until those routes are
-added, distributed deployments must use a dedicated inference-node/service URL
-for PDF readers and multimodal generators; ClipClap embedding can use the proxy
-only within its existing embed contract.
+The Go inference proxy exposes `GET /ai/v1/models`, `POST /ai/v1/read`,
+`POST /ai/v1/generate/batch`, and the existing embedding surface. It routes a
+homogeneous bounded batch intact by its nested model identity and rejects
+mixed-model batches before forwarding. Refreshed endpoint inventory retains
+the advertised task for each model; selection and failover filter by both model
+and operation, while the pool-only compatibility fallback is allowed only
+before that endpoint's first successful catalog refresh. The cluster catalog
+is assembled from healthy inference nodes and merges duplicate descriptors conservatively:
+accepted inputs and boolean support are intersected, numeric ceilings use the
+minimum, and native batching is advertised only when every eligible duplicate
+supports it. If any currently routable node's catalog cannot be read, discovery
+fails closed rather than publishing a partial union that routing could violate.
+Upstream authorization is forwarded for both discovery and execution.
 
 The long-term proxy contract is model-aware rather than a transparent
 round-robin surface:
@@ -204,7 +211,7 @@ attachment representation:
 ```zig
 const Attachment = extern struct {
     bytes: String,
-    content_type: String,
+    mime_type: String,
 };
 
 const AttachmentRef = struct {
@@ -247,6 +254,7 @@ const ExecutionReport = struct {
     native_batches: usize,
     native_items: usize,
     serial_items: usize,
+    rejected_items: usize,
     fallback_items: usize,
     fallback_reason: ?[]const u8,
 };
@@ -383,6 +391,77 @@ document. They are architectural requirements, not Florence-specific cleanup:
 23. **Generator modality admission omitted raw documents.**
     `application/pdf` maps to the document modality and is accepted only when
     the resolved generator advertises document input and PDF MIME support.
+24. **Generic generator media was serialized but ignored by the HTTP server.**
+    The generation parser now consumes the shared `media` form for image and
+    audio attachments, validates declared and decoded MIME types, charges the
+    existing aggregate media budgets, and rejects unknown or malformed content
+    parts instead of silently dropping them.
+25. **Distributed routing omitted the document inference surfaces.** The Go
+    proxy now routes read and generation-batch operations, extracts model
+    identity from nested batch bodies, rejects mixed-model batches, and merges
+    node catalogs using conservative capability intersection.
+26. **Per-item generator failures collapsed remote retry policy into one local
+    error.** The common result envelope now retains a stable failure code,
+    authoritative `retryable` flag, and optional `retry_after_ms`. Durable
+    enrichment retries only retryable items, applies bounded provider backoff
+    guidance, and records deterministic failures without rerunning successful
+    siblings.
+27. **Leases did not fence publication.** Every lease tenure now has a
+    monotonic epoch. Long render/inference windows heartbeat the exact tenure,
+    and the generated-record writer validates owner, epoch, and expiry inside
+    the same transaction that promotes stage records and appends replay. A
+    stale owner cannot publish or release a newer tenure, even when a process
+    restart reuses the configured owner ID.
+28. **Retry staging was shared across attempts.** Stage keys now include the
+    lease epoch and request attempt identity. Failure cleanup deletes only the
+    current attempt, successful promotion consumes only that attempt, and the
+    active fenced owner retires abandoned attempt namespaces without exposing
+    partial vectors.
+29. **Catalog limits and telemetry described aspirations, not execution.** The
+    server publishes a resolved task descriptor with live item, byte,
+    media-part, batch-mode, and per-item-failure facts. Legacy catalogs fail
+    closed to singleton execution. Multimodal generation remains
+    `serial_compatibility` until the backend actually executes natively, and
+    execution reports separately count pre-execution rejected items.
+30. **Split-delta admission could invoke arbitrary reclaimers under storage
+    locks.** Resource management now exposes a single-attempt, non-reclaiming
+    reservation for transaction-owned work. Exact split-delta accounting uses
+    that primitive, so callback lock ordering cannot enter the write
+    transaction; temporary pressure is returned to the durable supervisor.
+31. **Authoritative API text still said multimodal batches were rejected.**
+    Inference and shared security specifications now describe bounded image and
+    audio batch media, strict malformed-part rejection, and the same aggregate
+    byte, image-header, and decoded-image admission used by single requests.
+32. **Distributed inventory was model-aware but not task-aware.** A node that
+    advertised the same name only as a generator could be selected for reading,
+    and partial catalog fan-out could overstate the capabilities of another
+    still-routable node. Registry snapshots now retain per-model operations,
+    every initial and retry selection applies that filter, successful discovery
+    disables the unknown bootstrap fallback, and cluster discovery fails closed
+    if any eligible catalog is unavailable.
+33. **Generic generator media bypassed generation-batch byte and decoded-pixel
+    admission.** Preflight now includes raw `media` parts in the aggregate
+    resident-byte shape. Parsing uses that admitted byte ceiling; image headers,
+    dimensions, and aggregate pixels are validated before model loading; and
+    slot ownership grows to the decoded peak or rejects the request. The
+    published eight-part ceiling is enforced by the parser rather than remaining
+    advisory.
+34. **A manifest could upgrade a resolved executor to native batching.** Model
+    manifests may lower resource ceilings, but the server and standalone
+    resolver restore execution mode from the concrete backend after applying
+    those limits. Generator execution remains serial compatibility and native
+    reader batching remains Florence-specific until another executor implements
+    the same contract.
+35. **The distributed proxy retained request bodies without a ceiling.** The
+    proxy needs the body for nested-model routing and bounded failover, but now
+    rejects declared and streaming bodies beyond a configurable retained-byte
+    limit (256 MiB by default) before forwarding. Inference nodes still apply
+    their stricter decoded-media and model admission independently.
+36. **Cluster catalog fan-out multiplied memory by node count.** Discovery now
+    permits at most eight simultaneous upstream catalog bodies, caps each at
+    8 MiB, bounds the merged descriptor set at 32 MiB, and drains every worker
+    before returning an error. Catalog scale therefore cannot create an
+    unbounded request-scoped memory spike.
 
 ### Post-review implementation contract
 
@@ -526,6 +605,35 @@ The hardening above follows four long-term rules:
     by both total scan work and selected-model fanout, uses a hash set for desired
     pages, and appends canonical scan keys in linear time rather than performing
     quadratic list de-duplication at the page ceiling.
+19. **Implemented after distributed review:** the proxy exposes model catalog,
+    read, generation-batch, and embedding operations. Nested batch model
+    routing and conservative catalog merging keep discovery consistent with
+    the node that can execute the complete bounded request.
+20. **Implemented after wire review:** generation consumes generic borrowed
+    image/audio media end to end, item failures retain retry metadata, and
+    execution accounting distinguishes attempted serial/native work from
+    parser/admission rejection.
+21. **Implemented after durability review:** PDF stage namespaces are unique to
+    one lease epoch and request attempt. Lease heartbeats surround render and
+    inference windows, while final promotion is transactionally fenced by the
+    live lease record. Takeover and stale-release regression tests cover both
+    different and reused owner identities.
+22. **Implemented after lock-order review:** exact split-delta admission uses a
+    non-reclaiming resource reservation while the storage transaction is held;
+    regression coverage proves no reclaimer callback can run on that path.
+23. **Implemented after distributed routing review:** endpoint catalogs retain
+    task identity, routing and retry are operation-aware, known-missing models
+    no longer use pool fallback, and an incomplete cluster catalog is not
+    published.
+24. **Implemented after admission review:** generic generator media participates
+    in batch byte, image-header, dimension, decoded-pixel, and slot admission;
+    the advertised media-part ceiling is a hard parser limit.
+25. **Implemented after capability review:** model manifest strings may tighten
+    limits but cannot promote a serial executor to native batching.
+26. **Implemented after proxy-memory review:** inference request bodies use a
+    configurable hard retained-byte ceiling for both known and chunked lengths.
+27. **Implemented after discovery-memory review:** catalog fan-out concurrency,
+    per-node bytes, and merged catalog bytes are independently bounded.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

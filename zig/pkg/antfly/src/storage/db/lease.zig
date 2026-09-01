@@ -23,6 +23,15 @@ const mem_backend = @import("../mem_backend.zig");
 pub const LeaseRecord = struct {
     owner_id: []const u8,
     expires_at_ms: u64,
+    /// Monotonic tenure identity. Legacy records decode as epoch zero and are
+    /// upgraded on their next successful acquisition.
+    epoch: u64 = 0,
+};
+
+pub const AcquireResult = struct {
+    acquired: bool,
+    epoch: u64 = 0,
+    expires_at_ms: u64 = 0,
 };
 
 pub const Lease = struct {
@@ -61,6 +70,10 @@ pub const Lease = struct {
     }
 
     pub fn tryAcquire(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
+        return (try self.tryAcquireFenced(owner_id, now_ms, ttl_ms)).acquired;
+    }
+
+    pub fn tryAcquireFenced(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !AcquireResult {
         var txn = try self.store.store.beginWrite();
         var committed = false;
         defer if (!committed) txn.abort();
@@ -70,6 +83,7 @@ pub const Lease = struct {
             else => return err,
         };
 
+        var epoch: u64 = 1;
         if (current_raw) |raw| {
             const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{
                 .allocate = .alloc_always,
@@ -78,27 +92,72 @@ pub const Lease = struct {
 
             const current = parsed.value;
             if (current.expires_at_ms > now_ms and !std.mem.eql(u8, current.owner_id, owner_id)) {
-                return false;
+                return .{ .acquired = false, .epoch = current.epoch, .expires_at_ms = current.expires_at_ms };
             }
+            epoch = if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))
+                @max(current.epoch, 1)
+            else
+                std.math.add(u64, current.epoch, 1) catch return error.LeaseEpochOverflow;
         }
+
+        const expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
 
         const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
             .owner_id = owner_id,
-            .expires_at_ms = now_ms + ttl_ms,
+            .expires_at_ms = expires_at_ms,
+            .epoch = epoch,
         }, .{});
         defer self.allocator.free(payload);
 
         try txn.put(self.key, payload);
         try txn.commit();
         committed = true;
-        return true;
+        return .{ .acquired = true, .epoch = epoch, .expires_at_ms = expires_at_ms };
     }
 
     pub fn renew(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
         return try self.tryAcquire(owner_id, now_ms, ttl_ms);
     }
 
+    /// Renew only the exact live tenure. An expired owner must acquire a new
+    /// epoch, even if no competitor has written yet, so work from the expired
+    /// tenure can never be published under a revived identity.
+    pub fn renewFenced(self: *Lease, owner_id: []const u8, epoch: u64, now_ms: u64, ttl_ms: u64) !bool {
+        var txn = try self.store.store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        const raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
+            parsed.value.epoch != epoch or parsed.value.expires_at_ms <= now_ms) return false;
+        const expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = owner_id,
+            .expires_at_ms = expires_at_ms,
+            .epoch = epoch,
+        }, .{});
+        defer self.allocator.free(payload);
+        try txn.put(self.key, payload);
+        try txn.commit();
+        committed = true;
+        return true;
+    }
+
     pub fn release(self: *Lease, owner_id: []const u8) !bool {
+        return try self.releaseMatching(owner_id, null);
+    }
+
+    /// Release only the exact tenure. This is the safe operation for durable
+    /// workers because a process restart may reuse the configured owner ID.
+    pub fn releaseFenced(self: *Lease, owner_id: []const u8, epoch: u64) !bool {
+        return try self.releaseMatching(owner_id, epoch);
+    }
+
+    fn releaseMatching(self: *Lease, owner_id: []const u8, epoch: ?u64) !bool {
         var txn = try self.store.store.beginWrite();
         var committed = false;
         defer if (!committed) txn.abort();
@@ -112,7 +171,8 @@ pub const Lease = struct {
         });
         defer parsed.deinit();
 
-        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id)) return false;
+        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
+            (epoch != null and parsed.value.epoch != epoch.?)) return false;
         try txn.delete(self.key);
         try txn.commit();
         committed = true;
@@ -163,6 +223,7 @@ pub fn cloneRecord(alloc: Allocator, record: LeaseRecord) !LeaseRecord {
     return .{
         .owner_id = try alloc.dupe(u8, record.owner_id),
         .expires_at_ms = record.expires_at_ms,
+        .epoch = record.epoch,
     };
 }
 
@@ -205,6 +266,30 @@ test "lease acquires renews and releases by owner" {
     try std.testing.expect(!(try lease.release("worker-b")));
     try std.testing.expect(try lease.release("worker-a"));
     try std.testing.expect(try lease.tryAcquire("worker-b", 1300, 250));
+}
+
+test "lease epochs fence renewal and release after takeover" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var lease = try Lease.init(alloc, &store, "\x00\x00__metadata__:lease_fence_test");
+    defer lease.deinit();
+    const first = try lease.tryAcquireFenced("stable-worker-id", 1_000, 100);
+    try std.testing.expect(first.acquired);
+    try std.testing.expectEqual(@as(u64, 1), first.epoch);
+
+    const second = try lease.tryAcquireFenced("stable-worker-id", 1_101, 100);
+    try std.testing.expect(second.acquired);
+    try std.testing.expectEqual(@as(u64, 2), second.epoch);
+    try std.testing.expect(!(try lease.renewFenced("stable-worker-id", first.epoch, 1_102, 100)));
+    try std.testing.expect(!(try lease.releaseFenced("stable-worker-id", first.epoch)));
+    try std.testing.expect(try lease.releaseFenced("stable-worker-id", second.epoch));
 }
 
 test "lease works with memory backend store" {

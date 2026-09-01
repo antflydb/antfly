@@ -175,11 +175,18 @@ pub const GeneratedRecordCommit = struct {
     promoted_artifact_bytes: usize = 0,
 };
 
+pub const GeneratedWriteFence = struct {
+    lease_key: []const u8,
+    owner_id: []const u8,
+    epoch: u64,
+};
+
 pub const GeneratedRecordWriter = *const fn (
     ptr: *anyopaque,
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
+    fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
@@ -941,6 +948,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         => .fatal_worker,
 
         error.InvalidAssetProducerConfig,
+        error.GenerateBatchItemRejected,
         error.InvalidExtractorResponse,
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
@@ -1102,6 +1110,18 @@ fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
     runtime.retry_error_has_request_identity = false;
 }
 
+fn setRetryAfterHint(runtime: *EnrichmentRuntime, retry_after_ms: ?u64) void {
+    const value = retry_after_ms orelse return;
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.retry_after_hint_ms = @max(runtime.retry_after_hint_ms, value);
+        return;
+    }
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    runtime.retry_after_hint_ms = @max(runtime.retry_after_hint_ms, value);
+}
+
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
@@ -1216,6 +1236,19 @@ fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
     // user-supplied retry budgets from overflowing before the min is applied.
     const exponent: u6 = @intCast(@min(consecutive_retry_count -| 1, 6));
     return @min(transient_worker_retry_base_sleep_ms << exponent, transient_worker_retry_max_sleep_ms);
+}
+
+fn workerRetryDelayWithHintMs(consecutive_retry_count: u32, retry_after_hint_ms: u64) u64 {
+    return @max(
+        workerRetryDelayMs(consecutive_retry_count),
+        @min(retry_after_hint_ms, transient_worker_retry_max_sleep_ms),
+    );
+}
+
+test "provider retry guidance extends bounded worker backoff" {
+    try std.testing.expectEqual(@as(u64, 1_250), workerRetryDelayWithHintMs(1, 1_250));
+    try std.testing.expectEqual(transient_worker_retry_max_sleep_ms, workerRetryDelayWithHintMs(1, 60_000));
+    try std.testing.expectEqual(@as(u64, 1_000), workerRetryDelayWithHintMs(2, 0));
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
@@ -2349,6 +2382,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     fatal_error_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
+    retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
@@ -2737,6 +2771,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     notify_fn: NotifyFn,
     config: Config,
     ownership: ownership_mod.State,
+    lease_fencing_enabled: bool = false,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     sync_wait_epoch: std.atomic.Value(u32) = .init(0),
@@ -2751,6 +2786,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     fatal_error_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
+    retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
@@ -2847,6 +2883,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .owner_id = config.owner_id,
                 .lease_ttl_ms = config.lease_ttl_ms,
             }),
+            .lease_fencing_enabled = true,
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
@@ -3316,6 +3353,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.fatal_error_count += 1;
         self.retrying = false;
         self.next_retry_at_ms = 0;
+        self.retry_after_hint_ms = 0;
         self.worker_failed = true;
         self.retry_error_has_request_identity = false;
         if (self.last_error_name == null) self.last_error_name = @errorName(err);
@@ -3340,7 +3378,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retry_failure_count = 0;
         }
         self.retry_failure_count +|= 1;
-        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
+        const delay_ms = workerRetryDelayWithHintMs(self.consecutive_retry_count, self.retry_after_hint_ms);
+        self.retry_after_hint_ms = 0;
+        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| delay_ms;
         self.retrying = true;
         self.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(self);
@@ -6582,10 +6622,13 @@ fn flushRuntimeGeneratedTextBatch(
         };
         if (!item.identity.eql(expected_identity)) return error.InvalidAssetProducerResponseIdentity;
         switch (item.result) {
-            .item_error => |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
-                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+            .item_error => |failure| {
+                if (failure.retryable and shouldYieldRequestError(runtime, failure.cause)) {
+                    setRetryAfterHint(runtime, failure.retry_after_ms);
+                    return failure.cause;
+                }
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(failure.cause));
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, failure.cause);
             },
             .value => |output| {
                 item.result = .{ .value = &.{} };
@@ -10397,11 +10440,14 @@ fn flushGeneratedReplayWindow(
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys);
     const artifact_promotions = try window.artifact_promotions.toOwnedSlice(runtime.alloc);
     errdefer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
+    var promotions_committed = false;
+    defer if (!promotions_committed) cleanupGeneratedArtifactStages(runtime, artifact_promotions) catch {};
     var batch = try window.toOwnedBatch();
     defer derived_types.deinitDerivedBatch(runtime.alloc, &batch);
     defer freeKeyList(runtime.alloc, artifact_delete_keys);
     defer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
     const commit = try appendGeneratedBatchWithRetry(runtime, batch, artifact_promotions, artifact_delete_keys);
+    promotions_committed = true;
     recordArtifactBytes(runtime, .dense_embedding, commit.promoted_artifact_bytes);
     try applyQueuedCoverageTransitionsAfterReplayAppend(runtime, window.coverage_transitions.items);
     clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
@@ -10409,6 +10455,17 @@ fn flushGeneratedReplayWindow(
     runtime.notify_fn(runtime.notify_ctx, commit.sequence);
     try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
     succeeded = true;
+}
+
+fn cleanupGeneratedArtifactStages(
+    runtime: *EnrichmentRuntime,
+    promotions: []const GeneratedArtifactPromotion,
+) !void {
+    if (promotions.len == 0) return;
+    const keys = try runtime.alloc.alloc([]const u8, promotions.len);
+    defer runtime.alloc.free(keys);
+    for (promotions, 0..) |promotion, index| keys[index] = promotion.staged_key;
+    try storePutBatchWithRetry(runtime, &.{}, keys);
 }
 
 fn appendOwnedDocumentsToWindow(
@@ -10794,8 +10851,27 @@ fn processPdfPageImageEmbedding(
     const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 
-    // A retry must never combine a page produced by a previous invocation
-    // with pages produced after the source or model may have changed.
+    try heartbeatEnrichmentLease(runtime);
+    const fence_epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
+    const source_hash = std.hash.Wyhash.hash(0x7064665f73746167, downloaded.data);
+    const stage_attempt_id = try std.fmt.allocPrint(
+        runtime.alloc,
+        "epoch-{d}:sequence-{d}:attempt-{d}:source-{x}",
+        .{ fence_epoch, request.sequence, requestAttemptNumber(runtime), source_hash },
+    );
+    defer runtime.alloc.free(stage_attempt_id);
+    var attempt_stages_owned = true;
+    defer if (attempt_stages_owned) clearPdfPageEmbeddingAttemptStages(
+        runtime,
+        request.doc_key,
+        requestArtifactName(request),
+        embedding_name,
+        stage_attempt_id,
+    ) catch {};
+
+    // A fenced owner may retire abandoned attempts without sharing their key
+    // namespace. A superseded owner can no longer publish because the final
+    // promotion transaction validates its lease epoch.
     try clearPdfPageEmbeddingStages(
         runtime,
         request.doc_key,
@@ -10815,6 +10891,7 @@ fn processPdfPageImageEmbedding(
 
     var first_page: usize = 1;
     while (first_page <= page_count) {
+        try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
         coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
         const count = @min(batch_items, page_count - first_page + 1);
@@ -10844,6 +10921,7 @@ fn processPdfPageImageEmbedding(
         defer rendered.deinit(download_alloc);
         var embedded = try embedRenderedPdfPageBatch(download_alloc, dense_embedder, embedding_name, rendered, request.expected_dims);
         defer embedded.deinit(download_alloc);
+        try heartbeatEnrichmentLease(runtime);
 
         if (firstPdfPageEmbeddingFailure(embedded)) |failure| {
             std.log.warn(
@@ -10871,19 +10949,20 @@ fn processPdfPageImageEmbedding(
                 request.doc_key,
                 requestArtifactName(request),
                 embedding_name,
+                stage_attempt_id,
                 unit_id,
             );
             var stage_key_owned = true;
             errdefer if (stage_key_owned) runtime.alloc.free(stage_key);
             try staged_page_keys.append(runtime.alloc, stage_key);
             stage_key_owned = false;
-            const source_hash = enrichment_artifact_codec.hashEmbeddingSource(
+            const page_source_hash = enrichment_artifact_codec.hashEmbeddingSource(
                 rendered.results[result_index].rendered.?.png,
                 request.producer_json,
             );
             const staged_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(
                 runtime.alloc,
-                source_hash,
+                page_source_hash,
                 result.vector.?,
             );
             defer runtime.alloc.free(staged_payload);
@@ -10927,6 +11006,12 @@ fn processPdfPageImageEmbedding(
         for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (expanded.len > 0) runtime.alloc.free(expanded);
     }
+    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
+    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
+    // Transfer stage ownership last. Once promotions enter the replay window,
+    // no later fallible operation may orphan this attempt outside its commit
+    // cleanup path.
     try queuePdfPageEmbeddingPromotions(
         runtime,
         window,
@@ -10934,9 +11019,7 @@ fn processPdfPageImageEmbedding(
         staged_page_keys.items,
         embedding_name,
     );
-    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
-    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
+    attempt_stages_owned = false;
 }
 
 fn pdfPageEmbeddingStageKeyAlloc(
@@ -10944,6 +11027,7 @@ fn pdfPageEmbeddingStageKeyAlloc(
     doc_key: []const u8,
     page_artifact_name: []const u8,
     embedding_name: []const u8,
+    attempt_id: []const u8,
     unit_id: []const u8,
 ) ![]u8 {
     return try internal_keys.pdfPageEmbeddingStageKeyAlloc(
@@ -10951,8 +11035,27 @@ fn pdfPageEmbeddingStageKeyAlloc(
         doc_key,
         page_artifact_name,
         embedding_name,
+        attempt_id,
         unit_id,
     );
+}
+
+fn clearPdfPageEmbeddingAttemptStages(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
+) !void {
+    const root = try internal_keys.pdfPageEmbeddingStageAttemptRootPrefixAlloc(
+        runtime.alloc,
+        doc_key,
+        page_artifact_name,
+        embedding_name,
+        attempt_id,
+    );
+    defer runtime.alloc.free(root);
+    try clearPdfPageEmbeddingStagesWithPrefix(runtime, root);
 }
 
 fn clearPdfPageEmbeddingStages(
@@ -10968,6 +11071,10 @@ fn clearPdfPageEmbeddingStages(
         embedding_name,
     );
     defer runtime.alloc.free(root);
+    try clearPdfPageEmbeddingStagesWithPrefix(runtime, root);
+}
+
+fn clearPdfPageEmbeddingStagesWithPrefix(runtime: *EnrichmentRuntime, root: []const u8) !void {
     while (true) {
         var page = try backend_scan.scanPrefixKeysPage(
             runtime.alloc,
@@ -11032,6 +11139,7 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
         "doc:1",
         "pdf_pages_v1",
         "visual_v1",
+        "attempt-a",
         "page:000001",
     );
     defer std.testing.allocator.free(first_stage);
@@ -11040,15 +11148,17 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
         "doc:1",
         "pdf_pages_v1",
         "visual_v1",
+        "attempt-b",
         "page:000001",
     );
     defer std.testing.allocator.free(retry_stage);
-    try std.testing.expectEqualStrings(first_stage, retry_stage);
+    try std.testing.expect(!std.mem.eql(u8, first_stage, retry_stage));
     const colon_left = try pdfPageEmbeddingStageKeyAlloc(
         std.testing.allocator,
         "doc:1",
         "pdf:pages",
         "visual",
+        "attempt",
         "page:000001",
     );
     defer std.testing.allocator.free(colon_left);
@@ -11057,6 +11167,7 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
         "doc:1",
         "pdf",
         "pages:visual",
+        "attempt",
         "page:000001",
     );
     defer std.testing.allocator.free(colon_right);
@@ -11106,9 +11217,9 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     defer alloc.free(final_two);
     const final_three = try embeddingArtifactKey(&runtime, page_three, "visual_v1");
     defer alloc.free(final_three);
-    const stage_one = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "page:000001");
+    const stage_one = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "attempt-2", "page:000001");
     defer alloc.free(stage_one);
-    const stage_two = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "page:000002");
+    const stage_two = try pdfPageEmbeddingStageKeyAlloc(alloc, "doc:1", "pdf_pages_v1", "visual_v1", "attempt-2", "page:000002");
     defer alloc.free(stage_two);
 
     const old_one = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 0.1, 0.2 });
@@ -14843,7 +14954,8 @@ fn appendGeneratedBatchWithRetry(
 ) !GeneratedRecordCommit {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_promotions, artifact_delete_keys) catch |err| switch (err) {
+        try heartbeatEnrichmentLease(runtime);
+        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_promotions, artifact_delete_keys, currentGeneratedWriteFence(runtime)) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -14853,6 +14965,32 @@ fn appendGeneratedBatchWithRetry(
         };
         return sequence;
     }
+}
+
+fn heartbeatEnrichmentLease(runtime: *EnrichmentRuntime) !void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    if (!runtime.lease_fencing_enabled) return;
+    const io_impl = runtime.io_impl orelse return;
+    const io = io_impl.io();
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    if (!(try runtime.ownership.heartbeatIfDue(runtime.config.clock.nowRealtimeMs())))
+        return error.EnrichmentLeaseFenceLost;
+}
+
+fn currentGeneratedWriteFence(runtime: *EnrichmentRuntime) ?GeneratedWriteFence {
+    if (comptime builtin.os.tag == .freestanding) return null;
+    if (!runtime.lease_fencing_enabled or !runtime.ownership.lease_owned) return null;
+    const io_impl = runtime.io_impl orelse return null;
+    const io = io_impl.io();
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    if (!runtime.ownership.has_lease or runtime.ownership.lease_epoch == 0) return null;
+    return .{
+        .lease_key = enrichment_lease.default_lease_key,
+        .owner_id = runtime.ownership.owner_id,
+        .epoch = runtime.ownership.lease_epoch,
+    };
 }
 
 const KVPair = struct {

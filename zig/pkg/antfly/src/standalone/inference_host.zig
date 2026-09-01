@@ -1532,13 +1532,16 @@ fn localModelCapabilities(
     };
 
     const native_batch = switch (task) {
-        .read => manifest.native_arch_hint == .florence or manifest.hasCapability("native_batch_read"),
-        .generate => manifest.hasCapability("native_batch_generate_multimodal"),
+        .read => manifest.native_arch_hint == .florence,
+        // The local generation executor currently accepts a batch-shaped ABI
+        // but executes each multimodal item under the shared model lock.
+        .generate => false,
         .embed => true,
     };
     const max_items: usize = switch (task) {
-        .read, .embed => 64,
-        .generate => 128,
+        .read => inference.server.max_read_batch_images,
+        .generate => inference.server.max_generate_batch_items,
+        .embed => 64,
     };
     const output: antfly.inference.work.OutputKind = switch (task) {
         .read => .read_result,
@@ -1567,9 +1570,11 @@ fn localModelCapabilities(
             .mode = if (native_batch) .native else .serial_compatibility,
             .preferred_items = @min(@as(usize, 8), max_items),
             .max_items = max_items,
-            .max_encoded_bytes = 64 * 1024 * 1024,
-            .max_decoded_pixels = 50_000_000,
-            .max_media_parts_per_item = if (task == .generate) 8 else 1,
+            .max_encoded_bytes = inference.server.requestMediaMaxBytes(node),
+            // The server owns decoded-image admission. Zero means that this
+            // planner has no separate, truthful pixel ceiling to advertise.
+            .max_decoded_pixels = 0,
+            .max_media_parts_per_item = if (task == .generate) inference.server.max_generate_media_parts_per_item else 1,
             .per_item_failures = task == .generate,
         },
         .output = output,
@@ -1580,6 +1585,9 @@ fn localModelCapabilities(
     for (manifest.capabilities) |capability| {
         try result.batch.applyManifestCapability(capability);
     }
+    // Manifests may tighten resource limits, but execution mode is a property
+    // of the resolved server executor and cannot be upgraded by a model claim.
+    result.batch.mode = if (native_batch) .native else .serial_compatibility;
     // A model may lower max_items without redundantly overriding the
     // throughput hint. The hard ceiling always wins.
     result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);

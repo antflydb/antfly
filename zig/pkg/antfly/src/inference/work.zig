@@ -225,6 +225,41 @@ pub const WorkIdentity = struct {
     }
 };
 
+/// Transport-neutral failure information for one work item. `cause` is the
+/// local error identity used by existing control flow; the remaining fields
+/// preserve the remote executor's authoritative retry decision without
+/// requiring borrowed JSON strings to outlive the invocation.
+pub const ItemFailure = struct {
+    pub const Code = enum {
+        unknown,
+        invalid_request,
+        content_too_large,
+        content_not_allowed,
+        model_not_found,
+        model_resource_busy,
+        service_unavailable,
+        generation_failed,
+        upstream_failure,
+
+        pub fn fromWire(value: []const u8) Code {
+            if (std.mem.eql(u8, value, "INVALID_REQUEST")) return .invalid_request;
+            if (std.mem.eql(u8, value, "CONTENT_TOO_LARGE")) return .content_too_large;
+            if (std.mem.eql(u8, value, "CONTENT_NOT_ALLOWED")) return .content_not_allowed;
+            if (std.mem.eql(u8, value, "MODEL_NOT_FOUND")) return .model_not_found;
+            if (std.mem.eql(u8, value, "MODEL_RESOURCE_BUSY")) return .model_resource_busy;
+            if (std.mem.eql(u8, value, "SERVICE_UNAVAILABLE")) return .service_unavailable;
+            if (std.mem.eql(u8, value, "GENERATION_FAILED") or
+                std.mem.eql(u8, value, "STRUCTURED_OUTPUT_INVALID")) return .generation_failed;
+            return .upstream_failure;
+        }
+    };
+
+    cause: anyerror,
+    code: Code = .unknown,
+    retryable: bool = false,
+    retry_after_ms: ?u64 = null,
+};
+
 /// Trusted media borrowed for the duration of one synchronous executor call.
 pub const Attachment = struct {
     bytes: []const u8,
@@ -242,13 +277,16 @@ pub const ExecutionReport = struct {
     native_batches: usize = 0,
     native_items: usize = 0,
     serial_items: usize = 0,
+    rejected_items: usize = 0,
     fallback_items: usize = 0,
     fallback_reason: ?[]const u8 = null,
 
     pub fn validate(self: ExecutionReport) !void {
         const executed = std.math.add(usize, self.native_items, self.serial_items) catch
             return error.InvalidExecutionReport;
-        if (executed != self.requested_items) return error.InvalidExecutionReport;
+        const accounted = std.math.add(usize, executed, self.rejected_items) catch
+            return error.InvalidExecutionReport;
+        if (accounted != self.requested_items) return error.InvalidExecutionReport;
         if (self.fallback_items > self.serial_items) return error.InvalidExecutionReport;
         if (self.native_batches == 0 and self.native_items != 0) return error.InvalidExecutionReport;
         if (self.native_batches > self.native_items) return error.InvalidExecutionReport;
@@ -289,7 +327,7 @@ pub fn WorkItemResult(comptime T: type) type {
         identity: WorkIdentity,
         result: union(enum) {
             value: T,
-            item_error: anyerror,
+            item_error: ItemFailure,
         },
     };
 }

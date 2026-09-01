@@ -1556,6 +1556,13 @@ pub const ResourceManager = struct {
         };
     }
 
+    /// Attempt admission exactly once and never invoke a reclaimer callback.
+    /// Use this while holding a storage transaction or another subsystem lock
+    /// whose lock order cannot safely include arbitrary cache owners.
+    pub fn reserveWithoutReclaim(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return self.reserveOnce(slice, bytes);
+    }
+
     /// Atomically owns a required secondary credit and as much of the requested
     /// primary credit as currently fits. The full request gets the normal cache
     /// reclamation opportunity before the partial fallback is considered.
@@ -3723,6 +3730,43 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "non-reclaiming reservation never invokes callbacks" {
+    const ReclaimContext = struct {
+        invoked: bool = false,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invoked = true;
+            return 0;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.shard_transition_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{};
+    var cache_bytes: u64 = 0;
+    manager.observeUsage(.hbc_node_metadata_cache, &cache_bytes, 80);
+    const identity = try manager.registerReclaimer(
+        .hbc_node_metadata_cache,
+        &context,
+        ReclaimContext.reclaim,
+    );
+    defer manager.unregisterReclaimer(identity);
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveWithoutReclaim(.shard_transition_working_set, 30),
+    );
+    try std.testing.expect(!context.invoked);
 }
 
 test "dense search admission reclaims retained scratch from its own slice" {

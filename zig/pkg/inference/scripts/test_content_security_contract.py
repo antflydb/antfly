@@ -35,8 +35,8 @@ class ContentSecurityContractTest(unittest.TestCase):
             self.assertIn("Remote URL byte potential is reserved before fetch", text)
 
         self.assertIn("Images are rejected rather than resized", shared)
-        self.assertIn("generate/chat, dense embed, multimodal rerank", shared)
-        self.assertIn("Batch generation rejects multimodal content before fetch", shared)
+        self.assertIn("generate/chat, batch generation, dense embed, multimodal rerank", shared)
+        self.assertIn("Batch generation applies the same image-header admission", shared)
         self.assertIn("non-inference scraping consumers do not enforce this setting", shared)
 
 

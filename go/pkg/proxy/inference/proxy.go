@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -105,6 +106,10 @@ type Endpoint struct {
 	Pool         string
 	WorkloadType WorkloadType
 	Models       map[string]*ModelInfo
+	// CatalogKnown distinguishes a successfully discovered empty/partial catalog
+	// from bootstrap registration, where the proxy has not learned capabilities
+	// yet. Only the latter may use the compatibility pool fallback.
+	CatalogKnown bool
 	QueueDepth   int32
 	LastSeen     time.Time
 	Healthy      bool
@@ -118,6 +123,9 @@ type ModelInfo struct {
 	RequestsTotal int64
 	AvgLatencyMs  float64
 	Latency       *RollingLatency
+	// Operations is nil for bootstrap/legacy inventory and otherwise contains
+	// the request operations this endpoint advertised for the model.
+	Operations map[OperationType]bool
 }
 
 // CircuitBreaker implements the circuit breaker pattern
@@ -380,6 +388,22 @@ func (r *ModelRegistry) UnregisterEndpoint(address string) {
 
 // UpdateModels refreshes the model list for an endpoint
 func (r *ModelRegistry) UpdateModels(address string, models []string) {
+	r.updateModels(address, models, nil, false)
+}
+
+// UpdateModelOperations atomically replaces an endpoint's discovered model and
+// task inventory. Routing uses this snapshot so a generator-only node cannot be
+// selected for reads merely because it loads a model with the same name.
+func (r *ModelRegistry) UpdateModelOperations(address string, operations map[string]map[OperationType]bool) {
+	models := make([]string, 0, len(operations))
+	for model := range operations {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	r.updateModels(address, models, operations, true)
+}
+
+func (r *ModelRegistry) updateModels(address string, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -398,6 +422,9 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 	for _, model := range models {
 		if _, exists := ep.Models[model]; !exists {
 			ep.Models[model] = newModelInfo(model)
+		}
+		if operations != nil {
+			ep.Models[model].Operations = cloneOperations(operations[model])
 		}
 		delete(oldModels, model)
 
@@ -435,6 +462,22 @@ func (r *ModelRegistry) UpdateModels(address string, models []string) {
 	}
 
 	ep.LastSeen = time.Now()
+	if catalogKnown {
+		ep.CatalogKnown = true
+	}
+}
+
+func cloneOperations(source map[OperationType]bool) map[OperationType]bool {
+	if source == nil {
+		return nil
+	}
+	result := make(map[OperationType]bool, len(source))
+	for operation, supported := range source {
+		if supported {
+			result[operation] = true
+		}
+	}
+	return result
 }
 
 // RecordModelLatency updates rolling per-model latency for an endpoint.
@@ -468,7 +511,7 @@ func (r *ModelRegistry) GetEndpointsForModel(model string) []*Endpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.getAvailableEndpointsForModelLocked(model, "")
+	return r.getAvailableEndpointsForModelLocked(model, "", "")
 }
 
 // GetEndpointsForModelInPool returns endpoints in a specific pool that have a model loaded.
@@ -476,10 +519,16 @@ func (r *ModelRegistry) GetEndpointsForModelInPool(model, pool string) []*Endpoi
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.getAvailableEndpointsForModelLocked(model, pool)
+	return r.getAvailableEndpointsForModelLocked(model, pool, "")
 }
 
-func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string) []*Endpoint {
+func (r *ModelRegistry) getAvailableEndpointsForModelOperation(model, pool string, operation OperationType) []*Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.getAvailableEndpointsForModelLocked(model, pool, operation)
+}
+
+func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string, operation OperationType) []*Endpoint {
 	endpoints := r.models[model]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -487,6 +536,28 @@ func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string) 
 			continue
 		}
 		if r.isEndpointAvailableLocked(ep) {
+			if operation != "" && !modelSupportsOperation(ep.Models[model], operation) {
+				continue
+			}
+			result = append(result, ep)
+		}
+	}
+	return result
+}
+
+func modelSupportsOperation(info *ModelInfo, operation OperationType) bool {
+	if info == nil || len(info.Operations) == 0 || operation == "" {
+		return true
+	}
+	return info.Operations[operation]
+}
+
+func (r *ModelRegistry) getBootstrapEndpointsForPool(pool string) []*Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]*Endpoint, 0, len(r.pools[pool]))
+	for _, ep := range r.pools[pool] {
+		if !ep.CatalogKnown && r.isEndpointAvailableLocked(ep) {
 			result = append(result, ep)
 		}
 	}
@@ -624,36 +695,73 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
-	models, err := extractModelNames(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelCatalogBytes+1))
+	if err != nil || len(body) > maxModelCatalogBytes {
+		r.markUnhealthy(address)
+		return errors.New("upstream model catalog is unreadable or too large")
+	}
+	models, err := extractModelOperations(bytes.NewReader(body))
 	if err != nil {
+		r.markUnhealthy(address)
 		return err
 	}
 
-	r.UpdateModels(address, models)
+	r.UpdateModelOperations(address, models)
 	r.markHealthy(address)
 	return nil
 }
 
 func extractModelNames(r io.Reader) ([]string, error) {
+	operations, err := extractModelOperations(r)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(operations))
+	for model := range operations {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models, nil
+}
+
+var modelCategoryOperations = map[string][]OperationType{
+	"embedders":    {"embed", "embeddings"},
+	"generators":   {"generate", "generate.batch", "chat.completions"},
+	"readers":      {"read"},
+	"rerankers":    {"rerank"},
+	"chunkers":     {"chunk"},
+	"extractors":   {"extract"},
+	"rewriters":    {"rewrite"},
+	"classifiers":  {"classify"},
+	"transcribers": {"transcribe"},
+}
+
+func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, error) {
 	var doc map[string]json.RawMessage
 	if err := json.NewDecoder(r).Decode(&doc); err != nil {
 		return nil, err
 	}
 
-	seen := make(map[string]bool)
-	add := func(name string) {
+	result := make(map[string]map[OperationType]bool)
+	add := func(name string, operations []OperationType) {
 		name = strings.TrimSpace(name)
-		if name != "" {
-			seen[name] = true
+		if name == "" {
+			return
+		}
+		if _, exists := result[name]; !exists {
+			result[name] = make(map[OperationType]bool)
+		}
+		for _, operation := range operations {
+			result[name][operation] = true
 		}
 	}
-	addFromCollection := func(raw json.RawMessage) {
+	addFromCollection := func(raw json.RawMessage, operations []OperationType) {
 		var entries []map[string]any
 		if err := json.Unmarshal(raw, &entries); err == nil {
 			for _, entry := range entries {
 				for _, key := range []string{"name", "id"} {
 					if value, ok := entry[key].(string); ok {
-						add(value)
+						add(value, operations)
 					}
 				}
 			}
@@ -662,30 +770,30 @@ func extractModelNames(r io.Reader) ([]string, error) {
 		var stringsList []string
 		if err := json.Unmarshal(raw, &stringsList); err == nil {
 			for _, name := range stringsList {
-				add(name)
+				add(name, operations)
 			}
 			return
 		}
 		var objectMap map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &objectMap); err == nil {
 			for name := range objectMap {
-				add(name)
+				add(name, operations)
 			}
 		}
 	}
 
-	for _, key := range []string{"models", "data", "embedders", "generators", "rerankers", "chunkers", "extractors", "rewriters", "classifiers", "readers", "transcribers"} {
+	// Generic/OpenAI collections prove model presence but not task support.
+	for _, key := range []string{"models", "data"} {
 		if raw, ok := doc[key]; ok {
-			addFromCollection(raw)
+			addFromCollection(raw, nil)
 		}
 	}
-
-	models := make([]string, 0, len(seen))
-	for model := range seen {
-		models = append(models, model)
+	for category, operations := range modelCategoryOperations {
+		if raw, ok := doc[category]; ok {
+			addFromCollection(raw, operations)
+		}
 	}
-	sort.Strings(models)
-	return models, nil
+	return result, nil
 }
 
 func (r *ModelRegistry) markHealthy(address string) {
@@ -743,8 +851,8 @@ func NewRouter(registry *ModelRegistry) *Router {
 }
 
 // RouteRequest selects the best endpoint for a request
-func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool) (*Endpoint, error) {
-	endpoints := r.ResolveEndpointCandidates(model, pool, excluded)
+func (r *Router) RouteRequest(ctx context.Context, model string, pool string, workloadType WorkloadType, excluded map[string]bool, operations ...OperationType) (*Endpoint, error) {
+	endpoints := r.ResolveEndpointCandidates(model, pool, excluded, operations...)
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no healthy endpoints available for model %s", model)
 	}
@@ -774,16 +882,18 @@ func (r *Router) RouteRequest(ctx context.Context, model string, pool string, wo
 }
 
 // ResolveEndpointCandidates returns currently eligible endpoint candidates without reserving them.
-func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool) []*Endpoint {
-	var endpoints []*Endpoint
-	if pool != "" {
-		endpoints = r.registry.GetEndpointsForModelInPool(model, pool)
-	} else {
-		endpoints = r.registry.GetEndpointsForModel(model)
+func (r *Router) ResolveEndpointCandidates(model string, pool string, excluded map[string]bool, operations ...OperationType) []*Endpoint {
+	var operation OperationType
+	if len(operations) > 0 {
+		operation = operations[0]
 	}
+	var endpoints []*Endpoint
+	endpoints = r.registry.getAvailableEndpointsForModelOperation(model, pool, operation)
 
 	if len(endpoints) == 0 && pool != "" {
-		endpoints = r.registry.GetEndpointsForPool(pool)
+		// Preserve bootstrap compatibility before the first successful catalog
+		// refresh, but never route a known-incompatible discovered endpoint.
+		endpoints = r.registry.getBootstrapEndpointsForPool(pool)
 	}
 
 	filtered := filterExcludedEndpoints(endpoints, excluded)
@@ -946,9 +1056,12 @@ type Proxy struct {
 	server       *http.Server
 	logger       *zap.Logger
 
-	defaultPool string
-	listenAddr  string
+	defaultPool         string
+	listenAddr          string
+	maxRequestBodyBytes int64
 }
+
+const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
 
 // Config holds proxy configuration
 type Config struct {
@@ -959,6 +1072,7 @@ type Config struct {
 	RouteWatchNamespace   string      // Namespace to watch for routes (empty for all)
 	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
 	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
+	MaxRequestBodyBytes   int64       // Optional retained request-body ceiling; defaults to 256 MiB
 	Logger                *zap.Logger // Optional logger (defaults to production logger)
 }
 
@@ -979,6 +1093,10 @@ func NewProxy(cfg Config) *Proxy {
 		defaultPool: cfg.DefaultPool,
 		listenAddr:  cfg.ListenAddr,
 		logger:      logger,
+	}
+	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
+	if p.maxRequestBodyBytes <= 0 {
+		p.maxRequestBodyBytes = defaultMaxProxyRequestBodyBytes
 	}
 
 	// Initialize RouteWatcher if enabled
@@ -1006,8 +1124,11 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
+	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
+	apiMux.HandleFunc("/ai/v1/generate/batch", p.handleGenerateBatch)
 	apiMux.HandleFunc("/ai/v1/chat/completions", p.handleChatCompletions)
+	apiMux.HandleFunc("/ai/v1/models", p.handleModels)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 
@@ -1080,25 +1201,310 @@ func (p *Proxy) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "generate")
 }
 
+func (p *Proxy) handleRead(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "read")
+}
+
+func (p *Proxy) handleGenerateBatch(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "generate.batch")
+}
+
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "chat.completions")
+}
+
+const maxModelCatalogBytes = 8 << 20
+const maxMergedModelCatalogBytes = 32 << 20
+const maxConcurrentModelCatalogRequests = 8
+
+// handleModels publishes the conservative union of healthy upstream model
+// catalogs. When the same model is served by heterogeneous nodes, only fields
+// supported by every advertising node survive. This prevents discovery from
+// promising a batch or modality that a later routing decision cannot honor.
+func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p.registry.mu.RLock()
+	addresses := make([]string, 0, len(p.registry.endpoints))
+	for _, endpoint := range p.registry.endpoints {
+		if p.registry.isEndpointAvailableLocked(endpoint) {
+			addresses = append(addresses, endpoint.Address)
+		}
+	}
+	p.registry.mu.RUnlock()
+	if len(addresses) == 0 {
+		http.Error(w, "no healthy inference endpoints", http.StatusServiceUnavailable)
+		return
+	}
+
+	type catalogResult struct {
+		catalog map[string]json.RawMessage
+		err     error
+	}
+	resultBuffer := min(len(addresses), maxConcurrentModelCatalogRequests)
+	results := make(chan catalogResult, resultBuffer)
+	catalogSlots := make(chan struct{}, maxConcurrentModelCatalogRequests)
+	for _, address := range addresses {
+		go func(address string) {
+			select {
+			case catalogSlots <- struct{}{}:
+				defer func() { <-catalogSlots }()
+			case <-r.Context().Done():
+				results <- catalogResult{err: r.Context().Err()}
+				return
+			}
+			request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
+			if err != nil {
+				results <- catalogResult{err: err}
+				return
+			}
+			if authorization := p.registry.upstreamAuthorizationValue(); authorization != "" {
+				request.Header.Set("Authorization", authorization)
+			}
+			response, err := p.registry.client.Do(request)
+			if err != nil {
+				results <- catalogResult{err: err}
+				return
+			}
+			defer func() { _ = response.Body.Close() }()
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
+			if err != nil || len(body) > maxModelCatalogBytes {
+				results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
+				return
+			}
+			var catalog map[string]json.RawMessage
+			if err := json.Unmarshal(body, &catalog); err != nil {
+				results <- catalogResult{err: err}
+				return
+			}
+			results <- catalogResult{catalog: catalog}
+		}(address)
+	}
+
+	categories := map[string]map[string]json.RawMessage{}
+	successes := 0
+	failures := 0
+	mergedTooLarge := false
+	for range addresses {
+		result := <-results
+		if result.err != nil {
+			failures++
+			continue
+		}
+		successes++
+		if !mergedTooLarge {
+			mergeModelCatalog(categories, result.catalog)
+			mergedTooLarge = modelCatalogEncodedBytes(categories) > maxMergedModelCatalogBytes
+		}
+	}
+	if failures > 0 {
+		// Returning a partial catalog is unsafe: any omitted endpoint remains a
+		// routing candidate, so its possibly weaker limits would make the merged
+		// descriptor an over-promise.
+		http.Error(w, "inference model catalog is temporarily incomplete", http.StatusBadGateway)
+		return
+	}
+	if mergedTooLarge {
+		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
+		return
+	}
+	if successes == 0 {
+		http.Error(w, "inference model catalog is unavailable", http.StatusBadGateway)
+		return
+	}
+
+	modelNames := map[string]bool{}
+	response := make(map[string]any, len(categories)+1)
+	for category, models := range categories {
+		response[category] = models
+		for model := range models {
+			modelNames[model] = true
+		}
+	}
+	names := make([]string, 0, len(modelNames))
+	for model := range modelNames {
+		names = append(names, model)
+	}
+	sort.Strings(names)
+	data := make([]map[string]string, 0, len(names))
+	for _, model := range names {
+		data = append(data, map[string]string{"id": model})
+	}
+	response["data"] = data
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		p.logger.Warn("failed to encode merged inference model catalog", zap.Error(err))
+	}
+}
+
+func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) int {
+	total := 0
+	for category, models := range categories {
+		total += len(category)
+		for model, descriptor := range models {
+			total += len(model) + len(descriptor)
+		}
+	}
+	return total
+}
+
+var modelCatalogCategories = []string{
+	"embedders", "generators", "readers", "rerankers", "chunkers",
+	"extractors", "rewriters", "classifiers", "transcribers",
+}
+
+func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage) {
+	for _, category := range modelCatalogCategories {
+		raw, ok := source[category]
+		if !ok {
+			continue
+		}
+		var models map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &models); err != nil {
+			continue
+		}
+		if target[category] == nil {
+			target[category] = make(map[string]json.RawMessage)
+		}
+		for model, descriptor := range models {
+			if existing, duplicate := target[category][model]; duplicate {
+				target[category][model] = conservativeModelDescriptor(existing, descriptor)
+			} else {
+				target[category][model] = append(json.RawMessage(nil), descriptor...)
+			}
+		}
+	}
+}
+
+func conservativeModelDescriptor(left, right json.RawMessage) json.RawMessage {
+	var a, b map[string]any
+	if json.Unmarshal(left, &a) != nil || json.Unmarshal(right, &b) != nil {
+		return json.RawMessage(`{}`)
+	}
+	merged := make(map[string]any)
+	for key, av := range a {
+		bv, ok := b[key]
+		if !ok {
+			continue
+		}
+		if key == "inputs" || key == "capabilities" {
+			merged[key] = intersectStringValues(av, bv)
+			continue
+		}
+		if key == "inference_capabilities" {
+			if capabilities, ok := conservativeInferenceCapabilities(av, bv); ok {
+				merged[key] = capabilities
+			}
+			continue
+		}
+		if reflect.DeepEqual(av, bv) {
+			merged[key] = av
+		}
+	}
+	raw, err := json.Marshal(merged)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
+	a, aok := left.(map[string]any)
+	b, bok := right.(map[string]any)
+	if !aok || !bok || a["task"] != b["task"] {
+		return nil, false
+	}
+	aBatch, aok := a["batch"].(map[string]any)
+	bBatch, bok := b["batch"].(map[string]any)
+	if !aok || !bok {
+		return nil, false
+	}
+	aMode, aok := aBatch["mode"].(string)
+	bMode, bok := bBatch["mode"].(string)
+	if !aok || !bok {
+		return nil, false
+	}
+	mode := "serial_compatibility"
+	if aMode == "none" || bMode == "none" {
+		mode = "none"
+	} else if aMode == "native" && bMode == "native" {
+		mode = "native"
+	}
+	batch := map[string]any{"mode": mode}
+	for _, field := range []string{"preferred_items", "max_items", "max_encoded_bytes", "max_decoded_pixels", "max_media_parts_per_item"} {
+		av, aok := aBatch[field].(float64)
+		bv, bok := bBatch[field].(float64)
+		if !aok || !bok {
+			return nil, false
+		}
+		if av < bv {
+			batch[field] = av
+		} else {
+			batch[field] = bv
+		}
+	}
+	aFailures, aok := aBatch["per_item_failures"].(bool)
+	bFailures, bok := bBatch["per_item_failures"].(bool)
+	if !aok || !bok {
+		return nil, false
+	}
+	batch["per_item_failures"] = aFailures && bFailures
+	return map[string]any{"task": a["task"], "batch": batch}, true
+}
+
+func intersectStringValues(left, right any) []string {
+	a, aok := left.([]any)
+	b, bok := right.([]any)
+	if !aok || !bok {
+		return []string{}
+	}
+	rightValues := make(map[string]bool, len(b))
+	for _, value := range b {
+		if text, ok := value.(string); ok {
+			rightValues[text] = true
+		}
+	}
+	intersection := make([]string, 0, len(a))
+	for _, value := range a {
+		if text, ok := value.(string); ok && rightValues[text] {
+			intersection = append(intersection, text)
+		}
+	}
+	return intersection
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation string) {
 	start := time.Now()
 
 	// Parse request to get model
-	body, err := io.ReadAll(r.Body)
+	if r.ContentLength > p.maxRequestBodyBytes {
+		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, p.maxRequestBodyBytes+1))
 	if err != nil {
 		http.Error(w, "failed to read request", http.StatusBadRequest)
 		return
 	}
-
-	var req struct {
-		Model string `json:"model"`
+	if int64(len(body)) > p.maxRequestBodyBytes {
+		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
+		return
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+
+	model, err := proxyRequestModel(body, operation)
+	if err != nil {
+		http.Error(w, "invalid inference request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if model == "" {
+		http.Error(w, "model is required", http.StatusBadRequest)
 		return
 	}
 
@@ -1110,7 +1516,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 
 	lease, err := p.AcquireRequestResolution(r.Context(), ResolveRequest{
 		Operation: OperationType(operation),
-		Model:     req.Model,
+		Model:     model,
 		Headers:   headers,
 		Source: VerifiedSource{
 			Table: firstHeader(r, "X-Antfly-Source-Table", "X-Antfly-Table"),
@@ -1162,7 +1568,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			lease, err = lease.NextAttempt(r.Context())
 		}
 		if err != nil {
-			requestsTotal.WithLabelValues(pool, req.Model, operation, "no_endpoint").Inc()
+			requestsTotal.WithLabelValues(pool, model, operation, "no_endpoint").Inc()
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -1180,7 +1586,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			if attempt+1 < attempts && shouldRetryRequestError(matchedRoute, reqErr) {
 				continue
 			}
-			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "error")
 			http.Error(w, fmt.Sprintf("proxy request failed: %v", reqErr), http.StatusBadGateway)
 			return
 		}
@@ -1190,7 +1596,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		resp.Body = wrapForwardingBody(resp.Body, forwardingLease)
 		if attempt+1 < attempts && shouldRetryStatus(matchedRoute, resp.StatusCode) {
 			drainErr := copyResponse(io.Discard, resp)
-			p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+			p.registry.RecordModelLatency(endpoint.Address, model, time.Since(attemptStarted))
 			lease.RecordFailure()
 			if drainErr != nil {
 				lastErr = drainErr
@@ -1200,14 +1606,14 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		}
 
 		streamErr := copyResponse(w, resp)
-		p.registry.RecordModelLatency(endpoint.Address, req.Model, time.Since(attemptStarted))
+		p.registry.RecordModelLatency(endpoint.Address, model, time.Since(attemptStarted))
 
 		if resp.StatusCode >= 400 || streamErr != nil {
 			lease.RecordFailure()
-			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "error")
+			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "error")
 		} else {
 			lease.RecordSuccess()
-			p.recordProxyMetrics(endpoint.Pool, req.Model, operation, start, "success")
+			p.recordProxyMetrics(endpoint.Pool, model, operation, start, "success")
 		}
 		return
 	}
@@ -1218,14 +1624,50 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 			status = "error"
 		}
 		if lastEndpoint != nil {
-			p.recordProxyMetrics(lastEndpoint.Pool, req.Model, operation, start, status)
+			p.recordProxyMetrics(lastEndpoint.Pool, model, operation, start, status)
 		}
 		_ = copyResponse(w, lastResp)
 		return
 	}
 
-	p.recordProxyMetrics(pool, req.Model, operation, start, "error")
+	p.recordProxyMetrics(pool, model, operation, start, "error")
 	http.Error(w, fmt.Sprintf("proxy request failed: %v", lastErr), http.StatusBadGateway)
+}
+
+func proxyRequestModel(body []byte, operation string) (string, error) {
+	if operation != "generate.batch" {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(request.Model), nil
+	}
+
+	var batch struct {
+		Requests []struct {
+			Body struct {
+				Model string `json:"model"`
+			} `json:"body"`
+		} `json:"requests"`
+	}
+	if err := json.Unmarshal(body, &batch); err != nil {
+		return "", err
+	}
+	if len(batch.Requests) == 0 {
+		return "", errors.New("batch requests must not be empty")
+	}
+	model := strings.TrimSpace(batch.Requests[0].Body.Model)
+	if model == "" {
+		return "", errors.New("batch request model is required")
+	}
+	for _, item := range batch.Requests[1:] {
+		if strings.TrimSpace(item.Body.Model) != model {
+			return "", errors.New("mixed-model batches must be partitioned before routing")
+		}
+	}
+	return model, nil
 }
 
 func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {

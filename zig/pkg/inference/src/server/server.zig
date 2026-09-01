@@ -1366,8 +1366,9 @@ fn kernelJitMaterializesOptionalSessions(mode: graph_mod.kernel_jit.Mode) bool {
 
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
-const max_generate_batch_items: usize = 128;
-const max_read_batch_images: usize = 64;
+pub const max_generate_batch_items: usize = 128;
+pub const max_read_batch_images: usize = 64;
+pub const max_generate_media_parts_per_item: usize = 8;
 const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
@@ -5809,8 +5810,8 @@ pub const Node = struct {
     }
 
     fn estimateGenerateBatchAdmissionUnitsPreflight(self: *Node, requests: []const api.GenerateBatchRequestItem, pending: []const bool) usize {
-        _ = self;
         var total: usize = 1;
+        var media_shape: RequestMediaAdmissionShape = .{};
         for (requests, pending) |item, is_pending| {
             if (!is_pending) continue;
             const max_tokens: i32 = if (item.body.max_tokens) |value|
@@ -5822,8 +5823,9 @@ pub const Node = struct {
                 total,
                 estimateGenerateRequestAdmissionUnits(item.body, max_tokens),
             ) catch std.math.maxInt(usize);
+            media_shape.merge(generateRequestMediaShape(item.body));
         }
-        return total;
+        return @max(total, requestMediaAdmission(self, media_shape).units);
     }
 
     fn estimateGenerateAdmissionUnitsFromShape(text_bytes: usize, media_count: usize, max_tokens: i32) usize {
@@ -6581,10 +6583,12 @@ pub const Node = struct {
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
         var owned_messages = self.parseGenerateMessagesWithBudget(ctx.allocator, body, &media_budget) catch |err| {
-            if (err == error.InvalidImageUrl) {
+            if (remoteContentRequestFailure(err) == null and err != error.OutOfMemory) {
+                const failure = generateBatchMessageParseError(err).?;
                 return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "image_url must contain a URL string",
+                    .@"error" = failure.code,
+                    .message = failure.message,
+                    .retryable = failure.retryable,
                 });
             }
             return remoteContentErrorResponse(ctx, err);
@@ -7969,7 +7973,9 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         messages: []generation.Message = &.{},
         decoded_images: [][]u8 = &.{},
+        decoded_audio: [][]u8 = &.{},
         image_slices: [][]const []const u8 = &.{},
+        audio_slices: [][]const []const u8 = &.{},
         content_parts: [][]const generation.Message.ContentPart = &.{},
 
         fn deinit(self: *OwnedGenerateMessages) void {
@@ -7977,8 +7983,12 @@ pub const Node = struct {
             self.allocator.free(self.messages);
             for (self.decoded_images) |img| self.allocator.free(img);
             self.allocator.free(self.decoded_images);
+            for (self.decoded_audio) |clip| self.allocator.free(clip);
+            self.allocator.free(self.decoded_audio);
             for (self.image_slices) |slice| self.allocator.free(slice);
             self.allocator.free(self.image_slices);
+            for (self.audio_slices) |slice| self.allocator.free(slice);
+            self.allocator.free(self.audio_slices);
             for (self.content_parts) |parts| self.allocator.free(parts);
             self.allocator.free(self.content_parts);
             self.* = .{ .allocator = self.allocator };
@@ -8006,16 +8016,27 @@ pub const Node = struct {
             for (decoded_images.items) |img| allocator.free(img);
             decoded_images.deinit(allocator);
         }
+        var decoded_audio = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (decoded_audio.items) |clip| allocator.free(clip);
+            decoded_audio.deinit(allocator);
+        }
         var image_slices = std.ArrayListUnmanaged([]const []const u8).empty;
         errdefer {
             for (image_slices.items) |slice| allocator.free(slice);
             image_slices.deinit(allocator);
+        }
+        var audio_slices = std.ArrayListUnmanaged([]const []const u8).empty;
+        errdefer {
+            for (audio_slices.items) |slice| allocator.free(slice);
+            audio_slices.deinit(allocator);
         }
         var content_parts = std.ArrayListUnmanaged([]const generation.Message.ContentPart).empty;
         errdefer {
             for (content_parts.items) |parts| allocator.free(parts);
             content_parts.deinit(allocator);
         }
+        var media_part_count: usize = 0;
 
         for (body.messages) |msg| {
             const role: []const u8 = switch (msg.role) {
@@ -8029,6 +8050,8 @@ pub const Node = struct {
             defer text_buf.deinit(allocator);
             var msg_images = std.ArrayListUnmanaged([]const u8).empty;
             defer msg_images.deinit(allocator);
+            var msg_audio = std.ArrayListUnmanaged([]const u8).empty;
+            defer msg_audio.deinit(allocator);
             var msg_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
             defer msg_parts.deinit(allocator);
 
@@ -8037,20 +8060,21 @@ pub const Node = struct {
                     .string => |s| try text_buf.appendSlice(allocator, s),
                     .array => |arr| {
                         for (arr.items) |part| {
-                            if (part != .object) continue;
+                            if (part != .object) return error.UnsupportedGenerateContentPart;
                             const obj = part.object;
-                            const type_val = obj.get("type") orelse continue;
-                            if (type_val != .string) continue;
+                            const type_val = obj.get("type") orelse return error.GenerateContentPartTypeRequired;
+                            if (type_val != .string) return error.GenerateContentPartTypeMustBeString;
                             const ptype = type_val.string;
 
                             if (std.mem.eql(u8, ptype, "text")) {
-                                if (obj.get("text")) |tv| {
-                                    if (tv == .string) {
-                                        try text_buf.appendSlice(allocator, tv.string);
-                                        try msg_parts.append(allocator, .{ .text = tv.string });
-                                    }
-                                }
+                                const tv = obj.get("text") orelse return error.GenerateTextContentPartMissingText;
+                                if (tv != .string) return error.GenerateTextContentPartMissingText;
+                                try text_buf.appendSlice(allocator, tv.string);
+                                try msg_parts.append(allocator, .{ .text = tv.string });
                             } else if (std.mem.eql(u8, ptype, "image_url")) {
+                                media_part_count += 1;
+                                if (media_part_count > max_generate_media_parts_per_item)
+                                    return error.GenerateMediaPartLimitExceeded;
                                 const url_str = blk: {
                                     const iu = obj.get("image_url") orelse return error.InvalidImageUrl;
                                     if (iu == .object) {
@@ -8068,10 +8092,42 @@ pub const Node = struct {
                                 owns_downloaded_data = false;
                                 try msg_images.append(allocator, downloaded.data);
                                 try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
+                            } else if (std.mem.eql(u8, ptype, "media")) {
+                                media_part_count += 1;
+                                if (media_part_count > max_generate_media_parts_per_item)
+                                    return error.GenerateMediaPartLimitExceeded;
+                                const data_value = obj.get("data") orelse return error.GenerateMediaContentPartMissingData;
+                                if (data_value != .string) return error.GenerateMediaContentPartMissingData;
+                                const mime_value = obj.get("mime_type") orelse return error.GenerateMediaContentPartMissingMimeType;
+                                if (mime_value != .string) return error.GenerateMediaContentPartMissingMimeType;
+
+                                const decoded_payload = decodeMediaDataWithBudget(allocator, data_value.string, media_budget) catch |err| switch (err) {
+                                    error.OutOfMemory, error.RemoteContentTooLarge => return err,
+                                    else => return error.InvalidGenerateMediaBase64,
+                                };
+                                var owns_decoded_data = true;
+                                errdefer if (owns_decoded_data) allocator.free(decoded_payload.data);
+                                if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type))
+                                    return error.GenerateMediaDataMimeTypeMismatch;
+                                if (std.mem.startsWith(u8, mime_value.string, "image/")) {
+                                    try decoded_images.append(allocator, decoded_payload.data);
+                                    owns_decoded_data = false;
+                                    try msg_images.append(allocator, decoded_payload.data);
+                                    try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
+                                } else if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
+                                    try decoded_audio.append(allocator, decoded_payload.data);
+                                    owns_decoded_data = false;
+                                    try msg_audio.append(allocator, decoded_payload.data);
+                                    try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
+                                } else {
+                                    return error.UnsupportedGenerateMediaMimeType;
+                                }
+                            } else {
+                                return error.UnsupportedGenerateContentPart;
                             }
                         }
                     },
-                    else => {},
+                    else => return error.InvalidGenerateMessageContent,
                 }
             }
 
@@ -8088,6 +8144,16 @@ pub const Node = struct {
                 try image_slices.append(allocator, slice);
                 owns_msg_img_slice = false;
             }
+            const msg_audio_slice: ?[]const []const u8 = if (msg_audio.items.len > 0)
+                try allocator.dupe([]const u8, msg_audio.items)
+            else
+                null;
+            var owns_msg_audio_slice = msg_audio_slice != null;
+            errdefer if (owns_msg_audio_slice) allocator.free(msg_audio_slice.?);
+            if (msg_audio_slice) |slice| {
+                try audio_slices.append(allocator, slice);
+                owns_msg_audio_slice = false;
+            }
             const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0)
                 try allocator.dupe(generation.Message.ContentPart, msg_parts.items)
             else
@@ -8103,6 +8169,7 @@ pub const Node = struct {
                 .role = role,
                 .content = content,
                 .image_bytes = msg_img_slice,
+                .audio_bytes = msg_audio_slice,
                 .content_parts = msg_part_slice,
             });
             owns_content = false;
@@ -8118,17 +8185,29 @@ pub const Node = struct {
             for (owned_decoded_images) |img| allocator.free(img);
             allocator.free(owned_decoded_images);
         }
+        const owned_decoded_audio = try decoded_audio.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_decoded_audio) |clip| allocator.free(clip);
+            allocator.free(owned_decoded_audio);
+        }
         const owned_image_slices = try image_slices.toOwnedSlice(allocator);
         errdefer {
             for (owned_image_slices) |slice| allocator.free(slice);
             allocator.free(owned_image_slices);
+        }
+        const owned_audio_slices = try audio_slices.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_audio_slices) |slice| allocator.free(slice);
+            allocator.free(owned_audio_slices);
         }
         const owned_content_parts = try content_parts.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
             .messages = owned_messages,
             .decoded_images = owned_decoded_images,
+            .decoded_audio = owned_decoded_audio,
             .image_slices = owned_image_slices,
+            .audio_slices = owned_audio_slices,
             .content_parts = owned_content_parts,
         };
     }
@@ -8196,6 +8275,17 @@ pub const Node = struct {
             .code = "INVALID_REQUEST",
             .message = switch (err) {
                 error.InvalidImageUrl => "image_url must contain a URL string",
+                error.GenerateContentPartTypeRequired => "content part missing 'type' field",
+                error.GenerateContentPartTypeMustBeString => "content part 'type' must be a string",
+                error.GenerateTextContentPartMissingText => "text content part missing 'text' field",
+                error.GenerateMediaContentPartMissingData => "media content part missing 'data' field",
+                error.GenerateMediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
+                error.InvalidGenerateMediaBase64 => "invalid base64 media data",
+                error.GenerateMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+                error.UnsupportedGenerateMediaMimeType => "media content part must have an image/* or audio/* mime_type",
+                error.UnsupportedGenerateContentPart => "unsupported content part type",
+                error.InvalidGenerateMessageContent => "message content must be text or an array of content parts",
+                error.GenerateMediaPartLimitExceeded => "generation request contains too many media parts",
                 else => "request messages are invalid",
             },
             .retryable = false,
@@ -8415,6 +8505,24 @@ pub const Node = struct {
         };
     }
 
+    fn generateBatchImageError(err: anyerror) api.GenerateBatchError {
+        return .{
+            .code = switch (err) {
+                error.ImageDecodeFailed => "INVALID_IMAGE",
+                error.ImageTooLarge => "IMAGE_TOO_LARGE",
+                error.ImageBatchTooLarge => "IMAGE_BATCH_TOO_LARGE",
+                else => "INVALID_IMAGE",
+            },
+            .message = switch (err) {
+                error.ImageDecodeFailed => "image input is unsupported, corrupt, or has a malformed header",
+                error.ImageTooLarge => "image dimensions exceed the configured inference limit",
+                error.ImageBatchTooLarge => "aggregate decoded image pixels exceed server capacity",
+                else => "image input is invalid",
+            },
+            .retryable = false,
+        };
+    }
+
     const BatchGenerateTask = struct {
         allocator: std.mem.Allocator,
         pipeline: generation.NativeGenerationPipeline,
@@ -8586,6 +8694,9 @@ pub const Node = struct {
         }
         var pending = try ctx.allocator.alloc(bool, body.requests.len);
         defer ctx.allocator.free(pending);
+        var execution_attempted = try ctx.allocator.alloc(bool, body.requests.len);
+        defer ctx.allocator.free(execution_attempted);
+        @memset(execution_attempted, false);
 
         for (body.requests, 0..) |item, idx| {
             results[idx] = .{
@@ -8600,13 +8711,19 @@ pub const Node = struct {
             }
         }
 
+        var batch_media_shape: RequestMediaAdmissionShape = .{};
+        for (body.requests, pending) |item, is_pending| {
+            if (is_pending) batch_media_shape.merge(generateRequestMediaShape(item.body));
+        }
+        const media_admission = requestMediaAdmission(self, batch_media_shape);
         const admission_units = self.estimateGenerateBatchAdmissionUnitsPreflight(body.requests, pending);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
-        defer self.releaseSlotUnits(admission_units);
+        var reserved_units = admission_units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("generate_batch");
         defer self.metrics.decActive();
 
-        var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.requests, 0..) |item, idx| {
             if (!pending[idx]) continue;
             owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
@@ -8622,6 +8739,30 @@ pub const Node = struct {
             }
             pending[idx] = results[idx].@"error" == null;
         }
+
+        // Inspect every decoded image before model loading. This enforces both the
+        // configured dimension ceiling and an aggregate decoded-pixel budget for
+        // the whole request; rejected items do not consume the remaining budget.
+        var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        for (owned_messages, 0..) |owned, idx| {
+            if (!pending[idx]) continue;
+            const prior_pixels = decoded_budget.used_pixels;
+            var image_error: ?anyerror = null;
+            for (owned.decoded_images) |image| {
+                decoded_budget.addImage(image) catch |err| {
+                    image_error = err;
+                    break;
+                };
+            }
+            if (image_error) |err| {
+                decoded_budget.used_pixels = prior_pixels;
+                results[idx].@"error" = generateBatchImageError(err);
+                pending[idx] = false;
+            }
+        }
+        const decoded_required_units = decoded_budget.requiredUnits();
+        if (try self.growSlotUnits(ctx, reserved_units, decoded_required_units)) |resp| return resp;
+        reserved_units = @max(reserved_units, decoded_required_units);
 
         while (true) {
             const first_idx = blk: {
@@ -9208,6 +9349,7 @@ pub const Node = struct {
                         .out = &task_results[pos],
                     };
                     task_ran[pos] = true;
+                    execution_attempted[idx] = true;
                     if (execution_mode == .shared_serial) {
                         tasks[pos].run() catch {};
                         if (model.native_generate_coordinator) |coordinator| {
@@ -9254,8 +9396,12 @@ pub const Node = struct {
         }
 
         var succeeded: i64 = 0;
+        var attempted: i64 = 0;
         for (results) |item| {
             if (item.response != null and item.@"error" == null) succeeded += 1;
+        }
+        for (execution_attempted) |did_attempt| {
+            if (did_attempt) attempted += 1;
         }
         const total: i64 = @intCast(results.len);
         return ctx.json(api.GenerateBatchResponse{
@@ -9268,7 +9414,8 @@ pub const Node = struct {
                 .requested_items = total,
                 .native_batches = 0,
                 .native_items = 0,
-                .serial_items = total,
+                .serial_items = attempted,
+                .rejected_items = total - attempted,
                 .fallback_items = 0,
             },
         });
@@ -11078,6 +11225,7 @@ pub const Node = struct {
                 )),
                 .native_items = count,
                 .serial_items = 0,
+                .rejected_items = 0,
                 .fallback_items = 0,
             },
             .serial => .{
@@ -11085,6 +11233,7 @@ pub const Node = struct {
                 .native_batches = 0,
                 .native_items = 0,
                 .serial_items = count,
+                .rejected_items = 0,
                 .fallback_items = 0,
             },
             .fallback => .{
@@ -11092,6 +11241,7 @@ pub const Node = struct {
                 .native_batches = @intCast(batch.native_batches),
                 .native_items = 0,
                 .serial_items = count,
+                .rejected_items = 0,
                 .fallback_items = count,
                 .fallback_reason = if (batch.fallback_reason) |reason| .{ .value = reason } else .{ .value = "reader_fallback" },
             },
@@ -11782,6 +11932,8 @@ pub const Node = struct {
                     has_visual,
                     has_audio,
                     listing.manifest.native_arch_hint == .florence,
+                    task,
+                    requestMediaMaxBytes(self),
                     chat_template_failed,
                     listing.compatibility_level,
                 );
@@ -11840,6 +11992,8 @@ pub const Node = struct {
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
                     model.manifest.native_arch_hint == .florence,
+                    task,
+                    requestMediaMaxBytes(self),
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                 );
@@ -13557,6 +13711,10 @@ fn appendModelInfo(
     /// Normalized executor capability inferred from the resolved architecture.
     /// Publishing this keeps remote planners from guessing from model names.
     native_batch_read: bool,
+    /// Public task category and live request-media limit. These are executor
+    /// facts, not model-manifest claims.
+    task: []const u8,
+    request_media_max_bytes: usize,
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
@@ -13572,8 +13730,11 @@ fn appendModelInfo(
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
+    const publishes_inference_capabilities = std.mem.eql(u8, task, "readers") or
+        std.mem.eql(u8, task, "generators") or
+        std.mem.eql(u8, task, "embedders");
 
-    if (capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !inferred_native_batch_read and !has_known_inputs) {
+    if (!publishes_inference_capabilities and capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !inferred_native_batch_read and !has_known_inputs) {
         if (!chat_template_failed and compatibility_level.len == 0) {
             try buf.appendSlice(allocator, "{}");
             return;
@@ -13592,6 +13753,10 @@ fn appendModelInfo(
     try buf.appendSlice(allocator, "{\"capabilities\":[");
     var cap_index: usize = 0;
     for (capabilities) |cap| {
+        // The current generator accepts multimodal batch requests but executes
+        // them serially under the shared model lock. Do not leak a model-owned
+        // aspiration as a resolved node capability.
+        if (std.mem.eql(u8, cap, "native_batch_generate_multimodal")) continue;
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, cap);
         cap_index += 1;
@@ -13635,12 +13800,68 @@ fn appendModelInfo(
         input_index += 1;
     }
     try buf.append(allocator, ']');
+    try appendResolvedInferenceCapabilities(
+        buf,
+        allocator,
+        task,
+        native_batch_read,
+        request_media_max_bytes,
+    );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
         try buf.appendSlice(allocator, ",\"compatibility\":");
         try jsonEncodeString(buf, allocator, compatibility_level);
     }
     try buf.append(allocator, '}');
+}
+
+fn appendResolvedInferenceCapabilities(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    task: []const u8,
+    native_batch_read: bool,
+    request_media_max_bytes: usize,
+) !void {
+    const task_name: ?[]const u8 = if (std.mem.eql(u8, task, "readers"))
+        "read"
+    else if (std.mem.eql(u8, task, "generators"))
+        "generate"
+    else if (std.mem.eql(u8, task, "embedders"))
+        "embed"
+    else
+        null;
+    const resolved_task = task_name orelse return;
+    const max_items: usize = if (std.mem.eql(u8, resolved_task, "read"))
+        max_read_batch_images
+    else if (std.mem.eql(u8, resolved_task, "generate"))
+        max_generate_batch_items
+    else
+        64;
+    const native = std.mem.eql(u8, resolved_task, "embed") or
+        (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
+    const max_bytes = if (std.mem.eql(u8, resolved_task, "read"))
+        @min(default_max_read_batch_bytes, request_media_max_bytes)
+    else
+        request_media_max_bytes;
+    const max_parts: usize = if (std.mem.eql(u8, resolved_task, "generate")) max_generate_media_parts_per_item else 1;
+
+    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"task\":");
+    try jsonEncodeString(buf, allocator, resolved_task);
+    try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
+    try jsonEncodeString(buf, allocator, if (native) "native" else "serial_compatibility");
+    const limits = try std.fmt.allocPrint(
+        allocator,
+        ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_bytes\":{d},\"max_decoded_pixels\":0,\"max_media_parts_per_item\":{d},\"per_item_failures\":{s}}}}}",
+        .{
+            @min(@as(usize, 8), max_items),
+            max_items,
+            max_bytes,
+            max_parts,
+            if (std.mem.eql(u8, resolved_task, "generate")) "true" else "false",
+        },
+    );
+    defer allocator.free(limits);
+    try buf.appendSlice(allocator, limits);
 }
 
 test "standalone inference model catalog publishes resolved native reader batching" {
@@ -13658,6 +13879,8 @@ test "standalone inference model catalog publishes resolved native reader batchi
         false,
         false,
         true,
+        "readers",
+        32 * 1024 * 1024,
         false,
         "compatible",
     );
@@ -13670,6 +13893,10 @@ test "standalone inference model catalog publishes resolved native reader batchi
         if (capability == .string and std.mem.eql(u8, capability.string, "native_batch_read")) found = true;
     }
     try std.testing.expect(found);
+    const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
+    try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
+    try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_bytes").?.integer);
 }
 
 const InferenceHttpRouteAdmission = enum { none, inference };
@@ -14439,6 +14666,54 @@ test "generate batch preflight accepts bounded multimodal content for per-item p
     defer parsed.deinit();
 
     try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(parsed.value) == null);
+}
+
+test "generate parser consumes generic image and audio media parts strictly" {
+    const alloc = std.testing.allocator;
+    const request_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"media","mime_type":"image/png","data":"AQI="},{"type":"media","mime_type":"audio/wav","data":"AwQ="}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var node: Node = undefined;
+    node.config = .{};
+    var budget = RequestMediaBudget.init(32);
+    var messages = try node.parseGenerateMessagesWithBudget(alloc, parsed.value, &budget);
+    defer messages.deinit();
+    const shape = generateRequestMediaShape(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.messages.len);
+    try std.testing.expectEqual(@as(usize, 1), shape.image_count);
+    try std.testing.expectEqual(@as(usize, 8), shape.inline_bytes);
+    try std.testing.expectEqual(@as(usize, 1), messages.decoded_images.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.decoded_audio.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, messages.messages[0].image_bytes.?[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 4 }, messages.messages[0].audio_bytes.?[0]);
+    try std.testing.expectEqual(@as(usize, 3), messages.messages[0].content_parts.?.len);
+    try std.testing.expect(messages.messages[0].content_parts.?[1] == .image);
+    try std.testing.expect(messages.messages[0].content_parts.?[2] == .audio);
+
+    const unknown_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"metadata"}]}]}
+    ;
+    var unknown = try std.json.parseFromSlice(api.GenerateRequest, alloc, unknown_json, .{ .ignore_unknown_fields = true });
+    defer unknown.deinit();
+    var unknown_budget = RequestMediaBudget.init(32);
+    try std.testing.expectError(
+        error.UnsupportedGenerateContentPart,
+        node.parseGenerateMessagesWithBudget(alloc, unknown.value, &unknown_budget),
+    );
+
+    const too_many_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="}]}]}
+    ;
+    var too_many = try std.json.parseFromSlice(api.GenerateRequest, alloc, too_many_json, .{ .ignore_unknown_fields = true });
+    defer too_many.deinit();
+    var too_many_budget = RequestMediaBudget.init(64);
+    try std.testing.expectError(
+        error.GenerateMediaPartLimitExceeded,
+        node.parseGenerateMessagesWithBudget(alloc, too_many.value, &too_many_budget),
+    );
 }
 
 test "generate batch isolates native execution and serializes stateful GPU backends" {
@@ -19746,6 +20021,13 @@ const RequestMediaAdmissionShape = struct {
         self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, bytes) catch std.math.maxInt(usize);
     }
 
+    fn merge(self: *RequestMediaAdmissionShape, other: RequestMediaAdmissionShape) void {
+        self.image_count = std.math.add(usize, self.image_count, other.image_count) catch std.math.maxInt(usize);
+        self.inline_bytes = std.math.add(usize, self.inline_bytes, other.inline_bytes) catch std.math.maxInt(usize);
+        self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, other.borrowed_bytes) catch std.math.maxInt(usize);
+        self.has_remote = self.has_remote or other.has_remote;
+    }
+
     fn addImageUrlSlice(self: *RequestMediaAdmissionShape, source: []const u8) void {
         if (std.mem.startsWith(u8, source, "data:")) {
             self.addInline(source.len, true);
@@ -19810,9 +20092,17 @@ fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionSha
         for (content.array.items) |part| {
             if (part != .object) continue;
             const part_type = part.object.get("type") orelse continue;
-            if (part_type != .string or !std.mem.eql(u8, part_type.string, "image_url")) continue;
-            const image_url = part.object.get("image_url") orelse continue;
-            shape.addImageUrl(image_url);
+            if (part_type != .string) continue;
+            if (std.mem.eql(u8, part_type.string, "image_url")) {
+                const image_url = part.object.get("image_url") orelse continue;
+                shape.addImageUrl(image_url);
+                continue;
+            }
+            if (!std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            const mime = part.object.get("mime_type") orelse continue;
+            if (data != .string or mime != .string) continue;
+            shape.addInline(data.string.len, std.mem.startsWith(u8, mime.string, "image/"));
         }
     }
     return shape;
@@ -19863,7 +20153,7 @@ fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestM
     return shape;
 }
 
-fn requestMediaMaxBytes(self: *const Node) usize {
+pub fn requestMediaMaxBytes(self: *const Node) usize {
     const configured_u64 = effectiveRequestContentSecurity(self).max_download_size_bytes orelse
         default_max_request_media_bytes;
     const configured = std.math.cast(usize, configured_u64) orelse std.math.maxInt(usize);

@@ -55,6 +55,7 @@ type ResolutionLease struct {
 
 	proxy        *Proxy
 	model        string
+	operation    OperationType
 	workloadType WorkloadType
 	once         sync.Once
 	completed    uint32
@@ -110,6 +111,7 @@ func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest
 		Resolution:   resolution,
 		proxy:        p,
 		model:        req.Model,
+		operation:    req.Operation,
 		workloadType: resolveWorkloadType(req.Operation, req.Headers),
 		admission:    &leaseAdmission{},
 		attempts:     newLeaseAttempts(),
@@ -157,7 +159,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
-	endpoint, err := l.proxy.router.RouteRequest(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded)
+	endpoint, err := l.proxy.router.RouteRequest(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded, l.operation)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +173,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		},
 		proxy:        l.proxy,
 		model:        l.model,
+		operation:    l.operation,
 		workloadType: l.workloadType,
 		admission:    l.admission,
 		attempts:     l.attempts,
@@ -331,7 +334,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}
 
 	workloadType := resolveWorkloadType(routeReq.Operation, headers)
-	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, reserve)
+	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, routeReq.Operation, reserve)
 	if err != nil {
 		return nil, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
@@ -347,12 +350,12 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}, nil
 }
 
-func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, reserve bool) (*Endpoint, error) {
+func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, operation OperationType, reserve bool) (*Endpoint, error) {
 	if reserve {
-		return p.router.RouteRequest(ctx, model, pool, workloadType, nil)
+		return p.router.RouteRequest(ctx, model, pool, workloadType, nil, operation)
 	}
 
-	candidates := p.router.ResolveEndpointCandidates(model, pool, nil)
+	candidates := p.router.ResolveEndpointCandidates(model, pool, nil, operation)
 	if len(candidates) == 0 {
 		return nil, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,

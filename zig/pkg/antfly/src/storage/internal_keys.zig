@@ -323,14 +323,31 @@ pub fn pdfPageEmbeddingStageKeyAlloc(
     doc_key: []const u8,
     page_artifact_name: []const u8,
     embedding_name: []const u8,
+    attempt_id: []const u8,
     unit_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageAttemptRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name, attempt_id);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, unit_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageAttemptRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
 ) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     const root = try pdfPageEmbeddingStageRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name);
     defer alloc.free(root);
     try list.appendSlice(alloc, root);
-    try appendEncodedComponent(&list, alloc, unit_id);
+    try appendEncodedComponent(&list, alloc, attempt_id);
     return try list.toOwnedSlice(alloc);
 }
 

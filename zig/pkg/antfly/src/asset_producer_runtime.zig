@@ -685,6 +685,7 @@ pub const Runtime = struct {
         var native_batches: usize = 0;
         var native_items: usize = 0;
         var serial_items: usize = 0;
+        var rejected_items: usize = 0;
         var fallback_items: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
@@ -706,6 +707,7 @@ pub const Runtime = struct {
             native_batches += chunk_response.execution.native_batches;
             native_items += chunk_response.execution.native_items;
             serial_items += chunk_response.execution.serial_items;
+            rejected_items += chunk_response.execution.rejected_items;
             fallback_items += chunk_response.execution.fallback_items;
             start = end;
         }
@@ -716,6 +718,7 @@ pub const Runtime = struct {
                 .native_batches = native_batches,
                 .native_items = native_items,
                 .serial_items = serial_items,
+                .rejected_items = rejected_items,
                 .fallback_items = fallback_items,
                 .fallback_reason = if (fallback_items > 0) "remote_generator_fallback" else null,
             },
@@ -2027,7 +2030,27 @@ fn parseAntflyGenerateBatchResponseAlloc(
 
         if (item.object.get("error")) |err_value| {
             if (err_value != .null) {
-                out[index] = .{ .identity = identity, .result = .{ .item_error = error.GenerateBatchItemFailed } };
+                if (err_value != .object) return error.InvalidGenerateBatchResponse;
+                const code_value = err_value.object.get("code") orelse return error.InvalidGenerateBatchResponse;
+                const retryable_value = err_value.object.get("retryable") orelse return error.InvalidGenerateBatchResponse;
+                if (code_value != .string or retryable_value != .bool) return error.InvalidGenerateBatchResponse;
+                const retry_after_ms: ?u64 = if (err_value.object.get("retry_after_ms")) |value| switch (value) {
+                    .null => null,
+                    .integer => |raw| if (raw >= 0) std.math.cast(u64, raw) else null,
+                    else => return error.InvalidGenerateBatchResponse,
+                } else null;
+                out[index] = .{
+                    .identity = identity,
+                    .result = .{ .item_error = .{
+                        .cause = if (retryable_value.bool)
+                            error.GenerateBatchItemRetryable
+                        else
+                            error.GenerateBatchItemRejected,
+                        .code = inference_work.ItemFailure.Code.fromWire(code_value.string),
+                        .retryable = retryable_value.bool,
+                        .retry_after_ms = retry_after_ms,
+                    } },
+                };
                 seen[index] = true;
                 continue;
             }
@@ -2058,12 +2081,19 @@ fn executionReportFromGenerateWire(value: ?std.json.Value, item_count: usize) !i
         .native_batches = try nonNegativeJsonUsize(raw.object.get("native_batches")),
         .native_items = try nonNegativeJsonUsize(raw.object.get("native_items")),
         .serial_items = try nonNegativeJsonUsize(raw.object.get("serial_items")),
+        .rejected_items = try optionalNonNegativeJsonUsize(raw.object.get("rejected_items")),
         .fallback_items = try nonNegativeJsonUsize(raw.object.get("fallback_items")),
     };
     if (report.fallback_items > 0) report.fallback_reason = "remote_generator_fallback";
     try report.validate();
     if (report.requested_items != item_count) return error.InvalidGenerateBatchExecutionReport;
     return report;
+}
+
+fn optionalNonNegativeJsonUsize(value: ?std.json.Value) !usize {
+    const raw = value orelse return 0;
+    if (raw != .integer or raw.integer < 0) return error.InvalidGenerateBatchExecutionReport;
+    return std.math.cast(usize, raw.integer) orelse error.InvalidGenerateBatchExecutionReport;
 }
 
 fn nonNegativeJsonUsize(value: ?std.json.Value) !usize {
@@ -2648,7 +2678,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
-            .body = "{\"generators\":{\"local-generator\":{\"inputs\":[\"text\",\"image\"],\"capabilities\":[\"native_batch_generate_multimodal\"]}}}",
+            .body = "{\"generators\":{\"local-generator\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"generate\",\"batch\":{\"mode\":\"serial_compatibility\",\"preferred_items\":8,\"max_items\":128,\"max_encoded_bytes\":104857600,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":8,\"per_item_failures\":true}}}}}",
         } },
         .{ .method = .POST, .path = "/generate/batch", .assert_request = expectAntflyGenerateBatchRequest, .respond = .{
             .body =
@@ -2724,7 +2754,7 @@ test "asset producer runtime preserves remote reader identity and native executi
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
-            .body = "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"capabilities\":[\"native_batch_read\",\"inference.batch.max_items=2\"]}}}",
+            .body = "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}",
         } },
         .{ .method = .POST, .path = "/read", .respond = .{
             .body =
@@ -2800,13 +2830,13 @@ test "asset producer runtime preserves generator item failures" {
     const io = io_impl.io();
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
-            .body = "{\"generators\":{\"gemma4\":{\"inputs\":[\"text\",\"image\"],\"capabilities\":[\"native_batch_generate_multimodal\"]}}}",
+            .body = "{\"generators\":{\"gemma4\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"generate\",\"batch\":{\"mode\":\"serial_compatibility\",\"preferred_items\":8,\"max_items\":128,\"max_encoded_bytes\":104857600,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":8,\"per_item_failures\":true}}}}}",
         } },
         .{ .method = .POST, .path = "/generate/batch", .respond = .{
             .body =
             \\{"object":"generate.batch","data":[
             \\{"custom_id":"0","index":0,"response":{"choices":[{"message":{"content":"ok"}}]}},
-            \\{"custom_id":"1","index":1,"error":{"code":"bad_page","message":"unreadable"}}
+            \\{"custom_id":"1","index":1,"error":{"code":"INVALID_REQUEST","message":"unreadable","retryable":false}}
             \\],"summary":{"total":2,"succeeded":1,"failed":1},"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"fallback_items":0}}
             ,
         } },
@@ -2852,8 +2882,36 @@ test "asset producer runtime preserves generator item failures" {
     var batch = result.?;
     defer batch.deinit(alloc);
     try std.testing.expectEqualStrings("ok", batch.items[0].result.value);
-    try std.testing.expectEqual(error.GenerateBatchItemFailed, batch.items[1].result.item_error);
+    try std.testing.expectEqual(error.GenerateBatchItemRejected, batch.items[1].result.item_error.cause);
+    try std.testing.expectEqual(inference_work.ItemFailure.Code.invalid_request, batch.items[1].result.item_error.code);
+    try std.testing.expect(!batch.items[1].result.item_error.retryable);
     try std.testing.expect(batch.items[1].identity.eql(.{ .item_id = "page-2", .page_number = 2 }));
+}
+
+test "generator item failures preserve remote retry guidance" {
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "one", .item_id = "page-1" },
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "two", .item_id = "page-2" },
+    };
+    const payload =
+        \\{"data":[
+        \\{"index":0,"error":{"code":"SERVICE_UNAVAILABLE","retryable":true,"retry_after_ms":1250}},
+        \\{"index":1,"error":{"code":"CONTENT_TOO_LARGE","retryable":false}}
+        \\],"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"rejected_items":0,"fallback_items":0}}
+    ;
+    var batch = try parseAntflyGenerateBatchResponseAlloc(std.testing.allocator, payload, &requests);
+    defer batch.deinit(std.testing.allocator);
+
+    const transient = batch.items[0].result.item_error;
+    try std.testing.expectEqual(error.GenerateBatchItemRetryable, transient.cause);
+    try std.testing.expectEqual(inference_work.ItemFailure.Code.service_unavailable, transient.code);
+    try std.testing.expect(transient.retryable);
+    try std.testing.expectEqual(@as(?u64, 1250), transient.retry_after_ms);
+
+    const terminal = batch.items[1].result.item_error;
+    try std.testing.expectEqual(error.GenerateBatchItemRejected, terminal.cause);
+    try std.testing.expectEqual(inference_work.ItemFailure.Code.content_too_large, terminal.code);
+    try std.testing.expect(!terminal.retryable);
 }
 
 test "asset producer runtime routes antfly reader without url to local provider" {

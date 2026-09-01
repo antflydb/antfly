@@ -115,7 +115,7 @@ pub const ProducedBatch = struct {
     pub fn intoOutputs(self: *@This(), alloc: Allocator) ![][]u8 {
         for (self.items) |item| switch (item.result) {
             .value => {},
-            .item_error => |err| return err,
+            .item_error => |failure| return failure.cause,
         };
         const out = try alloc.alloc([]u8, self.items.len);
         for (self.items, 0..) |*item, i| switch (item.result) {

@@ -15,7 +15,7 @@ pub const ContentSecurityConfig = struct {
     max_download_size_bytes: ?i64 = null,
     /// Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
     download_timeout_seconds: ?i64 = null,
-    /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation rejects multimodal content before fetch; non-inference scraping consumers do not enforce this setting.
+    /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation applies the same image-header admission before model execution; non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
     /// Whitelist of allowed path prefixes for file:// and s3:// URLs. The generic scraper treats omission as unrestricted and an explicit empty list as deny-all. Consumers may impose stricter defaults; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,

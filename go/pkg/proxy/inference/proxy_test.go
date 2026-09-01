@@ -3,12 +3,14 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1300,6 +1302,215 @@ func TestExtractModelNamesSupportsCategorizedResponses(t *testing.T) {
 	want := []string{"embedder-a", "generator-a", "openai-compatible", "reranker-a"}
 	if !slices.Equal(models, want) {
 		t.Fatalf("extractModelNames() = %#v, want %#v", models, want)
+	}
+}
+
+func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
+	operations, err := extractModelOperations(strings.NewReader(`{
+		"data": [{"id": "legacy"}],
+		"generators": {"shared": {}},
+		"readers": {"shared": {}, "reader-only": {}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !operations["shared"]["generate"] || !operations["shared"]["generate.batch"] || !operations["shared"]["read"] {
+		t.Fatalf("shared operations = %#v", operations["shared"])
+	}
+	if operations["reader-only"]["generate"] || !operations["reader-only"]["read"] {
+		t.Fatalf("reader-only operations = %#v", operations["reader-only"])
+	}
+	if len(operations["legacy"]) != 0 {
+		t.Fatalf("legacy generic catalog must remain task-unknown, got %#v", operations["legacy"])
+	}
+}
+
+func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://generator.internal", "primary", WorkloadTypeGeneral)
+	p.RegisterEndpoint("http://reader.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://generator.internal", map[string]map[OperationType]bool{
+		"shared": {"generate": true, "generate.batch": true},
+	})
+	p.registry.UpdateModelOperations("http://reader.internal", map[string]map[OperationType]bool{
+		"shared": {"read": true},
+	})
+
+	readResolution, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readResolution.Endpoint.Address != "http://reader.internal" {
+		t.Fatalf("read routed to %s", readResolution.Endpoint.Address)
+	}
+	generateResolution, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "generate", Model: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generateResolution.Endpoint.Address != "http://generator.internal" {
+		t.Fatalf("generation routed to %s", generateResolution.Endpoint.Address)
+	}
+}
+
+func TestResolveDoesNotPoolFallbackAfterCatalogDiscovery(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://known.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://known.internal", map[string]map[OperationType]bool{
+		"model-a": {"generate": true},
+	})
+
+	if _, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "generate", Model: "missing"}); err == nil {
+		t.Fatal("expected discovered endpoint to reject an absent model")
+	}
+}
+
+func TestProxyRoutesReadAndHomogeneousGenerateBatch(t *testing.T) {
+	t.Parallel()
+
+	var pathsMu sync.Mutex
+	var paths []string
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		pathsMu.Lock()
+		paths = append(paths, req.URL.Path)
+		pathsMu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://inference.internal", []string{"gemma4"})
+
+	read := httptest.NewRequest(http.MethodPost, "/ai/v1/read", strings.NewReader(`{"model":"gemma4"}`))
+	readRecorder := httptest.NewRecorder()
+	p.handleRead(readRecorder, read)
+	if readRecorder.Code != http.StatusOK {
+		t.Fatalf("read status = %d, want 200", readRecorder.Code)
+	}
+
+	batchBody := `{"mode":"sync","requests":[{"custom_id":"a","body":{"model":"gemma4"}},{"custom_id":"b","body":{"model":"gemma4"}}]}`
+	batch := httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(batchBody))
+	batchRecorder := httptest.NewRecorder()
+	p.handleGenerateBatch(batchRecorder, batch)
+	if batchRecorder.Code != http.StatusOK {
+		t.Fatalf("batch status = %d, want 200", batchRecorder.Code)
+	}
+
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	if !slices.Equal(paths, []string{"/ai/v1/read", "/ai/v1/generate/batch"}) {
+		t.Fatalf("forwarded paths = %v", paths)
+	}
+}
+
+func TestProxyRejectsMixedModelGenerateBatchBeforeForwarding(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	forwarded := false
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwarded = true
+		return nil, errors.New("must not forward")
+	})}
+	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://inference.internal", []string{"model-a", "model-b"})
+
+	body := `{"requests":[{"custom_id":"a","body":{"model":"model-a"}},{"custom_id":"b","body":{"model":"model-b"}}]}`
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", strings.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	if forwarded {
+		t.Fatal("mixed-model batch was forwarded")
+	}
+}
+
+func TestProxyBoundsRetainedInferenceRequestBody(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", MaxRequestBodyBytes: 16, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://inference.internal", []string{"model-a"})
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/ai/v1/generate", strings.NewReader(`{"model":"model-a","padding":"large"}`)),
+		func() *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "/ai/v1/generate", io.NopCloser(strings.NewReader(`{"model":"model-a","padding":"large"}`)))
+			req.ContentLength = -1
+			return req
+		}(),
+	} {
+		recorder := httptest.NewRecorder()
+		p.handleGenerate(recorder, request)
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want 413", recorder.Code)
+		}
+	}
+}
+
+func TestProxyModelCatalogIntersectsDuplicateCapabilities(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"generators":{"gemma4":{"inputs":["text","image"],"capabilities":["native_batch_generate_multimodal","shared"]}}}`
+		if req.URL.Host == "serial.internal" {
+			body = `{"generators":{"gemma4":{"inputs":["text","image"],"capabilities":["shared"]}}}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+	for _, address := range []string{"http://native.internal", "http://serial.internal"} {
+		p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+		p.registry.UpdateModels(address, []string{"gemma4"})
+	}
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	var response struct {
+		Generators map[string]struct {
+			Capabilities []string `json:"capabilities"`
+		} `json:"generators"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(response.Generators["gemma4"].Capabilities, []string{"shared"}) {
+		t.Fatalf("capabilities = %v, want conservative intersection", response.Generators["gemma4"].Capabilities)
+	}
+}
+
+func TestProxyModelCatalogFailsClosedWhenAnyCandidateFails(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "failed.internal" {
+			return nil, errors.New("catalog unavailable")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"generators":{"gemma4":{}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	for _, address := range []string{"http://healthy.internal", "http://failed.internal"} {
+		p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+		p.registry.UpdateModels(address, []string{"gemma4"})
+	}
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
 	}
 }
 

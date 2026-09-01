@@ -1090,6 +1090,13 @@ pub const DocStore = struct {
         build: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror![]u8,
     };
 
+    /// Read-only predicate evaluated inside the exact write transaction that
+    /// performs promotions and replay publication.
+    pub const TransactionalGuard = struct {
+        ptr: *anyopaque,
+        validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
+    };
+
     fn putBatchWithReplayOnceWithOptions(
         self: *DocStore,
         writes: []const KVPair,
@@ -1171,10 +1178,12 @@ pub const DocStore = struct {
         promotions: []const KeyPromotion,
         replay: ?ReplayAppend,
         transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
     ) !usize {
         var batch = try self.beginWriteBatchWithOptions(.{});
         errdefer batch.abort();
         var txn = batch.asTxn();
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
         const built_value = if (transactional_write) |builder|
             try builder.build(builder.ptr, self.alloc, &txn)
         else
@@ -1200,6 +1209,10 @@ pub const DocStore = struct {
         }
         for (writes) |kv| try txn.put(kv.key, kv.value);
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        // Recheck immediately before commit. A guard may contain a wall-clock
+        // lease expiry, and building a large replay value can outlive the tenure
+        // even though no competing writer can modify the record mid-transaction.
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
         try batch.commit();
         return promoted_bytes;
     }
@@ -1216,7 +1229,7 @@ pub const DocStore = struct {
         promotions: []const KeyPromotion,
         replay: ?ReplayAppend,
     ) !usize {
-        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null);
+        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null, null);
     }
 
     pub fn putBatchWithPromotionsReplayAndBuiltWrite(
@@ -1227,6 +1240,7 @@ pub const DocStore = struct {
         promotions: []const KeyPromotion,
         replay: ?ReplayAppend,
         transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
     ) !usize {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
@@ -1236,6 +1250,7 @@ pub const DocStore = struct {
                 promotions,
                 replay,
                 transactional_write,
+                transactional_guard,
             ) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
