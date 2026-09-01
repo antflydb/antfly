@@ -509,6 +509,26 @@ const RenderWaveControl = struct {
     }
 };
 
+const CombinedCancellation = struct {
+    source: reader.CancellationProbe,
+    operation: reader.CancellationProbe,
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        if (self.source.is_cancelled_fn) |check| {
+            if (check(self.source.context)) return true;
+        }
+        if (self.operation.is_cancelled_fn) |check| {
+            if (check(self.operation.context)) return true;
+        }
+        return false;
+    }
+
+    fn probe(self: *const @This()) reader.CancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+};
+
 const PageRenderWorker = struct {
     request: PageRenderRequest,
     profile: RenderProfile,
@@ -683,13 +703,14 @@ pub fn renderParsedPagesBatchAlloc(
     }
     if (requests.len > options.max_batch_pages) return error.RenderBatchTooLarge;
     const source_cancellation = parsed.cancellationProbe();
-    const cancellation = if (options.cancellation.is_cancelled_fn != null)
-        options.cancellation
-    else
-        source_cancellation;
+    const combined_cancellation = CombinedCancellation{
+        .source = source_cancellation,
+        .operation = options.cancellation,
+    };
+    const cancellation = combined_cancellation.probe();
     try cancellation.check();
     // Preflight reads the source Reader serially before private render forks
-    // exist. Install the operation probe for that phase, then restore the
+    // exist. Install the composed probe for that phase, then restore the
     // caller's session state before returning.
     parsed.setCancellationProbe(cancellation);
     defer parsed.setCancellationProbe(source_cancellation);
@@ -3549,6 +3570,11 @@ test "bounded render batch rejects an already-canceled window" {
             return true;
         }
     };
+    const Active = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return false;
+        }
+    };
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
     var parsed = try reader.Reader.init(std.testing.allocator, fixture);
     defer parsed.deinit();
@@ -3565,7 +3591,7 @@ test "bounded render batch rejects an already-canceled window" {
         std.testing.allocator,
         &parsed,
         &.{.{ .page_number = 1 }},
-        .{},
+        .{ .cancellation = .{ .is_cancelled_fn = Active.check } },
     ));
 }
 

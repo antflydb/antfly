@@ -8,7 +8,9 @@ hardening implemented
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
 preparation, media transport, scheduling, admission, identity, and failure
-semantics. Reader, generator, and embedder outputs remain deliberately distinct.
+semantics. The same model-work contract also covers reranking, chunking,
+extraction, rewriting, classification, and transcription. Every family keeps
+its own typed request and output semantics.
 
 Florence 2 is the first natively batched reader implementation, not the
 architecture boundary. Gemma4 multimodal is a generator: PDF OCR with Gemma4 is
@@ -41,12 +43,15 @@ bounded transformation stream
       +--> GeneratorExecutor -> generated text or tool output
       |
       +--> EmbedderExecutor  -> vectors
+      +--> Other typed model-family executors
+           rerank | chunk | extract | rewrite | classify | transcribe
 ```
 
 The reusable abstraction is document preparation plus typed work scheduling,
-not a universal reader. The three executor classes may share attachments,
+not a universal reader. All model-family executors may share attachments,
 admission, batching, provenance, cancellation, and per-item result envelopes;
-they must not share task semantics merely because all three can consume images.
+they must not share task semantics merely because several can consume the same
+prepared asset.
 
 ### Task-neutral document preparation
 
@@ -74,6 +79,12 @@ render profile; it must never be keyed by URL alone.
 | Read/OCR | Florence 2 | page image plus read prompt | structured page text |
 | Generate | Gemma4 multimodal | independent message containing a page image | generated text/tool output |
 | Embed | ClipClap | page image, text chunk, or audio | vector |
+| Rerank | text or multimodal reranker | query plus prepared candidates | ranked candidates |
+| Chunk | tokenizer/semantic chunker | extracted page/document text | chunks |
+| Extract | GLiNER or multimodal extractor | text, page image, or prepared item | structured extraction |
+| Rewrite | rewriter model | extracted or generated text | rewritten text |
+| Classify | classifier | one prepared logical item | classifications |
+| Transcribe | Whisper-family model | prepared audio item | transcription |
 
 A generator used for OCR is still a generator. It keeps generator sampling,
 chat-template, output-schema, tool, and result semantics. A reader keeps its
@@ -91,17 +102,21 @@ const InferenceCapabilities = struct {
     task: Task,
     input_modalities: Modalities,
     accepted_mime_types: MimeTypes,
-    input_granularity: enum { document, page, chunk },
+    input_granularity: enum { document, page, chunk, item },
     batch: struct {
         mode: enum { none, serial_compatibility, native },
         preferred_items: usize,
         max_items: usize,
-        max_encoded_bytes: usize,
-        max_decoded_pixels: u64,
+        // null means the executor has not published a hard ceiling.
+        max_encoded_bytes: ?usize,
+        max_decoded_pixels: ?u64,
         max_media_parts_per_item: usize,
         per_item_failures: bool,
     },
-    output: enum { read_result, generated_text, embedding },
+    output: enum {
+        read_result, generated_text, embedding, ranked_items, chunks,
+        extraction, rewritten_text, classification, transcription,
+    },
     result_cardinality: enum { one_per_item, one_per_request },
     prompt_policy: enum { explicit, model_default, structured_schema },
     borrowed_attachments: bool,
@@ -125,19 +140,27 @@ invocation again, so a caller cannot bypass the limits by skipping the planner.
 
 The same design applies when storage/enrichment and inference run on different
 Antfly nodes. Direct execution against a configured dedicated inference-node
-URL is supported by the reader, generator, and embedder clients. The node that
+URL is supported by the typed model clients. The node that
 owns enrichment prepares the document, performs bounded PDF parsing and page
 rendering, and retains each rendered window only until its consumers finish. A
 remote executor then sends that already-bounded window to the inference node.
 The PDF container and an unbounded set of page images are never forwarded as
 implicit remote state.
 
-Capability discovery is scoped to the resolved inference endpoint, model,
-task, and authentication identity. Thus admission uses the limits of the node
-that will execute the request, rather than assuming that all inference nodes
-have the same loaded model or backend. Work and result envelopes retain item,
-source-fingerprint, and page identities across the HTTP boundary, and the
-client validates cardinality and observed execution before publication.
+Capability discovery is scoped to the selected/default inference pool, model,
+task, and authentication identity. Antfly clients query
+`/ai/v1/models?model=<model>&task=<task>`, where task is one of `read`,
+`generate`, `embed`, `rerank`, `chunk`, `extract`, `rewrite`, `classify`, or
+`transcribe`, with the same pool and
+authorization headers used for execution. The proxy intersects only healthy
+endpoints that explicitly advertise the corresponding operation. Bootstrap
+inventory is eligible only before the first successful catalog refresh;
+successfully discovered generic inventory is task-unknown and fails closed.
+Thus admission uses limits that every routing candidate can honor rather than
+assuming all inference nodes have the same model or backend. Work and result
+envelopes retain item, source-fingerprint, and page identities across the HTTP
+boundary, and the client validates cardinality and observed execution before
+publication.
 
 Admission has two owners in a distributed deployment:
 
@@ -159,8 +182,9 @@ needed for throughput, belongs above the executor: partition into independent
 bounded requests, preserve per-item identity and failure, and aggregate their
 observed execution reports without assuming completion order.
 
-The Go inference proxy exposes `GET /ai/v1/models`, `POST /ai/v1/read`,
-`POST /ai/v1/generate/batch`, and the existing embedding surface. It routes a
+The Go inference proxy exposes `GET /ai/v1/models` and the reader, generator,
+embedding, reranking (including multimodal), chunking, extraction, rewriting,
+and transcription surfaces. It routes a
 homogeneous bounded batch intact by its nested model identity and rejects
 mixed-model batches before forwarding. Refreshed endpoint inventory retains
 the advertised task for each model; selection and failover filter by both model
@@ -462,6 +486,40 @@ document. They are architectural requirements, not Florence-specific cleanup:
     8 MiB, bounds the merged descriptor set at 32 MiB, and drains every worker
     before returning an error. Catalog scale therefore cannot create an
     unbounded request-scoped memory spike.
+37. **Successfully discovered task-unknown models still routed as every
+    operation.** Model inventory now has explicit bootstrap, task-unknown, and
+    known-operation states. Only known operation advertisements participate in
+    normal routing. Bootstrap compatibility is used only while a catalog has
+    never completed; a legacy generic entry cannot receive read or generation
+    traffic merely because its model name matches.
+38. **The proxy catalog described a different pool from request execution.**
+    Capability discovery now carries model and task scope and honors the same
+    explicit/default pool as execution. The proxy fans out only to healthy
+    operation-eligible endpoints in that scope and rejects a refresh if any
+    candidate no longer advertises the requested model/task. Unscoped legacy
+    listing remains pool-scoped rather than publishing a cluster-wide union.
+39. **Zero overloaded both an unknown limit and a real numeric value.** Encoded
+    byte and decoded-pixel limits are nullable in the normalized capability
+    contract. Proxy intersection treats legacy zero as unknown, preserves a
+    known finite ceiling when the other node is unknown, and emits null only
+    when every candidate is unknown. Inference nodes now publish their actual
+    aggregate decoded-pixel hard ceiling; dynamic admission may still be lower
+    when encoded media consumes the same request working set.
+40. **A render-window deadline replaced its session cancellation owner.** PDF
+    batch rendering now installs a stack-stable composite probe for the full
+    synchronous render call. Preflight, worker gates, private Reader forks, and
+    render/decode loops stop when either the document/session owner or the
+    window deadline cancels, and all launched workers are joined before return.
+41. **The normalized contract and distributed catalog still stopped at three
+    model families.** `Task`, typed output kinds, local/remote capability
+    resolution, server descriptors, and proxy-scoped discovery now cover all
+    nine current families: readers, generators, embedders, rerankers, chunkers,
+    extractors, rewriters, classifiers, and transcribers. Families without a
+    generic batch executor advertise `mode = none`, `max_items = 1`; they do
+    not borrow native-batch claims from another family. The proxy also forwards
+    rerank-multimodal, rewrite, and transcribe routes. Classification remains a
+    typed capability even where the public server exposes it through the
+    extraction surface.
 
 ### Post-review implementation contract
 
@@ -509,12 +567,13 @@ The hardening above follows four long-term rules:
 2. **Implemented:** local reader batching is selected from resolved model
    capabilities. Native and serial-compatibility modes are distinct, and OCR
    profiling no longer labels an accepted serial batch as native.
-3. **Implemented:** provider ABI v20 separates borrowed binary payload storage
+3. **Implemented:** provider ABI v21 separates borrowed binary payload storage
    from logical attachment references. One generator item may own several
    attachments, while read and embedding batches retain independent item,
    source, and page identity. Reader, generator, and embedder host paths borrow
    the same representation; remote transports encode only at the HTTP
-   boundary.
+   boundary. The version also makes nullable resource ceilings and the expanded
+   model-family task enum an explicit host/component compatibility boundary.
 4. **Implemented:** document OCR selects `reader` or `generator` explicitly.
    The generation batch endpoint accepts bounded multimodal requests and uses
    controlled serial execution for projector/session safety until a resolved
@@ -634,6 +693,10 @@ The hardening above follows four long-term rules:
     configurable hard retained-byte ceiling for both known and chunked lengths.
 27. **Implemented after discovery-memory review:** catalog fan-out concurrency,
     per-node bytes, and merged catalog bytes are independently bounded.
+28. **Implemented after model-family review:** the normalized capability and
+    distributed discovery contracts cover every current model family. Existing
+    task-specific executors remain distinct, and unbatched families publish a
+    conservative singleton capability until their own batch ABI exists.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

@@ -1499,10 +1499,36 @@ fn localModelCapabilities(
     model: []const u8,
     task: antfly.inference.work.Task,
 ) !antfly.inference.work.InferenceCapabilities {
+    if (task == .chunk and
+        (std.mem.eql(u8, model, "fixed_bert") or std.mem.eql(u8, model, "fixed_bpe")))
+    {
+        return .{
+            .task = .chunk,
+            .input_modalities = .{ .text = true },
+            .accepted_mime_types = .{ .text_plain = true },
+            .input_granularity = .item,
+            .batch = .{
+                .mode = .none,
+                .preferred_items = 1,
+                .max_items = 1,
+                .max_encoded_bytes = inference.server.requestMediaMaxBytes(node),
+            },
+            .output = .chunks,
+            .result_cardinality = .one_per_item,
+            .prompt_policy = .model_default,
+            .borrowed_attachments = false,
+        };
+    }
     const scope = switch (task) {
         .read => "readers",
         .generate => "generators",
         .embed => "embedders",
+        .rerank => "rerankers",
+        .chunk => "chunkers",
+        .extract => "extractors",
+        .rewrite => "rewriters",
+        .classify => "classifiers",
+        .transcribe => "transcribers",
     };
     const model_path = try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
     defer node.allocator.free(model_path);
@@ -1529,6 +1555,9 @@ fn localModelCapabilities(
             modalities.image = manifest.native_arch_hint == .clip;
             modalities.audio = manifest.native_arch_hint == .clap;
         },
+        .rerank, .chunk, .rewrite, .classify => modalities.text = true,
+        .extract => modalities.text = true,
+        .transcribe => modalities.audio = true,
     };
 
     const native_batch = switch (task) {
@@ -1537,16 +1566,32 @@ fn localModelCapabilities(
         // but executes each multimodal item under the shared model lock.
         .generate => false,
         .embed => true,
+        // These executors have task-specific request shapes. Until they expose
+        // a generic item-batch ABI, advertise only singleton execution.
+        .rerank, .chunk, .extract, .rewrite, .classify, .transcribe => false,
     };
     const max_items: usize = switch (task) {
         .read => inference.server.max_read_batch_images,
         .generate => inference.server.max_generate_batch_items,
         .embed => 64,
+        .rerank, .chunk, .extract, .rewrite, .classify, .transcribe => 1,
     };
+    const max_images = if (!modalities.image)
+        0
+    else if (task == .generate)
+        std.math.mul(usize, max_items, inference.server.max_generate_media_parts_per_item) catch std.math.maxInt(usize)
+    else
+        max_items;
     const output: antfly.inference.work.OutputKind = switch (task) {
         .read => .read_result,
         .generate => .generated_text,
         .embed => .embedding,
+        .rerank => .ranked_items,
+        .chunk => .chunks,
+        .extract => .extraction,
+        .rewrite => .rewritten_text,
+        .classify => .classification,
+        .transcribe => .transcription,
     };
     var result = antfly.inference.work.InferenceCapabilities{
         .task = task,
@@ -1564,30 +1609,38 @@ fn localModelCapabilities(
             .document
         else if (modalities.image)
             .page
+        else if (modalities.text and (task == .read or task == .generate or task == .embed))
+            .chunk
         else
-            .chunk,
+            .item,
         .batch = .{
-            .mode = if (native_batch) .native else .serial_compatibility,
+            .mode = if (native_batch) .native else if (max_items == 1) .none else .serial_compatibility,
             .preferred_items = @min(@as(usize, 8), max_items),
             .max_items = max_items,
             .max_encoded_bytes = inference.server.requestMediaMaxBytes(node),
-            // The server owns decoded-image admission. Zero means that this
-            // planner has no separate, truthful pixel ceiling to advertise.
-            .max_decoded_pixels = 0,
-            .max_media_parts_per_item = if (task == .generate) inference.server.max_generate_media_parts_per_item else 1,
+            .max_decoded_pixels = if (max_images > 0)
+                inference.server.requestMediaMaxDecodedPixels(node, max_images)
+            else
+                null,
+            .max_media_parts_per_item = if (task == .generate)
+                inference.server.max_generate_media_parts_per_item
+            else if (modalities.image or modalities.audio)
+                1
+            else
+                0,
             .per_item_failures = task == .generate,
         },
         .output = output,
         .result_cardinality = .one_per_item,
         .prompt_policy = .explicit,
-        .borrowed_attachments = true,
+        .borrowed_attachments = task == .read or task == .generate or task == .embed,
     };
     for (manifest.capabilities) |capability| {
         try result.batch.applyManifestCapability(capability);
     }
     // Manifests may tighten resource limits, but execution mode is a property
     // of the resolved server executor and cannot be upgraded by a model claim.
-    result.batch.mode = if (native_batch) .native else .serial_compatibility;
+    result.batch.mode = if (native_batch) .native else if (max_items == 1) .none else .serial_compatibility;
     // A model may lower max_items without redundantly overriding the
     // throughput hint. The hard ceiling always wins.
     result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);

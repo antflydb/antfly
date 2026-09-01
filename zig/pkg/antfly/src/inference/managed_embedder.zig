@@ -4118,11 +4118,11 @@ fn densePartBatchEnd(
         };
         const next_bytes = std.math.add(usize, encoded_bytes, item_bytes) catch
             return error.InferenceEncodedBytesExceeded;
-        if (capabilities.batch.max_encoded_bytes > 0 and
-            next_bytes > capabilities.batch.max_encoded_bytes)
-        {
-            if (end == start) return error.InferenceEncodedBytesExceeded;
-            break;
+        if (capabilities.batch.max_encoded_bytes) |limit| {
+            if (next_bytes > limit) {
+                if (end == start) return error.InferenceEncodedBytesExceeded;
+                break;
+            }
         }
         encoded_bytes = next_bytes;
     }

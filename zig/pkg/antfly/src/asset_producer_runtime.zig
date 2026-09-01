@@ -1472,12 +1472,12 @@ fn encodedReaderBatchEnd(
     capabilities: inference_work.BatchCapabilities,
 ) usize {
     const item_end = @min(start +| capabilities.max_items, images.len);
-    if (capabilities.max_encoded_bytes == 0) return item_end;
+    const max_encoded_bytes = capabilities.max_encoded_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
         const next = std.math.add(usize, bytes, images[end].bytes.len) catch break;
-        if (next > capabilities.max_encoded_bytes and end > start) break;
+        if (next > max_encoded_bytes and end > start) break;
         bytes = next;
     }
     return @max(start + 1, end);
@@ -1634,13 +1634,13 @@ fn generatorBatchEnd(
     start: usize,
 ) !usize {
     const item_end = @min(start +| capabilities.batch.max_items, requests.len);
-    if (capabilities.batch.max_encoded_bytes == 0) return item_end;
+    const max_encoded_bytes = capabilities.batch.max_encoded_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
         const item = try generatorRequestShape(alloc, capabilities, requests[end]);
         const next = std.math.add(usize, bytes, item.encoded_bytes) catch break;
-        if (next > capabilities.batch.max_encoded_bytes and end > start) break;
+        if (next > max_encoded_bytes and end > start) break;
         bytes = next;
     }
     return @max(start + 1, end);

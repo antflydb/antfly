@@ -338,7 +338,22 @@ fn capabilityCacheKeyAlloc(
 
 fn trimOperationSuffix(value: []const u8) []const u8 {
     var out = std.mem.trimEnd(u8, value, "/");
-    for ([_][]const u8{ "/read", "/generate", "/generate/batch", "/embeddings" }) |suffix| {
+    // Longest suffixes must come first because several operations share a
+    // prefix (for example generate and generate/batch).
+    for ([_][]const u8{
+        "/chat/completions",
+        "/generate/batch",
+        "/rerank_multimodal",
+        "/transcribe",
+        "/embeddings",
+        "/generate",
+        "/extract",
+        "/rewrite",
+        "/rerank",
+        "/chunk",
+        "/embed",
+        "/read",
+    }) |suffix| {
         if (std.mem.endsWith(u8, out, suffix)) {
             out = out[0 .. out.len - suffix.len];
             break;
@@ -359,11 +374,48 @@ pub fn modelsUrlAlloc(alloc: std.mem.Allocator, inference_url: []const u8) ![]u8
     return error.InvalidAntflyInferenceBaseUrl;
 }
 
+fn percentEncodeQueryValueAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (raw) |byte| {
+        if ((byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '-' or byte == '.' or byte == '_' or byte == '~')
+        {
+            try out.append(alloc, byte);
+        } else {
+            var buf: [3]u8 = undefined;
+            try out.appendSlice(alloc, try std.fmt.bufPrint(&buf, "%{X:0>2}", .{byte}));
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn scopedModelsUrlAlloc(
+    alloc: std.mem.Allocator,
+    inference_url: []const u8,
+    model: []const u8,
+    task: work.Task,
+) ![]u8 {
+    const base = try modelsUrlAlloc(alloc, inference_url);
+    defer alloc.free(base);
+    const encoded_model = try percentEncodeQueryValueAlloc(alloc, model);
+    defer alloc.free(encoded_model);
+    return try std.fmt.allocPrint(alloc, "{s}?model={s}&task={s}", .{ base, encoded_model, @tagName(task) });
+}
+
 fn taskCatalogName(task: work.Task) []const u8 {
     return switch (task) {
         .read => "readers",
         .generate => "generators",
         .embed => "embedders",
+        .rerank => "rerankers",
+        .chunk => "chunkers",
+        .extract => "extractors",
+        .rewrite => "rewriters",
+        .classify => "classifiers",
+        .transcribe => "transcribers",
     };
 }
 
@@ -372,6 +424,12 @@ fn outputForTask(task: work.Task) work.OutputKind {
         .read => .read_result,
         .generate => .generated_text,
         .embed => .embedding,
+        .rerank => .ranked_items,
+        .chunk => .chunks,
+        .extract => .extraction,
+        .rewrite => .rewritten_text,
+        .classify => .classification,
+        .transcribe => .transcription,
     };
 }
 
@@ -384,6 +442,15 @@ fn jsonCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !usize {
     const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
     if (value != .integer or value.integer < 0) return error.InvalidInferenceCapabilities;
     return std.math.cast(usize, value.integer) orelse error.InvalidInferenceCapabilities;
+}
+
+fn jsonOptionalCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !?usize {
+    const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
+    if (value == .null) return null;
+    if (value != .integer or value.integer < 0) return error.InvalidInferenceCapabilities;
+    const number = std.math.cast(usize, value.integer) orelse return error.InvalidInferenceCapabilities;
+    // Accept zero from pre-nullability servers as the legacy unknown sentinel.
+    return if (number == 0) null else number;
 }
 
 fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities {
@@ -404,8 +471,8 @@ fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities
         .mode = mode,
         .preferred_items = try jsonCapabilityUsize(value.object, "preferred_items"),
         .max_items = try jsonCapabilityUsize(value.object, "max_items"),
-        .max_encoded_bytes = try jsonCapabilityUsize(value.object, "max_encoded_bytes"),
-        .max_decoded_pixels = try jsonCapabilityUsize(value.object, "max_decoded_pixels"),
+        .max_encoded_bytes = try jsonOptionalCapabilityUsize(value.object, "max_encoded_bytes"),
+        .max_decoded_pixels = try jsonOptionalCapabilityUsize(value.object, "max_decoded_pixels"),
         .max_media_parts_per_item = try jsonCapabilityUsize(value.object, "max_media_parts_per_item"),
         .per_item_failures = per_item_value.bool,
     };
@@ -468,8 +535,10 @@ pub fn parseModelCapabilities(
             .document
         else if (modalities.image)
             .page
+        else if (modalities.text and (task == .read or task == .generate or task == .embed))
+            .chunk
         else
-            .chunk,
+            .item,
         // Older catalogs cannot prove live executor or request-limit facts.
         // Preserve compatibility safely as a singleton until the server
         // publishes the resolved descriptor below.
@@ -477,8 +546,8 @@ pub fn parseModelCapabilities(
             .mode = .none,
             .preferred_items = 1,
             .max_items = 1,
-            .max_encoded_bytes = 0,
-            .max_decoded_pixels = 0,
+            .max_encoded_bytes = null,
+            .max_decoded_pixels = null,
             .max_media_parts_per_item = if (modalities.image or modalities.audio) 1 else 0,
             .per_item_failures = false,
         },
@@ -505,7 +574,7 @@ pub fn discover(
     task: work.Task,
     headers: []const [2][]const u8,
 ) !?work.InferenceCapabilities {
-    const url = try modelsUrlAlloc(alloc, inference_url);
+    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, task);
     defer alloc.free(url);
     var response = try http.get(url, .{ .headers = headers });
     defer response.deinit();
@@ -535,7 +604,7 @@ fn discoverWithContext(
         @as(u64, 30_000),
         (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
     ));
-    const url = try modelsUrlAlloc(alloc, inference_url);
+    const url = try scopedModelsUrlAlloc(alloc, inference_url, model, task);
     defer alloc.free(url);
     var response = try http.get(url, .{
         .headers = headers,
@@ -573,6 +642,40 @@ test "remote Antfly capabilities fail closed for legacy execution claims" {
     try std.testing.expectEqual(@as(usize, 1), generator.batch.max_items);
 }
 
+test "remote Antfly capability parser supports every model family" {
+    const cases = [_]struct {
+        task: work.Task,
+        category: []const u8,
+        output: work.OutputKind,
+        input: []const u8,
+    }{
+        .{ .task = .read, .category = "readers", .output = .read_result, .input = "image" },
+        .{ .task = .generate, .category = "generators", .output = .generated_text, .input = "text" },
+        .{ .task = .embed, .category = "embedders", .output = .embedding, .input = "text" },
+        .{ .task = .rerank, .category = "rerankers", .output = .ranked_items, .input = "text" },
+        .{ .task = .chunk, .category = "chunkers", .output = .chunks, .input = "text" },
+        .{ .task = .extract, .category = "extractors", .output = .extraction, .input = "text" },
+        .{ .task = .rewrite, .category = "rewriters", .output = .rewritten_text, .input = "text" },
+        .{ .task = .classify, .category = "classifiers", .output = .classification, .input = "text" },
+        .{ .task = .transcribe, .category = "transcribers", .output = .transcription, .input = "audio" },
+    };
+    for (cases) |case| {
+        const payload = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"{s}\":{{\"model\":{{\"inputs\":[\"{s}\"],\"inference_capabilities\":{{\"task\":\"{s}\",\"batch\":{{\"mode\":\"none\",\"preferred_items\":1,\"max_items\":1,\"max_encoded_bytes\":null,\"max_decoded_pixels\":null,\"max_media_parts_per_item\":0,\"per_item_failures\":false}}}}}}}}}}",
+            .{ case.category, case.input, @tagName(case.task) },
+        );
+        defer std.testing.allocator.free(payload);
+        const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "model", case.task)).?;
+        try std.testing.expectEqual(case.output, capabilities.output);
+        if (case.task == .read or case.task == .generate or case.task == .embed) {
+            try std.testing.expect(capabilities.input_granularity != .item);
+        } else {
+            try std.testing.expectEqual(work.InputGranularity.item, capabilities.input_granularity);
+        }
+    }
+}
+
 test "remote Antfly model catalog URL normalizes service and operation URLs" {
     const root = try modelsUrlAlloc(std.testing.allocator, "http://localhost:8082");
     defer std.testing.allocator.free(root);
@@ -580,6 +683,42 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
     const read = try modelsUrlAlloc(std.testing.allocator, "http://localhost:8082/ai/v1/read");
     defer std.testing.allocator.free(read);
     try std.testing.expectEqualStrings("http://localhost:8082/ai/v1/models", read);
+
+    for ([_][]const u8{
+        "embed",
+        "embeddings",
+        "chunk",
+        "rerank",
+        "rerank_multimodal",
+        "extract",
+        "generate",
+        "generate/batch",
+        "chat/completions",
+        "rewrite",
+        "transcribe",
+    }) |operation| {
+        const operation_url = try std.fmt.allocPrint(std.testing.allocator, "http://localhost:8082/ai/v1/{s}", .{operation});
+        defer std.testing.allocator.free(operation_url);
+        const catalog_url = try modelsUrlAlloc(std.testing.allocator, operation_url);
+        defer std.testing.allocator.free(catalog_url);
+        try std.testing.expectEqualStrings("http://localhost:8082/ai/v1/models", catalog_url);
+    }
+
+    const scoped = try scopedModelsUrlAlloc(std.testing.allocator, "http://localhost:8082/ai/v1/generate/batch", "owner/gemma 4", .generate);
+    defer std.testing.allocator.free(scoped);
+    try std.testing.expectEqualStrings(
+        "http://localhost:8082/ai/v1/models?model=owner%2Fgemma%204&task=generate",
+        scoped,
+    );
+}
+
+test "remote Antfly capability parser maps legacy zero and explicit null to unknown" {
+    const payload =
+        \\{"readers":{"florence":{"inputs":["image"],"inference_capabilities":{"task":"read","batch":{"mode":"native","preferred_items":2,"max_items":4,"max_encoded_bytes":null,"max_decoded_pixels":0,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "florence", .read)).?;
+    try std.testing.expectEqual(@as(?usize, null), capabilities.batch.max_encoded_bytes);
+    try std.testing.expectEqual(@as(?u64, null), capabilities.batch.max_decoded_pixels);
 }
 
 test "remote Antfly capability single-flight wait observes deadline and cancellation" {

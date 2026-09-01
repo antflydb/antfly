@@ -11888,8 +11888,30 @@ pub const Node = struct {
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
-                try body.appendSlice(a, "\"fixed_bert\":{\"inputs\":[\"text\"]},\"fixed_bpe\":{\"inputs\":[\"text\"]}");
-                model_count += 2;
+                for ([_][]const u8{ "fixed_bert", "fixed_bpe" }) |name| {
+                    if (model_count > 0) try body.append(a, ',');
+                    try jsonEncodeString(&body, a, name);
+                    try body.append(a, ':');
+                    try appendModelInfo(
+                        &body,
+                        a,
+                        "chunker",
+                        "",
+                        &.{},
+                        &.{"text"},
+                        false,
+                        false,
+                        false,
+                        false,
+                        task,
+                        requestMediaMaxBytes(self),
+                        modelCatalogDecodedPixelCap(self, task),
+                        false,
+                        "compatible",
+                    );
+                    try listed_model_names.put(a, name, {});
+                    model_count += 1;
+                }
             }
 
             // Add discovered models matching this task
@@ -11934,6 +11956,7 @@ pub const Node = struct {
                     listing.manifest.native_arch_hint == .florence,
                     task,
                     requestMediaMaxBytes(self),
+                    modelCatalogDecodedPixelCap(self, task),
                     chat_template_failed,
                     listing.compatibility_level,
                 );
@@ -11994,6 +12017,7 @@ pub const Node = struct {
                     model.manifest.native_arch_hint == .florence,
                     task,
                     requestMediaMaxBytes(self),
+                    modelCatalogDecodedPixelCap(self, task),
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                 );
@@ -13715,6 +13739,7 @@ fn appendModelInfo(
     /// facts, not model-manifest claims.
     task: []const u8,
     request_media_max_bytes: usize,
+    request_media_max_decoded_pixels: u64,
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
@@ -13730,9 +13755,7 @@ fn appendModelInfo(
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
-    const publishes_inference_capabilities = std.mem.eql(u8, task, "readers") or
-        std.mem.eql(u8, task, "generators") or
-        std.mem.eql(u8, task, "embedders");
+    const publishes_inference_capabilities = normalizedInferenceTask(task) != null;
 
     if (!publishes_inference_capabilities and capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !inferred_native_batch_read and !has_known_inputs) {
         if (!chat_template_failed and compatibility_level.len == 0) {
@@ -13792,6 +13815,8 @@ fn appendModelInfo(
         cap_index += 1;
     }
     try buf.appendSlice(allocator, "],\"inputs\":[");
+    const accepts_image = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image");
+    const accepts_audio = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
     var input_index: usize = 0;
     for ([_][]const u8{ "text", "image", "audio" }) |input| {
         if (!model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, input)) continue;
@@ -13806,6 +13831,9 @@ fn appendModelInfo(
         task,
         native_batch_read,
         request_media_max_bytes,
+        request_media_max_decoded_pixels,
+        accepts_image,
+        accepts_audio,
     );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
@@ -13815,53 +13843,89 @@ fn appendModelInfo(
     try buf.append(allocator, '}');
 }
 
+fn normalizedInferenceTask(task: []const u8) ?[]const u8 {
+    const mappings = [_]struct { []const u8, []const u8 }{
+        .{ "readers", "read" },
+        .{ "generators", "generate" },
+        .{ "embedders", "embed" },
+        .{ "rerankers", "rerank" },
+        .{ "chunkers", "chunk" },
+        .{ "extractors", "extract" },
+        .{ "rewriters", "rewrite" },
+        .{ "classifiers", "classify" },
+        .{ "transcribers", "transcribe" },
+    };
+    for (mappings) |mapping| {
+        if (std.mem.eql(u8, task, mapping[0])) return mapping[1];
+    }
+    return null;
+}
+
 fn appendResolvedInferenceCapabilities(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     task: []const u8,
     native_batch_read: bool,
     request_media_max_bytes: usize,
+    request_media_max_decoded_pixels: u64,
+    accepts_image: bool,
+    accepts_audio: bool,
 ) !void {
-    const task_name: ?[]const u8 = if (std.mem.eql(u8, task, "readers"))
-        "read"
-    else if (std.mem.eql(u8, task, "generators"))
-        "generate"
-    else if (std.mem.eql(u8, task, "embedders"))
-        "embed"
-    else
-        null;
-    const resolved_task = task_name orelse return;
+    const resolved_task = normalizedInferenceTask(task) orelse return;
     const max_items: usize = if (std.mem.eql(u8, resolved_task, "read"))
         max_read_batch_images
     else if (std.mem.eql(u8, resolved_task, "generate"))
         max_generate_batch_items
+    else if (std.mem.eql(u8, resolved_task, "embed"))
+        64
     else
-        64;
+        1;
     const native = std.mem.eql(u8, resolved_task, "embed") or
         (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
     const max_bytes = if (std.mem.eql(u8, resolved_task, "read"))
         @min(default_max_read_batch_bytes, request_media_max_bytes)
     else
         request_media_max_bytes;
-    const max_parts: usize = if (std.mem.eql(u8, resolved_task, "generate")) max_generate_media_parts_per_item else 1;
+    const accepts_media = accepts_image or accepts_audio;
+    const max_parts: usize = if (!accepts_media)
+        0
+    else if (std.mem.eql(u8, resolved_task, "generate"))
+        max_generate_media_parts_per_item
+    else
+        1;
 
     try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
-    try jsonEncodeString(buf, allocator, if (native) "native" else "serial_compatibility");
-    const limits = try std.fmt.allocPrint(
+    try jsonEncodeString(buf, allocator, if (native) "native" else if (max_items == 1) "none" else "serial_compatibility");
+    const limits_prefix = try std.fmt.allocPrint(
         allocator,
-        ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_bytes\":{d},\"max_decoded_pixels\":0,\"max_media_parts_per_item\":{d},\"per_item_failures\":{s}}}}}",
+        ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_bytes\":{d},\"max_decoded_pixels\":",
         .{
             @min(@as(usize, 8), max_items),
             max_items,
             max_bytes,
+        },
+    );
+    defer allocator.free(limits_prefix);
+    try buf.appendSlice(allocator, limits_prefix);
+    if (accepts_image) {
+        const pixels = try std.fmt.allocPrint(allocator, "{d}", .{request_media_max_decoded_pixels});
+        defer allocator.free(pixels);
+        try buf.appendSlice(allocator, pixels);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    const limits_suffix = try std.fmt.allocPrint(
+        allocator,
+        ",\"max_media_parts_per_item\":{d},\"per_item_failures\":{s}}}}}",
+        .{
             max_parts,
             if (std.mem.eql(u8, resolved_task, "generate")) "true" else "false",
         },
     );
-    defer allocator.free(limits);
-    try buf.appendSlice(allocator, limits);
+    defer allocator.free(limits_suffix);
+    try buf.appendSlice(allocator, limits_suffix);
 }
 
 test "standalone inference model catalog publishes resolved native reader batching" {
@@ -13881,6 +13945,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         true,
         "readers",
         32 * 1024 * 1024,
+        8 * 1024 * 1024,
         false,
         "compatible",
     );
@@ -13897,6 +13962,61 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
     try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
+}
+
+test "normalized inference capabilities cover every model family" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        category: []const u8,
+        task: []const u8,
+        kind: []const u8,
+        input: []const u8,
+    }{
+        .{ .category = "readers", .task = "read", .kind = "read", .input = "image" },
+        .{ .category = "generators", .task = "generate", .kind = "generator", .input = "text" },
+        .{ .category = "embedders", .task = "embed", .kind = "embedder", .input = "text" },
+        .{ .category = "rerankers", .task = "rerank", .kind = "reranker", .input = "text" },
+        .{ .category = "chunkers", .task = "chunk", .kind = "chunker", .input = "text" },
+        .{ .category = "extractors", .task = "extract", .kind = "extractor", .input = "text" },
+        .{ .category = "rewriters", .task = "rewrite", .kind = "rewriter", .input = "text" },
+        .{ .category = "classifiers", .task = "classify", .kind = "classifier", .input = "text" },
+        .{ .category = "transcribers", .task = "transcribe", .kind = "transcriber", .input = "audio" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.task, normalizedInferenceTask(case.category).?);
+        var body = std.ArrayListUnmanaged(u8).empty;
+        defer body.deinit(alloc);
+        try appendModelInfo(
+            &body,
+            alloc,
+            case.kind,
+            "",
+            &.{},
+            &.{case.input},
+            false,
+            std.mem.eql(u8, case.input, "image"),
+            std.mem.eql(u8, case.input, "audio"),
+            false,
+            case.category,
+            32 * 1024 * 1024,
+            8 * 1024 * 1024,
+            false,
+            "compatible",
+        );
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
+        defer parsed.deinit();
+        const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(case.task, resolved.object.get("task").?.string);
+        const batch = resolved.object.get("batch").?.object;
+        if (std.mem.eql(u8, case.task, "read") or std.mem.eql(u8, case.task, "generate") or std.mem.eql(u8, case.task, "embed")) {
+            try std.testing.expect(batch.get("max_items").?.integer > 1);
+        } else {
+            try std.testing.expectEqualStrings("none", batch.get("mode").?.string);
+            try std.testing.expectEqual(@as(i64, 1), batch.get("max_items").?.integer);
+        }
+        if (!std.mem.eql(u8, case.input, "image")) try std.testing.expect(batch.get("max_decoded_pixels").? == .null);
+    }
 }
 
 const InferenceHttpRouteAdmission = enum { none, inference };
@@ -20158,6 +20278,31 @@ pub fn requestMediaMaxBytes(self: *const Node) usize {
         default_max_request_media_bytes;
     const configured = std.math.cast(usize, configured_u64) orelse std.math.maxInt(usize);
     return @min(default_max_request_media_bytes, configured);
+}
+
+/// Maximum aggregate decoded pixels any otherwise-empty request can admit.
+/// Actual admission can be lower when encoded media is resident concurrently;
+/// this is the truthful hard ceiling advertised to remote planners.
+pub fn requestMediaMaxDecodedPixels(self: *const Node, max_images: usize) u64 {
+    const pixels = readDecodedPixelCapForLimits(
+        max_images,
+        self.inference_admission.capacity,
+        effectiveRequestContentSecurity(self).max_image_dimension,
+        0,
+    );
+    return @intCast(pixels);
+}
+
+fn modelCatalogDecodedPixelCap(self: *const Node, task: []const u8) u64 {
+    const max_images: usize = if (std.mem.eql(u8, task, "readers"))
+        max_read_batch_images
+    else if (std.mem.eql(u8, task, "generators"))
+        std.math.mul(usize, max_generate_batch_items, max_generate_media_parts_per_item) catch std.math.maxInt(usize)
+    else if (std.mem.eql(u8, task, "embedders"))
+        64
+    else
+        1;
+    return requestMediaMaxDecodedPixels(self, max_images);
 }
 
 fn downloadRemoteContent(self: *const Node, alloc: std.mem.Allocator, url: []const u8) !scraping.DownloadedContent {

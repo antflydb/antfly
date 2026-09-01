@@ -1352,6 +1352,33 @@ func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsSuccessfullyDiscoveredTaskUnknownModel(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://legacy.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://legacy.internal", map[string]map[OperationType]bool{
+		"shared": {},
+	})
+
+	_, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"})
+	if err == nil {
+		t.Fatal("task-unknown discovered model must not receive a read request")
+	}
+}
+
+func TestResolveUsesBootstrapFallbackBeforeCatalogDiscovery(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://bootstrap.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://bootstrap.internal", []string{"shared"})
+
+	resolution, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: "read", Model: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Endpoint.Address != "http://bootstrap.internal" {
+		t.Fatalf("read routed to %s", resolution.Endpoint.Address)
+	}
+}
+
 func TestResolveDoesNotPoolFallbackAfterCatalogDiscovery(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://known.internal", "primary", WorkloadTypeGeneral)
@@ -1486,6 +1513,123 @@ func TestProxyModelCatalogIntersectsDuplicateCapabilities(t *testing.T) {
 	}
 	if !slices.Equal(response.Generators["gemma4"].Capabilities, []string{"shared"}) {
 		t.Fatalf("capabilities = %v, want conservative intersection", response.Generators["gemma4"].Capabilities)
+	}
+}
+
+func TestProxyModelCatalogScopesDiscoveryToSelectedPoolAndTask(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: "cpu", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"readers":{"florence":{"inputs":["image"]}}}`
+		if req.URL.Host == "gpu.internal" {
+			body = `{"generators":{"gemma4":{"inputs":["text","image"],"inference_capabilities":{"task":"generate","batch":{"mode":"serial_compatibility","preferred_items":8,"max_items":128,"max_encoded_bytes":104857600,"max_decoded_pixels":1000000,"max_media_parts_per_item":8,"per_item_failures":true}}}}}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://cpu.internal", map[string]map[OperationType]bool{"florence": {"read": true}})
+	p.registry.UpdateModelOperations("http://gpu.internal", map[string]map[OperationType]bool{"gemma4": {"generate.batch": true}})
+
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=gemma4&task=generate", nil)
+	request.Header.Set("X-Antfly-Inference-Pool", "gpu")
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "florence") {
+		t.Fatalf("catalog escaped selected pool: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "gemma4") {
+		t.Fatalf("scoped model missing: %s", recorder.Body.String())
+	}
+}
+
+func TestCatalogTaskScopesCoverEveryRoutableModelFamily(t *testing.T) {
+	tests := []struct {
+		task      string
+		operation OperationType
+		category  string
+	}{
+		{"read", "read", "readers"},
+		{"generate", "generate.batch", "generators"},
+		{"embed", "embed", "embedders"},
+		{"rerank", "rerank", "rerankers"},
+		{"chunk", "chunk", "chunkers"},
+		{"extract", "extract", "extractors"},
+		{"rewrite", "rewrite", "rewriters"},
+		{"classify", "classify", "classifiers"},
+		{"transcribe", "transcribe", "transcribers"},
+	}
+	for _, test := range tests {
+		t.Run(test.task, func(t *testing.T) {
+			scope, err := catalogTaskScopeFor(test.task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scope.Operation != test.operation || scope.Category != test.category {
+				t.Fatalf("scope = %#v, want operation=%q category=%q", scope, test.operation, test.category)
+			}
+		})
+	}
+}
+
+func TestConservativeCapabilitiesPreserveKnownOptionalLimits(t *testing.T) {
+	left := map[string]any{
+		"task": "read",
+		"batch": map[string]any{
+			"mode": "native", "preferred_items": float64(8), "max_items": float64(16),
+			"max_encoded_bytes": nil, "max_decoded_pixels": float64(0),
+			"max_media_parts_per_item": float64(1), "per_item_failures": false,
+		},
+	}
+	right := map[string]any{
+		"task": "read",
+		"batch": map[string]any{
+			"mode": "native", "preferred_items": float64(4), "max_items": float64(8),
+			"max_encoded_bytes": float64(1024), "max_decoded_pixels": float64(2048),
+			"max_media_parts_per_item": float64(1), "per_item_failures": false,
+		},
+	}
+	merged, ok := conservativeInferenceCapabilities(left, right)
+	if !ok {
+		t.Fatal("capabilities did not merge")
+	}
+	batch := merged["batch"].(map[string]any)
+	if batch["max_encoded_bytes"] != float64(1024) || batch["max_decoded_pixels"] != float64(2048) {
+		t.Fatalf("known optional limits were discarded: %#v", batch)
+	}
+}
+
+func TestConservativeCapabilitiesPreserveSingletonExecution(t *testing.T) {
+	left := map[string]any{
+		"task": "chunk",
+		"batch": map[string]any{
+			"mode": "none", "preferred_items": float64(1), "max_items": float64(1),
+			"max_encoded_bytes": nil, "max_decoded_pixels": nil,
+			"max_media_parts_per_item": float64(0), "per_item_failures": false,
+		},
+	}
+	right := map[string]any{
+		"task": "chunk",
+		"batch": map[string]any{
+			"mode": "serial_compatibility", "preferred_items": float64(8), "max_items": float64(8),
+			"max_encoded_bytes": nil, "max_decoded_pixels": nil,
+			"max_media_parts_per_item": float64(0), "per_item_failures": false,
+		},
+	}
+	merged, ok := conservativeInferenceCapabilities(left, right)
+	if !ok {
+		t.Fatal("capabilities did not merge")
+	}
+	batch := merged["batch"].(map[string]any)
+	if batch["mode"] != "none" || batch["max_items"] != float64(1) {
+		t.Fatalf("singleton execution was upgraded: %#v", batch)
 	}
 }
 

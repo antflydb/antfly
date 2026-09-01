@@ -6379,10 +6379,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             if (!capabilities.supports(.{ .image = true }) or !capabilities.acceptsMimeType("image/png"))
                 return error.UnsupportedInferenceModality;
             admitted_batch_policy.max_items = @min(admitted_batch_policy.max_items, capabilities.batch.max_items);
-            if (capabilities.batch.max_encoded_bytes > 0)
-                admitted_batch_policy.max_bytes = @min(admitted_batch_policy.max_bytes, capabilities.batch.max_encoded_bytes);
-            if (capabilities.batch.max_decoded_pixels > 0)
-                admitted_batch_policy.max_pixels = capabilities.batch.max_decoded_pixels;
+            if (capabilities.batch.max_encoded_bytes) |limit|
+                admitted_batch_policy.max_bytes = @min(admitted_batch_policy.max_bytes, limit);
+            if (capabilities.batch.max_decoded_pixels) |limit|
+                admitted_batch_policy.max_pixels = limit;
         }
     }
     const inline_png_budget = if (kind == .ocr)
@@ -10844,10 +10844,7 @@ fn processPdfPageImageEmbedding(
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = @min(policy.batch_items orelse default_items, capability_items);
-    const capability_bytes = if (capabilities.batch.max_encoded_bytes > 0)
-        capabilities.batch.max_encoded_bytes
-    else
-        generated_ocr_default_render_inflight_bytes;
+    const capability_bytes = capabilities.batch.max_encoded_bytes orelse generated_ocr_default_render_inflight_bytes;
     const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 
@@ -10905,10 +10902,7 @@ fn processPdfPageImageEmbedding(
             .requested_dpi = render_config.ocr_render_dpi,
             .max_output_bytes = per_page_bytes,
         };
-        const model_pixel_cap = if (capabilities.batch.max_decoded_pixels > 0)
-            capabilities.batch.max_decoded_pixels
-        else
-            render_config.pdf_render_max_inflight_pixels;
+        const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse render_config.pdf_render_max_inflight_pixels;
         var rendered = try coordinator.session.renderPagesBatchAlloc(download_alloc, requests, .{
             .max_batch_pages = count,
             .max_parallel_pages = @min(render_config.pdf_render_max_parallel_pages, count),

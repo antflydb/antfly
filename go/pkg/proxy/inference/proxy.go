@@ -123,10 +123,20 @@ type ModelInfo struct {
 	RequestsTotal int64
 	AvgLatencyMs  float64
 	Latency       *RollingLatency
-	// Operations is nil for bootstrap/legacy inventory and otherwise contains
-	// the request operations this endpoint advertised for the model.
-	Operations map[OperationType]bool
+	// OperationState separates pre-discovery bootstrap inventory from a
+	// successfully discovered legacy entry whose task is unknown. Only explicit
+	// task advertisements are eligible for operation-aware routing.
+	OperationState ModelOperationState
+	Operations     map[OperationType]bool
 }
+
+type ModelOperationState uint8
+
+const (
+	ModelOperationsBootstrap ModelOperationState = iota
+	ModelOperationsTaskUnknown
+	ModelOperationsKnown
+)
 
 // CircuitBreaker implements the circuit breaker pattern
 type CircuitBreaker struct {
@@ -425,6 +435,11 @@ func (r *ModelRegistry) updateModels(address string, models []string, operations
 		}
 		if operations != nil {
 			ep.Models[model].Operations = cloneOperations(operations[model])
+			if len(ep.Models[model].Operations) == 0 {
+				ep.Models[model].OperationState = ModelOperationsTaskUnknown
+			} else {
+				ep.Models[model].OperationState = ModelOperationsKnown
+			}
 		}
 		delete(oldModels, model)
 
@@ -546,8 +561,11 @@ func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string, 
 }
 
 func modelSupportsOperation(info *ModelInfo, operation OperationType) bool {
-	if info == nil || len(info.Operations) == 0 || operation == "" {
+	if operation == "" {
 		return true
+	}
+	if info == nil || info.OperationState != ModelOperationsKnown {
+		return false
 	}
 	return info.Operations[operation]
 }
@@ -574,6 +592,18 @@ func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
 	for _, ep := range endpoints {
 		if r.isEndpointAvailableLocked(ep) {
 			result = append(result, ep)
+		}
+	}
+	return result
+}
+
+func (r *ModelRegistry) GetAvailableEndpoints() []*Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]*Endpoint, 0, len(r.endpoints))
+	for _, endpoint := range r.endpoints {
+		if r.isEndpointAvailableLocked(endpoint) {
+			result = append(result, endpoint)
 		}
 	}
 	return result
@@ -1123,7 +1153,10 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
+	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerank)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
+	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
+	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
 	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
 	apiMux.HandleFunc("/ai/v1/generate/batch", p.handleGenerateBatch)
@@ -1197,6 +1230,14 @@ func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "extract")
 }
 
+func (p *Proxy) handleRewrite(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "rewrite")
+}
+
+func (p *Proxy) handleTranscribe(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "transcribe")
+}
+
 func (p *Proxy) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "generate")
 }
@@ -1217,26 +1258,42 @@ const maxModelCatalogBytes = 8 << 20
 const maxMergedModelCatalogBytes = 32 << 20
 const maxConcurrentModelCatalogRequests = 8
 
-// handleModels publishes the conservative union of healthy upstream model
-// catalogs. When the same model is served by heterogeneous nodes, only fields
-// supported by every advertising node survive. This prevents discovery from
-// promising a batch or modality that a later routing decision cannot honor.
+// handleModels publishes a conservative catalog for one routing scope. Antfly
+// clients provide model+task query parameters, allowing the proxy to aggregate
+// exactly the operation-eligible endpoints in the selected/default pool.
+// Unscoped compatibility requests remain pool-scoped rather than leaking a
+// cluster-wide union that the subsequent request router cannot honor.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	p.registry.mu.RLock()
-	addresses := make([]string, 0, len(p.registry.endpoints))
-	for _, endpoint := range p.registry.endpoints {
-		if p.registry.isEndpointAvailableLocked(endpoint) {
-			addresses = append(addresses, endpoint.Address)
-		}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	task := strings.TrimSpace(r.URL.Query().Get("task"))
+	taskScope, taskErr := catalogTaskScopeFor(task)
+	if taskErr != nil || (model == "") != (taskScope.Operation == "") {
+		http.Error(w, "model and a valid task must be provided together", http.StatusBadRequest)
+		return
 	}
-	p.registry.mu.RUnlock()
+	pool := strings.TrimSpace(r.Header.Get("X-Antfly-Inference-Pool"))
+	if pool == "" {
+		pool = p.defaultPool
+	}
+	var endpoints []*Endpoint
+	if model != "" {
+		endpoints = p.router.ResolveEndpointCandidates(model, pool, nil, taskScope.Operation)
+	} else if pool == "" {
+		endpoints = p.registry.GetAvailableEndpoints()
+	} else {
+		endpoints = p.registry.GetEndpointsForPool(pool)
+	}
+	addresses := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		addresses = append(addresses, endpoint.Address)
+	}
 	if len(addresses) == 0 {
-		http.Error(w, "no healthy inference endpoints", http.StatusServiceUnavailable)
+		http.Error(w, "no operation-eligible inference endpoints", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -1284,6 +1341,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				results <- catalogResult{err: err}
 				return
 			}
+			if model != "" && !catalogContainsTaskModel(catalog, taskScope, model) {
+				results <- catalogResult{err: errors.New("upstream catalog no longer advertises the scoped model task")}
+				return
+			}
 			results <- catalogResult{catalog: catalog}
 		}(address)
 	}
@@ -1300,7 +1361,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		successes++
 		if !mergedTooLarge {
-			mergeModelCatalog(categories, result.catalog)
+			if model != "" {
+				mergeScopedModelCatalog(categories, result.catalog, taskScope, model)
+			} else {
+				mergeModelCatalog(categories, result.catalog)
+			}
 			mergedTooLarge = modelCatalogEncodedBytes(categories) > maxMergedModelCatalogBytes
 		}
 	}
@@ -1344,6 +1409,48 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type catalogTaskScope struct {
+	Operation OperationType
+	Category  string
+}
+
+var catalogTaskScopes = map[string]catalogTaskScope{
+	"read":       {Operation: "read", Category: "readers"},
+	"generate":   {Operation: "generate.batch", Category: "generators"},
+	"embed":      {Operation: "embed", Category: "embedders"},
+	"rerank":     {Operation: "rerank", Category: "rerankers"},
+	"chunk":      {Operation: "chunk", Category: "chunkers"},
+	"extract":    {Operation: "extract", Category: "extractors"},
+	"rewrite":    {Operation: "rewrite", Category: "rewriters"},
+	"classify":   {Operation: "classify", Category: "classifiers"},
+	"transcribe": {Operation: "transcribe", Category: "transcribers"},
+}
+
+func catalogTaskScopeFor(raw string) (catalogTaskScope, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return catalogTaskScope{}, nil
+	}
+	scope, ok := catalogTaskScopes[raw]
+	if !ok {
+		return catalogTaskScope{}, fmt.Errorf("unsupported inference task %q", raw)
+	}
+	return scope, nil
+}
+
+func catalogContainsTaskModel(catalog map[string]json.RawMessage, scope catalogTaskScope, model string) bool {
+	raw, ok := catalog[scope.Category]
+	if !ok {
+		return false
+	}
+	var models map[string]json.RawMessage
+	if json.Unmarshal(raw, &models) != nil {
+		return false
+	}
+	_, ok = models[model]
+	return ok
+}
+
 func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) int {
 	total := 0
 	for category, models := range categories {
@@ -1380,6 +1487,26 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 				target[category][model] = append(json.RawMessage(nil), descriptor...)
 			}
 		}
+	}
+}
+
+func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, scope catalogTaskScope, model string) {
+	raw := source[scope.Category]
+	var models map[string]json.RawMessage
+	if json.Unmarshal(raw, &models) != nil {
+		return
+	}
+	descriptor, ok := models[model]
+	if !ok {
+		return
+	}
+	if target[scope.Category] == nil {
+		target[scope.Category] = make(map[string]json.RawMessage)
+	}
+	if existing, duplicate := target[scope.Category][model]; duplicate {
+		target[scope.Category][model] = conservativeModelDescriptor(existing, descriptor)
+	} else {
+		target[scope.Category][model] = append(json.RawMessage(nil), descriptor...)
 	}
 }
 
@@ -1428,7 +1555,7 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	}
 	aMode, aok := aBatch["mode"].(string)
 	bMode, bok := bBatch["mode"].(string)
-	if !aok || !bok {
+	if !aok || !bok || !validBatchMode(aMode) || !validBatchMode(bMode) {
 		return nil, false
 	}
 	mode := "serial_compatibility"
@@ -1438,17 +1565,26 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		mode = "native"
 	}
 	batch := map[string]any{"mode": mode}
-	for _, field := range []string{"preferred_items", "max_items", "max_encoded_bytes", "max_decoded_pixels", "max_media_parts_per_item"} {
-		av, aok := aBatch[field].(float64)
-		bv, bok := bBatch[field].(float64)
-		if !aok || !bok {
+	for _, field := range []string{"preferred_items", "max_items"} {
+		value, ok := conservativePositiveLimit(aBatch[field], bBatch[field])
+		if !ok {
 			return nil, false
 		}
-		if av < bv {
-			batch[field] = av
-		} else {
-			batch[field] = bv
+		batch[field] = value
+	}
+	for _, field := range []string{"max_media_parts_per_item"} {
+		value, ok := conservativeRequiredLimit(aBatch[field], bBatch[field])
+		if !ok {
+			return nil, false
 		}
+		batch[field] = value
+	}
+	for _, field := range []string{"max_encoded_bytes", "max_decoded_pixels"} {
+		value, ok := conservativeOptionalLimit(aBatch[field], bBatch[field])
+		if !ok {
+			return nil, false
+		}
+		batch[field] = value
 	}
 	aFailures, aok := aBatch["per_item_failures"].(bool)
 	bFailures, bok := bBatch["per_item_failures"].(bool)
@@ -1457,6 +1593,65 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	}
 	batch["per_item_failures"] = aFailures && bFailures
 	return map[string]any{"task": a["task"], "batch": batch}, true
+}
+
+func validBatchMode(mode string) bool {
+	return mode == "none" || mode == "serial_compatibility" || mode == "native"
+}
+
+func conservativeRequiredLimit(left, right any) (float64, bool) {
+	a, aok := nonNegativeInteger(left)
+	b, bok := nonNegativeInteger(right)
+	if !aok || !bok {
+		return 0, false
+	}
+	return min(a, b), true
+}
+
+func conservativePositiveLimit(left, right any) (float64, bool) {
+	value, ok := conservativeRequiredLimit(left, right)
+	return value, ok && value > 0
+}
+
+// Encoded-byte and decoded-pixel ceilings are nullable. Older nodes used zero
+// for unknown, so zero is accepted as the legacy spelling of null. A known
+// finite ceiling always survives intersection with an unknown value.
+func conservativeOptionalLimit(left, right any) (any, bool) {
+	a, aKnown, aok := optionalLimit(left)
+	b, bKnown, bok := optionalLimit(right)
+	if !aok || !bok {
+		return nil, false
+	}
+	switch {
+	case aKnown && bKnown:
+		return min(a, b), true
+	case aKnown:
+		return a, true
+	case bKnown:
+		return b, true
+	default:
+		return nil, true
+	}
+}
+
+func optionalLimit(value any) (float64, bool, bool) {
+	if value == nil {
+		return 0, false, true
+	}
+	number, ok := nonNegativeInteger(value)
+	if !ok {
+		return 0, false, false
+	}
+	return number, number != 0, true
+}
+
+func nonNegativeInteger(value any) (float64, bool) {
+	number, ok := value.(float64)
+	const maxExactJSONInteger = float64(1<<53 - 1)
+	if !ok || number < 0 || number > maxExactJSONInteger || number != float64(uint64(number)) {
+		return 0, false
+	}
+	return number, true
 }
 
 func intersectStringValues(left, right any) []string {

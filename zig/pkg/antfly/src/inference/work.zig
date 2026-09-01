@@ -5,7 +5,7 @@
 
 //! Shared contracts for bounded multimodal work. These types describe the
 //! scheduler boundary; task-specific request and result types remain in their
-//! reader, generator, and embedder packages.
+//! owning model-family packages.
 
 const std = @import("std");
 
@@ -13,12 +13,21 @@ pub const Task = enum {
     read,
     generate,
     embed,
+    rerank,
+    chunk,
+    extract,
+    rewrite,
+    classify,
+    transcribe,
 };
 
 pub const InputGranularity = enum {
     document,
     page,
     chunk,
+    /// One task-specific logical request, such as a reranking query plus its
+    /// candidates or one audio transcription request.
+    item,
 };
 
 pub const BatchMode = enum {
@@ -31,6 +40,12 @@ pub const OutputKind = enum {
     read_result,
     generated_text,
     embedding,
+    ranked_items,
+    chunks,
+    extraction,
+    rewritten_text,
+    classification,
+    transcription,
 };
 
 pub const ResultCardinality = enum {
@@ -89,8 +104,11 @@ pub const BatchCapabilities = struct {
     mode: BatchMode = .none,
     preferred_items: usize = 1,
     max_items: usize = 1,
-    max_encoded_bytes: usize = 0,
-    max_decoded_pixels: u64 = 0,
+    /// Null means the executor did not publish a hard ceiling. Zero is never a
+    /// valid known byte/pixel ceiling, avoiding the former unknown/unbounded
+    /// sentinel ambiguity during distributed capability intersection.
+    max_encoded_bytes: ?usize = null,
+    max_decoded_pixels: ?u64 = null,
     max_media_parts_per_item: usize = 0,
     per_item_failures: bool = false,
 
@@ -123,9 +141,9 @@ pub const BatchCapabilities = struct {
         } else if (std.mem.startsWith(u8, capability, max_items_prefix)) {
             self.max_items = clampManifestLimit(self.max_items, try parseManifestLimit(usize, capability[max_items_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_bytes_prefix)) {
-            self.max_encoded_bytes = clampManifestLimit(self.max_encoded_bytes, try parseManifestLimit(usize, capability[max_bytes_prefix.len..]));
+            self.max_encoded_bytes = clampOptionalManifestLimit(self.max_encoded_bytes, try parseManifestLimit(usize, capability[max_bytes_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_pixels_prefix)) {
-            self.max_decoded_pixels = clampManifestLimit(self.max_decoded_pixels, try parseManifestLimit(u64, capability[max_pixels_prefix.len..]));
+            self.max_decoded_pixels = clampOptionalManifestLimit(self.max_decoded_pixels, try parseManifestLimit(u64, capability[max_pixels_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_parts_prefix)) {
             self.max_media_parts_per_item = clampManifestLimit(self.max_media_parts_per_item, try parseManifestLimit(usize, capability[max_parts_prefix.len..]));
         }
@@ -141,6 +159,10 @@ fn parseManifestLimit(comptime T: type, raw: []const u8) !T {
 
 fn clampManifestLimit(current: anytype, requested: @TypeOf(current)) @TypeOf(current) {
     return if (current == 0) requested else @min(current, requested);
+}
+
+fn clampOptionalManifestLimit(current: anytype, requested: std.meta.Child(@TypeOf(current))) @TypeOf(current) {
+    return if (current) |known| @min(known, requested) else requested;
 }
 
 /// Resource and modality facts measured from one concrete executor call.
@@ -171,6 +193,12 @@ pub const InferenceCapabilities = struct {
             .read => .read_result,
             .generate => .generated_text,
             .embed => .embedding,
+            .rerank => .ranked_items,
+            .chunk => .chunks,
+            .extract => .extraction,
+            .rewrite => .rewritten_text,
+            .classify => .classification,
+            .transcribe => .transcription,
         };
         if (self.output != expected_output) return error.InvalidInferenceCapabilities;
         if (self.input_granularity == .document and !self.input_modalities.document)
@@ -194,10 +222,12 @@ pub const InferenceCapabilities = struct {
         if (shape.item_count == 0) return;
         if (!self.batch.acceptsItems(shape.item_count)) return error.InferenceBatchTooLarge;
         if (!self.supports(shape.modalities)) return error.UnsupportedInferenceModality;
-        if (self.batch.max_encoded_bytes > 0 and shape.encoded_bytes > self.batch.max_encoded_bytes)
-            return error.InferenceEncodedBytesExceeded;
-        if (self.batch.max_decoded_pixels > 0 and shape.decoded_pixels > self.batch.max_decoded_pixels)
-            return error.InferenceDecodedPixelsExceeded;
+        if (self.batch.max_encoded_bytes) |limit| {
+            if (shape.encoded_bytes > limit) return error.InferenceEncodedBytesExceeded;
+        }
+        if (self.batch.max_decoded_pixels) |limit| {
+            if (shape.decoded_pixels > limit) return error.InferenceDecodedPixelsExceeded;
+        }
         if (shape.max_media_parts_per_item > 0 and
             (self.batch.max_media_parts_per_item == 0 or
                 shape.max_media_parts_per_item > self.batch.max_media_parts_per_item))
@@ -368,6 +398,29 @@ test "inference capabilities distinguish native and compatibility batches" {
     try std.testing.expect(!compatibility.batch.executesNatively(8));
 }
 
+test "inference capabilities keep every model family output typed" {
+    const cases = [_]struct { Task, OutputKind }{
+        .{ .read, .read_result },
+        .{ .generate, .generated_text },
+        .{ .embed, .embedding },
+        .{ .rerank, .ranked_items },
+        .{ .chunk, .chunks },
+        .{ .extract, .extraction },
+        .{ .rewrite, .rewritten_text },
+        .{ .classify, .classification },
+        .{ .transcribe, .transcription },
+    };
+    for (cases) |case| {
+        const capabilities = InferenceCapabilities{
+            .task = case[0],
+            .input_modalities = .{ .text = true },
+            .input_granularity = .item,
+            .output = case[1],
+        };
+        try capabilities.validate();
+    }
+}
+
 test "inference capabilities enforce invocation resource limits" {
     const capabilities = InferenceCapabilities{
         .task = .embed,
@@ -417,8 +470,8 @@ test "batch capabilities accept model-owned limit overrides" {
     try batch.applyManifestCapability("inference.batch.max_decoded_pixels=12345");
     try batch.applyManifestCapability("inference.batch.max_media_parts_per_item=3");
     try std.testing.expectEqual(@as(usize, 12), batch.max_items);
-    try std.testing.expectEqual(@as(usize, 4096), batch.max_encoded_bytes);
-    try std.testing.expectEqual(@as(u64, 12345), batch.max_decoded_pixels);
+    try std.testing.expectEqual(@as(?usize, 4096), batch.max_encoded_bytes);
+    try std.testing.expectEqual(@as(?u64, 12345), batch.max_decoded_pixels);
     try std.testing.expectEqual(@as(usize, 1), batch.max_media_parts_per_item);
     try batch.applyManifestCapability("inference.batch.max_items=128");
     try std.testing.expectEqual(@as(usize, 12), batch.max_items);
