@@ -15909,8 +15909,20 @@ pub const IndexManager = struct {
                         std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
                     }
                 }
-                if (densePostingWalMutationStoreEnabled() or index.experimentalPostingWalAuthoritative()) {
-                    index.enableExperimentalPostingWalMutations();
+                // A legacy v1 index may maintain a posting sidecar, but its
+                // LSM remains the mutation and rollback authority until this
+                // entry is either an unpublished native candidate or selected
+                // by an incompatible v2 pointer. Enabling WAL-only routing on
+                // every v1 index makes an inverse delete join the same aborted
+                // capture it is supposed to roll back.
+                const native_mutation_store_permitted = native_catalog_floor_permitted and
+                    (self.dense_native_candidate_build_authorized or
+                        authorize_dense_native_candidate or
+                        native_physical_v2);
+                if (index.experimentalPostingWalAuthoritative() or
+                    (densePostingWalMutationStoreEnabled() and native_mutation_store_permitted))
+                {
+                    index.enableNativePostingMutationStore();
                 }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
@@ -20473,17 +20485,18 @@ pub const IndexManager = struct {
 
     fn rollbackPendingDenseVectors(self: *IndexManager, entry: *DenseIndex, pending: []const PendingDenseVectorMapping) void {
         if (pending.len == 0) return;
-        // An authoritative source-sequence capture owns the complete
-        // pre-mutation native generation. Its caller's error path cancels that
-        // capture, restores metadata/search state, and clears the affected
-        // caches in constant time. Performing maintained HBC deletes here
-        // first is both redundant and dangerous: every inverse delete can
-        // recompute a centroid and reload external vectors, turning a
-        // recoverable mapping commit failure into a multi-minute public-write
-        // stall. Before authority exists, cancellation cannot restore a full
-        // generation and the inverse rollback below remains required.
+        // A native source-sequence capture owns the complete pre-mutation
+        // generation, including during a private candidate build before its
+        // irreversible authority marker is published. Its caller's error path
+        // cancels that capture, restores metadata/search state, and clears the
+        // affected caches in constant time. Performing maintained HBC deletes
+        // here first is both redundant and dangerous: the inverse would join
+        // the transaction it is meant to abort, and can also recompute a
+        // centroid and reload external vectors. A legacy mirrored capture has
+        // no pinned rollback base, so the inverse LSM rollback remains required.
         if (entry.index.experimentalPostingMutationCaptureActive() and
-            entry.index.experimentalPostingWalAuthoritative()) return;
+            (entry.index.nativePostingMutationStoreEnabled() or
+                entry.index.experimentalPostingWalAuthoritative())) return;
         const vector_ids = self.alloc.alloc(u64, pending.len) catch return;
         defer self.alloc.free(vector_ids);
         for (pending, 0..) |mapping, i| vector_ids[i] = mapping.vector_id;
@@ -26616,6 +26629,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
         const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expect(entry.native_physical_v2);
         try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+        try std.testing.expect(entry.index.nativePostingMutationStoreEnabled());
         try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
         const canonical_path = try manager.indexPath(cfg.name);
         defer alloc.free(canonical_path);
@@ -26654,7 +26668,27 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     const reopened_entry = reopened.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expect(reopened_entry.native_physical_v2);
     try std.testing.expect(reopened_entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expect(reopened_entry.index.nativePostingMutationStoreEnabled());
     try std.testing.expect(!try reopened.denseNativePhysicalMigrationRequired(cfg.name));
+
+    // Model a crash after the catalog commit but before construction-marker
+    // cleanup. Orphan collection must derive liveness from the catalog/pointer
+    // graph and preserve the selected generation even when its stale marker
+    // names a dead process.
+    const canonical_path = try reopened.indexPath(cfg.name);
+    defer alloc.free(canonical_path);
+    const relative_path = (try reopened.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(relative_path);
+    const active_path = try std.fs.path.join(alloc, &.{ path, relative_path });
+    defer alloc.free(active_path);
+    const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ active_path, repair_shadow_in_progress_file });
+    defer alloc.free(marker_path);
+    const stale_marker = try std.fmt.allocPrint(alloc, "{s}pid={d}\n", .{ repair_shadow_in_progress_magic, std.math.maxInt(u32) });
+    defer alloc.free(stale_marker);
+    try writeFileAtomicallyDurable(alloc, std.testing.io, marker_path, stale_marker);
+    _ = try reopened.cleanupInactiveRepairShadowRootsPage();
+    try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
 }
 
 test "fresh dense admission remains legacy before the native capability floor" {
@@ -26691,6 +26725,7 @@ test "fresh dense admission remains legacy before the native capability floor" {
     const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!entry.native_physical_v2);
     try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expect(!entry.index.nativePostingMutationStoreEnabled());
     try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
     const canonical_path = try manager.indexPath(cfg.name);
     defer alloc.free(canonical_path);
@@ -26739,6 +26774,57 @@ test "fresh dense admission reclaims a broken orphan construction pointer" {
     const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expect(entry.native_physical_v2);
     try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+}
+
+test "fresh dense admission reclaims a certified generation orphaned before catalog commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const cfg: types.IndexConfig = .{
+        .name = "dv_v2",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    var orphan_path: []u8 = undefined;
+    {
+        var constructing = try IndexManager.init(alloc, path);
+        defer constructing.deinit();
+        constructing.updateRange(.{ .start = "", .end = "" });
+        var stored_cfg = try indexConfigWithCoverageGeneration(alloc, constructing.io, cfg);
+        defer stored_cfg.deinit(alloc);
+        try constructing.prepareStorageForFreshCatalogEntry(&store, stored_cfg);
+        try constructing.provisionConfiguredIndexDirDurable(stored_cfg);
+        var generation = try constructing.stageFreshDenseNativeGeneration(stored_cfg);
+        defer generation.deinit();
+        orphan_path = try alloc.dupe(u8, generation.index_path);
+        errdefer alloc.free(orphan_path);
+        try constructing.openConfiguredIndexWithAuthorization(&store, stored_cfg, false, false, true);
+        try constructing.completeFreshDenseNativeGeneration(&store, stored_cfg, false, &generation);
+        try std.testing.expect(try constructing.activeIndexRootPointerUsesNativeV2(cfg.name));
+        // Deliberately omit logical catalog persistence and marker cleanup.
+        // This is the durable state left by a crash immediately before the
+        // catalog/outbox transaction becomes the visibility boundary.
+    }
+    defer alloc.free(orphan_path);
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.addManaged(&store, cfg, null);
+    const entry = reopened.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.native_physical_v2);
+    try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}),
+    );
 }
 
 test "fresh native dense backfill certifies one pinned source snapshot" {
@@ -34278,7 +34364,8 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
         },
     });
     try entry.index.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-    entry.index.enableExperimentalPostingWalMutations();
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    entry.index.enableNativePostingMutationStore();
     try entry.index.beginExperimentalPostingMutationCapture();
     try entry.index.batchInsertWithMetadata(&.{
         .{
@@ -34451,7 +34538,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     residency_probe.deinit();
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
-    var metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+    const metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
 
     // Exercise the production HBC -> IndexManager -> DocStore external-vector
     // wiring with one governed decoded hit and one true artifact miss. The
@@ -34499,8 +34586,9 @@ test "production external scorers use bounded cache-first artifact batches" {
         try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_metadata_vectors_loaded);
         try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_artifact_vectors_loaded);
     }
-    try std.testing.expectEqual(metadata_insertions_before + 1, entry.index.hbcCacheStats().metadata.insertions);
-    metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+    // Rerank metadata is a transaction-owned one-shot view. Retaining a copy
+    // cannot serve this path and only adds allocation/cache-lock churn.
+    try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
 
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
@@ -36948,7 +37036,7 @@ test "authoritative posting capture starts inside an existing replay session" {
     // environment remaining set in every future process.
     _ = try entry.index.publishExperimentalPostingCheckpoint(0);
     entry.index.experimental_posting_wal_authoritative.store(true, .release);
-    entry.index.enableExperimentalPostingWalMutations();
+    entry.index.enableNativePostingMutationStore();
 
     // A source window may not mistake an independently owned maintenance
     // capture for its own transaction boundary.

@@ -3565,6 +3565,15 @@ pub const ExperimentalPostingCaptureOwner = enum {
     maintenance,
 };
 
+const ExperimentalPostingMutationStoreMode = enum {
+    /// V1 compatibility authority. The optional immutable generation is a
+    /// query mirror; mutations and inverse rollback still reach the HBC LSM.
+    legacy_lsm,
+    /// Candidate/v2 authority. Mutations are staged over a pinned immutable
+    /// generation and committed through the native posting WAL.
+    native_wal,
+};
+
 pub const ExperimentalPostingCaptureLease = struct {
     epoch: u64,
     base_coverage: u64,
@@ -3588,7 +3597,11 @@ pub const HBCIndex = struct {
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
-    experimental_posting_wal_mutations_enabled: bool = false,
+    /// Selects the native WAL as the mutation authority for a complete,
+    /// immutable base generation. Legacy indexes may still mirror mutations
+    /// into an optional posting sidecar, but must keep mutating their LSM so
+    /// an aborted source transaction has a real inverse-rollback target.
+    experimental_posting_mutation_store_mode: ExperimentalPostingMutationStoreMode = .legacy_lsm,
     /// First authority publication is a physical-generation capability, not a
     /// side effect of observing an available native base. Ordinary active v1
     /// indexes keep dual-writing their compatibility store; only an inactive
@@ -7735,7 +7748,7 @@ pub const HBCIndex = struct {
         self.experimental_exact_vector_capture_enabled = capture_exact_vectors;
         self.clearExperimentalPostingMutationBase();
         const wal_authoritative = self.experimental_posting_wal_authoritative.load(.acquire);
-        if (self.experimental_posting_wal_mutations_enabled or wal_authoritative) {
+        if (self.experimental_posting_mutation_store_mode == .native_wal or wal_authoritative) {
             self.experimental_posting_mutation_base_generation = self.acquireExperimentalPostingReadGeneration();
             // A persisted authority marker is irreversible without an
             // explicit rebuild. Never route a later mutation into the stale
@@ -7840,8 +7853,14 @@ pub const HBCIndex = struct {
     /// Routes query-facing HBC mutations through the committed posting WAL
     /// once an immutable base generation is available. Bootstrap and rebuild
     /// still use the general store until the first complete checkpoint exists.
-    pub fn enableExperimentalPostingWalMutations(self: *HBCIndex) void {
-        self.experimental_posting_wal_mutations_enabled = true;
+    pub fn enableNativePostingMutationStore(self: *HBCIndex) void {
+        std.debug.assert(self.experimental_posting_authority_transition_permitted or
+            self.experimental_posting_wal_authoritative.load(.acquire));
+        self.experimental_posting_mutation_store_mode = .native_wal;
+    }
+
+    pub fn nativePostingMutationStoreEnabled(self: *const HBCIndex) bool {
+        return self.experimental_posting_mutation_store_mode == .native_wal;
     }
 
     pub fn setExperimentalPostingAuthorityTransitionPermitted(self: *HBCIndex, permitted: bool) void {
@@ -7858,14 +7877,13 @@ pub const HBCIndex = struct {
         self.experimental_posting_capture_base_source_sequence = 0;
         self.experimental_posting_capture_max_mutation_sequence = 0;
         var mutation_base_restored = true;
-        if (self.experimental_posting_wal_authoritative.load(.acquire) and
-            self.experimental_posting_mutation_base_generation != null)
-        {
+        if (self.experimental_posting_mutation_base_generation != null) {
             // The source window may fail after one or more local HBC
             // transactions committed but before their posting-WAL batch was
-            // published. Those transactions were WAL-only for derived state;
-            // restore mutable topology and discard caches populated from the
-            // abandoned overlay before admitting another query or replay.
+            // published. Acquiring this base is itself the explicit decision
+            // to route the window away from the compatibility LSM; restore it
+            // even while a private native candidate has not yet published its
+            // irreversible authority marker.
             self.restoreExperimentalPostingMutationBase() catch |err| {
                 mutation_base_restored = false;
                 self.disableExperimentalPostingReads();
@@ -18933,9 +18951,14 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
     try model.ensureCoverageMemberCapacity(alloc, 8_192);
     try model.ensureLookupCapacity(alloc, 8_192);
     try model.resetCoverageVisited(alloc, idx.metadata.node_count);
-    const frontier_only = try model.projectedBytesWithFlatProbeCapacity(directory.posting_count, false, 0);
+    // Ordinary full-effort ANN remains bounded by the requested search width;
+    // only complete-snapshot validation selects the whole directory. Model
+    // the same selection limit used by this request so an oversized directory
+    // does not accidentally donate unrelated budget to block scoring.
+    const selection_limit = @min(directory.posting_count, @as(usize, 32));
+    const frontier_only = try model.projectedBytesWithFlatProbeCapacity(selection_limit, false, 0);
     const complete_flat = try model.projectedBytesWithFlatProbeCapacity(
-        directory.posting_count,
+        selection_limit,
         false,
         max_block_count,
     );
@@ -19832,7 +19855,8 @@ test "posting WAL mutations provide read your writes without derived LSM persist
         try idx.beginExperimentalPostingMutationCapture();
         try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-        idx.enableExperimentalPostingWalMutations();
+        idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+        idx.enableNativePostingMutationStore();
 
         var pinned_before_mutation = try idx.beginReadTxn();
         try idx.beginExperimentalPostingMutationCapture();
@@ -19939,7 +19963,8 @@ test "posting WAL mutation capture aborts without publishing partial state" {
     try idx.beginExperimentalPostingMutationCapture();
     try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
     try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-    idx.enableExperimentalPostingWalMutations();
+    idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+    idx.enableNativePostingMutationStore();
 
     var store_before = try idx.openExperimentalPostingStore();
     const committed_bytes_before = store_before.wal_committed_bytes;
@@ -20036,7 +20061,8 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
             .metadata = "doc:1",
         }}, .{ .skip_vector_store = true });
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-        idx.enableExperimentalPostingWalMutations();
+        idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+        idx.enableNativePostingMutationStore();
 
         try idx.beginExperimentalPostingMutationCapture();
         try idx.batchInsertWithMetadataOptions(&.{.{
@@ -20213,7 +20239,8 @@ test "posting WAL capture can begin inside a streaming replay session" {
         try idx.beginExperimentalPostingMutationCapture();
         try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-        idx.enableExperimentalPostingWalMutations();
+        idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+        idx.enableNativePostingMutationStore();
 
         // A long-lived replay session can already be open when the next
         // independently durable source window begins. This ordering used to
@@ -20288,12 +20315,24 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
             @as(?u64, 3),
             idx.experimentalPostingDurableAppliedSequence(),
         );
-        // A delayed persistence callback must not regress source coverage or
-        // invalidate a newer sidecar. Its captured changes become a derived
-        // batch at the already-published source epoch.
+        // A delayed persistence callback does not own this newer capture. It
+        // must fail closed rather than relabeling mutations at a source epoch
+        // outside the capture lease. The source owner cancels and retries the
+        // mutation at the current boundary.
         try idx.beginExperimentalPostingMutationCapture();
         try idx.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
-        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+        try std.testing.expectError(
+            error.PostingWalCaptureSequenceOutsideLease,
+            idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{}),
+        );
+        // This is a legacy mirrored capture, so the source owner's inverse
+        // rollback must reach the LSM before the capture is discarded. Native
+        // candidates instead restore their pinned immutable generation.
+        try idx.delete(3);
+        idx.cancelExperimentalPostingMutationCapture();
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
         try std.testing.expectEqual(
             @as(?u64, 3),
             idx.experimentalPostingDurableAppliedSequence(),
@@ -20408,7 +20447,8 @@ test "managed posting capture exports coalesced exact vector mutations" {
     try std.testing.expectEqualStrings("doc:1", inserted[0].metadata);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, inserted[0].vector);
     try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-    idx.enableExperimentalPostingWalMutations();
+    idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+    idx.enableNativePostingMutationStore();
 
     // A replacement is represented once and the final upsert wins over its
     // internal delete. A pure delete recovers metadata from the pinned native
@@ -20623,7 +20663,7 @@ test "flat rabitq centroid directory searches leaf postings" {
     try std.testing.expect(profiled.profile.leaves_explored > 0);
 }
 
-test "flat rabitq filtered traversal advances past its initial probe wave safely" {
+test "flat rabitq filtered traversal advances then stops on a certified bound" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -20664,7 +20704,8 @@ test "flat rabitq filtered traversal advances past its initial probe wave safely
     try std.testing.expect(profiled.profile.traversal_initial_wave_leaves == 2);
     try std.testing.expect(profiled.profile.traversal_waves > 1);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
-    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+    try std.testing.expect(profiled.profile.traversal_bound_resolutions > 0);
+    try std.testing.expect(profiled.profile.traversal_bound_stops > 0);
 }
 
 test "flat traversal does not treat a full candidate heap as a pruning proof" {

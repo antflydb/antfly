@@ -3810,6 +3810,30 @@ cache-inclusive process-tree peak was about 1.18 GiB and its physical-footprint
 ledger peak was about 785 MiB, but its wired-demand headline must not be
 published.
 
+## V1 mirror versus native-v2 authority
+
+The rollback audit established an explicit storage-mode boundary that must not
+be inferred from the presence of an optional posting generation:
+
+- A v1 index remains LSM-authoritative, matching the v0.2.0 lifecycle. It may
+  publish an immutable posting mirror for query acceleration, but mutations and
+  their inverse rollback continue through the HBC LSM.
+- Only a capability-authorized private candidate or an index selected by the
+  incompatible v2 pointer may route mutations exclusively through the native
+  posting WAL. Enabling that path without transition authority is a programmer
+  invariant violation.
+- A native capture pins its immutable base. Cancellation restores that base
+  whether the candidate has published its irreversible authority marker yet or
+  not; marker publication and rollback ownership are separate states.
+- A delayed source callback below the capture's base coverage fails closed. It
+  cannot relabel mutations at the current epoch. Legacy owners apply their true
+  LSM inverse before cancellation; native owners restore the pinned generation.
+
+The term `posting sidecar` predates this distinction and is now ambiguous. In
+v2, the posting segment store is retained because it is the index authority;
+only the compatibility HBC LSM is retired. Future API cleanup should use
+`native_posting_store` for v2 and reserve `sidecar` for the optional v1 mirror.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
