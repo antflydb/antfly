@@ -14547,7 +14547,7 @@ export interface components {
          */
         InferenceModelQuantization: "q4_k" | "q8" | "fp16";
         /**
-         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
          * @enum {string}
          */
         InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
@@ -14582,13 +14582,13 @@ export interface components {
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**
-             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
              * @default auto
              */
             residency_mode?: components["schemas"]["InferenceA4bResidencyMode"];
             /**
              * Format: uint32
-             * @description Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+             * @description Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
              * @default 0
              */
             memory_budget_mb?: number;

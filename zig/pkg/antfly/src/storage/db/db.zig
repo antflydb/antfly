@@ -25698,6 +25698,17 @@ pub const DB = struct {
     }
 
     fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
+        // A retained status snapshot may predate durable repair-state
+        // materialization. The checkpoint is itself durable proof that a
+        // non-replay generation build is active and must not be erased by a
+        // live replay-counter overlay.
+        if (std.mem.eql(u8, item.projection_checkpoint_status, "rebuilding")) return true;
+        if (item.index_repair_id != null and
+            !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal)) and
+            !std.mem.eql(u8, item.index_repair_automation, "paused"))
+        {
+            return true;
+        }
         const generation_build = std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_rebuild)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
@@ -26388,7 +26399,7 @@ pub const DB = struct {
                 }
             } else {
                 item.backfill_active = durableGenerationBuildActive(item);
-                if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+                if (!item.backfill_active and item.replay_target_sequence > 0) item.backfill_progress = 1.0;
             }
             normalizeReplayStatusFromDurableCheckpoint(item);
             for (item.source_replay) |*source| {
@@ -26414,7 +26425,7 @@ pub const DB = struct {
         item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
         if (!item.catch_up_active and !item.replay_catch_up_required) {
             item.backfill_active = durableGenerationBuildActive(item);
-            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+            if (!item.backfill_active and item.replay_target_sequence > 0) item.backfill_progress = 1.0;
         }
     }
 

@@ -1887,11 +1887,12 @@ fn validateSourceSnapshotGroupSet(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     base_result: db_mod.types.SearchResult,
+    deadline_ns: ?u64,
 ) !void {
     const tokens = base_result.shard_identity_read_generations;
     if (tokens.len == 0) return;
 
-    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    const group_ids = try table_catalog.resolveGroupsForSpanUntil(alloc, catalog, table_name, "", "", deadline_ns);
     defer alloc.free(group_ids);
     if (group_ids.len != tokens.len) return error.TopologyChanged;
     for (group_ids) |group_id| {
@@ -2012,9 +2013,9 @@ fn executeCrossRangeOnce(
     // existing range + generation checks below to validate an unstamped
     // standalone catalog without weakening cross-shard snapshot fencing.
     try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
-    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.execution_deadline_ns);
     if (match_anchor_source) |source| switch (source) {
-        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors),
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.execution_deadline_ns),
         .paged => {},
     };
 
@@ -2395,9 +2396,9 @@ const GraphNodeAdmissionContext = struct {
                 db_mod.types.GraphTableReadAuthorization{ .allowed = true };
             defer authorization.deinit(self.alloc);
             const exists = authorization.allowed and
-                try table_catalog.tableExists(self.catalog, table_name);
+                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns);
             topology_epoch = if (exists)
-                try table_catalog.topologyEpoch(self.alloc, self.catalog, table_name)
+                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns)
             else
                 0;
             allowed = exists;
@@ -2774,7 +2775,7 @@ fn executeSingleCrossRange(
     request_work_budget: *graph_pattern_mod.WorkBudget,
     request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
-    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
+    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.execution_deadline_ns);
     const admission_req = graphNodeAdmissionRequest(req, graph_query);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
@@ -2947,12 +2948,13 @@ const DistributedEdgeReader = struct {
         if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
             return try a.alloc(graph_mod.Edge, 0);
 
-        const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
+        const owner_group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
             a,
             self.catalog,
             table_name,
             key,
             table_state.topology_epoch,
+            self.worker.execution_deadline_ns,
         )) orelse return error.TableNotFound;
 
         // Outgoing adjacency is colocated with its source and needs one routed
@@ -2984,11 +2986,17 @@ const DistributedEdgeReader = struct {
         if (!std.mem.eql(u8, table_name, self.source_table) and !source_table_declared)
             return error.UnsupportedQueryRequest;
 
-        const routed = try table_catalog.routedSpanSnapshot(a, self.catalog, table_name, "", "");
-        defer a.free(routed.group_ids);
-        if (table_state.topology_epoch != 0 and routed.topology_epoch != table_state.topology_epoch)
-            return error.TopologyChanged;
-        if (routed.group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
+        const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+            a,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            table_state.topology_epoch,
+            self.worker.execution_deadline_ns,
+        );
+        defer if (group_ids.len > 0) a.free(group_ids);
+        if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
 
         var positive = GraphExpandBatches.empty;
         defer freeFrontierBatches(a, &positive);
@@ -2997,7 +3005,7 @@ const DistributedEdgeReader = struct {
             self.worker,
             &positive,
             table_state,
-            routed.group_ids,
+            group_ids,
             &.{0},
             &.{key},
             self.index_name,
@@ -3006,7 +3014,7 @@ const DistributedEdgeReader = struct {
 
         var candidate_group_ids = std.ArrayListUnmanaged(u64).empty;
         defer candidate_group_ids.deinit(a);
-        for (routed.group_ids) |group_id| {
+        for (group_ids) |group_id| {
             const has_incoming = positive.contains(.{
                 .table_name = table_state.table_name,
                 .group_id = group_id,
@@ -3636,7 +3644,13 @@ fn executeDistributedConjunctivePattern(
             page.total_hits,
             page.total_hits_relation,
         );
-        try validateSourceSnapshotGroupSet(alloc, edge_reader.catalog, edge_reader.source_table, page);
+        try validateSourceSnapshotGroupSet(
+            alloc,
+            edge_reader.catalog,
+            edge_reader.source_table,
+            page,
+            edge_reader.worker.execution_deadline_ns,
+        );
         try validateMatchingSourceSnapshots(base_result, page);
         try validateMatchAnchorPageOrder(cursor_key, page.hits);
         if (page.hits.len == 0) break;
@@ -5217,12 +5231,13 @@ fn findDistributedShortestPath(
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
         if (!(try admission.graphIndexAvailable(table_state, graph_query.query.index_name))) continue;
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
+        const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
             alloc,
             catalog,
             expansion_table,
             item.key,
             table_state.topology_epoch,
+            worker.execution_deadline_ns,
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
@@ -5385,12 +5400,13 @@ fn batchFrontierByGroup(
         if (!(try admission.graphIndexAvailable(table_state, index_name))) continue;
         switch (direction) {
             .out => {
-                const group_id = (try table_catalog.resolveGroupForKeyPinned(
+                const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
                     alloc,
                     catalog,
                     table_name,
                     item.key,
                     table_state.topology_epoch,
+                    worker.execution_deadline_ns,
                 )) orelse return error.TableNotFound;
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
@@ -5398,12 +5414,13 @@ fn batchFrontierByGroup(
                 // Preserve the target-owner route for `.both` so outgoing
                 // adjacency is read even when that shard has no reverse row.
                 if (direction == .both) {
-                    const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
+                    const owner_group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
                         alloc,
                         catalog,
                         table_name,
                         item.key,
                         table_state.topology_epoch,
+                        worker.execution_deadline_ns,
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
@@ -5422,10 +5439,16 @@ fn batchFrontierByGroup(
     while (incoming_it.next()) |entry| {
         const table_name = entry.key_ptr.*;
         const table_state = try admission.ensureTable(table_name);
-        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
-        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+        const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+            alloc,
+            catalog,
+            table_name,
+            "",
+            "",
+            table_state.topology_epoch,
+            worker.execution_deadline_ns,
+        );
         defer if (group_ids.len > 0) alloc.free(group_ids);
-        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
         if (group_ids.len == 0) return error.TableNotFound;
 
         const frontier_ids = entry.value_ptr.items;
@@ -6786,7 +6809,14 @@ fn hydrateHitsForKeys(
             _ = unique.remove(key);
             return err;
         };
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, key, topology_epoch)) orelse return error.TableNotFound;
+        const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
+            alloc,
+            catalog,
+            table_name,
+            key,
+            topology_epoch,
+            worker.execution_deadline_ns,
+        )) orelse return error.TableNotFound;
         const batch = try batches.getOrPut(alloc, group_id);
         if (!batch.found_existing) batch.value_ptr.* = .empty;
         try batch.value_ptr.append(alloc, key);
@@ -6975,12 +7005,18 @@ pub fn probeIncomingEdgesForKeys(
     defer alloc.free(route_resolved);
     @memset(route_resolved, false);
 
-    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     const index_identity = (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse
         return error.IndexNotFound;
-    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        topology_epoch,
+        worker.execution_deadline_ns,
+    );
     defer if (group_ids.len > 0) alloc.free(group_ids);
-    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     if (group_ids.len == 0) return error.TableNotFound;
 
     var route_projection_available = true;
@@ -7233,6 +7269,9 @@ test "distributed graph root probe retires resolved keys between shard waves" {
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -11245,6 +11284,9 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                 },
             };
         }
@@ -11263,6 +11305,15 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
     const FakeWorker = struct {
@@ -11464,6 +11515,9 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -13081,6 +13135,9 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                 },
             };
         }
@@ -13098,6 +13155,15 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
     const TestState = struct {
@@ -13789,6 +13855,9 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -13912,7 +13981,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
     incomplete_result.shard_identity_read_generations = @constCast(tokens[0..1]);
     try std.testing.expectError(
         error.TopologyChanged,
-        validateSourceSnapshotGroupSet(alloc, FakeCatalog.iface(), "docs", incomplete_result),
+        validateSourceSnapshotGroupSet(alloc, FakeCatalog.iface(), "docs", incomplete_result, null),
     );
 
     var state = TestState{};
@@ -14334,6 +14403,9 @@ test "distributed graph executes result dependencies before declaration order" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14736,6 +14808,9 @@ test "distributed graph retries once on topology change and succeeds" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14905,6 +14980,9 @@ test "distributed graph stops after single retry on repeated topology churn" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

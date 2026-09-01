@@ -27,6 +27,7 @@ pub const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 pub const metadata = @import("../metadata/domain.zig");
 pub const metadata_api = @import("../metadata/api.zig");
 pub const metadata_http_client = @import("../metadata/http_client.zig");
+pub const metadata_http_routes = @import("../metadata/http_routes.zig");
 pub const metadata_service = @import("../metadata/service.zig");
 pub const public_api = @import("../api/runtime.zig");
 pub const raft = @import("../raft/mod.zig");

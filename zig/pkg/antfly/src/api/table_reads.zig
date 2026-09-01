@@ -67,6 +67,11 @@ const table_read_source = @import("table_read_source.zig");
 const table_read_graph = @import("table_reads/graph.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 
+fn earliestDeadline(a: ?u64, b: ?u64) ?u64 {
+    if (a) |left| return if (b) |right| @min(left, right) else left;
+    return b;
+}
+
 const GraphMetricFanInShardRequest = table_read_graph.GraphMetricFanInShardRequest;
 const graphSearchQueryNeedsInternalMetricStatus = table_read_graph.graphSearchQueryNeedsInternalMetricStatus;
 const rejectNonGlobalGraphMetricFanout = table_read_graph.rejectNonGlobalGraphMetricFanout;
@@ -6185,11 +6190,15 @@ test "hosted distributed grouped hierarchy expands the globally selected shard p
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -6414,11 +6423,15 @@ test "table read distributed sorted merge uses catalog runtime schema and reject
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -20477,11 +20490,15 @@ test "provisioned table read source routes lookup and scan across ranges" {
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -20704,11 +20721,15 @@ test "provisioned table read source merges query results across ranges" {
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -20805,11 +20826,15 @@ test "provisioned table read source serves dense queries for explicit external e
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -20905,11 +20930,15 @@ test "provisioned local query execution returns stamped identity request" {
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -21697,11 +21726,15 @@ test "provisioned table read source serves public dense query requests with read
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -29500,11 +29533,15 @@ test "hosted cross-range graph metric fan-in merges compatible published shard g
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -29752,11 +29789,15 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -30188,11 +30229,15 @@ test "hosted cross-range graph metric fan-in merges nonuniform promotion shard l
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -30507,11 +30552,15 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -30857,11 +30906,15 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -31132,11 +31185,15 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
@@ -31378,11 +31435,15 @@ test "hosted cross-range graph metric fan-in rejects unpublished or incompatible
         };
 
         fn iface() table_catalog.CatalogSource {
+            const Routing = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = Routing.routingSnapshot,
+                    .linearizable_routing_snapshot = Routing.linearizableSnapshot,
+                    .free_routing_snapshot = Routing.freeRoutingSnapshot,
                 },
             };
         }
