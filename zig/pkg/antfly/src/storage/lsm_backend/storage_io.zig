@@ -41,6 +41,7 @@ const fallback_cached_native_fds: usize = 64;
 const unlimited_fd_admission_capacity: usize = 1024;
 const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
 const max_posix_io_chunk: usize = 64 * 1024 * 1024;
+const cold_atomic_writeback_chunk: usize = 64 * 1024 * 1024;
 
 pub const RuntimeKind = enum {
     threaded,
@@ -92,6 +93,7 @@ pub const AtomicWriteSink = struct {
         write_at: *const fn (*anyopaque, usize, []const u8) anyerror!void,
         crc32_prefix: *const fn (*anyopaque, usize) anyerror!u32,
         crc32_range: *const fn (*anyopaque, usize, usize) anyerror!u32,
+        set_cache_intent: ?*const fn (*anyopaque, AtomicWriteCacheIntent) void = null,
         finish: *const fn (*anyopaque) anyerror!void,
         abort: *const fn (*anyopaque) void,
     };
@@ -121,6 +123,13 @@ pub const AtomicWriteSink = struct {
         return try self.vtable.crc32_range(self.ptr, offset, range_len);
     }
 
+    /// Marks a maintenance output as a one-pass sequential stream. Native
+    /// storage may keep these pages out of the process page-cache footprint;
+    /// compatibility backends safely ignore the advisory hint.
+    pub fn setCacheIntent(self: *AtomicWriteSink, intent: AtomicWriteCacheIntent) void {
+        if (self.vtable.set_cache_intent) |set_cache_intent| set_cache_intent(self.ptr, intent);
+    }
+
     /// Atomically publish the written bytes at the requested destination.
     /// Consumes the sink whether publishing succeeds or fails.
     pub fn finish(self: *AtomicWriteSink) !void {
@@ -131,6 +140,33 @@ pub const AtomicWriteSink = struct {
     /// Consumes the sink.
     pub fn abort(self: *AtomicWriteSink) void {
         self.vtable.abort(self.ptr);
+    }
+};
+
+pub const AtomicWriteCacheIntent = enum {
+    normal,
+    cold_sequential,
+};
+
+/// A file lease for one-pass maintenance reads. Native implementations use a
+/// descriptor distinct from the shared foreground FD cache, so cache policy
+/// cannot leak across concurrent query reads.
+pub const ColdSequentialReader = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        read_range_alloc: *const fn (*anyopaque, Allocator, u64, usize) anyerror![]u8,
+        deinit: *const fn (*anyopaque) void,
+    };
+
+    pub fn readRangeAlloc(self: *ColdSequentialReader, allocator: Allocator, offset: u64, len: usize) ![]u8 {
+        return try self.vtable.read_range_alloc(self.ptr, allocator, offset, len);
+    }
+
+    pub fn deinit(self: *ColdSequentialReader) void {
+        self.vtable.deinit(self.ptr);
+        self.* = undefined;
     }
 };
 
@@ -444,6 +480,8 @@ pub const Storage = struct {
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
+        begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
+        cold_sequential_reader_capacity: ?*const fn (*anyopaque) usize = null,
         /// Persists file contents without implying namespace durability.
         sync_contents_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         /// Persists the parent namespace entry for the supplied path.
@@ -570,6 +608,25 @@ pub const Storage = struct {
         return try BufferedAtomicWriteSink.create(allocator, self, path);
     }
 
+    pub fn beginColdSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        if (self.vtable.begin_cold_sequential_read) |begin_cold_sequential_read| {
+            return try begin_cold_sequential_read(self.ptr, allocator, path);
+        }
+        return try GenericColdSequentialReader.create(allocator, self, path);
+    }
+
+    pub fn beginSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        return try GenericColdSequentialReader.create(allocator, self, path);
+    }
+
+    /// Maximum private maintenance descriptors that can coexist while
+    /// retaining one slot for the output writer and the persistent reserve.
+    /// Compatibility readers use normal range I/O and consume no such leases.
+    pub fn coldSequentialReaderCapacity(self: Storage) usize {
+        if (self.vtable.cold_sequential_reader_capacity) |capacity| return capacity(self.ptr);
+        return std.math.maxInt(usize);
+    }
+
     pub fn syncFileContentsAbsolute(self: Storage, path: []const u8) !void {
         if (self.vtable.sync_contents_absolute) |sync_contents_absolute| {
             return try sync_contents_absolute(self.ptr, path);
@@ -614,6 +671,40 @@ pub const Storage = struct {
 
     pub fn supportsNativePathLocks(self: Storage) bool {
         return self.vtable.supports_native_path_locks;
+    }
+};
+
+const GenericColdSequentialReader = struct {
+    allocator: Allocator,
+    storage: Storage,
+    path: []u8,
+
+    const vtable: ColdSequentialReader.VTable = .{
+        .read_range_alloc = readRangeAlloc,
+        .deinit = deinitErased,
+    };
+
+    fn create(allocator: Allocator, storage: Storage, path: []const u8) !ColdSequentialReader {
+        const self = try allocator.create(GenericColdSequentialReader);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .storage = storage,
+            .path = try allocator.dupe(u8, path),
+        };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn readRangeAlloc(ptr: *anyopaque, allocator: Allocator, offset: u64, len: usize) ![]u8 {
+        const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
+        return try self.storage.readFileRangeAlloc(allocator, self.path, offset, len);
+    }
+
+    fn deinitErased(ptr: *anyopaque) void {
+        const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
+        const allocator = self.allocator;
+        allocator.free(self.path);
+        allocator.destroy(self);
     }
 };
 
@@ -1769,6 +1860,8 @@ else blk: {
                 .write_file_absolute = writeFileAbsolute,
                 .append_file_absolute = appendFileAbsolute,
                 .begin_atomic_write = beginAtomicWrite,
+                .begin_cold_sequential_read = beginColdSequentialRead,
+                .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
                 .sync_contents_absolute = syncFileContentsAbsolute,
                 .sync_parent_absolute = syncParentAbsolute,
                 .rename_absolute = renameAbsolute,
@@ -1942,6 +2035,16 @@ else blk: {
                 return try NativeAtomicWriteSink.create(allocator, path, self.state);
             }
 
+            fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                return try NativeColdSequentialReader.create(allocator, path, self.state);
+            }
+
+            fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                return nativeColdSequentialReaderCapacity(self.state);
+            }
+
             fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 switch (self.runtime) {
@@ -2040,6 +2143,8 @@ else blk: {
             .write_file_absolute = writeFileAbsolute,
             .append_file_absolute = appendFileAbsolute,
             .begin_atomic_write = beginAtomicWrite,
+            .begin_cold_sequential_read = beginColdSequentialRead,
+            .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
             .sync_contents_absolute = syncFileContentsAbsolute,
             .sync_parent_absolute = syncParentAbsolute,
             .rename_absolute = renameAbsolute,
@@ -2203,6 +2308,16 @@ else blk: {
         fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             return try NativeAtomicWriteSink.create(allocator, path, state);
+        }
+
+        fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            return try NativeColdSequentialReader.create(allocator, path, state);
+        }
+
+        fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            return nativeColdSequentialReaderCapacity(state);
         }
 
         fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -2812,6 +2927,72 @@ const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .abort = NativeBufferedAtomicWriteSink.abort,
 };
 
+fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
+    if (comptime !supports_posix_fd_cache) return 0;
+    const cache = state.fdCacheConst();
+    const unavailable = cache.persistent_reserve +| 1; // atomic output writer
+    return cache.capacity -| unavailable;
+}
+
+const NativeColdSequentialReader = struct {
+    allocator: Allocator,
+    fd_permit: NativeFdPermit,
+    fd: std.posix.fd_t,
+
+    const vtable: ColdSequentialReader.VTable = .{
+        .read_range_alloc = readRangeAlloc,
+        .deinit = deinitErased,
+    };
+
+    fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !ColdSequentialReader {
+        if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
+
+        var permit = try state.acquireFdPermit();
+        errdefer permit.release();
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+        }, 0);
+        errdefer closeFd(fd);
+
+        switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos =>
+            // This descriptor is maintenance-private, so F_NOCACHE cannot
+            // alter foreground query reads through the shared descriptor cache.
+            _ = std.posix.system.fcntl(fd, std.posix.F.NOCACHE, @as(usize, 1)),
+            .linux => _ = std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.SEQUENTIAL),
+            else => {},
+        }
+
+        const self = try allocator.create(NativeColdSequentialReader);
+        self.* = .{
+            .allocator = allocator,
+            .fd_permit = permit.take(),
+            .fd = fd,
+        };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn readRangeAlloc(ptr: *anyopaque, allocator: Allocator, offset: u64, len: usize) ![]u8 {
+        const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
+        const out = try allocator.alloc(u8, len);
+        errdefer allocator.free(out);
+        try readAllAtOffset(self.fd, out, offset);
+        if (builtin.os.tag == .linux) {
+            _ = std.os.linux.fadvise(self.fd, @intCast(offset), @intCast(len), std.os.linux.POSIX_FADV.DONTNEED);
+        }
+        return out;
+    }
+
+    fn deinitErased(ptr: *anyopaque) void {
+        const self: *NativeColdSequentialReader = @ptrCast(@alignCast(ptr));
+        closeFd(self.fd);
+        self.fd_permit.release();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
 const NativeAtomicWriteSink = struct {
     allocator: Allocator,
     state: *NativeStorageState,
@@ -2820,6 +3001,8 @@ const NativeAtomicWriteSink = struct {
     tmp_path: []u8,
     fd: std.posix.fd_t,
     bytes_written: usize = 0,
+    cache_intent: AtomicWriteCacheIntent = .normal,
+    last_cold_drain_bytes: usize = 0,
 
     fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !AtomicWriteSink {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
@@ -2888,8 +3071,40 @@ const NativeAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try writeAllAtOffset(self.fd, bytes, @intCast(self.bytes_written));
-        self.bytes_written += bytes.len;
+        if (self.cache_intent != .cold_sequential) {
+            try writeAllAtOffset(self.fd, bytes, @intCast(self.bytes_written));
+            self.bytes_written += bytes.len;
+            return;
+        }
+
+        // Callers are allowed to hand the sink an entire multi-gigabyte
+        // immutable block.  Chunk here, below that API boundary, so the cache
+        // residency bound cannot accidentally depend on their buffering.
+        var consumed: usize = 0;
+        while (consumed < bytes.len) {
+            const since_drain = self.bytes_written - self.last_cold_drain_bytes;
+            const until_drain = cold_atomic_writeback_chunk - since_drain;
+            const chunk_len = @min(bytes.len - consumed, until_drain);
+            try writeAllAtOffset(self.fd, bytes[consumed..][0..chunk_len], @intCast(self.bytes_written));
+            self.bytes_written += chunk_len;
+            consumed += chunk_len;
+            try self.drainColdWritebackIfNeeded();
+        }
+    }
+
+    fn drainColdWritebackIfNeeded(self: *NativeAtomicWriteSink) !void {
+        if (self.cache_intent != .cold_sequential or
+            self.bytes_written - self.last_cold_drain_bytes < cold_atomic_writeback_chunk) return;
+
+        // F_NODIRECT lets macOS aggregate writes efficiently, but dirty pages
+        // cannot be discarded until writeback. Bound that dirty window and
+        // make every completed prefix immediately reclaimable instead of
+        // retaining a multi-gigabyte checkpoint or compaction until close.
+        try fs_paths.syncFileFdPortable(self.fd);
+        self.last_cold_drain_bytes = self.bytes_written;
+        if (builtin.os.tag == .linux) {
+            _ = std.os.linux.fadvise(self.fd, 0, @intCast(self.last_cold_drain_bytes), std.os.linux.POSIX_FADV.DONTNEED);
+        }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
@@ -2918,6 +3133,33 @@ const NativeAtomicWriteSink = struct {
         return crc.final();
     }
 
+    fn setCacheIntent(ptr: *anyopaque, intent: AtomicWriteCacheIntent) void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        self.cache_intent = intent;
+        self.last_cold_drain_bytes = self.bytes_written;
+        switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                const enabled: usize = if (intent == .cold_sequential) 1 else 0;
+                // F_NOCACHE is advisory. Failure must not change durability or
+                // make a portable storage implementation unusable.
+                _ = std.posix.system.fcntl(self.fd, std.posix.F.NOCACHE, enabled);
+                // Allow buffered writeback internally while still preventing
+                // the completed one-pass output from polluting the file cache.
+                // Without F_NODIRECT, macOS may turn F_NOCACHE into slow
+                // synchronous direct writes.
+                _ = std.posix.system.fcntl(self.fd, std.posix.F.NODIRECT, enabled);
+            },
+            .linux => {
+                const advice = if (intent == .cold_sequential)
+                    std.os.linux.POSIX_FADV.SEQUENTIAL
+                else
+                    std.os.linux.POSIX_FADV.NORMAL;
+                _ = std.os.linux.fadvise(self.fd, 0, 0, advice);
+            },
+            else => {},
+        }
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -2930,6 +3172,12 @@ const NativeAtomicWriteSink = struct {
             self.state.invalidatePath(self.tmp_path);
             return err;
         };
+        if (self.cache_intent == .cold_sequential and builtin.os.tag == .linux) {
+            // Dirty pages become discardable only after the durability sync.
+            // Bound each completed compaction/checkpoint output rather than
+            // retaining every prior output until global memory pressure.
+            _ = std.os.linux.fadvise(self.fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+        }
         closeFd(self.fd);
         self.fd = -1;
         // The data-file descriptor is closed, so its existing admission slot
@@ -2966,6 +3214,7 @@ const native_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .write_at = NativeAtomicWriteSink.writeAt,
     .crc32_prefix = NativeAtomicWriteSink.crc32Prefix,
     .crc32_range = NativeAtomicWriteSink.crc32Range,
+    .set_cache_intent = NativeAtomicWriteSink.setCacheIntent,
     .finish = NativeAtomicWriteSink.finish,
     .abort = NativeAtomicWriteSink.abort,
 };
@@ -3406,6 +3655,50 @@ test "storage range read future fallback waits and cancels" {
     canceled.cancel();
 }
 
+test "cold sequential reader is isolated from foreground descriptor cache" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-cold-reader-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "abcdefgh");
+
+    const warm = try native.storage().readFileRangeAlloc(std.testing.allocator, path, 0, 1);
+    std.testing.allocator.free(warm);
+    const before = native.snapshotStats().fd_admitted_descriptors;
+    var reader = try native.storage().beginColdSequentialRead(std.testing.allocator, path);
+    try std.testing.expectEqual(before + 1, native.snapshotStats().fd_admitted_descriptors);
+
+    const cold = try reader.readRangeAlloc(std.testing.allocator, 2, 4);
+    defer std.testing.allocator.free(cold);
+    try std.testing.expectEqualStrings("cdef", cold);
+
+    // A normal read remains usable while the maintenance-private descriptor
+    // carries its cold policy.
+    const foreground = try native.storage().readFileRangeAlloc(std.testing.allocator, path, 0, 2);
+    defer std.testing.allocator.free(foreground);
+    try std.testing.expectEqualStrings("ab", foreground);
+
+    reader.deinit();
+    try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
+}
+
+test "cold sequential reader capacity preserves output and persistent admission" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+
+    // Capacity four reserves two descriptors for lifetime locks and one for
+    // the compaction output, leaving exactly one private input descriptor.
+    try std.testing.expectEqual(@as(usize, 1), native.storage().coldSequentialReaderCapacity());
+}
+
 test "native atomic write sink supports patching and crc before finish" {
     if (!supports_native_storage) return error.SkipZigTest;
 
@@ -3419,6 +3712,9 @@ test "native atomic write sink supports patching and crc before finish" {
     var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
     var active = true;
     defer if (active) writer.abort();
+    writer.setCacheIntent(.cold_sequential);
+    const native_writer: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+    try std.testing.expectEqual(AtomicWriteCacheIntent.cold_sequential, native_writer.cache_intent);
     if (supports_posix_fd_cache) {
         try std.testing.expectEqual(@as(usize, 1), native.snapshotStats().fd_admitted_descriptors);
     }

@@ -42,6 +42,13 @@ pub const RetainedSegment = union(enum) {
         return self == .mapped;
     }
 
+    pub fn mappedBytes(self: RetainedSegment) ?[]align(std.heap.page_size_min) u8 {
+        return switch (self) {
+            .mapped => |data| data,
+            .heap => null,
+        };
+    }
+
     pub fn deinit(self: *RetainedSegment, alloc: Allocator) void {
         switch (self.*) {
             .heap => |data| alloc.free(data),
@@ -80,6 +87,48 @@ pub const StagedCheckpointSegment = struct {
     bytes: u64,
     checksum: u32,
     admission_checksum: u32,
+};
+
+/// Crash-safe file-backed checkpoint construction. The temporary sibling is
+/// invisible until `finish`, and the finished generation remains an orphan
+/// until CURRENT is published. `deinit` aborts any unfinished write.
+pub const StagedCheckpointWriter = struct {
+    alloc: Allocator,
+    storage: lsm_backend.Storage,
+    generation: u64,
+    path: []u8,
+    output_sink: ?lsm_backend.storage_io.AtomicWriteSink,
+
+    pub fn output(self: *StagedCheckpointWriter) *lsm_backend.storage_io.AtomicWriteSink {
+        return &self.output_sink.?;
+    }
+
+    pub fn finish(self: *StagedCheckpointWriter, admission_checksum: u32) !StagedCheckpointSegment {
+        var sink = self.output_sink orelse return error.CheckpointWriterFinished;
+        const bytes: u64 = @intCast(sink.len());
+        const checksum = if (admission_checksum == 0)
+            try sink.crc32Prefix(sink.len())
+        else
+            0;
+        sink.finish() catch |err| {
+            self.output_sink = null;
+            return err;
+        };
+        self.output_sink = null;
+        if (try self.storage.fileSize(self.path) != bytes) return error.MissingPostingSegment;
+        return .{
+            .generation = self.generation,
+            .bytes = bytes,
+            .checksum = checksum,
+            .admission_checksum = admission_checksum,
+        };
+    }
+
+    pub fn deinit(self: *StagedCheckpointWriter) void {
+        if (self.output_sink) |*sink| sink.abort();
+        self.alloc.free(self.path);
+        self.* = undefined;
+    }
 };
 
 pub const RecoveredWal = struct {
@@ -222,6 +271,18 @@ pub const Store = struct {
         return if (self.checkpoint) |checkpoint| checkpoint.latestSegmentGeneration() else null;
     }
 
+    /// Opens the complete base through a maintenance-private descriptor. It
+    /// deliberately does not reuse the foreground mmap/FD cache: long-running
+    /// flattening can then stream cold payloads without making query residency
+    /// proportional to the corpus. The returned reader pins its own storage
+    /// descriptor and remains valid across CURRENT publication.
+    pub fn beginBaseColdSequentialRead(self: *const Store, allocator: Allocator) !lsm_backend.storage_io.ColdSequentialReader {
+        const checkpoint = self.checkpoint orelse return error.MissingPostingCheckpoint;
+        const path = try self.segmentPathAlloc(checkpoint.segment_generation);
+        defer self.alloc.free(path);
+        return try self.storage.beginColdSequentialRead(allocator, path);
+    }
+
     pub fn deltaSegmentCount(self: *const Store) usize {
         return if (self.checkpoint) |checkpoint| checkpoint.delta_segment_count else 0;
     }
@@ -354,8 +415,32 @@ pub const Store = struct {
         };
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
-        try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+        try generation_publication.replaceColdImmutable(self.alloc, self.storage, segment_path, segment_bytes);
         return receipt;
+    }
+
+    /// Begins a bounded-memory immutable segment build. Production native
+    /// storage writes directly to a temporary file; compatibility backends may
+    /// use their buffered atomic sink without changing publication semantics.
+    pub fn beginStagedCheckpointSegment(
+        self: *Store,
+        segment_generation: u64,
+    ) !StagedCheckpointWriter {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
+        if (self.checkpoint) |current| {
+            if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
+        }
+        const path = try self.segmentPathAlloc(segment_generation);
+        errdefer self.alloc.free(path);
+        var output_sink = try self.storage.beginAtomicWrite(self.alloc, path);
+        output_sink.setCacheIntent(.cold_sequential);
+        return .{
+            .alloc = self.alloc,
+            .storage = self.storage,
+            .generation = segment_generation,
+            .path = path,
+            .output_sink = output_sink,
+        };
     }
 
     /// Publishes a segment materialized from the committed WAL prefix ending
@@ -398,6 +483,24 @@ pub const Store = struct {
         );
     }
 
+    /// Publishes an already validated streaming checkpoint without retaining
+    /// its complete contents in heap merely to repeat the staged receipt.
+    pub fn publishStagedCheckpointReceiptPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        flattened_wal_bytes: u64,
+        staged: StagedCheckpointSegment,
+    ) !void {
+        return try self.publishCheckpointInternal(
+            segment_generation,
+            covered_source_sequence,
+            null,
+            flattened_wal_bytes,
+            staged,
+        );
+    }
+
     /// Publishes a small immutable replacement delta over the current base
     /// generation. CURRENT names the complete ordered chain atomically; the
     /// old base and deltas remain live and mmap-safe until a later full
@@ -424,7 +527,7 @@ pub const Store = struct {
         self: *Store,
         segment_generation: u64,
         covered_source_sequence: u64,
-        segment_bytes: []const u8,
+        segment_bytes: ?[]const u8,
         flattened_wal_bytes: ?u64,
         staged: ?StagedCheckpointSegment,
     ) !void {
@@ -444,7 +547,7 @@ pub const Store = struct {
         self: *Store,
         segment_generation: u64,
         covered_source_sequence: u64,
-        segment_bytes: []const u8,
+        segment_bytes: ?[]const u8,
         flattened_wal_bytes: ?u64,
         staged: ?StagedCheckpointSegment,
         mode: PublicationMode,
@@ -459,7 +562,7 @@ pub const Store = struct {
                 return error.TooManyPostingDeltaSegments;
             }
         }
-        if (staged == null) _ = try posting_segment.Reader.init(segment_bytes);
+        if (staged == null) _ = try posting_segment.Reader.init(segment_bytes orelse return error.MissingPostingCheckpoint);
 
         var retained_wal: ?RecoveredWal = null;
         defer if (retained_wal) |*wal| wal.deinit();
@@ -509,7 +612,9 @@ pub const Store = struct {
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
         const segment_checksum: u32 = if (staged) |receipt| blk: {
-            if (receipt.generation != segment_generation or receipt.bytes != segment_bytes.len) {
+            if (receipt.generation != segment_generation or
+                (segment_bytes != null and receipt.bytes != segment_bytes.?.len))
+            {
                 return error.InvalidStagedPostingSegment;
             }
             if (try self.storage.fileSize(segment_path) != receipt.bytes) return error.MissingPostingSegment;
@@ -518,17 +623,17 @@ pub const Store = struct {
         const segment_admission_checksum = if (staged) |receipt|
             receipt.admission_checksum
         else
-            try posting_segment.admissionChecksum(segment_bytes);
+            try posting_segment.admissionChecksum(segment_bytes.?);
         const effective_segment_checksum = if (staged != null or segment_admission_checksum != 0)
             segment_checksum
         else blk: {
             // A zero admission CRC is valid but indistinguishable from the
             // legacy "field absent" encoding. Only that one-in-2^32 case pays
             // for the old full-file checksum.
-            break :blk std.hash.Crc32.hash(segment_bytes);
+            break :blk std.hash.Crc32.hash(segment_bytes.?);
         };
         if (staged == null) {
-            try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+            try generation_publication.replaceColdImmutable(self.alloc, self.storage, segment_path, segment_bytes.?);
         }
 
         const next_wal_path = try self.walPathAlloc(next_wal_generation);
@@ -556,11 +661,12 @@ pub const Store = struct {
                 .admission_checksum = segment_admission_checksum,
             };
         }
+        const published_segment_bytes: u64 = if (staged) |receipt| receipt.bytes else @intCast(segment_bytes.?.len);
         const next_segment_bytes: u64 = if (mode == .delta)
-            std.math.add(u64, self.segment_bytes, @as(u64, @intCast(segment_bytes.len))) catch
+            std.math.add(u64, self.segment_bytes, published_segment_bytes) catch
                 return error.PostingSegmentTooLarge
         else
-            @intCast(segment_bytes.len);
+            published_segment_bytes;
         const encoded = next_checkpoint.encode();
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);

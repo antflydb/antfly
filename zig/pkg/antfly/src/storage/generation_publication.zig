@@ -43,6 +43,29 @@ pub fn replaceImmutable(
     try sink.finish();
 }
 
+/// Stages a one-pass immutable data file without displacing the serving
+/// generation from the page cache. WAL and authority replacements use the
+/// normal primitive above because their new bytes may be consumed or appended
+/// immediately after publication.
+pub fn replaceColdImmutable(
+    alloc: Allocator,
+    storage: lsm_backend.Storage,
+    path: []const u8,
+    contents: []const u8,
+) !void {
+    var sink = try storage.beginAtomicWrite(alloc, path);
+    var active = true;
+    defer if (active) sink.abort();
+    // Immutable generation data is produced by one-pass maintenance and is
+    // normally not read until after CURRENT publication.  Keeping the output
+    // resident competes with the active serving generation and can double RSS
+    // during a large checkpoint or compaction.
+    sink.setCacheIntent(.cold_sequential);
+    try sink.appendSlice(contents);
+    active = false;
+    try sink.finish();
+}
+
 const ControlAttempt = union(enum) {
     success,
     definitive_error: anyerror,

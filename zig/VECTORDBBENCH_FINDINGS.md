@@ -2596,6 +2596,1006 @@ lowered artifact read mean/p50 from 1.875/1.702 to 1.835/1.650 ms, vector load
 from 2.185 to 2.122 ms, and mean HBC search from 10.788 to 10.401 ms; server
 p95 fell from 13.02 to 12.21 ms on the same topology and source generation.
 
+## Projection I/O, routing, and ingestion experiment matrix (r76-r87)
+
+These experiments used the same preserved 1M public-API generation and fixed
+the search effort/rerank boundary unless noted. New profile counters distinguish
+logical exact/projection candidates from physical payload reads and bytes. The
+current positional baseline averaged 557.43 physical reads and 857,178 bytes
+per detailed query; this is the denominator for read-layout experiments.
+
+- The current-code positional baseline (`read-baseline-v2`) measured 0.9521
+  detailed recall, 69,128.7 approximate vectors/query, 146.3 exact
+  completions/query, client p50/p95/p99 29.72/133.44/284.04 ms, server mean
+  43.85 ms, and 678 MB sampled RSS. The unchanged official lifecycle
+  (`govern-baseline-v2`) measured 0.9455 recall and concurrency
+  1/10/20/30 throughput of 63.52/71.20/60.84/113.17 QPS.
+- Sorting projection requests and coalescing offsets separated by at most 4
+  KiB into at most 64-KiB reads was effectively a no-op: physical reads fell
+  from 557.43 to 557.38/query while bytes rose slightly to 857,209/query.
+  Client p95 was 106.33 ms, but the single short run is noise and cannot
+  justify allocations, sorting, and copying on every query. Reject it for the
+  current sparse candidates distributed across 128 shard files.
+- Direct generation-leased mmap views eliminated the counted `pread` calls but
+  raised RSS to 1.30 GB and worsened client mean latency to 62.92 ms. Mmap plus
+  `MADV_WILLNEED` raised RSS further to 1.43 GB; client p95 was 126.84 ms.
+  Reject both. Positional I/O is the material RSS win and must remain the
+  serving default.
+- Positional `MADV_WILLNEED` left reads/bytes unchanged and measured client
+  mean/p95 48.73/103.20 ms, but raised RSS to 898 MB. The apparent latency
+  movement was not replicated and costs roughly 220 MB, so cold-query
+  readahead is rejected as a default. A future implementation would need a
+  measured per-device cold classifier and a cache-pressure admission budget.
+- Dividing a process-wide 128-read target by the number of active positional
+  batches created wave barriers on top of the already shared `std.Io`
+  scheduler. Throughput collapsed to 61.80/44.54/27.54/4.16 QPS at concurrency
+  1/10/20/30. Keep the local eight-read wave and shared runtime governor; a
+  future global policy must govern individual scheduled reads, not resize
+  query-local synchronization waves.
+- Naively reducing flat search effort fails recall parity: effort 0.38 scored
+  about 53,847 vectors/query but recall fell to 0.9355, versus 0.9521 at effort
+  0.40. A complete-directory covering-radius proof made zero certified stops:
+  all nine attempted resolutions/query fell back because current generations
+  contain unresolved radii. Do not publish heuristic pruning as correctness.
+- Recursive HBC at effort 0.44 matched the flat detailed recall (0.9525 versus
+  0.9521) but scored 110,656 vectors/query. Its official recall was 0.9452 and
+  warm p95 55.6 ms, but concurrency-30 throughput was 53.25 QPS versus flat's
+  113.17. Locality made the single-query profile look attractive while 60%
+  more candidate work lost at concurrency. Keep flat routing; first make
+  conservative radii complete/fresh, then retry proof-driven stopping.
+
+The read-mode, readahead, ad-hoc governor, and uncertified routing prototypes
+were removed after measurement. Physical-I/O telemetry remains. The runner
+records retained experiment settings in `run-config.json` and exposes the
+stable-tip posting-batch A/B; the rejected payload-eviction flag was removed
+with its implementation.
+
+Fresh 50K ingestion exposed two independent lifecycle problems. A background
+timer repaired only one bounded dependency page per wake, and the stable-tip
+finalizer required posting sequence parity before the same finalizer could
+advance postings. The first attempted cooperative timer drain removed the
+backlog but could monopolize the HBC apply fence and rebuild payloads from the
+primary LSM before exact-vector publication. The production ordering under
+qualification is therefore:
+
+1. ordinary timer maintenance performs one bounded page;
+2. a stable source barrier may publish a cardinality-certified exact-vector
+   generation ahead of the last flattened posting generation;
+3. that leading vector generation remains non-ready to queries but serves as
+   the mmap repair source for the completeness-bounded posting drain;
+4. posting `CURRENT` advances to the same sequence, after which the existing
+   sequence/precision/scope/count checks may publish readiness.
+
+The r79 diagnostic inserted 50K in 16.7465 s and encoded the final vector base
+in 3.228 s, but the old order did not become ready until 322.8948 s and repaired
+42 latent posting payloads first. It preserved 0.9828 recall and peaked at
+1.045 GB RSS. r80 proved that vector-first alone is insufficient when an
+ordinary all-pages timer drain wins the apply fence; that run was stopped and
+is not a performance result.
+
+The corrected r81 bounded-timer/vector-first qualification restored the target
+50K lifecycle: 15.8543 s insert + 23.8986 s publication = 39.7529 s total.
+Recall was 0.9819; concurrency-one throughput was 109.36 QPS with 9.04 ms mean,
+12.54 ms p95, and 15.32 ms p99 latency. Cold/warm restart p95 was 18.5/16.6 ms.
+Live RSS peaked at 877.6 MB and the process physical-footprint ledger at 564.6
+MB; restart RSS and physical footprint were 216.3/90.6 MB. The final posting
+validation repaired 17 dependency steps from the newly published mmap vector
+generation and produced sequence-equal posting/vector authority.
+
+Raising the ordinary maintenance page from 64 to 256 did not batch those
+dependencies: every timer pass still reported one repaired step, and r82 lost
+the publication race and remained unready for minutes. The run was stopped and
+is not a performance result. Larger nominal pages are therefore not the
+solution; the accepted stable-tip path drains the complete dependency chain at
+one proven quiet boundary, while ordinary timers stay bounded.
+
+The r83 payload-only `MADV_DONTNEED` A/B completed in 17.3425 + 23.3886 =
+40.7311 s. It lowered sampled live/restart RSS from 877.6/216.3 MB to
+829.9/169.1 MB, but live physical footprint was unchanged at 565.9 MB and
+latency regressed: concurrency-one p95 rose from 12.54 to 17.51 ms and warm
+restart p95 from 16.6 to 19.1 ms. This moves clean file pages out of the process
+working set only to fault them back during queries; the prototype and flag were
+removed rather than making cache displacement a production memory policy.
+
+The fresh r84 1M public-API diagnostic inserted 1,000,000 vectors in 611.17 s
+(1,636 rows/s) with a sampled RSS high-water of approximately 1.95 GiB. It did
+not publish readiness: after the final source sequence, posting maintenance
+continued at one dependency step per one-second timer turn and no preferred
+vector base appeared. The run was stopped after more than four additional
+minutes. This is useful ingestion/RSS evidence, but it has no valid query or
+total-load result and must not be compared with the qualified r69 lifecycle.
+
+r85 verified that merely retrying lifecycle finalization from the recurring
+vector-maintenance lane does not close that gap. It inserted 50K in 16.5682 s
+but spent 308.2775 s waiting for optimization (324.8457 s total). Once the
+framework continued, recall was 0.9835 and concurrency-one throughput/mean/p95
+were 104.65 QPS, 9.37 ms, and 12.38 ms, so serving correctness survived; the
+publication latency is a decisive regression. Live RSS peaked at 1.064 GB,
+with a 561 MB physical-footprint ledger high-water; restart RSS/footprint were
+218.1/86.3 MB.
+
+r86 and r87 isolated the durable shape of the stall. Their 50K insertion phases
+finished in 18.00 and 15.61 s, respectively, then remained at public progress
+0.999 for minutes and were stopped. The native exact-vector store already held
+all 50K vectors in a one-shard float16-plus-lossless-residual delta, but its
+coverage watermark was source sequence 126 while the public source/posting tip
+was 501. Public coverage diagnostics simultaneously reported 50,000 produced
+outcomes against 50,001 source records. Removing the write-cache bulk-session
+skip did not help and was reverted; the independent dense-session/finalization
+gate still correctly prevented maintenance from racing active projection work.
+
+A bounded native topology-changing compactor was implemented and unit-tested:
+it deduplicates one source shard at a time, fans exact encoded records through
+fixed-size per-destination spools, builds one destination shard at a time, and
+atomically publishes `CURRENT`. Restart, all nine test vectors, quantization
+metadata, and lossless residuals survived a one-to-four-shard rewrite without
+consulting the primary LSM. The public lifecycle has not yet invoked this path
+in a completed 50K/1M run, so it is a correctness-tested prototype, not a
+measured performance win. Qualification requires first making the stable-tip
+coverage handoff reach the compactor without relaxing source-sequence or
+cardinality readiness.
+
+## Posting-local scan and fresh-publication follow-up (r88-r94)
+
+The r88 minimal public-API 50K qualification remains the performance baseline
+for this follow-up: 17.2530 s insert, 23.2939 s ready total, 0.9838 recall,
+112.82 concurrency-one QPS, 8.76 ms mean and 12.05 ms p95 latency. Peak live
+RSS was 975.4 MB, restart RSS was 232 MB, and durable data occupied 617 MB.
+Any candidate-layout change must preserve those query semantics and recover
+that lifecycle rather than comparing only an already-published generation.
+
+Fresh r89-r94 attempts did not qualify. They inserted all 50K vectors but
+remained at public progress 0.999 with dense publication pending. The attempted
+background posting burst initially appeared to repair 17-23 steps per wake;
+tri-state maintenance accounting proved those were debounce/write-plane
+pending returns, not durable progress. Later attempts also regressed ingestion
+to roughly two minutes and accumulated about 518 MB of mutable snapshot copies,
+so none is a load-time result. Generic maintenance/status lanes may run during
+the projection finalizer because its own reservation and commit fences preserve
+publication ownership; an optimistic `dense_projection_finalizing` bit is not
+itself active bulk work.
+
+Reopening r94 exposed a separate native topology-compaction readiness defect.
+The topology-changing compactor published posting/vector coverage at source
+sequence 501 but failed its vector-count readiness certificate with
+`VectorBlockPublishedGenerationNotReady`. Startup correctly fell back to an
+authoritative primary snapshot and published 50K float16-plus-lossless-residual
+vectors in 19.202 s. This is valid recovery behavior, but the extra primary scan
+is publication debt and must not be counted as the intended native compactor's
+load time.
+
+The reopened generation also found and fixed an exact-batch counter overflow:
+adding the residual-present `u1` flag directly to integer literal 1 overflowed
+on every float16 exact read. The counter now widens before addition, and the
+regression test exercises projection plus residual batch reads and exact value
+reconstruction.
+
+The first 1,000-query diagnostic after that fix measured 0.98312 recall,
+23,809.8 approximate vectors, 207.9 leaves, and 135.6 authoritative exact
+completions per query. Client mean/p50/p95 were 55.80/45.21/59.99 ms; server
+mean/p50/p95 were 37.82/36.74/50.19 ms. Leaf scoring averaged 11.33 ms and
+artifact reads 11.93 ms. The two-stage exact path still issued 304.6 compact
+projection reads plus 135.6 residual reads (440.2 physical reads and 1.278 MB
+per query). The narrow exact completion set is correct; the remaining fan-out
+comes from the centralized hash-sharded float16 refinement plane, not from
+unnecessarily exact-scoring the whole ANN shell.
+
+An explicit `flat_rabitq` routing qualification on the same durable generation
+is rejected. It returned only 0.9577 recall. The binary was subsequently found
+to be Debug, so its cold/warm p95 and concurrency throughput are not comparable
+performance data and must not be cited as a ReleaseFast regression. The recall
+failure remains valid because the query set, truth set, and durable generation
+were unchanged. Posting-local immutable membership/RaBitQ views are useful,
+but the flat router does not meet the one-percentage-point recall requirement
+and must not become the default.
+
+The posting-local view is therefore also used by the established tree route.
+It borrows co-located member IDs and RaBitQ bytes under the query's immutable
+generation lease, and any WAL/delta shadow forces the prior authoritative path.
+The common unfiltered heap-admission loop rejects noncompetitive groups with
+Zig `@Vector(8, f32)` comparisons while replaying every possibly competitive
+group through the existing scalar tie/interval logic. These changes still need
+a fresh normal-route r95 qualification before they can be called a performance
+win.
+
+Certified flat stopping now has an implementation-level experiment as well:
+for cosine/L2, selection retains the complete already-scored compact directory,
+builds conservative suffix minima from persisted posting radii, and stops only
+when the unseen suffix lower bound is strictly beyond the kth-smallest retained
+upper endpoint. Unresolved/dirty bounds fall back to the existing effort path;
+inner product has no metric-ball proof. This must be measured with reduced
+initial probe waves and removed if it cannot restore recall parity.
+
+## Posting-local ReleaseFast and native-capture follow-up (r96-r99)
+
+r96 re-ran the unchanged r94 tree generation with a ReleaseFast binary. The
+posting-local member/RaBitQ view scored 23,809.8 vectors across 207.9 leaves and
+preserved 0.98312 recall. Client mean/p50/p95/p99 were
+10.46/9.18/13.56/18.99 ms; server mean was 7.94 ms, including 1.11 ms leaf
+scoring and 2.87 ms artifact reads. It still issued 304.6 float16 projection
+reads and 135.6 lossless-residual reads per query. Official QPS at concurrency
+1/10/20/30 was 77.56/131.08/112.47/95.43. This establishes that the
+posting-local RaBitQ/SIMD path is sound; centralized refinement I/O, not leaf
+scoring, is the remaining single-query bottleneck.
+
+Fresh r97 stalled at public progress 0.999. r98 eventually qualified only
+after 306.9 seconds of optimization: an empty one-shard exact generation
+accepted the first vector window, but later capture eligibility incorrectly
+required the preferred serving layout. The resulting sparse overlay was exact
+but not preferred, so capture stopped, coverage stalled, and stable-tip repair
+rescanned the primary artifact plane. Mutation admission now tests exact
+transaction authority (precision, sequence, and scope), independently from
+serving-layout readiness. A regression test covers an exact sparse generation
+that remains capture-eligible before serving compaction.
+
+r99 validates that lifecycle fix. It inserted 50K through the public API in
+24.2855 s and compacted the native vector generations without a non-empty
+primary snapshot scan in 8.1097 s, for 32.3952 s total. This recovers the
+30--40-second load target. CPU contention makes the insert phase noisier than
+r88, but the publication mechanism itself is now native and bounded.
+
+The first r99 query attempted progressive float16 refinement in 64-candidate
+chunks. It reduced projection reads from 304.6 to 177.3 and total physical
+reads from 440.2 to 303.5; detailed client mean/p95 fell to 8.02/9.58 ms.
+However recall fell from the accepted 0.9838 baseline to 0.9504. Raising effort
+from 0.5 to 0.6 scored 26,212.6 vectors and achieved only 0.95217 recall.
+Exhaustive routing scored all 50K vectors and still reached only 0.95985, which
+rules out leaf routing as the cause. This optimization is rejected.
+
+A same-generation A/B that refines the complete RaBitQ-selected shell before
+applying the float16 boundary restored recall to 0.98451. It scored the same
+24,366.9 approximate vectors/208 leaves, read 303.8 float16 projections, and
+completed only 135.8 authoritative residuals. Client mean/p50/p95/p99 were
+12.12/10.14/16.63/27.55 ms and server mean was 9.34 ms. Official QPS at
+concurrency 1/10/20/30 was 83.07/134.70/115.25/117.46, with p95
+18.01/103.31/256.38/401.44 ms. Compared with r96, posting-local scanning keeps
+low/mid-concurrency throughput comparable and improves concurrency-30 QPS,
+but randomized centralized float16 reads still cap single-query latency.
+
+The correctness rule is now explicit: RaBitQ intervals select the complete
+refinement shell; only after every selected candidate has a float16 interval
+may the overlap boundary decide which candidates need lossless residual
+completion. RaBitQ's stochastic interval must not be used as a certificate for
+skipping unread float16 candidates. The next layout experiment should place
+the float16 scan plane beside immutable leaf membership/RaBitQ bytes (or make
+that the sole float16 authority) while retaining generation-leased centralized
+residual completion. That changes hundreds of random projection reads into a
+few sequential leaf reads without exact-scoring the whole shell.
+
+A bounded 32 MiB cross-query float16 projection cache was also rejected on the
+same r99 generation. It preserved 0.98451 recall and reduced total physical
+reads from 439.64 to 347.51/query (about 303.85 to 211.71 projection reads once
+the unchanged 135.80 residual reads are removed), but client mean/p95 regressed
+from 12.12/16.63 ms to 13.78/18.66 ms, artifact time rose from 3.99 to 6.54 ms,
+and RSS rose from 232.05 to 328.45 MB. Per-vector hash lookup, locking, copying,
+allocation, and FIFO churn cost more than the saved warm reads. The prototype
+was removed. Any future hot cache should admit immutable leaf scan pages as a
+unit under the resource manager, after the durable posting-local layout exists;
+it should not cache individually addressed projections.
+
+## Posting-local float16 scan plane and certified routing (r100-r103)
+
+r100 publishes a version-three immutable quantized directory with one
+contiguous float16 candidate matrix and its conservative error/norm metadata
+beside each leaf's membership and RaBitQ rows. Queries borrow the complete row
+under the posting-generation lease; any membership, posting-state, or
+quantized-payload shadow falls back to the authoritative overlay path. The hot
+loop scores the float16 matrix with Zig `@Vector(8, f16/f32)` kernels and marks
+those candidates as already refined. The public top-k boundary still controls
+lossless float32 completion, so this is a layout change rather than a weaker
+score contract.
+
+The fresh public-API r100 qualification inserted in 28.2927 s and reached
+ready in 34.3334 s. Recall/NDCG were 0.9867/0.9883. QPS at concurrency
+1/10/20/30 was 123.39/324.52/263.03/248.66, versus
+83.07/134.70/115.25/117.46 for r99. Serial p95 was 9.06 ms. The detailed
+profile scored 23,828.7 approximate vectors across 208.0 leaves, completed
+137.5 exact vectors, and measured 8.67 ms client mean, 6.43 ms server mean,
+3.87 ms leaf scoring, and 1.23 ms artifact reads. Physical vector reads fell
+from 439.64 to 275.01/query because the candidate shell no longer performs
+centralized projection reads.
+
+The remaining 275 reads are exactly two reads per 137.5 completed vectors: the
+central exact-vector path rereads a float16 projection before its lossless
+residual. The posting-local projection must either be passed into residual
+completion, or become the sole generation-bound projection authority while a
+central residual-only store remains keyed by vector identity. The latter also
+removes the current duplicate float16 payload. r100's posting segment grew by
+about 77 MB and total durable data was 761 MB; live RSS sampled 2.252 GB while
+restart RSS was 422 MB. The query-speed result is accepted, but that duplicate
+disk/RSS end state is not.
+
+r101 initially attempted to reconstruct missing cosine leaf radii from the
+same bounded projection rows. It incorrectly required an arithmetic-mean leaf
+centroid to have unit norm. That condition safely fell back but produced zero
+stops. r102 corrected the certificate to compare normalized projected members
+with the normalized centroid and conservatively add the float16 normalization
+perturbation. It reached ready in 28.9739 s, preserved 0.9868 recall, and
+delivered 125.53/318.21/270.11/252.84 QPS. The detailed profile was likewise
+unchanged: 23,984.8 vectors, 207.9 leaves, 137.4 exact completions, 8.64 ms
+client mean, and zero certified stops.
+
+Direct format inspection showed that r102 did publish finite certified radii
+for all 441 immutable leaves. r103 then exposed an experiment-control error:
+the default `auto` mode stays on the recursive tree below 1,024 completed
+postings, so altering the persisted flat directory could not affect its 208
+tree leaves. It remained at 0.9865 recall and zero stops and is a no-op routing
+result, not evidence for exact or quantized flat routing.
+
+r104 explicitly selected `flat_exact` with a 16-leaf initial wave. It reached
+only 0.9731 recall and 103.52/213.44/85.78/72.33 QPS at concurrency
+1/10/20/30. The detailed profile scored 20,985.0 vectors across 179.7 leaves,
+with 15.05 ms client mean and 23.06 ms p95. Most importantly, all routing
+bounds resolved but produced **zero certified stops**. The smaller shell and
+recall loss came from the ordinary flat-route candidate limit, not from proof
+pruning. Exact routing and reconstructed radii were removed: the current leaf
+spheres overlap too much for radius-only stopping, so persisting a new
+quantized encoding of the same directory would not create a query win. The
+next routing experiment must improve partition balance/separation or use a
+different certified summary, then compare at recall parity.
+
+r105 passed each posting-local bounded projection through the generation lease
+to exact completion, so an ambiguous candidate reads only its centralized
+lossless residual. Binding validates vector generation/location, dimensions,
+encoding, scale, error bound, decoded-norm bound, and the source projection
+checksum. A mismatch falls through to the complete authoritative vector read;
+it never turns a stale posting row into an exact score. This cut physical
+vector reads from 275.01 to 137.42/query and bytes from about 769 KB to 347 KB,
+but recomputing CRC32 over every borrowed 3 KiB projection made the warm 50K
+profile slower (9.46 ms mean versus r100's 8.67 ms).
+
+r106 therefore publishes the source projection checksum as a fourth metadata
+column in quantized-directory V4. The directory reader authenticates the
+complete immutable leaf entry once, after which exact binding compares the
+persisted checksum without rehashing the row. V1-V3 remain readable; V3 lacks
+that certificate and safely uses the complete-read fallback. The fresh public
+API qualification inserted 50K rows in 18.1686 s and reached ready in 28.2068
+s. Recall was 0.9863. QPS at concurrency 1/10/20/30 was
+117.24/281.66/241.98/232.62; detailed client mean/p50/p95/p99 was
+8.79/8.17/9.58/11.52 ms, server mean/p95 was 6.68/7.81 ms, leaf scoring was
+4.13 ms, and artifact read time was 1.13 ms. It scored 24,174.6 vectors over
+207.9 leaves and exactly completed 137.47 vectors with 137.47 physical reads
+and 346,921 bytes/query. Live RSS peaked at 2.131 GB and restart RSS at 432 MB;
+durable run-root size was 774 MB.
+
+The residual-only authority is retained for a 1M qualification: r106 halves
+random exact-completion I/O and preserves exactness, but normal warm 50K
+variance does not establish a latency win over r100. The durable end state must
+also remove the centralized duplicate float16 projection rather than merely
+avoid reading it. That requires a generation manifest which owns posting-local
+projection blocks plus centralized residual-only blocks as one atomic exact
+artifact, with compaction/recovery retaining their shared vector identity and
+checksum contract.
+
+## Posting-local 768D 1M qualification (r107)
+
+r107 used the exact Circus workload, `Performance768D1M` (Cohere 1M, 768
+dimensions), through the public table API with batch 100, four client workers,
+the default full-text index removed through the public contract, a 2 GiB
+process envelope, and query concurrency 1/10/20/30. The first attempted case
+name, `Performance1536D1M`, was rejected before load because VectorDBBench does
+not define it; it is not a benchmark result. Dataset download preceded the
+timed insert but occurred after the host wired baseline, so only process RSS is
+usable from this first cached lifecycle.
+
+The official insert completed in 814.682 s (13.58 minutes) and stable-tip
+optimization took 62.505 s, for 877.187 s ready time (14.62 minutes). This
+recovers the expected approximately 13-minute insertion time and disproves the
+reported 3,000-second result for this implementation/configuration. Native
+posting WAL/checkpoint recovery remained correct through sequence 10,001. It
+periodically compacted bounded deltas and ultimately published a 1.840 GB full
+posting segment; the exact-vector generation compacted all 1M vectors before
+readiness.
+
+Memory and disk do not yet qualify. The primary document/embedding LSM crossed
+hard pressure near 644K and a pressure compaction raised sampled RSS above
+3.5 GB. Stable-tip exact-vector plus posting publication ultimately produced a
+5.479 GB RSS peak and a 4.800 GB `phys_footprint` ledger peak despite the 2 GiB
+configured envelope. Final restart RSS peaked at 2.248 GB and the durable data
+root was 7.7 GB. Source LSM mutable snapshot copying reached about 2.15 GB
+cumulative; the final 1.7 GB posting segment also duplicates the float16 scan
+plane still present in the central exact-vector generation. The next memory
+fix must coordinate streaming builder buffers, source compaction, and page
+cache residency; the next disk format must make posting-local projection plus
+central residual the sole exact artifact rather than two projection copies.
+
+Serial quality was strong at 0.9935 recall/0.9942 NDCG. The detailed public
+profile scored 240,783.8 approximate vectors across exactly 2,048 leaves and
+completed only 147.06 exact vectors. Residual-only completion worked as
+designed: 147.06 physical reads and 186,920 bytes/query, with zero projection
+reads. Client mean/p50/p95/p99 was 44.49/30.31/54.55/496.78 ms; server mean
+was 32.14 ms, of which leaf scoring was 22.04 ms and artifact reads 5.13 ms.
+Thus refinement I/O is no longer the dominant 1M cost; the 240K candidate shell
+is.
+
+The published concurrency numbers from this lifecycle are **invalid**. At
+concurrency 20 and 30, ordinary queries exhausted the dense-search scratch
+slice and the public endpoint emitted HTTP 500 `ResourceBudgetExceeded`
+(45,165 server log occurrences, including wrapper lines). The framework still
+reported 26.80/108.01/120.45/187.36 QPS because its upstream result does not
+fail the run on these request errors. Root cause is the rejected certified
+routing experiment: cosine selected all 8,878 posting probes per query to make
+a suffix proof available, yet the profile recorded zero certified stops. Each
+query retained about 3.35 MB of scratch and the roughly 90 MB dense-search
+slice failed before public admission's nominal 32-request capacity.
+
+Approximate requests now retain only `search_width + bounded filter slack`
+posting probes; only explicit complete-snapshot validation allocates the full
+directory. This removes the failed proof experiment's O(postings) per-query
+scratch and restores the normal bounded ANN effort contract. A resumed
+concurrency/profile run against the same immutable r107 generation is required
+before claiming query latency or QPS. More generally, resource-derived query
+capacity should eventually participate in public admission so a future
+index-sized workspace cannot leak an internal 500 even when its estimator or
+configuration is wrong.
+
+### Bounded 1M routing and recall knee (r108)
+
+The first resumed A/B retained only 2,064 of the 8,878 flat posting probes,
+but still failed qualification. It reduced a scratch handle from roughly
+3.35 MB to 561 KB before flat block scoring, then accidentally called the
+general vector-fetch capacity helper for centroid output. That helper also
+allocated a `dimensions * block_size` float32 vector batch plus lookup and
+rerank columns which routing never reads. At concurrency 30, roughly 2.85 MB
+of needless growth per request again filled the 90 MB dense-search slice. Its
+apparent 225.1 peak QPS is rejected because the server logged 21,952
+`ResourceBudgetExceeded` occurrences.
+
+r108 splits flat centroid scoring into two scalar output planes and accounts
+their growth before allocation; it no longer couples routing to vector decode
+workspace. The second resumed default-effort curve had zero public failures
+and delivered 18.40/140.23/136.83/127.11 QPS at concurrency 1/10/20/30. The
+first point faults a cold 1.7 GB posting generation and is not a warm-latency
+claim. At concurrency 30, attributable demand was 574 MB and cache-inclusive
+RSS was 2.83 GB. A separate 1,000-query profile preserved 0.9935 recall while
+scoring 240,783.8 vectors across 2,048 leaves; client p50/p95 was
+25.56/27.03 ms, server mean was 27.58 ms, leaf scoring was 20.78 ms, and
+artifact reads were 0.97 ms. Exact refinement is no longer material to the
+default query cost.
+
+The same immutable generation then isolated the public effort curve:
+
+| effort | recall | leaves/query | approximate vectors/query | client p50 | client p95 |
+|---:|---:|---:|---:|---:|---:|
+| 0.30 | 0.83072 | 168 | 19,917.0 | 5.73 ms | 19.33 ms |
+| 0.35 | 0.89888 | 315 | 37,276.5 | 7.09 ms | 9.10 ms |
+| 0.40 | 0.94890 | 588 | 69,482.7 | 9.76 ms | 11.28 ms |
+| 0.41 | 0.95642 | 666 | 78,677.0 | 10.57 ms | 11.82 ms |
+| 0.50 | 0.99350 | 2,048 | 240,783.8 | 25.56 ms | 27.03 ms |
+
+Effort 0.41 is the smallest measured point above the Circus 0.955 recall
+floor. Its error-free concurrency curve was 63.29/179.28/147.46/142.23 QPS.
+This improves default work by 67%, but remains below the current 768d/1M
+competitor targets (238.7 QPS/6.6 ms p95 for Chroma and materially faster
+graph engines). The current flat partition therefore cannot reach the desired
+20--35K candidate shell at recall parity; merely changing the default effort
+would trade away quality.
+
+For comparison, native recursive topology at effort 0.44 reached only 0.9502
+recall while scoring 112,709.6 vectors across 959.2 leaves, with 13.86 ms p50
+and 15.18 ms p95. It is dominated by flat routing and remains rejected. The
+next retained experiment uses the already co-located RaBitQ leaf codes as a
+first-stage candidate heap, completes only admitted candidates from the
+posting-local float16 plane, and retains the existing lossless-residual
+completion solely for intervals which can cross the public top-k boundary.
+This attacks per-leaf arithmetic without changing generation ownership or
+authoritative score semantics; a better multi-representative partition or
+directory is still required to reduce routed leaves themselves.
+
+The two-stage implementation qualified on both public workloads. At 1M and
+effort 0.41 it retained exactly 800 RaBitQ-admitted candidates/query for
+float16 completion, preserved 0.95545 recall, and reduced leaf scoring from
+6.74 to 2.06 ms. Client p50/p95 improved from 10.57/11.82 to
+8.65/10.59 ms. Its error-free concurrency curve was
+93.91/174.95/147.72/147.92 QPS: concurrency-1 improved materially, while the
+throughput plateau moved to residual I/O and remaining routed-code work. The
+run exactly completed 145.72 vectors/query, so RaBitQ admission did not widen
+the authoritative boundary.
+
+The existing 1536d/50K V4 generation retained 0.98622 recall. Its public
+profile improved from 8.79/8.17/9.58 ms mean/p50/p95 to
+7.23/5.72/8.48 ms, with leaf scoring falling from 4.13 to 1.18 ms. The valid
+concurrency curve improved from 117.24/281.66/241.98/232.62 to
+174.59/331.47/256.30/239.01 QPS. This is a general native-leaf optimization,
+not a 1M-specific effort shortcut. High-concurrency scaling remains poor:
+the next format experiment should co-locate the lossless residual plane with
+the posting-local projection so boundary completion avoids roughly 140 sparse
+central reads/query and the duplicate central float16 generation can be
+removed.
+
+A narrower exact-residual mmap experiment confirms why the next step must be
+a format/layout change rather than another read-policy toggle. It retained the
+posting-local candidate plane and mapped only the lossless central residual
+rows admitted by the exact boundary. At 50K, physical residual reads fell from
+137.43/query to zero and profile p95 improved from 8.48 to 7.73 ms, but QPS
+changed from 174.59/331.47/256.30/239.01 to
+144.52/264.18/275.43/224.75 at concurrency 1/10/20/30. The mixed curve is not
+a throughput win.
+
+At 1M effort 0.41, physical reads likewise fell from 145.72/query to zero,
+with identical 0.95545 recall and candidate/exact counts. Warm profile p50/p95
+improved from 8.65/10.59 to 6.23/8.92 ms, and concurrency-1 rose from 93.91 to
+110.83 QPS. However, concurrency 10/20/30 regressed from
+174.95/147.72/147.92 to 133.45/135.61/131.14 QPS, while peak RSS rose from
+2.44 GB to 3.40 GB as random queries retained pages from the approximately
+1.25 GB residual arena. The implementation and flag are removed. Bounded
+positional reads remain the production policy; reducing this cost requires a
+smaller residual-only central format and/or locality-preserving residual
+packing, not unrestricted mmap touches.
+
+A lazy four-representative `flat_rabitq` directory was also tested before any
+durable-format change. Each leaf contributed its centroid plus three
+deterministic posting-local member rows, and query selection deduplicated by
+leaf after scoring the enlarged directory. At effort 0.30 it still searched
+168 leaves/20,564 vectors, but recall collapsed from 0.8307 to 0.02151 and
+routing alone cost 9.32 ms. Taking the minimum distance across raw member
+samples creates an extreme-value bias toward diverse leaves with one
+accidentally close representative. The prototype is removed. Any future
+multi-representative directory must use learned subcentroids with balanced
+assignment—or rebuild better-separated leaves—and must prove recall at fixed
+candidate work before receiving a persisted format version.
+
+### Global-clustering topology oracle (r109)
+
+The 50K corpus was rebuilt on an APFS clone with the existing one-shot
+`global_kmeans` topology builder. The rebuild consumed 322.7 MB of workspace,
+retired 547 online nodes, created 488 nodes, and took 12.55 seconds. This is a
+quality oracle rather than a production 1M builder: the current implementation
+materializes the complete transformed float32 corpus and would require more
+than 3 GB at 768d/1M, outside the 2 GiB service envelope.
+
+At effort 0.30, global clustering searched approximately the same shell as the
+online topology (42 leaves and 5,309 versus 4,910 vectors/query), but recall
+improved from 0.80787 to 0.86921. The broader sweep was:
+
+| effort | recall | leaves/query | approximate vectors/query | client p50 | client p95 |
+|---:|---:|---:|---:|---:|---:|
+| 0.30 | 0.86921 | 42 | 5,308.7 | 4.19 ms | 5.19 ms |
+| 0.40 | 0.94233 | 94 | 11,861.3 | 4.61 ms | 5.68 ms |
+| 0.45 | 0.96856 | 140 | 17,610.9 | 4.79 ms | 5.91 ms |
+| 0.47 | 0.97667 | 164 | 20,598.7 | 4.98 ms | 6.01 ms |
+| 0.50 | 0.98663 | 207 | 26,010.2 | 5.16 ms | 6.15 ms |
+
+Effort 0.47 is within 0.955 percentage points of the accepted online-tree
+default recall while scoring 14.8% fewer approximate vectors and reducing p95
+by 29.2%. Its error-free concurrency curve was
+187.80/301.44/238.45/222.16 QPS at concurrency 1/10/20/30. This improved
+serial QPS by 7.6%, but regressed concurrency 10--30 by 6.9--9.1%; peak RSS was
+approximately 1.00 GB with 410 MB attributable demand. The experiment proves
+that partition quality can materially improve recall per routed leaf, but it
+does not by itself solve shared-resource scaling.
+
+The rebuild also exposed a lifecycle gap. A restarted, already-queryable index
+did not schedule optional topology debt for more than 60 seconds, and an empty
+public `sync_level=full_index` barrier only waited for current readiness. A
+subsequent real source mutation caused idle maintenance to perform the rebuild.
+Topology acceleration must therefore become explicit, non-blocking maintenance
+debt: absence of the preferred topology must not make an otherwise valid index
+unqueryable, while the background scheduler and an explicit acceleration wait
+must be able to observe and drain it. The production builder must be bounded
+and streaming (for example, a sampled hierarchical trainer followed by
+batched assignment and atomic generation publication), not the whole-corpus
+oracle used here.
+
+The existing full-dimensional Hilbert-seeded bulk builder was also exposed as
+a temporary topology-rebuild oracle and tested on a separate 50K clone. It
+retired 547 online nodes, created 301 nodes, consumed 626.65 MB of explicitly
+accounted workspace, and took 16.56 seconds. The 2 GiB resource governor
+correctly denied that oversized repair reservation, so the oracle was built
+under a temporary 4 GiB envelope and served afterward under the normal 2 GiB
+envelope.
+
+Its routing quality was decisively worse. At effort 0.30 it searched 42 leaves
+and 7,047 vectors/query but reached only 0.36619 recall; at effort 0.50 it
+searched 208 leaves and 34,899 vectors/query yet reached only 0.91518 recall.
+The online/global-k-means comparisons at similar work are respectively
+0.80787/0.86921 recall near 42 leaves and 0.98622/0.98663 near 208 leaves.
+The experimental rebuild mode is removed. A full-dimensional space-filling
+curve is not a viable high-dimensional partition here, and its O(N*D) keys
+would also be an unsuitable external-sort format. Bounded production work
+should focus on sampled hierarchical clustering with streamed assignment.
+
+r99's live RSS sampler peaked at 1.9705 GB during the ingestion/publication
+phase, while restart query RSS was 215.6 MB and the final durable footprint was
+613 MB (273 MB exact vector blocks and 23 MB posting segments). The source
+capture currently owns coalesced float32 vectors, then vector-WAL encoding and
+WAL replay transiently materialize additional corpus-sized representations at
+stable tip. A production memory fix should stream uncommitted exact-vector
+records to a capture-scoped WAL/spool and publish its commit frame only after
+the source transaction commits; it must not trade correctness for borrowed
+request-buffer lifetimes or re-read the primary LSM.
+
+### Bounded hierarchy and concurrent-cache follow-up (r113)
+
+The bounded hierarchical-k-means builder now propagates exact leaf budgets
+through the hierarchy and uses capacity-constrained assignment. On the 50K
+corpus it completed in 39.33 seconds with 321.1 MB of accounted workspace,
+retiring 547 nodes and creating 429. It did not beat the global-clustering
+oracle: at effort 0.47 it reached 0.97275 recall while searching 164 leaves and
+27,527 vectors/query, with 7.61 ms p95. The public concurrency curve was
+154.60/273.92/211.90/192.02 QPS at concurrency 1/10/20/30. The builder is a
+bounded production candidate, but this particular hierarchy is rejected as
+the serving default until its partition quality matches the global oracle.
+
+This run also exposed a maintenance-state bug. The topology maintenance helper
+returned one boolean for both "nothing needed" and "work deferred", causing an
+already-completed topology rebuild to remain scheduled and run again after
+unrelated source mutations. Its result is now explicit: `not_needed`,
+`completed`, or `deferred`; only deferred work retains the candidate. A runtime
+reopen plus non-vector mutation confirmed that completed topology debt no
+longer reappears.
+
+Two flat-routing experiments are rejected. Exact flat routing did not improve
+the qualified latency/recall tradeoff. Adaptive flat routing initially appeared
+to reduce work, but that result exposed a correctness bug: traversal stopped
+when the bounded candidate heap became full even though heap capacity is not a
+pruning proof. Removing that early exit and adding a deterministic regression
+restored recall, but no certified stops were possible with the current bounded
+frontier and latency regressed. Future routing reductions must use persisted,
+conservative leaf bounds rather than a candidate-count heuristic.
+
+A valid concurrency-30 process sample then showed that the runtime admitted
+many queries; the bottleneck was not a small HTTP worker limit. The dominant
+search-side samples included 1,902 cache clock insertions, 1,328 shared apply
+locks, 1,584 RaBitQ scoring samples, and roughly 600 residual reads. Rerank's
+vector-to-document metadata API returned transaction-owned views, so its
+"cached" helper still read every value and then cloned it into a retained cache
+which that API could never borrow. Keeping those one-shot values in the search
+transaction reduced clock samples to 126 and shared-lock samples to 502. A
+same-generation, host-noisy A/B improved concurrency-10/30 from 273.92/192.02
+to 297.13/270.48 QPS; concurrency 20 was a host-load outlier and is not used as
+evidence.
+
+The next A/B skipped the adapter-level decoded-vector cache whenever a complete,
+sequence-matched native projection generation was already leased. Native
+projection reads deliberately do not populate that heap cache, making the
+probe pure shared-lock/hash overhead. On the same immutable generation the
+public curve reached 233.69/680.96/457.67/519.77 QPS with p95
+5.31/28.39/67.35/93.46 ms. This machine was under changing concurrent compiler
+load, so the absolute curve remains provisional, but the process sample is
+causal: cache-clock samples fell to 26 while RaBitQ and residual I/O became the
+remaining search hot paths. Cache-inclusive peak RSS was 1.37 GB and
+attributable demand was 600.7 MB. The manager still recorded 5.21 million
+always-miss decoded-vector probes in its inner candidate batch. Removing that
+second probe only while the matching native authority is present reduced the
+decoded-vector cache's hits, misses, and insertions to exactly zero and lowered
+shared apply-lock samples from 502 to 240. Attributable demand was 593.6 MB.
+Its concurrency curve was 217.24/621.55/563.55/407.51 QPS, versus
+233.69/680.96/457.67/519.77 in the immediately preceding run. The mixed delta
+is treated as host/scheduler variance rather than a throughput claim.
+
+The decisive 1,000-query public profile preserved exactly 0.97275 recall,
+164 leaves/query, and 27,527.27 approximate vectors/query. It completed only
+137.06 authoritative vectors/query, with zero native vector-block misses or
+fallbacks and 137.06 residual reads/query. Client p50/p95 was 4.72/5.41 ms and
+server p50/p95 was 3.33/3.88 ms. The two cache changes are accepted because
+they remove provably useless retained-cache work, preserve recall and exact
+completion semantics, reduce lock pressure and attributable demand, and
+materially improve the warm single-query profile; the concurrency headline
+still requires controlled-host repetition.
+
+The accepted online V4 generation then supplied the production-path check.
+At 50K, recall and work remained exactly 0.98622, 207.88 leaves, 24,174.57
+approximate vectors, and 137.43 exact vectors/query. Warm client
+mean/p50/p95 improved from 7.23/5.72/8.48 ms to 6.31/4.80/7.39 ms. Two
+independent public concurrency lifecycles reproduced
+251.73/947.44/1031.64/1012.31 and
+255.56/948.41/995.33/1016.71 QPS at concurrency 1/10/20/30. The former V4
+curve was 174.59/331.47/256.30/239.01 QPS. Concurrency-30 p95 fell from
+193.23 ms to 69.54 and 69.24 ms. The runs had no request failures, retries,
+resource-budget errors, native fallbacks, or decoded-vector cache activity.
+Attributable demand was 269--282 MB; cache-inclusive RSS was 1.83--1.88 GB
+because the higher query volume touched substantially more file-backed pages.
+
+The same cache-free binary qualified at 1M using the production `auto`
+centroid policy and effort 0.41. Recall and work remained exactly 0.95545,
+666 leaves, 78,677.02 approximate vectors, and 145.718 exact vectors/query.
+The warm profile reached 5.72 ms p50, with 1.99 ms leaf scoring and 1.08 ms
+mean residual-read work; transient host stalls inflated p95 to 12.09 ms. The
+public concurrency curve improved from 93.91/174.95/147.72/147.92 to
+166.64/888.40/977.06/913.65 QPS, with p95
+6.50/18.46/60.69/87.75 ms. Attributable demand was 692 MB and
+cache-inclusive RSS was 2.85 GB. Forcing the older HBC tree directory at the
+same nominal effort produced only 0.91383 recall and is rejected; benchmark
+comparisons must retain the production `auto` routing contract.
+
+These results move 1M throughput near pgvector and well above Chroma on the
+current Circus snapshot, but remain behind Elastic, Milvus, and Weaviate. The
+remaining warm server path is approximately 2.0 ms posting-local candidate
+scoring plus 1.1 ms sparse lossless-residual completion. The next format
+experiment should persist a compact, generation-bound residual locator per
+vector rather than duplicate residual payloads in each HBC index. A locator
+plane removes vector-to-document metadata and hash-directory lookup while
+retaining one shared authoritative residual copy; it must fail closed and fall
+back whenever the vector-block generation identity does not match.
+
+### Generation-bound residual locator plane (V5, r114)
+
+The posting-local projection format now has an optional V5 residual-locator
+plane. Six explicit columns bind each float16 candidate row to the shared exact
+vector generation: reader generation, shard, revision, residual offset,
+residual length, and residual checksum. The 36-byte logical locator avoids
+duplicating roughly 1.25 GB of residual payload at 1M while removing exact
+completion's vector-to-document metadata read, artifact-key construction, and
+hash-directory lookup. V1--V4 generations remain readable. A V5 hint is never
+authority by itself: exact completion leases the sequence-matched vector
+generation, validates its generation/shard and projection metadata, and
+validates the residual checksum. Any unavailable or invalid hint leaves the
+score unresolved for the established authoritative fallback.
+
+The first fresh r114 run exposed a query-lifecycle bug rather than a format
+bug. All 436 physical leaf entries had V5 flags and complete locators, but
+location reuse was zero. Posting-local float16 rows completed the entire
+bounded pass without invoking the external projection loader, so the query had
+not yet pinned an exact-vector generation when authoritative completion began.
+The located callback returned immediately and the old metadata path handled all
+137.479 vectors/query. Exact completion now acquires one validated CURRENT
+lease per batch when the bounded pass did not already pin one. A deterministic
+test clears the pre-pinned session generation and verifies exact float32
+reconstruction through this production path; stale generation hints are
+rejected.
+
+The same-corpus public profile after that correction preserved exactly 0.98673
+recall, 207.955 leaves, 24,329.306 approximate vectors, and 137.479 exact
+vectors/query. Metadata and external artifact loads fell from 137.479 to
+exactly zero; generation-bound location reuses and residual reads were both
+137.479, with zero projection rereads, block fallbacks, or score-policy
+changes. The controlled before/after profile was:
+
+| r114 50K profile | before lease fix | V5 locator path | change |
+|---|---:|---:|---:|
+| client mean | 6.199 ms | 5.389 ms | -13.1% |
+| client p50 | 5.541 ms | 4.776 ms | -13.8% |
+| client p95 | 7.214 ms | 5.968 ms | -17.3% |
+| server mean | 4.159 ms | 3.515 ms | -15.5% |
+| server p50 | 3.963 ms | 3.391 ms | -14.4% |
+| server p95 | 5.427 ms | 4.268 ms | -21.4% |
+| residual/artifact read mean | 1.394 ms | 1.149 ms | -17.6% |
+
+The post-fix concurrency curve was 230.53/730.21/884.47/913.91 QPS at
+concurrency 1/10/20/30, versus 234.69/801.05/842.74/760.63 in the immediately
+preceding r114 lifecycle. Concurrency-20/30 improved while 1/10 regressed, so
+the mixed curve remains scheduler-sensitive; the exact work counters and
+single-query profile are the causal acceptance evidence. Restart query/profile
+RSS peaked at 1.087 GB and attributable physical footprint at 472.1 MB while
+the concurrency curve touched the mapped corpus. This is below the 2 GiB
+envelope and should not be compared with a serial-only restart sample.
+
+The V5 segment was 180,767,821 bytes versus 179,025,087 bytes for the accepted
+V4 r106 generation: 1,742,734 bytes, or 34.85 bytes/source vector, with no
+change to the 279,216 KiB shared vector-block directory. Fresh r114 load time
+was 22.15 seconds of insert plus 9.06 seconds of public optimize/readiness,
+31.21 seconds total. The comparable r106 lifecycle was 18.17 + 10.04 = 28.21
+seconds; the 3.00-second difference is dominated by that run's slower insert,
+not locator publication, but needs controlled repetition. The result remains
+inside the 30--40-second 50K target and does not weaken load/RSS invariants.
+
+### Crash-safe streaming checkpoint publication (r116/r117)
+
+The buffered full-checkpoint builder had a corpus-sized peak that its cleanup
+comment obscured. `quantized_directory.build()` first owned the complete native
+candidate directory, then `posting_segment.Writer.build()` reserved the entire
+final segment before copying and freeing that directory. At 1M the two
+simultaneous allocations were approximately 1.88 GB each. Freeing each input
+after its copy bounded retained memory but could not bound peak memory because
+the complete output allocation already existed.
+
+Full checkpoints now write directly to the storage layer's durable atomic
+sink. The outer AFPS writer retains only fixed-size index entries; a nested
+AFQD streaming writer retains only its compact leaf index and one leaf's
+projection scratch. It patches the AFQD header inside the unpublished sibling,
+finishes the AFPS index/footer, fsyncs, atomically renames the immutable
+generation, and syncs the parent directory. Only after that staged receipt is
+validated does the existing WAL-prefix transaction publish `CURRENT`. A fault
+before the rename removes the temporary sibling; a crash after staging leaves
+an unreferenced orphan; a crash after `CURRENT` sees the complete generation.
+Older monolithic generations use the same bytes and remain readable.
+
+The builder deliberately traverses immutable node metadata twice: the first
+pass streams ordinary HBC values and constructs the small centroid directory;
+the second streams the quantized/projection planes. This preserves contiguous
+query layout without retaining a corpus-sized heap buffer. AFPS and AFQD
+streaming encoders have byte-parity tests against their buffered counterparts,
+including V5 residual locators. The background publication regression also
+proved that a concurrently appended same-sequence WAL suffix survives the
+staged full-checkpoint handoff and restart.
+
+Fresh r116 50K qualification preserved 0.9868 recall, 208 leaves/query,
+24,049.139 approximate vectors/query, and 137.416 exact completions/query.
+Load was 26.50 seconds insert plus 8.55 seconds readiness, 35.05 seconds total.
+The public QPS curve was 251.61/942.59/983.73/855.52 at concurrency
+1/10/20/30. Detailed client p50/p95 was 4.93/6.04 ms and server p50/p95 was
+3.44/4.30 ms. Relative to buffered r114, sampled RSS fell from 2.187 GB to
+2.041 GB and the process physical-footprint ledger fell from 849.5 MB to
+820.7 MB. Restart demand was 112.9 MB and restart RSS 356.1 MB.
+
+Fresh r117 1M qualification completed in 710.92 seconds insert plus 70.10
+seconds readiness, 781.01 seconds (13.02 minutes) total. Buffered r115b was
+768.20 seconds, so bounded-memory publication cost 12.81 seconds, or 1.7%,
+while producing a complete 1,876,801,174-byte V5 generation with zero WAL
+tail. Default-effort recall remained 0.9923. This validates the HBC builder,
+but it does **not** yet validate the end-to-end 2 GiB envelope: r117 peak RSS
+was 6.059 GB and physical-footprint high-water was 4.40 GB, versus r115b's
+5.685 GB and 4.70 GB.
+
+The RSS timeline and public LSM counters identify the new dominant event. At
+about 609K source rows the primary document LSM reached roughly 2.09 GB of L0,
+then compacted approximately 1.88 GB into lower levels. RSS rose from about
+2.1 GB to 6.06 GB during that compaction and receded before the later HBC full
+checkpoint began. The final streamed 1.877 GB HBC publication raised current
+RSS from about 2.81 GB to 3.86 GB through file-backed write-cache residency,
+not a matching heap allocation. Restart physical demand was only 279.7 MB even
+though restart RSS was 2.40 GB. Therefore the native HBC double buffer is
+fixed, but production acceptance now requires bounded primary-LSM compaction
+buffers plus post-fsync eviction of cold output pages; cache-inclusive RSS and
+attributable demand must remain reported separately.
+
+### Cold maintenance I/O and direct WAL resharding (r118/r119b)
+
+Fresh r118 applied cold sequential policy to streamed HBC publication and LSM
+compaction input/output without changing public durability. The 50K lifecycle
+completed in 26.39 seconds insert plus 11.21 seconds readiness, 37.60 seconds
+total, with 0.9857 recall. Live sampled RSS peaked at 874.3 MB versus 2.041 GB
+in r116; the one-shot physical-footprint sample was 1.10 GB and attributable
+demand was 1.20 GB. Restart RSS was 307 MB with a 118 MB footprint ledger.
+This is the first fresh lifecycle to retain the 30--40-second load target while
+removing most cache-inclusive load RSS.
+
+The immediate cold query curve was 182.84/616.08/772.35/700.63 QPS at
+concurrency 1/10/20/30, and the public profile reported client mean/p50/p95 of
+7.94/6.47/11.27 ms and server mean/p50/p95 of 5.11/4.46/8.39 ms. It retained
+208 leaves/query, 23,970 approximate scores, and 137.29 exact completions.
+These numbers are slower than warm r116 and are intentionally recorded as a
+cold-cache cost, not attributed to the scoring implementation. Future results
+must report first-cold and warmed query phases separately.
+
+Fresh r119b reached 1M inserts in 749.05 seconds but is **invalid** as a
+qualification result. At source sequence 9810, derived catch-up encountered an
+already active source capture and returned `PostingWalCaptureOwnershipConflict`;
+the index reactivated and invalidated all later timing/readiness evidence. The
+trace also showed peak RSS around 6.51 GB. A single-shard empty bootstrap
+generation first checkpointed the complete vector WAL into an approximately
+1.7 GB delta, then immediately resharded that delta into the intended 128-shard
+base. Cold cache intent was only observed after a caller's complete
+`appendSlice`, so a multi-gigabyte slice also evaded the intended residency
+bound.
+
+The durable correction is below both callers. A cold atomic sink now divides
+every append at 64 MiB writeback boundaries, syncs completed prefixes, and
+makes them reclaimable; immutable generation publication and primary LSM
+flush/compaction output use that policy while small mutable authority files do
+not. Cold compaction readers own private sequential descriptors and preserve a
+descriptor slot for output plus the persistent-lock reserve, falling back to
+ordinary positional readers rather than deadlocking under a low file limit.
+
+Stable-tip vector resharding now consumes the complete committed float32 WAL
+prefix directly together with immutable base/delta records. It encodes the
+destination float16 scan plane and lossless residual in one pass, publishes a
+complete replacement base, and atomically retains any later committed WAL
+tail. The old corpus-sized bootstrap delta is never created. A deterministic
+restart test covers an update, insert, and tombstone across a 1-to-4-shard
+topology change and verifies exact float32 bit reconstruction, generation 2
+publication, and an empty WAL. Derived catch-up explicitly borrows an active
+source capture: it may record mutations against the same token but cannot
+finish or cancel the owner's transaction.
+
+The bootstrap authority itself is now V4: it records the final logical shard
+count, exact-score precision, scoped zero-count certificates, and source
+coverage with `segments = []`. Older manifest versions still require every
+physical base shard, so a rolling downgrade rejects V4 explicitly instead of
+misreading a sparse delta as a complete base. The first mutation checkpoint
+therefore writes only touched blocks in the final 128-shard topology. Base
+compaction understands an omitted physical base, merges sparse blocks plus a
+committed WAL prefix shard-locally, publishes all 128 base members, and
+preserves any later complete WAL tail. Focused tests cover empty restart,
+sparse checkpoint restart, exact reads, WAL-over-sparse replacement, and final
+base consolidation without creating empty shard files or a one-shard corpus
+generation.
+
+Fresh r120 validates that design end to end through the public API. The 50K
+load completed in 16.77 seconds insert plus 15.36 seconds readiness, 32.14
+seconds total. It published complete visibility at source sequence 501 with
+0.9846 recall, within 0.22 percentage points of r116 and 0.11 points of r118.
+The final vector generation has exactly 128 files totaling 285.6 MB; the HBC
+posting generation is 181.1 MB. No one-shard corpus block was published.
+
+Cache-inclusive RSS peaked at 1.558 GB during readiness versus 2.041 GB in
+r116, a 24% reduction while load time improved from 35.05 to 32.14 seconds.
+The post-phase physical-footprint ledger was 989.8 MB and attributable demand
+was 1.080 GB. Restart RSS was 334.6 MB, its footprint ledger 106.2 MB, and
+attributable demand 201.4 MB. The live numbers remain below the 2 GiB service
+envelope without relying on a post-load restart.
+
+Public QPS was 236.23/838.57/869.59/858.74 at concurrency 1/10/20/30. The
+detailed restart profile reported client mean/p50/p95 of 5.80/5.10/6.62 ms and
+server mean/p50/p95 of 3.72/3.56/4.73 ms, with 207.93 leaves, 23,486.73
+approximate scores, and 137.47 exact completions/query. This is slightly below
+r116 at concurrency 1--20 and essentially equal at concurrency 30; no query
+algorithm changed in the low-memory patch, so the result is an acceptance
+guard rather than evidence of a query-throughput gain.
+
+### Durable cold generation I/O (r121--r125)
+
+The first uninterrupted 1M run of the final-shard builder, r121, completed the
+public insert in 644.58 seconds and readiness in another 70.23 seconds, 714.81
+seconds total. It did not complete its query curve because the diagnostic run
+was interrupted after concurrency 1 began, so it is not a query qualification.
+Its live RSS evidence is valid: the process reached 5.753 GB during final
+posting publication. The earlier 4.12 GB observation covered only the primary
+LSM/vector overlap and was not the run peak.
+
+r122 added cold immutable writes, private cold LSM compaction readers, and
+page-by-page advisory reclamation while streaming a posting checkpoint. Its
+fresh 50K result was strong: 20.13 seconds insert plus 10.22 seconds readiness,
+30.35 seconds total, 0.9863 recall, and 231.98/846.86/875.95/929.56 QPS at
+concurrency 1/10/20/30. Sampled peak RSS was 1.608 GB and restart RSS was 342.5
+MB. The profile retained about 24,014 approximate scores and 137.46 exact
+completions/query.
+
+r123 showed why advisory mmap reclamation alone is not a durable 1M design.
+The public load qualified in 665.67 seconds insert plus 68.93 seconds
+readiness, 734.60 seconds (12.24 minutes) total, with 0.9926 recall. Query QPS
+was 27.87/457.16/551.39/527.53 and serial p95/p99 was 12.5/14.3 ms. The detailed
+warm profile reported 239,808 approximate scores and only 146.51 exact
+completions/query, confirming that exact completion remained narrow.
+
+However, RSS still peaked at 5.841 GB while flattening the 1.88 GB posting
+generation; restart RSS was 2.456 GB. `madvise(DONTNEED)` reduced some already
+consumed pages but did not constitute an enforceable bound over a concurrent,
+generation-leased query mmap. The result is therefore a useful negative
+experiment: correctness and load time qualified, but the memory mechanism did
+not.
+
+The long-term correction reads base candidate rows through a separate
+maintenance descriptor instead of the serving mmap. Each quantized-directory
+entry already has an indexed byte range and checksum. Full flattening now
+performs an uncached positioned read of exactly one entry, authenticates it,
+decodes it into one aligned leaf-sized owner, writes it to the cold atomic
+output, and releases it before advancing. Foreground readers retain their mmap
+and generation lease; delta/WAL-shadowed postings continue through the
+authoritative resolver. Publication ordering, `covered_source_sequence`, WAL
+tail preservation, float16 bounds, and lossless residual locations do not
+change. This makes maintenance heap residency proportional to one leaf and no
+longer depends on the operating system honoring advisory eviction of the
+query mapping.
+
+Fresh r124 validates the new path at 50K. Load completed in 19.67 seconds
+insert plus 11.67 seconds readiness, 31.34 seconds total. Recall was 0.9861 and
+QPS was 240.97/868.93/890.50/895.52. Live RSS peaked at 1.588 GB, the post-run
+physical-footprint ledger was 907.4 MB, and restart RSS was 309.8 MB. The
+detailed profile reported client mean/p50/p95 of 5.69/4.94/7.06 ms and server
+mean/p50/p95 of 3.71/3.50/5.22 ms, with 24,103 approximate scores and 137.46
+exact completions/query. Thus the durable reader preserves the 30--40-second
+load target, recall parity, and serving performance.
+
+Fresh r125 validates the same design at 1M. Insert completed in 692.19 seconds
+and readiness in another 83.75 seconds, 775.94 seconds (12.93 minutes) total.
+The complete generation covered source sequence 10001 and recall was 0.9925.
+The 1.877 GB final posting generation published without increasing RSS: live
+RSS peaked earlier at 3.860 GB during primary/vector consolidation and fell to
+about 1.53 GB immediately after posting publication. This is 1.981 GB, or 34%,
+below r123's 5.841 GB high-water. The sampled post-query physical-footprint
+ledger was 2.60 GB; cold restart RSS was 2.400 GB with a 302.3 MB footprint
+ledger.
+
+The online curve immediately following deliberately cold publication was
+14.13/426.46/502.27/483.43 QPS at concurrency 1/10/20/30. A separate reopened
+concurrency pass distinguished first-touch I/O from steady serving and reached
+46.55/478.64/591.84/561.32 QPS. Its RSS peaked at 2.860 GB and its footprint
+ledger at 594.9 MB. The detailed profile reported client mean/p50/p95 of
+14.51/11.23/14.24 ms and server mean/p50/p95 of 10.39/10.02/12.58 ms, with
+239,507 approximate scores and only 146.60 exact completions/query. Exact
+completion therefore remains appropriately narrow; remaining 1M latency is in
+the approximate candidate shell and first-touch page admission, not reranking.
+
+r125 traded 41.35 seconds (5.6%) versus r123's 734.60-second load for a real
+memory bound, while remaining below the 13-minute target. Some run-to-run host
+variance is visible in the insert phase itself (692.19 versus 665.67 seconds),
+so publication overhead must not be inferred from the total delta alone. The
+50K A/B isolates a much smaller 0.99-second total difference between r122 and
+r124. Repeat runs on a controlled host remain necessary before assigning a
+precise throughput cost.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -2636,9 +3636,9 @@ published.
    with unsafe live probes merely to improve a cumulative counter.
 4. Repeat the final 128-shard/64-KiB-buffer float16 50K and 1M lifecycle three
    times through the post-phase-sampled, read-only-restart harness on a
-   controlled host and publish mean plus range. In particular, measure insert
-   and base publication in one uninterrupted 1M lifecycle; the current
-   758.57-second readiness figure is a qualified sum from the same corpus.
+   controlled host and publish mean plus range. The uninterrupted r125 result
+   now qualifies correctness and the 3.860 GB RSS bound; repetition is for
+   variance and precise throughput attribution, not to complete the lifecycle.
 5. Add deterministic fault injection at every posting-WAL append, fsync,
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
@@ -2665,7 +3665,18 @@ published.
     current Circus competitors using identical corpus, payload, recall, and
     concurrency semantics. Report cold and warm separately; never mix source
     mutation or maintenance into the first concurrency sample.
-11. Audit the remaining gap between 625 MB attributable restart demand and
-    roughly 2.53 GB cache-inclusive RSS. Classify mmap residency, allocator
+11. Audit the remaining gap between roughly 595 MB attributable warm-restart
+    demand and 2.86 GB cache-inclusive RSS. Classify mmap residency, allocator
     arenas, primary run/index pages, cache leases, and runtime stacks before
     changing budgets; reclaimable file cache must not be mislabeled as demand.
+12. Move candidate-page admission under an explicit resource-manager budget.
+    The cold r125 concurrency-1 wave was 14.13 QPS while a reopened pass reached
+    46.55 QPS. Split per-leaf authentication between compact RaBitQ and wide
+    float16/residual planes, prefetch only the routed shell, and evict whole
+    pages by generation. Do not restore unbounded mmap warmup merely to hide
+    cold latency.
+13. Reduce the remaining 3.60 GiB live high-water in primary/vector
+    consolidation. The posting flatten no longer raises the peak; prioritize
+    bounded vector-block source reads and primary LSM closure/output windows,
+    preserving crash-safe final-shard publication and progress on an
+    indivisible compaction closure.

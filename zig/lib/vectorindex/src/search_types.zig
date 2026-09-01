@@ -159,6 +159,10 @@ pub const SearchProfile = struct {
     /// completions rather than the wider bounded candidate shell.
     rerank_vector_residual_reads: u64 = 0,
     rerank_vector_residual_bytes: u64 = 0,
+    /// Actual kernel read calls/bytes after optional range coalescing. Mmap
+    /// views report zero because their page faults are not explicit reads.
+    rerank_vector_physical_reads: u64 = 0,
+    rerank_vector_physical_bytes: u64 = 0,
     /// Exact completions that reused a generation-pinned location discovered
     /// by the bounded pass instead of repeating key/index lookup.
     rerank_vector_location_reuses: u64 = 0,
@@ -214,6 +218,8 @@ pub const SearchProfile = struct {
     // payload was stale (payload_dirty) or absent from storage.
     leaf_payload_stale: u64 = 0,
     leaf_payload_missing: u64 = 0,
+    native_leaf_scan_hits: u64 = 0,
+    native_leaf_scan_fallbacks: u64 = 0,
     reranked_vectors: u64 = 0,
     approx_candidate_count: u64 = 0,
     rerank_candidate_count: u64 = 0,

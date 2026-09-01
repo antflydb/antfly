@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const vec = @import("antfly_vector").vector;
 const quantizer = @import("antfly_vector").quantizer;
 const types = @import("types.zig");
+const search_results = @import("search_results.zig");
 const search_types = @import("search_types.zig");
 
 pub const RerankLookup = struct {
@@ -49,6 +50,7 @@ pub const SearchScratch = struct {
     key_views: [][]const u8,
     values: []?[]const u8,
     vector_views: [][]const f32,
+    bounded_projections: []?search_results.BoundedProjection,
     distances: []f32,
     error_bounds: []f32,
     score_bounds: []f32,
@@ -91,6 +93,8 @@ pub const SearchScratch = struct {
         errdefer alloc.free(values);
         const vector_views = try alloc.alloc([]const f32, max_candidates);
         errdefer alloc.free(vector_views);
+        const bounded_projections = try alloc.alloc(?search_results.BoundedProjection, max_candidates);
+        errdefer alloc.free(bounded_projections);
         const distances = try alloc.alloc(f32, max_candidates);
         errdefer alloc.free(distances);
         const error_bounds = try alloc.alloc(f32, max_candidates);
@@ -120,6 +124,7 @@ pub const SearchScratch = struct {
             .key_views = key_views,
             .values = values,
             .vector_views = vector_views,
+            .bounded_projections = bounded_projections,
             .distances = distances,
             .error_bounds = error_bounds,
             .score_bounds = score_bounds,
@@ -143,11 +148,22 @@ pub const SearchScratch = struct {
         if (self.metadata.len < needed) self.metadata = try alloc.realloc(self.metadata, needed);
         try self.ensureLookupCapacity(alloc, needed);
         if (self.vector_views.len < needed) self.vector_views = try alloc.realloc(self.vector_views, needed);
+        if (self.bounded_projections.len < needed) self.bounded_projections = try alloc.realloc(self.bounded_projections, needed);
         if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
         if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
         const score_scratch_needed = std.math.mul(usize, needed, 2) catch return error.OutOfMemory;
         if (self.score_bounds.len < score_scratch_needed) self.score_bounds = try alloc.realloc(self.score_bounds, score_scratch_needed);
         if (self.vector_batch.len < vector_value_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_value_count);
+    }
+
+    /// Flat-directory routing scores one centroid block at a time. It needs
+    /// only the two scalar output planes; growing the complete vector-fetch
+    /// workspace here would allocate `dims * block_size` float32 values even
+    /// though no source vectors are decoded. At 768d/1M that accidental
+    /// coupling added roughly 2.8 MiB to every concurrent query.
+    pub fn ensureFlatCentroidScoreCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
+        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -178,25 +194,15 @@ pub const SearchScratch = struct {
         self: *const SearchScratch,
         needed: usize,
         needs_merge: bool,
-        vector_fetch_needed: usize,
+        centroid_score_needed: usize,
     ) !u64 {
         var projected = self.bytes();
         projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probes.len, needed);
         if (needs_merge) {
             projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probe_merge.len, needed);
         }
-        projected = try addSliceGrowthBytes(usize, projected, self.positions.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(u64, projected, self.vector_ids.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(?[]const u8, projected, self.metadata.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(RerankLookup, projected, self.lookups.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes([]const u8, projected, self.key_views.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(?[]const u8, projected, self.values.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes([]const f32, projected, self.vector_views.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(f32, projected, self.distances.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(f32, projected, self.error_bounds.len, vector_fetch_needed);
-        projected = try addSliceGrowthBytes(f32, projected, self.score_bounds.len, try std.math.mul(usize, vector_fetch_needed, 2));
-        const vector_value_count = std.math.mul(usize, self.dims, vector_fetch_needed) catch return error.OutOfMemory;
-        projected = try addSliceGrowthBytes(f32, projected, self.vector_batch.len, vector_value_count);
+        projected = try addSliceGrowthBytes(f32, projected, self.distances.len, centroid_score_needed);
+        projected = try addSliceGrowthBytes(f32, projected, self.error_bounds.len, centroid_score_needed);
         return projected;
     }
 
@@ -236,6 +242,8 @@ pub const SearchScratch = struct {
         reclaimed +|= freeSliceAboveRetainedCapacity(?[]const u8, alloc, &self.values, max_candidates);
         if (reclaimed >= target_bytes) return reclaimed;
         reclaimed +|= freeSliceAboveRetainedCapacity([]const f32, alloc, &self.vector_views, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(?search_results.BoundedProjection, alloc, &self.bounded_projections, max_candidates);
         if (reclaimed >= target_bytes) return reclaimed;
         reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.distances, max_candidates);
         if (reclaimed >= target_bytes) return reclaimed;
@@ -319,6 +327,7 @@ pub const SearchScratch = struct {
             byteLen(self.key_views) +
             byteLen(self.values) +
             byteLen(self.vector_views) +
+            byteLen(self.bounded_projections) +
             byteLen(self.distances) +
             byteLen(self.error_bounds) +
             byteLen(self.score_bounds) +
@@ -343,6 +352,7 @@ pub const SearchScratch = struct {
         alloc.free(self.key_views);
         alloc.free(self.values);
         alloc.free(self.vector_views);
+        alloc.free(self.bounded_projections);
         alloc.free(self.distances);
         alloc.free(self.error_bounds);
         alloc.free(self.score_bounds);
@@ -425,18 +435,22 @@ test "SearchScratch accounts reusable flat frontier workspace" {
         2 * 4_097 * @sizeOf(search_types.FlatCentroidProbe));
 }
 
-test "SearchScratch flat projection includes block scoring workspace" {
+test "SearchScratch flat projection includes only centroid score planes" {
     const alloc = std.testing.allocator;
     var scratch = try SearchScratch.init(alloc, 1_536, 16, 64);
     defer scratch.deinit(alloc);
 
     const frontier_only = try scratch.projectedBytesWithFlatProbeCapacity(10_000, false, 0);
     const with_block_scoring = try scratch.projectedBytesWithFlatProbeCapacity(10_000, false, 8_192);
-    try std.testing.expect(with_block_scoring > frontier_only + 48 * 1024 * 1024);
+    try std.testing.expectEqual(
+        frontier_only + 2 * (8_192 - 64) * @sizeOf(f32),
+        with_block_scoring,
+    );
 
     try scratch.ensureFlatProbeCapacity(alloc, 10_000, false);
-    try scratch.ensureVectorFetchCapacity(alloc, 8_192);
+    try scratch.ensureFlatCentroidScoreCapacity(alloc, 8_192);
     try std.testing.expectEqual(with_block_scoring, scratch.bytes());
+    try std.testing.expectEqual(@as(usize, 1_536 * 64), scratch.vector_batch.len);
 }
 
 test "SearchScratch vector fetch rejects dimension overflow before growth" {

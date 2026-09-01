@@ -834,6 +834,20 @@ pub const ValueLocation = struct {
         if (vector_bytes.len != self.vector_len) return error.CorruptedVectorBlock;
         if (std.hash.Crc32.hash(vector_bytes) != self.vector_checksum)
             return error.VectorBlockPayloadChecksumMismatch;
+        return self.projectionValueFromVerifiedPayload(vector_bytes, self.vector_checksum);
+    }
+
+    /// Exposes bytes authenticated by another immutable container. The
+    /// caller supplies that container's persisted payload checksum; matching
+    /// it to this authoritative location avoids hashing the same projection
+    /// again on every exact-completion query.
+    pub fn projectionValueFromVerifiedPayload(
+        self: ValueLocation,
+        vector_bytes: []const u8,
+        verified_checksum: u32,
+    ) !Value {
+        if (vector_bytes.len != self.vector_len) return error.CorruptedVectorBlock;
+        if (verified_checksum != self.vector_checksum) return error.VectorBlockPayloadChecksumMismatch;
         return .{
             .source_sequence = self.source_sequence,
             .revision = self.revision,

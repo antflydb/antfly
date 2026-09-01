@@ -19462,7 +19462,26 @@ pub const DB = struct {
         });
     }
 
-    fn drainDensePostingMaintenanceForIdle(self: *DB) !usize {
+    /// Advance only query-readiness debt from the periodic serving lane.
+    /// Split/merge/boundary optimization is intentionally separate: it may
+    /// create fresh dirty dependencies and, without a settled objective plus
+    /// hysteresis, can oscillate between equally valid layouts. Readiness must
+    /// converge independently of that optional topology work.
+    pub fn runDensePostingReadinessMaintenanceForIdle(self: *DB) !usize {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runDensePostingMaintenance(.{
+            .max_postings_per_index = densePostingIdleMaxPostingsPerIndex(),
+            .rebalance_layout = false,
+            .max_layout_changes_per_index = 0,
+            .max_boundary_reassignments_per_index = 0,
+        });
+    }
+
+    /// Cooperatively drain the posting dependency chain at a caller-proven
+    /// quiet boundary. Individual repair pages remain bounded by the runtime
+    /// policy and the drain stops when foreground dense work reappears.
+    pub fn drainDensePostingMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.drainDensePostingMaintenance(.{
@@ -19476,6 +19495,15 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.runVectorBlockMaintenance();
+    }
+
+    /// Retry readiness publication after all dense sessions have retired.
+    /// The last source callback can observe coverage counters just before
+    /// their final durable update and legitimately decline publication. The
+    /// recurring vector-maintenance lane must re-evaluate that lifecycle
+    /// proof; otherwise a finite load depends on unrelated future writes.
+    pub fn finalizeDenseProjectionLifecycleForIdle(self: *DB) !bool {
+        return try finalizeCoveredDenseProjectionCheckpointsIfIdle(self.async_context);
     }
 
     pub fn publishVectorBlockBasesAtStableTip(self: *DB) !usize {
@@ -36355,8 +36383,13 @@ fn asyncContextHasDenseSessionsOrWaiters(ctx: *const AsyncContext) bool {
 }
 
 fn asyncContextHasActiveDenseBulkWork(ctx: *const AsyncContext) bool {
-    return asyncContextHasDenseSessionsOrWaiters(ctx) or
-        ctx.dense_projection_finalizing.load(.acquire);
+    // Optimistic native projection construction is not a bulk session. It
+    // deliberately leaves source admission open and owns separate
+    // reservation/commit fences; treating it as bulk work suppresses the LSM,
+    // posting, status, and projection-maintenance lanes that let a stable-tip
+    // finalizer make progress. Only source sessions and their admission
+    // waiters defer those background services.
+    return asyncContextHasDenseSessionsOrWaiters(ctx);
 }
 
 // dense_finish_mutex must be held. The claim elects one finalization worker;
@@ -42808,7 +42841,10 @@ fn finishReplayCapture(
     sequence: u64,
 ) !void {
     const lease = replay_ctx.dense_capture_lease orelse return;
-    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    if (!lease.ownsLifecycle()) {
+        replay_ctx.dense_capture_lease = null;
+        return;
+    }
     const manager = replay_ctx.db.core.batchExecutionResources().index_manager;
     try manager.finishDensePostingSidecarCaptureLeaseByName(index_ref.name, lease, sequence);
     replay_ctx.dense_capture_lease = null;
@@ -42820,7 +42856,7 @@ fn abortReplayCapture(
 ) !void {
     const lease = replay_ctx.dense_capture_lease orelse return;
     defer replay_ctx.dense_capture_lease = null;
-    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    if (!lease.ownsLifecycle()) return;
     const manager = replay_ctx.db.core.batchExecutionResources().index_manager;
     manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
         error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
@@ -42834,7 +42870,10 @@ fn finishReplayCaptureContext(
     sequence: u64,
 ) !void {
     const lease = replay_ctx.dense_capture_lease orelse return;
-    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    if (!lease.ownsLifecycle()) {
+        replay_ctx.dense_capture_lease = null;
+        return;
+    }
     try replay_ctx.batch.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_ref.name, lease, sequence);
     replay_ctx.dense_capture_lease = null;
 }
@@ -42845,7 +42884,7 @@ fn abortReplayCaptureContext(
 ) !void {
     const lease = replay_ctx.dense_capture_lease orelse return;
     defer replay_ctx.dense_capture_lease = null;
-    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    if (!lease.ownsLifecycle()) return;
     replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
         error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
         else => return err,
@@ -42863,7 +42902,10 @@ fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.M
     // WAL transaction boundary.
     var index_apply_guard = try resources.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
-    const capture = try resources.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
+    const capture = try resources.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(
+        index_ref.name,
+        .{ .borrow_active_source = true },
+    );
     replay_ctx.dense_capture_lease = capture;
     errdefer if (capture) |lease| if (lease.ownsLifecycle()) {
         resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
@@ -42901,7 +42943,10 @@ fn beginDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manage
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     var index_apply_guard = try replay_ctx.batch.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
-    const capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
+    const capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(
+        index_ref.name,
+        .{ .borrow_active_source = true },
+    );
     replay_ctx.dense_capture_lease = capture;
     errdefer if (capture) |lease| if (lease.ownsLifecycle()) {
         replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
@@ -45537,12 +45582,29 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
     index_name: []const u8,
     applied_sequence: u64,
 ) !bool {
+    std.log.info(
+        "dense projection stable-tip claim evaluating index={s} sequence={}",
+        .{ index_name, applied_sequence },
+    );
     const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return false;
     if (checkpoint.status != .rebuilding) return false;
 
+    std.log.info(
+        "dense projection stable-tip target lookup started index={s} sequence={}",
+        .{ index_name, applied_sequence },
+    );
     const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
+    std.log.info(
+        "dense projection stable-tip target lookup completed index={s} sequence={} vectors={}",
+        .{ index_name, applied_sequence, expected_count },
+    );
     const entry = ctx.index_manager.denseIndex(index_name) orelse return false;
     if (entry.index.stats().active_count != expected_count) return false;
+
+    std.log.info(
+        "dense projection stable-tip finalization started index={s} sequence={} vectors={}",
+        .{ index_name, applied_sequence, expected_count },
+    );
 
     // Bootstrap/migrate the table-level exact-vector generation only at the
     // durable lifecycle boundary. Per-sequence persistence can be momentarily
@@ -45592,6 +45654,10 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         ctx.applied_sequence_checkpoint_path,
         index_name,
         clean_checkpoint,
+    );
+    std.log.info(
+        "dense projection stable-tip finalization completed index={s} sequence={} vectors={}",
+        .{ index_name, applied_sequence, expected_count },
     );
     return true;
 }
@@ -63709,7 +63775,7 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
     }
 }
 
-test "db runUntilIdle drains more than one dense posting maintenance page" {
+test "db cooperative dense posting drain crosses more than one maintenance page" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -63748,7 +63814,13 @@ test "db runUntilIdle drains more than one dense posting maintenance page" {
     const before = try entry.index.postingBacklogStats();
     try std.testing.expect(before.dirty_postings > dense_posting_idle_default_max_postings_per_index);
 
-    try db.runUntilIdle();
+    const first_page_steps = try db.runDensePostingMaintenanceForIdle();
+    try std.testing.expect(first_page_steps > 0);
+    const after_first_page = try entry.index.postingBacklogStats();
+    try std.testing.expect(after_first_page.needsRepair());
+
+    const drained_steps = try db.drainDensePostingMaintenanceForIdle();
+    try std.testing.expect(drained_steps > 0);
 
     const after = try entry.index.postingBacklogStats();
     try std.testing.expectEqual(@as(u64, 0), after.dirty_postings);
@@ -78685,7 +78757,7 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     // One indexed source and one unaccounted source is a normal bounded-replay
     // intermediate state. It must not be confused with complete coverage.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 0, 0 });
-    try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpointsIfIdle(db.async_context));
+    try std.testing.expect(!try db.finalizeDenseProjectionLifecycleForIdle());
     var checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.rebuilding, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
@@ -78697,10 +78769,11 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
         denseTargetCountForIndexContext(db.async_context, config.name),
     );
 
-    // Once every live source has a terminal outcome, the maintained summaries
-    // prove coverage without a primary-document scan.
+    // Once every live source has a terminal outcome, the recurring idle
+    // finalizer must retry the same rebuilding checkpoint without requiring a
+    // new source write or session-close callback.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
-    try std.testing.expect(try finalizeCoveredDenseProjectionCheckpointsIfIdle(db.async_context));
+    try std.testing.expect(try db.finalizeDenseProjectionLifecycleForIdle());
     checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);

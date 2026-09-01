@@ -21,11 +21,13 @@ usage() {
   echo "  --vector-block-encoding MODE  Exact projection encoding (float32 or float16)" >&2
   echo "  --recursive-topology-max-workspace-mb N" >&2
   echo "                           Enable bounded quiescent recursive topology rebuild" >&2
-  echo "  --topology-rebuild-algorithm MODE  recursive or global_kmeans" >&2
+  echo "  --topology-rebuild-algorithm MODE  recursive, global_kmeans, or hierarchical_kmeans" >&2
   echo "  --centroid-directory MODE  HBC centroid routing mode (auto, hbc, flat_rabitq, or flat_exact)" >&2
   echo "  --flat-probe-count N     Initial flat centroid posting wave (0: search width)" >&2
+  echo "  --posting-idle-max-postings N  Background dirty-posting batch per index" >&2
   echo "  --resume                 Restart/query an existing run root" >&2
   echo "  --resume-concurrent      Run the configured concurrent-search curve after warm resume" >&2
+  echo "  --resume-concurrent-only Skip cold/warm serial passes and run only the concurrent curve" >&2
   echo "  --diagnostic-profile-only  Skip the official client lifecycle during a resume A/B" >&2
   echo "  --label-suffix SUFFIX    Unique suffix required by --resume" >&2
   echo "" >&2
@@ -78,6 +80,7 @@ supports_load_concurrency=false
 supports_serial_cooldown=false
 resume_after_live=${VDBBENCH_RESUME_AFTER_LIVE:-0}
 resume_concurrent=${VDBBENCH_RESUME_CONCURRENT:-0}
+resume_concurrent_only=0
 label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
 native_hbc=0
 vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
@@ -87,6 +90,7 @@ topology_rebuild_algorithm=${VDBBENCH_TOPOLOGY_REBUILD_ALGORITHM:-global_kmeans}
 diagnostic_profile_only=0
 centroid_directory_mode=${VDBBENCH_HBC_CENTROID_DIRECTORY_MODE:-}
 flat_probe_count=${VDBBENCH_HBC_FLAT_PROBE_COUNT:-}
+posting_idle_max_postings=${ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX:-}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -108,8 +112,10 @@ while [[ $# -gt 0 ]]; do
     --topology-rebuild-algorithm) [[ $# -ge 2 ]] || usage; topology_rebuild_algorithm=$2; shift 2 ;;
     --centroid-directory) [[ $# -ge 2 ]] || usage; centroid_directory_mode=$2; shift 2 ;;
     --flat-probe-count) [[ $# -ge 2 ]] || usage; flat_probe_count=$2; shift 2 ;;
+    --posting-idle-max-postings) [[ $# -ge 2 ]] || usage; posting_idle_max_postings=$2; shift 2 ;;
     --resume) resume_after_live=1; shift ;;
     --resume-concurrent) resume_concurrent=1; shift ;;
+    --resume-concurrent-only) resume_after_live=1; resume_concurrent=1; resume_concurrent_only=1; shift ;;
     --diagnostic-profile-only) diagnostic_profile_only=1; shift ;;
     --label-suffix) [[ $# -ge 2 ]] || usage; label_suffix=$2; shift 2 ;;
     *) usage ;;
@@ -138,8 +144,8 @@ if [[ -n "$recursive_topology_max_workspace_mb" ]]; then
   fi
   export ANTFLY_HBC_RECURSIVE_TOPOLOGY_REBUILD_MAX_BYTES=$((recursive_topology_max_workspace_mb * 1024 * 1024))
 fi
-if [[ "$topology_rebuild_algorithm" != "recursive" && "$topology_rebuild_algorithm" != "global_kmeans" ]]; then
-  echo "topology rebuild algorithm must be recursive or global_kmeans" >&2
+if [[ "$topology_rebuild_algorithm" != "recursive" && "$topology_rebuild_algorithm" != "global_kmeans" && "$topology_rebuild_algorithm" != "hierarchical_kmeans" ]]; then
+  echo "topology rebuild algorithm must be recursive, global_kmeans, or hierarchical_kmeans" >&2
   exit 2
 fi
 export ANTFLY_HBC_TOPOLOGY_REBUILD_ALGORITHM=$topology_rebuild_algorithm
@@ -156,6 +162,13 @@ if [[ -n "$flat_probe_count" ]]; then
     exit 2
   fi
   export ANTFLY_HBC_FLAT_CENTROID_PROBE_COUNT=$flat_probe_count
+fi
+if [[ -n "$posting_idle_max_postings" ]]; then
+  if [[ ! "$posting_idle_max_postings" =~ ^[1-9][0-9]*$ ]]; then
+    echo "posting idle max postings must be a positive integer" >&2
+    exit 2
+  fi
+  export ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX=$posting_idle_max_postings
 fi
 
 live_label="antfly-qualification-online-live${label_suffix}"
@@ -221,6 +234,10 @@ if [[ "$resume_concurrent" == "1" && "$diagnostic_profile_only" == "1" ]]; then
   echo "--resume-concurrent is incompatible with --diagnostic-profile-only" >&2
   exit 2
 fi
+if [[ "$resume_concurrent_only" == "1" && "$profile_count" != "0" ]]; then
+  echo "--resume-concurrent-only requires --profile-count 0 so the run remains concurrency-only" >&2
+  exit 2
+fi
 for required in "$antfly_bin" "$vdbbench_python" "$sampler"; do
   if [[ ! -e "$required" ]]; then
     echo "missing required path: $required" >&2
@@ -249,8 +266,13 @@ mkdir -p "$run_root/results"
 if [[ "$resume_after_live" != "1" ]]; then
   python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$recursive_topology_max_workspace_mb" "$topology_rebuild_algorithm" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
 import json
+import os
 import subprocess
 import sys
+
+experiment_environment_names = (
+    "ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX",
+)
 
 (
     out_path,
@@ -307,6 +329,11 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "flat_centroid_probe_count": int(flat_probe_count) if flat_probe_count else None,
             "load_lifecycle": "public_api_online_incremental",
             "builder": "server_selected; do not assume recursive from client batch size",
+            "experiment_environment": {
+                name: os.environ[name]
+                for name in experiment_environment_names
+                if name in os.environ
+            },
         },
         handle,
         indent=2,
@@ -316,10 +343,15 @@ with open(out_path, "w", encoding="utf-8") as handle:
 PY
   python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
 else
-  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$cold_label" "$warm_label" "$concurrent_label" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$diagnostic_profile_only" "$resume_concurrent" <<'PY'
+  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$cold_label" "$warm_label" "$concurrent_label" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$diagnostic_profile_only" "$resume_concurrent" "$resume_concurrent_only" <<'PY'
 import json
+import os
 import subprocess
 import sys
+
+experiment_environment_names = (
+    "ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX",
+)
 
 (
     out_path,
@@ -338,6 +370,7 @@ import sys
     vector_block_encoding,
     diagnostic_profile_only,
     resume_concurrent,
+    resume_concurrent_only,
 ) = sys.argv[1:]
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(
@@ -361,6 +394,12 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "vector_block_encoding": vector_block_encoding,
             "diagnostic_profile_only": diagnostic_profile_only == "1",
             "resume_concurrent": resume_concurrent == "1",
+            "resume_concurrent_only": resume_concurrent_only == "1",
+            "experiment_environment": {
+                name: os.environ[name]
+                for name in experiment_environment_names
+                if name in os.environ
+            },
         },
         handle,
         indent=2,
@@ -727,14 +766,16 @@ if [[ "$resume_after_live" == "1" ]]; then
   wait_public_index_ready "$label_suffix"
   mark_phase restart_index_ready
   if [[ "$diagnostic_profile_only" != "1" ]]; then
-    ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
-      >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
-    validate_vdbbench_result "$cold_label" 0 1
-    mark_phase reopened_cold_query_end
-    ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
-      >"$run_root/vdbbench-reopened-warm${label_suffix}.log" 2>&1
-    validate_vdbbench_result "$warm_label" 0 1
-    mark_phase reopened_warm_query_end
+    if [[ "$resume_concurrent_only" != "1" ]]; then
+      ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+        >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
+      validate_vdbbench_result "$cold_label" 0 1
+      mark_phase reopened_cold_query_end
+      ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+        >"$run_root/vdbbench-reopened-warm${label_suffix}.log" 2>&1
+      validate_vdbbench_result "$warm_label" 0 1
+      mark_phase reopened_warm_query_end
+    fi
     if [[ "$resume_concurrent" == "1" ]]; then
       ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$concurrent_label" --skip-drop-old --skip-load --search-concurrent --skip-search-serial \
         >"$run_root/vdbbench-reopened-concurrent${label_suffix}.log" 2>&1

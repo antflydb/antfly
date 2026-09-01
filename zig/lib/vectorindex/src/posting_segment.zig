@@ -329,6 +329,117 @@ pub const Writer = struct {
     }
 };
 
+/// Writes an immutable segment directly to a durable atomic sink. Only the
+/// fixed-size index remains in memory; payloads are checksummed and released
+/// by the caller as soon as `appendValueAt` returns. The sink is intentionally
+/// passed to each operation so this codec stays independent of the storage
+/// implementation used by the server.
+pub const StreamingWriter = struct {
+    alloc: Allocator,
+    entries: std.ArrayListUnmanaged(IndexEntry) = .empty,
+    finished: bool = false,
+
+    pub const Finish = struct {
+        bytes: usize,
+        admission_checksum: u32,
+    };
+
+    pub fn init(alloc: Allocator) StreamingWriter {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *StreamingWriter) void {
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn appendValueAt(
+        self: *StreamingWriter,
+        sink: anytype,
+        id: PostingId,
+        kind: EntryKind,
+        sequence: u64,
+        value: []const u8,
+    ) !void {
+        if (self.finished) return error.PostingSegmentWriterFinished;
+        if (isNativeNestedContainer(kind)) try alignStreamingSink(sink, nested_container_alignment);
+        const offset = sink.len();
+        try sink.appendSlice(value);
+        try self.entries.append(self.alloc, .{
+            .posting_id = id,
+            .kind = kind,
+            .sequence = sequence,
+            .offset = offset,
+            .len = value.len,
+            .checksum = std.hash.Crc32.hash(value),
+        });
+    }
+
+    pub fn alignForValue(self: *StreamingWriter, sink: anytype, kind: EntryKind) !void {
+        if (self.finished) return error.PostingSegmentWriterFinished;
+        if (isNativeNestedContainer(kind)) try alignStreamingSink(sink, nested_container_alignment);
+    }
+
+    /// Registers a nested container already written into this same sink.
+    /// `checksum` binds the complete nested bytes just like a normal value;
+    /// nested readers still validate their own index and per-entry checksums.
+    pub fn appendWrittenValueAt(
+        self: *StreamingWriter,
+        sink: anytype,
+        id: PostingId,
+        kind: EntryKind,
+        sequence: u64,
+        offset: usize,
+        len: usize,
+        checksum: u32,
+    ) !void {
+        if (self.finished) return error.PostingSegmentWriterFinished;
+        if (!isNativeNestedContainer(kind) or offset % nested_container_alignment != 0)
+            return error.InvalidWrittenPostingSegmentValue;
+        const end = std.math.add(usize, offset, len) catch return error.PostingSegmentTooLarge;
+        if (end > sink.len()) return error.InvalidWrittenPostingSegmentValue;
+        try self.entries.append(self.alloc, .{
+            .posting_id = id,
+            .kind = kind,
+            .sequence = sequence,
+            .offset = offset,
+            .len = len,
+            .checksum = checksum,
+        });
+    }
+
+    pub fn finish(self: *StreamingWriter, sink: anytype) !Finish {
+        if (self.finished) return error.PostingSegmentWriterFinished;
+        self.finished = true;
+        std.mem.sort(IndexEntry, self.entries.items, {}, indexEntryLessThan);
+        try rejectDuplicateIndexEntries(self.entries.items);
+
+        const index_offset = sink.len();
+        var admission_crc = std.hash.Crc32.init();
+        for (self.entries.items) |entry| {
+            const encoded = encodeIndexEntry(entry);
+            try sink.appendSlice(&encoded);
+            admission_crc.update(&encoded);
+        }
+
+        var footer: [footer_size]u8 = undefined;
+        std.mem.writeInt(u64, footer[0..8], @intCast(index_offset), .big);
+        std.mem.writeInt(u64, footer[8..16], @intCast(self.entries.items.len), .big);
+        std.mem.writeInt(u32, footer[16..20], admission_crc.final(), .big);
+        std.mem.writeInt(u16, footer[20..22], version, .big);
+        std.mem.writeInt(u16, footer[22..24], 0, .big);
+        std.mem.writeInt(u32, footer[24..28], std.hash.Crc32.hash(footer[0..24]), .big);
+        @memcpy(footer[28..32], &magic);
+        try sink.appendSlice(&footer);
+
+        // Admission fingerprints the authenticated index and footer. It is
+        // deliberately independent of payload size, so restart can admit a
+        // multi-gigabyte mmap without faulting every page.
+        admission_crc.update(&footer);
+        return .{ .bytes = sink.len(), .admission_checksum = admission_crc.final() };
+    }
+};
+
 pub const Reader = struct {
     data: []const u8,
     index_offset: usize,
@@ -561,6 +672,14 @@ pub const VerifiedReader = struct {
         return .{ .reader = self };
     }
 
+    /// Complete opaque payload region, excluding the hot authenticated index
+    /// and footer. Generation owners may use this range to release clean mmap
+    /// residency after a one-pass compaction scan without making subsequent
+    /// point lookups refault the binary-search index.
+    pub fn payloadBytes(self: *const VerifiedReader) []const u8 {
+        return self.reader.data[0..self.reader.index_offset];
+    }
+
     /// Returns a nested container without checksumming its complete payload.
     /// The posting segment index still authenticates the container bounds;
     /// the nested format must validate its own header/index and lazily verify
@@ -644,6 +763,35 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
     try appendU64(alloc, out, @intCast(entry.offset));
     try appendU64(alloc, out, @intCast(entry.len));
     try appendU32(alloc, out, entry.checksum);
+}
+
+fn encodeIndexEntry(entry: IndexEntry) [index_entry_size]u8 {
+    var out: [index_entry_size]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], entry.posting_id, .big);
+    out[8] = @intFromEnum(entry.kind);
+    std.mem.writeInt(u64, out[9..17], entry.sequence, .big);
+    std.mem.writeInt(u64, out[17..25], @intCast(entry.offset), .big);
+    std.mem.writeInt(u64, out[25..33], @intCast(entry.len), .big);
+    std.mem.writeInt(u32, out[33..37], entry.checksum, .big);
+    return out;
+}
+
+fn alignStreamingSink(sink: anytype, alignment: usize) !void {
+    const aligned = std.mem.alignForward(usize, sink.len(), alignment);
+    var zeros: [nested_container_alignment]u8 = @splat(0);
+    try sink.appendSlice(zeros[0 .. aligned - sink.len()]);
+}
+
+fn rejectDuplicateIndexEntries(entries: []const IndexEntry) !void {
+    if (entries.len < 2) return;
+    for (entries[1..], entries[0 .. entries.len - 1]) |cur, prev| {
+        if (prev.posting_id == cur.posting_id and prev.kind == cur.kind and prev.sequence == cur.sequence)
+            return error.DuplicatePostingSegmentEntry;
+    }
+}
+
+fn indexEntryLessThan(_: void, lhs: IndexEntry, rhs: IndexEntry) bool {
+    return compareEntryKey(lhs.posting_id, lhs.kind, lhs.sequence, rhs.posting_id, rhs.kind, rhs.sequence) == .lt;
 }
 
 fn rejectDuplicateEntries(entries: []const PendingEntry) !void {
@@ -893,4 +1041,40 @@ test "posting segment nested container avoids eager payload verification" {
     try std.testing.expectEqual(@as(usize, 0), quantized_entry.offset % nested_container_alignment);
     try std.testing.expectEqualStrings("quantized payload", quantized);
     try std.testing.expectError(error.NotNestedPostingContainer, reader.getNestedContainer(0, .base));
+}
+
+test "posting segment streaming writer is byte-compatible and admission-safe" {
+    const alloc = std.testing.allocator;
+    const Sink = struct {
+        alloc: Allocator,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn len(self: *const @This()) usize {
+            return self.out.items.len;
+        }
+
+        fn appendSlice(self: *@This(), bytes: []const u8) !void {
+            try self.out.appendSlice(self.alloc, bytes);
+        }
+    };
+
+    var expected_writer = Writer.init(alloc);
+    defer expected_writer.deinit();
+    try expected_writer.appendValueAt(0, .index_metadata, 9, "metadata");
+    try expected_writer.appendValueAt(0, .quantized_directory, 9, "nested");
+    try expected_writer.appendValueAt(7, .base, 9, "posting");
+    const expected = try expected_writer.build();
+    defer alloc.free(expected);
+
+    var sink: Sink = .{ .alloc = alloc };
+    defer sink.out.deinit(alloc);
+    var streaming = StreamingWriter.init(alloc);
+    defer streaming.deinit();
+    try streaming.appendValueAt(&sink, 0, .index_metadata, 9, "metadata");
+    try streaming.appendValueAt(&sink, 0, .quantized_directory, 9, "nested");
+    try streaming.appendValueAt(&sink, 7, .base, 9, "posting");
+    const finish = try streaming.finish(&sink);
+    try std.testing.expectEqual(expected.len, finish.bytes);
+    try std.testing.expectEqualSlices(u8, expected, sink.out.items);
+    try std.testing.expectEqual(try admissionChecksum(expected), finish.admission_checksum);
 }

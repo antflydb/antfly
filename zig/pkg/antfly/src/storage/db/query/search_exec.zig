@@ -430,6 +430,8 @@ pub const DenseSearchProfile = struct {
     hbc_exact_vectors_scored: u64 = 0,
     hbc_leaf_payload_stale: u64 = 0,
     hbc_leaf_payload_missing: u64 = 0,
+    hbc_native_leaf_scan_hits: u64 = 0,
+    hbc_native_leaf_scan_fallbacks: u64 = 0,
     hbc_reranked_vectors: u64 = 0,
     hbc_approx_candidate_count: u64 = 0,
     hbc_rerank_candidate_count: u64 = 0,
@@ -471,6 +473,8 @@ pub const DenseSearchProfile = struct {
     hbc_rerank_vector_projection_bytes: u64 = 0,
     hbc_rerank_vector_residual_reads: u64 = 0,
     hbc_rerank_vector_residual_bytes: u64 = 0,
+    hbc_rerank_vector_physical_reads: u64 = 0,
+    hbc_rerank_vector_physical_bytes: u64 = 0,
     hbc_rerank_vector_location_reuses: u64 = 0,
     hbc_rerank_vector_block_misses: u64 = 0,
     hbc_rerank_vector_block_fallbacks: u64 = 0,
@@ -13234,6 +13238,8 @@ fn searchDenseInternal(
             profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
             profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
             profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
+            profile.hbc_native_leaf_scan_hits = profiled.profile.native_leaf_scan_hits;
+            profile.hbc_native_leaf_scan_fallbacks = profiled.profile.native_leaf_scan_fallbacks;
             profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
             profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
             profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
@@ -13277,6 +13283,8 @@ fn searchDenseInternal(
             profile.hbc_rerank_vector_projection_bytes = profiled.profile.rerank_vector_projection_bytes;
             profile.hbc_rerank_vector_residual_reads = profiled.profile.rerank_vector_residual_reads;
             profile.hbc_rerank_vector_residual_bytes = profiled.profile.rerank_vector_residual_bytes;
+            profile.hbc_rerank_vector_physical_reads = profiled.profile.rerank_vector_physical_reads;
+            profile.hbc_rerank_vector_physical_bytes = profiled.profile.rerank_vector_physical_bytes;
             profile.hbc_rerank_vector_location_reuses = profiled.profile.rerank_vector_location_reuses;
             profile.hbc_rerank_vector_block_misses = profiled.profile.rerank_vector_block_misses;
             profile.hbc_rerank_vector_block_fallbacks = profiled.profile.rerank_vector_block_fallbacks;
@@ -14498,7 +14506,7 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
+        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} native_leaf_scan_hits={d} native_leaf_scan_fallbacks={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
         .{
             req.index_name orelse "",
             profile.hbc_nodes_visited,
@@ -14507,6 +14515,8 @@ fn logBenchDenseQueryProfile(
             profile.hbc_exact_vectors_scored,
             profile.hbc_leaf_payload_stale,
             profile.hbc_leaf_payload_missing,
+            profile.hbc_native_leaf_scan_hits,
+            profile.hbc_native_leaf_scan_fallbacks,
             profile.hbc_reranked_vectors,
             profile.hbc_approx_candidate_count,
             profile.hbc_rerank_candidate_count,

@@ -103,6 +103,17 @@ const BulkRecursiveScratch = struct {
     partitioned_indexes: []usize,
 };
 
+const BulkHierarchicalKmeansScratch = struct {
+    points: []kmeans.Point,
+    assignments: []usize,
+    distances: []f32,
+    counts: []usize,
+    centroids: []f32,
+    next_centroids: []f32,
+    entries: []kmeans.Entry,
+    partitioned_indexes: []usize,
+};
+
 fn txnSupportsGetManySorted(comptime Txn: type) bool {
     return switch (@typeInfo(Txn)) {
         .pointer => |ptr| @hasDecl(ptr.child, "getManySorted"),
@@ -529,6 +540,22 @@ fn loadNativeQuantizedReadView(
         // treated that as an unavailable acceleration and fallen back to
         // exact vectors; the native borrowed fast path must preserve the same
         // contract as decoded and cached payloads.
+        if (err == error.Corrupted) return null;
+        return err;
+    };
+}
+
+fn loadNativeLeafScanReadView(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+) !?hbc_runtime.NativeLeafScanView {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "loadNativeLeafScanView")) return null;
+    return self.loadNativeLeafScanView(txn, node_id) catch |err| {
+        // A stale or structurally inconsistent acceleration must preserve the
+        // established packed-node path. Complete-snapshot validation still
+        // checks the authoritative membership/assignment relation there.
         if (err == error.Corrupted) return null;
         return err;
     };
@@ -2664,16 +2691,40 @@ fn searchProfiledRequestAttempt(
                     profile.traversal_max_wave_leaves,
                     @as(u64, @intCast(next_wave_end - previous_wave_end)),
                 );
-                // Covering-radius bounds remain shadow telemetry until their
-                // end-to-end certification includes payload freshness and
-                // quantized candidate retention. Preserve the ANN budget as a
-                // floor, then expand only when filters or sparse postings have
-                // not filled the requested rerank pool.
-                if (!exhaustive_coverage and approx_results.items.items.len >= candidate_limit) {
-                    profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
-                    break;
+                // The complete immutable directory carries a suffix minimum
+                // over conservative posting-ball bounds. Compare it with the
+                // kth-smallest upper endpoint already retained by the
+                // quantized candidate shell: when the former is strictly
+                // larger, no unseen vector can enter the public top-k. Dirty
+                // or unresolved radii leave suffix_bounds_resolved false and
+                // retain the established effort/fill behavior.
+                if (!exhaustive_coverage and probe.suffix_bounds_resolved) {
+                    profile.traversal_bound_resolutions += 1;
+                    try scratch.ensureVectorFetchCapacity(self.alloc, approx_results.items.items.len);
+                    if (approxTopKUpperBound(
+                        approx_results.items.items,
+                        req.k,
+                        scratch.distances,
+                    )) |top_k_upper| {
+                        profile.traversal_stop_lower_bound = probe.suffix_member_lower_bound;
+                        profile.traversal_stop_result_upper_bound = top_k_upper;
+                        if (probe.suffix_member_lower_bound > top_k_upper) {
+                            profile.traversal_bound_stops += 1;
+                            profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
+                            break;
+                        }
+                    } else {
+                        profile.traversal_bound_fallbacks += 1;
+                    }
+                } else if (!exhaustive_coverage) {
+                    profile.traversal_bound_resolutions += 1;
+                    profile.traversal_bound_fallbacks += 1;
                 }
-
+                // A full candidate heap is not evidence that the selected
+                // leaves contain the nearest neighbors. It only bounds the
+                // retained shell. Continue honoring the caller's leaf-effort
+                // budget unless the conservative suffix radius above proves
+                // that every unseen posting is unable to cross public top-k.
                 const explored = @max(flat_leaves_scored, 1);
                 const eligible = @max(profile.traversal_eligible_vectors, 1);
                 const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
@@ -2689,6 +2740,36 @@ fn searchProfiledRequestAttempt(
             }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
+            if (try loadNativeLeafScanReadView(self, &txn, probe.posting_id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                try coverage_tracker.observe(self, &txn, scratch, probe.posting_id, native_scan.member_ids);
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    probe.posting_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                profile.leaves_explored += 1;
+                flat_leaves_scored += 1;
+                continue;
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             var leaf_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, probe.posting_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
                 try handleTraversalNodeLoadError(err, coverage_policy);
                 continue;
@@ -2710,7 +2791,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             leaf_handle.deinit(self.alloc);
             leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
         }
@@ -2780,6 +2861,49 @@ fn searchProfiledRequestAttempt(
     {
         const root = root_handle.ptr();
         if (root.is_leaf) {
+            if (try loadNativeLeafScanReadView(self, &txn, root.id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                try coverage_tracker.observe(self, &txn, scratch, root.id, native_scan.member_ids);
+                const leaf_id = root.id;
+                root_handle.deinit(self.alloc);
+                root_handle_active = false;
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    leaf_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+                if (should_rerank) {
+                    const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+                    approx_results.deinit();
+                    profile.total_ns = elapsed_fn_u64(total_start);
+                    return .{ .results = reranked, .profile = profile };
+                }
+                var results = try approx_results.toFinalResults();
+                approx_results.deinit();
+                results.sort();
+                if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
+                profile.total_ns = elapsed_fn_u64(total_start);
+                return .{ .results = results, .profile = profile };
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             const root_posting = try posting.PostingStore.view(root);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, root_posting);
             try coverage_tracker.observe(self, &txn, scratch, root_posting.id, member_ids);
@@ -2788,7 +2912,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
             root_handle.deinit(self.alloc);
             root_handle_active = false;
-            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
                     if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
@@ -2914,6 +3038,39 @@ fn searchProfiledRequestAttempt(
                 node_handle_active = false;
                 continue;
             }
+            if (try loadNativeLeafScanReadView(self, &txn, node.id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                const leaf_id = node.id;
+                node_handle.deinit(self.alloc);
+                node_handle_active = false;
+                try coverage_tracker.observe(self, &txn, scratch, leaf_id, native_scan.member_ids);
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    leaf_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                search_mod.noteLeafExplored(&beam_state);
+                profile.leaves_explored += 1;
+                continue;
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             const leaf_posting = try posting.PostingStore.view(node);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
             try coverage_tracker.observe(self, &txn, scratch, leaf_posting.id, member_ids);
@@ -2922,7 +3079,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             search_mod.noteLeafExplored(&beam_state);
             profile.leaves_explored += 1;
         } else {
@@ -3363,7 +3520,7 @@ pub fn scoreLeafMembers(
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
     const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn scoreLeafMemberIds(
@@ -3373,6 +3530,8 @@ fn scoreLeafMemberIds(
     leaf_uses_nonquantized_payload: bool,
     leaf_has_fresh_stored_payload: bool,
     member_ids: []const u64,
+    native_quantized: ?*const hbc_runtime.QuantizedSet,
+    native_projections: ?hbc_runtime.NativeProjectionPlane,
     approx_query: []const f32,
     approx_query_measure: f32,
     exact_query: []const f32,
@@ -3453,19 +3612,149 @@ fn scoreLeafMemberIds(
     scoring_req.filter_ids = &.{};
     scoring_req.exclude_ids = &.{};
     const empty_filter_state = search_types.RequestFilterState{};
-    if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
-        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
-            defer {
-                var handle = quantized_handle;
-                handle.deinit(self.alloc);
+    if (native_projections) |projection_plane| {
+        const dims: usize = @intCast(self.config.dims);
+        if (projection_plane.validFor(member_ids.len, dims)) {
+            // The immutable leaf already co-locates RaBitQ and float16. Use
+            // the compact code as a first-stage heap admission, retain a
+            // generation-leased projection only for admitted candidates, and
+            // complete those candidates from float16 before rerank. This
+            // avoids decoding every wide projection in the routed shell while
+            // preserving the established RaBitQ recall/error-bound contract.
+            if (!filters_active and
+                !has_extra_filters and
+                self.config.use_quantization and
+                leaf_has_fresh_stored_payload and
+                native_quantized != null and
+                projection_plane.checksums.len == member_ids.len)
+            {
+                const count = member_ids.len;
+                const distances = scratch.distances[0..count];
+                const error_bounds = scratch.error_bounds[0..count];
+                try self.estimateQuantizedDistances(
+                    native_quantized.?,
+                    approx_query,
+                    approx_query_measure,
+                    distances,
+                    error_bounds,
+                    &scratch.estimate,
+                );
+                results.addApproxResultsWithDeferredProjectionPlane(
+                    member_ids,
+                    distances,
+                    error_bounds,
+                    projection_plane.values,
+                    projection_plane.scales,
+                    projection_plane.error_norms,
+                    projection_plane.decoded_norm_lower_bounds,
+                    projection_plane.checksums,
+                    projection_plane.residual_locations,
+                    original_positions,
+                    dims,
+                );
+                profile.approx_leaves_scored += 1;
+                profile.approx_vectors_scored += count;
+                return;
             }
-            const quantized = quantized_handle.ptr();
+            const query_norm: f32 = switch (self.config.metric) {
+                .inner_product => vec.norm(exact_query),
+                .cosine => exact_query_measure,
+                .l2_squared => 0,
+            };
+            const distances = scratch.distances[0..filtered_count];
+            const error_bounds = scratch.error_bounds[0..filtered_count];
+            for (original_positions, 0..) |original_position, i| {
+                if (i % 256 == 0) try search_types.checkCancelled(req);
+                const row = projection_plane.values[original_position * dims ..][0..dims];
+                const distance = vec.distanceToQueryF16(
+                    exact_query,
+                    exact_query_measure,
+                    row,
+                    projection_plane.scales[original_position],
+                    self.config.metric,
+                );
+                const bounded = vec.boundedDistanceFromProjectionMetadata(
+                    distance,
+                    query_norm,
+                    projection_plane.error_norms[original_position],
+                    projection_plane.decoded_norm_lower_bounds[original_position],
+                    self.config.metric,
+                );
+                distances[i] = bounded.distance;
+                error_bounds[i] = bounded.error_bound;
+            }
+            if (!has_extra_filters) {
+                if (projection_plane.checksums.len == member_ids.len) {
+                    results.addApproxResultsWithProjectionPlane(
+                        scoring_member_ids,
+                        distances,
+                        error_bounds,
+                        projection_plane.values,
+                        projection_plane.scales,
+                        projection_plane.error_norms,
+                        projection_plane.decoded_norm_lower_bounds,
+                        projection_plane.checksums,
+                        projection_plane.residual_locations,
+                        original_positions,
+                        dims,
+                    );
+                } else {
+                    results.addApproxResultsWithProjection(scoring_member_ids, distances, error_bounds, true);
+                }
+            } else {
+                for (scoring_member_ids, 0..) |member_id, i| {
+                    if (!try memberMatchesRequestWithCachePolicy(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true, use_search_cache)) continue;
+                    const original_position = original_positions[i];
+                    results.addApproxResultWithProjectionValue(
+                        member_id,
+                        distances[i],
+                        error_bounds[i],
+                        true,
+                        if (projection_plane.checksums.len == member_ids.len) .{
+                            .values = projection_plane.values[original_position * dims ..][0..dims],
+                            .scale = projection_plane.scales[original_position],
+                            .error_norm = projection_plane.error_norms[original_position],
+                            .decoded_norm_lower_bound = projection_plane.decoded_norm_lower_bounds[original_position],
+                            .checksum = projection_plane.checksums[original_position],
+                            .residual_location = if (projection_plane.residual_locations) |locations|
+                                locations.at(original_position)
+                            else
+                                null,
+                        } else null,
+                    );
+                }
+            }
+            profile.approx_leaves_scored += 1;
+            profile.approx_vectors_scored += filtered_count;
+            return;
+        }
+    }
+    if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
+        var loaded_quantized = if (native_quantized == null)
+            try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)
+        else
+            null;
+        defer if (loaded_quantized) |*handle| handle.deinit(self.alloc);
+        const quantized = native_quantized orelse if (loaded_quantized) |*handle| handle.ptr() else null;
+        if (quantized) |quantized_set| {
             profile.approx_leaves_scored += 1;
             const count = member_ids.len;
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
-            try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
-            if (!has_extra_filters) {
+            try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            if (!has_extra_filters and !filters_active) {
+                var cancellation_index: usize = 0;
+                while (cancellation_index < scoring_member_ids.len) : (cancellation_index += 256) {
+                    try search_types.checkCancelled(req);
+                }
+                // The common unfiltered path preserves the posting-local
+                // column layout through heap admission. ApproxSearchResults
+                // rejects eight candidates at once when all conservative
+                // lower bounds are beyond the retained frontier, then replays
+                // any possibly competitive group scalar to preserve exact
+                // tie and interval semantics.
+                results.addApproxResults(scoring_member_ids, distances, error_bounds);
+            } else if (!has_extra_filters) {
                 for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
@@ -3628,6 +3917,74 @@ pub fn rerankResults(
     return rerankResultsWithCachePolicy(self, txn, approx_results, query, query_measure, req, filter_state, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
+fn completeDeferredProjectionScores(
+    config: types.HBCConfig,
+    query: []const f32,
+    query_measure: f32,
+    items: []search_results.ApproxSearchResult,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const query_norm: f32 = switch (config.metric) {
+        .inner_product => vec.norm(query),
+        .cosine => query_measure,
+        .l2_squared => 0,
+    };
+    for (items, 0..) |*item, i| {
+        if ((i & 0xff) == 0) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        }
+        if (item.bounded_projection) continue;
+        const projection = item.projection orelse continue;
+        const distance = vec.distanceToQueryF16(
+            query,
+            query_measure,
+            projection.values,
+            projection.scale,
+            config.metric,
+        );
+        const bounded = vec.boundedDistanceFromProjectionMetadata(
+            distance,
+            query_norm,
+            projection.error_norm,
+            projection.decoded_norm_lower_bound,
+            config.metric,
+        );
+        item.distance = bounded.distance;
+        item.error_bound = bounded.error_bound;
+        item.bounded_projection = true;
+    }
+}
+
+test "deferred posting projection completes a RaBit-admitted score" {
+    const projection_values = [_]f16{ 1, 2 };
+    var items = [_]search_results.ApproxSearchResult{.{
+        .vector_id = 7,
+        .distance = 123,
+        .error_bound = 9,
+        .bounded_projection = false,
+        .projection = .{
+            .values = &projection_values,
+            .scale = 1,
+            .error_norm = 0,
+            .decoded_norm_lower_bound = 0,
+            .checksum = 42,
+        },
+    }};
+    try completeDeferredProjectionScores(
+        .{ .dims = 2, .metric = .inner_product },
+        &.{ 3, 4 },
+        0,
+        &items,
+        null,
+    );
+    try std.testing.expect(items[0].bounded_projection);
+    try std.testing.expectApproxEqAbs(@as(f32, -11), items[0].distance, 0.0001);
+    // The projection bound retains the small floating-point arithmetic guard
+    // even when the persisted reconstruction error itself is zero.
+    try std.testing.expect(items[0].error_bound >= 0);
+    try std.testing.expect(items[0].error_bound < 0.001);
+}
+
 fn rerankResultsWithCachePolicy(
     self: anytype,
     txn: anytype,
@@ -3650,6 +4007,11 @@ fn rerankResultsWithCachePolicy(
     try scratch.ensureRerankCapacity(self.alloc, ranked_items.len);
 
     const prepare_start = now_fn_u64();
+    // Candidates admitted by posting-local RaBitQ carry a generation-leased
+    // float16 projection. Complete only that bounded heap before ordering;
+    // authoritative residual completion below remains limited to intervals
+    // that can cross the public top-k boundary.
+    try completeDeferredProjectionScores(self.config, query, query_measure, ranked_items, req.cancellation);
     search_mod.sortApproxResultsByDistance(ranked_items);
 
     const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
@@ -3693,7 +4055,27 @@ fn rerankResultsWithCachePolicy(
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratch")) bounded: {
-            const max_external_rerank_batch = externalRerankBatchSize(self.config.dims, rerank_positions.len);
+            // Candidate admission is ordered by the RaBitQ plane, while this
+            // pass replaces those estimates with the tighter float16 plane.
+            // RaBitQ's stochastic error interval is a rerank-selection policy,
+            // not a proof that an unread candidate cannot cross a float16
+            // boundary. Refining only a prefix lost 3.4 recall points on the
+            // public 50K workload even with exhaustive leaf coverage. Load the
+            // complete selected shell before applying the float16 overlap
+            // policy below. The external loader still sorts physical reads by
+            // shard/offset, so retaining vector-id order here avoids a second
+            // query-local sort without sacrificing I/O locality.
+            // Posting-local float16 rows already carry this deterministic
+            // interval. Compact only the unresolved subset in place; the
+            // selection flags retain the complete shell for boundary proof.
+            var unresolved_count: usize = 0;
+            for (rerank_positions) |index| {
+                if (ranked_items[index].bounded_projection) continue;
+                rerank_positions[unresolved_count] = index;
+                unresolved_count += 1;
+            }
+            rerank_positions = rerank_positions[0..unresolved_count];
+            const max_external_rerank_batch = rerank_positions.len;
             var offset: usize = 0;
             while (offset < rerank_positions.len) {
                 const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
@@ -3710,6 +4092,7 @@ fn rerankResultsWithCachePolicy(
                         batch_distances,
                         batch_bounds,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
                         scratch.vector_views,
                         scratch.lookups,
@@ -3730,6 +4113,7 @@ fn rerankResultsWithCachePolicy(
                         batch_distances,
                         batch_bounds,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
                         scratch.vector_views,
                         scratch.lookups,
@@ -3746,6 +4130,7 @@ fn rerankResultsWithCachePolicy(
                     const item = &ranked_items[index];
                     item.distance = batch_distances[slot];
                     item.error_bound = batch_bounds[slot];
+                    item.bounded_projection = true;
                     if (!std.math.isFinite(item.distance)) {
                         if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                         item.distance = std.math.inf(f32);
@@ -3783,6 +4168,23 @@ fn rerankResultsWithCachePolicy(
                     profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, batch_positions.len);
                 }
                 offset = batch_end;
+                if (offset < rerank_positions.len) {
+                    const top_k_upper = approxTopKUpperBound(
+                        ranked_items,
+                        rerank_selection.top_k_count,
+                        scratch.distances,
+                    ) orelse continue;
+                    const next = ranked_items[rerank_positions[offset]];
+                    if (next.distance - next.error_bound > top_k_upper) {
+                        profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                        for (rerank_positions[offset..]) |index| {
+                            rerank_selection.flags[index] = false;
+                            ranked_items[index].distance = std.math.inf(f32);
+                            ranked_items[index].error_bound = 0;
+                        }
+                        break;
+                    }
+                }
             }
             external_scored = true;
             search_mod.sortApproxResultsByDistance(ranked_items);
@@ -3821,6 +4223,7 @@ fn rerankResultsWithCachePolicy(
                         query_measure,
                         batch_distances,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
                         scratch.vector_views,
                         scratch.lookups,
@@ -3839,6 +4242,7 @@ fn rerankResultsWithCachePolicy(
                         query_measure,
                         batch_distances,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
                         scratch.vector_views,
                         scratch.lookups,
@@ -4257,6 +4661,42 @@ fn markAuthoritativeCompletionCandidates(
         if (selected.*) count += 1;
     }
     return count;
+}
+
+/// Returns a conservative upper bound on the true kth score among an already
+/// retained bounded candidate shell. A routing lower bound strictly beyond
+/// this value proves that an unseen posting cannot contribute to top-k.
+fn approxTopKUpperBound(
+    ranked_items: []const search_results.ApproxSearchResult,
+    top_k: usize,
+    upper_storage: []f32,
+) ?f32 {
+    if (top_k == 0 or ranked_items.len < top_k or upper_storage.len < ranked_items.len) return null;
+    var upper_count: usize = 0;
+    for (ranked_items) |item| {
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[upper_count] = upper;
+        upper_count += 1;
+    }
+    if (upper_count < top_k) return null;
+    std.mem.sort(f32, upper_storage[0..upper_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    return upper_storage[top_k - 1];
+}
+
+test "flat routing top-k upper bound is conservative" {
+    const items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 0.10, .error_bound = 0.02 },
+        .{ .vector_id = 2, .distance = 0.20, .error_bound = 0.03 },
+        .{ .vector_id = 3, .distance = 0.15, .error_bound = 0.01 },
+    };
+    var storage: [items.len]f32 = undefined;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.16), approxTopKUpperBound(&items, 2, &storage).?, 0.000001);
+    try std.testing.expect(approxTopKUpperBound(items[0..1], 2, &storage) == null);
 }
 
 test "bounded candidate completion selects every possible top-k crossover" {
@@ -5218,7 +5658,7 @@ test "dirty leaf payloads are not fresh stored payloads" {
     try std.testing.expect(hasFreshStoredPayload(&leaf));
 }
 
-test "kmeans bulk builder packs bounded leaves" {
+test "kmeans bulk builders pack bounded leaves" {
     const go_rand = @import("antfly_vector").go_rand;
     const MockIndex = struct {
         alloc: Allocator,
@@ -5321,6 +5761,21 @@ test "kmeans bulk builder packs bounded leaves" {
     try std.testing.expect(mock.internal_count > 1);
     try std.testing.expect(mock.max_internal_children <= 2);
     try std.testing.expectEqual(@as(usize, inputs.len), built.member_count);
+
+    var hierarchical = MockIndex{
+        .alloc = std.testing.allocator,
+        .config = mock.config,
+        .rng = go_rand.GoPcg.init(42, 1024),
+    };
+    defer hierarchical.deinit();
+    var hierarchical_built = try buildBulkHierarchicalKmeansFromInputs(&hierarchical, {}, &inputs);
+    defer hierarchical_built.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), hierarchical.leaf_count);
+    try std.testing.expect(hierarchical.max_leaf_members <= 2);
+    try std.testing.expect(hierarchical.internal_count > 0);
+    try std.testing.expect(hierarchical.max_internal_children <= 2);
+    try std.testing.expectEqual(@as(usize, inputs.len), hierarchical_built.member_count);
 }
 
 pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
@@ -9087,6 +9542,229 @@ pub fn buildBulkKmeansFromInputs(
     }
 
     return try buildBulkKmeansParentLevels(self, txn, current, current_count);
+}
+
+/// Builds a learned k-way hierarchy without comparing every vector against
+/// every final leaf. This is the in-memory quality oracle for the bounded
+/// production builder: the latter can stream each level through bucket spools
+/// while retaining the same partition and publication semantics.
+pub fn buildBulkHierarchicalKmeansFromInputs(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+) !BuiltBulkNode {
+    if (inputs.len == 0) return error.TooFewVectors;
+    const dims: usize = @intCast(self.config.dims);
+    const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
+    const max_clusters = @min(
+        @max(@as(usize, 2), self.config.branching_factor),
+        std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable,
+    );
+
+    const indexes = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(indexes);
+    for (indexes, 0..) |*index, i| index.* = i;
+
+    const points = try self.alloc.alloc(kmeans.Point, inputs.len);
+    defer self.alloc.free(points);
+    const assignments = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, inputs.len);
+    defer self.alloc.free(distances);
+    const counts = try self.alloc.alloc(usize, max_clusters);
+    defer self.alloc.free(counts);
+    const centroids = try self.alloc.alloc(f32, max_clusters * dims);
+    defer self.alloc.free(centroids);
+    const next_centroids = try self.alloc.alloc(f32, max_clusters * dims);
+    defer self.alloc.free(next_centroids);
+    const entries = try self.alloc.alloc(kmeans.Entry, inputs.len);
+    defer self.alloc.free(entries);
+    const partitioned_indexes = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(partitioned_indexes);
+    var scratch: BulkHierarchicalKmeansScratch = .{
+        .points = points,
+        .assignments = assignments,
+        .distances = distances,
+        .counts = counts,
+        .centroids = centroids,
+        .next_centroids = next_centroids,
+        .entries = entries,
+        .partitioned_indexes = partitioned_indexes,
+    };
+
+    const target_leaf_count = std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable;
+    return try buildBulkHierarchicalKmeansSubtree(self, txn, inputs, indexes, target_leaf_count, &scratch);
+}
+
+fn buildBulkHierarchicalKmeansSubtree(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    target_leaf_count: usize,
+    scratch: *BulkHierarchicalKmeansScratch,
+) !BuiltBulkNode {
+    const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
+    if (target_leaf_count == 1) {
+        if (indexes.len > leaf_size) return error.UnbalancedBulkSplit;
+        const selected = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, indexes.len);
+        defer self.alloc.free(selected);
+        for (selected, indexes) |*out, input_index| out.* = inputs[input_index];
+        return try buildBulkLeaf(self, txn, self.nextNodeId(), selected, 0, 0);
+    }
+
+    const dims: usize = @intCast(self.config.dims);
+    const cluster_count = @min(
+        @max(@as(usize, 2), self.config.branching_factor),
+        target_leaf_count,
+    );
+    const points = scratch.points[0..indexes.len];
+    for (points, indexes) |*point, input_index| point.* = .{
+        .stable_id = inputs[input_index].vector_id,
+        .vector = inputs[input_index].transformed,
+        .weight = 1,
+    };
+
+    const stats = try kmeans.run(.{
+        .dims = dims,
+        .metric = self.config.metric,
+        .max_iter = self.config.kmeans_max_iter,
+        // Subtrees are index views over the caller-owned matrix. The CPU
+        // backend accepts those views without cloning them; a future streamed
+        // builder can batch the same assignments through an accelerator.
+        .backend = .cpu,
+        .update_strategy = self.config.kmeans_update_strategy,
+        .dense_vectors = null,
+    }, points, self.rng.intN(points.len), scratch.centroids[0 .. cluster_count * dims], scratch.next_centroids[0 .. cluster_count * dims], scratch.assignments[0..indexes.len], scratch.distances[0..indexes.len], scratch.counts[0..cluster_count], scratch.entries[0..indexes.len]);
+    recordKmeansRunStats(self, stats);
+
+    const child_leaf_counts = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(child_leaf_counts);
+    const group_sizes = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(group_sizes);
+    const base_leaf_count = target_leaf_count / cluster_count;
+    const extra_leaf_count = target_leaf_count % cluster_count;
+    var leaf_cursor: usize = 0;
+    const base_leaf_size = indexes.len / target_leaf_count;
+    const extra_vector_count = indexes.len % target_leaf_count;
+    for (child_leaf_counts, group_sizes, 0..) |*child_leaves, *group_size, cluster| {
+        child_leaves.* = base_leaf_count + @intFromBool(cluster < extra_leaf_count);
+        const next_leaf_cursor = leaf_cursor + child_leaves.*;
+        group_size.* = child_leaves.* * base_leaf_size +
+            @min(next_leaf_cursor, extra_vector_count) - @min(leaf_cursor, extra_vector_count);
+        leaf_cursor = next_leaf_cursor;
+    }
+    if (leaf_cursor != target_leaf_count) return error.UnbalancedBulkSplit;
+
+    try assignBalancedHierarchicalKmeansGroups(
+        self,
+        points,
+        scratch.centroids[0 .. cluster_count * dims],
+        group_sizes,
+        scratch.assignments[0..indexes.len],
+        scratch.distances[0..indexes.len],
+        scratch.counts[0..cluster_count],
+        scratch.partitioned_indexes[0..indexes.len],
+    );
+    const write_positions = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(write_positions);
+    var write_cursor: usize = 0;
+    for (write_positions, group_sizes) |*position, group_size| {
+        position.* = write_cursor;
+        write_cursor += group_size;
+    }
+    if (write_cursor != indexes.len) return error.UnbalancedBulkSplit;
+    for (scratch.assignments[0..indexes.len], 0..) |cluster, local_index| {
+        if (cluster >= cluster_count or write_positions[cluster] >= indexes.len) return error.UnbalancedBulkSplit;
+        scratch.partitioned_indexes[write_positions[cluster]] = indexes[local_index];
+        write_positions[cluster] += 1;
+    }
+    @memcpy(indexes, scratch.partitioned_indexes[0..indexes.len]);
+
+    const children = try self.alloc.alloc(BuiltBulkNode, cluster_count);
+    var child_count: usize = 0;
+    defer {
+        for (children[0..child_count]) |*child| child.deinit(self.alloc);
+        self.alloc.free(children);
+    }
+    var index_start: usize = 0;
+    var parent_level: u16 = 1;
+    for (group_sizes, child_leaf_counts) |group_size, child_target_leaf_count| {
+        children[child_count] = try buildBulkHierarchicalKmeansSubtree(
+            self,
+            txn,
+            inputs,
+            indexes[index_start .. index_start + group_size],
+            child_target_leaf_count,
+            scratch,
+        );
+        parent_level = @max(parent_level, children[child_count].level +| 1);
+        child_count += 1;
+        index_start += group_size;
+    }
+    return try buildBulkParentFromNodeRange(self, txn, children, parent_level);
+}
+
+fn assignBalancedHierarchicalKmeansGroups(
+    self: anytype,
+    points: []const kmeans.Point,
+    centroids: []const f32,
+    capacities: []const usize,
+    assignments: []usize,
+    margins: []f32,
+    counts: []usize,
+    order: []usize,
+) !void {
+    const dims: usize = @intCast(self.config.dims);
+    if (points.len != assignments.len or points.len != margins.len or points.len != order.len or
+        capacities.len != counts.len or centroids.len != capacities.len * dims)
+        return error.BufferTooSmall;
+
+    for (points, 0..) |point, point_index| {
+        var best = std.math.inf(f32);
+        var second = std.math.inf(f32);
+        for (0..capacities.len) |cluster| {
+            const centroid = centroids[cluster * dims ..][0..dims];
+            const distance = vec.distance(point.vector, centroid, self.config.metric);
+            if (distance < best) {
+                second = best;
+                best = distance;
+            } else if (distance < second) {
+                second = distance;
+            }
+        }
+        const margin = second - best;
+        margins[point_index] = if (std.math.isFinite(margin)) margin else 0;
+        order[point_index] = point_index;
+    }
+    const SortContext = struct { margins: []const f32, points: []const kmeans.Point };
+    std.mem.sort(usize, order, SortContext{ .margins = margins, .points = points }, struct {
+        fn lessThan(context: SortContext, a: usize, b: usize) bool {
+            if (context.margins[a] != context.margins[b]) return context.margins[a] > context.margins[b];
+            return context.points[a].stable_id < context.points[b].stable_id;
+        }
+    }.lessThan);
+
+    @memset(counts, 0);
+    for (order) |point_index| {
+        var selected: ?usize = null;
+        var selected_distance = std.math.inf(f32);
+        for (0..capacities.len) |cluster| {
+            if (counts[cluster] >= capacities[cluster]) continue;
+            const centroid = centroids[cluster * dims ..][0..dims];
+            const distance = vec.distance(points[point_index].vector, centroid, self.config.metric);
+            if (selected == null or distance < selected_distance) {
+                selected = cluster;
+                selected_distance = distance;
+            }
+        }
+        const cluster = selected orelse return error.UnbalancedBulkSplit;
+        assignments[point_index] = cluster;
+        counts[cluster] += 1;
+    }
+    for (counts, capacities) |count, capacity| {
+        if (count != capacity) return error.UnbalancedBulkSplit;
+    }
 }
 
 pub fn splitVectorSet(

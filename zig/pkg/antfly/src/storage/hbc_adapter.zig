@@ -63,6 +63,8 @@ const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 const vectorindex_posting = @import("antfly_vectorindex").posting;
 const vectorindex_centroid_directory = @import("antfly_vectorindex").centroid_directory;
 const vectorindex_quantized_directory = @import("antfly_vectorindex").quantized_directory;
+
+pub const NativeProjectionBuildValue = vectorindex_hbc_runtime.NativeProjectionBuildValue;
 const vectorindex_posting_segment = @import("antfly_vectorindex").posting_segment;
 const vectorindex_posting_wal = @import("antfly_vectorindex").posting_wal;
 const vectorindex_hbc_vector_directory = @import("antfly_vectorindex").hbc_vector_directory;
@@ -2244,6 +2246,69 @@ const ExperimentalPostingResolvedValue = struct {
     }
 };
 
+/// Advances monotonically through one immutable mmap and releases only whole
+/// pages whose borrowed values have already been copied to the staged output.
+/// The mapping and generation lease remain valid, so concurrent readers keep
+/// correctness and may fault an old page back if they still need it.
+const ExperimentalPostingSequentialReclaimer = struct {
+    mapped: ?[]align(std.heap.page_size_min) u8,
+    observed_end: usize = 0,
+    reclaimed_end: usize = 0,
+
+    fn init(segment: posting_segment_store_mod.RetainedSegment) ExperimentalPostingSequentialReclaimer {
+        return .{ .mapped = segment.mappedBytes() };
+    }
+
+    fn observe(self: *ExperimentalPostingSequentialReclaimer, bytes: []const u8) void {
+        const mapped = self.mapped orelse return;
+        if (bytes.len == 0) return;
+        const base = @intFromPtr(mapped.ptr);
+        const start = @intFromPtr(bytes.ptr);
+        if (start < base or start - base > mapped.len or bytes.len > mapped.len - (start - base)) return;
+        self.observed_end = @max(self.observed_end, start - base + bytes.len);
+    }
+
+    fn observeQuantizedView(
+        self: *ExperimentalPostingSequentialReclaimer,
+        view: vectorindex_quantized_directory.View,
+    ) void {
+        self.observe(std.mem.sliceAsBytes(view.centroid));
+        self.observe(std.mem.sliceAsBytes(view.codes));
+        self.observe(std.mem.sliceAsBytes(view.code_counts));
+        self.observe(std.mem.sliceAsBytes(view.centroid_distances));
+        self.observe(std.mem.sliceAsBytes(view.quantized_dot_products));
+        self.observe(std.mem.sliceAsBytes(view.centroid_dot_products));
+        self.observe(std.mem.sliceAsBytes(view.member_ids));
+        if (view.projections) |projections| {
+            self.observe(std.mem.sliceAsBytes(projections.values));
+            self.observe(std.mem.sliceAsBytes(projections.scales));
+            self.observe(std.mem.sliceAsBytes(projections.error_norms));
+            self.observe(std.mem.sliceAsBytes(projections.decoded_norm_lower_bounds));
+            self.observe(std.mem.sliceAsBytes(projections.checksums));
+            if (projections.residual_locations) |locations| {
+                self.observe(std.mem.sliceAsBytes(locations.reader_generations));
+                self.observe(std.mem.sliceAsBytes(locations.reader_shard_ids));
+                self.observe(std.mem.sliceAsBytes(locations.revisions));
+                self.observe(std.mem.sliceAsBytes(locations.residual_offsets));
+                self.observe(std.mem.sliceAsBytes(locations.residual_lengths));
+                self.observe(std.mem.sliceAsBytes(locations.residual_checksums));
+            }
+        }
+    }
+
+    fn reclaimObserved(self: *ExperimentalPostingSequentialReclaimer) void {
+        if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+        const mapped = self.mapped orelse return;
+        const page = std.heap.page_size_min;
+        const start = std.mem.alignForward(usize, self.reclaimed_end, page);
+        const end = std.mem.alignBackward(usize, self.observed_end, page);
+        if (end <= start) return;
+        const reclaimable: []align(std.heap.page_size_min) u8 = @alignCast(mapped[start..end]);
+        std.posix.madvise(reclaimable.ptr, reclaimable.len, std.posix.MADV.DONTNEED) catch return;
+        self.reclaimed_end = end;
+    }
+};
+
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
@@ -2278,6 +2343,19 @@ const ExperimentalPostingReadState = struct {
         for (self.retained_segments) |*segment| segment.deinit(self.alloc);
         self.alloc.free(self.retained_segments);
         self.* = undefined;
+    }
+
+    /// Delta enumeration is complete before the full checkpoint starts its
+    /// ordered base rewrite. Drop those one-pass payload pages while retaining
+    /// each delta's hot index and all borrowed-value validity.
+    fn discardDeltaPayloadResidency(self: *ExperimentalPostingReadState) void {
+        if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+        for (self.retained_segments[1..], self.segments[1..]) |retained, *reader| {
+            const mapped = retained.mappedBytes() orelse continue;
+            const payload_len = std.mem.alignBackward(usize, @min(mapped.len, reader.payloadBytes().len), std.heap.page_size_min);
+            if (payload_len == 0) continue;
+            std.posix.madvise(mapped.ptr, payload_len, std.posix.MADV.DONTNEED) catch {};
+        }
     }
 
     fn value(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
@@ -2316,10 +2394,10 @@ const ExperimentalPostingReadState = struct {
     /// recovered WAL value shadows that posting. This keeps the native base a
     /// read optimization; the existing value chain remains authoritative for
     /// every mutation and crash-recovery path.
-    fn quantizedViewIfUnmodified(self: *ExperimentalPostingReadState, posting_id: u64) !?vectorindex_quantized_directory.View {
-        const directory = if (self.quantized_directory) |*stored_directory| stored_directory else return null;
+    fn quantizedEntryUnmodified(self: *ExperimentalPostingReadState, posting_id: u64) !bool {
+        if (self.quantized_directory == null) return false;
         const key = experimentalPostingValueKey(posting_id, .quantized_checkpoint);
-        if (self.materialized.contains(key)) return null;
+        if (self.materialized.contains(key)) return false;
         var index = self.segments.len;
         while (index > 1) {
             index -= 1;
@@ -2327,10 +2405,47 @@ const ExperimentalPostingReadState = struct {
                 (try self.segments[index].getValue(posting_id, .quantized_checkpoint_tombstone)) != null or
                 (try self.segments[index].getValue(posting_id, .quantized_checkpoint_patch)) != null)
             {
-                return null;
+                return false;
             }
         }
+        return true;
+    }
+
+    fn quantizedViewIfUnmodified(self: *ExperimentalPostingReadState, posting_id: u64) !?vectorindex_quantized_directory.View {
+        if (!try self.quantizedEntryUnmodified(posting_id)) return null;
+        const directory = if (self.quantized_directory) |*stored_directory| stored_directory else return null;
         return try directory.get(posting_id);
+    }
+
+    /// Borrows the complete leaf scan row only while all state used to
+    /// interpret it still comes from the same immutable checkpoint. A delta
+    /// to membership, posting flags, or the quantized payload forces the
+    /// ordinary resolver path until the next flatten.
+    fn leafScanViewIfUnmodified(self: *ExperimentalPostingReadState, posting_id: u64) !?vectorindex_quantized_directory.View {
+        const directory = if (self.quantized_directory) |*stored_directory| stored_directory else return null;
+        inline for (.{
+            vectorindex_posting_wal.RecordKind.base,
+            vectorindex_posting_wal.RecordKind.posting_state,
+            vectorindex_posting_wal.RecordKind.quantized_checkpoint,
+        }) |kind| {
+            const key = experimentalPostingValueKey(posting_id, kind);
+            if (self.materialized.contains(key)) return null;
+            var index = self.segments.len;
+            while (index > 1) {
+                index -= 1;
+                const entry_kind = experimentalPostingSegmentKind(kind).?;
+                if ((try self.segments[index].getValue(posting_id, entry_kind)) != null) return null;
+                if (experimentalPostingSegmentTombstoneKind(kind)) |tombstone_kind| {
+                    if ((try self.segments[index].getValue(posting_id, tombstone_kind)) != null) return null;
+                }
+                if (experimentalPostingSegmentPatchKind(kind)) |patch_kind| {
+                    if ((try self.segments[index].getValue(posting_id, patch_kind)) != null) return null;
+                }
+            }
+        }
+        const view = (try directory.get(posting_id)) orelse return null;
+        if (view.member_ids.len != view.count) return null;
+        return view;
     }
 
     fn patchCacheShard(key: u128) usize {
@@ -2724,6 +2839,36 @@ const ExperimentalPostingReadGeneration = struct {
         }
         return error.Corrupted;
     }
+
+    fn quantizedEntryUnmodified(self: *ExperimentalPostingReadGeneration, posting_id: u64) !bool {
+        const key = experimentalPostingValueKey(posting_id, .quantized_checkpoint);
+        var generation: ?*ExperimentalPostingReadGeneration = self;
+        while (generation) |current| : (generation = current.parent) {
+            if (current.values.contains(key)) return false;
+            if (current.root) |state| return try state.quantizedEntryUnmodified(posting_id);
+        }
+        return error.Corrupted;
+    }
+
+    fn leafScanViewIfUnmodified(self: *ExperimentalPostingReadGeneration, posting_id: u64) !?vectorindex_quantized_directory.View {
+        inline for (.{
+            vectorindex_posting_wal.RecordKind.base,
+            vectorindex_posting_wal.RecordKind.posting_state,
+            vectorindex_posting_wal.RecordKind.quantized_checkpoint,
+        }) |kind| {
+            const key = experimentalPostingValueKey(posting_id, kind);
+            var generation: ?*ExperimentalPostingReadGeneration = self;
+            while (generation) |current| : (generation = current.parent) {
+                if (current.values.contains(key)) return null;
+                if (current.root != null) break;
+            }
+        }
+        var generation: ?*ExperimentalPostingReadGeneration = self;
+        while (generation) |current| : (generation = current.parent) {
+            if (current.root) |state| return try state.leafScanViewIfUnmodified(posting_id);
+        }
+        return error.Corrupted;
+    }
 };
 
 fn experimentalPostingValueKey(posting_id: u64, kind: vectorindex_posting_wal.RecordKind) u128 {
@@ -2909,7 +3054,8 @@ pub const PostingCheckpointStats = struct {
 };
 
 const ExperimentalPostingCheckpointBuildResult = struct {
-    segment_bytes: []u8,
+    segment_bytes: []u8 = &.{},
+    segment_len: u64,
     posting_count: u64,
     patch_count: u64 = 0,
     patched_value_bytes: u64 = 0,
@@ -2917,6 +3063,11 @@ const ExperimentalPostingCheckpointBuildResult = struct {
 };
 
 const ExperimentalPostingCheckpointKind = enum { full, delta };
+
+const StagedExperimentalPostingCheckpoint = struct {
+    result: ExperimentalPostingCheckpointBuildResult,
+    staged: posting_segment_store_mod.StagedCheckpointSegment,
+};
 
 /// A retained immutable generation can be rewritten independently of source
 /// replay. Publication later carries forward the exact durable WAL suffix
@@ -2932,6 +3083,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     wal_generation: u64,
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     /// Hard recovery-debt enforcement and graceful close can promote an
     /// opportunistic build to mandatory progress so foreground queries cannot
     /// indefinitely hold durability/shutdown behind the soft-priority gate.
@@ -2951,44 +3103,51 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.resource_manager,
             &self.force_progress,
         );
-        const result = switch (self.kind) {
-            .full => HBCIndex.buildExperimentalPostingCheckpointFromGeneration(
+        const built = switch (self.kind) {
+            .full => HBCIndex.stageExperimentalPostingCheckpointFromGeneration(
                 allocator(),
                 self.source_generation,
                 self.metadata,
                 self.covered_source_sequence,
                 self.resource_manager,
                 &self.force_progress,
+                self.projection_source,
+                &self.staging_store,
+                self.segment_generation,
             ),
-            .delta => HBCIndex.buildExperimentalPostingDeltaFromGeneration(
-                allocator(),
-                self.source_generation,
-                self.metadata,
-                self.covered_source_sequence,
-                self.resource_manager,
-                &self.force_progress,
-            ),
+            .delta => self.buildAndStageDelta(),
         } catch |err| {
             self.build_error = err;
             self.completed.store(true, .release);
             return;
         };
-        self.staged = self.staging_store.stageCheckpointSegment(
-            self.segment_generation,
-            result.segment_bytes,
-        ) catch |err| {
-            allocator().free(result.segment_bytes);
-            self.build_error = err;
-            self.completed.store(true, .release);
-            return;
-        };
-        self.result = result;
+        self.staged = built.staged;
+        self.result = built.result;
         self.completed.store(true, .release);
+    }
+
+    fn buildAndStageDelta(self: *ExperimentalPostingCheckpointBuild) !StagedExperimentalPostingCheckpoint {
+        const result = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(
+            allocator(),
+            self.source_generation,
+            self.metadata,
+            self.covered_source_sequence,
+            self.resource_manager,
+            &self.force_progress,
+        );
+        errdefer allocator().free(result.segment_bytes);
+        return .{
+            .result = result,
+            .staged = try self.staging_store.stageCheckpointSegment(
+                self.segment_generation,
+                result.segment_bytes,
+            ),
+        };
     }
 
     fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         if (self.thread) |thread| thread.join();
-        if (self.result) |result| allocator().free(result.segment_bytes);
+        if (self.result) |result| if (result.segment_bytes.len != 0) allocator().free(result.segment_bytes);
         self.staging_store.deinit();
         self.source_generation.release();
         const owner_alloc = self.owner_alloc;
@@ -3037,6 +3196,7 @@ const managedPostingMaxDeltaSegments: usize = vectorindex_posting_wal.Checkpoint
 pub const TopologyRebuildAlgorithm = enum {
     recursive,
     global_kmeans,
+    hierarchical_kmeans,
 };
 
 pub const TopologyRebuildStats = struct {
@@ -3296,6 +3456,7 @@ pub const HBCIndex = struct {
     external_vector_batch_bounded_distance_loader: ?ExternalVectorBatchBoundedDistanceLoader = null,
     external_vector_batch_located_distance_loader: ?ExternalVectorBatchLocatedDistanceLoader = null,
     external_vector_bounded_distance_available: ?ExternalVectorBoundedDistanceAvailable = null,
+    external_vector_projection_build_loader: ?vectorindex_hbc_runtime.NativeProjectionBuildLoader = null,
 
     const EnvOwner = hbc_backend.OpenedBackend;
     pub const ExternalVectorLoader = *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32;
@@ -3307,6 +3468,7 @@ pub const HBCIndex = struct {
         artifact_keys: [][]const u8,
         raw_values: []?[]const u8,
         vector_views: [][]const f32,
+        bounded_projections: []const ?vectorindex_search_results.BoundedProjection = &.{},
         /// Source boundary pinned by the same immutable HBC generation lease
         /// as this search transaction. External exact-vector projections must
         /// not return a revision newer than this sequence.
@@ -3345,6 +3507,7 @@ pub const HBCIndex = struct {
     pub const ExternalVectorBatchLocatedDistanceLoader = *const fn (
         ctx: *anyopaque,
         vector_ids: []const u64,
+        bounded_projections: []const ?vectorindex_search_results.BoundedProjection,
         query: []const f32,
         query_measure: f32,
         metric: vec.DistanceMetric,
@@ -5524,6 +5687,15 @@ pub const HBCIndex = struct {
         self.external_vector_bounded_distance_available = available;
     }
 
+    pub fn setExternalVectorProjectionBuildLoader(
+        self: *HBCIndex,
+        ctx: *anyopaque,
+        loader: vectorindex_hbc_runtime.NativeProjectionBuildLoader,
+    ) void {
+        self.external_vector_ctx = ctx;
+        self.external_vector_projection_build_loader = loader;
+    }
+
     pub fn hasExternalVectorLoader(self: *const HBCIndex) bool {
         return self.external_vector_ctx != null and
             (self.external_vector_loader != null or self.external_vector_scratch_loader != null or self.external_vector_batch_scratch_loader != null or self.external_vector_batch_transformed_matrix_loader != null or self.external_vector_batch_distance_loader != null or self.external_vector_batch_bounded_distance_loader != null);
@@ -6715,6 +6887,13 @@ pub const HBCIndex = struct {
             .wal_generation = source_wal_generation,
             .staging_store = staging_store,
             .resource_manager = self.resource_manager,
+            .projection_source = if (self.external_vector_ctx != null and self.external_vector_projection_build_loader != null)
+                .{
+                    .ctx = self.external_vector_ctx.?,
+                    .loader = self.external_vector_projection_build_loader.?,
+                }
+            else
+                null,
         };
         build.thread = std.Thread.spawn(.{}, ExperimentalPostingCheckpointBuild.run, .{build}) catch |err| {
             build.deinit();
@@ -6765,10 +6944,9 @@ pub const HBCIndex = struct {
         const result = build.result orelse return error.MissingPostingCheckpoint;
         const staged = build.staged orelse return error.MissingPostingCheckpoint;
         switch (build.kind) {
-            .full => try posting_store.publishStagedCheckpointPreservingWalTail(
+            .full => try posting_store.publishStagedCheckpointReceiptPreservingWalTail(
                 build.segment_generation,
                 build.covered_source_sequence,
-                result.segment_bytes,
                 build.flattened_wal_bytes,
                 staged,
             ),
@@ -6783,7 +6961,7 @@ pub const HBCIndex = struct {
         std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} kind={s} wal_tail_bytes={} chain_deltas={} patches={} patched_value_bytes={} encoded_patch_bytes={}", .{
             build.segment_generation,
             build.covered_source_sequence,
-            result.segment_bytes.len,
+            result.segment_len,
             @tagName(build.kind),
             posting_store.wal_committed_bytes,
             posting_store.deltaSegmentCount(),
@@ -7650,6 +7828,66 @@ pub const HBCIndex = struct {
         };
     }
 
+    fn loadExperimentalLeafProjectionPlane(
+        alloc: Allocator,
+        generation: *ExperimentalPostingReadGeneration,
+        member_id_bytes: []const u8,
+        dims: usize,
+        covered_source_sequence: u64,
+        source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
+        vector_ids: *std.ArrayListUnmanaged(u64),
+        metadata_values: *std.ArrayListUnmanaged(?[]const u8),
+        projection_values: *std.ArrayListUnmanaged(vectorindex_hbc_runtime.NativeProjectionBuildValue),
+        payload_scratch: *std.ArrayListUnmanaged(u8),
+    ) ![]const vectorindex_hbc_runtime.NativeProjectionBuildValue {
+        const projection_source = source orelse return &.{};
+        if (member_id_bytes.len == 0 or member_id_bytes.len % @sizeOf(u64) != 0) return &.{};
+        const count = member_id_bytes.len / @sizeOf(u64);
+        const payload_len = std.math.mul(usize, std.math.mul(usize, count, dims) catch return error.OutOfMemory, @sizeOf(f16)) catch return error.OutOfMemory;
+        try vector_ids.resize(alloc, count);
+        try metadata_values.resize(alloc, count);
+        try projection_values.resize(alloc, count);
+        try payload_scratch.resize(alloc, payload_len);
+        for (vector_ids.items, metadata_values.items, projection_values.items, 0..) |*vector_id, *metadata_value, *projection, i| {
+            const offset = i * @sizeOf(u64);
+            vector_id.* = std.mem.readInt(u64, member_id_bytes[offset..][0..@sizeOf(u64)], .little);
+            metadata_value.* = generation.value(vector_id.*, .vector_metadata) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            projection.* = .{};
+        }
+        projection_source.loader(
+            projection_source.ctx,
+            vector_ids.items,
+            metadata_values.items,
+            projection_values.items,
+            payload_scratch.items,
+            dims,
+            covered_source_sequence,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return &.{},
+        };
+        const row_bytes = std.math.mul(usize, dims, @sizeOf(f16)) catch return error.OutOfMemory;
+        for (projection_values.items) |projection| if (projection.bytes.len != row_bytes) return &.{};
+        // The directory publishes one fixed-width locator plane per leaf.
+        // Mixed block/WAL locations are still fully scoreable from their
+        // projections, but omitting the incomplete plane keeps exact
+        // completion on the established authoritative fallback.
+        var complete_locations = true;
+        for (projection_values.items) |projection| {
+            if (projection.residual_location == null) {
+                complete_locations = false;
+                break;
+            }
+        }
+        if (!complete_locations) {
+            for (projection_values.items) |*projection| projection.residual_location = null;
+        }
+        return projection_values.items;
+    }
+
     /// Rewrites a checkpoint from the already complete immutable query
     /// generation. This avoids opening a new LSM snapshot and scanning all
     /// derived namespaces every time the sidecar WAL is flattened.
@@ -7661,6 +7899,7 @@ pub const HBCIndex = struct {
         covered_source_sequence: u64,
         foreground_manager: ?*resource_manager_mod.ResourceManager,
         force_progress: ?*const std.atomic.Value(bool),
+        projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
         reconstructed_values: *std.ArrayListUnmanaged([]u8),
     ) !?u64 {
         const root = experimentalPostingRootState(generation) orelse return null;
@@ -7694,6 +7933,14 @@ pub const HBCIndex = struct {
         defer quantized_directory.deinit();
         const centroid_scratch = try alloc.alloc(f32, metadata.dims);
         defer alloc.free(centroid_scratch);
+        var projection_vector_ids = std.ArrayListUnmanaged(u64).empty;
+        defer projection_vector_ids.deinit(alloc);
+        var projection_metadata = std.ArrayListUnmanaged(?[]const u8).empty;
+        defer projection_metadata.deinit(alloc);
+        var projection_values = std.ArrayListUnmanaged(vectorindex_hbc_runtime.NativeProjectionBuildValue).empty;
+        defer projection_values.deinit(alloc);
+        var projection_payload = std.ArrayListUnmanaged(u8).empty;
+        defer projection_payload.deinit(alloc);
 
         var posting_count: u64 = 0;
         var node_id: u64 = 1;
@@ -7705,6 +7952,21 @@ pub const HBCIndex = struct {
             try writer.appendValueBorrowedAt(node_id, .base, covered_source_sequence, packed_node);
             posting_count += 1;
             const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            const leaf_projections = if (decoded_node.header.is_leaf)
+                try loadExperimentalLeafProjectionPlane(
+                    alloc,
+                    generation,
+                    decoded_node.ids_bytes,
+                    metadata.dims,
+                    covered_source_sequence,
+                    projection_source,
+                    &projection_vector_ids,
+                    &projection_metadata,
+                    &projection_values,
+                    &projection_payload,
+                )
+            else
+                &.{};
             if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
                 if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
                 @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
@@ -7730,12 +7992,22 @@ pub const HBCIndex = struct {
                         else => return error.Corrupted,
                     };
                     defer decoded_quantized.deinit(alloc);
-                    try quantized_directory.append(node_id, &decoded_quantized);
+                    try quantized_directory.appendWithLeafPlanes(
+                        node_id,
+                        &decoded_quantized,
+                        if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
+                        leaf_projections,
+                    );
                 }
             } else if (node_id != metadata.root_node) {
                 if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
                     const borrowed_quantized = view.asProto();
-                    try quantized_directory.append(node_id, &borrowed_quantized);
+                    try quantized_directory.appendWithLeafPlanes(
+                        node_id,
+                        &borrowed_quantized,
+                        if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
+                        leaf_projections,
+                    );
                 }
             }
         }
@@ -7800,6 +8072,302 @@ pub const HBCIndex = struct {
         return posting_count;
     }
 
+    /// Production full checkpoints stream both the outer segment and its
+    /// corpus-sized quantized directory into one atomic generation file. The
+    /// immutable source generation is traversed twice: once for ordinary HBC
+    /// families and centroid routing, then once for the contiguous candidate
+    /// plane. That bounded extra metadata traversal avoids retaining either a
+    /// complete nested directory or a second outer-segment copy in heap.
+    fn stageExperimentalPostingCheckpointFromGeneration(
+        alloc: Allocator,
+        generation: *ExperimentalPostingReadGeneration,
+        metadata: IndexMetadata,
+        covered_source_sequence: u64,
+        foreground_manager: ?*resource_manager_mod.ResourceManager,
+        force_progress: ?*const std.atomic.Value(bool),
+        projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
+        posting_store: *posting_segment_store_mod.Store,
+        segment_generation: u64,
+    ) !StagedExperimentalPostingCheckpoint {
+        const root = experimentalPostingRootState(generation) orelse return error.MissingPostingCheckpoint;
+        const base_directory = root.vector_directory orelse return error.MissingPostingCheckpoint;
+
+        var latest: ExperimentalPostingLatestValues = .empty;
+        defer latest.deinit(alloc);
+        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (reconstructed_values.items) |value| alloc.free(value);
+            reconstructed_values.deinit(alloc);
+        }
+        try collectExperimentalPostingCompactionValues(alloc, generation, &latest, &reconstructed_values);
+        root.discardDeltaPayloadResidency();
+        var base_reclaimer = ExperimentalPostingSequentialReclaimer.init(root.retained_segments[0]);
+        defer base_reclaimer.reclaimObserved();
+
+        // A full flatten must not make the query-serving mmap resident merely
+        // because maintenance copies its corpus-sized candidate directory.
+        // Translate the nested container into the base segment and read each
+        // independently checksummed row through a private F_NOCACHE/fadvise
+        // descriptor. Heap-backed compatibility stores retain the borrowed
+        // path because there is no file mapping to protect.
+        var cold_base_reader: ?lsm_backend.storage_io.ColdSequentialReader = null;
+        defer if (cold_base_reader) |*reader| reader.deinit();
+        var quantized_file_offset: ?u64 = null;
+        if (root.retained_segments[0].mappedBytes()) |mapped| {
+            if (root.quantized_directory) |*directory| {
+                const encoded = directory.encodedBytes();
+                const mapped_base = @intFromPtr(mapped.ptr);
+                const encoded_base = @intFromPtr(encoded.ptr);
+                if (encoded_base >= mapped_base and
+                    encoded_base - mapped_base <= mapped.len and
+                    encoded.len <= mapped.len - (encoded_base - mapped_base))
+                {
+                    cold_base_reader = try posting_store.beginBaseColdSequentialRead(alloc);
+                    quantized_file_offset = @intCast(encoded_base - mapped_base);
+                }
+            }
+        }
+
+        var staged_writer = try posting_store.beginStagedCheckpointSegment(segment_generation);
+        defer staged_writer.deinit();
+        var writer = vectorindex_posting_segment.StreamingWriter.init(alloc);
+        defer writer.deinit();
+        const sink = staged_writer.output();
+
+        var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
+        try writer.appendValueAt(sink, 0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
+
+        const metric: vec.DistanceMetric = switch (metadata.metric) {
+            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
+            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            else => return error.DistanceMetricMismatch,
+        };
+        var centroid_directory = try vectorindex_centroid_directory.Writer.init(
+            alloc,
+            metadata.dims,
+            metadata.metric,
+            1024,
+        );
+        defer centroid_directory.deinit();
+        const centroid_scratch = try alloc.alloc(f32, metadata.dims);
+        defer alloc.free(centroid_scratch);
+
+        var posting_count: u64 = 0;
+        var node_id: u64 = 1;
+        while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
+            if (node_id % 256 == 0) {
+                base_reclaimer.reclaimObserved();
+                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
+            }
+            const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
+            try writer.appendValueAt(sink, node_id, .base, covered_source_sequence, packed_node);
+            base_reclaimer.observe(packed_node);
+            posting_count += 1;
+            const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
+                if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
+                @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
+                const measure: f32 = switch (metric) {
+                    .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
+                    .cosine => vec.norm(centroid_scratch),
+                    .inner_product => 0,
+                };
+                try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
+            }
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .node_range)) |range| {
+                try writer.appendValueAt(sink, node_id, .node_range, covered_source_sequence, range);
+                base_reclaimer.observe(range);
+            }
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .posting_state)) |posting_state| {
+                try writer.appendValueAt(sink, node_id, .posting_state, covered_source_sequence, posting_state);
+                base_reclaimer.observe(posting_state);
+            }
+            if (node_id == metadata.root_node) {
+                if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
+                    try writer.appendValueAt(sink, node_id, .quantized_checkpoint, covered_source_sequence, quantized);
+                    base_reclaimer.observe(quantized);
+                }
+            }
+        }
+        base_reclaimer.reclaimObserved();
+
+        const encoded_centroid_directory = try centroid_directory.build();
+        defer alloc.free(encoded_centroid_directory);
+        try writer.appendValueAt(sink, 0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
+
+        // The nested directory begins on the same 64-byte boundary required by
+        // mmap readers. Its header is patched in place before the enclosing
+        // index is finalized, all still inside the unpublished temp file.
+        try writer.alignForValue(sink, .quantized_directory);
+        var quantized_directory = try vectorindex_quantized_directory.StreamingWriter.init(
+            alloc,
+            sink,
+            metadata.dims,
+            metadata.metric,
+        );
+        defer quantized_directory.deinit();
+        var projection_vector_ids = std.ArrayListUnmanaged(u64).empty;
+        defer projection_vector_ids.deinit(alloc);
+        var projection_metadata = std.ArrayListUnmanaged(?[]const u8).empty;
+        defer projection_metadata.deinit(alloc);
+        var projection_values = std.ArrayListUnmanaged(vectorindex_hbc_runtime.NativeProjectionBuildValue).empty;
+        defer projection_values.deinit(alloc);
+        var projection_payload = std.ArrayListUnmanaged(u8).empty;
+        defer projection_payload.deinit(alloc);
+
+        node_id = 1;
+        while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
+            if (node_id % 256 == 0) {
+                base_reclaimer.reclaimObserved();
+                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
+            }
+            if (node_id == metadata.root_node) continue;
+            const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
+            const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            const leaf_projections = if (decoded_node.header.is_leaf)
+                try loadExperimentalLeafProjectionPlane(
+                    alloc,
+                    generation,
+                    decoded_node.ids_bytes,
+                    metadata.dims,
+                    covered_source_sequence,
+                    projection_source,
+                    &projection_vector_ids,
+                    &projection_metadata,
+                    &projection_values,
+                    &projection_payload,
+                )
+            else
+                &.{};
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
+                var decoded_quantized = proto.RaBitQuantizedVectorSet.decode(alloc, quantized) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.Corrupted,
+                };
+                defer decoded_quantized.deinit(alloc);
+                try quantized_directory.appendWithLeafPlanes(
+                    sink,
+                    node_id,
+                    &decoded_quantized,
+                    if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
+                    leaf_projections,
+                );
+                base_reclaimer.observe(quantized);
+            } else if (cold_base_reader != null and
+                quantized_file_offset != null and
+                try generation.quantizedEntryUnmodified(node_id))
+            {
+                const directory = if (root.quantized_directory) |*value| value else return error.Corrupted;
+                const location = directory.entryLocation(node_id) orelse continue;
+                const absolute_offset = std.math.add(u64, quantized_file_offset.?, location.offset) catch
+                    return error.Corrupted;
+                const entry = try cold_base_reader.?.readRangeAlloc(alloc, absolute_offset, location.len);
+                defer alloc.free(entry);
+                var owned_view = try directory.decodeOwnedEntry(alloc, node_id, entry);
+                defer owned_view.deinit();
+                const borrowed_quantized = owned_view.view.asProto();
+                try quantized_directory.appendWithLeafPlanes(
+                    sink,
+                    node_id,
+                    &borrowed_quantized,
+                    if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
+                    leaf_projections,
+                );
+            } else if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
+                const borrowed_quantized = view.asProto();
+                try quantized_directory.appendWithLeafPlanes(
+                    sink,
+                    node_id,
+                    &borrowed_quantized,
+                    if (decoded_node.header.is_leaf) decoded_node.ids_bytes else &.{},
+                    leaf_projections,
+                );
+                base_reclaimer.observeQuantizedView(view);
+            }
+            base_reclaimer.observe(packed_node);
+        }
+        base_reclaimer.reclaimObserved();
+        const quantized_finish = try quantized_directory.finish(sink);
+        try writer.appendWrittenValueAt(
+            sink,
+            0,
+            .quantized_directory,
+            covered_source_sequence,
+            quantized_finish.offset,
+            quantized_finish.len,
+            quantized_finish.outer_checksum,
+        );
+
+        var vector_overrides = std.ArrayListUnmanaged(ExperimentalVectorOverride).empty;
+        defer vector_overrides.deinit(alloc);
+        try vector_overrides.ensureTotalCapacity(alloc, latest.count());
+        var latest_it = latest.iterator();
+        while (latest_it.next()) |entry| {
+            const record_kind = experimentalPostingValueKeyKind(entry.key_ptr.*) catch continue;
+            const directory_kind: vectorindex_hbc_vector_directory.Kind = switch (record_kind) {
+                .vector_leaf => .leaf,
+                .vector_metadata => .metadata,
+                else => continue,
+            };
+            vector_overrides.appendAssumeCapacity(.{
+                .kind = directory_kind,
+                .id = experimentalPostingValueKeyId(entry.key_ptr.*),
+                .value = entry.value_ptr.*,
+            });
+        }
+        std.mem.sort(ExperimentalVectorOverride, vector_overrides.items, {}, ExperimentalVectorOverride.lessThan);
+
+        var directory_writer = try vectorindex_hbc_vector_directory.Writer.init(alloc);
+        defer directory_writer.deinit();
+        var base_it = base_directory.iterator();
+        var override_index: usize = 0;
+        var directory_items: usize = 0;
+        while (try base_it.next()) |base| {
+            directory_items += 1;
+            if (directory_items % 256 == 0) {
+                base_reclaimer.reclaimObserved();
+                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
+            }
+            while (override_index < vector_overrides.items.len and
+                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .lt)
+            {
+                const replacement = vector_overrides.items[override_index];
+                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                override_index += 1;
+            }
+            if (override_index < vector_overrides.items.len and
+                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .eq)
+            {
+                const replacement = vector_overrides.items[override_index];
+                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                override_index += 1;
+            } else {
+                try directory_writer.append(base.kind, base.id, base.value);
+            }
+            base_reclaimer.observe(base.value);
+        }
+        while (override_index < vector_overrides.items.len) : (override_index += 1) {
+            const replacement = vector_overrides.items[override_index];
+            if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+        }
+        const vector_directory = try directory_writer.build();
+        defer alloc.free(vector_directory);
+        try writer.appendValueAt(sink, 0, .vector_directory, covered_source_sequence, vector_directory);
+        base_reclaimer.reclaimObserved();
+
+        const finish = try writer.finish(sink);
+        const staged = try staged_writer.finish(finish.admission_checksum);
+        if (staged.bytes != finish.bytes) return error.InvalidStagedPostingSegment;
+        return .{
+            .result = .{
+                .segment_len = staged.bytes,
+                .posting_count = posting_count,
+            },
+            .staged = staged,
+        };
+    }
+
     fn buildExperimentalPostingCheckpointFromGeneration(
         alloc: Allocator,
         generation: *ExperimentalPostingReadGeneration,
@@ -7807,6 +8375,7 @@ pub const HBCIndex = struct {
         covered_source_sequence: u64,
         foreground_manager: ?*resource_manager_mod.ResourceManager,
         force_progress: ?*const std.atomic.Value(bool),
+        projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
     ) !ExperimentalPostingCheckpointBuildResult {
         var writer = vectorindex_posting_segment.Writer.init(alloc);
         defer writer.deinit();
@@ -7823,10 +8392,13 @@ pub const HBCIndex = struct {
             covered_source_sequence,
             foreground_manager,
             force_progress,
+            projection_source,
             &reconstructed_values,
         )) orelse return error.MissingPostingCheckpoint;
+        const segment_bytes = try writer.build();
         return .{
-            .segment_bytes = try writer.build(),
+            .segment_bytes = segment_bytes,
+            .segment_len = @intCast(segment_bytes.len),
             .posting_count = posting_count,
         };
     }
@@ -7945,8 +8517,10 @@ pub const HBCIndex = struct {
             const encoded = try directory.build();
             try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded);
         }
+        const segment_bytes = try writer.build();
         return .{
-            .segment_bytes = try writer.build(),
+            .segment_bytes = segment_bytes,
+            .segment_len = @intCast(segment_bytes.len),
             .posting_count = posting_count,
             .patch_count = patch_count,
             .patched_value_bytes = patched_value_bytes,
@@ -8005,6 +8579,13 @@ pub const HBCIndex = struct {
                 covered_source_sequence,
                 null,
                 null,
+                if (self.external_vector_ctx != null and self.external_vector_projection_build_loader != null)
+                    .{
+                        .ctx = self.external_vector_ctx.?,
+                        .loader = self.external_vector_projection_build_loader.?,
+                    }
+                else
+                    null,
                 &reconstructed_values,
             )) |count| blk: {
                 posting_count = count;
@@ -11699,6 +12280,7 @@ pub const HBCIndex = struct {
         query_measure: f32,
         distances: []f32,
         vector_id_storage: []u64,
+        bounded_projection_storage: []?vectorindex_search_results.BoundedProjection,
         metadata_storage: []?[]const u8,
         vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
@@ -11716,6 +12298,7 @@ pub const HBCIndex = struct {
             query_measure,
             distances,
             vector_id_storage,
+            bounded_projection_storage,
             metadata_storage,
             vector_view_storage,
             lookup_storage,
@@ -11739,6 +12322,7 @@ pub const HBCIndex = struct {
         query_measure: f32,
         distances: []f32,
         vector_id_storage: []u64,
+        bounded_projection_storage: []?vectorindex_search_results.BoundedProjection,
         metadata_storage: []?[]const u8,
         vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
@@ -11756,6 +12340,7 @@ pub const HBCIndex = struct {
             query_measure,
             distances,
             vector_id_storage,
+            bounded_projection_storage,
             metadata_storage,
             vector_view_storage,
             lookup_storage,
@@ -11780,6 +12365,7 @@ pub const HBCIndex = struct {
         distances: []f32,
         error_bounds: []f32,
         vector_id_storage: []u64,
+        bounded_projection_storage: []?vectorindex_search_results.BoundedProjection,
         metadata_storage: []?[]const u8,
         vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
@@ -11798,6 +12384,7 @@ pub const HBCIndex = struct {
             query_measure,
             distances,
             vector_id_storage,
+            bounded_projection_storage,
             metadata_storage,
             vector_view_storage,
             lookup_storage,
@@ -11822,6 +12409,7 @@ pub const HBCIndex = struct {
         distances: []f32,
         error_bounds: []f32,
         vector_id_storage: []u64,
+        bounded_projection_storage: []?vectorindex_search_results.BoundedProjection,
         metadata_storage: []?[]const u8,
         vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
@@ -11840,6 +12428,7 @@ pub const HBCIndex = struct {
             query_measure,
             distances,
             vector_id_storage,
+            bounded_projection_storage,
             metadata_storage,
             vector_view_storage,
             lookup_storage,
@@ -11863,6 +12452,7 @@ pub const HBCIndex = struct {
         query_measure: f32,
         distances: []f32,
         vector_id_storage: []u64,
+        bounded_projection_storage: []?vectorindex_search_results.BoundedProjection,
         metadata_storage: []?[]const u8,
         vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
@@ -11880,12 +12470,15 @@ pub const HBCIndex = struct {
         if (bounded_error_bounds == null and exact_loader == null) return false;
         if (bounded_error_bounds != null and bounded_loader == null) return false;
         const ctx = self.external_vector_ctx orelse return false;
-        if (bounded_error_bounds != null) {
-            const available = self.external_vector_bounded_distance_available orelse return false;
-            if (!available(ctx, experimentalPostingSourceSequenceFromTxn(txn))) return false;
-        }
+        const source_sequence = experimentalPostingSourceSequenceFromTxn(txn);
+        const native_projection_available = if (self.external_vector_bounded_distance_available) |available|
+            available(ctx, source_sequence)
+        else
+            false;
+        if (bounded_error_bounds != null and !native_projection_available) return false;
         if (distances.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
+        if (bounded_projection_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (metadata_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_view_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (miss_distance_storage.len < rerank_positions.len) return error.InvalidArgument;
@@ -11905,7 +12498,13 @@ pub const HBCIndex = struct {
         for (rerank_positions, 0..) |index, slot| {
             const vector_id = ranked_items[index].vector_id;
             distances[slot] = std.math.inf(f32);
-            if (use_cache) {
+            // A matching native projection generation is complete at this
+            // source boundary and the external loader will use it (or its
+            // authoritative fallback) without publishing decoded vectors.
+            // Probing the retained decoded-vector cache in that state is an
+            // always-miss shared-lock operation paid once in the bounded pass
+            // and again in exact completion.
+            if (use_cache and !native_projection_available) {
                 if (self.borrowCachedVector(vector_id)) |cached_handle| {
                     var handle = cached_handle;
                     defer handle.deinit();
@@ -11927,6 +12526,7 @@ pub const HBCIndex = struct {
                 }
             }
             vector_id_storage[miss_count] = vector_id;
+            bounded_projection_storage[miss_count] = ranked_items[index].projection;
             miss_count += 1;
         }
         if (miss_count == 0) return true;
@@ -11939,13 +12539,14 @@ pub const HBCIndex = struct {
                 try located_loader(
                     ctx,
                     location_ids,
+                    bounded_projection_storage[0..miss_count],
                     query,
                     query_measure,
                     self.config.metric,
                     location_distances,
                     batch_scratch,
                     @intCast(self.config.dims),
-                    experimentalPostingSourceSequenceFromTxn(txn),
+                    source_sequence,
                     profile,
                 );
                 for (location_ids, location_distances) |vector_id, distance| {
@@ -11960,6 +12561,7 @@ pub const HBCIndex = struct {
                 for (rerank_positions, 0..) |index, slot| {
                     if (std.math.isFinite(distances[slot])) continue;
                     vector_id_storage[miss_count] = ranked_items[index].vector_id;
+                    bounded_projection_storage[miss_count] = ranked_items[index].projection;
                     miss_count += 1;
                 }
                 if (miss_count == 0) return true;
@@ -11970,32 +12572,31 @@ pub const HBCIndex = struct {
         const metadata = metadata_storage[0..miss_count];
         if (profile) |p| p.rerank_metadata_vectors_loaded +|= @intCast(miss_count);
         const metadata_start = platform_time.monotonicNs();
-        if (use_cache) {
-            try self.getMetadataManySortedInTxnWithScratch(
-                txn,
-                vector_ids,
-                metadata,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-            );
-        } else {
-            try self.getMetadataManySortedInTxnWithScratchUncached(
-                txn,
-                vector_ids,
-                metadata,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-            );
-        }
+        // These values are transaction-owned views which must remain valid
+        // until the external loader returns. HBC's retained metadata cache
+        // deliberately cannot lend an unretained view here, so the cached
+        // helper would still read every value from this transaction and then
+        // clone it into a cache which this path can never hit. At concurrent
+        // rerank rates that becomes allocator and global-cache-lock churn with
+        // no read benefit. Keep `use_cache` for the decoded-vector fast path
+        // above, but leave one-shot vector-to-document metadata in the stable
+        // search transaction.
+        try self.getMetadataManySortedInTxnWithScratchUncached(
+            txn,
+            vector_ids,
+            metadata,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+        );
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
         const miss_distances = miss_distance_storage[0..miss_count];
         const distance_scratch: ExternalVectorBatchDistanceScratch = .{
             .artifact_keys = key_views_storage,
             .raw_values = values_storage,
             .vector_views = vector_view_storage,
-            .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
+            .bounded_projections = bounded_projection_storage[0..miss_count],
+            .source_sequence = source_sequence,
         };
         if (bounded_error_bounds) |_| {
             bounded_loader.?(
@@ -12582,6 +13183,41 @@ pub const HBCIndex = struct {
         return .{ .rabit = view.asProto() };
     }
 
+    /// Borrows co-located membership and RaBitQ planes from the immutable
+    /// generation. The query transaction owns the generation lease, so these
+    /// slices remain valid for the complete search.
+    pub fn loadNativeLeafScanView(
+        self: *HBCIndex,
+        txn: anytype,
+        node_id: u64,
+    ) !?vectorindex_hbc_runtime.NativeLeafScanView {
+        const immutable_generation = experimentalPostingGenerationFromTxn(txn);
+        const generation = immutable_generation orelse self.experimental_posting_mutation_base_generation orelse return null;
+        if (immutable_generation == null) {
+            inline for (.{
+                vectorindex_posting_wal.RecordKind.base,
+                vectorindex_posting_wal.RecordKind.posting_state,
+                vectorindex_posting_wal.RecordKind.quantized_checkpoint,
+            }) |kind| {
+                if (self.experimental_posting_captured_values.contains(experimentalPostingValueKey(node_id, kind))) return null;
+            }
+        }
+        const view = (try generation.leafScanViewIfUnmodified(node_id)) orelse return null;
+        const dims: usize = @intCast(self.config.dims);
+        if (view.metric != @intFromEnum(self.config.metric) or
+            view.centroid.len != dims or
+            view.member_ids.len != view.count or
+            view.width != rabitq.codeWidth(dims))
+        {
+            return error.Corrupted;
+        }
+        return .{
+            .member_ids = view.member_ids,
+            .quantized = .{ .rabit = view.asProto() },
+            .projections = view.projections,
+        };
+    }
+
     pub fn loadQuantized(self: *HBCIndex, txn: anytype, node_id: u64, is_root: bool, expected_count: usize) !QuantizedSet {
         return try vectorindex_hbc_index.loadQuantized(self, txn, node_id, is_root, expected_count, isNotFound);
     }
@@ -12898,6 +13534,14 @@ pub const HBCIndex = struct {
         inputs: []const PreparedBulkBuildInput,
     ) !BuiltBulkNode {
         return try vectorindex_hbc_index.buildBulkKmeansFromInputs(self, txn, inputs);
+    }
+
+    pub fn buildBulkHierarchicalKmeansFromInputs(
+        self: *HBCIndex,
+        txn: anytype,
+        inputs: []const PreparedBulkBuildInput,
+    ) !BuiltBulkNode {
+        return try vectorindex_hbc_index.buildBulkHierarchicalKmeansFromInputs(self, txn, inputs);
     }
 
     pub fn ingestMembersFrom(self: *HBCIndex, src: *HBCIndex, member_ids: []const u64, batch_size: usize) !void {
@@ -13581,7 +14225,7 @@ pub const HBCIndex = struct {
             @sizeOf(u8);
         const scalar_bytes = std.math.mul(usize, active_count, per_vector_scalar_bytes) catch return null;
         var total = std.math.add(usize, matrix_bytes, scalar_bytes) catch return null;
-        if (algorithm == .global_kmeans) {
+        if (algorithm == .global_kmeans or algorithm == .hierarchical_kmeans) {
             // K-means points reference the transformed matrix directly. Cover
             // assignments, entries, output descriptors, and two centroid
             // matrices without charging a second full vector matrix.
@@ -13591,7 +14235,13 @@ pub const HBCIndex = struct {
                 total,
                 std.math.mul(usize, active_count, kmeans_per_vector) catch return null,
             ) catch return null;
-            const cluster_count = std.math.divCeil(usize, active_count, @max(@as(usize, 1), self.config.leaf_size)) catch return null;
+            const cluster_count = if (algorithm == .global_kmeans)
+                std.math.divCeil(usize, active_count, @max(@as(usize, 1), self.config.leaf_size)) catch return null
+            else
+                @min(
+                    @max(@as(usize, 2), self.config.branching_factor),
+                    std.math.divCeil(usize, active_count, @max(@as(usize, 1), self.config.leaf_size)) catch return null,
+                );
             const centroid_floats = std.math.mul(usize, cluster_count, dims * 2) catch return null;
             total = std.math.add(
                 usize,
@@ -13733,6 +14383,7 @@ pub const HBCIndex = struct {
         var built = switch (algorithm) {
             .recursive => try vectorindex_hbc_index.buildBulkRecursiveFromInputs(self, &batch, inputs),
             .global_kmeans => try vectorindex_hbc_index.buildBulkKmeansFromInputs(self, &batch, inputs),
+            .hierarchical_kmeans => try vectorindex_hbc_index.buildBulkHierarchicalKmeansFromInputs(self, &batch, inputs),
         };
         defer built.deinit(self.alloc);
         for (old_nodes) |node| try self.deleteNode(&batch, node.id);
@@ -13854,6 +14505,7 @@ pub const HBCIndex = struct {
 
 pub const SearchResult = vectorindex_search_results.SearchResult;
 pub const ApproxSearchResult = vectorindex_search_results.ApproxSearchResult;
+pub const BoundedProjection = vectorindex_search_results.BoundedProjection;
 pub const SearchRequest = vectorindex_search_types.SearchRequest;
 pub const CancellationToken = vectorindex_search_types.CancellationToken;
 pub const SearchProfile = vectorindex_search_types.SearchProfile;
@@ -16290,6 +16942,8 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     defer idx.close();
     try idx.insertWithMetadata(1, &.{ 1, 0 }, "doc:cached");
     try idx.insertWithMetadata(2, &.{ 0, 1 }, "doc:miss");
+    idx.invalidateMetadataCache(1);
+    idx.invalidateMetadataCache(2);
     idx.setRetainedVectorCacheEnabled(true);
     _ = try idx.cacheVector(1, &.{ 1, 0 });
 
@@ -16297,6 +16951,12 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
         calls: usize = 0,
         ids: [2]u64 = .{ 0, 0 },
         count: usize = 0,
+        native_projection_available: bool = false,
+
+        fn projectionAvailable(context: *anyopaque, _: ?u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.native_projection_available;
+        }
 
         fn score(
             context: *anyopaque,
@@ -16313,6 +16973,14 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.calls += 1;
+            if (self.native_projection_available) {
+                try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, vector_ids);
+                try std.testing.expectEqualStrings("doc:cached", metadata[0] orelse return error.TestUnexpectedResult);
+                try std.testing.expectEqualStrings("doc:miss", metadata[1] orelse return error.TestUnexpectedResult);
+                distances[0] = 8;
+                distances[1] = 9;
+                return;
+            }
             try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
             try std.testing.expectEqual(@as(u64, 2), vector_ids[0]);
             try std.testing.expectEqualStrings("doc:miss", metadata[0] orelse return error.TestUnexpectedResult);
@@ -16332,6 +17000,7 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     };
     var distances: [2]f32 = undefined;
     var vector_ids: [2]u64 = undefined;
+    var bounded_projections: [2]?vectorindex_search_results.BoundedProjection = undefined;
     var metadata: [2]?[]const u8 = undefined;
     var vector_views: [2][]const f32 = undefined;
     var lookups: [2]FixedKeyLookup = undefined;
@@ -16348,6 +17017,7 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
         1,
         &distances,
         &vector_ids,
+        &bounded_projections,
         &metadata,
         &vector_views,
         &lookups,
@@ -16364,6 +17034,35 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     try std.testing.expectEqual(@as(u64, 1), profile.vector_cache_hits);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_artifact_cache_hits);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_metadata_vectors_loaded);
+    // Rerank needs the miss metadata only for the duration of this stable
+    // transaction. Retaining a cloned copy cannot accelerate the next rerank:
+    // this API cannot safely return the cache-owned view without a lease.
+    try std.testing.expect(idx.borrowCachedMetadata(2) == null);
+
+    loader.native_projection_available = true;
+    idx.setExternalVectorBoundedDistanceAvailable(&loader, Loader.projectionAvailable);
+    var native_profile: SearchProfile = .{};
+    try std.testing.expect(try idx.scoreExternalRerankVectorsSortedWithScratch(
+        &txn,
+        &ranked,
+        &.{ 0, 1 },
+        &.{ 1, 0 },
+        1,
+        &distances,
+        &vector_ids,
+        &bounded_projections,
+        &metadata,
+        &vector_views,
+        &lookups,
+        &key_views,
+        &values,
+        &batch_scratch,
+        &miss_distances,
+        &native_profile,
+    ));
+    try std.testing.expectEqual(@as(f32, 8), distances[0]);
+    try std.testing.expectEqual(@as(f32, 9), distances[1]);
+    try std.testing.expectEqual(@as(u64, 0), native_profile.vector_cache_hits);
 }
 
 test "hbc external rerank completes saved locations before metadata fallback" {
@@ -16388,6 +17087,7 @@ test "hbc external rerank completes saved locations before metadata fallback" {
         fn scoreLocated(
             context: *anyopaque,
             vector_ids: []const u64,
+            bounded_projections: []const ?BoundedProjection,
             _: []const f32,
             _: f32,
             _: vec.DistanceMetric,
@@ -16400,6 +17100,7 @@ test "hbc external rerank completes saved locations before metadata fallback" {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.located_calls += 1;
             try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, vector_ids);
+            try std.testing.expectEqual(@as(usize, 2), bounded_projections.len);
             distances[0] = 3;
             distances[1] = std.math.inf(f32);
         }
@@ -16436,6 +17137,7 @@ test "hbc external rerank completes saved locations before metadata fallback" {
     };
     var distances: [2]f32 = undefined;
     var vector_ids: [2]u64 = undefined;
+    var bounded_projections: [2]?vectorindex_search_results.BoundedProjection = undefined;
     var metadata: [2]?[]const u8 = undefined;
     var vector_views: [2][]const f32 = undefined;
     var lookups: [2]FixedKeyLookup = undefined;
@@ -16452,6 +17154,7 @@ test "hbc external rerank completes saved locations before metadata fallback" {
         1,
         &distances,
         &vector_ids,
+        &bounded_projections,
         &metadata,
         &vector_views,
         &lookups,
@@ -16510,6 +17213,7 @@ test "hbc uncached external rerank does not publish snapshot metadata" {
     const ranked = [_]ApproxSearchResult{.{ .vector_id = 1, .distance = 0.1 }};
     var distances: [1]f32 = undefined;
     var vector_ids: [1]u64 = undefined;
+    var bounded_projections: [1]?vectorindex_search_results.BoundedProjection = undefined;
     var metadata: [1]?[]const u8 = undefined;
     var vector_views: [1][]const f32 = undefined;
     var lookups: [1]FixedKeyLookup = undefined;
@@ -16525,6 +17229,7 @@ test "hbc uncached external rerank does not publish snapshot metadata" {
         1,
         &distances,
         &vector_ids,
+        &bounded_projections,
         &metadata,
         &vector_views,
         &lookups,
@@ -17534,7 +18239,7 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
 
     // Model the exact state at flat selection: complete-coverage buffers have
     // already been admitted and allocated, but neither the frontier nor the
-    // directory block-scoring workspace has grown yet.
+    // directory centroid-score planes have grown yet.
     var model = try vectorindex_search_runtime.SearchScratch.init(
         alloc,
         dims,
@@ -17583,6 +18288,8 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
     const rejected = &(idx.cached_scratch orelse return error.TestUnexpectedResult);
     try std.testing.expect(rejected.vector_batch.len <= dims * leaf_size);
     try std.testing.expect(rejected.positions.len <= leaf_size);
+    try std.testing.expect(rejected.distances.len <= leaf_size);
+    try std.testing.expect(rejected.error_bounds.len <= leaf_size);
     try std.testing.expectEqual(@as(usize, 0), rejected.flat_probes.len);
 }
 
@@ -19259,6 +19966,46 @@ test "flat rabitq filtered traversal advances past its initial probe wave safely
     try std.testing.expect(profiled.profile.traversal_waves > 1);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+}
+
+test "flat traversal does not treat a full candidate heap as a pruning proof" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        // Inner product has no posting-ball proof today, so this test isolates
+        // the effort contract from certified bound stopping.
+        .metric = .inner_product,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .rerank_policy = .boundary,
+        .centroid_directory_mode = .flat_exact,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 2,
+    });
+    defer idx.close();
+
+    for (0..128) |i| {
+        const value: f32 = @floatFromInt(i + 1);
+        try idx.insert(@intCast(i + 1), &.{ value, 1 });
+    }
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &.{ 1, 0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), profiled.profile.traversal_initial_wave_leaves);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+    try std.testing.expect(profiled.profile.leaves_explored > 2);
 }
 
 test "flat rabitq full effort exhausts an underfilled published directory" {

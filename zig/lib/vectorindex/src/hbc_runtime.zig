@@ -47,6 +47,81 @@ pub const QuantizedSet = union(enum) {
     }
 };
 
+/// One immutable leaf scoring row borrowed from a generation lease. Keeping
+/// membership beside the fixed-width candidate plane removes the packed-node
+/// lookup and copy from the flat-directory search path. The source generation
+/// remains authoritative: adapters decline this view as soon as any leaf
+/// membership, posting state, or quantized payload is shadowed by a delta.
+pub const NativeLeafScanView = struct {
+    member_ids: []const u64,
+    quantized: QuantizedSet,
+    /// Optional source-space float16 rows owned by the same immutable posting
+    /// generation. Rows follow member_ids exactly; per-row metadata makes the
+    /// resulting score interval conservative enough to defer authoritative
+    /// residual reads until the public top-k boundary is known.
+    projections: ?NativeProjectionPlane = null,
+};
+
+pub const NativeProjectionPlane = struct {
+    dims: usize,
+    values: []const f16,
+    scales: []const f32,
+    error_norms: []const f32,
+    decoded_norm_lower_bounds: []const f32,
+    /// Source vector payload CRCs. Version-three posting generations omit
+    /// this column and remain scoreable, but cannot use residual-only exact
+    /// completion without revalidating the projection payload.
+    checksums: []const u32 = &.{},
+    /// Optional generation-bound locations of the lossless residuals in the
+    /// shared exact-vector store. Older posting generations omit this plane;
+    /// callers must then resolve the artifact key through the authoritative
+    /// directory. A location is only a hint until the exact-vector generation
+    /// validates its generation, shard, sequence, projection checksum, and
+    /// residual checksum.
+    residual_locations: ?NativeResidualLocationPlane = null,
+
+    pub fn validFor(self: @This(), count: usize, dims: usize) bool {
+        const expected_values = std.math.mul(usize, count, dims) catch return false;
+        return self.dims == dims and
+            self.values.len == expected_values and
+            self.scales.len == count and
+            self.error_norms.len == count and
+            self.decoded_norm_lower_bounds.len == count and
+            (self.checksums.len == 0 or self.checksums.len == count) and
+            (self.residual_locations == null or self.residual_locations.?.validFor(count));
+    }
+};
+
+pub const NativeResidualLocation = types.NativeResidualLocation;
+pub const NativeResidualLocationPlane = types.NativeResidualLocationPlane;
+
+/// One transient projection returned to an immutable checkpoint builder. The
+/// callback owns the bytes only until it returns; the posting codec copies the
+/// complete leaf plane before the next callback invocation.
+pub const NativeProjectionBuildValue = struct {
+    bytes: []const u8 = &.{},
+    scale: f32 = 1,
+    error_norm: f32 = 0,
+    decoded_norm_lower_bound: f32 = 0,
+    checksum: u32 = 0,
+    residual_location: ?NativeResidualLocation = null,
+};
+
+pub const NativeProjectionBuildLoader = *const fn (
+    ctx: *anyopaque,
+    vector_ids: []const u64,
+    metadata: []const ?[]const u8,
+    values: []NativeProjectionBuildValue,
+    payload_scratch: []u8,
+    dims: usize,
+    source_sequence: u64,
+) anyerror!void;
+
+pub const NativeProjectionBuildSource = struct {
+    ctx: *anyopaque,
+    loader: NativeProjectionBuildLoader,
+};
+
 pub const WriteProfile = struct {
     bulk_build_store_ns: u64 = 0,
     bulk_build_tree_ns: u64 = 0,

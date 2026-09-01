@@ -2465,11 +2465,17 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
         for (cursors[0..initialized_cursors]) |*cursor| cursor.deinit();
         allocator.free(cursors);
     }
+    const cold_reader_capacity = backend.storage.?.coldSequentialReaderCapacity();
     for (window_runs, 0..) |run, i| {
         const path = run.path orelse return error.RunStateUnavailable;
-        cursors[i] = try PersistedRunCursor.init(allocator, backend.storage.?, path);
-        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
+        cursors[i] = try PersistedRunCursor.init(
+            allocator,
+            backend.storage.?,
+            path,
+            i < cold_reader_capacity,
+        );
         initialized_cursors += 1;
+        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
     }
 
     var runs = std.ArrayListUnmanaged(Run).empty;
@@ -2671,6 +2677,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.options.table_block_compression,
                 backend.options.table_prefix_extractor,
                 backend.options.resource_manager,
+                .cold_sequential,
             );
             self.writer_active = true;
         }
@@ -2772,8 +2779,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
 
 const PersistedRunCursor = struct {
     allocator: std.mem.Allocator,
-    storage: @import("storage_io.zig").Storage,
-    path: []const u8,
+    reader: @import("storage_io.zig").ColdSequentialReader,
     index: lsm_table_file.SequentialTableIndex,
     position: ?usize = null,
     block_index: usize = 0,
@@ -2787,13 +2793,21 @@ const PersistedRunCursor = struct {
     loaded_window: ?lsm_table_file.EntryDataWindow = null,
     loaded_bytes: ?[]u8 = null,
 
-    fn init(allocator: std.mem.Allocator, storage: @import("storage_io.zig").Storage, path: []const u8) !PersistedRunCursor {
+    fn init(
+        allocator: std.mem.Allocator,
+        storage: @import("storage_io.zig").Storage,
+        path: []const u8,
+        cold: bool,
+    ) !PersistedRunCursor {
         var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path);
         errdefer index.deinit(allocator);
+        const reader = if (cold)
+            try storage.beginColdSequentialRead(allocator, path)
+        else
+            try storage.beginSequentialRead(allocator, path);
         return .{
             .allocator = allocator,
-            .storage = storage,
-            .path = path,
+            .reader = reader,
             .index = index,
             .position = if (index.entry_count > 0) 0 else null,
         };
@@ -2801,6 +2815,7 @@ const PersistedRunCursor = struct {
 
     fn deinit(self: *PersistedRunCursor) void {
         if (self.loaded_bytes) |bytes| self.allocator.free(bytes);
+        self.reader.deinit();
         self.index.deinit(self.allocator);
         self.* = undefined;
     }
@@ -2861,9 +2876,8 @@ const PersistedRunCursor = struct {
             self.allocator.free(bytes);
             self.loaded_bytes = null;
         }
-        const payload = try self.storage.readFileRangeAlloc(
+        const payload = try self.reader.readRangeAlloc(
             self.allocator,
-            self.path,
             @as(u64, @intCast(self.index.entry_data_start)) + window.physicalRelativeOffset(),
             window.physicalLen(),
         );
@@ -3352,6 +3366,7 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
             backend.options.table_block_compression,
             backend.options.table_prefix_extractor,
             backend.options.resource_manager,
+            .cold_sequential,
             physicalRunFileLimit(BackendType, backend),
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
@@ -3405,6 +3420,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         backend.options.table_block_compression,
         backend.options.table_prefix_extractor,
         backend.options.resource_manager,
+        .cold_sequential,
     );
     var writer_active = true;
     errdefer if (writer_active) writer.deinit();

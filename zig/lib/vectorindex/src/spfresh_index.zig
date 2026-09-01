@@ -302,6 +302,23 @@ pub const FlatCentroidSelection = struct {
     total_postings: usize,
 };
 
+fn flatSelectionLimit(
+    coverage_policy: search_types.CoveragePolicy,
+    max_postings: usize,
+    posting_count: usize,
+) usize {
+    return if (coverage_policy == .complete_snapshot)
+        posting_count
+    else
+        @min(max_postings, posting_count);
+}
+
+test "approximate flat routing bounds request scratch while complete coverage remains exhaustive" {
+    try std.testing.expectEqual(@as(usize, 2_064), flatSelectionLimit(.best_effort, 2_064, 8_878));
+    try std.testing.expectEqual(@as(usize, 8_878), flatSelectionLimit(.complete_snapshot, 2_064, 8_878));
+    try std.testing.expectEqual(@as(usize, 64), flatSelectionLimit(.best_effort, 2_064, 64));
+}
+
 fn checkedAddMul(total: *u64, count: u64, element_size: u64) !void {
     const bytes = std.math.mul(u64, count, element_size) catch return error.OutOfMemory;
     total.* = std.math.add(u64, total.*, bytes) catch return error.OutOfMemory;
@@ -1304,10 +1321,12 @@ pub fn selectFlatPostingsAlloc(
     // Complete-snapshot searches promise exhaustive coverage of the
     // published directory. Approximate searches retain the bounded ANN
     // frontier so their latency remains governed by the caller's effort.
-    const selection_limit = if (coverage_policy == .complete_snapshot)
-        posting_count
-    else
-        @min(max_postings, posting_count);
+    // Approximate requests retain only their governed ANN frontier. The
+    // complete-directory radius experiment produced no certified stops on
+    // either qualification corpus, while multiplying per-query scratch by
+    // the posting count and exhausting the public query budget under normal
+    // concurrency. Complete-snapshot validation remains exhaustive.
+    const selection_limit = flatSelectionLimit(coverage_policy, max_postings, posting_count);
     const needs_merge = cancellation != null and selection_limit > cancellable_flat_sort_chunk_size;
     const previous_accounted_bytes = scratch_handle.accounted_bytes;
     const Index = comptime @TypeOf(self.*);
@@ -1337,7 +1356,7 @@ pub fn selectFlatPostingsAlloc(
     for (directory.blocks) |*block| {
         try checkCancellation(cancellation);
         const count = block.posting_ids.len;
-        try scratch.ensureVectorFetchCapacity(self.alloc, count);
+        try scratch.ensureFlatCentroidScoreCapacity(self.alloc, count);
         const distances = scratch.distances[0..count];
         const error_bounds = scratch.error_bounds[0..count];
         switch (block.encoding) {

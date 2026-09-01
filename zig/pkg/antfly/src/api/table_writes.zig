@@ -10760,10 +10760,26 @@ pub const ProvisionedTableWriteSource = struct {
         }
         var total_steps: usize = 0;
         for (leases.items) |lease| {
-            total_steps += lease.db.runDensePostingMaintenanceForIdle() catch |err| blk: {
-                std.log.warn("dense posting maintenance round failed: {}", .{err});
-                break :blk 0;
-            };
+            // A dependency chain can expose only one newly repairable posting
+            // per transaction. One pass per one-second timer wake made a
+            // settled 50K load spend minutes at 99.9% readiness even though
+            // each repair itself took little CPU. Drain a bounded burst while
+            // releasing the DB apply fence between passes. Foreground work can
+            // therefore become visible to shouldDeferOptionalPostingMaintenance
+            // on the next pass, while an idle corpus advances up to 64 links or
+            // 50 ms per wake instead of one.
+            const burst_start_ns = platform_time.monotonicNs();
+            const max_passes: usize = 64;
+            const max_elapsed_ns: u64 = 50 * std.time.ns_per_ms;
+            var pass: usize = 0;
+            while (pass < max_passes and platform_time.monotonicNs() -| burst_start_ns < max_elapsed_ns) : (pass += 1) {
+                const progressed = lease.db.runDensePostingReadinessMaintenanceForIdle() catch |err| {
+                    std.log.warn("dense posting maintenance round failed: {}", .{err});
+                    break;
+                };
+                total_steps += progressed;
+                if (progressed == 0) break;
+            }
         }
         return total_steps;
     }
@@ -10801,6 +10817,10 @@ pub const ProvisionedTableWriteSource = struct {
             // its error is readiness state: swallowing it would let the data
             // runtime retain a stale `ready` snapshot while queries fall back
             // to an expensive primary-artifact scan.
+            if (try lease.db.finalizeDenseProjectionLifecycleForIdle()) {
+                total_steps += 1;
+                continue;
+            }
             total_steps += try lease.db.runVectorBlockMaintenanceForIdle();
         }
         return total_steps;
@@ -10823,6 +10843,22 @@ pub const ProvisionedTableWriteSource = struct {
         if (!self.local_db_mutex.tryLock()) return null;
         const finished = self.finishExpiredAutoBulkIngestLockedCollectingStatusLeases(alloc, &leases);
         self.local_db_mutex.unlock();
+
+        // Closing the automatic source window is the first point at which a
+        // finite upload has a proven stable tip. Hand that boundary directly
+        // to dense projection publication while the just-finished DB leases
+        // remain pinned, instead of relying on a later polling race between
+        // status traffic and the generic maintenance worker. This work is
+        // deliberately outside local_db_mutex: native generation construction
+        // may perform bounded I/O and must not block writer-cache admission.
+        if (finished) for (leases.items) |lease| {
+            _ = lease.db.finalizeDenseProjectionLifecycleForIdle() catch |err| {
+                std.log.warn(
+                    "dense projection finalization after auto bulk close deferred table={s} err={s}",
+                    .{ if (lease.entry) |entry| entry.table_name else "", @errorName(err) },
+                );
+            };
+        };
 
         self.publishRuntimeStatusLeaseSnapshots(alloc, leases.items);
         return finished;
