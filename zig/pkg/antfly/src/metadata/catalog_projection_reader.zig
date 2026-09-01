@@ -435,7 +435,13 @@ pub const CatalogProjectionReader = struct {
 
         const tables = try alloc.alloc(metadata_table_manager.TableRecord, 1);
         errdefer alloc.free(tables);
-        tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, table);
+        // The point projection is also the physical-owner descriptor source.
+        // Unlike the catalog-wide routing snapshot, its cost is bounded to one
+        // table, so retain the complete schema/index definition. Blanking
+        // these fields here caused production data-Raft entries to persist an
+        // empty storage-owner configuration while test adapters (which cloned
+        // full admin records) continued to pass.
+        tables[0] = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, tables[0]);
         const span = snapshot.table_range_spans.get(table.table_id) orelse Snapshot.RangeSpan{ .start = 0, .len = 0 };
         const table_ranges = snapshot.ranges[span.start..][0..span.len];

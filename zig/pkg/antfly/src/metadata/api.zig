@@ -270,6 +270,13 @@ pub const CatalogRoutingChangeRequest = struct {
     confirm_absence: bool = false,
 };
 
+/// Bounded request for the complete physical definition and routing ranges of
+/// one table. Unlike the catalog-wide routing projection, this response keeps
+/// schema and index payloads because storage owners need them to open the DB.
+pub const CatalogTableRoutingSnapshotRequest = struct {
+    table_name: []const u8,
+};
+
 pub const CatalogRoutingChangeResult = struct {
     token: CatalogRoutingChangeToken,
     disposition: ?Disposition = null,

@@ -86,7 +86,9 @@ pub const AdminSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -167,9 +169,19 @@ pub const AdminSource = struct {
         return try self.vtable.routing_snapshot(self.ptr, deadline_ns);
     }
 
+    pub fn tableRoutingSnapshot(self: AdminSource, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.table_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, table_name, deadline_ns);
+    }
+
     pub fn linearizableRoutingSnapshot(self: AdminSource, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const capture = self.vtable.linearizable_routing_snapshot orelse return error.UnsupportedOperation;
         return try capture(self.ptr, request);
+    }
+
+    pub fn linearizableTableRoutingSnapshot(self: AdminSource, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.linearizable_table_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, table_name, request);
     }
 
     pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -365,7 +377,9 @@ pub const AdminSource = struct {
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
@@ -414,7 +428,9 @@ pub const AdminSource = struct {
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -513,9 +529,21 @@ pub const AdminSource = struct {
         return try svc.catalogRoutingSnapshot(deadline_ns);
     }
 
+    fn metadataServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+    }
+
     fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataService, svc, request);
+    }
+
+    fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -896,9 +924,21 @@ pub const AdminSource = struct {
         return try svc.catalogRoutingSnapshot(deadline_ns);
     }
 
+    fn metadataHttpServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+    }
+
     fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataHttpService, svc, request);
+    }
+
+    fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
     fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1301,6 +1341,8 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
+        try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
+        try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
@@ -1651,6 +1693,40 @@ pub const MetadataHttpServer = struct {
         const request = requestContext(ctx);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         var result = self.source.linearizableRoutingSnapshot(request) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn parseTableRoutingSnapshotRequest(ctx: *httpx.Context) !std.json.Parsed(metadata_api.CatalogTableRoutingSnapshotRequest) {
+        const body = (try ctx.body()) orelse "";
+        const parsed = std.json.parseFromSlice(metadata_api.CatalogTableRoutingSnapshotRequest, ctx.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidArgument;
+        errdefer parsed.deinit();
+        if (parsed.value.table_name.len == 0) return error.InvalidArgument;
+        return parsed;
+    }
+
+    fn metadataTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid table routing snapshot request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.tableRoutingSnapshot(parsed.value.table_name, request.deadline_ns) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn metadataLinearizableTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid table routing snapshot request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.linearizableTableRoutingSnapshot(parsed.value.table_name, request) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
@@ -3760,7 +3836,13 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 test "metadata routing server converts relative budget to local deadline" {
     const RoutingSource = struct {
         const tables = [_]metadata_table_manager.TableRecord{
-            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+            .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .schema_json = "{\"document\":{}}",
+                .indexes_json = "{\"full_text_index_v0\":{\"kind\":\"full_text\"}}",
+            },
         };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .range_id = 4, .group_id = 71, .table_id = 7, .start_key = "", .end_key = null },
@@ -3769,6 +3851,7 @@ test "metadata routing server converts relative budget to local deadline" {
         observed_deadline_ns: ?u64 = null,
         observed_change_token: ?metadata_api.CatalogRoutingChangeToken = null,
         observed_confirm_absence: bool = false,
+        observed_table_name: bool = false,
 
         fn iface(self: *@This()) AdminSource {
             return .{ .ptr = self, .vtable = &.{
@@ -3776,7 +3859,9 @@ test "metadata routing server converts relative budget to local deadline" {
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .routing_snapshot = routingSnapshot,
+                .table_routing_snapshot = tableRoutingSnapshot,
                 .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = linearizableTableRoutingSnapshot,
                 .free_routing_snapshot = freeRoutingSnapshot,
                 .wait_for_routing_change = waitForRoutingChange,
             } };
@@ -3806,6 +3891,16 @@ test "metadata routing server converts relative budget to local deadline" {
 
         fn linearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
             return routingSnapshot(ptr, request.deadline_ns);
+        }
+
+        fn tableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_table_name = std.mem.eql(u8, table_name, "docs");
+            return routingSnapshot(ptr, deadline_ns);
+        }
+
+        fn linearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+            return tableRoutingSnapshot(ptr, table_name, request.deadline_ns);
         }
 
         fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
@@ -3895,6 +3990,27 @@ test "metadata routing server converts relative budget to local deadline" {
     const linearizable_observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(linearizable_observed >= linearizable_before_ns + 125 * std.time.ns_per_ms);
     try std.testing.expect(linearizable_observed <= platform_time.monotonicNs() + 125 * std.time.ns_per_ms);
+
+    source.observed_deadline_ns = null;
+    var table_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_table_routing_snapshot,
+    );
+    defer table_request.deinit();
+    table_request.body = "{\"table_name\":\"docs\"}";
+    try table_request.headers.append(routes.routing_remaining_ms_header, "125");
+    var table_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &table_request);
+    defer table_ctx.deinit();
+    var table_response = try server.metadataTableRoutingSnapshot(&table_ctx);
+    defer table_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), table_response.status.code);
+    try std.testing.expect(source.observed_table_name);
+    const parsed_table = try std.json.parseFromSlice(metadata_api.CatalogRoutingSnapshot, std.testing.allocator, table_response.body.?, .{});
+    defer parsed_table.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_table.value.tables.len);
+    try std.testing.expectEqualStrings("{\"document\":{}}", parsed_table.value.tables[0].schema_json);
+    try std.testing.expectEqualStrings("{\"full_text_index_v0\":{\"kind\":\"full_text\"}}", parsed_table.value.tables[0].indexes_json);
 
     source.observed_deadline_ns = null;
     var change_request = try httpx.Request.init(

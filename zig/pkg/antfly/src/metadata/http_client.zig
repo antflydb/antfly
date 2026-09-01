@@ -229,6 +229,7 @@ pub const MetadataHttpClient = struct {
             base_uri,
             .GET,
             routes.Routes.routing_snapshot,
+            null,
             budget,
         );
     }
@@ -242,8 +243,51 @@ pub const MetadataHttpClient = struct {
             base_uri,
             .POST,
             routes.Routes.internal_linearizable_routing_snapshot,
+            null,
             budget,
         );
+    }
+
+    pub fn fetchTableRoutingSnapshot(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return try self.fetchTableRoutingSnapshotAt(
+            base_uri,
+            table_name,
+            routes.Routes.internal_table_routing_snapshot,
+            budget,
+        );
+    }
+
+    pub fn fetchLinearizableTableRoutingSnapshot(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return try self.fetchTableRoutingSnapshotAt(
+            base_uri,
+            table_name,
+            routes.Routes.internal_linearizable_table_routing_snapshot,
+            budget,
+        );
+    }
+
+    fn fetchTableRoutingSnapshotAt(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        path: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{
+            .table_name = table_name,
+        }, .{});
+        defer self.alloc.free(body);
+        return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
     fn fetchRoutingSnapshotAt(
@@ -251,6 +295,7 @@ pub const MetadataHttpClient = struct {
         base_uri: []const u8,
         method: http_common.Method,
         path: []const u8,
+        body: ?[]const u8,
         budget: ?RequestBudget,
     ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
         const uri = try join(self.alloc, base_uri, path);
@@ -264,7 +309,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         };
         if (method == .POST) {
-            request.body = "{}";
+            request.body = body orelse "{}";
             request.content_type = "application/json";
         }
         if (budget) |value| {
@@ -1335,6 +1380,40 @@ test "metadata linearizable routing client uses compact internal endpoint" {
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
+}
+
+test "metadata table routing client requests and preserves one full table definition" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_table_routing_snapshot));
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const parsed = try std.json.parseFromSlice(metadata_api.CatalogTableRoutingSnapshotRequest, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("docs", parsed.value.table_name);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9," ++
+                    "\"tables\":[{\"table_id\":7,\"name\":\"docs\",\"schema_json\":\"{\\\"document\\\":{}}\",\"indexes_json\":\"{\\\"full_text_index_v0\\\":{}}\"}]," ++
+                    "\"ranges\":[{\"range_id\":4,\"group_id\":71,\"table_id\":7,\"start_key\":\"\"}]}"),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.fetchTableRoutingSnapshot("http://127.0.0.1:9000", "docs", .{
+        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.value.tables.len);
+    try std.testing.expectEqualStrings("{\"document\":{}}", result.value.tables[0].schema_json);
+    try std.testing.expectEqualStrings("{\"full_text_index_v0\":{}}", result.value.tables[0].indexes_json);
 }
 
 test "metadata routing change client forwards an authority-scoped long poll" {

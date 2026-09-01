@@ -17096,7 +17096,9 @@ const RemoteMetadataSource = struct {
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .routing_snapshot = remoteRoutingSnapshot,
+                .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
                 .await_route = remoteAwaitRoute,
@@ -17379,6 +17381,80 @@ const RemoteMetadataSource = struct {
         return try self.remoteRoutingSnapshotWithMode(deadline_ns, true);
     }
 
+    fn remoteTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, false);
+    }
+
+    fn remoteLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, true);
+    }
+
+    fn remoteTableRoutingSnapshotWithMode(
+        self: *RemoteMetadataSource,
+        table_name: []const u8,
+        deadline_ns: ?u64,
+        linearizable: bool,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
+            .{ .deadline_ns = deadline }
+        else
+            null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
+                const now_ns = platform_time.monotonicNs();
+                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt) };
+            } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var metadata_client = self.metadataClient(arena.allocator());
+            var parsed = (if (linearizable)
+                metadata_client.fetchLinearizableTableRoutingSnapshot(self.base_uris[index], table_name, attempt_budget)
+            else
+                metadata_client.fetchTableRoutingSnapshot(self.base_uris[index], table_name, attempt_budget)) catch |err| {
+                if (err == error.UnsupportedOperation) {
+                    const legacy = self.fetchLegacyTableRoutingSnapshotAtEndpoint(
+                        &metadata_client,
+                        index,
+                        table_name,
+                        attempt_budget,
+                        linearizable,
+                    ) catch |legacy_err| {
+                        last_err = normalizeCatalogRoutingSnapshotError(legacy_err);
+                        continue;
+                    };
+                    self.noteMetadataReadSuccess(index);
+                    return legacy;
+                }
+                last_err = normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            const owned = self.ownedTableRoutingSnapshotUntil(
+                parsed.value.metadata_group_id,
+                parsed.value.metadata_incarnation,
+                parsed.value.catalog_revision,
+                table_name,
+                parsed.value.tables,
+                parsed.value.ranges,
+                if (attempt_budget) |budget| budget.deadline_ns else null,
+            ) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return owned;
+        }
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        return last_err;
+    }
+
     fn remoteRoutingSnapshotWithMode(
         self: *RemoteMetadataSource,
         deadline_ns: ?u64,
@@ -17588,6 +17664,100 @@ const RemoteMetadataSource = struct {
             parsed.value.ranges,
             if (budget) |value| value.deadline_ns else null,
         );
+    }
+
+    fn fetchLegacyTableRoutingSnapshotAtEndpoint(
+        self: *RemoteMetadataSource,
+        metadata_client: *antfly.metadata_http_client.MetadataHttpClient,
+        index: usize,
+        table_name: []const u8,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+        linearizable: bool,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        var parsed = if (linearizable)
+            try metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget)
+        else
+            try metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget);
+        defer parsed.deinit();
+        return try self.ownedTableRoutingSnapshotUntil(
+            parsed.value.status.metadata_group_id,
+            parsed.value.status.metadata_incarnation,
+            0,
+            table_name,
+            parsed.value.tables,
+            parsed.value.ranges,
+            if (budget) |value| value.deadline_ns else null,
+        );
+    }
+
+    fn ownedTableRoutingSnapshotUntil(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation,
+        catalog_revision: u64,
+        table_name: []const u8,
+        source_tables: []const antfly.metadata.table_manager.TableRecord,
+        source_ranges: []const antfly.metadata.table_manager.RangeRecord,
+        deadline_ns: ?u64,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
+        const source_table = blk: {
+            for (source_tables) |*table| {
+                if (deadline_ns) |deadline| {
+                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                }
+                if (std.mem.eql(u8, table.name, table_name)) break :blk table;
+            }
+            break :blk null;
+        };
+        const tables: []antfly.metadata.table_manager.TableRecord = if (source_table) |table| blk: {
+            const owned = try self.alloc.alloc(antfly.metadata.table_manager.TableRecord, 1);
+            errdefer self.alloc.free(owned);
+            owned[0] = try antfly.metadata.table_manager.cloneTable(self.alloc, table.*);
+            break :blk owned;
+        } else &.{};
+        errdefer freeTablesOwned(self.alloc, tables);
+
+        var range_count: usize = 0;
+        if (source_table) |table| {
+            for (source_ranges) |range| {
+                if (deadline_ns) |deadline| {
+                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                }
+                if (range.table_id == table.table_id) range_count += 1;
+            }
+        }
+        const ranges: []antfly.metadata.table_manager.RangeRecord = if (range_count == 0) &.{} else try self.alloc.alloc(antfly.metadata.table_manager.RangeRecord, range_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (ranges[0..initialized]) |range| antfly.metadata.table_manager.freeRange(self.alloc, range);
+            if (ranges.len > 0) self.alloc.free(ranges);
+        }
+        if (source_table) |table| {
+            for (source_ranges) |range| {
+                if (range.table_id != table.table_id) continue;
+                if (deadline_ns) |deadline| {
+                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                }
+                ranges[initialized] = try antfly.metadata.table_manager.cloneRoutingRange(self.alloc, range);
+                initialized += 1;
+            }
+        }
+        return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = metadata_incarnation,
+            .catalog_revision = catalog_revision,
+            .change_token = .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = metadata_incarnation,
+                .revision = catalog_revision,
+            },
+            .tables = tables,
+            .ranges = ranges,
+        };
     }
 
     fn ownedRoutingSnapshotUntil(
