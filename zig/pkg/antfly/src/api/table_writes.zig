@@ -70,41 +70,49 @@ fn resolveCatalogGroupsEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) ![]u64 {
-    return switch (try table_catalog.resolveGroupsForSpanEventually(
+    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+    const budget = table_catalog.RoutingBudget.init(deadline_ns);
+    return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,
         table_name,
         from_key,
         to_key,
-        timeout_ns,
+        deadline_ns,
         poll_interval_ms,
     )) {
         .found => |plan_value| blk: {
             var plan = plan_value;
             defer plan.deinit(alloc);
-            break :blk try plan.groupIdsAlloc(alloc);
+            break :blk try plan.groupIdsAllocUntil(alloc, budget);
         },
-        .not_found => try alloc.alloc(u64, 0),
+        .not_found => blk: {
+            try budget.checkpoint();
+            const group_ids = try alloc.alloc(u64, 0);
+            errdefer alloc.free(group_ids);
+            try budget.checkpoint();
+            break :blk group_ids;
+        },
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };
 }
 
-fn resolveCatalogRouteEventually(
+fn resolveCatalogRouteEventuallyUntil(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     from_key: []const u8,
     to_key: []const u8,
-    timeout_ns: u64,
+    deadline_ns: u64,
     poll_interval_ms: u64,
 ) !?table_catalog.CatalogRoutePlan {
-    return switch (try table_catalog.resolveGroupsForSpanEventually(
+    return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,
         table_name,
         from_key,
         to_key,
-        timeout_ns,
+        deadline_ns,
         poll_interval_ms,
     )) {
         .found => |plan| plan,
@@ -15391,17 +15399,19 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
-        var route = (try resolveCatalogRouteEventually(
+        const routing_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const routing_budget = table_catalog.RoutingBudget.init(routing_deadline_ns);
+        var route = (try resolveCatalogRouteEventuallyUntil(
             alloc,
             self.catalog,
             table_name,
             "",
             "",
-            5 * std.time.ns_per_s,
+            routing_deadline_ns,
             10,
         )) orelse return null;
         defer route.deinit(alloc);
-        const group_ids = try route.groupIdsAlloc(alloc);
+        const group_ids = try route.groupIdsAllocUntil(alloc, routing_budget);
         defer alloc.free(group_ids);
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;

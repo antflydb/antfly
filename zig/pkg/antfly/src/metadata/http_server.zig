@@ -1416,6 +1416,113 @@ pub const MetadataHttpServer = struct {
         return response;
     }
 
+    const BudgetedRoutingSnapshotJson = struct {
+        const Failure = enum { canceled, timed_out };
+
+        snapshot: metadata_api.CatalogRoutingSnapshot,
+        ctx: *const httpx.Context,
+        failure: *?Failure,
+
+        fn checkpoint(self: @This()) error{WriteFailed}!void {
+            if (self.ctx.isCancellationRequested()) {
+                self.failure.* = .canceled;
+                return error.WriteFailed;
+            }
+            if (self.ctx.application_deadline_ns) |deadline_ns| {
+                if (platform_time.monotonicNs() >= deadline_ns) {
+                    self.failure.* = .timed_out;
+                    return error.WriteFailed;
+                }
+            }
+        }
+
+        fn checkpointIndex(self: @This(), index: usize) error{WriteFailed}!void {
+            if (index % 64 == 0) try self.checkpoint();
+        }
+
+        /// Keep materialized JSON responses interruptible without changing the
+        /// public wire schema. A checkpoint per fixed-size batch avoids a
+        /// clock read for every catalog record.
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            comptime {
+                const expected_fields = [_][]const u8{
+                    "metadata_group_id",
+                    "metadata_incarnation",
+                    "catalog_revision",
+                    "change_token",
+                    "tables",
+                    "ranges",
+                };
+                const actual_fields = std.meta.fields(metadata_api.CatalogRoutingSnapshot);
+                if (actual_fields.len != expected_fields.len) {
+                    @compileError("update budgeted routing snapshot serialization for the new wire field");
+                }
+                for (expected_fields, actual_fields) |expected, actual| {
+                    if (!std.mem.eql(u8, expected, actual.name)) {
+                        @compileError("budgeted routing snapshot serialization is out of sync with the wire type");
+                    }
+                }
+            }
+            try self.checkpoint();
+            try jw.beginObject();
+            try jw.objectField("metadata_group_id");
+            try jw.write(self.snapshot.metadata_group_id);
+            try jw.objectField("metadata_incarnation");
+            try jw.write(self.snapshot.metadata_incarnation);
+            try jw.objectField("catalog_revision");
+            try jw.write(self.snapshot.catalog_revision);
+            try jw.objectField("change_token");
+            try jw.write(self.snapshot.change_token);
+            try jw.objectField("tables");
+            try jw.beginArray();
+            for (self.snapshot.tables, 0..) |table, index| {
+                try self.checkpointIndex(index);
+                try jw.write(table);
+            }
+            try jw.endArray();
+            try jw.objectField("ranges");
+            try jw.beginArray();
+            for (self.snapshot.ranges, 0..) |range, index| {
+                try self.checkpointIndex(index);
+                try jw.write(range);
+            }
+            try jw.endArray();
+            try jw.endObject();
+            try self.checkpoint();
+        }
+    };
+
+    fn trackedRoutingSnapshotJsonUntil(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        snapshot: metadata_api.CatalogRoutingSnapshot,
+    ) !httpx.Response {
+        var failure: ?BudgetedRoutingSnapshotJson.Failure = null;
+        var response = ctx.json(BudgetedRoutingSnapshotJson{
+            .snapshot = snapshot,
+            .ctx = ctx,
+            .failure = &failure,
+        }) catch |err| {
+            if (failure) |cause| return metadataReadError(ctx, switch (cause) {
+                .canceled => error.Canceled,
+                .timed_out => error.CatalogRoutingSnapshotTimeout,
+            });
+            return err;
+        };
+        if (ctx.isCancellationRequested()) {
+            response.deinit();
+            return metadataReadError(ctx, error.Canceled);
+        }
+        if (ctx.application_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) {
+                response.deinit();
+                return metadataReadError(ctx, error.CatalogRoutingSnapshotTimeout);
+            }
+        }
+        self.source.recordJsonResponseAllocation(if (response.body) |body| body.len else 0);
+        return response;
+    }
+
     /// Do not publish a successful or authoritative-negative route result if
     /// response encoding consumed the remainder of the caller's budget.
     fn trackedCatalogRouteResultUntil(
@@ -1531,7 +1638,7 @@ pub const MetadataHttpServer = struct {
         var result = self.source.linearizableRoutingSnapshot(request) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
-        return self.trackedJson(ctx, result);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
     fn metadataRoutingChange(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -1646,7 +1753,7 @@ pub const MetadataHttpServer = struct {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         var result = self.source.routingSnapshot(ctx.application_deadline_ns) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
-        return self.trackedJson(ctx, result);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
     fn metadataActiveTransitions(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -3505,6 +3612,90 @@ test "metadata route wire conversion preserves its absolute deadline" {
     try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.timed_out, parsed.value.disposition);
     try std.testing.expectEqual(@as(u64, 12), parsed.value.token.revision);
     try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    const empty_snapshot = metadata_api.CatalogRoutingSnapshot{
+        .metadata_group_id = 91,
+        .catalog_revision = 12,
+        .change_token = .{ .metadata_group_id = 91, .revision = 12 },
+        .tables = &.{},
+        .ranges = &.{},
+    };
+    var expired_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer expired_request.deinit();
+    var expired_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &expired_request);
+    defer expired_ctx.deinit();
+    expired_ctx.application_deadline_ns = 1;
+    var expired_response = try server.trackedRoutingSnapshotJsonUntil(&expired_ctx, empty_snapshot);
+    defer expired_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), expired_response.status.code);
+    try std.testing.expectEqualStrings("request deadline exceeded", expired_response.body.?);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    var canceled = std.atomic.Value(bool).init(true);
+    var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer canceled_request.deinit();
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    defer canceled_ctx.deinit();
+    canceled_ctx.cancellation = &canceled;
+    var canceled_response = try server.trackedRoutingSnapshotJsonUntil(&canceled_ctx, empty_snapshot);
+    defer canceled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), canceled_response.status.code);
+    try std.testing.expectEqualStrings("request canceled", canceled_response.body.?);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    const CancelAfterCheckpoints = struct {
+        checks: usize = 0,
+
+        fn isCanceled(ptr: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr.?)));
+            self.checks += 1;
+            return self.checks >= 3;
+        }
+    };
+    var projection_tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    } ** 65;
+    const large_snapshot = metadata_api.CatalogRoutingSnapshot{
+        .metadata_group_id = 91,
+        .catalog_revision = 12,
+        .change_token = .{ .metadata_group_id = 91, .revision = 12 },
+        .tables = &projection_tables,
+        .ranges = &.{},
+    };
+    var cancellation_probe = CancelAfterCheckpoints{};
+    var interrupted_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer interrupted_request.deinit();
+    var interrupted_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &interrupted_request);
+    defer interrupted_ctx.deinit();
+    interrupted_ctx.cancellation_probe = .{
+        .ptr = &cancellation_probe,
+        .is_cancelled = CancelAfterCheckpoints.isCanceled,
+    };
+    var interrupted_response = try server.trackedRoutingSnapshotJsonUntil(&interrupted_ctx, large_snapshot);
+    defer interrupted_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), interrupted_response.status.code);
+    try std.testing.expectEqualStrings("request canceled", interrupted_response.body.?);
+    try std.testing.expectEqual(@as(usize, 3), cancellation_probe.checks);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    var snapshot_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer snapshot_request.deinit();
+    var snapshot_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &snapshot_request);
+    defer snapshot_ctx.deinit();
+    snapshot_ctx.application_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    var snapshot_response = try server.trackedRoutingSnapshotJsonUntil(&snapshot_ctx, empty_snapshot);
+    defer snapshot_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), snapshot_response.status.code);
+    const parsed_snapshot = try std.json.parseFromSlice(
+        metadata_api.CatalogRoutingSnapshot,
+        std.testing.allocator,
+        snapshot_response.body.?,
+        .{},
+    );
+    defer parsed_snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 91), parsed_snapshot.value.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 12), parsed_snapshot.value.change_token.revision);
+    try std.testing.expectEqual(@as(usize, 2), source.json_responses);
 }
 
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {

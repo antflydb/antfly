@@ -49,6 +49,22 @@ pub const RoutingBudget = struct {
     }
 };
 
+fn cloneGroupIdsUntil(
+    alloc: std.mem.Allocator,
+    source: []const u64,
+    budget: RoutingBudget,
+) ![]u64 {
+    try budget.checkpoint();
+    const ids = try alloc.alloc(u64, source.len);
+    errdefer alloc.free(ids);
+    for (source, ids, 0..) |group_id, *owned_group_id, index| {
+        try budget.checkpointIndex(index);
+        owned_group_id.* = group_id;
+    }
+    try budget.checkpoint();
+    return ids;
+}
+
 pub const CatalogSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -578,6 +594,8 @@ fn cloneRoutingSnapshot(
     source: metadata_api.CatalogRoutingSnapshot,
     deadline_ns: ?u64,
 ) !metadata_api.CatalogRoutingSnapshot {
+    const budget = RoutingBudget.init(deadline_ns);
+    try budget.checkpoint();
     const tables = try alloc.alloc(metadata_table_manager.TableRecord, source.tables.len);
     var table_count: usize = 0;
     errdefer {
@@ -585,9 +603,7 @@ fn cloneRoutingSnapshot(
         alloc.free(tables);
     }
     for (source.tables, 0..) |table, index| {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        try budget.checkpointIndex(index);
         tables[index] = try metadata_table_manager.cloneRoutingTable(alloc, table);
         table_count = index + 1;
     }
@@ -599,12 +615,11 @@ fn cloneRoutingSnapshot(
         alloc.free(ranges);
     }
     for (source.ranges, 0..) |range, index| {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        try budget.checkpointIndex(index);
         ranges[index] = try metadata_table_manager.cloneRoutingRange(alloc, range);
         range_count = index + 1;
     }
+    try budget.checkpoint();
     return .{
         .metadata_group_id = source.metadata_group_id,
         .metadata_incarnation = source.metadata_incarnation,
@@ -898,11 +913,14 @@ pub fn routedGroupsSnapshotUntil(
     group_ids: []const u64,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
+    const budget = RoutingBudget.init(deadline_ns);
+    try budget.checkpoint();
     if (catalog.vtable.route_fence) |route_fence| {
         const routes = try alloc.alloc(CatalogGroupRoute, group_ids.len);
         errdefer alloc.free(routes);
         var first: ?metadata_api.CatalogRouteFence = null;
-        for (group_ids, routes) |group_id, *route| {
+        for (group_ids, routes, 0..) |group_id, *route, index| {
+            try budget.checkpointIndex(index);
             const fence = (try route_fence(catalog.ptr, group_id)) orelse return error.TopologyChanged;
             try fence.validate();
             if (first) |expected| {
@@ -919,7 +937,8 @@ pub fn routedGroupsSnapshotUntil(
             }
             route.* = fence.route;
         }
-        const ids = try alloc.dupe(u64, group_ids);
+        const ids = try cloneGroupIdsUntil(alloc, group_ids, budget);
+        errdefer alloc.free(ids);
         const authority = first orelse return .{
             .routes = routes,
             .group_ids = ids,
@@ -929,6 +948,7 @@ pub fn routedGroupsSnapshotUntil(
             .catalog_revision = 0,
             .topology_epoch = 0,
         };
+        try budget.checkpoint();
         return .{
             .routes = routes,
             .group_ids = ids,
@@ -947,14 +967,14 @@ pub fn routedGroupsSnapshotUntil(
         .not_found => return error.TopologyChanged,
         .timed_out => return error.CatalogRoutingSnapshotTimeout,
     };
-    const routes = try alloc.alloc(CatalogGroupRoute, group_ids.len);
+    const routes = try plan.selectGroupsUntil(alloc, group_ids, budget);
     errdefer alloc.free(routes);
-    for (group_ids, routes) |group_id, *route| {
-        route.* = plan.group(group_id) orelse return error.TopologyChanged;
-    }
+    const ids = try cloneGroupIdsUntil(alloc, group_ids, budget);
+    errdefer alloc.free(ids);
+    try budget.checkpoint();
     return .{
         .routes = routes,
-        .group_ids = try alloc.dupe(u64, group_ids),
+        .group_ids = ids,
         .metadata_group_id = plan.metadata_group_id,
         .metadata_incarnation = plan.metadata_incarnation,
         .table_id = plan.table_id,
@@ -1789,13 +1809,14 @@ pub fn resolveGroupsForSpanUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) ![]u64 {
+    const budget = RoutingBudget.init(deadline_ns);
     return switch (try resolveGroupsForSpanWithDeadline(alloc, try catalog.routingSource(), table_name, from_key, to_key, deadline_ns)) {
         .found => |plan_value| blk: {
             var plan = plan_value;
             defer plan.deinit(alloc);
-            break :blk try plan.groupIdsAlloc(alloc);
+            break :blk try plan.groupIdsAllocUntil(alloc, budget);
         },
-        .not_found => try alloc.alloc(u64, 0),
+        .not_found => try cloneGroupIdsUntil(alloc, &.{}, budget),
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };
 }
@@ -1809,6 +1830,7 @@ pub fn resolveGroupsForSpanPinnedUntil(
     expected_epoch: u64,
     deadline_ns: ?u64,
 ) ![]u64 {
+    const budget = RoutingBudget.init(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
@@ -1817,9 +1839,9 @@ pub fn resolveGroupsForSpanPinnedUntil(
     return switch (result) {
         .found => |plan| blk: {
             if (expected_epoch != 0 and plan.topology_epoch != expected_epoch) return error.TopologyChanged;
-            break :blk try plan.groupIdsAlloc(alloc);
+            break :blk try plan.groupIdsAllocUntil(alloc, budget);
         },
-        .not_found => try alloc.alloc(u64, 0),
+        .not_found => try cloneGroupIdsUntil(alloc, &.{}, budget),
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };
 }
@@ -1843,9 +1865,67 @@ pub const CatalogRoutePlan = struct {
     }
 
     pub fn groupIdsAlloc(self: @This(), alloc: std.mem.Allocator) ![]u64 {
+        return try self.groupIdsAllocUntil(alloc, .{});
+    }
+
+    pub fn groupIdsAllocUntil(
+        self: @This(),
+        alloc: std.mem.Allocator,
+        budget: RoutingBudget,
+    ) ![]u64 {
+        try budget.checkpoint();
         const ids = try alloc.alloc(u64, self.groups.len);
-        for (self.groups, ids) |route, *id| id.* = route.group_id;
+        errdefer alloc.free(ids);
+        for (self.groups, ids, 0..) |route, *id, index| {
+            try budget.checkpointIndex(index);
+            id.* = route.group_id;
+        }
+        try budget.checkpoint();
         return ids;
+    }
+
+    /// Preserve caller order while avoiding quadratic scans for large
+    /// fanouts. Tiny selections stay allocation-free beyond the result.
+    pub fn selectGroupsUntil(
+        self: @This(),
+        alloc: std.mem.Allocator,
+        group_ids: []const u64,
+        budget: RoutingBudget,
+    ) ![]CatalogGroupRoute {
+        const linear_lookup_limit = 8;
+        try budget.checkpoint();
+        const selected = try alloc.alloc(CatalogGroupRoute, group_ids.len);
+        errdefer alloc.free(selected);
+        if (group_ids.len <= linear_lookup_limit) {
+            for (group_ids, selected, 0..) |group_id, *route, requested_index| {
+                try budget.checkpointIndex(requested_index);
+                var found: ?CatalogGroupRoute = null;
+                for (self.groups, 0..) |candidate, route_index| {
+                    try budget.checkpointIndex(route_index);
+                    if (candidate.group_id == group_id) {
+                        found = candidate;
+                        break;
+                    }
+                }
+                route.* = found orelse return error.TopologyChanged;
+            }
+        } else {
+            var group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+            defer group_indexes.deinit(alloc);
+            try group_indexes.ensureTotalCapacity(alloc, @intCast(self.groups.len));
+            for (self.groups, 0..) |route, index| {
+                try budget.checkpointIndex(index);
+                if (group_indexes.contains(route.group_id)) return error.InvalidCatalogProjection;
+                group_indexes.putAssumeCapacity(route.group_id, index);
+            }
+            for (group_ids, selected, 0..) |group_id, *route, index| {
+                try budget.checkpointIndex(index);
+                const route_index = group_indexes.get(group_id) orelse return error.TopologyChanged;
+                route.* = self.groups[route_index];
+            }
+        }
+        try budget.checkpoint();
+        return selected;
     }
 
     pub fn group(self: @This(), group_id: u64) ?CatalogGroupRoute {
@@ -2149,6 +2229,47 @@ test "route planning never succeeds after its absolute deadline" {
     );
 }
 
+test "route projection preserves order and remains bounded after capture" {
+    var groups: [12]CatalogGroupRoute = undefined;
+    for (&groups, 0..) |*group, index| {
+        const group_id: u64 = @intCast(index + 1);
+        group.* = .{
+            .group_id = group_id,
+            .range_id = group_id + 100,
+            .identity_namespace = .{
+                .table_id = 7,
+                .shard_id = group_id,
+                .range_id = group_id + 100,
+            },
+        };
+    }
+    const plan = CatalogRoutePlan{
+        .metadata_group_id = 3,
+        .metadata_incarnation = null,
+        .catalog_revision = 18,
+        .table_id = 7,
+        .topology_epoch = 19,
+        .groups = groups[0..],
+    };
+    const requested = [_]u64{ 12, 1, 7, 2, 9, 4, 6, 3, 12 };
+    const budget = RoutingBudget.init(platform_time.monotonicNs() + std.time.ns_per_s);
+    const selected = try plan.selectGroupsUntil(std.testing.allocator, &requested, budget);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqual(requested.len, selected.len);
+    for (requested, selected) |group_id, route| {
+        try std.testing.expectEqual(group_id, route.group_id);
+    }
+
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        plan.groupIdsAllocUntil(std.testing.allocator, RoutingBudget.init(1)),
+    );
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        RoutedSpanSnapshot.fromPlanUntil(std.testing.allocator, plan, RoutingBudget.init(1)),
+    );
+}
+
 pub const RoutedSpanSnapshot = struct {
     routes: []CatalogGroupRoute,
     group_ids: []u64,
@@ -2172,6 +2293,33 @@ pub const RoutedSpanSnapshot = struct {
             .table_id = self.table_id,
             .topology_epoch = self.topology_epoch,
             .route = self.routes[index],
+        };
+    }
+
+    fn fromPlanUntil(
+        alloc: std.mem.Allocator,
+        plan: CatalogRoutePlan,
+        budget: RoutingBudget,
+    ) !RoutedSpanSnapshot {
+        try budget.checkpoint();
+        const routes = try alloc.alloc(CatalogGroupRoute, plan.groups.len);
+        errdefer alloc.free(routes);
+        const group_ids = try alloc.alloc(u64, plan.groups.len);
+        errdefer alloc.free(group_ids);
+        for (plan.groups, routes, group_ids, 0..) |route, *owned_route, *group_id, index| {
+            try budget.checkpointIndex(index);
+            owned_route.* = route;
+            group_id.* = route.group_id;
+        }
+        try budget.checkpoint();
+        return .{
+            .routes = routes,
+            .group_ids = group_ids,
+            .metadata_group_id = plan.metadata_group_id,
+            .metadata_incarnation = plan.metadata_incarnation,
+            .table_id = plan.table_id,
+            .catalog_revision = plan.catalog_revision,
+            .topology_epoch = plan.topology_epoch,
         };
     }
 };
@@ -2221,31 +2369,24 @@ pub fn routedSpanSnapshotUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
+    const budget = RoutingBudget.init(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
     } }, deadline_ns);
     defer result.deinit(alloc);
     return switch (result) {
-        .found => |plan| blk: {
-            const routes = try alloc.dupe(CatalogGroupRoute, plan.groups);
-            errdefer alloc.free(routes);
-            break :blk .{
-                .routes = routes,
-                .group_ids = try plan.groupIdsAlloc(alloc),
-                .metadata_group_id = plan.metadata_group_id,
-                .metadata_incarnation = plan.metadata_incarnation,
-                .table_id = plan.table_id,
-                .catalog_revision = plan.catalog_revision,
-                .topology_epoch = plan.topology_epoch,
-            };
-        },
+        .found => |plan| try RoutedSpanSnapshot.fromPlanUntil(alloc, plan, budget),
         .not_found => blk: {
+            try budget.checkpoint();
             const routes = try alloc.alloc(CatalogGroupRoute, 0);
             errdefer alloc.free(routes);
+            const group_ids = try alloc.alloc(u64, 0);
+            errdefer alloc.free(group_ids);
+            try budget.checkpoint();
             break :blk .{
                 .routes = routes,
-                .group_ids = try alloc.alloc(u64, 0),
+                .group_ids = group_ids,
                 .metadata_group_id = 0,
                 .metadata_incarnation = null,
                 .table_id = 0,
@@ -2266,8 +2407,27 @@ pub fn resolveGroupsForSpanEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) !ResolveGroupsResult {
-    const start_ns = platform_time.monotonicNs();
-    const deadline_ns = start_ns +| timeout_ns;
+    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+    return try resolveGroupsForSpanEventuallyUntil(
+        alloc,
+        catalog,
+        table_name,
+        from_key,
+        to_key,
+        deadline_ns,
+        poll_interval_ms,
+    );
+}
+
+pub fn resolveGroupsForSpanEventuallyUntil(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    deadline_ns: u64,
+    poll_interval_ms: u64,
+) !ResolveGroupsResult {
     const routing = try catalog.routingSource();
     var result = try awaitRoute(
         alloc,
