@@ -38,9 +38,10 @@ class QueryBuilderResult:
         remaining_user_clarifications (int | Unset): Remaining clarification turns allowed for this interaction.
         questions (list[AgentQuestion] | Unset): Clarification questions exposed in the shared bounded-agent envelope.
         query_request (QueryRequest | Unset):
-        retrieval_query_request (RetrievalQueryRequest | Unset): A query in the retrieval pipeline. Extends QueryRequest
-            with an optional
-            tree search configuration. Each query specifies its own table.
+        retrieval_query_request (RetrievalQueryRequest | Unset): A canonical query in the retrieval pipeline with an
+            optional tree search
+            configuration. Each query specifies its own table. Deprecated stateful
+            graph_searches compatibility is intentionally unavailable here.
 
             When both search fields (semantic_search, full_text_search) and tree_search
             are provided, the search results are used as start nodes for tree navigation.

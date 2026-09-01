@@ -38,6 +38,8 @@ const c_file = if (builtin.os.tag == .freestanding) struct {
         pub fn adviseSequentialPrefix(_: *MmapRegion, _: usize) void {}
 
         pub fn discardFileRange(_: *MmapRegion, _: usize, _: usize) void {}
+
+        pub fn preserveFileCacheOnDeinit(_: *MmapRegion) void {}
     };
 
     pub fn readRegion(_: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
@@ -110,6 +112,7 @@ pub const TensorStore = struct {
         loadTensorRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!weight_source_mod.LoadedWeight,
         loadQuantizedStorageRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!?weight_source_mod.QuantizedStorage,
         discardTensorFileCache: *const fn (*anyopaque, name: []const u8) void,
+        preserveFileCacheOnDeinit: *const fn (*anyopaque) void,
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
         deinit: *const fn (*anyopaque) void,
     };
@@ -145,6 +148,13 @@ pub const TensorStore = struct {
         self.vtable.discardTensorFileCache(self.ptr, name);
     }
 
+    /// Preserve clean mapped checkpoint pages when this store closes. The
+    /// kernel may still reclaim them under pressure, but a replacement
+    /// process can reuse them without another storage read.
+    pub fn preserveFileCacheOnDeinit(self: TensorStore) void {
+        self.vtable.preserveFileCacheOnDeinit(self.ptr);
+    }
+
     pub fn ggufFile(self: TensorStore) ?*const gguf_mod.format.File {
         return self.vtable.ggufFile(self.ptr);
     }
@@ -155,6 +165,7 @@ pub const TensorStore = struct {
 };
 
 fn discardTensorFileCacheNoop(_: *anyopaque, _: []const u8) void {}
+fn preserveFileCacheOnDeinitNoop(_: *anyopaque) void {}
 
 pub const SafetensorsStore = struct {
     source: *weight_source_mod.SafetensorsSource,
@@ -168,6 +179,7 @@ pub const SafetensorsStore = struct {
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .discardTensorFileCache = &discardTensorFileCacheNoop,
+        .preserveFileCacheOnDeinit = &preserveFileCacheOnDeinitNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -253,6 +265,7 @@ pub const ShardedSafetensorsStore = struct {
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .discardTensorFileCache = &discardTensorFileCacheNoop,
+        .preserveFileCacheOnDeinit = &preserveFileCacheOnDeinitNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -340,6 +353,7 @@ pub const GgufStore = struct {
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+        .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -417,6 +431,10 @@ pub const GgufStore = struct {
 
     fn discardTensorFileCacheImpl(self: *GgufStore, name: []const u8) void {
         self.discardTensorFileCache(name);
+    }
+
+    fn preserveFileCacheOnDeinitImpl(self: *GgufStore) void {
+        if (self.mmap_region) |*region| region.preserveFileCacheOnDeinit();
     }
 
     fn rawData(self: *const GgufStore) []const u8 {
@@ -992,6 +1010,7 @@ pub const CompositeGlinerStore = struct {
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+        .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -1079,6 +1098,11 @@ pub const CompositeGlinerStore = struct {
             return;
         }
         self.encoder.discardTensorFileCache(name);
+    }
+
+    fn preserveFileCacheOnDeinitImpl(self: *CompositeGlinerStore) void {
+        self.encoder.preserveFileCacheOnDeinitImpl();
+        if (self.head_gguf) |head| head.preserveFileCacheOnDeinitImpl();
     }
 
     fn ggufFileImpl(self: *CompositeGlinerStore) ?*const gguf_mod.format.File {

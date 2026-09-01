@@ -16,6 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
+const route_metadata_api = @import("../metadata/api.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("../storage/db/db.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -97,13 +98,15 @@ pub const TxnPreDecisionOutcome = enum {
 };
 
 pub const QueryResponse = struct {
+    owner_allocator: ?std.mem.Allocator = null,
     content_type: ?[]u8 = null,
     identity_read_generation: ?u64 = null,
     body: []u8,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
-        if (self.content_type) |content_type| alloc.free(content_type);
-        alloc.free(self.body);
+        const owner = self.owner_allocator orelse alloc;
+        if (self.content_type) |content_type| owner.free(content_type);
+        if (self.body.len > 0) owner.free(self.body);
         self.* = undefined;
     }
 };
@@ -795,10 +798,14 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{
-            .content_type = if (resp.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
-            .body = try self.alloc.dupe(u8, resp.body),
+        const response = QueryResponse{
+            .owner_allocator = resp.owner_allocator orelse self.alloc,
+            .content_type = resp.content_type,
+            .body = resp.body,
         };
+        resp.content_type = null;
+        resp.body = &.{};
+        return response;
     }
 
     pub fn fetchRetrievalAgent(
@@ -868,10 +875,13 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{
+        const response = QueryResponse{
+            .owner_allocator = resp.owner_allocator orelse self.alloc,
             .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
-            .body = try self.alloc.dupe(u8, resp.body),
+            .body = resp.body,
         };
+        resp.body = &.{};
+        return response;
     }
 
     pub fn fetchGroupQueryPreflight(
@@ -1472,6 +1482,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            422 => return remoteGraphEdgesError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -1885,7 +1896,7 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !BatchResponse {
-        return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null);
+        return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null, null);
     }
 
     pub fn fetchGroupBatchWithForwarding(
@@ -1897,6 +1908,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         forwarding: ?internal_batch_forwarding.Context,
         cancellation: ?*const http_common.RequestCancellation,
+        encoded_route_fence: ?[]const u8,
     ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -1911,7 +1923,8 @@ pub const ApiHttpClient = struct {
 
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
-        var request_headers: [3]http_common.RequestHeader = undefined;
+        var route_deadline_buf: [10]u8 = undefined;
+        var request_headers: [5]http_common.RequestHeader = undefined;
         var header_count: usize = 0;
         if (forwarding) |context| {
             request_headers[header_count] = .{
@@ -1927,6 +1940,22 @@ pub const ApiHttpClient = struct {
             request_headers[header_count] = .{
                 .name = internal_batch_forwarding.campaign_allowed_header,
                 .value = if (context.campaign_allowed) "true" else "false",
+            };
+            header_count += 1;
+        }
+        if (encoded_route_fence) |encoded| {
+            request_headers[header_count] = .{
+                .name = route_metadata_api.catalog_route_fence_header,
+                .value = encoded,
+            };
+            header_count += 1;
+            const route_budget_ms = @min(
+                if (forwarding) |context| context.remaining_ms else timeout_ms orelse route_metadata_api.catalog_route_default_deadline_ms,
+                route_metadata_api.catalog_route_max_deadline_ms,
+            );
+            request_headers[header_count] = .{
+                .name = route_metadata_api.catalog_route_deadline_ms_header,
+                .value = try std.fmt.bufPrint(&route_deadline_buf, "{d}", .{@max(@as(u32, 1), route_budget_ms)}),
             };
             header_count += 1;
         }
@@ -1955,6 +1984,12 @@ pub const ApiHttpClient = struct {
             return err;
         };
         defer resp.deinit(self.alloc);
+        if (encoded_route_fence != null and resp.status >= 200 and resp.status < 300) {
+            const ack = resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse
+                return error.RaftBatchWriteOutcomeUnknown;
+            if (!std.mem.eql(u8, ack, route_metadata_api.catalog_route_fence_ack_value))
+                return error.RaftBatchWriteOutcomeUnknown;
+        }
         if (resp.status != 201) {
             const outcome = resp.header(internal_batch_forwarding.outcome_header);
             if (resp.status == 202) {
@@ -1976,6 +2011,14 @@ pub const ApiHttpClient = struct {
             if (resp.status == 503) {
                 if (forwarding == null or (outcome != null and
                     std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
+                {
+                    return error.LeaderUnavailable;
+                }
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
+            if (resp.status == 408 or resp.status == 504) {
+                if (outcome != null and
+                    std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1))
                 {
                     return error.LeaderUnavailable;
                 }
@@ -3211,6 +3254,15 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remoteGraphEdgesError(body: []const u8) anyerror {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, message, "graph explored edges budget exceeded"))
+        return error.GraphExploredEdgesBudgetExceeded;
+    if (std.mem.eql(u8, message, "graph explored edge bytes budget exceeded"))
+        return error.GraphExploredEdgeBytesBudgetExceeded;
+    return error.UnexpectedHttpStatus;
+}
+
 fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
     switch (status) {
@@ -3286,6 +3338,21 @@ test "api http client preserves remote storage read contention" {
     );
 }
 
+test "api http client preserves remote graph edge budget exhaustion" {
+    try std.testing.expectEqual(
+        error.GraphExploredEdgesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edges budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.GraphExploredEdgeBytesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edge bytes budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.UnexpectedHttpStatus,
+        remoteGraphEdgesError("invalid graph edge request"),
+    );
+}
+
 test "api http client preserves storage read contention across group read endpoints" {
     const UnavailableExecutor = struct {
         fn executor(self: *@This()) http_common.RequestExecutor {
@@ -3316,6 +3383,41 @@ test "api http client preserves storage read contention across group read endpoi
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client transfers query response buffers without copying" {
+    const TransferExecutor = struct {
+        body_address: usize = 0,
+        content_type_address: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const body = try alloc.dupe(u8, "{\"responses\":[]}");
+            const content_type = try alloc.dupe(u8, "application/json");
+            self.body_address = @intFromPtr(body.ptr);
+            self.content_type_address = @intFromPtr(content_type.ptr);
+            return .{
+                .status = 200,
+                .content_type = content_type,
+                .body = body,
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var executor = TransferExecutor{};
+    var client = ApiHttpClient.init(alloc, executor.executor());
+    var response = try client.fetchQuery("http://127.0.0.1:1", "docs", "{}");
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(executor.body_address, @intFromPtr(response.body.ptr));
+    try std.testing.expectEqual(
+        executor.content_type_address,
+        @intFromPtr(response.content_type.?.ptr),
+    );
 }
 
 test "api http client accepts durable pending batch responses" {
@@ -3752,6 +3854,8 @@ test "api http client forwards bounded raft batch routing context without alloca
     const ForwardingExecutor = struct {
         response_body_address: usize = 0,
         saw_service_token: bool = false,
+        saw_route_fence: bool = false,
+        saw_route_deadline: bool = false,
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{
@@ -3770,13 +3874,31 @@ test "api http client forwards bounded raft batch routing context without alloca
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
             try std.testing.expect(!forwarding.campaign_allowed);
             for (req.headers) |header| {
-                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
-                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
-                self.saw_service_token = true;
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) {
+                    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                    self.saw_service_token = true;
+                } else if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_header)) {
+                    try std.testing.expectEqualStrings("{\"route\":true}", header.value);
+                    self.saw_route_fence = true;
+                } else if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_deadline_ms_header)) {
+                    try std.testing.expectEqualStrings("425", header.value);
+                    self.saw_route_deadline = true;
+                }
             }
             const response_body = try alloc.dupe(u8, "{}");
+            errdefer alloc.free(response_body);
             self.response_body_address = @intFromPtr(response_body.ptr);
-            return .{ .status = 201, .body = response_body };
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const ack_name = try alloc.dupe(u8, route_metadata_api.catalog_route_fence_ack_header);
+            errdefer alloc.free(ack_name);
+            const ack_value = try alloc.dupe(u8, route_metadata_api.catalog_route_fence_ack_value);
+            errdefer alloc.free(ack_value);
+            headers[0] = .{
+                .name = ack_name,
+                .value = ack_value,
+            };
+            return .{ .status = 201, .headers = headers, .body = response_body };
         }
     };
 
@@ -3792,9 +3914,12 @@ test "api http client forwards bounded raft batch routing context without alloca
         500,
         .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
         &cancellation,
+        "{\"route\":true}",
     );
     try std.testing.expectEqual(executor.response_body_address, @intFromPtr(response.body.ptr));
     try std.testing.expect(executor.saw_service_token);
+    try std.testing.expect(executor.saw_route_fence);
+    try std.testing.expect(executor.saw_route_deadline);
     response.deinit(std.testing.allocator);
 }
 
@@ -3875,6 +4000,7 @@ test "api http client preserves committed visibility outcomes for forwarded raft
         500,
         forwarding,
         null,
+        null,
     ));
     executor.body = "committed_repair_required";
     try std.testing.expectError(error.EnrichmentWorkerFailed, client.fetchGroupBatchWithForwarding(
@@ -3884,6 +4010,7 @@ test "api http client preserves committed visibility outcomes for forwarded raft
         "{}",
         500,
         forwarding,
+        null,
         null,
     ));
 }
@@ -3918,6 +4045,7 @@ test "api http client rejects unsupported routed batch protocol without legacy r
         500,
         .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
         null,
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 1), executor.attempts);
 }
@@ -3927,6 +4055,8 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
         const Mode = enum {
             unmarked_unavailable,
             marked_not_proposed,
+            unmarked_timeout,
+            marked_timeout,
             failure_before_send,
             failure_after_send,
             refused_after_send,
@@ -3957,6 +4087,16 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
                         .value = internal_batch_forwarding.outcome_not_proposed_v1,
                     }},
                 ),
+                .unmarked_timeout => try http_route_helpers.textResponse(alloc, 504, "request deadline exceeded"),
+                .marked_timeout => try http_route_helpers.textResponseWithHeaders(
+                    alloc,
+                    504,
+                    "request deadline exceeded",
+                    &.{.{
+                        .name = internal_batch_forwarding.outcome_header,
+                        .value = internal_batch_forwarding.outcome_not_proposed_v1,
+                    }},
+                ),
                 .failure_before_send => {
                     tracker.markNotSent();
                     return error.OutOfMemory;
@@ -3982,6 +4122,7 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
                 500,
                 .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
                 null,
+                null,
             );
         }
     };
@@ -3991,6 +4132,12 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
     try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .marked_not_proposed;
+    try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .unmarked_timeout;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .marked_timeout;
     try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_before_send;

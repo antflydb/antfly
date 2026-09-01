@@ -464,19 +464,19 @@ fn readAlignment(metadata: []const MetadataEntry) ?u64 {
 
 fn metadataValueTypeFromRaw(raw: u32) ?MetadataValueType {
     return switch (raw) {
-        @intFromEnum(MetadataValueType.u8) => .u8,
-        @intFromEnum(MetadataValueType.i8) => .i8,
-        @intFromEnum(MetadataValueType.u16) => .u16,
-        @intFromEnum(MetadataValueType.i16) => .i16,
-        @intFromEnum(MetadataValueType.u32) => .u32,
-        @intFromEnum(MetadataValueType.i32) => .i32,
-        @intFromEnum(MetadataValueType.f32) => .f32,
-        @intFromEnum(MetadataValueType.bool_) => .bool_,
-        @intFromEnum(MetadataValueType.string) => .string,
-        @intFromEnum(MetadataValueType.array) => .array,
-        @intFromEnum(MetadataValueType.u64) => .u64,
-        @intFromEnum(MetadataValueType.i64) => .i64,
-        @intFromEnum(MetadataValueType.f64) => .f64,
+        @backingInt(MetadataValueType.u8) => .u8,
+        @backingInt(MetadataValueType.i8) => .i8,
+        @backingInt(MetadataValueType.u16) => .u16,
+        @backingInt(MetadataValueType.i16) => .i16,
+        @backingInt(MetadataValueType.u32) => .u32,
+        @backingInt(MetadataValueType.i32) => .i32,
+        @backingInt(MetadataValueType.f32) => .f32,
+        @backingInt(MetadataValueType.bool_) => .bool_,
+        @backingInt(MetadataValueType.string) => .string,
+        @backingInt(MetadataValueType.array) => .array,
+        @backingInt(MetadataValueType.u64) => .u64,
+        @backingInt(MetadataValueType.i64) => .i64,
+        @backingInt(MetadataValueType.f64) => .f64,
         else => null,
     };
 }
@@ -582,48 +582,48 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     // A string array, like tokenizer.ggml.tokens: the entry that makes a full parse
     // expensive, and the one readArchitecture must walk without allocating.
     try appendString(allocator, &data, "tokenizer.ggml.tokens");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendLe(u64, allocator, &data, 1024);
     for (0..1024) |_| try appendString(allocator, &data, "representative-token");
 
     // A fixed-width array, skipped in one jump.
     try appendString(allocator, &data, "tokenizer.ggml.token_type");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.i32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.i32));
     try appendLe(u64, allocator, &data, 3);
     try appendLe(i32, allocator, &data, 1);
     try appendLe(i32, allocator, &data, 1);
     try appendLe(i32, allocator, &data, 1);
 
     try appendString(allocator, &data, "gemma4.block_count");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 30);
 
     try appendString(allocator, &data, "general.architecture");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendString(allocator, &data, "gemma4");
 
     // Structural serving facts can appear after the architecture key, so the lightweight
     // reader must keep scanning rather than returning on the first match.
     try appendString(allocator, &data, "gemma4.expert_count");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 128);
 
     try appendString(allocator, &data, "gemma4.embedding_length");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 2816);
 
     try appendString(allocator, &data, "gemma4.expert_used_count");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 8);
 
     try appendString(allocator, &data, "gemma4.expert_feed_forward_length");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 704);
 
     try appendString(allocator, &data, "general.file_type");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 2);
 
     const metadata = try readSupportMetadata(data.items);
@@ -647,20 +647,20 @@ test "encoded metadata prefix scan counts only matching entries" {
 
     const tokenizer_start = data.items.len;
     try appendString(allocator, &data, "tokenizer.ggml.tokens");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendLe(u64, allocator, &data, 2);
     try appendString(allocator, &data, "hello");
     try appendString(allocator, &data, "world");
     const first_tokenizer_end = data.items.len;
 
     try appendString(allocator, &data, "general.architecture");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendString(allocator, &data, "llama");
 
     const second_tokenizer_start = data.items.len;
     try appendString(allocator, &data, "tokenizer.ggml.eos_token_id");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 2);
     const second_tokenizer_end = data.items.len;
 
@@ -683,7 +683,7 @@ test "readArchitecture returns null when the key is absent" {
     try appendLe(u64, allocator, &data, 1);
 
     try appendString(allocator, &data, "general.alignment");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 32);
 
     try std.testing.expect(try readArchitecture(data.items) == null);
@@ -700,11 +700,11 @@ test "parse minimal gguf file" {
     try appendLe(u64, allocator, &data, 2);
 
     try appendString(allocator, &data, "general.architecture");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendString(allocator, &data, "llama");
 
     try appendString(allocator, &data, "general.alignment");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 64);
 
     try appendString(allocator, &data, "tok_embeddings.weight");
@@ -740,18 +740,18 @@ test "parseStructure skips tokenizer payloads and retains tensor headers" {
     try appendLe(u64, allocator, &data, 3);
 
     try appendString(allocator, &data, "tokenizer.ggml.tokens");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendLe(u64, allocator, &data, 3);
     try appendString(allocator, &data, "<bos>");
     try appendString(allocator, &data, "hello");
     try appendString(allocator, &data, "world");
 
     try appendString(allocator, &data, "general.architecture");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendString(allocator, &data, "llama");
     try appendString(allocator, &data, "general.alignment");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 32);
 
     try appendString(allocator, &data, "token_embd.weight");
@@ -785,8 +785,8 @@ test "metadata skipping rejects overflowing array lengths" {
     try appendLe(u64, allocator, &data, 0);
     try appendLe(u64, allocator, &data, 1);
     try appendString(allocator, &data, "tokenizer.ggml.token_type");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u64));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.u64));
     try appendLe(u64, allocator, &data, std.math.maxInt(u64));
 
     try std.testing.expectError(error.Overflow, readSupportMetadata(data.items));
@@ -817,7 +817,7 @@ test "tensor data range validation rejects truncated payloads" {
     var truncated = try buildSingleTensorGguf(
         allocator,
         "llama",
-        @intFromEnum(tensor_types.KnownTensorType.F32),
+        @backingInt(tensor_types.KnownTensorType.F32),
     );
     defer truncated.deinit(allocator);
     var parsed = try parseStructure(allocator, truncated.items);
@@ -839,7 +839,7 @@ fn buildSingleTensorGguf(allocator: std.mem.Allocator, architecture: []const u8,
     try appendLe(u64, allocator, &data, 1);
 
     try appendString(allocator, &data, "general.architecture");
-    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u32, allocator, &data, @backingInt(MetadataValueType.string));
     try appendString(allocator, &data, architecture);
 
     try appendString(allocator, &data, "test.weight");

@@ -325,12 +325,12 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
 fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) void {
     hashLengthPrefixedBytes(hasher, artifact_ref.document_id);
     hashLengthPrefixedBytes(hasher, artifact_ref.name);
-    hasher.update(&.{@intFromEnum(artifact_ref.kind)});
+    hasher.update(&.{@backingInt(artifact_ref.kind)});
     hashOptionalU32(hasher, artifact_ref.chunk_id);
     hashOptionalBytes(hasher, artifact_ref.unit_id);
     if (artifact_ref.source) |source| {
         hasher.update(&.{1});
-        hasher.update(&.{@intFromEnum(source.kind)});
+        hasher.update(&.{@backingInt(source.kind)});
         hashLengthPrefixedBytes(hasher, source.name);
         hashOptionalU32(hasher, source.chunk_id);
         hashOptionalBytes(hasher, source.unit_id);

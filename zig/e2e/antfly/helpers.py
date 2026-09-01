@@ -16,16 +16,16 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
+from collections.abc import Callable
 from socketserver import BaseServer
-from typing import Callable
+from typing import TypeVar
 
 import requests
 
-
 HTTP_SERVER_POLL_INTERVAL_S = 0.02
+T = TypeVar("T")
 
 
 def start_http_server(server: BaseServer) -> threading.Thread:
@@ -39,12 +39,14 @@ def start_http_server(server: BaseServer) -> threading.Thread:
     return thread
 
 
-def json_doc(**fields) -> str:
-    return json.dumps(fields, separators=(",", ":"), sort_keys=True)
+def json_doc(**fields: object) -> dict[str, object]:
+    """Construct a public JSON document without an intermediate encoding."""
+    return fields
 
 
-def upsert(doc_id: str, body: str) -> dict:
-    return {"kind": "upsert", "doc_id": doc_id, "body": body}
+def upsert(doc_id: str, document: dict[str, object]) -> dict[str, object]:
+    """Construct the canonical structural table-upsert mutation."""
+    return {"kind": "upsert", "doc_id": doc_id, "document": document}
 
 
 def assert_single_top_hit(payload: dict, doc_id: str) -> None:
@@ -76,11 +78,19 @@ def query_hits_total_value(hits: dict) -> int:
 
 
 def wait_until(
-    fn: Callable[[], dict | None],
+    fn: Callable[[], T | None],
     *,
     timeout_s: float,
     interval_s: float = 1.0,
-) -> dict | None:
+    ready_when: Callable[[T | None], bool] | None = None,
+) -> T | None:
+    """Poll until the result is ready, with an explicit predicate when needed.
+
+    The default retains the historical truthiness contract. Callers whose
+    domain includes valid falsey values (node index 0, empty collections, zero
+    counters) must supply ``ready_when`` instead of encoding readiness into the
+    value.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
@@ -95,7 +105,7 @@ def wait_until(
                 result = None
             else:
                 raise
-        if result:
+        if ready_when(result) if ready_when is not None else bool(result):
             return result
         time.sleep(interval_s)
     return None

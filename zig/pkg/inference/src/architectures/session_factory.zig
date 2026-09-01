@@ -70,6 +70,7 @@ const gemma4_runtime = @import("gemma4_runtime.zig");
 const cuda_load_plan = @import("../ops/cuda/load_plan.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const a4b_prepared_pack_mod = @import("../ops/cuda/a4b_prepared_pack.zig");
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
@@ -504,6 +505,27 @@ pub fn resolveA4bInferenceConfigForModelListing(
     return resolveA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
 }
 
+/// Resolve the qualified CUDA policy once for every caller that must agree on
+/// its resident envelope (resource admission, CLI preflight, and construction).
+pub fn resolveCudaA4bInferenceConfigForModelListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+    request: ?backend_contracts.A4bInferenceRequest,
+) !?backend_contracts.A4bInferenceConfig {
+    var report_opt = try inspectGgufModelForListing(allocator, model_path, manifest);
+    defer if (report_opt) |*report| report.deinit();
+    const report = report_opt orelse {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    };
+    const config = report.gpt_config orelse {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    };
+    return resolveCudaA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
+}
+
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
@@ -526,6 +548,10 @@ pub fn inspectGgufModelForListing(
     const gguf_path = mf.gguf_path.?;
     var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
     defer mapped.deinit();
+    // Listing inspection touches metadata only. Evicting the entire backing
+    // file on close would destroy an intentionally warmed checkpoint before
+    // the production CUDA loader gets to consume it.
+    mapped.preserveFileCacheOnDeinit();
 
     var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
     defer file.deinit(allocator);
@@ -1184,12 +1210,29 @@ pub fn createCudaSessionWithKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
+    return createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
+        allocator,
+        model_path,
+        config,
+        load_context,
+        null,
+    );
+}
+
+pub fn createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+) !Session {
     return createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         allocator,
         model_path,
         null,
         config,
         load_context,
+        a4b_request,
     );
 }
 
@@ -1205,7 +1248,61 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJit(
         override,
         config,
         .dynamic,
+        null,
     );
+}
+
+const CudaResidentUpload = struct {
+    key: []const u8,
+    loaded: *const LoadedWeight,
+    mmap_bytes: ?[]const u8,
+    mmap_base: ?usize,
+    mmap_offset: ?usize,
+};
+
+fn loadedWeightMmapSpan(loaded: *const LoadedWeight) ?struct { bytes: []const u8, base: usize, offset: usize } {
+    if (loaded.quantized_storage) |storage| {
+        if (storage.raw_mmap_backed) {
+            if (storage.raw_mmap_source_bytes) |full| {
+                if (c_file.mappedSliceOffset(full, storage.raw_bytes)) |offset| {
+                    return .{ .bytes = storage.raw_bytes, .base = @intFromPtr(full.ptr), .offset = offset };
+                }
+            }
+        }
+    }
+    if (loaded.tensor.mmap_source_bytes) |full| {
+        if (c_file.mappedSliceOffset(full, loaded.tensor.data)) |offset| {
+            return .{ .bytes = loaded.tensor.data, .base = @intFromPtr(full.ptr), .offset = offset };
+        }
+    }
+    return null;
+}
+
+fn cudaResidentUploadLessThan(_: void, lhs: CudaResidentUpload, rhs: CudaResidentUpload) bool {
+    if (lhs.mmap_offset) |lhs_offset| {
+        if (rhs.mmap_offset) |rhs_offset| {
+            const lhs_base = lhs.mmap_base.?;
+            const rhs_base = rhs.mmap_base.?;
+            if (lhs_base != rhs_base) return lhs_base < rhs_base;
+            if (lhs_offset != rhs_offset) return lhs_offset < rhs_offset;
+        } else return true;
+    } else if (rhs.mmap_offset != null) return false;
+    return std.mem.lessThan(u8, lhs.key, rhs.key);
+}
+
+test "CUDA resident uploads follow mmap offsets before heap weights" {
+    var mapped: [64]u8 = @splat(0);
+    var loaded: LoadedWeight = undefined;
+    const base = @intFromPtr(mapped[0..].ptr);
+    var uploads = [_]CudaResidentUpload{
+        .{ .key = "heap", .loaded = &loaded, .mmap_bytes = null, .mmap_base = null, .mmap_offset = null },
+        .{ .key = "later", .loaded = &loaded, .mmap_bytes = mapped[40..48], .mmap_base = base, .mmap_offset = 40 },
+        .{ .key = "earlier", .loaded = &loaded, .mmap_bytes = mapped[8..16], .mmap_base = base, .mmap_offset = 8 },
+    };
+    std.mem.sort(CudaResidentUpload, &uploads, {}, cudaResidentUploadLessThan);
+    try std.testing.expectEqualStrings("earlier", uploads[0].key);
+    try std.testing.expectEqualStrings("later", uploads[1].key);
+    try std.testing.expectEqualStrings("heap", uploads[2].key);
 }
 
 pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
@@ -1214,11 +1311,58 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     override: ?TaskOverride,
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     try config.validate();
     if (config.mode.failClosed() and !load_context.allowsQualification()) {
         return error.KernelJitRequiredDynamicLoad;
+    }
+
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const a4b_inference = try resolveCudaA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        a4b_request,
+    );
+    if (a4b_inference) |a4b| {
+        if (a4b.residency_mode != .resident)
+            return error.A4bCudaStreamingUnsupported;
+
+        // Required, stale, and malformed deployment packs fail before native
+        // session construction or any CUDA allocation. The hot loader later
+        // checks its exact source inventory against the canonical GGUF catalog.
+        if (a4b.prepared_pack != .off) {
+            const source_artifact_path = model_manifest.gguf_path orelse
+                return error.A4bCudaPackedStoreUnavailable;
+            const installed = a4b_prepared_pack_mod.preflightInstalled(
+                allocator,
+                model_path,
+                source_artifact_path,
+                .{
+                    .moe_layer_count = a4b.geometry.moe_layer_count,
+                    .expert_count = a4b.geometry.expert_count,
+                    .top_k = a4b.geometry.top_k,
+                    .hidden_size = a4b.geometry.hidden_size,
+                    .expert_intermediate_size = a4b.geometry.expert_intermediate_size,
+                    .encoded_expert_bytes = a4b.geometry.encoded_expert_bytes,
+                },
+            ) catch |err| switch (a4b.prepared_pack) {
+                .auto => blk: {
+                    std.log.warn(
+                        "cuda_a4b: ignoring unusable optional prepared pack during early preflight error={s}; using canonical GGUF",
+                        .{@errorName(err)},
+                    );
+                    break :blk false;
+                },
+                .required => return err,
+                .off => unreachable,
+            };
+            if (!installed and a4b.prepared_pack == .required)
+                return error.A4bPreparedPackRequired;
+        }
     }
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
@@ -1228,6 +1372,15 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
+    if (a4b_inference) |a4b| {
+        try cuda_compute_mod.CudaCompute.preflightA4bPreparedPackInventory(
+            allocator,
+            &native_impl.backend_data.native,
+            a4b,
+            model_path,
+            model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
+        );
+    }
     const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
@@ -1247,17 +1400,70 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    if (a4b_inference != null and
+        (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
+    {
+        return error.A4bCudaUnsupportedDevice;
+    }
+    cuda_compute.a4b_inference = a4b_inference;
+    var resident_uploads: std.ArrayListUnmanaged(CudaResidentUpload) = .empty;
+    defer resident_uploads.deinit(allocator);
     var it = native_impl.backend_data.native.resident_weights.iterator();
-    var resident_count: usize = 0;
     while (it.next()) |entry| {
-        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-        cuda_compute.insertWeightFromLoaded(owned_key, entry.value_ptr) catch |err| {
+        const span = loadedWeightMmapSpan(entry.value_ptr);
+        try resident_uploads.append(allocator, .{
+            .key = entry.key_ptr.*,
+            .loaded = entry.value_ptr,
+            .mmap_bytes = if (span) |mapped| mapped.bytes else null,
+            .mmap_base = if (span) |mapped| mapped.base else null,
+            .mmap_offset = if (span) |mapped| mapped.offset else null,
+        });
+    }
+    std.mem.sort(CudaResidentUpload, resident_uploads.items, {}, cudaResidentUploadLessThan);
+    const dense_upload_start_ns = platform.time.monotonicNs();
+    var dense_mmap_weight_count: usize = 0;
+    if (a4b_inference != null) {
+        for (resident_uploads.items) |upload| {
+            if (upload.mmap_offset != null) dense_mmap_weight_count += 1;
+        }
+        std.log.info("cuda_a4b: dense upload start weights={d} mmap_weights={d} access=offset_sorted_sequential", .{
+            resident_uploads.items.len,
+            dense_mmap_weight_count,
+        });
+    }
+    for (resident_uploads.items) |upload| {
+        if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
+        const owned_key = try allocator.dupe(u8, upload.key);
+        cuda_compute.insertWeightFromLoaded(owned_key, upload.loaded) catch |err| {
             allocator.free(owned_key);
             return err;
         };
-        resident_count += 1;
     }
-    if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_count});
+    if (a4b_inference != null) {
+        cuda_compute.noteA4bDenseUpload(
+            platform.time.monotonicNs() -| dense_upload_start_ns,
+            resident_uploads.items.len,
+            dense_mmap_weight_count,
+        );
+        std.log.info("cuda_a4b: dense upload complete weights={d} elapsed_ms={d}", .{
+            resident_uploads.items.len,
+            (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms,
+        });
+    }
+    if (a4b_inference != null) {
+        try cuda_compute.loadA4bResidentFromHostStore(
+            &native_impl.backend_data.native,
+            model_path,
+            model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
+        );
+        if (!a4b_inference.?.drop_host_cache_after_load) {
+            if (native_impl.backend_data.native.tensor_store) |store| {
+                store.preserveFileCacheOnDeinit();
+                std.log.info("cuda_a4b: retaining clean checkpoint pages for shared-cache reloads", .{});
+            }
+        }
+    }
+    if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_uploads.items.len});
     const upload_stats = cuda_compute.snapshotStats();
     if (upload_stats.bf16_mirror_weight_count > 0) {
         // The default-on prefill mirrors trade device memory for cuBLASLt
@@ -1280,6 +1486,78 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     };
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+/// Materialize the immutable, pre-sharded expert payload consumed by the A4B
+/// CUDA admission fast path. This deliberately uses the normal native model
+/// loader to inherit the same catalog normalization and packed-source
+/// validation as production admission; it does not require a CUDA device.
+pub fn writeCudaA4bPreparedPack(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    output_path: []const u8,
+    shard_count: u8,
+) !a4b_prepared_pack_mod.WriteReport {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const source_artifact_path = model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable;
+    const config = (try resolveA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
+            .prepared_pack = .off,
+        },
+    )) orelse return error.A4bUnsupportedGeometry;
+    var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, null);
+    defer native_session.close();
+    const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
+    if (native_impl.backend_type != .native) return error.InvalidBackend;
+    return cuda_compute_mod.CudaCompute.writeA4bPreparedPack(
+        allocator,
+        io,
+        &native_impl.backend_data.native,
+        config,
+        source_artifact_path,
+        output_path,
+        shard_count,
+    );
+}
+
+pub fn verifyCudaA4bPreparedPack(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+) !a4b_prepared_pack_mod.VerifyReport {
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const source_artifact_path = model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable;
+    const config = (try resolveA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
+            .prepared_pack = .off,
+        },
+    )) orelse return error.A4bUnsupportedGeometry;
+    return a4b_prepared_pack_mod.verify(
+        allocator,
+        model_path,
+        source_artifact_path,
+        .{
+            .moe_layer_count = config.geometry.moe_layer_count,
+            .expert_count = config.geometry.expert_count,
+            .top_k = config.geometry.top_k,
+            .hidden_size = config.geometry.hidden_size,
+            .expert_intermediate_size = config.geometry.expert_intermediate_size,
+            .encoded_expert_bytes = config.geometry.encoded_expert_bytes,
+        },
+    );
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
@@ -3914,6 +4192,19 @@ fn resolveA4bGptInferenceConfig(
     );
 }
 
+fn resolveCudaA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    const detected = (try resolveA4bGptInferenceConfig(
+        gpt_config,
+        request,
+        artifact_qualified,
+    )) orelse return null;
+    return try backend_contracts.buildCudaA4bInferenceConfig(request, detected.geometry);
+}
+
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
     // Safetensors stores mmap weights and resident tensors may borrow those
     // buffers directly, so the store must live for the entire session.
@@ -4072,6 +4363,17 @@ test "A4B geometry does not opt an unqualified artifact into A4B inference" {
         null,
         true,
     )) != null);
+
+    const cuda_default = (try resolveCudaA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )).?;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.resident, cuda_default.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        cuda_default.memory_budget_bytes,
+    );
 }
 
 test "A4B configured GGUF passes metadata-only production qualification" {

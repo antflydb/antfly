@@ -85,7 +85,7 @@ pub const ProgressStore = struct {
     }
 
     pub fn getEnrichmentStageHeadVersion(self: *ProgressStore, namespace: []const u8, stage: catalog_types.EnrichmentStage) !?u64 {
-        return try self.vtable.get_enrichment_stage_head_version(self.ptr, namespace, @intFromEnum(stage));
+        return try self.vtable.get_enrichment_stage_head_version(self.ptr, namespace, @backingInt(stage));
     }
 
     pub fn compareAndSwapEnrichmentStageHeadVersion(
@@ -95,11 +95,11 @@ pub const ProgressStore = struct {
         expected: ?u64,
         head_version: u64,
     ) !bool {
-        return try self.vtable.compare_and_swap_enrichment_stage_head_version(self.ptr, namespace, @intFromEnum(stage), expected, head_version);
+        return try self.vtable.compare_and_swap_enrichment_stage_head_version(self.ptr, namespace, @backingInt(stage), expected, head_version);
     }
 
     pub fn getEnrichmentStageDocOffset(self: *ProgressStore, namespace: []const u8, stage: catalog_types.EnrichmentStage) !?u64 {
-        return try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @intFromEnum(stage));
+        return try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @backingInt(stage));
     }
 
     pub fn compareAndSwapEnrichmentStageDocOffset(
@@ -109,6 +109,6 @@ pub const ProgressStore = struct {
         expected: ?u64,
         doc_offset: u64,
     ) !bool {
-        return try self.vtable.compare_and_swap_enrichment_stage_doc_offset(self.ptr, namespace, @intFromEnum(stage), expected, doc_offset);
+        return try self.vtable.compare_and_swap_enrichment_stage_doc_offset(self.ptr, namespace, @backingInt(stage), expected, doc_offset);
     }
 };

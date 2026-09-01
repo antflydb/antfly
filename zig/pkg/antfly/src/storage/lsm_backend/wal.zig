@@ -1353,7 +1353,7 @@ fn encodeControl(out: []u8, kind: ControlKind, payload: []const u8) void {
     std.debug.assert(out.len == control_overhead + payload.len);
     @memcpy(out[0..control_magic.len], control_magic);
     std.mem.writeInt(u16, out[8..10], control_version, .little);
-    out[10] = @intFromEnum(kind);
+    out[10] = @backingInt(kind);
     out[11] = 0;
     std.mem.writeInt(u32, out[12..16], @intCast(payload.len), .little);
     @memcpy(out[control_header_len .. control_header_len + payload.len], payload);
@@ -1369,7 +1369,7 @@ fn decodeControl(raw: []const u8, kind: ControlKind, payload_len: usize) ![]cons
     if (raw.len != control_overhead + payload_len) return error.CorruptLsmWalIndex;
     if (!std.mem.eql(u8, raw[0..control_magic.len], control_magic)) return error.CorruptLsmWalIndex;
     if (std.mem.readInt(u16, raw[8..10], .little) != control_version) return error.CorruptLsmWalIndex;
-    if (raw[10] != @intFromEnum(kind) or raw[11] != 0) return error.CorruptLsmWalIndex;
+    if (raw[10] != @backingInt(kind) or raw[11] != 0) return error.CorruptLsmWalIndex;
     if (std.mem.readInt(u32, raw[12..16], .little) != payload_len) return error.CorruptLsmWalIndex;
     const expected_checksum = std.mem.readInt(
         u32,

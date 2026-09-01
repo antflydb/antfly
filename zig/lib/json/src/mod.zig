@@ -26,11 +26,13 @@ const simd_stage1 = @import("simd_stage1.zig");
 const _skip_tape = @import("skip_tape.zig");
 const simd_typed = @import("simd_typed.zig");
 const simd_value = @import("simd_value.zig");
+const raw_mod = @import("raw.zig");
 
 pub const testing = @import("testing.zig");
 
 test {
     _ = testing;
+    _ = raw_mod;
 }
 
 const Allocator = std.mem.Allocator;
@@ -39,6 +41,9 @@ pub const ObjectMap = std.json.ObjectMap;
 pub const Array = std.json.Array;
 pub const Value = std.json.Value;
 pub const ArrayHashMap = std.json.ArrayHashMap;
+pub const RawValue = raw_mod.RawValue;
+pub const RawObject = raw_mod.RawObject;
+pub const max_raw_nesting = raw_mod.max_raw_nesting;
 
 pub const Scanner = std.json.Scanner;
 pub const validate = std.json.validate;
@@ -285,6 +290,49 @@ test "parseFromSlice stays source-compatible with std.json callers" {
     try std.testing.expectEqualStrings("alpha", parsed.value.name);
     try std.testing.expectEqual(@as(u32, 2), parsed.value.count);
     try std.testing.expectEqual(false, parsed.value.enabled);
+}
+
+test "generated OpenAPI object metadata preserves automatic SIMD admission" {
+    const T = struct {
+        required_nullable: ?u32,
+        optional_value: ?u32 = null,
+
+        pub const openApiFieldMetadata = .{
+            .{ "required_nullable", "required_nullable", false },
+            .{ "optional_value", "optional_value", true },
+        };
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: ParseOptions) !@This() {
+            return error.UnexpectedToken;
+        }
+    };
+    const input = @as([256]u8, @splat(' '));
+    const selection = backendSelectionForTypedSlice(T, input, .{ .simd_min_input_len = 0 });
+    if (simdTargetSupported()) {
+        try std.testing.expectEqual(Backend.simd, selection.selected);
+        try std.testing.expectEqual(BackendSelectionReason.simd_partial_backend, selection.reason);
+    } else {
+        try std.testing.expectEqual(Backend.stdlib, selection.selected);
+        try std.testing.expectEqual(BackendSelectionReason.unsupported_target, selection.reason);
+    }
+
+    if (simdTargetSupported()) {
+        var parsed = try parseFromSliceWithConfig(
+            T,
+            std.testing.allocator,
+            "{\"required_nullable\":null}",
+            .{},
+            .{ .simd_min_input_len = 0 },
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(?u32, null), parsed.value.required_nullable);
+        try std.testing.expectEqual(@as(?u32, null), parsed.value.optional_value);
+
+        try std.testing.expectError(
+            error.MissingField,
+            parseFromSliceWithConfig(T, std.testing.allocator, "{}", .{}, .{ .simd_min_input_len = 0 }),
+        );
+    }
 }
 
 test "parseFromSliceLeaky supports Value callers" {

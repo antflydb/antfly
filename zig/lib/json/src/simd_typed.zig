@@ -18,8 +18,24 @@ const simd_stage1 = @import("simd_stage1.zig");
 const Allocator = std.mem.Allocator;
 const json = std.json;
 
+/// Generated OpenAPI objects retain std.json-compatible `jsonParse` methods
+/// for fallback targets while publishing field metadata that this parser can
+/// enforce directly. Treat those methods as adapters, not opaque custom
+/// parsers, so supported typed responses stay on the SIMD path.
+fn hasOpenApiFieldMetadata(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "openApiFieldMetadata"),
+        else => false,
+    };
+}
+
 pub fn supportsType(comptime T: type) bool {
-    if (std.meta.hasFn(T, "jsonParse")) return true;
+    // OpenAPI response types can be wide, nested unions. Keep the capability
+    // walk proportional to the generated type instead of Zig's small default
+    // comptime branch budget.
+    @setEvalBranchQuota(100_000);
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or
+        (std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T))) return true;
 
     switch (@typeInfo(T)) {
         .bool, .int, .float, .comptime_int, .comptime_float => return true,
@@ -51,7 +67,9 @@ pub fn supportsType(comptime T: type) bool {
 }
 
 pub fn containsCustomJsonParseType(comptime T: type) bool {
-    if (std.meta.hasFn(T, "jsonParse")) return true;
+    @setEvalBranchQuota(100_000);
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or
+        (std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T))) return true;
 
     switch (@typeInfo(T)) {
         .optional => |info| return containsCustomJsonParseType(info.child),
@@ -156,7 +174,11 @@ const Parser = struct {
     }
 
     fn parseType(self: *Parser, comptime T: type) json.ParseError(json.Scanner)!T {
-        if (comptime std.meta.hasFn(T, "jsonParse")) {
+        if (comptime std.meta.hasFn(T, "jsonParseFromSliceLeaky")) {
+            const raw = try self.captureValueSliceForStdlib();
+            return T.jsonParseFromSliceLeaky(self.allocator, raw, self.options);
+        }
+        if (comptime std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T)) {
             return self.parseViaStdlibSubtree(T);
         }
 
@@ -251,7 +273,7 @@ const Parser = struct {
         self.skipWhitespace();
 
         var result: T = undefined;
-        var seen = @as([_reflFields(info).len]bool, @splat(false));
+        var seen = @as([info.field_names.len]bool, @splat(false));
 
         if (!self.atEnd() and self.input[self.pos] == '}') {
             self.pos += 1;
@@ -276,13 +298,17 @@ const Parser = struct {
             if (self.cachedStructFieldIndex(T, field_name.slice())) |i| {
                 try self.parseStructFieldAtIndex(T, info, &result, &seen, i);
                 matched = true;
-            } else inline for (_reflFields(info), 0..) |field, i| {
-                if (std.mem.eql(u8, field.name, field_name.slice())) {
-                    self.rememberStructField(T, field.name, i);
+            } else inline for (info.field_names, info.field_types, 0..) |field_name_zig, Field, i| {
+                const json_field_name = comptime structFieldJsonName(T, field_name_zig, i);
+                if (std.mem.eql(u8, json_field_name, field_name.slice())) {
+                    self.rememberStructField(T, json_field_name, i);
+                    if (comptime structFieldRejectsNull(T, field_name_zig, i)) {
+                        if (self.startsWith("null")) return error.UnexpectedToken;
+                    }
                     if (seen[i]) {
                         switch (self.options.duplicate_field_behavior) {
                             .use_first => {
-                                _ = try self.parseType(field.type);
+                                _ = try self.parseType(Field);
                                 matched = true;
                                 break;
                             },
@@ -290,7 +316,7 @@ const Parser = struct {
                             .use_last => {},
                         }
                     }
-                    @field(result, field.name) = try self.parseType(field.type);
+                    @field(result, field_name_zig) = try self.parseType(Field);
                     seen[i] = true;
                     matched = true;
                     break;
@@ -330,24 +356,44 @@ const Parser = struct {
         seen: []bool,
         field_index: usize,
     ) json.ParseError(json.Scanner)!void {
-        inline for (_reflFields(info), 0..) |field, i| {
+        inline for (info.field_names, info.field_types, 0..) |field_name_zig, Field, i| {
             if (field_index == i) {
+                if (comptime structFieldRejectsNull(T, field_name_zig, i)) {
+                    if (self.startsWith("null")) return error.UnexpectedToken;
+                }
                 if (seen[i]) {
                     switch (self.options.duplicate_field_behavior) {
                         .use_first => {
-                            _ = try self.parseType(field.type);
+                            _ = try self.parseType(Field);
                             return;
                         },
                         .@"error" => return error.DuplicateField,
                         .use_last => {},
                     }
                 }
-                @field(result.*, field.name) = try self.parseType(field.type);
+                @field(result.*, field_name_zig) = try self.parseType(Field);
                 seen[i] = true;
                 return;
             }
         }
         unreachable;
+    }
+
+    fn structFieldJsonName(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) []const u8 {
+        if (!hasOpenApiFieldMetadata(T)) return zig_name;
+        const metadata = T.openApiFieldMetadata;
+        const field_names = @typeInfo(T).@"struct".field_names;
+        if (metadata.len != field_names.len)
+            @compileError("OpenAPI field metadata must match the generated struct");
+        if (!std.mem.eql(u8, zig_name, metadata[field_index][1]))
+            @compileError("OpenAPI field metadata order does not match the generated struct");
+        return metadata[field_index][0];
+    }
+
+    fn structFieldRejectsNull(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) bool {
+        if (!hasOpenApiFieldMetadata(T)) return false;
+        _ = structFieldJsonName(T, zig_name, field_index);
+        return T.openApiFieldMetadata[field_index][2];
     }
 
     fn cachedStructFieldIndex(self: *const Parser, comptime T: type, field_name: []const u8) ?usize {
@@ -387,14 +433,14 @@ const Parser = struct {
 
         var result: T = undefined;
 
-        inline for (_reflFields(info), 0..) |field, i| {
+        inline for (info.field_types, 0..) |Field, i| {
             if (self.atEnd()) return error.UnexpectedEndOfInput;
             if (i > 0) {
                 if (self.input[self.pos] != ',') return error.UnexpectedToken;
                 self.pos += 1;
                 self.skipWhitespace();
             }
-            result[i] = try self.parseType(field.type);
+            result[i] = try self.parseType(Field);
             self.skipWhitespace();
         }
 
@@ -432,12 +478,12 @@ const Parser = struct {
         self.pos += 1;
         self.skipWhitespace();
 
-        inline for (_reflFields(info)) |field| {
-            if (std.mem.eql(u8, field.name, field_name.slice())) {
-                const result = if (field.type == void)
-                    try self.parseVoidPayloadUnion(T, field.name)
+        inline for (info.field_names, info.field_types) |field_name_zig, Field| {
+            if (std.mem.eql(u8, field_name_zig, field_name.slice())) {
+                const result = if (Field == void)
+                    try self.parseVoidPayloadUnion(T, field_name_zig)
                 else
-                    @unionInit(T, field.name, try self.parseType(field.type));
+                    @unionInit(T, field_name_zig, try self.parseType(Field));
 
                 self.skipWhitespace();
                 if (self.atEnd()) return error.UnexpectedEndOfInput;
@@ -1011,44 +1057,22 @@ fn validateNumberLikeSlice(slice: []const u8) json.ParseError(json.Scanner)!void
 
 fn fillDefaults(comptime T: type, result: *T, seen: []bool) json.ParseFromValueError!void {
     const info = @typeInfo(T).@"struct";
-    inline for (_reflFields(info), 0..) |field, i| {
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, Field, attrs, i| {
         if (!seen[i]) {
-            if (field.default_value_ptr) |ptr| {
-                const typed_ptr: *align(@alignOf(field.type)) const field.type = @ptrCast(@alignCast(ptr));
-                @field(result.*, field.name) = typed_ptr.*;
-            } else if (@typeInfo(field.type) == .optional) {
-                @field(result.*, field.name) = null;
+            if (attrs.default_value_ptr) |ptr| {
+                const typed_ptr: *align(@alignOf(Field)) const Field = @ptrCast(@alignCast(ptr));
+                @field(result.*, field_name) = typed_ptr.*;
+            } else if (!hasOpenApiFieldMetadata(T) and @typeInfo(Field) == .optional) {
+                // Preserve std.json's ordinary Zig-struct behavior. Generated
+                // OpenAPI structs encode property presence in the field
+                // default: an optional-typed field without a default is a
+                // required nullable property and must remain missing here.
+                @field(result.*, field_name) = null;
             } else {
                 return error.MissingField;
             }
         }
     }
-}
-
-const ReflField = struct {
-    name: [:0]const u8,
-    type: type = void,
-    value: comptime_int = 0,
-    is_comptime: bool = false,
-    default_value_ptr: ?*const anyopaque = null,
-};
-
-fn _reflFields(comptime info: anytype) [info.field_names.len]ReflField {
-    const Info = @TypeOf(info);
-    var result: [info.field_names.len]ReflField = undefined;
-    if (@hasField(Info, "field_values")) {
-        for (info.field_names, info.field_values, 0..) |name, value, i| result[i] = .{ .name = name, .value = value };
-    } else if (@hasField(Info, "is_tuple")) {
-        for (info.field_names, info.field_types, info.field_attrs, 0..) |name, Field, attrs, i| result[i] = .{
-            .name = name,
-            .type = Field,
-            .is_comptime = attrs.@"comptime",
-            .default_value_ptr = attrs.default_value_ptr,
-        };
-    } else {
-        for (info.field_names, info.field_types, 0..) |name, Field, i| result[i] = .{ .name = name, .type = Field };
-    }
-    return result;
 }
 
 test "simd typed parser parses nested structs arrays and escapes natively" {
@@ -1306,6 +1330,76 @@ test "simd typed parser falls back per-subtree for custom jsonParse types" {
 
     try std.testing.expectEqual(@as(u32, 1), parsed.value.plain);
     try std.testing.expectEqual(@as(u32, 5), parsed.value.custom.value);
+}
+
+test "simd typed parser prefers allocation-light raw subtree parsers" {
+    const alloc = std.testing.allocator;
+    const Custom = struct {
+        value: u32,
+
+        pub fn jsonParseFromSliceLeaky(_: Allocator, input: []const u8, _: json.ParseOptions) !@This() {
+            return .{ .value = try std.fmt.parseUnsigned(u32, input, 10) };
+        }
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: json.ParseOptions) !@This() {
+            return error.TestExpectedError;
+        }
+    };
+
+    const T = struct {
+        plain: u32,
+        custom: Custom,
+    };
+    const raw = "{\"plain\":1,\"custom\":4}";
+    var structural = try simd_stage1.buildStructuralIndexAlloc(alloc, raw);
+    defer structural.deinit(alloc);
+
+    var parsed = try parseFromSlice(T, alloc, raw, .{}, structural);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.custom.value);
+}
+
+test "simd typed parser consumes generated OpenAPI field metadata without custom fallback" {
+    const alloc = std.testing.allocator;
+    const OpenApiObject = struct {
+        required_nullable: ?u32,
+        optional_value: ?u32 = null,
+
+        pub const openApiFieldMetadata = .{
+            .{ "required_nullable", "required_nullable", false },
+            .{ "wire.value", "optional_value", true },
+        };
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: json.ParseOptions) !@This() {
+            return error.UnexpectedToken;
+        }
+    };
+
+    try std.testing.expect(!containsCustomJsonParseType(OpenApiObject));
+
+    const valid = "{\"required_nullable\":null,\"wire.value\":7}";
+    var valid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, valid);
+    defer valid_structural.deinit(alloc);
+    var parsed = try parseFromSlice(OpenApiObject, alloc, valid, .{}, valid_structural);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parsed.value.required_nullable);
+    try std.testing.expectEqual(@as(?u32, 7), parsed.value.optional_value);
+
+    const missing_required = "{\"wire.value\":7}";
+    var missing_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, missing_required);
+    defer missing_structural.deinit(alloc);
+    try std.testing.expectError(
+        error.MissingField,
+        parseFromSliceLeaky(OpenApiObject, alloc, missing_required, .{}, missing_structural),
+    );
+
+    const invalid = "{\"required_nullable\":null,\"wire.value\":null}";
+    var invalid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, invalid);
+    defer invalid_structural.deinit(alloc);
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        parseFromSliceLeaky(OpenApiObject, alloc, invalid, .{}, invalid_structural),
+    );
 }
 
 test "simd typed parser captures composite subtrees for custom jsonParse" {

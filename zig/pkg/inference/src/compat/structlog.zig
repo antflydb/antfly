@@ -38,7 +38,7 @@ pub fn logFn(
 ) void {
     _ = scope;
 
-    if (@intFromEnum(level) > @intFromEnum(global_config.level)) return;
+    if (@backingInt(level) > @backingInt(global_config.level)) return;
 
     switch (global_config.formatter) {
         .json => {

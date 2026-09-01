@@ -705,7 +705,7 @@ pub const AdmissionPressure = union(enum) {
 const backend_class_count = 2;
 
 fn backendClassIndex(backend_class: BackendClass) usize {
-    return @intFromEnum(backend_class);
+    return @backingInt(backend_class);
 }
 
 fn emptyAdmissionAmountsByBackend() [backend_class_count]AdmissionAmounts {
@@ -1030,7 +1030,7 @@ pub const AdmissionController = struct {
                 const next_scratch = domain_next.scratchTotalBytesChecked() catch
                     return error.ResourceLimitExceeded;
 
-                const backend_class: BackendClass = @enumFromInt(index);
+                const backend_class: BackendClass = @fromBackingInt(@intCast(index));
                 try checkAdmissionLimitWithPressure(
                     domain_request_host,
                     next_host,
@@ -1111,7 +1111,7 @@ pub const AdmissionController = struct {
                 retain_backend_class = null;
                 break;
             }
-            retain_backend_class = @enumFromInt(index);
+            retain_backend_class = @fromBackingInt(@intCast(index));
         }
         return .{
             .controller = self,

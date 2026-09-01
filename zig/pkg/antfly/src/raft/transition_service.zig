@@ -197,7 +197,7 @@ pub const TransitionService = struct {
                     {
                         effective_record.rollback_reason = previous.rollback_reason;
                     }
-                    if (@intFromEnum(effective_record.phase) < @intFromEnum(previous.phase)) {
+                    if (@backingInt(effective_record.phase) < @backingInt(previous.phase)) {
                         // Controller snapshots can lag the executor phase
                         // while carrying a newly committed rollback request.
                         // Preserve local progress while adopting that intent.
@@ -256,7 +256,7 @@ pub const TransitionService = struct {
                     {
                         effective_record.rollback_reason = previous.rollback_reason;
                     }
-                    if (@intFromEnum(effective_record.phase) < @intFromEnum(previous.phase)) {
+                    if (@backingInt(effective_record.phase) < @backingInt(previous.phase)) {
                         if (!rollback_requested) return;
                         effective_record.phase = previous.phase;
                     }

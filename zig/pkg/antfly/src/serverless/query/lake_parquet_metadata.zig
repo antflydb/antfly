@@ -61,8 +61,8 @@ const CompactType = enum(u4) {
 };
 
 fn decodeCompactType(raw: u8) !CompactType {
-    if (raw > @intFromEnum(CompactType.struct_)) return error.InvalidParquetMetadata;
-    return @enumFromInt(raw);
+    if (raw > @backingInt(CompactType.struct_)) return error.InvalidParquetMetadata;
+    return @fromBackingInt(@intCast(raw));
 }
 
 pub const ParsedFooter = struct {
@@ -1421,9 +1421,9 @@ fn zigzagDecode(raw: u64) i64 {
 fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i16, id: i16, field_type: CompactType) !void {
     const delta = id - previous.*;
     if (delta > 0 and delta <= 15) {
-        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @intFromEnum(field_type));
+        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @backingInt(field_type));
     } else {
-        try out.append(alloc, @intFromEnum(field_type));
+        try out.append(alloc, @backingInt(field_type));
         try appendI16(out, alloc, id);
     }
     previous.* = id;
@@ -1435,9 +1435,9 @@ fn appendStop(out: *std.ArrayListUnmanaged(u8), alloc: Allocator) !void {
 
 fn appendListHeader(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, elem_type: CompactType, len: usize) !void {
     if (len < 15) {
-        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @backingInt(elem_type)));
     } else {
-        try out.append(alloc, 0xf0 | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, 0xf0 | @as(u8, @backingInt(elem_type)));
         try appendVarint(out, alloc, len);
     }
 }

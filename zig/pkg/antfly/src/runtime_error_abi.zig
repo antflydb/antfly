@@ -299,18 +299,26 @@ pub const Detail = enum(c_int) {
     enrichment_worker_failed,
     deadline_exceeded,
     pre_decision_deadline_exceeded,
+    graph_distinct_budget_exceeded,
+    graph_anchor_filter_requires_index,
+    graph_match_operation_limit_exceeded,
+    graph_cross_range_mode_unsupported,
+    graph_work_budget_exceeded,
+    graph_min_weight_domain_violation,
+    graph_max_weight_domain_violation,
+    graph_path_weight_overflow,
 };
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
     // rejected without constructing an invalid exhaustive Zig enum.
-    code: c_int = @intFromEnum(Code.ok),
-    detail: c_int = @intFromEnum(Detail.none),
+    code: c_int = @backingInt(Code.ok),
+    detail: c_int = @backingInt(Detail.none),
 
     pub const ok: Status = .{};
 
     pub fn isOk(self: Status) bool {
-        return self.code == @intFromEnum(Code.ok);
+        return self.code == @backingInt(Code.ok);
     }
 };
 
@@ -417,6 +425,16 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
+        error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
+        error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
+        error.GraphPathWeightOverflow => status(.invalid_argument, .graph_path_weight_overflow),
+        error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
+        error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
+        error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
+        // Preserve the append-only runtime detail code while the public error
+        // name reflects that unsupported exact modes are not topology-specific.
+        error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -596,18 +614,18 @@ pub fn statusFromError(err: anyerror) Status {
 /// not an arbitrary error string across the stable ABI.
 pub fn statusFromErrorWithFallback(err: anyerror, fallback: anyerror) Status {
     const value = statusFromError(err);
-    if (value.detail != @intFromEnum(Detail.none)) return value;
+    if (value.detail != @backingInt(Detail.none)) return value;
     const fallback_value = statusFromError(fallback);
-    std.debug.assert(fallback_value.detail != @intFromEnum(Detail.none));
+    std.debug.assert(fallback_value.detail != @backingInt(Detail.none));
     return fallback_value;
 }
 
 pub fn errorHasStableDetail(err: anyerror) bool {
-    return statusFromError(err).detail != @intFromEnum(Detail.none);
+    return statusFromError(err).detail != @backingInt(Detail.none);
 }
 
 fn status(code: Code, detail: Detail) Status {
-    return .{ .code = @intFromEnum(code), .detail = @intFromEnum(detail) };
+    return .{ .code = @backingInt(code), .detail = @backingInt(detail) };
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
@@ -889,6 +907,14 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
+        .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
+        .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
+        .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
+        .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
+        .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
+        .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
+        .graph_path_weight_overflow => "GraphPathWeightOverflow",
     };
 }
 
@@ -901,6 +927,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
     try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
+    try std.testing.expectEqual(error.GraphQueryModeUnsupported, errorFromStatus(statusFromError(error.GraphQueryModeUnsupported)));
     try std.testing.expectEqual(error.InferenceProviderFailure, errorFromStatus(statusFromError(error.InferenceProviderFailure)));
     try std.testing.expectEqual(error.KernelJitRequiredDynamicLoad, errorFromStatus(statusFromError(error.KernelJitRequiredDynamicLoad)));
     try std.testing.expectEqual(error.UnexpectedToken, errorFromStatus(statusFromError(error.UnexpectedToken)));
@@ -957,9 +984,9 @@ test "stable status has a C layout" {
 
 test "unknown wire values fail closed" {
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = 999, .detail = 999 }));
-    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @intFromEnum(Code.internal), .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = 999 }));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{
-        .code = @intFromEnum(Code.invalid_argument),
-        .detail = @intFromEnum(Detail.table_not_found),
+        .code = @backingInt(Code.invalid_argument),
+        .detail = @backingInt(Detail.table_not_found),
     }));
 }

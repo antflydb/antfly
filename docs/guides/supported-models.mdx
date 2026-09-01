@@ -96,7 +96,7 @@ the same compatibility and resource-fit checks as every other artifact.
 | Family | Verified with |
 |---|---|
 | Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
-| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF` |
+| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF`; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
 | Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
 | Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
@@ -105,6 +105,28 @@ also available when the bundle contains a compatible Antfly Gemma 3 projector or
 Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable
 images, audio, or both. The projector is opened only when a request contains media, so the
 same bundle continues to serve text-only requests without projector execution.
+
+Gemma 4 26B-A4B support is intentionally narrower than dense Gemma 4. The GGUF
+must match the qualified 30-layer, 128-expert, top-8 Q4_0 layout. Metal supports
+bounded or resident placement. CUDA requires a 16 GiB resident A4B envelope
+and an SM89 GPU. Unsupported geometry, streamed CUDA, or unavailable kernels
+are rejected at load time rather than falling back to host MoE execution.
+Server deployments must also leave transient host/combined admission headroom
+for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains
+leased after load.
+
+CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean
+GGUF pages remain kernel-reclaimable and shared across rolling workers unless
+`--a4b-drop-host-cache-after-load` is selected. Production images can install
+a versioned `$MODEL/a4b-cuda-pack-v2` created with `antfly-inference a4b-pack`;
+use `a4b-pack --verify` after copying it and `--a4b-prepared-pack required` to
+fail closed if that artifact is absent or stale. The default `auto` policy
+warns and uses the canonical GGUF when an optional pack is unusable. This is deliberately a
+full-model residency contract, not an `ngl`-style layer split. Cache retention
+and server `startup_strategy: "prefetch"` are deployment tools rather than a
+latency guarantee; hosts must have enough reclaimable memory for their
+checkpoint and loader working set, and should measure replacement-worker load
+time on the actual storage topology.
 
 ## Known incompatible artifacts and families
 
@@ -126,7 +148,6 @@ otherwise crash the server, so blocking them protects every other caller.
 | Phi | The mapping works for the separate-projection layout, but Phi-3 GGUFs fuse `attn_qkv` and `ffn_up` and report 257 missing tensors. |
 | BitNet | Loads and generates, then degenerates into repetition. |
 | Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains compatible. |
-| Gemma 4 26B-A4B MoE exports | The GGUF declares experts, but the 0.2.0 Gemma 4 MoE runtime is not enabled. |
 | DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
 | `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
 | `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |

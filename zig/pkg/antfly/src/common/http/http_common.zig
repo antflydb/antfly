@@ -128,24 +128,24 @@ pub const RequestDeliveryTracker = struct {
         may_have_been_sent,
     };
 
-    state: std.atomic.Value(u8) = .init(@intFromEnum(State.unknown)),
+    state: std.atomic.Value(u8) = .init(@backingInt(State.unknown)),
 
     /// Enter an executor whose send boundary is not yet known. The executor
     /// may subsequently prove `not_sent` or advance to `may_have_been_sent`.
     pub fn markUnknown(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.unknown), .release);
+        self.state.store(@backingInt(State.unknown), .release);
     }
 
     pub fn markNotSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.not_sent), .release);
+        self.state.store(@backingInt(State.not_sent), .release);
     }
 
     pub fn markMayHaveBeenSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.may_have_been_sent), .release);
+        self.state.store(@backingInt(State.may_have_been_sent), .release);
     }
 
     pub fn load(self: *const RequestDeliveryTracker) State {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 };
 

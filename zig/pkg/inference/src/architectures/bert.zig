@@ -71,11 +71,11 @@ fn metalEncoderFrameEnabled() bool {
 }
 
 fn bertLinearSlot(layer: usize, kind: BertLinearSlotKind) usize {
-    return layer * bert_linear_specs.len + @intFromEnum(kind);
+    return layer * bert_linear_specs.len + @backingInt(kind);
 }
 
 fn bertLayerNormSlot(layer: usize, kind: BertLayerNormSlotKind) usize {
-    return layer * bert_layer_norm_specs.len + @intFromEnum(kind);
+    return layer * bert_layer_norm_specs.len + @backingInt(kind);
 }
 
 fn bertEmbeddingLayerNormSlot(layer_count: usize) usize {
@@ -809,8 +809,8 @@ const MetalEncoderPreparedProbe = struct {
         const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
         self.linear_calls += 1;
         if (self.missing_linear_slot == slot) return false;
-        const kind: BertLinearSlotKind = @enumFromInt(slot % bert_linear_specs.len);
-        const spec = bert_linear_specs[@intFromEnum(kind)];
+        const kind: BertLinearSlotKind = @fromBackingInt(@intCast(slot % bert_linear_specs.len));
+        const spec = bert_linear_specs[@backingInt(kind)];
         const expected_in_dim: usize = if (spec.input_intermediate) 8 else 4;
         const expected_out_dim: usize = if (spec.output_intermediate) 8 else 4;
         return in_dim == expected_in_dim and out_dim == expected_out_dim;

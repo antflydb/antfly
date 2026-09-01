@@ -7,6 +7,7 @@ class TransformOpType(str, Enum):
     UNSET = "$unset"
     INC = "$inc"
     PUSH = "$push"
+    PULL = "$pull"
     ADD_TO_SET = "$addToSet"
     MIN = "$min"
     MAX = "$max"

@@ -311,24 +311,24 @@ test "storage.ha compat keeps v1 backup manifest encoding stable" {
 }
 
 test "storage.ha compat keeps v1 backup manifest file kind tags stable" {
-    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(backup_manifest.FileKind.sstable));
-    try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(backup_manifest.FileKind.manifest));
-    try std.testing.expectEqual(@as(u16, 0x0003), @intFromEnum(backup_manifest.FileKind.metadata));
-    try std.testing.expectEqual(@as(u16, 0x0004), @intFromEnum(backup_manifest.FileKind.wal_tail));
-    try std.testing.expectEqual(@as(u16, 0x0005), @intFromEnum(backup_manifest.FileKind.artifact));
-    try std.testing.expectEqual(@as(u16, 0x00ff), @intFromEnum(backup_manifest.FileKind.other));
+    try std.testing.expectEqual(@as(u16, 0x0001), @backingInt(backup_manifest.FileKind.sstable));
+    try std.testing.expectEqual(@as(u16, 0x0002), @backingInt(backup_manifest.FileKind.manifest));
+    try std.testing.expectEqual(@as(u16, 0x0003), @backingInt(backup_manifest.FileKind.metadata));
+    try std.testing.expectEqual(@as(u16, 0x0004), @backingInt(backup_manifest.FileKind.wal_tail));
+    try std.testing.expectEqual(@as(u16, 0x0005), @backingInt(backup_manifest.FileKind.artifact));
+    try std.testing.expectEqual(@as(u16, 0x00ff), @backingInt(backup_manifest.FileKind.other));
 }
 
 test "storage.ha compat keeps v1 record kind tags stable" {
-    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(replication_record.RecordKind.batch_mutation));
-    try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(replication_record.RecordKind.metadata_mutation));
-    try std.testing.expectEqual(@as(u16, 0x0003), @intFromEnum(replication_record.RecordKind.derived_effect));
-    try std.testing.expectEqual(@as(u16, 0x0010), @intFromEnum(replication_record.RecordKind.backup_start));
-    try std.testing.expectEqual(@as(u16, 0x0011), @intFromEnum(replication_record.RecordKind.backup_end));
-    try std.testing.expectEqual(@as(u16, 0x0012), @intFromEnum(replication_record.RecordKind.checkpoint));
-    try std.testing.expectEqual(@as(u16, 0x0013), @intFromEnum(replication_record.RecordKind.manifest));
-    try std.testing.expectEqual(@as(u16, 0x0014), @intFromEnum(replication_record.RecordKind.truncate));
-    try std.testing.expectEqual(@as(u16, 0x0020), @intFromEnum(replication_record.RecordKind.timeline_switch));
+    try std.testing.expectEqual(@as(u16, 0x0001), @backingInt(replication_record.RecordKind.batch_mutation));
+    try std.testing.expectEqual(@as(u16, 0x0002), @backingInt(replication_record.RecordKind.metadata_mutation));
+    try std.testing.expectEqual(@as(u16, 0x0003), @backingInt(replication_record.RecordKind.derived_effect));
+    try std.testing.expectEqual(@as(u16, 0x0010), @backingInt(replication_record.RecordKind.backup_start));
+    try std.testing.expectEqual(@as(u16, 0x0011), @backingInt(replication_record.RecordKind.backup_end));
+    try std.testing.expectEqual(@as(u16, 0x0012), @backingInt(replication_record.RecordKind.checkpoint));
+    try std.testing.expectEqual(@as(u16, 0x0013), @backingInt(replication_record.RecordKind.manifest));
+    try std.testing.expectEqual(@as(u16, 0x0014), @backingInt(replication_record.RecordKind.truncate));
+    try std.testing.expectEqual(@as(u16, 0x0020), @backingInt(replication_record.RecordKind.timeline_switch));
 }
 
 fn expectRecordEqual(expected: replication_record.Record, actual: replication_record.RecordView) !void {

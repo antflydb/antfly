@@ -133,7 +133,7 @@ pub fn encodeNodeKey(buf: *[12]u8, node_id: u64, suffix: Suffix) []u8 {
     buf[1] = ':';
     buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, node_id));
     buf[10] = ':';
-    buf[11] = @intFromEnum(suffix);
+    buf[11] = @backingInt(suffix);
     return buf;
 }
 

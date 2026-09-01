@@ -862,7 +862,7 @@ test "lite restore staging accepts aflite input for normal restore" {
         const graph = try searchJson(
             allocator,
             &restored.db,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"restore_graph\",\"start_nodes\":{\"keys\":[\"doc:restore:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"restore_graph\",\"traverse\":{\"start\":{\"keys\":[\"doc:restore:a\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer allocator.free(graph);
         try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:restore:c\"") != null);
@@ -1118,7 +1118,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         const graph = try searchJson(
             allocator,
             &restored.db,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"roundtrip_graph\",\"start_nodes\":{\"keys\":[\"doc:roundtrip:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"roundtrip_graph\",\"traverse\":{\"start\":{\"keys\":[\"doc:roundtrip:a\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer allocator.free(graph);
         try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:roundtrip:c\"") != null);

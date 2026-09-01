@@ -41,6 +41,111 @@ pub const BraveSearchConfig = struct {
     text_decorations: ?bool = null,
     /// Enable spellcheck suggestions
     spellcheck: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "freshness", "freshness", true },
+        .{ "text_decorations", "text_decorations", true },
+        .{ "spellcheck", "spellcheck", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.freshness) |value| {
+            try jw.objectField("freshness");
+            try jw.write(value);
+        }
+        if (self.text_decorations) |value| {
+            try jw.objectField("text_decorations");
+            try jw.write(value);
+        }
+        if (self.spellcheck) |value| {
+            try jw.objectField("spellcheck");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
@@ -86,6 +191,126 @@ pub const ExaSearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_type", "search_type", true },
+        .{ "num_results", "num_results", true },
+        .{ "start_published_date", "start_published_date", true },
+        .{ "end_published_date", "end_published_date", true },
+        .{ "include_domains", "include_domains", true },
+        .{ "exclude_domains", "exclude_domains", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.search_type) |value| {
+            try jw.objectField("search_type");
+            try jw.write(value);
+        }
+        if (self.num_results) |value| {
+            try jw.objectField("num_results");
+            try jw.write(value);
+        }
+        if (self.start_published_date) |value| {
+            try jw.objectField("start_published_date");
+            try jw.write(value);
+        }
+        if (self.end_published_date) |value| {
+            try jw.objectField("end_published_date");
+            try jw.write(value);
+        }
+        if (self.include_domains) |value| {
+            try jw.objectField("include_domains");
+            try jw.write(value);
+        }
+        if (self.exclude_domains) |value| {
+            try jw.objectField("exclude_domains");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for URL content fetching. Uses Antfly's content fetcher for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features include: - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
@@ -102,6 +327,56 @@ pub const FetchConfig = struct {
     max_download_size_bytes: ?i64 = null,
     /// Download timeout in seconds
     timeout_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "s3_credentials", "s3_credentials", false },
+        .{ "max_content_length", "max_content_length", true },
+        .{ "allowed_hosts", "allowed_hosts", true },
+        .{ "block_private_ips", "block_private_ips", true },
+        .{ "max_download_size_bytes", "max_download_size_bytes", true },
+        .{ "timeout_seconds", "timeout_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.s3_credentials) |value| {
+            try jw.objectField("s3_credentials");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("s3_credentials");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.max_content_length) |value| {
+            try jw.objectField("max_content_length");
+            try jw.write(value);
+        }
+        if (self.allowed_hosts) |value| {
+            try jw.objectField("allowed_hosts");
+            try jw.write(value);
+        }
+        if (self.block_private_ips) |value| {
+            try jw.objectField("block_private_ips");
+            try jw.write(value);
+        }
+        if (self.max_download_size_bytes) |value| {
+            try jw.objectField("max_download_size_bytes");
+            try jw.write(value);
+        }
+        if (self.timeout_seconds) |value| {
+            try jw.objectField("timeout_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result from fetching a URL through Antfly's content fetcher. Content is automatically processed based on MIME type: - HTML: Readable text extracted via go-readability - PDF: Text extracted from all pages - Images: Returned as base64 data URIs - Text: Returned as-is
@@ -118,6 +393,49 @@ pub const FetchResult = struct {
     truncated: ?bool = null,
     /// Time taken to fetch and process in milliseconds
     fetch_time_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "url", "url", false },
+        .{ "title", "title", true },
+        .{ "content", "content", false },
+        .{ "content_type", "content_type", true },
+        .{ "truncated", "truncated", true },
+        .{ "fetch_time_ms", "fetch_time_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("url");
+        try jw.write(self.url);
+        if (self.title) |value| {
+            try jw.objectField("title");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.truncated) |value| {
+            try jw.objectField("truncated");
+            try jw.write(value);
+        }
+        if (self.fetch_time_ms) |value| {
+            try jw.objectField("fetch_time_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
@@ -155,6 +473,106 @@ pub const LinkupSearchConfig = struct {
     depth: ?[]const u8 = null,
     /// Linkup response shape to request
     output_type: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "depth", "depth", true },
+        .{ "output_type", "output_type", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.depth) |value| {
+            try jw.objectField("depth");
+            try jw.write(value);
+        }
+        if (self.output_type) |value| {
+            try jw.objectField("output_type");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
@@ -192,6 +610,106 @@ pub const SerperSearchConfig = struct {
     search_type: ?[]const u8 = null,
     /// Time period filter: d=day, w=week, m=month, y=year
     time_period: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_type", "search_type", true },
+        .{ "time_period", "time_period", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.search_type) |value| {
+            try jw.objectField("search_type");
+            try jw.write(value);
+        }
+        if (self.time_period) |value| {
+            try jw.objectField("time_period");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
@@ -235,6 +753,121 @@ pub const TavilySearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_depth", "search_depth", true },
+        .{ "include_answer", "include_answer", true },
+        .{ "include_raw_content", "include_raw_content", true },
+        .{ "include_domains", "include_domains", true },
+        .{ "exclude_domains", "exclude_domains", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.search_depth) |value| {
+            try jw.objectField("search_depth");
+            try jw.write(value);
+        }
+        if (self.include_answer) |value| {
+            try jw.objectField("include_answer");
+            try jw.write(value);
+        }
+        if (self.include_raw_content) |value| {
+            try jw.objectField("include_raw_content");
+            try jw.write(value);
+        }
+        if (self.include_domains) |value| {
+            try jw.objectField("include_domains");
+            try jw.write(value);
+        }
+        if (self.exclude_domains) |value| {
+            try jw.objectField("exclude_domains");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
@@ -270,6 +903,101 @@ pub const VertexSearchConfig = struct {
     include_highlights: ?bool = null,
     /// Google Cloud search service flavor
     service: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "service", "service", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.service) |value| {
+            try jw.objectField("service");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
@@ -303,6 +1031,96 @@ pub const WebSearchConfig = struct {
     include_content: ?bool = null,
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The web search provider to use. - **exa**: Exa neural/semantic web search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **you**: You.com Search API for agent and research workflows - **linkup**: Linkup Search API for web search and content retrieval - **vertex**: Google Cloud Agent Search / Vertex AI Search
@@ -358,6 +1176,46 @@ pub const WebSearchResponse = struct {
     total_results: ?i64 = null,
     /// Time taken to perform the search in milliseconds
     search_time_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query", "query", true },
+        .{ "results", "results", false },
+        .{ "answer", "answer", true },
+        .{ "total_results", "total_results", true },
+        .{ "search_time_ms", "search_time_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        try jw.objectField("results");
+        try jw.write(self.results);
+        if (self.answer) |value| {
+            try jw.objectField("answer");
+            try jw.write(value);
+        }
+        if (self.total_results) |value| {
+            try jw.objectField("total_results");
+            try jw.write(value);
+        }
+        if (self.search_time_ms) |value| {
+            try jw.objectField("search_time_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A single web search result
@@ -374,6 +1232,49 @@ pub const WebSearchResult = struct {
     published_date: ?[]const u8 = null,
     /// Relevance score (provider-specific)
     score: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "title", "title", false },
+        .{ "url", "url", false },
+        .{ "snippet", "snippet", true },
+        .{ "source", "source", true },
+        .{ "published_date", "published_date", true },
+        .{ "score", "score", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("title");
+        try jw.write(self.title);
+        try jw.objectField("url");
+        try jw.write(self.url);
+        if (self.snippet) |value| {
+            try jw.objectField("snippet");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.published_date) |value| {
+            try jw.objectField("published_date");
+            try jw.write(value);
+        }
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com
@@ -407,4 +1308,199 @@ pub const YouSearchConfig = struct {
     include_content: ?bool = null,
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(Field, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field_name_zig) = try std.json.innerParse(Field, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
+                @field(result, field_name_zig) = try std.json.innerParseFromValue(Field, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".field_names.len]bool) !void {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (!fields_seen[i]) {
+            if (field_attrs.defaultValue(Field)) |default| @field(result, field_name_zig) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}

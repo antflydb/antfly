@@ -268,7 +268,7 @@ pub const CredentialCache = struct {
 fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
     var hash = std.hash.Wyhash.init(0);
     hash.update(region);
-    const tag: [1]u8 = .{@intFromEnum(std.meta.activeTag(source))};
+    const tag: [1]u8 = .{@backingInt(std.meta.activeTag(source))};
     hash.update(&tag);
     switch (source) {
         .default => {},
@@ -1244,7 +1244,7 @@ fn formatAmzDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const day_seconds = epoch_seconds.getDaySeconds();
     return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         month_day.day_index + 1,
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
@@ -1256,7 +1256,7 @@ fn formatScopeDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_seconds };
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 });
+    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @backingInt(month_day.month), month_day.day_index + 1 });
 }
 
 fn signingKeyAlloc(alloc: std.mem.Allocator, secret: []const u8, scope_date: []const u8, region: []const u8) ![]u8 {

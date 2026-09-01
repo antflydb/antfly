@@ -1222,7 +1222,7 @@ fn receiverCoversDonor(receiver: db_types.ByteRange, donor: db_types.ByteRange) 
 }
 
 fn encodeMergeState(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, state: PersistedMergeState) !void {
-    try list.append(alloc, @intFromEnum(state.phase));
+    try list.append(alloc, @backingInt(state.phase));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.donor_group_id)));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.receiver_group_id)));
     const start_len: u32 = @intCast(state.receiver_base_range.start.len);
@@ -1245,7 +1245,7 @@ fn encodeMergeState(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator,
 fn decodeMergeStateAlloc(alloc: std.mem.Allocator, data: []const u8) !PersistedMergeState {
     if (data.len < 1 + 8 + 8 + 4 + 4) return error.InvalidMergeState;
     var pos: usize = 0;
-    const phase: MergeLifecyclePhase = @enumFromInt(data[pos]);
+    const phase: MergeLifecyclePhase = @fromBackingInt(@intCast(data[pos]));
     pos += 1;
     const donor_group_id = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += 8;

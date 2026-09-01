@@ -8,8 +8,8 @@ import { AntflyClient } from "../src/client.js";
 import {
   type BatchRequest,
   type CreateTableRequest,
-  type QueryRequest,
   queryResultTotalHits,
+  type TableQueryRequest,
 } from "../src/types.js";
 
 async function main() {
@@ -91,8 +91,7 @@ async function main() {
 
     // Query the data
     console.log("\nSearching for products...");
-    const searchQuery: QueryRequest = {
-      table: "products",
+    const searchQuery: TableQueryRequest = {
       full_text_search: {
         query: "laptop OR mouse",
       },

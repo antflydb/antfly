@@ -149,7 +149,7 @@ export fn load_projector_gguf(
 
 export fn projector_kind(projector_handle: u32) u32 {
     const projector = ctx.runtime.getProjector(projector_handle) catch return 0;
-    return @intFromEnum(projector.kind) + 1;
+    return @backingInt(projector.kind) + 1;
 }
 
 export fn unload_projector(projector_handle: u32) void {

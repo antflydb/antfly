@@ -382,7 +382,7 @@ test "registerGradBlock reserves budget and residency entry" {
     try testing.expect(coord.residency.entry(id) != null);
     try testing.expectEqual(
         @as(u64, 4096),
-        coord.budget.host_by_category[@intFromEnum(budget_mod.BudgetCategory.gradients)],
+        coord.budget.host_by_category[@backingInt(budget_mod.BudgetCategory.gradients)],
     );
 }
 
@@ -426,7 +426,7 @@ test "spillGradBlock round-trips via NVMe and touchGradBlock rehydrates" {
     // Budget released after spill.
     try testing.expectEqual(
         @as(u64, 0),
-        coord.budget.host_by_category[@intFromEnum(budget_mod.BudgetCategory.gradients)],
+        coord.budget.host_by_category[@backingInt(budget_mod.BudgetCategory.gradients)],
     );
 
     var dest: [16]u8 = undefined;
@@ -438,7 +438,7 @@ test "spillGradBlock round-trips via NVMe and touchGradBlock rehydrates" {
     // Budget re-reserved after rehydrate.
     try testing.expectEqual(
         @as(u64, 16),
-        coord.budget.host_by_category[@intFromEnum(budget_mod.BudgetCategory.gradients)],
+        coord.budget.host_by_category[@backingInt(budget_mod.BudgetCategory.gradients)],
     );
 }
 

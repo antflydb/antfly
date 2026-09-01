@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const ascii_compat = @import("../common/ascii_compat.zig");
+const ant_json = @import("antfly-json");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
@@ -33,12 +34,13 @@ const AgentStep = metadata_openapi.AgentStep;
 const QueryHit = metadata_openapi.QueryHit;
 const QueryRequest = metadata_openapi.QueryRequest;
 const QueryResponses = metadata_openapi.QueryResponses;
-const GraphPath = indexes_openapi.Path;
+const GraphPath = indexes_openapi.GraphPath;
 const RetrievalAgentRequest = metadata_openapi.RetrievalAgentRequest;
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
 const TreeSearchConfig = metadata_openapi.TreeSearchConfig;
+const JsonObject = std.json.ArrayHashMap(std.json.Value);
 
 const ToolPolicy = struct {
     global_tools: ?generating_api_openapi.ChatToolsConfig = null,
@@ -118,11 +120,11 @@ pub const EventSink = struct {
 };
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
+    return try ant_json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn parseQueryRequestBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(QueryRequest) {
-    return try std.json.parseFromSlice(QueryRequest, alloc, body, .{ .ignore_unknown_fields = true });
+    return try ant_json.parseFromSlice(QueryRequest, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn expectFullTextQueryValue(value: std.json.Value, expected: []const u8) !void {
@@ -816,7 +818,7 @@ fn executeInternal(
         const strategy = detectStrategy(retrieval_query);
         try strategies.append(arena, strategy);
         var refinement_queries = std.ArrayListUnmanaged([]const u8).empty;
-        if (currentRetrievalQueryText(retrieval_query)) |current_query| {
+        if (currentRetrievalQueryText(arena, retrieval_query)) |current_query| {
             try refinement_queries.append(arena, current_query);
         }
 
@@ -956,7 +958,7 @@ fn executeInternal(
                 previous_attempt_summary,
                 candidate_scores,
                 attempted_query_indices,
-                can_attempt_refinement and nextEvaluationRefinedQueryText(classification_result, retrieval_query, retrieval_query_index, refinement_queries.items) != null,
+                can_attempt_refinement and nextEvaluationRefinedQueryText(arena, classification_result, retrieval_query, retrieval_query_index, refinement_queries.items) != null,
                 strategy == .tree and pending_tree_expansion_plan != null,
                 planner_can_clarify,
             );
@@ -1050,7 +1052,7 @@ fn executeInternal(
                 continue;
             }
             if (planner_decision != .refine_query) break;
-            if (nextEvaluationRefinedQueryText(classification_result, retrieval_query, retrieval_query_index, refinement_queries.items)) |refined_query| {
+            if (nextEvaluationRefinedQueryText(arena, classification_result, retrieval_query, retrieval_query_index, refinement_queries.items)) |refined_query| {
                 try refinement_queries.append(arena, refined_query);
                 try appendStep(arena, &steps_list, &live, .{
                     .kind = .planning,
@@ -1204,7 +1206,7 @@ fn executeInternal(
                             previous_attempt_summary,
                             fallback_plan.candidate_scores,
                         );
-                        try clarification_details.object.put(alloc, "planner_decision", .{ .string = "clarify" });
+                        try clarification_details.map.put(alloc, "planner_decision", .{ .string = "clarify" });
                         try appendStep(arena, &steps_list, &live, .{
                             .kind = .planning,
                             .name = "evaluate",
@@ -1625,7 +1627,7 @@ fn buildClassificationStepDetails(
     request: RetrievalAgentRequest,
     cfg: ParsedClassificationConfig,
     selected_query_indices: ?[]const usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "agentic_mode", .{ .bool = (request.max_internal_iterations orelse 0) > 0 });
     if (cfg.force_strategy) |strategy| try obj.put(alloc, "force_strategy", .{ .string = @tagName(strategy) });
@@ -1636,14 +1638,14 @@ fn buildClassificationStepDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildAgenticSelectionDetails(
     alloc: std.mem.Allocator,
     request: RetrievalAgentRequest,
     selected_query_indices: ?[]const usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "agentic_mode", .{ .bool = true });
     try obj.put(alloc, "query_count", .{ .integer = @intCast(request.queries.len) });
@@ -1652,7 +1654,7 @@ fn buildAgenticSelectionDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildPipelineStepDetails(
@@ -1660,7 +1662,7 @@ fn buildPipelineStepDetails(
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: ?[]const usize,
     broadened_from_decision: bool,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_count", .{ .integer = @intCast(retrieval_queries.len) });
     try obj.put(alloc, "broadened_from_decision", .{ .bool = broadened_from_decision });
@@ -1676,7 +1678,7 @@ fn buildPipelineStepDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildToolStepDetails(
@@ -1684,7 +1686,7 @@ fn buildToolStepDetails(
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     strategy: RetrievalStrategy,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(strategy) });
@@ -1704,7 +1706,7 @@ fn buildToolStepDetails(
         if (tree_search.beam_width) |beam_width| try tree_obj.put(alloc, "beam_width", .{ .integer = beam_width });
         try obj.put(alloc, "tree_search", .{ .object = tree_obj });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildTreeExpansionStepDetails(
@@ -1712,7 +1714,7 @@ fn buildTreeExpansionStepDetails(
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     plan: TreeBranchExpansionPlan,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1724,7 +1726,7 @@ fn buildTreeExpansionStepDetails(
     try obj.put(alloc, "max_depth", .{ .integer = plan.max_depth });
     try obj.put(alloc, "query_relevance", .{ .float = plan.branch.query_relevance });
     try obj.put(alloc, "node_count", .{ .integer = @intCast(plan.branch.node_count) });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildSelectStrategyAction(
@@ -1753,7 +1755,7 @@ fn buildSelectStrategyStepDetails(
     source: AgenticSelectionSource,
     candidate_scores: []const AgenticCandidateScore,
     broadened_from_decision: bool,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "selected_strategy", .{ .string = @tagName(detectSelectedAgenticStrategy(retrieval_queries, selected_query_indices)) });
     try obj.put(alloc, "selected_query_count", .{ .integer = @intCast(selected_query_indices.len) });
@@ -1785,13 +1787,13 @@ fn buildSelectStrategyStepDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildClarificationSelectionDetails(
     alloc: std.mem.Allocator,
     candidate_scores: []const AgenticCandidateScore,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     var scores = std.json.Array.init(alloc);
     for (candidate_scores) |candidate| {
@@ -1805,14 +1807,14 @@ fn buildClarificationSelectionDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1820,7 +1822,7 @@ fn buildRefineQueryStepDetails(
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationRefineQueryStepDetails(
@@ -1829,7 +1831,7 @@ fn buildEvaluationRefineQueryStepDetails(
     retrieval_query_index: usize,
     classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1839,16 +1841,14 @@ fn buildEvaluationRefineQueryStepDetails(
     if (retrieval_query.semantic_search) |original_query| {
         try obj.put(alloc, "original_query", .{ .string = original_query });
     } else if (retrieval_query.full_text_search) |full_text| {
-        if (full_text == .object) {
-            if (full_text.object.get("query")) |query_value| {
-                if (query_value == .string) try obj.put(alloc, "original_query", .{ .string = query_value.string });
-            }
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| {
+            try obj.put(alloc, "original_query", .{ .string = query });
         }
     }
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationStepDetails(
@@ -1863,7 +1863,7 @@ fn buildEvaluationStepDetails(
     attempt_summary: AttemptEvaluationSummary,
     previous_attempt_summary: ?AttemptEvaluationSummary,
     candidate_scores: []const AgenticCandidateScore,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, strategy);
     const best_fallback_score = bestRemainingCandidateScore(candidate_scores, attempted_query_indices);
@@ -1937,7 +1937,7 @@ fn buildEvaluationStepDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationRefinementStepDetails(
@@ -1948,7 +1948,7 @@ fn buildEvaluationRefinementStepDetails(
     trigger: AgenticEvaluationTrigger,
     attempt_summary: AttemptEvaluationSummary,
     best_fallback_score: ?f32,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, detectStrategy(retrieval_query));
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
@@ -1971,7 +1971,7 @@ fn buildEvaluationRefinementStepDetails(
         try obj.put(alloc, "current_top_tree_branch_leaf_hits", .{ .integer = value });
         try obj.put(alloc, "current_tree_branch_thin", .{ .bool = value == 0 });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationAcceptStepDetails(
@@ -1983,7 +1983,7 @@ fn buildEvaluationAcceptStepDetails(
     current_score: f32,
     previous_score: ?f32,
     best_fallback_score: ?f32,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -2008,7 +2008,7 @@ fn buildEvaluationAcceptStepDetails(
         try obj.put(alloc, "current_top_tree_branch_leaf_hits", .{ .integer = value });
         try obj.put(alloc, "current_tree_branch_thin", .{ .bool = value == 0 });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationTreeExpansionStepDetails(
@@ -2020,7 +2020,7 @@ fn buildEvaluationTreeExpansionStepDetails(
     attempt_summary: AttemptEvaluationSummary,
     best_fallback_score: ?f32,
     plan: TreeBranchExpansionPlan,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, detectStrategy(retrieval_query));
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
@@ -2047,7 +2047,7 @@ fn buildEvaluationTreeExpansionStepDetails(
     try obj.put(alloc, "seed_key", .{ .string = plan.seed_key });
     try obj.put(alloc, "seed_depth", .{ .integer = @intCast(plan.seed_depth) });
     try obj.put(alloc, "max_depth", .{ .integer = plan.max_depth });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn summarizeAttemptEvaluation(
@@ -2143,7 +2143,7 @@ fn buildInitialRefineQueryStepDetails(
     retrieval_query_index: usize,
     classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -2162,7 +2162,7 @@ fn buildInitialRefineQueryStepDetails(
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn parseGenerationConfig(
@@ -2291,24 +2291,25 @@ fn hasAggregationRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
 }
 
 fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
-    const graph_searches = retrieval_query.graph_searches orelse return false;
-    return graph_searches.map.count() > 0;
+    if (retrieval_query.graph_queries) |graph_queries| {
+        if (graph_queries.map.count() > 0) return true;
+    }
+    return false;
 }
 
 fn buildToolModeStepDetails(
     alloc: std.mem.Allocator,
     tool_policy: ToolPolicy,
-) !?std.json.Value {
+) !?JsonObject {
     const count = tool_policy.explicitToolCount() orelse return null;
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "tools_count", .{ .integer = @intCast(count) });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
-fn toolCountFromStepDetails(details: ?std.json.Value) ?i64 {
+fn toolCountFromStepDetails(details: ?JsonObject) ?i64 {
     const value = details orelse return null;
-    if (value != .object) return null;
-    const tools_count = value.object.get("tools_count") orelse return null;
+    const tools_count = value.map.get("tools_count") orelse return null;
     return switch (tools_count) {
         .integer => |count| count,
         else => null,
@@ -2708,8 +2709,7 @@ fn buildBranchGenerationSummaryWithLimit(
             if (seen_nodes >= limit) break;
         }
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const title = switch (source.object.get("title") orelse continue) {
+        const title = switch (source.map.get("title") orelse continue) {
             .string => |value| value,
             else => continue,
         };
@@ -3003,8 +3003,7 @@ fn compareGenerationHitOrder(lhs: QueryHit, rhs: QueryHit) i32 {
 
 fn treeMetaString(hit: QueryHit, key: []const u8) ?[]const u8 {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3015,8 +3014,7 @@ fn treeMetaString(hit: QueryHit, key: []const u8) ?[]const u8 {
 
 fn treeMetaInteger(hit: QueryHit, key: []const u8) ?i64 {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3028,8 +3026,7 @@ fn treeMetaInteger(hit: QueryHit, key: []const u8) ?i64 {
 
 fn treeMetaBool(hit: QueryHit, key: []const u8) ?bool {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3051,8 +3048,7 @@ fn buildTreeGenerationContext(
     var tree_hit_count: usize = 0;
     for (hits) |hit| {
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const meta_value = source.object.get("_tree") orelse continue;
+        const meta_value = source.map.get("_tree") orelse continue;
         if (meta_value != .object) continue;
         const meta = meta_value.object;
         saw_tree_hit = true;
@@ -3082,8 +3078,7 @@ fn buildTreeGenerationContext(
 
     for (hits) |hit| {
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const meta_value = source.object.get("_tree") orelse continue;
+        const meta_value = source.map.get("_tree") orelse continue;
         if (meta_value != .object) continue;
         const meta = meta_value.object;
 
@@ -3146,20 +3141,20 @@ fn buildTreeGenerationContext(
             }
         }
 
-        if (source.object.get("title")) |title| {
+        if (source.map.get("title")) |title| {
             if (title == .string) {
                 try out.appendSlice(alloc, "  Title ");
                 try out.appendSlice(alloc, title.string);
                 try out.append(alloc, '\n');
             }
         }
-        if (source.object.get("body")) |body| {
+        if (source.map.get("body")) |body| {
             if (body == .string and body.string.len > 0) {
                 try out.appendSlice(alloc, "  Body ");
                 try out.appendSlice(alloc, body.string);
                 try out.append(alloc, '\n');
             }
-        } else if (source.object.get("content")) |content| {
+        } else if (source.map.get("content")) |content| {
             if (content == .string and content.string.len > 0) {
                 try out.appendSlice(alloc, "  Content ");
                 try out.appendSlice(alloc, content.string);
@@ -3378,15 +3373,7 @@ fn describeHitForGeneration(
     hit: QueryHit,
 ) ![]const u8 {
     const source = hit._source orelse return try alloc.dupe(u8, "null");
-    if (source != .object) {
-        // Use page_allocator to avoid @memcpy aliasing with arena-backed json strings.
-        var tmp: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer tmp.deinit();
-        try std.json.Stringify.value(source, .{}, &tmp.writer);
-        return try alloc.dupe(u8, tmp.written());
-    }
-
-    const object = source.object;
+    const object = source.map;
     const tree_meta = object.get("_tree");
     // Use page_allocator to avoid @memcpy aliasing with arena-backed json strings.
     const encoded_source = blk: {
@@ -4107,15 +4094,16 @@ fn maybeProbeAgenticSelection(
             try extractTreeFallbackRootKey(arena, query_json)
         else
             null;
+        const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
         const query_hits = if (retrieval_query.tree_search != null)
-            try extractTreeHits(arena, parsed_query.value, queryTextForProbe(classification_result, retrieval_query), fallback_tree_root)
+            try extractTreeHits(arena, parsed_query.value, probe_query_text, fallback_tree_root)
         else
             extractHits(parsed_query.value);
 
         scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(probe_query_text, probe_context);
         }
         scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
@@ -4264,15 +4252,16 @@ fn probeAgenticFallbackCandidates(
             try extractTreeFallbackRootKey(arena, query_json)
         else
             null;
+        const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
         const query_hits = if (retrieval_query.tree_search != null)
-            try extractTreeHits(arena, parsed_query.value, queryTextForProbe(classification_result, retrieval_query), fallback_tree_root)
+            try extractTreeHits(arena, parsed_query.value, probe_query_text, fallback_tree_root)
         else
             extractHits(parsed_query.value);
 
         scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(probe_query_text, probe_context);
         }
         scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
@@ -4791,6 +4780,7 @@ fn compareProbeCandidate(lhs: AgenticCandidateScore, rhs: AgenticCandidateScore)
 }
 
 fn queryTextForProbe(
+    alloc: std.mem.Allocator,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) []const u8 {
@@ -4800,10 +4790,10 @@ fn queryTextForProbe(
     }
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
-        if (extractQueryString(full_text)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
-        if (extractQueryString(filter_query)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, filter_query)) |query| return query;
     }
     if (retrieval_query.tree_search) |tree_search| {
         if (tree_search.start_nodes) |start_nodes| return start_nodes;
@@ -4820,6 +4810,11 @@ fn extractQueryString(value: std.json.Value) ?[]const u8 {
         },
         else => null,
     };
+}
+
+fn extractRawQueryStringAlloc(alloc: std.mem.Allocator, raw: metadata_openapi.RawQuery) ?[]const u8 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{}) catch return null;
+    return extractQueryString(value);
 }
 
 fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) generating_api_openapi.QueryStrategy {
@@ -5190,18 +5185,16 @@ fn encodeSse(
             }
         } else if (std.mem.eql(u8, step.name, "select_strategy")) {
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("selection_source")) |selection_source| {
-                        if (selection_source == .string and std.mem.eql(u8, selection_source.string, "probe")) {
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "probe",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("selection_source")) |selection_source| {
+                    if (selection_source == .string and std.mem.eql(u8, selection_source.string, "probe")) {
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "probe",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5235,46 +5228,44 @@ fn encodeSse(
                 .details = step.details,
             });
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("current_vs_fallback_ambiguous")) |ambiguous| {
-                        if (ambiguous == .bool and ambiguous.bool) {
-                            try appendSseTextChunks(
-                                alloc,
-                                &out,
-                                "reasoning",
-                                "evaluation found the current result and the best fallback to be effectively tied",
-                                step_id,
-                                step.name,
-                            );
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "current_vs_fallback_ambiguity",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("current_vs_fallback_ambiguous")) |ambiguous| {
+                    if (ambiguous == .bool and ambiguous.bool) {
+                        try appendSseTextChunks(
+                            alloc,
+                            &out,
+                            "reasoning",
+                            "evaluation found the current result and the best fallback to be effectively tied",
+                            step_id,
+                            step.name,
+                        );
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "current_vs_fallback_ambiguity",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
-                    if (details.object.get("fallback_consensus_ambiguous")) |ambiguous| {
-                        if (ambiguous == .bool and ambiguous.bool) {
-                            try appendSseTextChunks(
-                                alloc,
-                                &out,
-                                "reasoning",
-                                "evaluation found multiple stronger fallback strategies that remain effectively tied",
-                                step_id,
-                                step.name,
-                            );
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "fallback_consensus_ambiguity",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                }
+                if (details.map.get("fallback_consensus_ambiguous")) |ambiguous| {
+                    if (ambiguous == .bool and ambiguous.bool) {
+                        try appendSseTextChunks(
+                            alloc,
+                            &out,
+                            "reasoning",
+                            "evaluation found multiple stronger fallback strategies that remain effectively tied",
+                            step_id,
+                            step.name,
+                        );
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "fallback_consensus_ambiguity",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5292,24 +5283,22 @@ fn encodeSse(
             try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
         } else if (step.kind == .tool_call) {
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("strategy")) |strategy| {
-                        if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
-                            const tree_depth = maxTreeHitDepth(result.hits);
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "tree_search",
-                                .depth = tree_depth,
-                                .num_nodes = result.hits.len,
-                                .collected = result.hits.len,
-                                .complete = true,
-                                .sufficient = result.hits.len > 0,
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("strategy")) |strategy| {
+                    if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
+                        const tree_depth = maxTreeHitDepth(result.hits);
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "tree_search",
+                            .depth = tree_depth,
+                            .num_nodes = result.hits.len,
+                            .collected = result.hits.len,
+                            .complete = true,
+                            .sufficient = result.hits.len > 0,
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5381,12 +5370,11 @@ fn hasTreeHits(hits: []const QueryHit) bool {
 }
 
 fn stepProgressPhase(
-    details: ?std.json.Value,
+    details: ?JsonObject,
     default_phase: []const u8,
 ) []const u8 {
     const value = details orelse return default_phase;
-    if (value != .object) return default_phase;
-    if (value.object.get("phase")) |phase| {
+    if (value.map.get("phase")) |phase| {
         if (phase == .string) return phase.string;
     }
     return default_phase;
@@ -5451,28 +5439,36 @@ fn encodeQueryValueForRetrievalQuery(
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ![]u8 {
-    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(encoded);
+    if (value != .object or
+        value.object.get("graph_searches") != null or
+        value.object.get("expand_strategy") != null)
+        return error.UnsupportedRetrievalAgentRequest;
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var parsed = std.json.parseFromSlice(QueryRequest, arena, encoded, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.InvalidRetrievalAgentRequest;
-    defer parsed.deinit();
-
-    var query_request = parsed.value;
-    applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
+    // RetrievalQueryRequest is a strict schema extension of QueryRequest.
+    // Project its shared generated fields directly: reparsing the raw object
+    // would incorrectly present retrieval-only `tree_search` to the canonical
+    // QueryRequest parser and would add a full stringify/parse cycle per step.
+    var query_request = canonicalQueryRequestFromRetrieval(retrieval_query);
+    try applyClassificationRefinement(arena, &query_request, classification_result, retrieval_query_index, refinement_pass);
     // The raw query predicates are already folded into this query's mandatory
     // set. Install that canonical set instead of conjoining the source query a
     // second time on every refinement pass.
-    query_request.filter_query = mandatory_predicates.filter_query;
-    query_request.exclusion_query = mandatory_predicates.exclusion_query;
+    query_request.filter_query = if (mandatory_predicates.filter_query) |predicate|
+        try rawQueryFromValueAlloc(arena, predicate)
+    else
+        null;
+    query_request.exclusion_query = if (mandatory_predicates.exclusion_query) |predicate|
+        try rawQueryFromValueAlloc(arena, predicate)
+    else
+        null;
     if (retrieval_query.tree_search) |tree_search| {
-        if (query_request.graph_searches != null) return error.UnsupportedRetrievalAgentRequest;
-        query_request.graph_searches = try buildTreeGraphSearches(
+        if (query_request.graph_queries != null)
+            return error.UnsupportedRetrievalAgentRequest;
+        query_request.graph_queries = try buildTreeGraphSearches(
             arena,
             runner,
             retrieval_query.table orelse return error.InvalidRetrievalAgentRequest,
@@ -5483,7 +5479,24 @@ fn encodeQueryValueForRetrievalQuery(
         );
     }
 
-    return try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+    // This is an internal request hop, so keep the canonical wire compact and
+    // preserve the public absent-vs-null contract for optional fields.
+    return try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+}
+
+fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
+    var canonical: QueryRequest = .{};
+    const query_info = @typeInfo(QueryRequest).@"struct";
+    inline for (query_info.field_names, query_info.field_types) |field_name, Field| {
+        if (!@hasField(RetrievalQueryRequest, field_name)) {
+            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field_name);
+        }
+        if (@TypeOf(@field(request, field_name)) != Field) {
+            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field_name);
+        }
+        @field(canonical, field_name) = @field(request, field_name);
+    }
+    return canonical;
 }
 
 const MandatoryPredicates = struct {
@@ -5517,16 +5530,24 @@ fn buildMandatoryPredicates(
     for (queries, out) |query, *predicates| {
         if (query.table == null) return error.InvalidRetrievalAgentRequest;
         predicates.* = global;
+        const filter_query = if (query.filter_query) |raw|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+        else
+            null;
+        const exclusion_query = if (query.exclusion_query) |raw|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+        else
+            null;
         predicates.filter_query = try combineMandatoryPredicate(
             alloc,
             predicates.filter_query,
-            query.filter_query,
+            filter_query,
             "conjuncts",
         );
         predicates.exclusion_query = try combineMandatoryPredicate(
             alloc,
             predicates.exclusion_query,
-            query.exclusion_query,
+            exclusion_query,
             "disjuncts",
         );
     }
@@ -5641,18 +5662,32 @@ fn applyMandatoryPredicates(
     query_request: *QueryRequest,
     mandatory: MandatoryPredicates,
 ) !void {
-    query_request.filter_query = try combineMandatoryPredicate(
+    const existing_filter = if (query_request.filter_query) |raw|
+        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+    else
+        null;
+    const existing_exclusion = if (query_request.exclusion_query) |raw|
+        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+    else
+        null;
+    const combined_filter = try combineMandatoryPredicate(
         alloc,
-        query_request.filter_query,
+        existing_filter,
         mandatory.filter_query,
         "conjuncts",
     );
-    query_request.exclusion_query = try combineMandatoryPredicate(
+    const combined_exclusion = try combineMandatoryPredicate(
         alloc,
-        query_request.exclusion_query,
+        existing_exclusion,
         mandatory.exclusion_query,
         "disjuncts",
     );
+    query_request.filter_query = if (combined_filter) |value| try rawQueryFromValueAlloc(alloc, value) else null;
+    query_request.exclusion_query = if (combined_exclusion) |value| try rawQueryFromValueAlloc(alloc, value) else null;
+}
+
+fn rawQueryFromValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !metadata_openapi.RawQuery {
+    return .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
 }
 
 fn combineMandatoryPredicate(
@@ -5674,11 +5709,12 @@ fn combineMandatoryPredicate(
 }
 
 fn applyClassificationRefinement(
+    alloc: std.mem.Allocator,
     query_request: *QueryRequest,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
-) void {
+) !void {
     const classification = classification_result orelse return;
     const refined_text = selectRefinedQueryText(classification, retrieval_query_index, refinement_pass) orelse return;
 
@@ -5687,9 +5723,11 @@ fn applyClassificationRefinement(
     }
     if (refinement_pass == .evaluation) {
         if (query_request.full_text_search) |*full_text| {
-            if (full_text.* == .object) {
-                if (full_text.object.getPtr("query")) |query_value| {
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, full_text.bytes, .{});
+            if (parsed == .object) {
+                if (parsed.object.getPtr("query")) |query_value| {
                     query_value.* = .{ .string = refined_text };
+                    full_text.* = try rawQueryFromValueAlloc(alloc, parsed);
                 }
             }
         }
@@ -5754,14 +5792,15 @@ fn initialRefinedQueryText(
 }
 
 fn currentRetrievalQueryText(
+    alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
 ) ?[]const u8 {
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
-        if (extractQueryString(full_text)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
-        if (extractQueryString(filter_query)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, filter_query)) |query| return query;
     }
     return null;
 }
@@ -5777,6 +5816,7 @@ fn containsUsedQueryText(
 }
 
 fn nextEvaluationRefinedQueryText(
+    alloc: std.mem.Allocator,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
@@ -5801,7 +5841,7 @@ fn nextEvaluationRefinedQueryText(
     if (!containsUsedQueryText(used_queries, semantic_query)) return semantic_query;
     if (!containsUsedQueryText(used_queries, classification.improved_query)) return classification.improved_query;
 
-    if (currentRetrievalQueryText(retrieval_query)) |current_query| {
+    if (currentRetrievalQueryText(alloc, retrieval_query)) |current_query| {
         if (!containsUsedQueryText(used_queries, current_query)) return current_query;
     }
     return null;
@@ -5830,8 +5870,8 @@ fn buildTreeGraphSearches(
     previous_query_hits: []const QueryHit,
     query_limit: ?i64,
 ) !std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    errdefer graph_searches.deinit(alloc);
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    errdefer graph_queries.deinit(alloc);
 
     const start_nodes = try buildTreeStartNodes(alloc, runner, table_name, query_request, tree_search, previous_query_hits);
     const max_depth = tree_search.max_depth orelse 5;
@@ -5841,19 +5881,23 @@ fn buildTreeGraphSearches(
     else
         @max(@as(i64, 1), max_depth * beam_width);
 
-    try graph_searches.map.put(alloc, "tree_search", .{
-        .type = .traverse,
-        .index_name = tree_search.index,
-        .start_nodes = start_nodes,
-        .params = .{
-            .direction = .out,
+    const traverse_query = try alloc.create(indexes_openapi.GraphTraverseQuery);
+    traverse_query.* = .{
+        .index = tree_search.index,
+        .traverse = .{
+            .start = start_nodes,
             .max_depth = max_depth,
-            .max_results = max_results,
-            .deduplicate_nodes = true,
+            .limit = max_results,
+            // Tree retrieval consumes both the document and its ancestry when
+            // ranking branches and grounding generation. Keep those semantics
+            // explicit in the canonical graph query instead of relying on the
+            // legacy graph-search response to include them implicitly.
+            .include_documents = true,
+            .include_paths = true,
         },
-        .include_documents = true,
-    });
-    return graph_searches;
+    };
+    try graph_queries.map.put(alloc, "tree_search", .{ .graph_traverse_query = traverse_query });
+    return graph_queries;
 }
 
 fn buildTreeStartNodes(
@@ -5868,28 +5912,45 @@ fn buildTreeStartNodes(
         const trimmed = std.mem.trim(u8, start_nodes, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidRetrievalAgentRequest;
         if (std.mem.eql(u8, trimmed, "$roots")) {
-            return .{ .keys = try discoverTreeRootKeys(
+            return try makeTreeKeyNodeSelector(alloc, try discoverTreeRootKeys(
                 alloc,
                 runner,
                 table_name,
                 tree_search.index,
                 query_request.filter_query,
                 query_request.exclusion_query,
-            ) };
+            ));
         }
         if (trimmed[0] == '$') {
-            if (hasInlineTreeSeedSearch(query_request)) {
-                return .{ .result_ref = "$tree_search" };
-            }
-            return .{ .keys = try buildTreeStartKeysFromHits(alloc, previous_query_hits) };
+            if (treeSeedResultRef(query_request)) |result_ref|
+                return try makeTreeResultRefNodeSelector(alloc, result_ref, query_request.limit);
+            return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
         }
-        return .{ .keys = try buildTreeStartKeysFromCsv(alloc, trimmed) };
+        return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromCsv(alloc, trimmed));
     }
 
-    if (hasInlineTreeSeedSearch(query_request)) {
-        return .{ .result_ref = "$tree_search" };
-    }
-    return .{ .keys = try buildTreeStartKeysFromHits(alloc, previous_query_hits) };
+    if (treeSeedResultRef(query_request)) |result_ref|
+        return try makeTreeResultRefNodeSelector(alloc, result_ref, query_request.limit);
+    return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
+}
+
+fn makeTreeKeyNodeSelector(
+    alloc: std.mem.Allocator,
+    keys: []const []const u8,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphKeyNodeSelector);
+    value.* = .{ .keys = keys };
+    return .{ .graph_key_node_selector = value };
+}
+
+fn makeTreeResultRefNodeSelector(
+    alloc: std.mem.Allocator,
+    result_ref: []const u8,
+    limit: ?i64,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphResultRefNodeSelector);
+    value.* = .{ .result_ref = result_ref, .limit = limit };
+    return .{ .graph_result_ref_node_selector = value };
 }
 
 fn retrievalQueryDiscoversTreeRoots(retrieval_query: RetrievalQueryRequest) bool {
@@ -5898,12 +5959,14 @@ fn retrievalQueryDiscoversTreeRoots(retrieval_query: RetrievalQueryRequest) bool
     return std.mem.eql(u8, std.mem.trim(u8, start_nodes, " \t\r\n"), "$roots");
 }
 
-fn hasInlineTreeSeedSearch(query_request: QueryRequest) bool {
-    return query_request.full_text_search != null or
-        query_request.semantic_search != null or
-        query_request.embeddings != null or
+fn treeSeedResultRef(query_request: QueryRequest) ?[]const u8 {
+    const has_lexical = query_request.full_text_search != null or
         query_request.filter_query != null or
         query_request.exclusion_query != null;
+    const has_semantic = query_request.semantic_search != null or
+        query_request.embeddings != null;
+    if (has_lexical or has_semantic) return "$query_results";
+    return null;
 }
 
 fn buildTreeStartKeysFromHits(
@@ -5942,22 +6005,14 @@ fn discoverTreeRootKeys(
     runner: QueryRunner,
     table_name: []const u8,
     index_name: []const u8,
-    filter_query: ?std.json.Value,
-    exclusion_query: ?std.json.Value,
+    filter_query: ?metadata_openapi.RawQuery,
+    exclusion_query: ?metadata_openapi.RawQuery,
 ) ![]const []const u8 {
     const scan_page_size: u32 = 256;
     const max_root_keys: usize = 4096;
 
-    const filter_query_json = if (filter_query) |value|
-        try std.json.Stringify.valueAlloc(alloc, value, .{})
-    else
-        null;
-    defer if (filter_query_json) |value| alloc.free(value);
-    const exclusion_query_json = if (exclusion_query) |value|
-        try std.json.Stringify.valueAlloc(alloc, value, .{})
-    else
-        null;
-    defer if (exclusion_query_json) |value| alloc.free(value);
+    const filter_query_json = if (filter_query) |value| value.bytes else null;
+    const exclusion_query_json = if (exclusion_query) |value| value.bytes else null;
 
     var roots = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -6040,20 +6095,18 @@ fn extractTreeHits(
         var it = graph_results.map.iterator();
         while (it.next()) |entry| {
             const graph_result = entry.value_ptr.*;
-            const nodes = entry.value_ptr.nodes orelse continue;
-            for (nodes) |node| {
+            const node_result = switch (graph_result) {
+                .graph_nodes_result => |value| value,
+                else => continue,
+            };
+            for (node_result.nodes) |node| {
                 const source = if (node.document) |document|
-                    try annotateTreeDocument(alloc, document, entry.key_ptr.*, node, graph_result.paths orelse &.{}, fallback_root_key)
+                    try annotateTreeDocument(alloc, document, entry.key_ptr.*, node, &.{}, fallback_root_key)
                 else
                     null;
                 try hits.append(alloc, .{
                     ._id = node.key,
-                    ._score = if (node.depth) |depth|
-                        1.0 / (1.0 + @as(f32, @floatFromInt(depth)))
-                    else if (node.distance) |distance|
-                        @floatCast(distance)
-                    else
-                        1.0,
+                    ._score = 1.0 / (1.0 + @as(f32, @floatFromInt(node.depth))),
                     ._source = source,
                 });
             }
@@ -6126,18 +6179,16 @@ fn treeHitBranchRank(
 
 fn annotateTreeDocument(
     alloc: std.mem.Allocator,
-    document: std.json.Value,
+    document: std.json.ArrayHashMap(std.json.Value),
     search_name: []const u8,
     node: indexes_openapi.GraphResultNode,
     graph_paths: []const GraphPath,
     fallback_root_key: ?[]const u8,
-) !std.json.Value {
-    if (document != .object) return try json_helpers.cloneJsonValue(alloc, document);
-
+) !std.json.ArrayHashMap(std.json.Value) {
     var object = std.json.ObjectMap.empty;
     errdefer object.deinit(alloc);
 
-    var it = document.object.iterator();
+    var it = document.map.iterator();
     while (it.next()) |entry| {
         try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try json_helpers.cloneJsonValue(alloc, entry.value_ptr.*));
     }
@@ -6145,59 +6196,42 @@ fn annotateTreeDocument(
     var tree_meta = std.json.ObjectMap.empty;
     errdefer tree_meta.deinit(alloc);
     try tree_meta.put(alloc, "search", .{ .string = try alloc.dupe(u8, search_name) });
-    const depth = node.depth orelse 0;
-    if (node.depth) |node_depth| try tree_meta.put(alloc, "depth", .{ .integer = @intCast(node_depth) });
-    const node_path = bestTreePathPrefixForNode(graph_paths, node.key) orelse node.path;
-    if (node_path) |path| {
-        if (path.len >= 1) {
-            try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, path[0]) });
-        }
-        if (path.len >= 2) {
-            try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, path[path.len - 2]) });
-        }
-        try tree_meta.put(alloc, "path_length", .{ .integer = @intCast(path.len) });
-        var path_text = std.ArrayListUnmanaged(u8).empty;
-        defer path_text.deinit(alloc);
-        for (path, 0..) |segment, i| {
-            if (i != 0) try path_text.appendSlice(alloc, " > ");
-            try path_text.appendSlice(alloc, segment);
-        }
-        try tree_meta.put(alloc, "path_text", .{ .string = try path_text.toOwnedSlice(alloc) });
-        if (bestTreeBranchPathForNode(graph_paths, node.key)) |branch_path| {
-            try tree_meta.put(alloc, "branch_path_length", .{ .integer = @intCast(branch_path.len) });
-            try tree_meta.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, branch_path[branch_path.len - 1], node.key) });
-            var branch_path_text = std.ArrayListUnmanaged(u8).empty;
-            defer branch_path_text.deinit(alloc);
-            for (branch_path, 0..) |segment, i| {
-                if (i != 0) try branch_path_text.appendSlice(alloc, " > ");
-                try branch_path_text.appendSlice(alloc, segment);
+    const depth = node.depth;
+    try tree_meta.put(alloc, "depth", .{ .integer = @intCast(depth) });
+    var has_path = false;
+    if (bestTreePathPrefixForNode(graph_paths, node.key)) |path| {
+        const branch = bestTreeBranchPathForNode(graph_paths, node.key) orelse &.{};
+        try putTreePathMetadata(alloc, &tree_meta, path, branch, node.key);
+        has_path = true;
+    } else if (node.path) |path| {
+        try putTreePathMetadata(alloc, &tree_meta, path, @as([]const []const u8, &.{}), node.key);
+        has_path = true;
+    }
+    if (!has_path) {
+        if (fallback_root_key) |root_key| {
+            try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, root_key) });
+            if (depth == 1 and !std.mem.eql(u8, root_key, node.key)) {
+                try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, root_key) });
+                try tree_meta.put(alloc, "path_length", .{ .integer = 2 });
+                try tree_meta.put(alloc, "path_text", .{ .string = try std.fmt.allocPrint(alloc, "{s} > {s}", .{ root_key, node.key }) });
+            } else if (depth == 0 or std.mem.eql(u8, root_key, node.key)) {
+                try tree_meta.put(alloc, "path_length", .{ .integer = 1 });
+                try tree_meta.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, root_key) });
             }
-            try tree_meta.put(alloc, "branch_path_text", .{ .string = try branch_path_text.toOwnedSlice(alloc) });
-        }
-    } else if (fallback_root_key) |root_key| {
-        try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, root_key) });
-        if (depth == 1 and !std.mem.eql(u8, root_key, node.key)) {
-            try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, root_key) });
-            try tree_meta.put(alloc, "path_length", .{ .integer = 2 });
-            try tree_meta.put(alloc, "path_text", .{ .string = try std.fmt.allocPrint(alloc, "{s} > {s}", .{ root_key, node.key }) });
-        } else if (depth == 0 or std.mem.eql(u8, root_key, node.key)) {
-            try tree_meta.put(alloc, "path_length", .{ .integer = 1 });
-            try tree_meta.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, root_key) });
         }
     }
 
     try object.put(alloc, "_tree", .{ .object = tree_meta });
-    return .{ .object = object };
+    return .{ .map = object };
 }
 
 fn bestTreePathPrefixForNode(
     graph_paths: []const GraphPath,
     node_key: []const u8,
-) ?[]const []const u8 {
-    var best: ?[]const []const u8 = null;
+) ?[]const indexes_openapi.GraphPathEndpoint {
+    var best: ?[]const indexes_openapi.GraphPathEndpoint = null;
     for (graph_paths) |path| {
-        const nodes = path.nodes orelse continue;
-        const prefix = treePathPrefixForNode(nodes, node_key) orelse continue;
+        const prefix = treePathPrefixForNode(path.nodes, node_key) orelse continue;
         if (best == null or prefix.len > best.?.len) best = prefix;
     }
     return best;
@@ -6206,10 +6240,10 @@ fn bestTreePathPrefixForNode(
 fn bestTreeBranchPathForNode(
     graph_paths: []const GraphPath,
     node_key: []const u8,
-) ?[]const []const u8 {
-    var best: ?[]const []const u8 = null;
+) ?[]const indexes_openapi.GraphPathEndpoint {
+    var best: ?[]const indexes_openapi.GraphPathEndpoint = null;
     for (graph_paths) |path| {
-        const nodes = path.nodes orelse continue;
+        const nodes = path.nodes;
         if (treePathPrefixForNode(nodes, node_key) == null) continue;
         if (best == null or nodes.len > best.?.len) best = nodes;
     }
@@ -6217,28 +6251,71 @@ fn bestTreeBranchPathForNode(
 }
 
 fn treePathPrefixForNode(
-    path_nodes: []const []const u8,
+    path_nodes: []const indexes_openapi.GraphPathEndpoint,
     node_key: []const u8,
-) ?[]const []const u8 {
+) ?[]const indexes_openapi.GraphPathEndpoint {
     for (path_nodes, 0..) |segment, i| {
-        if (std.mem.eql(u8, segment, node_key)) return path_nodes[0 .. i + 1];
+        if (std.mem.eql(u8, segment.key, node_key)) return path_nodes[0 .. i + 1];
     }
     return null;
+}
+
+fn putTreePathMetadata(
+    alloc: std.mem.Allocator,
+    tree_meta: *std.json.ObjectMap,
+    path: anytype,
+    branch_path: anytype,
+    node_key: []const u8,
+) !void {
+    if (path.len >= 1) {
+        try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, treePathSegmentKey(path[0])) });
+    }
+    if (path.len >= 2) {
+        try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, treePathSegmentKey(path[path.len - 2])) });
+    }
+    try tree_meta.put(alloc, "path_length", .{ .integer = @intCast(path.len) });
+    try tree_meta.put(alloc, "path_text", .{ .string = try treePathTextAlloc(alloc, path) });
+    if (branch_path.len > 0) {
+        try tree_meta.put(alloc, "branch_path_length", .{ .integer = @intCast(branch_path.len) });
+        try tree_meta.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, treePathSegmentKey(branch_path[branch_path.len - 1]), node_key) });
+        try tree_meta.put(alloc, "branch_path_text", .{ .string = try treePathTextAlloc(alloc, branch_path) });
+    }
+}
+
+fn treePathTextAlloc(alloc: std.mem.Allocator, path: anytype) ![]u8 {
+    var text = std.ArrayListUnmanaged(u8).empty;
+    errdefer text.deinit(alloc);
+    for (path, 0..) |segment, i| {
+        if (i != 0) try text.appendSlice(alloc, " > ");
+        try text.appendSlice(alloc, treePathSegmentKey(segment));
+    }
+    return try text.toOwnedSlice(alloc);
+}
+
+fn treePathSegmentKey(segment: anytype) []const u8 {
+    if (comptime @hasField(@TypeOf(segment), "key")) return segment.key;
+    return segment;
 }
 
 fn extractTreeFallbackRootKey(
     alloc: std.mem.Allocator,
     query_json: []const u8,
 ) !?[]const u8 {
-    var parsed = std.json.parseFromSlice(QueryRequest, alloc, query_json, .{
+    var parsed = ant_json.parseFromSlice(QueryRequest, alloc, query_json, .{
         .ignore_unknown_fields = true,
     }) catch return null;
     defer parsed.deinit();
 
-    const graph_searches = parsed.value.graph_searches orelse return null;
-    const tree_query = graph_searches.map.get("tree_search") orelse return null;
-    const start_nodes = tree_query.start_nodes orelse return null;
-    const keys = start_nodes.keys orelse return null;
+    const graph_queries = parsed.value.graph_queries orelse return null;
+    const tree_query = graph_queries.map.get("tree_search") orelse return null;
+    const start_nodes = switch (tree_query) {
+        .graph_traverse_query => |query| query.traverse.start,
+        else => return null,
+    };
+    const keys = switch (start_nodes) {
+        .graph_key_node_selector => |selector| selector.keys,
+        else => return null,
+    };
     if (keys.len != 1) return null;
     return keys[0];
 }
@@ -6292,11 +6369,19 @@ test "retrieval agent rejects removed search tool name" {
 
 test "retrieval agent requires every tool used by a combined retrieval query" {
     const semantic_graph_body =
-        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{"related":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}},"limit":5}]}
+        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}},"limit":5}]}
     ;
     try std.testing.expectError(
         error.UnsupportedRetrievalAgentRequest,
         executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, semantic_graph_body),
+    );
+
+    const semantic_legacy_graph_body =
+        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{"related":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, semantic_legacy_graph_body),
     );
 
     const tree_seed_body =
@@ -6328,8 +6413,8 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
             if (parsed_query.value.aggregations) |aggregations| {
                 try std.testing.expectEqual(@as(usize, 0), aggregations.map.count());
             }
-            if (parsed_query.value.graph_searches) |graph_searches| {
-                try std.testing.expectEqual(@as(usize, 0), graph_searches.map.count());
+            if (parsed_query.value.graph_queries) |graph_queries| {
+                try std.testing.expectEqual(@as(usize, 0), graph_queries.map.count());
             }
 
             return .{
@@ -6352,7 +6437,7 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
     try std.testing.expectEqual(RetrievalStrategy.bm25, empty_aggregations_result.value.strategy_used.?);
 
     const empty_graph_body =
-        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{},"limit":5}]}
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const empty_graph_encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, empty_graph_body);
     defer std.testing.allocator.free(empty_graph_encoded);
@@ -6431,14 +6516,19 @@ test "retrieval agent supports inline tree search" {
 
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_json: []const u8) !query_api.QueryResponse {
             try std.testing.expectEqualStrings("docs", table_name);
+            var admitted = try query_api.parsePublicQueryRequest(alloc, null, table_name, query_json);
+            defer admitted.deinit(alloc);
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
-            const graph_searches = parsed_query.value.graph_searches.?;
-            const tree_query = graph_searches.map.get("tree_search").?;
-            try std.testing.expectEqualStrings("$tree_search", tree_query.start_nodes.?.result_ref.?);
+            const graph_queries = parsed_query.value.graph_queries.?;
+            const tree_query = graph_queries.map.get("tree_search").?;
+            try std.testing.expectEqualStrings("$query_results", tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+            try std.testing.expectEqual(@as(?i64, 5), tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.limit);
+            try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_documents.?);
+            try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -6485,7 +6575,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -6567,7 +6657,7 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -7155,8 +7245,8 @@ test "generation ordering prefers tree ancestors before leaves" {
     try leaf_source.put(alloc, "_tree", .{ .object = leaf_tree });
 
     const ordered = try orderHitsForGeneration(alloc, &[_]QueryHit{
-        .{ ._id = "doc:leaf", ._score = 1.0, ._source = .{ .object = leaf_source } },
-        .{ ._id = "doc:root", ._score = 0.5, ._source = .{ .object = root_source } },
+        .{ ._id = "doc:leaf", ._score = 1.0, ._source = .{ .map = leaf_source } },
+        .{ ._id = "doc:root", ._score = 0.5, ._source = .{ .map = root_source } },
     });
     try std.testing.expectEqualStrings("doc:root", ordered[0]._id);
     try std.testing.expectEqualStrings("doc:leaf", ordered[1]._id);
@@ -7171,21 +7261,28 @@ test "annotate tree document prefers graph path branch metadata" {
     try document.put(alloc, "title", .{ .string = try alloc.dupe(u8, "child") });
 
     const paths = [_]GraphPath{
-        .{ .nodes = &[_][]const u8{ "doc:root", "doc:child", "doc:leaf" } },
+        .{
+            .nodes = &.{ .{ .key = "doc:root" }, .{ .key = "doc:child" }, .{ .key = "doc:leaf" } },
+            .edges = &.{},
+            .length = 2,
+            .objective = .min_hops,
+            .weight_sum = 2,
+            .objective_value = 2,
+        },
     };
     const annotated = try annotateTreeDocument(
         alloc,
-        .{ .object = document },
+        .{ .map = document },
         "tree_search",
         .{
             .key = "doc:child",
             .depth = 1,
-            .document = .{ .object = document },
+            .document = .{ .map = document },
         },
         &paths,
         null,
     );
-    const meta = annotated.object.get("_tree").?.object;
+    const meta = annotated.map.get("_tree").?.object;
     try std.testing.expectEqualStrings("doc:root", meta.get("root").?.string);
     try std.testing.expectEqualStrings("doc:root", meta.get("parent").?.string);
     try std.testing.expectEqualStrings("doc:root > doc:child", meta.get("path_text").?.string);
@@ -7197,14 +7294,14 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
     const alloc = std.testing.allocator;
 
     const response_json =
-        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[
+        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[
         \\{"key":"doc:b","depth":1,"document":{"title":"branch b"}},
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
         \\],"paths":[
-        \\{"nodes":["doc:root","doc:a","doc:a:leaf"]},
-        \\{"nodes":["doc:root","doc:b"]}
-        \\],"total":3,"took":1}}}]}
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:a"},{"key":"doc:a:leaf"}],"edges":[],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2},
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:b"}],"edges":[],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}
+        \\],"stats":{"returned_items":3,"truncated":false}}}}]}
     ;
 
     var parsed = try std.json.parseFromSlice(QueryResponses, alloc, response_json, .{});
@@ -7331,20 +7428,20 @@ test "retrieval agent can select multiple evaluation refinement phrases" {
         .limit = 5,
     };
 
-    const first = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const first = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
     }).?;
     try std.testing.expectEqualStrings("architecture overview", first);
 
-    const second = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const second = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
         "architecture overview",
     }).?;
     try std.testing.expectEqualStrings("architecture planning", second);
 
-    const third = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const third = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
         "architecture overview",
@@ -7843,7 +7940,7 @@ test "retrieval agent streaming emits go-shaped tree search progress" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"},"path":[{"key":"doc:root"},{"key":"doc:child"}]}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -7913,8 +8010,8 @@ test "retrieval agent agentic mode selects one best query" {
     try std.testing.expect(parsed.value.classification != null);
     const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
     const selection_details = selection_step.details.?;
-    try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "heuristic"));
-    try std.testing.expect(selection_details.object.get("candidate_scores").?.array.items.len == 2);
+    try std.testing.expect(std.mem.eql(u8, selection_details.map.get("selection_source").?.string, "heuristic"));
+    try std.testing.expect(selection_details.map.get("candidate_scores").?.array.items.len == 2);
 }
 
 test "retrieval agent agentic mode can resolve ambiguity by probing candidates" {
@@ -7972,8 +8069,8 @@ test "retrieval agent agentic mode can resolve ambiguity by probing candidates" 
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
     const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
     const selection_details = selection_step.details.?;
-    try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "probe"));
-    const candidate_scores = selection_details.object.get("candidate_scores").?.array.items;
+    try std.testing.expect(std.mem.eql(u8, selection_details.map.get("selection_source").?.string, "probe"));
+    const candidate_scores = selection_details.map.get("candidate_scores").?.array.items;
     try std.testing.expect(candidate_scores.len == 2);
     try std.testing.expect(candidate_scores[0].object.get("probe_hits") != null);
     try std.testing.expect(candidate_scores[1].object.get("probe_hits") != null);
@@ -8037,7 +8134,7 @@ test "retrieval agent agentic mode evaluates misses and falls back to the next q
     try std.testing.expectEqual(@as(usize, 1), parsed.value.hits.len);
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
     const evaluation_details = parsed.value.steps.?[3].details.?;
-    const candidate_scores = evaluation_details.object.get("candidate_scores").?.array.items;
+    const candidate_scores = evaluation_details.map.get("candidate_scores").?.array.items;
     try std.testing.expect(candidate_scores.len == 2);
     try std.testing.expect(candidate_scores[1].object.get("probe_hits") != null);
 
@@ -8653,7 +8750,7 @@ test "retrieval agent refines step-back semantic queries before execution" {
     for (parsed.value.steps.?) |step| {
         if (!std.mem.eql(u8, step.name, "refine_query")) continue;
         const details = step.details orelse continue;
-        const phase = details.object.get("phase") orelse continue;
+        const phase = details.map.get("phase") orelse continue;
         if (phase == .string and std.mem.eql(u8, phase.string, "step_back_initial")) {
             found = true;
             break;

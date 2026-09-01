@@ -88,19 +88,19 @@ fn computeTensorOffsets(
 
 fn metadataValueType(value: format.MetadataValue) u32 {
     return switch (value) {
-        .u8 => @intFromEnum(format.MetadataValueType.u8),
-        .i8 => @intFromEnum(format.MetadataValueType.i8),
-        .u16 => @intFromEnum(format.MetadataValueType.u16),
-        .i16 => @intFromEnum(format.MetadataValueType.i16),
-        .u32 => @intFromEnum(format.MetadataValueType.u32),
-        .i32 => @intFromEnum(format.MetadataValueType.i32),
-        .f32 => @intFromEnum(format.MetadataValueType.f32),
-        .bool_ => @intFromEnum(format.MetadataValueType.bool_),
-        .string => @intFromEnum(format.MetadataValueType.string),
-        .array => @intFromEnum(format.MetadataValueType.array),
-        .u64 => @intFromEnum(format.MetadataValueType.u64),
-        .i64 => @intFromEnum(format.MetadataValueType.i64),
-        .f64 => @intFromEnum(format.MetadataValueType.f64),
+        .u8 => @backingInt(format.MetadataValueType.u8),
+        .i8 => @backingInt(format.MetadataValueType.i8),
+        .u16 => @backingInt(format.MetadataValueType.u16),
+        .i16 => @backingInt(format.MetadataValueType.i16),
+        .u32 => @backingInt(format.MetadataValueType.u32),
+        .i32 => @backingInt(format.MetadataValueType.i32),
+        .f32 => @backingInt(format.MetadataValueType.f32),
+        .bool_ => @backingInt(format.MetadataValueType.bool_),
+        .string => @backingInt(format.MetadataValueType.string),
+        .array => @backingInt(format.MetadataValueType.array),
+        .u64 => @backingInt(format.MetadataValueType.u64),
+        .i64 => @backingInt(format.MetadataValueType.i64),
+        .f64 => @backingInt(format.MetadataValueType.f64),
     };
 }
 
@@ -120,7 +120,7 @@ fn appendMetadataValue(
         .bool_ => |item| try appendLe(u8, allocator, data, if (item) 1 else 0),
         .string => |item| try appendString(allocator, data, item),
         .array => |arr| {
-            try appendLe(u32, allocator, data, @intFromEnum(arr.element_type));
+            try appendLe(u32, allocator, data, @backingInt(arr.element_type));
             try appendLe(u64, allocator, data, arr.values.len);
             for (arr.values) |item| try appendMetadataValue(allocator, data, item);
         },

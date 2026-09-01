@@ -2383,6 +2383,8 @@ test "failed destination authorization refresh reuses the idempotent restore job
 }
 
 test "replicated restore persistence maps private callback errors to stable unavailability" {
+    @import("../test_error_logs.zig").expectErrorLogs(2);
+
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     const replicated = persistence.persistence();
@@ -2816,6 +2818,8 @@ test "replicated restore mutations are rejected after leadership term changes" {
 }
 
 test "restore dispatch recovery retains worker ownership when begin fails" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);

@@ -396,7 +396,7 @@ fn runProvisionedDenseIngest(
         alloc.free(owner_stats);
     }
     for (owner_stats) |owner| {
-        const bulk = owner.maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(antfly.lsm_backend.MutableSnapshotReason.bulk_current_scan)];
+        const bulk = owner.maintenance.mutable_snapshot_clone_by_reason[@backingInt(antfly.lsm_backend.MutableSnapshotReason.bulk_current_scan)];
         summary.bulk_clone_calls +|= bulk.calls;
         summary.bulk_clone_bytes +|= bulk.bytes_total;
         summary.bulk_clone_peak_bytes = @max(summary.bulk_clone_peak_bytes, bulk.peak_bytes);

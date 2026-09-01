@@ -1165,9 +1165,10 @@ pub const DBCore = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
         node_admission: ?NodeAdmission,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1178,6 +1179,7 @@ pub const DBCore = struct {
             .min_weight = min_weight,
             .max_weight = max_weight,
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 
@@ -1192,9 +1194,10 @@ pub const DBCore = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
         node_admission: ?NodeAdmission,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1205,6 +1208,7 @@ pub const DBCore = struct {
             .min_weight = min_weight,
             .max_weight = max_weight,
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 
@@ -1218,6 +1222,31 @@ pub const DBCore = struct {
     ) ![]graph_pattern_mod.PatternMatch {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try graph_pattern_mod.matchPattern(alloc, &entry.index, start_keys, pattern, opts);
+    }
+
+    pub fn graphMatchConjunctivePattern(
+        self: *DBCore,
+        alloc: Allocator,
+        index_name: []const u8,
+        start_keys: []const []const u8,
+        pattern: graph_pattern_mod.ConjunctivePattern,
+        opts: graph_pattern_mod.MatchOptions,
+    ) ![]graph_pattern_mod.PatternMatch {
+        const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try graph_pattern_mod.matchConjunctivePattern(alloc, &entry.index, start_keys, pattern, opts);
+    }
+
+    pub fn graphAggregateConjunctivePattern(
+        self: *DBCore,
+        alloc: Allocator,
+        index_name: []const u8,
+        start_keys: []const []const u8,
+        pattern: graph_pattern_mod.ConjunctivePattern,
+        specs: []const graph_pattern_mod.CountAggregateSpec,
+        opts: graph_pattern_mod.MatchOptions,
+    ) ![]graph_pattern_mod.CountAggregateResult {
+        const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try graph_pattern_mod.aggregateConjunctivePattern(alloc, &entry.index, start_keys, pattern, specs, opts);
     }
 
     pub fn documentRangeLowerAlloc(self: *DBCore, raw_key: []const u8) ![]u8 {

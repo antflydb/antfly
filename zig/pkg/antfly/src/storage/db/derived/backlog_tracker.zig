@@ -153,7 +153,7 @@ pub const Tracker = struct {
 
 test "derived backlog tracker accounts and releases payload bytes" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };
@@ -164,22 +164,22 @@ test "derived backlog tracker accounts and releases payload bytes" {
     try tracker.track(std.testing.allocator, 1, 8);
     try tracker.track(std.testing.allocator, 2, 15);
     var stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 23), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
-    try std.testing.expectEqual(@as(u64, 1), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].soft_limit_events);
-    try std.testing.expectEqual(@as(u64, 1), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].hard_limit_rejections);
+    try std.testing.expectEqual(@as(u64, 23), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].soft_limit_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].hard_limit_rejections);
 
     tracker.releaseThrough(1);
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 15), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 15), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
 
     tracker.releaseThrough(2);
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
 }
 
 test "derived backlog tracker reports throttle pressure" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };
@@ -196,7 +196,7 @@ test "derived backlog tracker reports throttle pressure" {
 
 test "derived backlog tracker fails closed when sequence accounting allocation fails" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };
@@ -251,7 +251,7 @@ test "derived backlog tracker bounds sequence-only admission drain window" {
 
 test "derived backlog tracker reacts to aggregate lsm state pressure" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };

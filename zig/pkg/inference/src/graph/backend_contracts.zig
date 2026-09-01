@@ -49,6 +49,25 @@ pub const A4bResidencyMode = enum(u8) {
     resident,
 };
 
+/// Host-file to CUDA transfer policy for the qualified A4B runtime. `auto`
+/// selects the bounded multithreaded pipeline and may fall back to the legacy
+/// mmap upload only when the host cannot provide the required pinned staging
+/// resources. The choice is frozen at admission.
+pub const A4bLoadStrategy = enum(u8) {
+    auto,
+    pipeline,
+    legacy,
+};
+
+/// Selection policy for an optional prepared A4B CUDA load pack. Prepared
+/// packs are derived, bit-preserving load artifacts; the canonical model
+/// remains the source of architecture and tokenizer metadata.
+pub const A4bPreparedPackMode = enum(u8) {
+    auto,
+    off,
+    required,
+};
+
 /// The complete caller-controlled A4B surface. Expert slots, prefetch depth,
 /// worker counts, and routing placement are intentionally backend-owned.
 pub const A4bInferenceRequest = struct {
@@ -56,7 +75,30 @@ pub const A4bInferenceRequest = struct {
     /// Total memory envelope in MiB. Zero selects the conservative 2 GiB
     /// streamed floor; an explicitly smaller value is rejected.
     memory_budget_mb: u32 = 0,
+    load_strategy: A4bLoadStrategy = .auto,
+    /// Zero selects the production default. Explicit values are bounded so a
+    /// model request cannot create an unbounded host thread pool.
+    load_workers: u8 = 0,
+    /// Zero selects the production default. This is the aggregate pinned-host
+    /// staging envelope rather than a per-worker allocation.
+    load_staging_mb: u32 = 0,
+    prepared_pack: A4bPreparedPackMode = .auto,
+    drop_host_cache_after_load: bool = false,
 };
+
+/// The qualified CUDA lane owns the complete packed expert set. This value is
+/// the single source of truth for its implicit public request and must be used
+/// by device construction, resource admission, and CLI preflight alike.
+pub const qualified_cuda_a4b_memory_budget_mb: u32 = 16 * 1024;
+
+pub fn effectiveCudaA4bRequest(request: ?A4bInferenceRequest) A4bInferenceRequest {
+    var effective = request orelse A4bInferenceRequest{};
+    if (effective.memory_budget_mb == 0)
+        effective.memory_budget_mb = qualified_cuda_a4b_memory_budget_mb;
+    if (effective.residency_mode == .auto)
+        effective.residency_mode = .resident;
+    return effective;
+}
 
 pub const A4bExpertGeometry = struct {
     moe_layer_count: u16,
@@ -86,6 +128,11 @@ pub const A4bInferenceConfig = struct {
     safety_reserve_bytes: u64 = default_safety_reserve_bytes,
     expert_cache_slots: u8,
     geometry: A4bExpertGeometry,
+    load_strategy: A4bLoadStrategy,
+    load_workers: u8,
+    load_staging_bytes: u64,
+    prepared_pack: A4bPreparedPackMode,
+    drop_host_cache_after_load: bool,
 
     pub const min_memory_budget_mb: u32 = 2048;
     /// Unassigned headroom inside the public envelope. Sixty-four MiB is the
@@ -96,6 +143,11 @@ pub const A4bInferenceConfig = struct {
     pub const min_expert_cache_slots: u8 = 8;
     pub const max_expert_cache_slots: u8 = 128;
     pub const expert_arena_alignment: u64 = 16 * 1024;
+    pub const default_load_workers: u8 = 4;
+    pub const max_load_workers: u8 = 8;
+    pub const default_load_staging_mb: u32 = 256;
+    pub const min_load_staging_mb: u32 = 64;
+    pub const max_load_staging_mb: u32 = 1024;
 
     pub fn softLimitBytes(self: A4bInferenceConfig) u64 {
         return self.memory_budget_bytes -| self.safety_reserve_bytes;
@@ -127,6 +179,8 @@ pub const A4bConfigError = error{
     A4bResidentBudgetTooSmall,
     A4bUnsupportedArtifact,
     A4bUnsupportedGeometry,
+    A4bInvalidLoadWorkers,
+    A4bInvalidLoadStagingBudget,
 };
 
 pub fn isQualifiedA4bGeometry(geometry: A4bExpertGeometry) bool {
@@ -147,6 +201,14 @@ pub fn buildA4bInferenceConfig(
         request.memory_budget_mb < A4bInferenceConfig.min_memory_budget_mb)
     {
         return error.A4bBudgetTooSmall;
+    }
+    if (request.load_workers > A4bInferenceConfig.max_load_workers)
+        return error.A4bInvalidLoadWorkers;
+    if (request.load_staging_mb != 0 and
+        (request.load_staging_mb < A4bInferenceConfig.min_load_staging_mb or
+            request.load_staging_mb > A4bInferenceConfig.max_load_staging_mb))
+    {
+        return error.A4bInvalidLoadStagingBudget;
     }
 
     const budget_mb = if (request.memory_budget_mb == 0)
@@ -175,6 +237,17 @@ pub fn buildA4bInferenceConfig(
         .kv_budget_bytes = kv_budget_bytes,
         .expert_cache_slots = slots,
         .geometry = geometry,
+        .load_strategy = request.load_strategy,
+        .load_workers = if (request.load_workers == 0)
+            A4bInferenceConfig.default_load_workers
+        else
+            request.load_workers,
+        .load_staging_bytes = @as(u64, if (request.load_staging_mb == 0)
+            A4bInferenceConfig.default_load_staging_mb
+        else
+            request.load_staging_mb) * 1024 * 1024,
+        .prepared_pack = request.prepared_pack,
+        .drop_host_cache_after_load = request.drop_host_cache_after_load,
     };
     const full_resident = @as(u16, slots) == geometry.expert_count and
         budget_bytes >= config.fullResidencyFloorBytes();
@@ -186,6 +259,13 @@ pub fn buildA4bInferenceConfig(
     return config;
 }
 
+pub fn buildCudaA4bInferenceConfig(
+    request: ?A4bInferenceRequest,
+    geometry: A4bExpertGeometry,
+) A4bConfigError!A4bInferenceConfig {
+    return buildA4bInferenceConfig(effectiveCudaA4bRequest(request), geometry);
+}
+
 test "A4B inference contract is qualified and budget derived" {
     const geometry = qualified_a4b_geometries[0];
     const floor = try buildA4bInferenceConfig(.{}, geometry);
@@ -193,6 +273,9 @@ test "A4B inference contract is qualified and budget derived" {
     try std.testing.expectEqual(@as(u8, 8), floor.expert_cache_slots);
     try std.testing.expectEqual(@as(u64, 2048) * 1024 * 1024, floor.memory_budget_bytes);
     try std.testing.expectEqual(@as(u64, 512) * 1024 * 1024, floor.kv_budget_bytes);
+    try std.testing.expectEqual(A4bLoadStrategy.auto, floor.load_strategy);
+    try std.testing.expectEqual(@as(u8, 4), floor.load_workers);
+    try std.testing.expectEqual(@as(u64, 256) * 1024 * 1024, floor.load_staging_bytes);
 
     try std.testing.expectEqual(@as(u8, 24), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 4096 }, geometry)).expert_cache_slots);
     try std.testing.expectEqual(@as(u8, 45), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 6144 }, geometry)).expert_cache_slots);
@@ -213,6 +296,26 @@ test "A4B inference contract is qualified and budget derived" {
     try std.testing.expect(resident.memory_budget_bytes >= resident.fullResidencyFloorBytes());
 }
 
+test "CUDA A4B effective policy defaults to the qualified resident envelope" {
+    const geometry = qualified_a4b_geometries[0];
+    const implicit = try buildCudaA4bInferenceConfig(null, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.resident, implicit.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        implicit.memory_budget_bytes,
+    );
+
+    const explicit_streamed = try buildCudaA4bInferenceConfig(.{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 2048,
+    }, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.streamed, explicit_streamed.residency_mode);
+    try std.testing.expectError(
+        error.A4bResidentBudgetTooSmall,
+        buildCudaA4bInferenceConfig(.{ .memory_budget_mb = 2048 }, geometry),
+    );
+}
+
 test "A4B inference contract fails closed" {
     const geometry = qualified_a4b_geometries[0];
     try std.testing.expectError(
@@ -222,6 +325,14 @@ test "A4B inference contract fails closed" {
     try std.testing.expectError(
         error.A4bResidentBudgetTooSmall,
         buildA4bInferenceConfig(.{ .residency_mode = .resident }, geometry),
+    );
+    try std.testing.expectError(
+        error.A4bInvalidLoadWorkers,
+        buildA4bInferenceConfig(.{ .load_workers = 9 }, geometry),
+    );
+    try std.testing.expectError(
+        error.A4bInvalidLoadStagingBudget,
+        buildA4bInferenceConfig(.{ .load_staging_mb = 32 }, geometry),
     );
     var wrong = geometry;
     wrong.expert_count -= 1;
@@ -520,6 +631,10 @@ pub const DecoderRuntimeApplyRmsNormLinearRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    /// Diagnostic-only escape hatch used by the fail-closed LM-head repack
+    /// quality campaign. Ordinary full-logit consumers retain checkpoint
+    /// semantics through the exact companion slot.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = struct {
@@ -559,6 +674,11 @@ pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = struct {
 /// Sample from the full logits left resident in the backend's sample-logits
 /// buffer by the most recent decode frame's fused lm-head tail.
 pub const DecoderRuntimeSampleResidentLogitsRequest = struct {
+    /// Identifies the tail that produced the resident buffer. Backends use the
+    /// slot and shape to reject sampling when that buffer contains lossy
+    /// transformed logits rather than checkpoint-format logits.
+    linear_slot: usize,
+    hidden_size: usize,
     out_dim: usize,
     /// Gemma-style final-logit softcap applied on-device before sampling
     /// (0 = disabled).
@@ -582,6 +702,17 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
+    /// True only for the vocab-projection (lm_head) slot; gates head-specific
+    /// prepare transforms (the opt-in Q4 repack) so shape heuristics cannot
+    /// misfire on large FFN projections.
+    lm_head: bool = false,
+    /// Optional slot that retains the checkpoint-format lm_head while `slot`
+    /// carries a lossy fast-path transform. Backends that do not implement
+    /// exact candidate refinement ignore it.
+    lm_head_refine_slot: ?usize = null,
+    /// Stage this dense-BF16 slot to Q8_0 at prepare time (half the bytes,
+    /// planned quant-MMV route instead of a dense encoder break).
+    prefer_q8_over_dense_bf16: bool = false,
     allow_direct_quant_fallback: bool = false,
     prefer_bf16_fallback: bool = false,
     prefer_f16_mps_fallback: bool = false,
@@ -600,6 +731,8 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     input: CT,
     in_dim: usize,
     out_dim: usize,
+    /// See DecoderRuntimeApplyRmsNormLinearRequest.use_transformed_lm_head.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {

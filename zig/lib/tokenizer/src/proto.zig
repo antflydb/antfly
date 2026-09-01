@@ -64,7 +64,7 @@ pub fn parseModelProto(allocator: std.mem.Allocator, data: []const u8) !ModelPro
         pieces[i] = .{
             .text = p.piece,
             .score = p.score,
-            .piece_type = @intCast(@intFromEnum(p.type)),
+            .piece_type = @intCast(@backingInt(p.type)),
         };
     }
 

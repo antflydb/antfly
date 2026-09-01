@@ -481,19 +481,19 @@ fn resourceManagerOptions(cfg: Config) resource_manager_mod.Options {
     switch (cfg.resource_profile) {
         .normal => {},
         .full_text_stress => {
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
                 .soft_limit_bytes = 256 * 1024,
                 .hard_limit_bytes = 512 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
                 .soft_limit_bytes = 512 * 1024,
                 .hard_limit_bytes = 1024 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
                 .soft_limit_bytes = 512 * 1024,
                 .hard_limit_bytes = 1024 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{
                 .soft_limit_bytes = 256 * 1024,
                 .hard_limit_bytes = 512 * 1024,
             };

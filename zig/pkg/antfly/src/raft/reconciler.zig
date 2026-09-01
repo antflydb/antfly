@@ -659,10 +659,10 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, intent.record.group_id);
     hashU64(&hasher, intent.record.replica_id);
     hashU64(&hasher, intent.record.local_node_id);
-    hashU64(&hasher, @as(u64, @intFromEnum(intent.record.bootstrap_mode)));
+    hashU64(&hasher, @as(u64, @backingInt(intent.record.bootstrap_mode)));
     hashU64(&hasher, intent.record.metadata_version);
     hashU64(&hasher, intent.store_id);
-    hashU64(&hasher, @intFromEnum(intent.serving_state));
+    hashU64(&hasher, @backingInt(intent.serving_state));
     hashU64(&hasher, intent.relocation_generation);
     hashU64(&hasher, intent.relocation_source_node_id);
     hashU64(&hasher, intent.relocation_source_store_id);

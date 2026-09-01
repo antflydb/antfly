@@ -57,7 +57,7 @@ const method_count = @typeInfo(types.Method).@"enum".field_names.len;
 /// Routes are partitioned by HTTP method for O(R/M) lookup instead of O(R).
 pub const Router = struct {
     allocator: Allocator,
-    /// Per-method route lists indexed by @intFromEnum(method).
+    /// Per-method route lists indexed by @backingInt(method).
     method_routes: [method_count]std.ArrayListUnmanaged(Route) = @as([method_count]std.ArrayListUnmanaged(Route), @splat(.empty)),
     body_limited_route_count: usize = 0,
     body_limited_route_counts: [method_count]usize = @as([method_count]usize, @splat(0)),

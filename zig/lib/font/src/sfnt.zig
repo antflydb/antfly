@@ -274,6 +274,7 @@ pub const Font = struct {
                 const glyph = switch (format) {
                     0 => try cmapFormat0Glyph(sub, codepoint),
                     4 => try cmapFormat4Glyph(sub, codepoint),
+                    6 => try cmapFormat6Glyph(sub, codepoint),
                     12 => try cmapFormat12Glyph(sub, codepoint),
                     else => null,
                 };
@@ -304,6 +305,7 @@ pub const Font = struct {
             const glyph = switch (readU16(sub, 0)) {
                 0 => try cmapFormat0Glyph(sub, codepoint),
                 4 => try cmapFormat4Glyph(sub, codepoint),
+                6 => try cmapFormat6Glyph(sub, codepoint),
                 12 => try cmapFormat12Glyph(sub, codepoint),
                 else => null,
             };
@@ -612,6 +614,24 @@ fn cmapFormat4Glyph(sub: []const u8, codepoint: u21) Error!?u16 {
     return null;
 }
 
+/// Format 6 is the compact trimmed table commonly retained by older
+/// Macintosh font subsets. Its character codes are in the platform encoding
+/// domain (for example MacRoman), so callers use exact platform lookup when
+/// the PDF font dictionary selects that encoding.
+fn cmapFormat6Glyph(sub: []const u8, codepoint: u21) Error!?u16 {
+    if (sub.len < 10) return error.TruncatedSfnt;
+    const declared_len: usize = readU16(sub, 2);
+    if (declared_len < 10 or declared_len > sub.len) return error.TruncatedSfnt;
+    const first_code = readU16(sub, 6);
+    const entry_count = readU16(sub, 8);
+    if (entry_count > (declared_len - 10) / 2) return error.TruncatedSfnt;
+    if (codepoint < first_code) return null;
+    const index = codepoint - first_code;
+    if (index >= entry_count) return null;
+    const glyph = readU16(sub, 10 + @as(usize, @intCast(index)) * 2);
+    return if (glyph == 0) null else glyph;
+}
+
 fn cmapFormat12Glyph(sub: []const u8, codepoint: u21) Error!?u16 {
     if (sub.len < 16) return error.TruncatedSfnt;
     const num_groups = readU32(sub, 12);
@@ -909,6 +929,28 @@ test "sfnt reader parses head maxp hhea and glyph range" {
 test "sfnt reader rejects invalid scaler type" {
     const bytes = [_]u8{ 0, 0, 0, 0 } ++ @as([8]u8, @splat(0));
     try std.testing.expectError(error.InvalidSfnt, Font.init(std.testing.allocator, &bytes));
+}
+
+test "sfnt cmap format 6 maps a bounded trimmed code range" {
+    const sub = [_]u8{
+        0, 6, // format
+        0, 16, // length
+        0, 0, // language
+        0, 65, // firstCode
+        0, 3, // entryCount
+        0, 7,
+        0, 0,
+        0, 9,
+    };
+    try std.testing.expectEqual(@as(?u16, null), try cmapFormat6Glyph(&sub, 64));
+    try std.testing.expectEqual(@as(?u16, 7), try cmapFormat6Glyph(&sub, 65));
+    try std.testing.expectEqual(@as(?u16, null), try cmapFormat6Glyph(&sub, 66));
+    try std.testing.expectEqual(@as(?u16, 9), try cmapFormat6Glyph(&sub, 67));
+    try std.testing.expectEqual(@as(?u16, null), try cmapFormat6Glyph(&sub, 68));
+
+    var truncated = sub;
+    truncated[3] = 18;
+    try std.testing.expectError(error.TruncatedSfnt, cmapFormat6Glyph(&truncated, 65));
 }
 
 test "sfnt reader maps cmap and extracts simple glyph outline" {

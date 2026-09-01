@@ -83,6 +83,10 @@ pub const BackendType = enum {
         };
     }
 
+    pub fn supportsA4bSession(self: BackendType) bool {
+        return self == .metal or self == .cuda;
+    }
+
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
@@ -217,6 +221,23 @@ pub const SessionManager = struct {
             fallback_backends,
             &required_buf,
         );
+        const fail_closed_cuda_a4b = self.a4b_inference_request == null and
+            backendOrderSelectsCudaBeforeCpu(effective_backends) and
+            if (manifest) |m|
+                ((session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                    self.allocator,
+                    model_path,
+                    m,
+                    null,
+                ) catch |err| blk: {
+                    std.log.warn(
+                        "CUDA A4B auto-policy inspection failed for {s}: {s}",
+                        .{ model_path, @errorName(err) },
+                    );
+                    break :blk null;
+                }) != null)
+            else
+                false;
 
         // Every backend below logs its failure and moves on, so without this the caller
         // only ever sees a blanket NoBackendAvailable. The actionable cause -- a GGUF
@@ -225,8 +246,15 @@ pub const SessionManager = struct {
         var first_err: ?anyerror = null;
 
         for (effective_backends) |backend| {
+            if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
+                std.log.err(
+                    "qualified CUDA A4B model {s} rejected CPU fallback after GPU admission failure",
+                    .{model_path},
+                );
+                return first_err orelse error.A4bCudaAutoFallbackForbidden;
+            }
             if (!backendAcceptsA4bRequest(backend, self.a4b_inference_request)) {
-                first_err = first_err orelse error.A4bRequiresMetal;
+                first_err = first_err orelse error.A4bRequiresGpu;
                 continue;
             }
             // The imported-ONNX graph runtime has no A4B residency contract.
@@ -307,11 +335,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    session_factory.createCudaSessionWithKernelJitAndLoadContext(
+                    session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
@@ -505,7 +534,16 @@ fn backendAcceptsA4bRequest(
     backend: BackendType,
     request: ?backend_contracts.A4bInferenceRequest,
 ) bool {
-    return request == null or backend == .metal;
+    return request == null or backend == .metal or backend == .cuda;
+}
+
+pub fn backendOrderSelectsCudaBeforeCpu(order: []const BackendType) bool {
+    var saw_cuda = false;
+    for (order) |backend| {
+        if (backend == .cuda) saw_cuda = true;
+        if (!backend.supportsA4bSession()) return saw_cuda;
+    }
+    return false;
 }
 
 test "onnx artifact routes graph execution for direct compute backends" {
@@ -519,11 +557,18 @@ test "qualified workload profiles select direct Metal sessions only" {
     try std.testing.expect(!backendAcceptsQualifiedProfile(.cuda, "model.gguf"));
 }
 
-test "explicit A4B requests select Metal without generic backend fallback" {
+test "explicit A4B requests select GPU backends without generic fallback" {
     try std.testing.expect(backendAcceptsA4bRequest(.metal, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.cuda, .{}));
     try std.testing.expect(!backendAcceptsA4bRequest(.native, .{}));
-    try std.testing.expect(!backendAcceptsA4bRequest(.cuda, .{}));
     try std.testing.expect(backendAcceptsA4bRequest(.native, null));
+}
+
+test "CUDA-first automatic backend order is fail-closed before CPU" {
+    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .native }));
+    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .onnx, .native }));
+    try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .native, .cuda }));
+    try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .metal, .native }));
 }
 
 test "onnx backend availability follows linked onnx runtime" {

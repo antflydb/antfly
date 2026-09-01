@@ -371,10 +371,10 @@ fn parseRecord(raw: []const u8, offset: usize) !ParsedRecord {
     const value = payload[path.len + aux.len ..];
 
     const kind: RecordKind = switch (kind_raw) {
-        @intFromEnum(RecordKind.put) => .put,
-        @intFromEnum(RecordKind.delete) => .delete,
-        @intFromEnum(RecordKind.rename) => .rename,
-        @intFromEnum(RecordKind.delete_tree) => .delete_tree,
+        @backingInt(RecordKind.put) => .put,
+        @backingInt(RecordKind.delete) => .delete,
+        @backingInt(RecordKind.rename) => .rename,
+        @backingInt(RecordKind.delete_tree) => .delete_tree,
         else => return error.InvalidRecordKind,
     };
 
@@ -406,7 +406,7 @@ fn appendEncodedRecord(
     const record = out.items[start..][0..record_len];
 
     @memcpy(record[0..4], record_magic);
-    record[4] = @intFromEnum(kind);
+    record[4] = @backingInt(kind);
     std.mem.writeInt(u32, record[5..9], @intCast(path.len), .little);
     std.mem.writeInt(u32, record[9..13], @intCast(aux.len), .little);
     std.mem.writeInt(u64, record[13..21], value.len, .little);

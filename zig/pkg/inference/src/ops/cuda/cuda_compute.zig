@@ -25,6 +25,7 @@ const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
 const tensor_store_mod = @import("../../models/tensor_store.zig");
 const c_file = @import("../../util/c_file.zig");
+pub const a4b_prepared_pack = @import("a4b_prepared_pack.zig");
 const native_compute_mod = @import("../native_compute.zig");
 const run_memory = @import("../../runtime/tier/memory.zig");
 const load_plan = @import("load_plan.zig");
@@ -43,6 +44,7 @@ const kv_block_mod = @import("../../runtime/kv/block.zig");
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const gpt_arch = @import("../../architectures/gpt.zig");
 const gemma4_runtime = @import("../../architectures/gemma4_runtime.zig");
+const a4b_qualification = @import("../../runtime/moe/a4b_qualification.zig");
 const gpt_model = @import("../../models/gpt.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
@@ -80,6 +82,312 @@ pub const CudaTensorCoreQuantBuffer = struct {
     layout: CudaTensorCoreQuantLayout,
     row_blocks: usize,
     bytes: usize,
+};
+
+const max_a4b_layers = 256;
+// Match the scheduler's maximum idle prefill chunk so qualified server
+// requests never escape the device MoE path merely because a prompt is long.
+const max_a4b_prefill_rows = a4b_qualification.max_prefill_rows;
+
+const CudaA4bProjection = struct {
+    source: buffer_mod.DeviceBuffer,
+    base_offset: usize,
+    expert_stride: usize,
+
+    fn view(self: CudaA4bProjection) !buffer_mod.DeviceBuffer {
+        if (self.base_offset > self.source.len) return error.InvalidPackedExpertTensor;
+        return .{
+            .ptr = self.source.ptr + @as(u64, @intCast(self.base_offset)),
+            .len = self.source.len - self.base_offset,
+        };
+    }
+};
+
+const CudaA4bLayer = struct {
+    gate: CudaA4bProjection,
+    up: CudaA4bProjection,
+    down: CudaA4bProjection,
+};
+
+const CudaA4bSource = struct {
+    name: []u8,
+    buffer: buffer_mod.DeviceBuffer,
+};
+
+const CudaA4bSourceLoad = struct {
+    name: []u8,
+    raw_bytes: []const u8,
+    mmap_offset: ?usize,
+    load_order: usize,
+    lane: u8 = 0,
+};
+
+const CudaA4bSourceLoadPlan = struct {
+    sources: std.ArrayListUnmanaged(CudaA4bSourceLoad) = .empty,
+    total_bytes: usize = 0,
+    mmap_source_count: usize = 0,
+    parallel_lanes: u8 = 1,
+    prepared_pack: ?a4b_prepared_pack.Loaded = null,
+
+    fn deinit(self: *CudaA4bSourceLoadPlan, allocator: std.mem.Allocator) void {
+        for (self.sources.items) |source| allocator.free(source.name);
+        self.sources.deinit(allocator);
+        if (self.prepared_pack) |*pack| pack.deinit();
+        self.* = .{};
+    }
+};
+
+const CudaA4bLoadChunk = struct {
+    source_index: usize,
+    source_offset: usize,
+    len: usize,
+};
+
+const CudaA4bLoadSlotState = enum(u8) {
+    empty,
+    filling,
+    ready,
+    in_flight,
+};
+
+const CudaA4bLoadSlot = struct {
+    host: buffer_mod.HostBuffer = .{},
+    event: driver_mod.CUevent = null,
+    state: CudaA4bLoadSlotState = .empty,
+    task_index: usize = 0,
+};
+
+const CudaA4bLoadPipelineState = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    plan: *const CudaA4bSourceLoadPlan,
+    tasks: []const CudaA4bLoadChunk,
+    slots: []CudaA4bLoadSlot,
+    next_task: usize = 0,
+    workers_done: usize = 0,
+    stop: bool = false,
+    worker_copy_ns: u64 = 0,
+
+    fn lock(self: *CudaA4bLoadPipelineState) void {
+        platform.sync.lockYielding(&self.mutex);
+    }
+
+    const Observation = struct {
+        ready_index: ?usize = null,
+        in_flight_index: ?usize = null,
+        workers_done: usize,
+    };
+
+    /// Take one ready slot and observe completion under one lock acquisition.
+    /// A worker may publish its final ready slot immediately before incrementing
+    /// workers_done; keeping these observations atomic prevents the consumer
+    /// from declaring an incomplete pipeline while completed work is waiting.
+    fn observe(self: *CudaA4bLoadPipelineState) Observation {
+        self.lock();
+        defer self.mutex.unlock();
+        var result = Observation{ .workers_done = self.workers_done };
+        for (self.slots, 0..) |slot, index| {
+            switch (slot.state) {
+                .ready => if (result.ready_index == null) {
+                    self.slots[index].state = .in_flight;
+                    result.ready_index = index;
+                },
+                .in_flight => if (result.in_flight_index == null) {
+                    result.in_flight_index = index;
+                },
+                else => {},
+            }
+        }
+        return result;
+    }
+
+    fn workerMain(self: *CudaA4bLoadPipelineState) void {
+        while (true) {
+            self.lock();
+            if (self.stop or self.next_task >= self.tasks.len) {
+                self.workers_done += 1;
+                self.mutex.unlock();
+                return;
+            }
+            var slot_index: ?usize = null;
+            for (self.slots, 0..) |slot, index| {
+                if (slot.state == .empty) {
+                    slot_index = index;
+                    break;
+                }
+            }
+            if (slot_index == null) {
+                self.mutex.unlock();
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+                continue;
+            }
+            const task_index = self.next_task;
+            self.next_task += 1;
+            const slot = &self.slots[slot_index.?];
+            slot.state = .filling;
+            slot.task_index = task_index;
+            self.mutex.unlock();
+
+            const started_ns = platform.time.monotonicNs();
+            const task = self.tasks[task_index];
+            const source = self.plan.sources.items[task.source_index].raw_bytes;
+            @memcpy(
+                slot.host.bytes()[0..task.len],
+                source[task.source_offset..][0..task.len],
+            );
+            const elapsed_ns = platform.time.monotonicNs() -| started_ns;
+
+            self.lock();
+            if (self.stop) {
+                slot.state = .empty;
+                self.workers_done += 1;
+                self.mutex.unlock();
+                return;
+            }
+            self.worker_copy_ns +|= elapsed_ns;
+            slot.state = .ready;
+            self.mutex.unlock();
+        }
+    }
+};
+
+test "CUDA A4B pipeline drains a final ready slot after workers finish" {
+    var slots = [_]CudaA4bLoadSlot{
+        .{ .state = .empty },
+        .{ .state = .ready, .task_index = 7 },
+        .{ .state = .in_flight, .task_index = 6 },
+    };
+    var state = CudaA4bLoadPipelineState{
+        .plan = undefined,
+        .tasks = &.{},
+        .slots = &slots,
+        .workers_done = 4,
+    };
+    const observation = state.observe();
+    try std.testing.expectEqual(@as(?usize, 1), observation.ready_index);
+    try std.testing.expectEqual(@as(?usize, 2), observation.in_flight_index);
+    try std.testing.expectEqual(@as(usize, 4), observation.workers_done);
+    try std.testing.expectEqual(CudaA4bLoadSlotState.in_flight, slots[1].state);
+}
+
+fn a4bSourceLoadLessThan(_: void, lhs: CudaA4bSourceLoad, rhs: CudaA4bSourceLoad) bool {
+    if (lhs.load_order != rhs.load_order) return lhs.load_order < rhs.load_order;
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+test "CUDA A4B source upload order follows mmap offsets" {
+    var mapped: [64]u8 = @splat(0);
+    try std.testing.expectEqual(@as(?usize, 24), c_file.mappedSliceOffset(&mapped, mapped[24..32]));
+    try std.testing.expectEqual(@as(?usize, null), c_file.mappedSliceOffset(mapped[16..], mapped[0..8]));
+
+    var sources = [_]CudaA4bSourceLoad{
+        .{ .name = @constCast("heap"), .raw_bytes = &.{}, .mmap_offset = null, .load_order = std.math.maxInt(usize) },
+        .{ .name = @constCast("later"), .raw_bytes = &.{}, .mmap_offset = 48, .load_order = 48 },
+        .{ .name = @constCast("earlier"), .raw_bytes = &.{}, .mmap_offset = 8, .load_order = 8 },
+    };
+    std.mem.sort(CudaA4bSourceLoad, &sources, {}, a4bSourceLoadLessThan);
+    try std.testing.expectEqualStrings("earlier", sources[0].name);
+    try std.testing.expectEqualStrings("later", sources[1].name);
+    try std.testing.expectEqualStrings("heap", sources[2].name);
+}
+
+const A4bPackedProjectionLayout = struct {
+    base_offset: usize,
+    expert_stride: usize,
+};
+
+fn a4bPackedProjectionLayout(
+    storage: *const weight_source_mod.QuantizedStorage,
+    expected_experts: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !A4bPackedProjectionLayout {
+    const packed_view = storage.packed_expert orelse return error.InvalidPackedExpertTensor;
+    if (!storage.tensor_type.eql(.{ .known = .Q4_0 }) or
+        @as(usize, packed_view.expert_count) != expected_experts)
+    {
+        return error.A4bCudaUnsupportedPackedWeight;
+    }
+    const meta = try quant_codec.packedExpertLinearMeta(
+        storage.shape,
+        @intCast(packed_view.expert_axis),
+        0,
+        in_dim,
+        out_dim,
+        storage.tensor_type,
+    );
+    const base_blocks = try quant_codec.packedExpertLinearRowBlockBase(
+        meta,
+        0,
+        0,
+        @intCast(packed_view.row_offset),
+    );
+    const base_offset = try checkedMul(base_blocks, meta.block_size);
+    const projection_bytes = try checkedMul(
+        out_dim,
+        try checkedMul(meta.row_blocks, meta.block_size),
+    );
+    const expert_stride = if (packed_view.expert_count > 1) blk: {
+        const next_blocks = try quant_codec.packedExpertLinearRowBlockBase(
+            meta,
+            1,
+            0,
+            @intCast(packed_view.row_offset),
+        );
+        const next_offset = try checkedMul(next_blocks, meta.block_size);
+        if (next_offset <= base_offset) return error.InvalidPackedExpertTensor;
+        break :blk next_offset - base_offset;
+    } else projection_bytes;
+    const last_expert: usize = @intCast(packed_view.expert_count - 1);
+    const last_offset = try checkedAdd(base_offset, try checkedMul(last_expert, expert_stride));
+    if (last_offset > storage.raw_bytes.len or projection_bytes > storage.raw_bytes.len - last_offset)
+        return error.InvalidPackedExpertTensor;
+    return .{ .base_offset = base_offset, .expert_stride = expert_stride };
+}
+
+const CudaA4bRuntime = struct {
+    config: backend_contracts.A4bInferenceConfig,
+    sources: std.ArrayListUnmanaged(CudaA4bSource) = .empty,
+    packed_markers: std.StringHashMapUnmanaged(CudaTensor) = .empty,
+    layers: [max_a4b_layers]?CudaA4bLayer = @as([max_a4b_layers]?CudaA4bLayer, @splat(null)),
+    route_ids: buffer_mod.DeviceBuffer = .{},
+    route_weights: buffer_mod.DeviceBuffer = .{},
+    input_q8: buffer_mod.DeviceBuffer = .{},
+    activated: buffer_mod.DeviceBuffer = .{},
+    activated_q8: buffer_mod.DeviceBuffer = .{},
+    expert_output: buffer_mod.DeviceBuffer = .{},
+    loaded_source_bytes: usize = 0,
+    route_calls: u64 = 0,
+    decode_calls: u64 = 0,
+    prefill_calls: u64 = 0,
+
+    fn deinit(self: *CudaA4bRuntime, compute: *CudaCompute) void {
+        compute.ctx.synchronize() catch {};
+        self.route_ids.free(&compute.ctx);
+        self.route_weights.free(&compute.ctx);
+        self.input_q8.free(&compute.ctx);
+        self.activated.free(&compute.ctx);
+        self.activated_q8.free(&compute.ctx);
+        self.expert_output.free(&compute.ctx);
+        for (self.sources.items) |*source| {
+            source.buffer.free(&compute.ctx);
+            compute.allocator.free(source.name);
+        }
+        self.sources.deinit(compute.allocator);
+        var marker_it = self.packed_markers.iterator();
+        while (marker_it.next()) |entry| {
+            compute.allocator.free(entry.key_ptr.*);
+            compute.allocator.free(entry.value_ptr.shape);
+        }
+        self.packed_markers.deinit(compute.allocator);
+        self.* = undefined;
+    }
+
+    fn sourceByName(self: *CudaA4bRuntime, name: []const u8) ?buffer_mod.DeviceBuffer {
+        for (self.sources.items) |source| {
+            if (std.mem.eql(u8, source.name, name)) return source.buffer;
+        }
+        return null;
+    }
 };
 
 pub const CapabilityProfile = enum {
@@ -767,6 +1075,31 @@ pub const RuntimeStats = struct {
     d2h_bytes: usize = 0,
     d2d_bytes: usize = 0,
     resident_weight_bytes: usize = 0,
+    a4b_resident_source_bytes: usize = 0,
+    a4b_resident_source_count: usize = 0,
+    a4b_load_plan_ns: u64 = 0,
+    a4b_load_dense_upload_ns: u64 = 0,
+    a4b_load_dense_weight_count: usize = 0,
+    a4b_load_dense_mmap_weight_count: usize = 0,
+    a4b_load_host_stage_ns: u64 = 0,
+    a4b_load_h2d_ns: u64 = 0,
+    a4b_load_finalize_ns: u64 = 0,
+    a4b_load_total_ns: u64 = 0,
+    a4b_load_workers: usize = 0,
+    a4b_load_staging_bytes: usize = 0,
+    a4b_load_chunks: usize = 0,
+    a4b_load_pipeline_attempts: u64 = 0,
+    a4b_load_pipeline_successes: u64 = 0,
+    a4b_load_pipeline_fallbacks: u64 = 0,
+    a4b_load_prepared_pack_hits: u64 = 0,
+    a4b_load_prepared_pack_misses: u64 = 0,
+    a4b_route_calls: u64 = 0,
+    a4b_decode_calls: u64 = 0,
+    a4b_prefill_calls: u64 = 0,
+    a4b_compact_down_hits: u64 = 0,
+    a4b_compact_down_fallbacks: u64 = 0,
+    a4b_exact_lm_head_hits: u64 = 0,
+    a4b_exact_lm_head_fallbacks: u64 = 0,
     bf16_mirror_weight_count: usize = 0,
     bf16_mirror_weight_bytes: usize = 0,
     device_allocated_bytes: usize = 0,
@@ -1715,6 +2048,10 @@ pub const CudaCompute = struct {
     ctx: context_mod.CudaContext,
     kernels: kernels_mod.KernelModule,
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
+    /// Frozen load-time contract for the qualified resident Gemma 4 A4B path.
+    /// A non-null value is fail-closed: generic MoE fallback is not permitted.
+    a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
+    a4b_runtime: ?CudaA4bRuntime = null,
     lazy_host_store: ?*native_compute_mod.WeightStore = null,
     lazy_device_epochs: std.StringHashMapUnmanaged(u64) = .{},
     lazy_device_bytes: usize = 0,
@@ -2033,6 +2370,10 @@ pub const CudaCompute = struct {
         for (&self.debug_cuda_graph_slots) |*slot| {
             deinitCudaGraphReplaySlot(self, slot);
         }
+        if (self.a4b_runtime) |*runtime| {
+            runtime.deinit(self);
+            self.a4b_runtime = null;
+        }
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_upload_arena.host.free(&self.ctx);
@@ -2149,7 +2490,25 @@ pub const CudaCompute = struct {
         stats.cuda_temp_arena_plan_admission_budget_bytes = self.temp_arena_planner.admission_budget_bytes;
         stats.cuda_temp_arena_plan_admission_denials = self.temp_arena_planner.admission_denials;
         stats.deferred_free_pending_bytes = self.deferred_device_free_bytes;
+        if (self.a4b_runtime) |runtime| {
+            stats.a4b_resident_source_bytes = runtime.loaded_source_bytes;
+            stats.a4b_resident_source_count = runtime.sources.items.len;
+            stats.a4b_route_calls = runtime.route_calls;
+            stats.a4b_decode_calls = runtime.decode_calls;
+            stats.a4b_prefill_calls = runtime.prefill_calls;
+        }
         return stats;
+    }
+
+    pub fn noteA4bDenseUpload(
+        self: *CudaCompute,
+        elapsed_ns: u64,
+        weight_count: usize,
+        mmap_weight_count: usize,
+    ) void {
+        self.stats.a4b_load_dense_upload_ns +|= elapsed_ns;
+        self.stats.a4b_load_dense_weight_count +|= weight_count;
+        self.stats.a4b_load_dense_mmap_weight_count +|= mmap_weight_count;
     }
 
     pub fn attachLazyHostStore(self: *CudaCompute, store: *native_compute_mod.WeightStore) !void {
@@ -2160,6 +2519,639 @@ pub const CudaCompute = struct {
         );
         try installCudaLazyHostPrefetch(self, store);
         try initDenseHostPrefetch(self);
+    }
+
+    fn a4bWorkspaceBytes(config: backend_contracts.A4bInferenceConfig) !usize {
+        const rows = max_a4b_prefill_rows;
+        const top_k: usize = config.geometry.top_k;
+        const hidden: usize = @intCast(config.geometry.hidden_size);
+        const intermediate: usize = @intCast(config.geometry.expert_intermediate_size);
+        const routes = try checkedMul(rows, top_k);
+        var total: usize = 0;
+        total = try checkedAdd(total, try checkedMul(routes, @sizeOf(u32)));
+        total = try checkedAdd(total, try checkedMul(routes, @sizeOf(f32)));
+        total = try checkedAdd(total, try checkedMul(try checkedMul(rows, hidden / 32), 36));
+        total = try checkedAdd(total, try checkedMul(try checkedMul(routes, intermediate), @sizeOf(f32)));
+        total = try checkedAdd(total, try checkedMul(try checkedMul(routes, intermediate / 32), 36));
+        total = try checkedAdd(total, try checkedMul(try checkedMul(routes, hidden), @sizeOf(f32)));
+        return total;
+    }
+
+    fn a4bPackedStorage(
+        store: *native_compute_mod.WeightStore,
+        key: []const u8,
+    ) !weight_source_mod.QuantizedStorage {
+        const tensor_store = store.tensor_store orelse return error.A4bCudaPackedStoreUnavailable;
+        const entry = store.lazy_weights.getPtr(key) orelse return error.A4bCudaMissingPackedWeight;
+        return (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) orelse
+            error.A4bCudaPackedWeightNotQuantized;
+    }
+
+    fn a4bProjectionFromStorage(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        marker_name: []const u8,
+        storage: *const weight_source_mod.QuantizedStorage,
+        in_dim: usize,
+        out_dim: usize,
+    ) !CudaA4bProjection {
+        const layout = try a4bPackedProjectionLayout(
+            storage,
+            runtime.config.geometry.expert_count,
+            in_dim,
+            out_dim,
+        );
+        const source_name = storage.source_name orelse return error.A4bCudaMissingPackedSource;
+
+        const source = runtime.sourceByName(source_name) orelse
+            return error.A4bCudaMissingResidentSource;
+
+        if (runtime.packed_markers.contains(marker_name)) return error.A4bCudaDuplicatePackedWeight;
+        const owned_marker_name = try self.allocator.dupe(u8, marker_name);
+        errdefer self.allocator.free(owned_marker_name);
+        const marker_shape = try self.allocator.dupe(i64, storage.shape);
+        errdefer self.allocator.free(marker_shape);
+        var elem_count: usize = 1;
+        for (marker_shape) |dim| {
+            if (dim <= 0) return error.InvalidPackedExpertTensor;
+            elem_count = try checkedMul(elem_count, @intCast(dim));
+        }
+        try runtime.packed_markers.put(self.allocator, owned_marker_name, .{
+            .buffer = source,
+            .dtype = .u8,
+            .shape = marker_shape,
+            .elem_count = elem_count,
+            .quant_type = storage.tensor_type,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+        return .{ .source = source, .base_offset = layout.base_offset, .expert_stride = layout.expert_stride };
+    }
+
+    fn a4bPreparedPackGeometry(config: backend_contracts.A4bInferenceConfig) a4b_prepared_pack.GeometryIdentity {
+        return .{
+            .moe_layer_count = config.geometry.moe_layer_count,
+            .expert_count = config.geometry.expert_count,
+            .top_k = config.geometry.top_k,
+            .hidden_size = config.geometry.hidden_size,
+            .expert_intermediate_size = config.geometry.expert_intermediate_size,
+            .encoded_expert_bytes = config.geometry.encoded_expert_bytes,
+        };
+    }
+
+    fn loadA4bPreparedPackForConfig(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !?a4b_prepared_pack.Loaded {
+        if (config.prepared_pack == .off) return null;
+        return a4b_prepared_pack.load(
+            allocator,
+            model_path,
+            source_artifact_path,
+            a4bPreparedPackGeometry(config),
+        ) catch |err| switch (config.prepared_pack) {
+            .auto => blk: {
+                std.log.warn(
+                    "cuda_a4b: ignoring unusable optional prepared pack error={s}; using canonical GGUF",
+                    .{@errorName(err)},
+                );
+                break :blk null;
+            },
+            .required => return err,
+            .off => unreachable,
+        };
+    }
+
+    fn a4bSourceLoadPlan(
+        allocator: std.mem.Allocator,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !CudaA4bSourceLoadPlan {
+        var plan = CudaA4bSourceLoadPlan{};
+        errdefer plan.deinit(allocator);
+        var source_indices = std.StringHashMapUnmanaged(usize){};
+        defer {
+            var it = source_indices.keyIterator();
+            while (it.next()) |name| allocator.free(name.*);
+            source_indices.deinit(allocator);
+        }
+        var key_buf: [160]u8 = undefined;
+        for (0..config.geometry.moe_layer_count) |layer| {
+            inline for (.{ "w1", "w3", "w2" }) |projection| {
+                const key = try std.fmt.bufPrint(&key_buf, "model.layers.{d}.block_sparse_moe.packed.{s}.weight", .{ layer, projection });
+                var storage = try a4bPackedStorage(store, key);
+                defer storage.deinit();
+                const source_name = storage.source_name orelse return error.A4bCudaMissingPackedSource;
+                const mmap_offset = if (storage.raw_mmap_backed)
+                    if (storage.raw_mmap_source_bytes) |full|
+                        c_file.mappedSliceOffset(full, storage.raw_bytes)
+                    else
+                        null
+                else
+                    null;
+                if (source_indices.get(source_name)) |source_index| {
+                    const existing = plan.sources.items[source_index];
+                    if (@intFromPtr(existing.raw_bytes.ptr) != @intFromPtr(storage.raw_bytes.ptr) or
+                        existing.raw_bytes.len != storage.raw_bytes.len or
+                        existing.mmap_offset != mmap_offset)
+                    {
+                        return error.A4bCudaAmbiguousPackedSource;
+                    }
+                } else {
+                    const map_name = try allocator.dupe(u8, source_name);
+                    source_indices.put(allocator, map_name, plan.sources.items.len) catch |err| {
+                        allocator.free(map_name);
+                        return err;
+                    };
+                    const plan_name = try allocator.dupe(u8, source_name);
+                    plan.sources.append(allocator, .{
+                        .name = plan_name,
+                        .raw_bytes = storage.raw_bytes,
+                        .mmap_offset = mmap_offset,
+                        // Heap-backed sources follow file-backed ranges in
+                        // stable discovery order. Qualified GGUF sources are
+                        // mmap-backed, but fallback ordering remains explicit.
+                        .load_order = mmap_offset orelse std.math.maxInt(usize) / 2 + plan.sources.items.len,
+                    }) catch |err| {
+                        allocator.free(plan_name);
+                        return err;
+                    };
+                    plan.total_bytes = try checkedAdd(plan.total_bytes, storage.raw_bytes.len);
+                    if (mmap_offset != null) plan.mmap_source_count += 1;
+                }
+            }
+        }
+        std.mem.sort(CudaA4bSourceLoad, plan.sources.items, {}, a4bSourceLoadLessThan);
+        return plan;
+    }
+
+    fn a4bApplyPreparedPack(plan: *CudaA4bSourceLoadPlan, loaded: a4b_prepared_pack.Loaded) !void {
+        var pack = loaded;
+        errdefer pack.deinit();
+        if (pack.sources.len != plan.sources.items.len) return error.A4bPreparedPackSourceCountMismatch;
+        var max_lane: u8 = 0;
+        for (plan.sources.items) |*source| {
+            var match: ?a4b_prepared_pack.LoadedSource = null;
+            for (pack.sources) |candidate| {
+                if (std.mem.eql(u8, source.name, candidate.name)) {
+                    match = candidate;
+                    break;
+                }
+            }
+            const prepared = match orelse return error.A4bPreparedPackMissingSource;
+            if (prepared.bytes.len != source.raw_bytes.len) return error.A4bPreparedPackSourceLengthMismatch;
+            source.raw_bytes = prepared.bytes;
+            source.mmap_offset = null;
+            source.load_order = prepared.load_order;
+            source.lane = prepared.shard;
+            max_lane = @max(max_lane, prepared.shard);
+        }
+        std.mem.sort(CudaA4bSourceLoad, plan.sources.items, {}, a4bSourceLoadLessThan);
+        plan.mmap_source_count = plan.sources.items.len;
+        plan.parallel_lanes = max_lane + 1;
+        plan.prepared_pack = pack;
+    }
+
+    fn a4bResolvedSourceLoadPlan(
+        self: *CudaCompute,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !CudaA4bSourceLoadPlan {
+        var plan = try a4bSourceLoadPlan(self.allocator, store, config);
+        errdefer plan.deinit(self.allocator);
+        if (config.prepared_pack != .off) {
+            if (try loadA4bPreparedPackForConfig(
+                self.allocator,
+                model_path,
+                source_artifact_path,
+                config,
+            )) |loaded| {
+                try a4bApplyPreparedPack(&plan, loaded);
+                self.stats.a4b_load_prepared_pack_hits +|= 1;
+            } else if (config.prepared_pack == .required) {
+                return error.A4bPreparedPackRequired;
+            } else {
+                self.stats.a4b_load_prepared_pack_misses +|= 1;
+            }
+        }
+        return plan;
+    }
+
+    /// Cross-check an installed pack against the canonical packed-source
+    /// inventory without constructing a CUDA context. Session admission calls
+    /// this after native catalog parsing but before allocating device memory.
+    pub fn preflightA4bPreparedPackInventory(
+        allocator: std.mem.Allocator,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !void {
+        if (config.prepared_pack == .off) return;
+        var plan = try a4bSourceLoadPlan(allocator, store, config);
+        defer plan.deinit(allocator);
+        if (try loadA4bPreparedPackForConfig(
+            allocator,
+            model_path,
+            source_artifact_path,
+            config,
+        )) |loaded| {
+            try a4bApplyPreparedPack(&plan, loaded);
+            // Metadata preflight must never undo an earlier explicit prefetch.
+            if (plan.prepared_pack) |*pack| pack.preserveFileCacheOnDeinit();
+        } else if (config.prepared_pack == .required) {
+            return error.A4bPreparedPackRequired;
+        }
+    }
+
+    pub fn writeA4bPreparedPack(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        source_artifact_path: []const u8,
+        output_path: []const u8,
+        shard_count: u8,
+    ) !a4b_prepared_pack.WriteReport {
+        var plan = try a4bSourceLoadPlan(allocator, store, config);
+        defer plan.deinit(allocator);
+        const sources = try allocator.alloc(a4b_prepared_pack.SourceView, plan.sources.items.len);
+        defer allocator.free(sources);
+        for (plan.sources.items, 0..) |source, index| {
+            sources[index] = .{ .name = source.name, .bytes = source.raw_bytes };
+        }
+        return a4b_prepared_pack.write(
+            allocator,
+            io,
+            source_artifact_path,
+            output_path,
+            a4bPreparedPackGeometry(config),
+            sources,
+            shard_count,
+        );
+    }
+
+    fn loadA4bResidentSourcesLegacy(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        plan: *const CudaA4bSourceLoadPlan,
+    ) !void {
+        for (plan.sources.items) |source| {
+            var device = try allocDeviceBuffer(self, source.raw_bytes.len);
+            errdefer device.free(&self.ctx);
+            if (source.mmap_offset != null) {
+                c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
+            }
+            try copyFromHostTracked(self, device, source.raw_bytes);
+            const owned_name = try self.allocator.dupe(u8, source.name);
+            errdefer self.allocator.free(owned_name);
+            try runtime.sources.append(self.allocator, .{ .name = owned_name, .buffer = device });
+            runtime.loaded_source_bytes = try checkedAdd(runtime.loaded_source_bytes, source.raw_bytes.len);
+        }
+    }
+
+    fn prepareA4bResidentSourceDestinations(
+        self: *CudaCompute,
+        plan: *const CudaA4bSourceLoadPlan,
+    ) !std.ArrayListUnmanaged(CudaA4bSource) {
+        var sources = std.ArrayListUnmanaged(CudaA4bSource).empty;
+        errdefer {
+            for (sources.items) |*source| {
+                source.buffer.free(&self.ctx);
+                self.allocator.free(source.name);
+            }
+            sources.deinit(self.allocator);
+        }
+        try sources.ensureTotalCapacity(self.allocator, plan.sources.items.len);
+        for (plan.sources.items) |source| {
+            var device = try allocDeviceBuffer(self, source.raw_bytes.len);
+            errdefer device.free(&self.ctx);
+            const owned_name = try self.allocator.dupe(u8, source.name);
+            sources.appendAssumeCapacity(.{ .name = owned_name, .buffer = device });
+        }
+        return sources;
+    }
+
+    fn buildA4bLoadChunks(
+        self: *CudaCompute,
+        plan: *const CudaA4bSourceLoadPlan,
+        chunk_bytes: usize,
+    ) !std.ArrayListUnmanaged(CudaA4bLoadChunk) {
+        if (chunk_bytes == 0) return error.A4bCudaInvalidLoadStaging;
+        var chunks = std.ArrayListUnmanaged(CudaA4bLoadChunk).empty;
+        errdefer chunks.deinit(self.allocator);
+        if (plan.parallel_lanes <= 1) {
+            for (plan.sources.items, 0..) |source, source_index| {
+                var offset: usize = 0;
+                while (offset < source.raw_bytes.len) {
+                    const len = @min(chunk_bytes, source.raw_bytes.len - offset);
+                    try chunks.append(self.allocator, .{
+                        .source_index = source_index,
+                        .source_offset = offset,
+                        .len = len,
+                    });
+                    offset += len;
+                }
+            }
+            return chunks;
+        }
+
+        // Prepared shards are independent sequential files. Interleave one
+        // chunk from each source/lane so workers can keep all backing devices
+        // busy instead of draining an entire shard before opening the next.
+        const offsets = try self.allocator.alloc(usize, plan.sources.items.len);
+        defer self.allocator.free(offsets);
+        @memset(offsets, 0);
+        var remaining = plan.sources.items.len;
+        while (remaining > 0) {
+            for (0..plan.parallel_lanes) |lane| {
+                for (plan.sources.items, 0..) |source, source_index| {
+                    if (source.lane != lane or offsets[source_index] >= source.raw_bytes.len) continue;
+                    const offset = offsets[source_index];
+                    const len = @min(chunk_bytes, source.raw_bytes.len - offset);
+                    try chunks.append(self.allocator, .{
+                        .source_index = source_index,
+                        .source_offset = offset,
+                        .len = len,
+                    });
+                    offsets[source_index] += len;
+                    if (offsets[source_index] == source.raw_bytes.len) remaining -= 1;
+                }
+            }
+        }
+        return chunks;
+    }
+
+    fn loadA4bResidentSourcesPipeline(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        plan: *const CudaA4bSourceLoadPlan,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !void {
+        const worker_count: usize = config.load_workers;
+        if (worker_count == 0 or worker_count > backend_contracts.A4bInferenceConfig.max_load_workers)
+            return error.A4bCudaInvalidLoadWorkers;
+        const staging_bytes: usize = @intCast(config.load_staging_bytes);
+        const slot_count = worker_count * 2;
+        if (slot_count == 0 or staging_bytes < slot_count) return error.A4bCudaInvalidLoadStaging;
+        const page_size = std.heap.page_size_min;
+        const raw_chunk_bytes = staging_bytes / slot_count;
+        const chunk_bytes = std.mem.alignBackward(usize, raw_chunk_bytes, page_size);
+        if (chunk_bytes == 0) return error.A4bCudaInvalidLoadStaging;
+
+        var chunks = try self.buildA4bLoadChunks(plan, chunk_bytes);
+        defer chunks.deinit(self.allocator);
+        if (chunks.items.len == 0) return;
+
+        var slots = try self.allocator.alloc(CudaA4bLoadSlot, slot_count);
+        defer self.allocator.free(slots);
+        @memset(slots, .{});
+        var slots_initialized: usize = 0;
+        defer {
+            for (slots[0..slots_initialized]) |*slot| {
+                if (slot.event != null) self.ctx.destroyEvent(slot.event);
+                slot.host.free(&self.ctx);
+            }
+        }
+        for (slots) |*slot| {
+            slot.host = buffer_mod.HostBuffer.alloc(&self.ctx, chunk_bytes) catch |err| switch (err) {
+                error.CudaSymbolMissing, error.CudaHostAllocationFailed => return error.A4bCudaPinnedStagingUnavailable,
+                else => return err,
+            };
+            slot.event = try self.ctx.createStreamEvent();
+            slots_initialized += 1;
+        }
+
+        var sources = try self.prepareA4bResidentSourceDestinations(plan);
+        var sources_committed = false;
+        defer {
+            if (!sources_committed) {
+                for (sources.items) |*source| {
+                    source.buffer.free(&self.ctx);
+                    self.allocator.free(source.name);
+                }
+            }
+            sources.deinit(self.allocator);
+        }
+
+        try self.ctx.makeCurrent();
+        var upload_stream: driver_mod.CUstream = null;
+        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamCreate(&upload_stream, 1));
+        if (upload_stream == null) return error.InvalidCudaState;
+        // Worker teardown runs first (its defer is registered below), then this
+        // synchronization retires every submitted DMA before source buffers or
+        // pinned slots are released by their outer defers. cuStreamDestroy is
+        // not a completion fence and cannot provide this lifetime guarantee.
+        defer {
+            self.ctx.makeCurrent() catch {};
+            _ = self.ctx.driver.fns.cuStreamSynchronize(upload_stream);
+            _ = self.ctx.driver.fns.cuStreamDestroy(upload_stream);
+        }
+
+        for (plan.sources.items) |source| {
+            if (source.mmap_offset != null) c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
+        }
+
+        var state = CudaA4bLoadPipelineState{
+            .plan = plan,
+            .tasks = chunks.items,
+            .slots = slots,
+        };
+        const threads = try self.allocator.alloc(std.Thread, worker_count);
+        defer self.allocator.free(threads);
+        var spawned: usize = 0;
+        defer {
+            state.lock();
+            state.stop = true;
+            state.mutex.unlock();
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (threads) |*thread| {
+            thread.* = std.Thread.spawn(.{}, CudaA4bLoadPipelineState.workerMain, .{&state}) catch
+                return error.A4bCudaLoadWorkersUnavailable;
+            spawned += 1;
+        }
+
+        const transfer_started_ns = platform.time.monotonicNs();
+        var completed: usize = 0;
+        while (completed < chunks.items.len) {
+            const observation = state.observe();
+            if (observation.ready_index) |slot_index| {
+                const slot = &state.slots[slot_index];
+                const task = chunks.items[slot.task_index];
+                const destination = sources.items[task.source_index].buffer;
+                if (task.source_offset > destination.len or
+                    task.len > destination.len - task.source_offset)
+                {
+                    return error.InvalidPackedExpertTensor;
+                }
+                try self.ctx.makeCurrent();
+                try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyHtoDAsync(
+                    destination.ptr + @as(u64, @intCast(task.source_offset)),
+                    slot.host.ptr,
+                    task.len,
+                    upload_stream,
+                ));
+                try self.ctx.driver.check(self.ctx.driver.fns.cuEventRecord(slot.event, upload_stream));
+                self.stats.h2d_bytes = try checkedAdd(self.stats.h2d_bytes, task.len);
+                continue;
+            }
+
+            if (observation.in_flight_index) |slot_index| {
+                const slot = &state.slots[slot_index];
+                try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
+                state.lock();
+                slot.state = .empty;
+                state.mutex.unlock();
+                completed += 1;
+                continue;
+            }
+
+            if (observation.workers_done == worker_count)
+                return error.A4bCudaIncompleteLoadPipeline;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
+        self.stats.a4b_load_host_stage_ns +|= state.worker_copy_ns;
+        self.stats.a4b_load_h2d_ns +|= platform.time.monotonicNs() -| transfer_started_ns;
+        self.stats.a4b_load_workers = worker_count;
+        self.stats.a4b_load_staging_bytes = staging_bytes;
+        self.stats.a4b_load_chunks = chunks.items.len;
+
+        try runtime.sources.appendSlice(self.allocator, sources.items);
+        sources_committed = true;
+        runtime.loaded_source_bytes = try checkedAdd(runtime.loaded_source_bytes, plan.total_bytes);
+    }
+
+    fn loadA4bResidentSources(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        plan: *const CudaA4bSourceLoadPlan,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !void {
+        switch (config.load_strategy) {
+            .legacy => try self.loadA4bResidentSourcesLegacy(runtime, plan),
+            .pipeline => {
+                self.stats.a4b_load_pipeline_attempts +|= 1;
+                try self.loadA4bResidentSourcesPipeline(runtime, plan, config);
+                self.stats.a4b_load_pipeline_successes +|= 1;
+            },
+            .auto => {
+                self.stats.a4b_load_pipeline_attempts +|= 1;
+                self.loadA4bResidentSourcesPipeline(runtime, plan, config) catch |err| switch (err) {
+                    error.A4bCudaPinnedStagingUnavailable,
+                    error.A4bCudaLoadWorkersUnavailable,
+                    error.OutOfMemory,
+                    => {
+                        self.stats.a4b_load_pipeline_fallbacks +|= 1;
+                        std.log.warn("cuda_a4b: load pipeline unavailable error={s}; using legacy mmap upload", .{@errorName(err)});
+                        try self.loadA4bResidentSourcesLegacy(runtime, plan);
+                        return;
+                    },
+                    else => return err,
+                };
+                self.stats.a4b_load_pipeline_successes +|= 1;
+            },
+        }
+    }
+
+    pub fn loadA4bResidentFromHostStore(
+        self: *CudaCompute,
+        store: *native_compute_mod.WeightStore,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !void {
+        const total_started_ns = platform.time.monotonicNs();
+        const config = self.a4b_inference orelse return;
+        if (self.a4b_runtime != null) return error.A4bCudaAlreadyLoaded;
+        if (config.residency_mode != .resident) return error.A4bCudaStreamingUnsupported;
+        if (!self.kernels.hasGemma4A4BResidentQ4_0Primitives()) return error.A4bCudaKernelUnavailable;
+
+        const plan_started_ns = platform.time.monotonicNs();
+        var source_plan = try self.a4bResolvedSourceLoadPlan(store, config, model_path, source_artifact_path);
+        defer source_plan.deinit(self.allocator);
+        self.stats.a4b_load_plan_ns +|= platform.time.monotonicNs() -| plan_started_ns;
+        const source_bytes = source_plan.total_bytes;
+        const workspace_bytes = try a4bWorkspaceBytes(config);
+        const projected_weight_bytes = try checkedAdd(self.stats.resident_weight_bytes, try checkedAdd(source_bytes, workspace_bytes));
+        const weight_limit: usize = @intCast(config.memory_budget_bytes -| config.kv_budget_bytes -| config.safety_reserve_bytes);
+        if (projected_weight_bytes > weight_limit) return error.A4bCudaResidentBudgetExceeded;
+
+        var runtime = CudaA4bRuntime{ .config = config };
+        var runtime_live = true;
+        errdefer if (runtime_live) runtime.deinit(self);
+        const route_capacity = try checkedMul(max_a4b_prefill_rows, @as(usize, config.geometry.top_k));
+        const hidden: usize = @intCast(config.geometry.hidden_size);
+        const intermediate: usize = @intCast(config.geometry.expert_intermediate_size);
+        runtime.route_ids = try allocDeviceBuffer(self, try checkedMul(route_capacity, @sizeOf(u32)));
+        runtime.route_weights = try allocDeviceBuffer(self, try checkedMul(route_capacity, @sizeOf(f32)));
+        runtime.input_q8 = try allocDeviceBuffer(self, try checkedMul(try checkedMul(max_a4b_prefill_rows, hidden / 32), 36));
+        runtime.activated = try allocDeviceBuffer(self, try checkedMul(try checkedMul(route_capacity, intermediate), @sizeOf(f32)));
+        runtime.activated_q8 = try allocDeviceBuffer(self, try checkedMul(try checkedMul(route_capacity, intermediate / 32), 36));
+        runtime.expert_output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(route_capacity, hidden), @sizeOf(f32)));
+
+        std.log.info("cuda_a4b: resident upload start sources={d} source_mib={d} mmap_sources={d} access=offset_sorted_sequential", .{
+            source_plan.sources.items.len,
+            source_plan.total_bytes / (1024 * 1024),
+            source_plan.mmap_source_count,
+        });
+        const upload_start_ns = platform.time.monotonicNs();
+        try self.loadA4bResidentSources(&runtime, &source_plan, config);
+        if (!config.drop_host_cache_after_load) {
+            if (source_plan.prepared_pack) |*pack| pack.preserveFileCacheOnDeinit();
+        }
+
+        const finalize_started_ns = platform.time.monotonicNs();
+        var key_buf: [160]u8 = undefined;
+        for (0..config.geometry.moe_layer_count) |layer| {
+            var projections: [3]CudaA4bProjection = undefined;
+            inline for (.{ "w1", "w3", "w2" }, 0..) |projection, index| {
+                const key = try std.fmt.bufPrint(&key_buf, "model.layers.{d}.block_sparse_moe.packed.{s}.weight", .{ layer, projection });
+                var storage = try a4bPackedStorage(store, key);
+                defer storage.deinit();
+                projections[index] = try self.a4bProjectionFromStorage(
+                    &runtime,
+                    key,
+                    &storage,
+                    if (index == 2) intermediate else hidden,
+                    if (index == 2) hidden else intermediate,
+                );
+            }
+            runtime.layers[layer] = .{ .gate = projections[0], .up = projections[1], .down = projections[2] };
+        }
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        self.stats.a4b_load_finalize_ns +|= platform.time.monotonicNs() -| finalize_started_ns;
+        self.stats.a4b_load_total_ns +|= platform.time.monotonicNs() -| total_started_ns;
+        const upload_elapsed_ms = elapsedNsSince(upload_start_ns) / std.time.ns_per_ms;
+        std.log.info("cuda_a4b: resident upload complete sources={d} source_mib={d} elapsed_ms={d}", .{
+            runtime.sources.items.len,
+            runtime.loaded_source_bytes / (1024 * 1024),
+            upload_elapsed_ms,
+        });
+        self.stats.resident_weight_bytes = try checkedAdd(self.stats.resident_weight_bytes, try checkedAdd(runtime.loaded_source_bytes, workspace_bytes));
+        std.log.info("cuda_a4b: resident load complete layers={d} sources={d} source_mib={d} workspace_mib={d} budget_mib={d} strategy={s} workers={d} staging_mib={d} chunks={d} plan_ms={d} host_stage_worker_ms={d} h2d_wall_ms={d} finalize_ms={d} total_ms={d}", .{
+            config.geometry.moe_layer_count,
+            runtime.sources.items.len,
+            runtime.loaded_source_bytes / (1024 * 1024),
+            workspace_bytes / (1024 * 1024),
+            config.memory_budget_bytes / (1024 * 1024),
+            @tagName(config.load_strategy),
+            self.stats.a4b_load_workers,
+            self.stats.a4b_load_staging_bytes / (1024 * 1024),
+            self.stats.a4b_load_chunks,
+            self.stats.a4b_load_plan_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_host_stage_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_h2d_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_finalize_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_total_ns / std.time.ns_per_ms,
+        });
+        self.a4b_runtime = runtime;
+        runtime_live = false;
     }
 
     pub fn configureRunBudget(self: *CudaCompute, run_budget: ?*run_memory.RunBudget) void {
@@ -5414,6 +6406,12 @@ fn cudaF32LinearTiledEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_LINEAR_TILED", true);
 }
 
+fn isA4bRouterDecodeShape(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == 1 and
+        in_dim == a4b_qualification.hidden_size and
+        out_dim == a4b_qualification.expert_count;
+}
+
 fn cudaPleRmsEmbeddingFusionEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION", false);
 }
@@ -7740,6 +8738,9 @@ fn materializeLazyWeight(self: *CudaCompute, name: []const u8) !*CudaTensor {
 
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.a4b_runtime) |*runtime| {
+        if (runtime.packed_markers.getPtr(name)) |tensor| return tensor;
+    }
     if (self.resident_weights.getPtr(name)) |tensor| {
         if (self.lazy_device_epochs.contains(name)) {
             try noteLazyDeviceAccess(self, name, 0);
@@ -12695,7 +13696,10 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     } else {
         if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
-        } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and out_dim >= 512) {
+        } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and
+            (out_dim >= 512 or
+                (self.a4b_runtime != null and isA4bRouterDecodeShape(rows, in_dim, out_dim))))
+        {
             self.kernels.launchLinearF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tiled_err| switch (tiled_err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 else => return tiled_err,
@@ -13351,6 +14355,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         // handwritten dispatch, including suppressed-token requests.
         const generated_q8_1_candidate = cudaGeneratedQ6KQ8_1LmHeadArgmaxEnabled() and
             generatedQ6KQ8_1LmHeadArgmaxEligible(rows, in_dim, out_dim, suppress_token_ids.len);
+        const a4b_exact_candidate = self.a4b_runtime != null and rows == 1 and
+            in_dim == a4b_qualification.hidden_size and
+            out_dim % 8 == 0 and suppress_token_ids.len == 0;
+        const prefer_a4b_exact = a4b_exact_candidate and
+            self.kernels.hasGemma4A4BExactLmHeadPrimitive();
         const launched_q8_1 = if (cudaQ6KLmHeadQ8_1Enabled(self) or generated_q8_1_candidate) blk: {
             if (rows != 1 or in_dim % 256 != 0) break :blk false;
             const q8_row_blocks = in_dim / 32;
@@ -13407,6 +14416,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                     in_dim,
                     out_dim,
                     suppress_token_ids.len,
+                    prefer_a4b_exact,
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                     else => return err,
@@ -13414,6 +14424,12 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             }
             break :blk true;
         } else false;
+        if (a4b_exact_candidate) {
+            if (launched_q8_1 and prefer_a4b_exact)
+                self.stats.a4b_exact_lm_head_hits +|= 1
+            else
+                self.stats.a4b_exact_lm_head_fallbacks +|= 1;
+        }
         const launched_tile16 = blk: {
             if (launched_q8_1) break :blk true;
             if (!cudaQ6KLmHeadTile16Enabled()) break :blk false;
@@ -15534,6 +16550,133 @@ fn rmsNormBare(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms_bare += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn rmsNormTripleOp(
+    ctx: *anyopaque,
+    input: CT,
+    first_weight: CT,
+    second_weight: CT,
+    third_weight: CT,
+    dim: usize,
+    eps: f32,
+) anyerror!?ops.RmsNormTripleResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const runtime = if (self.a4b_runtime) |*value| value else return null;
+    if (!self.kernels.hasGemma4A4BNormFusionPrimitives() or
+        dim != runtime.config.geometry.hidden_size) return null;
+    const input_tensor = tensorFromCt(input);
+    const first_weight_tensor = tensorFromCt(first_weight);
+    const second_weight_tensor = tensorFromCt(second_weight);
+    const third_weight_tensor = tensorFromCt(third_weight);
+    try ensureF32(input_tensor);
+    try ensureF32(first_weight_tensor);
+    try ensureF32(second_weight_tensor);
+    try ensureF32(third_weight_tensor);
+    if (dim == 0 or input_tensor.elem_count % dim != 0) return null;
+    try ensureCount(first_weight_tensor, dim);
+    try ensureCount(second_weight_tensor, dim);
+    try ensureCount(third_weight_tensor, dim);
+    const rows = input_tensor.elem_count / dim;
+    if (rows == 0 or rows > max_a4b_prefill_rows) return null;
+
+    const first_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var first_shape_owned = false;
+    errdefer if (!first_shape_owned) self.allocator.free(first_shape);
+    const second_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var second_shape_owned = false;
+    errdefer if (!second_shape_owned) self.allocator.free(second_shape);
+    const third_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var third_shape_owned = false;
+    errdefer if (!third_shape_owned) self.allocator.free(third_shape);
+    var first_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var first_device_owned = false;
+    errdefer if (!first_device_owned) first_device.free(&self.ctx);
+    var second_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var second_device_owned = false;
+    errdefer if (!second_device_owned) second_device.free(&self.ctx);
+    var third_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var third_device_owned = false;
+    errdefer if (!third_device_owned) third_device.free(&self.ctx);
+    try self.kernels.launchGemma4A4BRmsNormTripleF32(
+        &self.ctx,
+        first_device,
+        second_device,
+        third_device,
+        input_tensor.buffer,
+        first_weight_tensor.buffer,
+        second_weight_tensor.buffer,
+        third_weight_tensor.buffer,
+        rows,
+        dim,
+        eps,
+    );
+    self.stats.launch_norm += 1;
+
+    const first = try createTensor(self, first_device, first_shape, input_tensor.elem_count);
+    first_device_owned = true;
+    first_shape_owned = true;
+    errdefer freeTensor(ctx, first);
+    const second = try createTensor(self, second_device, second_shape, input_tensor.elem_count);
+    second_device_owned = true;
+    second_shape_owned = true;
+    errdefer freeTensor(ctx, second);
+    const third = try createTensor(self, third_device, third_shape, input_tensor.elem_count);
+    third_device_owned = true;
+    third_shape_owned = true;
+    return .{ .first = first, .second = second, .third = third };
+}
+
+fn parallelFfnPostResidualOp(
+    ctx: *anyopaque,
+    request: *const ops.ParallelFfnPostResidualRequest,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_PARALLEL_FFN_POST_RESIDUAL"))
+        return null;
+    const runtime = if (self.a4b_runtime) |*value| value else return null;
+    if (!self.kernels.hasGemma4A4BNormFusionPrimitives() or
+        request.dim != runtime.config.geometry.hidden_size) return null;
+    const shared = tensorFromCt(request.shared);
+    const shared_weight = tensorFromCt(request.shared_weight);
+    const routed = tensorFromCt(request.routed);
+    const routed_weight = tensorFromCt(request.routed_weight);
+    const combined_weight = tensorFromCt(request.combined_weight);
+    const residual = tensorFromCt(request.residual);
+    try ensureF32(shared);
+    try ensureF32(shared_weight);
+    try ensureF32(routed);
+    try ensureF32(routed_weight);
+    try ensureF32(combined_weight);
+    try ensureF32(residual);
+    if (request.dim == 0 or shared.elem_count % request.dim != 0 or
+        routed.elem_count != shared.elem_count or residual.elem_count != shared.elem_count or
+        !sameShape(shared.shape, routed.shape) or !sameShape(shared.shape, residual.shape)) return null;
+    try ensureCount(shared_weight, request.dim);
+    try ensureCount(routed_weight, request.dim);
+    try ensureCount(combined_weight, request.dim);
+    const rows = shared.elem_count / request.dim;
+    if (rows == 0 or rows > max_a4b_prefill_rows) return null;
+
+    const shape = try dupeShape(self.allocator, shared.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, shared.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchGemma4A4BParallelFfnPostResidualF32(
+        &self.ctx,
+        device,
+        shared.buffer,
+        shared_weight.buffer,
+        routed.buffer,
+        routed_weight.buffer,
+        combined_weight.buffer,
+        residual.buffer,
+        rows,
+        request.dim,
+        request.eps,
+    );
+    self.stats.launch_norm += 1;
+    return createTensor(self, device, shape, shared.elem_count);
 }
 const UnaryOp = enum { gelu, relu, quick_gelu, sigmoid, tanh };
 
@@ -18735,7 +19878,8 @@ fn cudaPrepareGemmaDecoderRuntimeFamily(
     configured_layer_count: usize,
 ) !bool {
     _ = allocator;
-    if (config.family != .gemma or config.usesMoe()) return false;
+    if (config.family != .gemma) return false;
+    if (config.usesMoe() and self.a4b_runtime == null) return false;
     const layer_count: usize = @intCast(config.num_hidden_layers);
     if (layer_count == 0 or layer_count > 256) return false;
 
@@ -18811,7 +19955,7 @@ fn cudaPrepareGemmaDecoderRuntimeFamily(
             if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, cudaGemmaNormSlot(layer, .ffn_post), ffn_post_norm_name, config.hidden_size))) return false;
         }
 
-        if (override_level >= 4) {
+        if (override_level >= 4 and !config.usesMoe()) {
             const gate_w = try gpt_arch.getFFNWeight(&cb, config, layer, "gate", &name_buf);
             defer cb.free(gate_w);
             if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .mlp_gate), gate_w, config.hidden_size, config.intermediateSize(layer)))) return false;
@@ -20703,6 +21847,151 @@ fn runGatedDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunGatedDecoderBl
     return block_output;
 }
 
+fn runA4bMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const runtime = if (self.a4b_runtime) |*value| value else {
+        if (self.a4b_inference != null) return error.A4bCudaRuntimeUnavailable;
+        return null;
+    };
+    const config = runtime.config;
+    if (request.layer_index >= config.geometry.moe_layer_count or
+        request.total == 0 or request.total > max_a4b_prefill_rows or
+        request.hidden_size != config.geometry.hidden_size or
+        request.inter_size != config.geometry.expert_intermediate_size or
+        request.num_experts != config.geometry.expert_count or
+        request.top_k != config.geometry.top_k or
+        request.activation != .gelu_new)
+    {
+        return error.A4bCudaUnsupportedRequest;
+    }
+    const layer = runtime.layers[request.layer_index] orelse return error.A4bCudaLayerUnavailable;
+    const input = tensorFromCt(request.input);
+    const router_logits = tensorFromCt(request.router_logits);
+    try ensureF32(input);
+    try ensureF32(router_logits);
+    try ensureCount(input, try checkedMul(request.total, request.hidden_size));
+    try ensureCount(router_logits, try checkedMul(request.total, request.num_experts));
+    const expert_scale: ?buffer_mod.DeviceBuffer = if (request.expert_scale) |scale_ct| blk: {
+        const scale = tensorFromCt(scale_ct);
+        try ensureF32(scale);
+        if (scale.elem_count < request.num_experts) return error.InvalidShape;
+        break :blk scale.buffer;
+    } else null;
+
+    const routes = try checkedMul(request.total, request.top_k);
+    const input_q8_bytes = try checkedMul(try checkedMul(request.total, request.hidden_size / 32), 36);
+    const activated_bytes = try checkedMul(try checkedMul(routes, request.inter_size), @sizeOf(f32));
+    const activated_q8_bytes = try checkedMul(try checkedMul(routes, request.inter_size / 32), 36);
+    const expert_output_bytes = try checkedMul(try checkedMul(routes, request.hidden_size), @sizeOf(f32));
+    const route_ids = buffer_mod.DeviceBuffer{ .ptr = runtime.route_ids.ptr, .len = try checkedMul(routes, @sizeOf(u32)) };
+    const route_weights = buffer_mod.DeviceBuffer{ .ptr = runtime.route_weights.ptr, .len = try checkedMul(routes, @sizeOf(f32)) };
+    const input_q8 = buffer_mod.DeviceBuffer{ .ptr = runtime.input_q8.ptr, .len = input_q8_bytes };
+    const activated = buffer_mod.DeviceBuffer{ .ptr = runtime.activated.ptr, .len = activated_bytes };
+    const activated_q8 = buffer_mod.DeviceBuffer{ .ptr = runtime.activated_q8.ptr, .len = activated_q8_bytes };
+    const expert_output = buffer_mod.DeviceBuffer{ .ptr = runtime.expert_output.ptr, .len = expert_output_bytes };
+
+    try self.kernels.launchGemma4A4BTopKRowsF32(
+        &self.ctx,
+        route_ids,
+        route_weights,
+        router_logits.buffer,
+        expert_scale,
+        request.total,
+        request.num_experts,
+        request.top_k,
+        request.router_logit_scale,
+    );
+    try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, input_q8, input.buffer, request.total, request.hidden_size);
+    const gate = try layer.gate.view();
+    const up = try layer.up.view();
+    try self.kernels.launchGemma4A4BGateUpRowsQ4_0Q8_1F32(
+        &self.ctx,
+        activated,
+        input_q8,
+        gate,
+        up,
+        route_ids,
+        layer.gate.expert_stride,
+        layer.up.expert_stride,
+        request.total,
+        request.top_k,
+        request.hidden_size,
+        request.inter_size,
+        @backingInt(request.activation),
+    );
+    try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, activated_q8, activated, routes, request.inter_size);
+    const down = try layer.down.view();
+    if (request.total == 1) {
+        const launched_compact = blk: {
+            self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32Compact(
+                &self.ctx,
+                expert_output,
+                activated_q8,
+                down,
+                route_ids,
+                layer.down.expert_stride,
+                request.total,
+                request.top_k,
+                request.inter_size,
+                request.hidden_size,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (launched_compact) {
+            self.stats.a4b_compact_down_hits +|= 1;
+        } else {
+            self.stats.a4b_compact_down_fallbacks +|= 1;
+            try self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+                &self.ctx,
+                expert_output,
+                activated_q8,
+                down,
+                route_ids,
+                layer.down.expert_stride,
+                request.total,
+                request.top_k,
+                request.inter_size,
+                request.hidden_size,
+            );
+        }
+    } else {
+        try self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+            &self.ctx,
+            expert_output,
+            activated_q8,
+            down,
+            route_ids,
+            layer.down.expert_stride,
+            request.total,
+            request.top_k,
+            request.inter_size,
+            request.hidden_size,
+        );
+    }
+
+    const shape = try allocShape2(self.allocator, request.total, request.hidden_size);
+    errdefer self.allocator.free(shape);
+    var output_buffer = try allocDeviceBuffer(self, try checkedMul(try checkedMul(request.total, request.hidden_size), @sizeOf(f32)));
+    errdefer output_buffer.free(&self.ctx);
+    try self.kernels.launchGemma4A4BCombineRowsF32(
+        &self.ctx,
+        output_buffer,
+        expert_output,
+        route_weights,
+        request.total,
+        request.top_k,
+        request.hidden_size,
+    );
+    runtime.route_calls +|= 1;
+    if (request.total == 1) runtime.decode_calls +|= 1 else runtime.prefill_calls +|= 1;
+    self.stats.launch_linear += 2;
+    self.stats.launch_other += 4;
+    return try createTensor(self, output_buffer, shape, try checkedMul(request.total, request.hidden_size));
+}
+
 fn runAttentionOutputResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionOutputResidualRequest) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.stats.decoder_runtime_attention_residual_attempts += 1;
@@ -20896,6 +22185,25 @@ fn gqaPagedAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct
     return gqaDenseAttention(ctx, q_ct, k_ct, v_ct, attn_bias_ct, attention.attn_or_mask, batch, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, head_dim, query_position_offset, attention.kv_position_offset, attention.sliding_window, attention.total_sequence_len);
 }
 
+fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    var provider = ops.NativeQuantTimingStats{};
+    if (self.a4b_runtime) |runtime| {
+        provider.a4b_cuda_resident_source_bytes = @intCast(runtime.loaded_source_bytes);
+        provider.a4b_cuda_resident_source_count = @intCast(runtime.sources.items.len);
+        provider.a4b_cuda_route_calls = runtime.route_calls;
+        provider.a4b_cuda_decode_calls = runtime.decode_calls;
+        provider.a4b_cuda_prefill_calls = runtime.prefill_calls;
+        provider.a4b_moe_route_select_attempts = runtime.route_calls;
+        provider.a4b_moe_route_select_successes = runtime.route_calls;
+    }
+    return .{
+        .native_quant_null = false,
+        .provider = provider,
+        .quant = .{},
+    };
+}
+
 const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
@@ -20907,6 +22215,7 @@ const vtable = ops.ComputeBackend.VTable{
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .debugProfileCheckpoint = &debugProfileCheckpoint,
+    .debugTimingSnapshot = &debugTimingSnapshotOp,
     .trainingRuntimeStats = &trainingRuntimeStatsOp,
     .debugCudaGraphCaptureBegin = &debugCudaGraphCaptureBegin,
     .debugCudaGraphPrepareDecodeScalars = &debugCudaGraphPrepareDecodeScalars,
@@ -20973,6 +22282,7 @@ const vtable = ops.ComputeBackend.VTable{
     .decoderRuntimeApplyScaledAddScale = &decoderRuntimeApplyScaledAddScaleOp,
     .runGatedFfnResidual = &runGatedFfnResidualOp,
     .runGatedDecoderBlock = &runGatedDecoderBlockOp,
+    .runMoeBlock = &runA4bMoeBlockOp,
     .runAttentionOutputResidual = &runAttentionOutputResidualOp,
     .multiplyScalar = &multiplyScalar,
     .addScalar = &addScalar,
@@ -20991,6 +22301,8 @@ const vtable = ops.ComputeBackend.VTable{
     .rmsNormAddOutputScaleTensor = &rmsNormAddOutputScaleTensor,
     .rmsNormHeadsRope = &rmsNormHeadsRope,
     .rmsNormBare = &rmsNormBare,
+    .rmsNormTriple = &rmsNormTripleOp,
+    .parallelFfnPostResidual = &parallelFfnPostResidualOp,
     .gelu = &gelu,
     .geluExact = &geluExact,
     .relu = &relu,
@@ -21114,6 +22426,64 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+}
+
+test "cuda A4B resident workspace is bounded for the qualified geometry" {
+    const config = backend_contracts.A4bInferenceConfig{
+        .residency_mode = .resident,
+        .memory_budget_bytes = 16 * 1024 * 1024 * 1024,
+        .kv_budget_bytes = 1024 * 1024 * 1024,
+        .expert_cache_slots = 128,
+        .geometry = backend_contracts.qualified_a4b_geometries[0],
+        .load_strategy = .auto,
+        .load_workers = backend_contracts.A4bInferenceConfig.default_load_workers,
+        .load_staging_bytes = backend_contracts.A4bInferenceConfig.default_load_staging_mb * 1024 * 1024,
+        .prepared_pack = .off,
+        .drop_host_cache_after_load = false,
+    };
+    try std.testing.expectEqual(@as(usize, 250_281_984), try CudaCompute.a4bWorkspaceBytes(config));
+    try std.testing.expect(try CudaCompute.a4bWorkspaceBytes(config) < 256 * 1024 * 1024);
+}
+
+test "cuda A4B router tiled decode shape is exact" {
+    try std.testing.expect(isA4bRouterDecodeShape(1, 2816, 128));
+    try std.testing.expect(!isA4bRouterDecodeShape(2, 2816, 128));
+    try std.testing.expect(!isA4bRouterDecodeShape(1, 2560, 128));
+    try std.testing.expect(!isA4bRouterDecodeShape(1, 2816, 256));
+}
+
+test "cuda A4B packed projection layout preserves fused source offsets" {
+    var raw = @as([2 * 8 * 18]u8, @splat(0));
+    const shape = [_]i64{ 2, 8, 32 };
+    const base = weight_source_mod.QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = &raw,
+        .shape = &shape,
+        .packed_expert = .{
+            .expert_index = 0,
+            .expert_count = 2,
+            .expert_axis = 0,
+            .row_offset = 0,
+        },
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    const gate = try a4bPackedProjectionLayout(&base, 2, 32, 4);
+    try std.testing.expectEqual(@as(usize, 0), gate.base_offset);
+    try std.testing.expectEqual(@as(usize, 8 * 18), gate.expert_stride);
+
+    var up_storage = base;
+    up_storage.packed_expert.?.row_offset = 4;
+    const up = try a4bPackedProjectionLayout(&up_storage, 2, 32, 4);
+    try std.testing.expectEqual(@as(usize, 4 * 18), up.base_offset);
+    try std.testing.expectEqual(gate.expert_stride, up.expert_stride);
+
+    var truncated = up_storage;
+    truncated.raw_bytes = raw[0 .. raw.len - 1];
+    try std.testing.expectError(
+        error.InvalidPackedExpertTensor,
+        a4bPackedProjectionLayout(&truncated, 2, 32, 4),
+    );
 }
 
 test "deberta materialized workspace is aligned bounded and scales linearly with batch" {

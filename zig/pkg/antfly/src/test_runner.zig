@@ -20,7 +20,8 @@ pub const std_options: std.Options = .{
     .logFn = log,
 };
 
-var log_err_count: usize = 0;
+var log_err_count: std.atomic.Value(usize) = .init(0);
+var expected_error_log_count: std.atomic.Value(usize) = .init(0);
 var test_filters: []const []const u8 = &.{};
 var skip_test_filters: []const []const u8 = &.{};
 
@@ -76,6 +77,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var skip_count: usize = 0;
     var fail_count: usize = 0;
     var leak_count: usize = 0;
+    var matched_error_log_count: usize = 0;
     var total_count: usize = 0;
     const matched_filter_counts = arena.alloc(usize, test_filters.len) catch
         @panic("out of memory while allocating test filter counters");
@@ -115,6 +117,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
+    const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
     var current_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
@@ -130,17 +133,17 @@ pub fn main(init: std.process.Init.Minimal) void {
         });
         testing.environ = init.environ;
         testing.log_level = .warn;
+        expected_error_log_count.store(0, .release);
+        const error_logs_before = log_err_count.load(.acquire);
 
-        if (test_fn.func()) |_| {
-            ok_count += 1;
-            std.debug.print("OK\n", .{});
-        } else |err| switch (err) {
+        const Outcome = enum { passed, skipped, failed };
+        var outcome: Outcome = .passed;
+        if (test_fn.func()) |_| {} else |err| switch (err) {
             error.SkipZigTest => {
-                skip_count += 1;
-                std.debug.print("SKIP\n", .{});
+                outcome = .skipped;
             },
             else => {
-                fail_count += 1;
+                outcome = .failed;
                 // Logs emitted by a test can split the leading test name from
                 // its result. Repeat it on failure so CI attribution survives
                 // interleaved diagnostics and truncated log windows.
@@ -158,19 +161,59 @@ pub fn main(init: std.process.Init.Minimal) void {
             leak_count += 1;
         }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
+
+        const error_logs_after = log_err_count.load(.acquire);
+        const actual_error_logs = error_logs_after -| error_logs_before;
+        const expected_error_logs = expected_error_log_count.swap(0, .acq_rel);
+        const declared_expectation_mismatch =
+            expected_error_logs != 0 and actual_error_logs != expected_error_logs;
+        const strict_unexpected_error_logs =
+            fail_on_error_logs and expected_error_logs == 0 and actual_error_logs != 0;
+        if (declared_expectation_mismatch or strict_unexpected_error_logs) {
+            fail_count += 1;
+            std.debug.print(
+                "FAIL (expected {d} error logs, observed {d}) {s}\n",
+                .{ expected_error_logs, actual_error_logs, test_fn.name },
+            );
+        } else {
+            if (actual_error_logs == expected_error_logs) {
+                matched_error_log_count +|= actual_error_logs;
+            }
+            switch (outcome) {
+                .passed => {
+                    ok_count += 1;
+                    std.debug.print("OK\n", .{});
+                },
+                .skipped => {
+                    skip_count += 1;
+                    std.debug.print("SKIP\n", .{});
+                },
+                .failed => fail_count += 1,
+            }
+        }
     }
 
     std.debug.print(
         "{d} passed; {d} skipped; {d} failed; {d} leaked.\n",
         .{ ok_count, skip_count, fail_count, leak_count },
     );
-    const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
-    if (log_err_count != 0) {
-        std.debug.print("{d} errors were logged.\n", .{log_err_count});
+    const total_error_log_count = log_err_count.load(.acquire);
+    const unexpected_error_log_count = total_error_log_count -| matched_error_log_count;
+    if (total_error_log_count != 0) {
+        std.debug.print(
+            "{d} errors were logged ({d} expected, {d} unexpected).\n",
+            .{ total_error_log_count, matched_error_log_count, unexpected_error_log_count },
+        );
     }
-    if (fail_count != 0 or leak_count != 0 or (fail_on_error_logs and log_err_count != 0)) {
+    if (fail_count != 0 or leak_count != 0 or
+        (fail_on_error_logs and unexpected_error_log_count != 0))
+    {
         std.process.exit(1);
     }
+}
+
+pub export fn antfly_test_expect_error_logs(count: usize) callconv(.c) void {
+    _ = expected_error_log_count.fetchAdd(count, .monotonic);
 }
 
 fn matchesFilter(name: []const u8) bool {
@@ -244,7 +287,7 @@ pub fn log(
 ) void {
     @disableInstrumentation();
     if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
-        log_err_count +|= 1;
+        _ = log_err_count.fetchAdd(1, .monotonic);
     }
     std.debug.print("[{s}] ({s}): ", .{
         @tagName(message_level),

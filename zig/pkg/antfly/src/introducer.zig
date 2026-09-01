@@ -2785,7 +2785,7 @@ test "buildSegmentFromTextWithAnalysisOptions releases full text working set aft
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };

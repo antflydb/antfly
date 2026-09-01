@@ -227,7 +227,7 @@ pub const ChunkedIntEncoder = struct {
         const start_len = self.final.items.len;
 
         // Format byte
-        try self.final.append(self.alloc, @intFromEnum(ChunkFormat.columnar));
+        try self.final.append(self.alloc, @backingInt(ChunkFormat.columnar));
 
         // Header: numDocs, numLocs, numArrayPos
         var hdr_buf: [30]u8 = undefined;
@@ -280,7 +280,7 @@ pub const ChunkedIntEncoder = struct {
         const start_len = self.final.items.len;
 
         // Format byte
-        try self.final.append(self.alloc, @intFromEnum(ChunkFormat.stream_vbyte));
+        try self.final.append(self.alloc, @backingInt(ChunkFormat.stream_vbyte));
 
         // numValues, controlLen
         var hdr_buf: [20]u8 = undefined;
@@ -734,7 +734,7 @@ test "ChunkedIntDecoder rejects inconsistent columnar cardinalities" {
     var header_pos: usize = 0;
     _ = try readUvarint(bytes, &header_pos); // numChunks
     _ = try readUvarint(bytes, &header_pos); // chunk offset
-    try std.testing.expectEqual(@as(u8, @intFromEnum(ChunkFormat.columnar)), bytes[header_pos]);
+    try std.testing.expectEqual(@as(u8, @backingInt(ChunkFormat.columnar)), bytes[header_pos]);
     header_pos += 1;
     _ = try readUvarint(bytes, &header_pos); // numDocs
     _ = try readUvarint(bytes, &header_pos); // numLocs

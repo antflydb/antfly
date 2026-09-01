@@ -1381,12 +1381,12 @@ fn emitZigMetadata(
         \\};
         \\
         \\pub fn tokenId(token: Token) u16 {
-        \\    return @intFromEnum(token) + 1;
+        \\    return @backingInt(token) + 1;
         \\}
         \\
         \\pub fn terminalIdByName(name: []const u8) ?u16 {
         \\    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
-        \\        if (std.mem.eql(u8, field_name, name)) return @intFromEnum(@field(Token, field_name)) + 1;
+        \\        if (std.mem.eql(u8, field_name, name)) return @backingInt(@field(Token, field_name)) + 1;
         \\    }
         \\    return null;
         \\}
@@ -1394,7 +1394,7 @@ fn emitZigMetadata(
         \\pub fn terminalName(terminal: u16) ?[]const u8 {
         \\    if (terminal == 0) return "$end";
         \\    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
-        \\        if (terminal == @intFromEnum(@field(Token, field_name)) + 1) return field_name;
+        \\        if (terminal == @backingInt(@field(Token, field_name)) + 1) return field_name;
         \\    }
         \\    return null;
         \\}

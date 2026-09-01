@@ -41,13 +41,11 @@ pub const DistributedEntitySink = struct {
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
-    /// When set, commit the entity upsert through the distributed-transaction
-    /// (2PC) path rather than a plain batch. Single participant today (the entity
-    /// table), so it behaves like a transactional batch; it is the reachable
-    /// foundation for the deferred multi-participant entity+edge coupling
-    /// (RESOLUTION.md option 1). Falls back to a batch when the write source does
-    /// not implement the transaction path.
-    transactional: bool = false,
+    /// Require the source's atomic batch contract. First-party sources collapse
+    /// a single participant to one fenced shard batch and use 2PC only when
+    /// operations span groups. Unsupported sources fail closed instead of
+    /// silently weakening document-level promotion atomicity.
+    atomic_batch_required: bool = false,
 
     pub fn entitySink(self: *DistributedEntitySink) EntitySink {
         return .{ .ptr = self, .vtable = &vtable };
@@ -55,10 +53,11 @@ pub const DistributedEntitySink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn };
 
-    /// Promote all of a document's entities in one transaction. With
-    /// `transactional` set, this is a single multi-participant 2PC commit across
-    /// the entity table's shards, so a document never lands a partial set of its
-    /// entities; otherwise it falls back to independent per-entity upserts.
+    /// Promote all of a document's entities atomically. With
+    /// `atomic_batch_required`
+    /// set, a single entity shard uses one fenced Raft batch and multiple shards
+    /// use 2PC, so a document never lands a partial set of its entities;
+    /// otherwise it falls back to independent per-entity upserts.
     fn upsertBatchFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -66,7 +65,7 @@ pub const DistributedEntitySink = struct {
     ) anyerror!void {
         const self: *DistributedEntitySink = @ptrCast(@alignCast(ptr));
         if (entries.len == 0) return;
-        if (!self.transactional) {
+        if (!self.atomic_batch_required) {
             for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
             return;
         }
@@ -76,7 +75,7 @@ pub const DistributedEntitySink = struct {
         const a = arena.allocator();
 
         // Group merge transforms by table (one TableCommitRequest per table;
-        // commitTransaction routes each key to its group and commits atomically).
+        // commitBatch routes each key and chooses one-shard or 2PC atomically).
         var tables = std.ArrayListUnmanaged([]const u8).empty;
         var table_ops = std.ArrayListUnmanaged(std.ArrayListUnmanaged(db_mod.types.DocumentTransform)).empty;
         for (entries) |e| {
@@ -100,16 +99,22 @@ pub const DistributedEntitySink = struct {
             try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
         }
 
-        const outcome = try self.writes.commitTransaction(allocator, reqs.items, self.sync_level);
+        // Promotion is a stateless, idempotent batch. Use the batch commit
+        // contract so first-party sources can safely retry topology races and
+        // collapse a single-shard promotion to one fenced Raft batch. The
+        // implementation still uses 2PC when the entities span groups, so the
+        // document-level atomicity contract is unchanged.
+        const outcome = try self.writes.commitBatch(allocator, reqs.items, self.sync_level);
         if (outcome) |result| {
             switch (result) {
                 .committed => return,
                 .conflict => return error.EntityPromotionConflict,
             }
         }
-        // Transaction path unsupported by this write source; fall back to
-        // independent per-entity upserts (non-atomic).
-        for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+        // Atomic mode is an explicit correctness contract. A custom or rolling
+        // source that cannot honor it must leave promotion unapplied so the
+        // catch-up worker can retry after capability convergence.
+        return error.EntityPromotionAtomicCommitUnavailable;
     }
 
     fn upsertFn(
@@ -129,11 +134,11 @@ pub const DistributedEntitySink = struct {
         if (ops.len == 0) return;
         const transform = db_mod.types.DocumentTransform{ .key = key, .operations = ops, .upsert = true };
 
-        if (self.transactional) {
-            // Commit the merge through the 2PC path. A null outcome means the
-            // write source does not implement the transaction vtable, so fall
-            // back to a plain batch.
-            const outcome = try self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
+        if (self.atomic_batch_required) {
+            // Commit the merge through the atomic batch path. A null outcome
+            // means the write source has no atomic commit callback, so fail
+            // closed without publishing a weaker independent write.
+            const outcome = try self.writes.commitBatch(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
                 switch (result) {
                     .committed => return,
@@ -143,6 +148,7 @@ pub const DistributedEntitySink = struct {
                     .conflict => return error.EntityPromotionConflict,
                 }
             }
+            return error.EntityPromotionAtomicCommitUnavailable;
         }
 
         return self.batchUpsert(allocator, table, transform);
@@ -206,7 +212,10 @@ const FakeTableWriteSource = struct {
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
     /// Set so the source advertises the transaction vtable method.
     support_transactions: bool = false,
+    /// Set so the source advertises the optimized stateless batch commit.
+    support_commit_batch: bool = false,
     commit_calls: usize = 0,
+    commit_batch_calls: usize = 0,
 
     fn deinit(self: *FakeTableWriteSource) void {
         for (self.keys.items) |k| self.alloc.free(k);
@@ -216,11 +225,21 @@ const FakeTableWriteSource = struct {
     }
 
     fn source(self: *FakeTableWriteSource) table_writes.TableWriteSource {
-        return .{ .ptr = self, .vtable = if (self.support_transactions) &txn_vtable else &vtable };
+        return .{ .ptr = self, .vtable = if (self.support_commit_batch)
+            &batch_commit_vtable
+        else if (self.support_transactions)
+            &txn_vtable
+        else
+            &vtable };
     }
 
     const vtable = table_writes.TableWriteSource.VTable{ .batch = batch };
     const txn_vtable = table_writes.TableWriteSource.VTable{ .batch = batch, .commit_transaction = commitTransaction };
+    const batch_commit_vtable = table_writes.TableWriteSource.VTable{
+        .batch = batch,
+        .commit_transaction = commitTransaction,
+        .commit_batch = commitBatch,
+    };
 
     fn commitTransaction(
         ptr: *anyopaque,
@@ -231,6 +250,22 @@ const FakeTableWriteSource = struct {
         _ = sync_level;
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_calls += 1;
+        for (tables) |t| {
+            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            try recordTransforms(self, alloc, t.transforms);
+        }
+        return .{ .committed = .{ .participant_count = tables.len } };
+    }
+
+    fn commitBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) anyerror!?distributed_txn.CommitOutcome {
+        _ = sync_level;
+        const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.commit_batch_calls += 1;
         for (tables) |t| {
             if (!std.mem.eql(u8, t.table_name, self.table)) return null;
             try recordTransforms(self, alloc, t.transforms);
@@ -358,39 +393,79 @@ test "DistributedEntitySink skips a malformed document" {
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }
 
-test "DistributedEntitySink transactional mode commits through the 2PC path" {
+test "DistributedEntitySink atomic promotion batch prefers stateless batch commit" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "entities",
+        .support_transactions = true,
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsertBatch(alloc, &.{
+        .{
+            .table = "entities",
+            .key = "person/ada_lovelace",
+            .doc_json = "{\"entity_type\":\"person\",\"canonical_name\":\"Ada Lovelace\",\"aliases\":[\"Ada Lovelace\"]}",
+        },
+        .{
+            .table = "entities",
+            .key = "org/antfly",
+            .doc_json = "{\"entity_type\":\"org\",\"canonical_name\":\"Antfly\",\"aliases\":[\"Antfly\"]}",
+        },
+    });
+
+    // Routed through the stateless batch contract rather than forcing 2PC.
+    try testing.expectEqual(@as(usize, 0), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.keys.items.len);
+    try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
+    try testing.expectEqualStrings("org/antfly", fake.keys.items[1]);
+    try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
+}
+
+test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {
     const alloc = testing.allocator;
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities", .support_transactions = true };
     defer fake.deinit();
 
-    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
     const sink = sink_impl.entitySink();
 
     try sink.upsert(alloc, "entities", "person/ada_lovelace",
         \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
     );
 
-    // Routed through commitTransaction, not batch, and carried the merge ops.
+    // TableWriteSource.commitBatch falls back to the transaction callback for
+    // older/custom sources that have not implemented the optimized contract.
     try testing.expectEqual(@as(usize, 1), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 0), fake.commit_batch_calls);
     try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
-    try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
-    try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
 }
 
-test "DistributedEntitySink transactional mode falls back to batch when unsupported" {
+test "DistributedEntitySink atomic mode fails closed when unsupported" {
     const alloc = testing.allocator;
     // support_transactions = false -> the source has no commit_transaction vtable.
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities" };
     defer fake.deinit();
 
-    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
     const sink = sink_impl.entitySink();
 
-    try sink.upsert(alloc, "entities", "person/ada_lovelace",
+    try testing.expectError(error.EntityPromotionAtomicCommitUnavailable, sink.upsert(alloc, "entities", "person/ada_lovelace",
         \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
-    );
+    ));
+    try testing.expectError(error.EntityPromotionAtomicCommitUnavailable, sink.upsertBatch(alloc, &.{.{
+        .table = "entities",
+        .key = "org/antfly",
+        .doc_json = "{\"entity_type\":\"org\",\"canonical_name\":\"Antfly\",\"aliases\":[\"Antfly\"]}",
+    }}));
 
-    // commitTransaction returned null (unwired) -> fell back to batch, still wrote.
+    // No callback means no partial write; catch-up can retry after convergence.
     try testing.expectEqual(@as(usize, 0), fake.commit_calls);
-    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }

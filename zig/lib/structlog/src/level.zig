@@ -17,18 +17,18 @@ const std = @import("std");
 /// Global runtime log level. Atomic so it can be changed at runtime.
 /// Unlike std.log which only has compile-time levels, this enables
 /// dynamic level control (e.g., via HTTP endpoint or signal).
-var global_level: std.atomic.Value(i32) = std.atomic.Value(i32).init(@intFromEnum(std.log.Level.info));
+var global_level: std.atomic.Value(i32) = std.atomic.Value(i32).init(@backingInt(std.log.Level.info));
 
 pub fn setLevel(level: std.log.Level) void {
-    global_level.store(@intFromEnum(level), .monotonic);
+    global_level.store(@backingInt(level), .monotonic);
 }
 
 pub fn getLevel() std.log.Level {
-    return @enumFromInt(global_level.load(.monotonic));
+    return @fromBackingInt(@intCast(global_level.load(.monotonic)));
 }
 
 pub fn isEnabled(level: std.log.Level) bool {
-    return @intFromEnum(level) <= global_level.load(.monotonic);
+    return @backingInt(level) <= global_level.load(.monotonic);
 }
 
 test "level: default is info" {

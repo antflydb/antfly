@@ -192,7 +192,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
             .apply_lag_lsn = slot.apply_lag_lsn,
             .safe_read_lag_lsn = slot.safe_read_lag_lsn,
             .retention_lag_lsn = slot.retention_lag_lsn,
-            .status_code = @intFromEnum(slotStatusCode(slot.status)),
+            .status_code = @backingInt(slotStatusCode(slot.status)),
             .last_error = boolGauge(slot.last_error != null),
         };
         filled += 1;
@@ -200,9 +200,9 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
 
     const durability = snapshot.durability;
     const durability_status_code = if (durability) |decision|
-        @intFromEnum(durabilityStatusCode(decision.status))
+        @backingInt(durabilityStatusCode(decision.status))
     else
-        @intFromEnum(DurabilityStatusCode.not_configured);
+        @backingInt(DurabilityStatusCode.not_configured);
     const durability_satisfied = if (durability) |decision|
         boolGauge(decision.status == .satisfied)
     else
@@ -275,8 +275,8 @@ pub fn fromPromotionAssessment(assessment: status_mod.PromotionAssessment) Promo
 
 pub fn fromRejoinAssessment(assessment: rejoin.Assessment) RejoinMetrics {
     return .{
-        .action_code = @intFromEnum(rejoinActionCode(assessment.action)),
-        .reason_code = @intFromEnum(rejoinReasonCode(assessment.reason)),
+        .action_code = @backingInt(rejoinActionCode(assessment.action)),
+        .reason_code = @backingInt(rejoinReasonCode(assessment.reason)),
         .rejected_unfenced = boolGauge(assessment.action == .reject_unfenced),
         .already_current = boolGauge(assessment.action == .already_current),
         .can_rewind = boolGauge(assessment.action == .rewind),
@@ -621,7 +621,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 1), metrics.durability_configured);
     try std.testing.expectEqual(@as(u64, 0), metrics.durability_satisfied);
     try std.testing.expectEqual(@as(u64, 1), metrics.durability_degraded);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(DurabilityStatusCode.would_block)), metrics.durability_status_code);
+    try std.testing.expectEqual(@as(u64, @backingInt(DurabilityStatusCode.would_block)), metrics.durability_status_code);
     try std.testing.expectEqual(@as(u64, 20), metrics.durability_target_lsn);
     try std.testing.expectEqual(@as(u64, 18), metrics.durability_progress_lsn);
     try std.testing.expectEqual(@as(u64, 2), metrics.durability_missing_lsn_count);
@@ -631,7 +631,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqualStrings("standby-b", metrics.slots[1].name);
     try std.testing.expectEqual(@as(u64, 5), metrics.slots[1].safe_read_lsn);
     try std.testing.expectEqual(@as(u64, 15), metrics.slots[1].safe_read_lag_lsn);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(SlotStatusCode.reseed_required)), metrics.slots[1].status_code);
+    try std.testing.expectEqual(@as(u64, @backingInt(SlotStatusCode.reseed_required)), metrics.slots[1].status_code);
     try std.testing.expectEqual(@as(u64, 1), metrics.slots[1].last_error);
 }
 
@@ -705,8 +705,8 @@ test "storage.ha metrics derives rejoin gauges" {
         .data_loss_discarded = true,
     };
     const rejoin_metrics = fromRejoinAssessment(assessment);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(RejoinActionCode.reseed)), rejoin_metrics.action_code);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(RejoinReasonCode.parent_timeline_wal_expired)), rejoin_metrics.reason_code);
+    try std.testing.expectEqual(@as(u64, @backingInt(RejoinActionCode.reseed)), rejoin_metrics.action_code);
+    try std.testing.expectEqual(@as(u64, @backingInt(RejoinReasonCode.parent_timeline_wal_expired)), rejoin_metrics.reason_code);
     try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.rejected_unfenced);
     try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.already_current);
     try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.can_rewind);
@@ -737,7 +737,7 @@ test "storage.ha metrics renders prometheus text" {
             .apply_lag_lsn = 3,
             .safe_read_lag_lsn = 4,
             .retention_lag_lsn = 12,
-            .status_code = @intFromEnum(SlotStatusCode.healthy),
+            .status_code = @backingInt(SlotStatusCode.healthy),
             .last_error = 0,
         },
     };
@@ -759,7 +759,7 @@ test "storage.ha metrics renders prometheus text" {
         .durability_configured = 1,
         .durability_satisfied = 1,
         .durability_degraded = 0,
-        .durability_status_code = @intFromEnum(DurabilityStatusCode.satisfied),
+        .durability_status_code = @backingInt(DurabilityStatusCode.satisfied),
         .durability_target_lsn = 20,
         .durability_progress_lsn = 20,
         .durability_missing_lsn_count = 0,
@@ -817,8 +817,8 @@ test "storage.ha metrics renders prometheus text" {
     try expectContains(promotion_text, "antfly_ha_promotion_can_promote 0\n");
 
     const rejoin_text = try renderRejoinPrometheusAlloc(alloc, .{
-        .action_code = @intFromEnum(RejoinActionCode.rewind),
-        .reason_code = @intFromEnum(RejoinReasonCode.parent_timeline_retained),
+        .action_code = @backingInt(RejoinActionCode.rewind),
+        .reason_code = @backingInt(RejoinReasonCode.parent_timeline_retained),
         .rejected_unfenced = 0,
         .already_current = 0,
         .can_rewind = 1,

@@ -144,7 +144,7 @@ pub fn encodeAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     @memcpy(out[cursor..][0..manifest.manifest_id.len], manifest.manifest_id);
     cursor += manifest.manifest_id.len;
     for (manifest.files) |file| {
-        std.mem.writeInt(u16, out[cursor..][0..2], @intFromEnum(file.kind), .little);
+        std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(file.kind), .little);
         std.mem.writeInt(u16, out[cursor + 2 ..][0..2], 0, .little);
         std.mem.writeInt(u32, out[cursor + 4 ..][0..4], file.flags, .little);
         std.mem.writeInt(u64, out[cursor + 8 ..][0..8], file.size_bytes, .little);
@@ -204,7 +204,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !ManifestView {
         if (path_len == 0) return error.InvalidManifestPath;
         file.* = .{
             .path = bytes[cursor + entry_header_size .. entry_end],
-            .kind = @enumFromInt(std.mem.readInt(u16, bytes[cursor..][0..2], .little)),
+            .kind = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[cursor..][0..2], .little))),
             .flags = std.mem.readInt(u32, bytes[cursor + 4 ..][0..4], .little),
             .size_bytes = std.mem.readInt(u64, bytes[cursor + 8 ..][0..8], .little),
             .crc32 = std.mem.readInt(u32, bytes[cursor + 16 ..][0..4], .little),
