@@ -3689,6 +3689,25 @@ shadow/pointer machinery applies to newly created managed indexes, avoiding a
 special migration-only serving path. Standalone/Lite databases, which own their
 entire compatibility domain, may still authorize local native publication.
 
+Fresh dense admission now selects that end state directly once the durable
+capability floor permits it. Creation stages an unpublished private root with a
+checksummed construction manifest, establishes an O(1) empty native authority,
+rewrites the root pointer with the incompatible v2 header, and commits the
+logical catalog last. Managed/public admission therefore never builds a corpus
+in the compatibility HBC LSM before scheduling its durable rebuild outbox; the
+first user mutation is WAL-native. The construction capability is immutable and
+scoped to that one entry, so building a new index cannot authorize native
+transition on an unrelated live v1 index.
+
+The synchronous standalone path uses the same lifecycle but backfills through
+one pinned primary read transaction. The native capture records exactly that
+transaction's replay sequence, writes the applied-sequence checkpoint, and
+certifies the v2 generation at the same boundary; rows committed afterward stay
+ordinary replay debt. A construction marker remains until the logical catalog
+is durable, and explicit re-creation can reclaim a broken orphan pointer after a
+crash. Before capability activation, fresh managed indexes remain v1, while all
+pre-existing v1 indexes continue to use online shadow migration.
+
 The natural extension for reusable embeddings and other source artifacts is a
 catalog-managed immutable artifact identity. Indexes should hold references,
 not ownership by convention. Index-created artifacts remain scoped to their

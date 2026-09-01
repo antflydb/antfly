@@ -143,6 +143,22 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
+var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
+
+const FreshDenseNativeGeneration = struct {
+    alloc: Allocator,
+    shadow_root: []u8,
+    index_path: []u8,
+    relative_index_path: []u8,
+    generation_id: u128,
+
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.shadow_root);
+        self.alloc.free(self.index_path);
+        self.alloc.free(self.relative_index_path);
+        self.* = undefined;
+    }
+};
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
 var hbc_coalesce_bulk_writes_cache: std.atomic.Value(u8) = .init(0);
 var hbc_bulk_ingest_bulk_build_min_items_cache: std.atomic.Value(usize) = .init(0);
@@ -2027,6 +2043,10 @@ pub const IndexManager = struct {
         /// pointer or during atomic adoption of a certified native candidate;
         /// maintenance/status checks therefore never reread control files.
         native_physical_v2: bool = false,
+        /// Immutable construction capability for a fresh unpublished native
+        /// generation. It scopes authority to this entry instead of exposing
+        /// the manager-wide repair grant to unrelated live v1 indexes.
+        native_candidate_build_authorized: bool = false,
         index: hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
@@ -3832,6 +3852,7 @@ pub const IndexManager = struct {
         // negotiation, but still build an inactive candidate and acquire the
         // same versioned pointer/manifest boundary as provisioned storage.
         return self.dense_native_candidate_build_authorized or
+            entry.native_candidate_build_authorized or
             entry.native_physical_v2;
     }
 
@@ -5935,7 +5956,7 @@ pub const IndexManager = struct {
             };
             self.catalog_mutex.unlockExclusive();
 
-            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false) catch |err| {
+            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false, false) catch |err| {
                 self.catalog_mutex.lockExclusive();
                 defer self.catalog_mutex.unlockExclusive();
                 self.completeIndexLoadNoLock(task.name);
@@ -7711,7 +7732,7 @@ pub const IndexManager = struct {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
-                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true) catch |err| {
+                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true, false) catch |err| {
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             state.configs[index].name,
                             @tagName(state.configs[index].kind),
@@ -7940,6 +7961,22 @@ pub const IndexManager = struct {
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
+        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore)
+            self.freshDenseNativeV2Permitted(stored_cfg)
+        else
+            false;
+        var fresh_native_generation: ?FreshDenseNativeGeneration = if (create_fresh_native_v2)
+            try self.stageFreshDenseNativeGeneration(stored_cfg)
+        else
+            null;
+        defer if (fresh_native_generation) |*generation| generation.deinit();
+        var fresh_native_generation_committed = false;
+        errdefer if (!fresh_native_generation_committed) if (fresh_native_generation) |*generation| {
+            self.discardFreshDenseNativeGeneration(stored_cfg, generation);
+        };
+
+        // Only the unpublished construction entry receives native-transition
+        // authority; unrelated live v1 entries in this manager remain fenced.
         const enrichment_checkpoint = self.enrichments.items.len;
         var enrichment_catalog_committed = false;
         errdefer if (!enrichment_catalog_committed) self.truncateEnrichments(enrichment_checkpoint);
@@ -7950,9 +7987,25 @@ pub const IndexManager = struct {
         else
             false;
 
-        try self.openConfiguredIndex(store, stored_cfg, allow_backfill, false);
+        try self.openConfiguredIndexWithAuthorization(
+            store,
+            stored_cfg,
+            allow_backfill and fresh_native_generation == null,
+            false,
+            fresh_native_generation != null,
+        );
         errdefer {
             self.removeInMemory(stored_cfg.name);
+        }
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+            if (fresh_native_generation) |*generation| {
+                try self.completeFreshDenseNativeGeneration(
+                    store,
+                    stored_cfg,
+                    allow_backfill,
+                    generation,
+                );
+            }
         }
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
@@ -7967,6 +8020,19 @@ pub const IndexManager = struct {
             return err;
         };
         self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+        fresh_native_generation_committed = true;
+        // The logical catalog is the final visibility boundary. Keep the
+        // construction marker through that commit so crash cleanup cannot
+        // collect a fully certified but not-yet-cataloged generation. Marker
+        // removal is cleanup-only once the catalog is durable.
+        if (fresh_native_generation) |*generation| {
+            IndexManager.clearRepairShadowInProgressMarker(self.alloc, generation.shadow_root) catch |err| {
+                std.log.warn("failed to clear fresh dense generation marker index={s} err={s}", .{
+                    stored_cfg.name,
+                    @errorName(err),
+                });
+            };
+        }
     }
 
     pub fn addAllNoBackfill(self: *IndexManager, store: anytype, configs: []const types.IndexConfig) !void {
@@ -14703,6 +14769,200 @@ pub const IndexManager = struct {
         try ensureIndexDirDurable(self.alloc, self.io, self.base_path, path);
     }
 
+    fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) bool {
+        if (cfg.kind != .dense_vector or builtin.os.tag == .freestanding) return false;
+        if (!densePostingWalMutationStoreEnabled()) return false;
+        if (self.dense_native_migration_policy_source) |source| return source.authorityPermitted();
+        return true;
+    }
+
+    /// Allocate a fresh dense index in an unpublished physical generation.
+    /// The temporary v1 pointer is only a construction locator: the logical
+    /// catalog does not contain this index yet, so neither current nor older
+    /// binaries can serve it. Completion rewrites the pointer with the
+    /// deliberately incompatible v2 header after native authority and its
+    /// checksummed manifest are durable.
+    fn stageFreshDenseNativeGeneration(
+        self: *IndexManager,
+        cfg: types.IndexConfig,
+    ) !FreshDenseNativeGeneration {
+        if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
+        try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
+
+        for (0..64) |_| {
+            const nonce = fresh_dense_native_generation_nonce.fetchAdd(1, .monotonic);
+            if (nonce == 0) continue;
+            const shadow_name = try std.fmt.allocPrint(
+                self.alloc,
+                ".repair-shadow-fresh-{x}-{x}",
+                .{ platform_time.monotonicNs(), nonce },
+            );
+            defer self.alloc.free(shadow_name);
+            const shadow_root = try std.fs.path.join(self.alloc, &.{ self.base_path, shadow_name });
+            errdefer self.alloc.free(shadow_root);
+
+            std.Io.Dir.cwd().createDir(self.checkpointIo(), shadow_root, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    self.alloc.free(shadow_root);
+                    continue;
+                },
+                else => return err,
+            };
+            var keep_root = false;
+            errdefer if (!keep_root) std.Io.Dir.cwd().deleteTree(self.checkpointIo(), shadow_root) catch {};
+            try fs_paths.syncDirPortable(self.checkpointIo(), self.base_path);
+            try IndexManager.writeRepairShadowInProgressMarker(self.alloc, shadow_root);
+
+            const index_path = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/indexes/{s}",
+                .{ shadow_root, cfg.name },
+            );
+            errdefer self.alloc.free(index_path);
+            try ensureIndexDirDurable(self.alloc, self.io, shadow_root, index_path);
+            const relative_index_path = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/indexes/{s}",
+                .{ shadow_name, cfg.name },
+            );
+            errdefer self.alloc.free(relative_index_path);
+            if (!validRelativeRepairIndexRoot(cfg.name, relative_index_path)) return error.InvalidIndexRootPointer;
+
+            const generation_seed = nonce ^ platform_time.monotonicNs();
+            const generation_id = restoredNativeGenerationId(
+                cfg.name,
+                types.indexConfigHash(cfg),
+                generation_seed,
+            );
+            // activeIndexPathForConfig validates every pointer-selected root
+            // before opening it. Certify the unpublished construction root as
+            // legacy first; completion atomically replaces this manifest with
+            // dense_native_v2 only after native authority is durable.
+            try index_generation_manifest.writeReadyForPhysicalFormat(
+                self.alloc,
+                index_path,
+                generation_id,
+                cfg.name,
+                types.indexConfigHash(cfg),
+                0,
+                .legacy_lsm,
+            );
+
+            const canonical_path = try self.indexPath(cfg.name);
+            defer self.alloc.free(canonical_path);
+            // Before certification this intentionally writes a v1 locator.
+            // Catalog absence is the visibility fence until completion below.
+            try self.writeActiveIndexRootPointer(canonical_path, relative_index_path);
+
+            keep_root = true;
+            return .{
+                .alloc = self.alloc,
+                .shadow_root = shadow_root,
+                .index_path = index_path,
+                .relative_index_path = relative_index_path,
+                .generation_id = generation_id,
+            };
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn discardFreshDenseNativeGeneration(
+        self: *IndexManager,
+        cfg: types.IndexConfig,
+        generation: *const FreshDenseNativeGeneration,
+    ) void {
+        const canonical_path = self.indexPath(cfg.name) catch return;
+        defer self.alloc.free(canonical_path);
+        self.clearActiveIndexRootPointer(canonical_path) catch {};
+        std.Io.Dir.cwd().deleteTree(self.checkpointIo(), generation.shadow_root) catch {};
+        fs_paths.syncDirPortable(self.checkpointIo(), self.base_path) catch {};
+    }
+
+    fn saveDenseBackfillAppliedSequence(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        cfg: types.IndexConfig,
+        sequence: u64,
+    ) !void {
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+            self.alloc,
+            self.checkpointIo(),
+            store,
+            self.applied_sequence_checkpoint_path,
+            .{
+                .index_name = cfg.name,
+                .sequence = sequence,
+                .config_hash = types.indexConfigHash(cfg),
+            },
+        );
+    }
+
+    /// Complete a fresh physical generation before the logical catalog makes
+    /// it visible. Native authority is established on an empty base first, so
+    /// an optional synchronous backfill writes only through the native
+    /// transaction path. The final pointer is published after the captured
+    /// snapshot boundary and manifest agree.
+    fn completeFreshDenseNativeGeneration(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        cfg: types.IndexConfig,
+        allow_backfill: bool,
+        generation: *const FreshDenseNativeGeneration,
+    ) !void {
+        const entry = self.denseIndex(cfg.name) orelse return error.IndexNotFound;
+
+        _ = try self.finalizeNativePostingGenerationAtStableTip(
+            cfg.name,
+            0,
+            .{ .validate_payloads = true, .flatten = true },
+        );
+        var ready_sequence: u64 = 0;
+        if (allow_backfill and entry.index.stats().active_count == 0) {
+            const lease = (try self.beginDensePostingSidecarCaptureLeaseByNameWithOptions(cfg.name, .{})) orelse
+                return error.PostingWalMutationStoreUnavailable;
+            var capture_active = true;
+            errdefer if (capture_active) self.cancelDensePostingSidecarCaptureLeaseByName(cfg.name, lease) catch {};
+            ready_sequence = try self.backfillDenseIndex(store, entry);
+            try self.recordDensePostingCaptureMutationSequence(cfg.name, lease, ready_sequence);
+            try self.finishDensePostingSidecarCaptureLeaseByName(cfg.name, lease, ready_sequence);
+            capture_active = false;
+            try self.saveDenseBackfillAppliedSequence(store, cfg, ready_sequence);
+        }
+
+        _ = try self.finalizeNativePostingGenerationAtStableTip(
+            cfg.name,
+            ready_sequence,
+            .{ .validate_payloads = true, .flatten = true },
+        );
+        try index_generation_manifest.writeReadyForPhysicalFormat(
+            self.alloc,
+            generation.index_path,
+            generation.generation_id,
+            cfg.name,
+            types.indexConfigHash(cfg),
+            ready_sequence,
+            .dense_native_v2,
+        );
+        const certified_sequence = try index_generation_manifest.validateReady(
+            self.alloc,
+            generation.index_path,
+            generation.generation_id,
+            cfg.name,
+            types.indexConfigHash(cfg),
+        );
+        if (certified_sequence != ready_sequence) return error.IndexGenerationManifestMismatch;
+
+        const canonical_path = try self.indexPath(cfg.name);
+        defer self.alloc.free(canonical_path);
+        try self.writeActiveIndexRootPointer(canonical_path, generation.relative_index_path);
+        if (!try self.activeIndexRootPointerUsesNativeV2(cfg.name)) return error.InvalidIndexRootPointer;
+        entry.native_physical_v2 = true;
+        // A fresh generation has no downgrade predecessor. Retain neither an
+        // empty compatibility manifest nor WAL after the incompatible pointer
+        // is durable.
+        try entry.index.retireLegacyLsmArtifactsAfterCatalogFence();
+    }
+
     fn prepareStorageForFreshCatalogEntry(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         // Artifact records use public names, so a delayed retire operation and
         // a replacement generation cannot safely mutate them concurrently.
@@ -14712,7 +14972,17 @@ pub const IndexManager = struct {
         }
         const canonical_path = try self.indexPath(cfg.name);
         defer self.alloc.free(canonical_path);
-        const active_path = try self.activeIndexPath(cfg.name);
+        const active_path = self.activeIndexPath(cfg.name) catch |err| switch (err) {
+            // Catalog absence owns this namespace. A crash may have left a
+            // pointer whose private construction root was already collected;
+            // fail-closed reads are correct, but must not permanently prevent
+            // an explicit create from reclaiming that absent catalog name.
+            error.InvalidIndexRootPointer => blk: {
+                try self.clearActiveIndexRootPointer(canonical_path);
+                break :blk try self.alloc.dupe(u8, canonical_path);
+            },
+            else => return err,
+        };
         defer self.alloc.free(active_path);
         if (!std.mem.eql(u8, active_path, canonical_path)) {
             self.invalidateIndexPathCaches(active_path);
@@ -15231,10 +15501,27 @@ pub const IndexManager = struct {
     }
 
     fn openConfiguredIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !void {
+        return self.openConfiguredIndexWithAuthorization(store, cfg, allow_backfill, read_only, false);
+    }
+
+    fn openConfiguredIndexWithAuthorization(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        allow_backfill: bool,
+        read_only: bool,
+        authorize_dense_native_candidate: bool,
+    ) !void {
         try self.beginIndexLoadNoLock(cfg.name);
         defer self.completeIndexLoadNoLock(cfg.name);
         try self.ensureConfiguredIndexDir(cfg);
-        var opened = try self.openConfiguredIndexDetached(store, cfg, allow_backfill, read_only);
+        var opened = try self.openConfiguredIndexDetached(
+            store,
+            cfg,
+            allow_backfill,
+            read_only,
+            authorize_dense_native_candidate,
+        );
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
         if (cfg.kind == .algebraic) {
@@ -15249,7 +15536,14 @@ pub const IndexManager = struct {
         }
     }
 
-    fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
+    fn openConfiguredIndexDetached(
+        self: *IndexManager,
+        store: anytype,
+        cfg_input: types.IndexConfig,
+        allow_backfill: bool,
+        read_only: bool,
+        authorize_dense_native_candidate: bool,
+    ) !OpenedIndex {
         if (test_inject_index_open_error) |err| return err;
         var cfg = cfg_input;
         try populateCoverageConfigFingerprint(self.alloc, &cfg);
@@ -15529,7 +15823,9 @@ pub const IndexManager = struct {
                     true;
                 index.setExperimentalPostingAuthorityTransitionPermitted(
                     native_catalog_floor_permitted and
-                        (self.dense_native_candidate_build_authorized or native_physical_v2),
+                        (self.dense_native_candidate_build_authorized or
+                            authorize_dense_native_candidate or
+                            native_physical_v2),
                 );
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
@@ -15651,6 +15947,7 @@ pub const IndexManager = struct {
                     else
                         false,
                     .native_physical_v2 = native_physical_v2,
+                    .native_candidate_build_authorized = authorize_dense_native_candidate,
                     .index = index,
                     .vector_loader_context = vector_loader_context,
                 };
@@ -15660,7 +15957,7 @@ pub const IndexManager = struct {
 
                 if (allow_backfill and entry.index.metadata.active_count == 0) {
                     const backfill_started_ns = nowNs();
-                    try self.backfillDenseIndex(store, &entry);
+                    _ = try self.backfillDenseIndex(store, &entry);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -17397,7 +17694,10 @@ pub const IndexManager = struct {
         return try self.lookupDenseDocKeyByVectorIdTxn(&txn, index_name, vector_id);
     }
 
-    fn backfillDenseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex) !void {
+    /// Rebuild from one stable primary snapshot and return its exact source
+    /// boundary. Direct-v2 admission uses that boundary to commit the native
+    /// capture without ever claiming writes that raced the snapshot.
+    fn backfillDenseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex) !u64 {
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -17405,9 +17705,6 @@ pub const IndexManager = struct {
         defer self.alloc.free(lower);
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
-
-        const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
-        defer backend_scan.freeResults(self.alloc, docs);
 
         var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
         defer {
@@ -17424,35 +17721,78 @@ pub const IndexManager = struct {
         var mapping_batch = try runtime_store.store.beginBatch();
         errdefer mapping_batch.abort();
 
-        for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
-            defer self.alloc.free(raw_key);
-            if (!self.keyInRange(raw_key)) continue;
-            const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
-            errdefer self.alloc.free(vector_values);
+        var source_txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer source_txn.abort();
+        const snapshot_sequence = try store.lastReplaySequenceFromTxn(&source_txn, 0);
+        const ScanContext = struct {
+            manager: *IndexManager,
+            entry: *DenseIndex,
+            mapping_batch: *backend_erased.Batch,
+            metadata_presence_memo: *DenseVectorMetadataPresenceMemo,
+            items: *std.ArrayListUnmanaged(hbc_mod.BatchInsertItem),
+            pending_mappings: *std.ArrayListUnmanaged(PendingDenseVectorMapping),
 
-            const assignment = try self.ensureDenseVectorIdTxnWithMemo(
-                &mapping_batch,
-                entry.config.name,
-                raw_key,
-                null,
-                &metadata_presence_memo,
-            );
-            try items.append(self.alloc, .{
-                .vector_id = assignment.vector_id,
-                .vector = vector_values,
-                .metadata = try self.alloc.dupe(u8, raw_key),
-            });
-            try pending_mappings.append(self.alloc, .{
-                .doc_key = items.items[items.items.len - 1].metadata,
-                .parent_doc_key = null,
-                .vector_id = assignment.vector_id,
-            });
-        }
+            fn scan(raw_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const ctx: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
+                if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
+                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(ctx.manager.alloc, key)) orelse
+                    return .@"continue";
+                defer ctx.manager.alloc.free(raw_key);
+                if (!ctx.manager.keyInRange(raw_key)) return .@"continue";
+                const vector_values = (try mapper.extractDenseVectorField(
+                    ctx.manager.alloc,
+                    value,
+                    ctx.entry.field_name,
+                    ctx.entry.dims,
+                )) orelse return .@"continue";
+                var vector_owned = true;
+                errdefer if (vector_owned) ctx.manager.alloc.free(vector_values);
+                const metadata = try ctx.manager.alloc.dupe(u8, raw_key);
+                var metadata_owned = true;
+                errdefer if (metadata_owned) ctx.manager.alloc.free(metadata);
+
+                const assignment = try ctx.manager.ensureDenseVectorIdTxnWithMemo(
+                    ctx.mapping_batch,
+                    ctx.entry.config.name,
+                    raw_key,
+                    null,
+                    ctx.metadata_presence_memo,
+                );
+                try ctx.items.append(ctx.manager.alloc, .{
+                    .vector_id = assignment.vector_id,
+                    .vector = vector_values,
+                    .metadata = metadata,
+                });
+                vector_owned = false;
+                metadata_owned = false;
+                try ctx.pending_mappings.append(ctx.manager.alloc, .{
+                    .doc_key = metadata,
+                    .parent_doc_key = null,
+                    .vector_id = assignment.vector_id,
+                });
+                return .@"continue";
+            }
+        };
+        var scan_context = ScanContext{
+            .manager = self,
+            .entry = entry,
+            .mapping_batch = &mapping_batch,
+            .metadata_presence_memo = &metadata_presence_memo,
+            .items = &items,
+            .pending_mappings = &pending_mappings,
+        };
+        try store.scanReadTxnWithContext(
+            &source_txn,
+            lower,
+            if (upper) |buf| buf else "",
+            .{},
+            &scan_context,
+            ScanContext.scan,
+        );
 
         try self.insertDenseItems(entry, items.items);
         try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
+        return snapshot_sequence;
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
@@ -26235,6 +26575,212 @@ test "dense native migration policy is fail closed when provisioned" {
     try std.testing.expect(try manager.denseNativePhysicalMigrationRequired("dv_v1"));
     manager.dense_native_candidate_build_authorized = true;
     try std.testing.expect(manager.denseNativeAuthorityPermitted(entry));
+}
+
+test "fresh dense admission publishes native v2 before the logical catalog" {
+    const Gate = struct {
+        permitted: bool,
+
+        fn read(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.permitted;
+        }
+    };
+    var gate = Gate{ .permitted = true };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const cfg: types.IndexConfig = .{
+        .name = "dv_v2",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{
+            .dense_native_migration_policy_source = .{
+                .ptr = &gate,
+                .authority_permitted = Gate.read,
+            },
+        });
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addManaged(&store, cfg, null);
+
+        const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(entry.native_physical_v2);
+        try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+        try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
+        const canonical_path = try manager.indexPath(cfg.name);
+        defer alloc.free(canonical_path);
+        const relative_path = (try manager.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(relative_path);
+        try std.testing.expect(validRelativeRepairIndexRoot(cfg.name, relative_path));
+        try std.testing.expect(std.mem.startsWith(u8, relative_path, ".repair-shadow-fresh-"));
+        const active_path = try std.fs.path.join(alloc, &.{ path, relative_path });
+        defer alloc.free(active_path);
+        var ready = try index_generation_manifest.load(alloc, active_path);
+        defer ready.deinit(alloc);
+        try std.testing.expectEqual(index_generation_manifest.PhysicalFormat.dense_native_v2, ready.physical_format);
+        try std.testing.expectEqual(@as(u64, 0), ready.ready_applied_sequence);
+        for ([_][]const u8{ "runs", "wal", "manifest.bin" }) |legacy_name| {
+            const legacy_path = try std.fs.path.join(alloc, &.{ active_path, legacy_name });
+            defer alloc.free(legacy_path);
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+            );
+        }
+    }
+
+    // Restart selects the incompatible pointer directly. It must not reopen a
+    // legacy generation and enqueue a second whole-index rebuild.
+    var reopened = try IndexManager.initWithOptions(alloc, path, .{
+        .dense_native_migration_policy_source = .{
+            .ptr = &gate,
+            .authority_permitted = Gate.read,
+        },
+    });
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.loadNoBackfill(&store);
+    const reopened_entry = reopened.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reopened_entry.native_physical_v2);
+    try std.testing.expect(reopened_entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expect(!try reopened.denseNativePhysicalMigrationRequired(cfg.name));
+}
+
+test "fresh dense admission remains legacy before the native capability floor" {
+    const Gate = struct {
+        fn read(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var gate: u8 = 0;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .dense_native_migration_policy_source = .{
+            .ptr = &gate,
+            .authority_permitted = Gate.read,
+        },
+    });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const cfg: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    try manager.addManaged(&store, cfg, null);
+
+    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!entry.native_physical_v2);
+    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
+    const canonical_path = try manager.indexPath(cfg.name);
+    defer alloc.free(canonical_path);
+    try std.testing.expect((try manager.readActiveIndexRootPointer(canonical_path, cfg.name)) == null);
+}
+
+test "fresh dense admission reclaims a broken orphan construction pointer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const cfg: types.IndexConfig = .{
+        .name = "dv_v2",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    const canonical_path = try manager.indexPath(cfg.name);
+    defer alloc.free(canonical_path);
+    try ensureIndexDirDurable(alloc, null, path, canonical_path);
+    const pointer_path = try manager.activeIndexRootPointerPath(canonical_path);
+    defer alloc.free(pointer_path);
+    const broken_pointer = try std.fmt.allocPrint(
+        alloc,
+        "{s}.repair-shadow-fresh-dead/indexes/{s}\n",
+        .{ active_index_root_pointer_magic_v2, cfg.name },
+    );
+    defer alloc.free(broken_pointer);
+    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, broken_pointer);
+    try std.testing.expectError(
+        error.InvalidIndexRootPointer,
+        manager.readActiveIndexRootPointer(canonical_path, cfg.name),
+    );
+
+    // Catalog absence gives explicit create ownership of the name. It clears
+    // the fail-closed stale pointer and publishes a new certified generation.
+    try manager.addManaged(&store, cfg, null);
+    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.native_physical_v2);
+    try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+}
+
+test "fresh native dense backfill certifies one pinned source snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const document_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+    defer alloc.free(document_key);
+    try store.put(document_key, "{\"embedding\":[1.0,2.0]}");
+    const snapshot_sequence = store.lastReplaySequence(0);
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const cfg: types.IndexConfig = .{
+        .name = "dv_v2",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    };
+    try manager.add(&store, cfg);
+
+    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.native_physical_v2);
+    try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expectEqual(@as(?u64, snapshot_sequence), entry.index.experimentalPostingDurableAppliedSequence());
+    const canonical_path = try manager.indexPath(cfg.name);
+    defer alloc.free(canonical_path);
+    const relative_path = (try manager.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(relative_path);
+    const active_path = try std.fs.path.join(alloc, &.{ path, relative_path });
+    defer alloc.free(active_path);
+    var ready = try index_generation_manifest.load(alloc, active_path);
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(snapshot_sequence, ready.ready_applied_sequence);
 }
 
 test "standalone dense native migration still requires an explicit physical generation" {
