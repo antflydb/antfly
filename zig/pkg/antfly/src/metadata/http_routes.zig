@@ -26,14 +26,24 @@ pub const ForwardedTableMutation = struct {
     definition_json: ?[]const u8 = null,
 };
 
+/// Relative budget forwarded by routing clients. Absolute monotonic deadlines
+/// are process-local and must never be sent across hosts.
+pub const routing_remaining_ms_header = "X-Antfly-Routing-Remaining-Ms";
+
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
     pub const head = "/metadata/v1/head";
+    pub const capabilities = "/metadata/v1/capabilities";
     pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const internal_linearizable_snapshot = "/internal/v1/catalog/linearizable-snapshot";
+    pub const internal_linearizable_routing_snapshot = "/internal/v1/catalog/linearizable-routing-snapshot";
+    pub const internal_routing_change = "/internal/v1/catalog/routing-change";
+    pub const internal_routing_authority = "/internal/v2/catalog/routing-authority";
+    pub const internal_await_route = "/internal/v2/catalog/await-route";
     pub const runtime_topology = "/metadata/v1/runtime-topology";
     pub const status = "/metadata/v1/status";
     pub const admin_snapshot = "/metadata/v1/admin/snapshot";
+    pub const routing_snapshot = "/metadata/v1/catalog/routing-snapshot";
     pub const internal_catalog_publication_check = "/internal/v1/catalog/publication-check";
     pub const internal_catalog_table_publication_check = "/internal/v1/catalog/table-publication-check";
     pub const internal_catalog_group_retirement_check = "/internal/v1/catalog/group-retirement-check";

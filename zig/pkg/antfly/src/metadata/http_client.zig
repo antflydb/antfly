@@ -56,6 +56,22 @@ pub const RequestBudget = struct {
     cancellation: ?*const http_common.RequestCancellation = null,
 };
 
+fn ensureRequestBudget(budget: ?RequestBudget) !void {
+    if (budget) |value| {
+        if (value.cancellation) |signal| {
+            if (signal.isCancelled()) return error.Cancelled;
+        }
+        if (platform_time.monotonicNs() >= value.deadline_ns) return error.Timeout;
+    }
+}
+
+fn ensureRoutingBudget(budget: ?RequestBudget) !void {
+    ensureRequestBudget(budget) catch |err| switch (err) {
+        error.Timeout => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+}
+
 fn isUriUnreserved(ch: u8) bool {
     return (ch >= 'A' and ch <= 'Z') or
         (ch >= 'a' and ch <= 'z') or
@@ -139,6 +155,26 @@ pub const MetadataHttpClient = struct {
         return try self.fetchHeadWithBudget(base_uri, null);
     }
 
+    pub fn fetchCapabilities(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !metadata_api.MetadataCapabilities {
+        const uri = try join(self.alloc, base_uri, routes.Routes.capabilities);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetryBudget(.{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        const capabilities = try std.json.parseFromSliceLeaky(metadata_api.MetadataCapabilities, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        try ensureRequestBudget(budget);
+        return capabilities;
+    }
+
     pub fn fetchHeadWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -182,7 +218,10 @@ pub const MetadataHttpClient = struct {
         // upgrade. Treat both common server spellings as unsupported.
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         try mapStatus(resp.status, null, null, null);
-        return try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
+        var parsed = try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRequestBudget(budget);
+        return parsed;
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
@@ -195,6 +234,170 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
     ) !std.json.Parsed(metadata_api.AdminSnapshot) {
         return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
+    }
+
+    pub fn fetchRoutingSnapshotWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return try self.fetchRoutingSnapshotAt(
+            base_uri,
+            .GET,
+            routes.Routes.routing_snapshot,
+            budget,
+        );
+    }
+
+    pub fn fetchLinearizableRoutingSnapshot(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return try self.fetchRoutingSnapshotAt(
+            base_uri,
+            .POST,
+            routes.Routes.internal_linearizable_routing_snapshot,
+            budget,
+        );
+    }
+
+    fn fetchRoutingSnapshotAt(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        method: http_common.Method,
+        path: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var remaining_buf: [32]u8 = undefined;
+        var headers: [1]http_common.RequestHeader = undefined;
+        var request: http_common.HttpRequest = .{
+            .method = method,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        };
+        if (method == .POST) {
+            request.body = "{}";
+            request.content_type = "application/json";
+        }
+        if (budget) |value| {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= value.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            const remaining_ns = value.deadline_ns - now_ns;
+            const remaining_ms = @max(
+                @as(u64, 1),
+                (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+            );
+            const encoded = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
+            headers[0] = .{ .name = routes.routing_remaining_ms_header, .value = encoded };
+            request.headers = headers[0..];
+        }
+
+        var resp = self.executeWithRetryBudget(request, budget) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        var parsed = try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
+    }
+
+    pub fn waitForRoutingChange(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        confirm_absence: bool,
+        budget: RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingChangeResult) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_authority);
+        defer self.alloc.free(uri);
+
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        const remaining_ns = budget.deadline_ns - now_ns;
+        const remaining_ms = @max(
+            @as(u64, 1),
+            (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
+        var remaining_buf: [32]u8 = undefined;
+        const remaining = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
+        const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogRoutingChangeRequest{
+            .observed_token = observed_token,
+            .confirm_absence = confirm_absence,
+        }, .{});
+        defer self.alloc.free(body);
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.routing_remaining_ms_header, .value = remaining },
+        };
+        var resp = self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .headers = headers[0..],
+            .timeout_ms = default_request_timeout_ms,
+        }, budget) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        var parsed = try parseJson(metadata_api.CatalogRoutingChangeResult, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
+    }
+
+    pub fn awaitCatalogRoute(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        request: metadata_api.CatalogRouteResolveRequest,
+        budget: RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRouteResolveResult) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_await_route);
+        defer self.alloc.free(uri);
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        const remaining_ms = @max(
+            @as(u64, 1),
+            ((budget.deadline_ns - now_ns) +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
+        var remaining_buf: [32]u8 = undefined;
+        const remaining = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.routing_remaining_ms_header, .value = remaining },
+        };
+        var resp = self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .headers = headers[0..],
+            .timeout_ms = default_request_timeout_ms,
+        }, budget) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        var parsed = try parseJson(metadata_api.CatalogRouteResolveResult, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
     }
 
     pub fn validateCatalogPublication(
@@ -913,7 +1116,10 @@ pub const MetadataHttpClient = struct {
         }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try parseJson(T, self.alloc, resp.body);
+        var parsed = try parseJson(T, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRequestBudget(budget);
+        return parsed;
     }
 
     fn getJsonValue(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !T {
@@ -937,7 +1143,9 @@ pub const MetadataHttpClient = struct {
         }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        const value = try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        try ensureRequestBudget(budget);
+        return value;
     }
 
     fn requestWithBody(
@@ -1235,6 +1443,299 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
         parsed.value.store_id,
         routes.Routes.internal_node_status_suffix,
     });
+}
+
+test "metadata routing client forwards relative deadline and preserves timeout" {
+    const TimeoutExecutor = struct {
+        saw_budget: bool = false,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routing_snapshot));
+            const raw = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const remaining_ms = try std.fmt.parseUnsigned(u64, raw, 10);
+            try std.testing.expect(remaining_ms > 0);
+            try std.testing.expect(remaining_ms <= 1_000);
+            self.saw_budget = true;
+            return .{
+                .status = 504,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "request deadline exceeded"),
+            };
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        client.fetchRoutingSnapshotWithBudget("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+        }),
+    );
+    try std.testing.expect(executor.saw_budget);
+}
+
+test "budgeted admin snapshots reject cancellation after transport completion" {
+    const Executor = struct {
+        cancellation: *http_common.RequestCancellation,
+        expected_method: http_common.Method,
+        expected_path: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected_method, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+            // Simulate cancellation racing a successful response. The client
+            // must reject the parsed value instead of returning work that
+            // completed outside the caller's request lifetime.
+            self.cancellation.cancel();
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                ),
+            };
+        }
+    };
+
+    var eventual_cancellation: http_common.RequestCancellation = .{};
+    var eventual_executor = Executor{
+        .cancellation = &eventual_cancellation,
+        .expected_method = .GET,
+        .expected_path = routes.Routes.admin_snapshot,
+    };
+    var eventual_client = MetadataHttpClient.init(std.testing.allocator, eventual_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        eventual_client.fetchSnapshotWithBudget("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &eventual_cancellation,
+        }),
+    );
+
+    var linearizable_cancellation: http_common.RequestCancellation = .{};
+    var linearizable_executor = Executor{
+        .cancellation = &linearizable_cancellation,
+        .expected_method = .POST,
+        .expected_path = routes.Routes.internal_linearizable_snapshot,
+    };
+    var linearizable_client = MetadataHttpClient.init(std.testing.allocator, linearizable_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        linearizable_client.fetchLinearizableSnapshot("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &linearizable_cancellation,
+        }),
+    );
+}
+
+test "budgeted metadata values reject cancellation after transport completion" {
+    const Executor = struct {
+        cancellation: *http_common.RequestCancellation,
+        expected_path: []const u8,
+        response_body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+            self.cancellation.cancel();
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, self.response_body),
+            };
+        }
+    };
+
+    var head_cancellation: http_common.RequestCancellation = .{};
+    var head_executor = Executor{
+        .cancellation = &head_cancellation,
+        .expected_path = routes.Routes.head,
+        .response_body =
+        \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
+        ,
+    };
+    var head_client = MetadataHttpClient.init(std.testing.allocator, head_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        head_client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &head_cancellation,
+        }),
+    );
+
+    var capabilities_cancellation: http_common.RequestCancellation = .{};
+    var capabilities_executor = Executor{
+        .cancellation = &capabilities_cancellation,
+        .expected_path = routes.Routes.capabilities,
+        .response_body =
+        \\{"catalog_routing_protocol_min":2,"catalog_routing_protocol_max":2}
+        ,
+    };
+    var capabilities_client = MetadataHttpClient.init(std.testing.allocator, capabilities_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        capabilities_client.fetchCapabilities("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &capabilities_cancellation,
+        }),
+    );
+}
+
+test "metadata capability client distinguishes advertised routing from N-1 absence" {
+    const Executor = struct {
+        status: u16,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.capabilities));
+            return .{
+                .status = self.status,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, if (self.status == 200)
+                    "{\"catalog_routing_protocol_min\":2,\"catalog_routing_protocol_max\":2}"
+                else
+                    "not found"),
+            };
+        }
+    };
+
+    var current_executor = Executor{ .status = 200 };
+    var current_client = MetadataHttpClient.init(std.testing.allocator, current_executor.executor());
+    const capabilities = try current_client.fetchCapabilities("http://127.0.0.1:9000", null);
+    try std.testing.expect(capabilities.supportsCatalogRouting(metadata_api.catalog_routing_protocol_current));
+
+    var legacy_executor = Executor{ .status = 404 };
+    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        legacy_client.fetchCapabilities("http://127.0.0.1:9000", null),
+    );
+}
+
+test "metadata linearizable routing client uses compact internal endpoint" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_linearizable_routing_snapshot));
+            try std.testing.expectEqualStrings("{}", req.body);
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9,\"tables\":[],\"ranges\":[]}"),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.fetchLinearizableRoutingSnapshot("http://127.0.0.1:9000", .{
+        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
+}
+
+test "metadata routing change client forwards an authority-scoped long poll" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_authority));
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 7), parsed.value.observed_token.metadata_group_id);
+            try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
+            try std.testing.expect(parsed.value.confirm_absence);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"token\":{\"metadata_group_id\":7,\"revision\":18},\"disposition\":\"advanced\",\"changed\":true}"),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.waitForRoutingChange(
+        "http://127.0.0.1:9000",
+        .{ .metadata_group_id = 7, .revision = 17 },
+        true,
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.value.changed);
+    try std.testing.expectEqual(metadata_api.CatalogRoutingChangeResult.Disposition.advanced, result.value.effectiveDisposition());
+    try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
+}
+
+test "metadata route authority client forwards the query and decodes a route plan" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_await_route));
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveRequest, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("docs", parsed.value.query.table_name);
+            try std.testing.expectEqual(metadata_api.CatalogRouteSelector.key, parsed.value.query.selector);
+            try std.testing.expectEqualStrings("row-17", parsed.value.query.key);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"disposition":"found","token":{"metadata_group_id":1,"revision":9},"plan":{"metadata_group_id":1,"metadata_incarnation":null,"catalog_revision":9,"table_id":7,"topology_epoch":3,"groups":[{"group_id":71,"range_id":4,"identity_namespace":{"table_id":7,"shard_id":71,"range_id":4}}]}}
+                ),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.awaitCatalogRoute(
+        "http://127.0.0.1:9000",
+        .{ .query = .{ .table_name = "docs", .selector = .key, .key = "row-17" } },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, result.value.disposition);
+    try std.testing.expectEqual(@as(u64, 71), result.value.plan.?.groups[0].group_id);
 }
 
 test "metadata http client uses the reallocation route and maps upgrade gating" {
@@ -2450,6 +2951,8 @@ test "metadata http client round-trips server endpoints" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                     .create_table = createTable,
                     .create_table_with_context = createTableWithContext,
                     .drop_table = dropTable,
@@ -2501,6 +3004,17 @@ test "metadata http client round-trips server endpoints" {
         }
 
         fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
             snapshot.* = undefined;
         }
 
@@ -2652,6 +3166,11 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqualStrings("slot_resumed", snapshot.value.replication_source_statuses[0].cutover_mode);
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_action_hints.len);
     try std.testing.expectEqualStrings("reseed_exact_cutover", snapshot.value.replication_source_action_hints[0].action);
+
+    var routing_snapshot = try client.fetchRoutingSnapshotWithBudget(base_uri, null);
+    defer routing_snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), routing_snapshot.value.tables.len);
+    try std.testing.expectEqual(@as(usize, 2), routing_snapshot.value.ranges.len);
 
     var ranges = try client.listTableRanges(base_uri, 1);
     defer ranges.deinit();

@@ -90,6 +90,9 @@ const remote_metadata_http_executor_pool_size: usize = 4;
 const remote_metadata_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
 const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
 const remote_metadata_linearizable_snapshot_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
+const remote_metadata_routing_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
+const remote_metadata_routing_capability_refresh_ns: u64 = 60 * std.time.ns_per_s;
+const remote_metadata_routing_probe_wait_ns: u64 = std.time.ns_per_ms;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
@@ -351,6 +354,9 @@ const DataRaftBatchRoute = struct {
     /// Borrowed only by the local visibility phase after Raft apply confirms
     /// the durable outcome. It is never forwarded or serialized.
     visibility_cancellation: antfly.db.types.CancellationToken = .none,
+    /// Immutable catalog authority selected with the public mutation. This is
+    /// forwarded unchanged and consumed only by the confirmed Raft leader.
+    write_route_fence: ?antfly.metadata_api.CatalogRouteFence = null,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -5498,9 +5504,9 @@ pub const DataServer = struct {
         // source so the promoter upserts canonical entity documents into the
         // shard that owns each entity key, then hand it to the write source(s)
         // that open managed DBs.
-        // Promote each document's entities atomically through the 2PC commit
-        // path (multi-participant across the entity table's shards).
-        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .transactional = true };
+        // Require atomic promotion: one fenced batch for a single shard and
+        // 2PC only when the entity set spans multiple shards.
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
@@ -7525,6 +7531,7 @@ pub const DataServer = struct {
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
                 .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
+                .batch_group_routed_with_cancellation = localRaftBatchGroupRoutedWithCancellation,
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
@@ -7632,6 +7639,23 @@ pub const DataServer = struct {
         });
     }
 
+    fn localRaftBatchGroupRoutedWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: antfly.metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try fence.validate();
+        try self.proposeRaftBatchGroup(alloc, fence.route.group_id, table_name, req, .{
+            .refresh_metadata = true,
+            .visibility_cancellation = cancellation,
+            .write_route_fence = fence,
+        });
+    }
+
     fn localRaftBatchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7691,6 +7715,7 @@ pub const DataServer = struct {
     fn localRaftBatchGroupForwarded(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
+        authority: antfly.public_api.internal_group_operations.RoutedBatchAuthority,
         group_id: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
@@ -7698,6 +7723,10 @@ pub const DataServer = struct {
         cancellation_token: antfly.public_api.operation.CancellationToken,
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
+            .catalog => |fence| fence,
+            .split_replication => null,
+        };
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
         if (leader_wait_ns == 0) return error.LeaderUnavailable;
@@ -7712,6 +7741,7 @@ pub const DataServer = struct {
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
                 .visibility_cancellation = cancellation_token,
+                .write_route_fence = write_route_fence,
             },
             leader_wait_ns,
         );
@@ -8137,8 +8167,10 @@ pub const DataServer = struct {
             var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
             var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
             var protocol_activation_lock_owned = false;
+            var routed_write_admission: ?antfly.public_api.table_writes.ProvisionedTableWriteSource.RoutedWriteAdmission = null;
             defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
             defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
+            defer if (routed_write_admission) |*admission| admission.deinit();
             if (preflighted_local_leader) {
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
@@ -8203,6 +8235,15 @@ pub const DataServer = struct {
                 try ensureDataRaftBatchRouteActive(route);
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                if (route.write_route_fence) |fence| {
+                    routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
+                        alloc,
+                        table_name,
+                        fence,
+                        deadline_ns,
+                        route.visibility_cancellation,
+                    );
+                }
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
             }
 
@@ -8341,6 +8382,15 @@ pub const DataServer = struct {
                 }
             }
 
+            // The structural lease only fences validation through proposal
+            // acceptance. Once Raft assigns an index, log ordering owns the
+            // mutation; holding the table gate through apply/visibility would
+            // unnecessarily stall split and merge progress.
+            if (routed_write_admission) |*admission| {
+                admission.deinit();
+                routed_write_admission = null;
+            }
+
             if (retry_for_leader_preflight) {
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 continue;
@@ -8456,6 +8506,11 @@ pub const DataServer = struct {
                                     sleepDataRaftBatchLeaderRetry();
                                     continue;
                                 };
+                                const encoded_route_fence = if (route.write_route_fence) |fence|
+                                    try std.json.Stringify.valueAlloc(alloc, fence, .{})
+                                else
+                                    null;
+                                defer if (encoded_route_fence) |encoded| alloc.free(encoded);
                                 var response = client.fetchGroupBatchWithForwarding(
                                     base_uri,
                                     group_id,
@@ -8464,6 +8519,7 @@ pub const DataServer = struct {
                                     dataRaftBatchHttpTimeoutMs(deadline_ns),
                                     forwarding,
                                     route.cancellation,
+                                    encoded_route_fence,
                                 ) catch |err| {
                                     switch (classifyDataRaftForwardError(err)) {
                                         .safe_to_retry => {
@@ -8648,6 +8704,11 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
+        const encoded_route_fence = if (route.write_route_fence) |fence|
+            try std.json.Stringify.valueAlloc(alloc, fence, .{})
+        else
+            null;
+        defer if (encoded_route_fence) |encoded| alloc.free(encoded);
         var response = client.fetchGroupBatchWithForwarding(
             target_store.api_url,
             group_id,
@@ -8656,6 +8717,7 @@ pub const DataServer = struct {
             dataRaftBatchHttpTimeoutMs(deadline_ns),
             forwarding,
             route.cancellation,
+            encoded_route_fence,
         ) catch |err| {
             switch (classifyDataRaftForwardError(err)) {
                 .safe_to_retry => {
@@ -15617,6 +15679,116 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn lockAtomicBefore(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    if (deadline_ns == null) {
+        lockAtomic(mutex);
+        return true;
+    }
+    while (platform_time.monotonicNs() < deadline_ns.?) {
+        if (mutex.tryLock()) return true;
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    return false;
+}
+
+fn catalogRoutingProbeDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
+    return @min(
+        deadline_ns,
+        now_ns +| @max(probe_interval_ns, std.time.ns_per_ms),
+    );
+}
+
+fn catalogRoutingAttemptDeadline(now_ns: u64, deadline_ns: u64, attempts_remaining: usize) u64 {
+    if (now_ns >= deadline_ns) return deadline_ns;
+    const divisor: u64 = @intCast(@max(attempts_remaining, 1));
+    return now_ns +| @max(@as(u64, 1), (deadline_ns - now_ns) / divisor);
+}
+
+fn isCatalogRoutingTimeout(err: anyerror) bool {
+    return switch (err) {
+        error.CatalogRoutingSnapshotTimeout,
+        error.Timeout,
+        error.DeadlineExceeded,
+        error.Cancelled,
+        error.Canceled,
+        => true,
+        else => false,
+    };
+}
+
+fn normalizeCatalogRoutingSnapshotError(err: anyerror) anyerror {
+    return if (isCatalogRoutingTimeout(err)) error.CatalogRoutingSnapshotTimeout else err;
+}
+
+fn ensureCatalogRoutingDeadline(deadline_ns: u64) !void {
+    if (platform_time.monotonicNs() >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+}
+
+fn legacyCatalogRoutingOptimisticDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
+    if (now_ns >= deadline_ns) return deadline_ns;
+    const remaining_ns = deadline_ns - now_ns;
+    // Keep a meaningful fraction of the caller's budget for the only legacy
+    // operation that can establish an authoritative miss. Without this
+    // reserve, eventual probes can consume the entire deadline and turn a
+    // stable not-found into a misleading timeout.
+    const authority_reserve_ns = @min(
+        remaining_ns,
+        @max(@max(probe_interval_ns, std.time.ns_per_ms), remaining_ns / 3),
+    );
+    return deadline_ns - authority_reserve_ns;
+}
+
+fn routeQueryForWire(
+    table_name: []const u8,
+    query: antfly.public_api.table_catalog.RouteQuery,
+) antfly.metadata_api.CatalogRouteQuery {
+    return switch (query) {
+        .table => .{ .table_name = table_name, .selector = .table },
+        .all_ranges => .{ .table_name = table_name, .selector = .all_ranges },
+        .key => |key| .{ .table_name = table_name, .selector = .key, .key = key },
+        .span => |span| .{
+            .table_name = table_name,
+            .selector = .span,
+            .from_key = span.from_key,
+            .to_key = span.to_key,
+        },
+        .group => |group_id| .{ .table_name = table_name, .selector = .group, .group_id = group_id },
+    };
+}
+
+fn cloneRoutePlanFromWireUntil(
+    alloc: std.mem.Allocator,
+    plan: antfly.metadata_api.CatalogRoutePlan,
+    deadline_ns: u64,
+) !antfly.public_api.table_catalog.CatalogRoutePlan {
+    try ensureCatalogRoutingDeadline(deadline_ns);
+    const groups = try alloc.alloc(antfly.public_api.table_catalog.CatalogGroupRoute, plan.groups.len);
+    errdefer alloc.free(groups);
+    for (plan.groups, groups, 0..) |source_group, *target_group, index| {
+        // This is a primitive copy, so checking once per bounded batch
+        // preserves prompt cancellation without a clock read per route.
+        if (index % 64 == 0) try ensureCatalogRoutingDeadline(deadline_ns);
+        target_group.* = .{
+            .group_id = source_group.group_id,
+            .range_id = source_group.range_id,
+            .identity_namespace = .{
+                .table_id = source_group.identity_namespace.table_id,
+                .shard_id = source_group.identity_namespace.shard_id,
+                .range_id = source_group.identity_namespace.range_id,
+            },
+        };
+    }
+    try ensureCatalogRoutingDeadline(deadline_ns);
+    return .{
+        .metadata_group_id = plan.metadata_group_id,
+        .metadata_incarnation = plan.metadata_incarnation,
+        .catalog_revision = plan.catalog_revision,
+        .table_id = plan.table_id,
+        .topology_epoch = plan.topology_epoch,
+        .groups = groups,
+    };
+}
+
 fn haContextPrimaryIsFenced(ctx: antfly.ha.admin_exec.Context) bool {
     const primary = ctx.primary orelse return false;
     const fence_store = ctx.fence_store orelse return false;
@@ -15836,6 +16008,59 @@ fn appendOwnedPeerRouteUpsert(
 }
 
 const RemoteMetadataSource = struct {
+    const RoutingProtocol = enum {
+        unknown,
+        legacy_v1,
+        compact_v2,
+        incompatible,
+    };
+
+    const RoutingProtocolState = struct {
+        protocol: RoutingProtocol = .unknown,
+        checked_at_ns: u64 = 0,
+        generation: u64 = 0,
+        probe_in_flight: bool = false,
+    };
+
+    const RoutingSnapshotCacheEntry = struct {
+        /// The cache owns one reference. Readers retain under `cache_mutex`
+        /// and clone after releasing it, so catalog-sized allocation never
+        /// blocks mutation invalidation or protocol bookkeeping.
+        ref_count: std.atomic.Value(usize) = .init(1),
+        snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+
+        fn create(
+            alloc: std.mem.Allocator,
+            source: antfly.metadata_api.CatalogRoutingSnapshot,
+        ) !*@This() {
+            return try createUntil(alloc, source, null);
+        }
+
+        fn createUntil(
+            alloc: std.mem.Allocator,
+            source: antfly.metadata_api.CatalogRoutingSnapshot,
+            deadline_ns: ?u64,
+        ) !*@This() {
+            const entry = try alloc.create(@This());
+            errdefer alloc.destroy(entry);
+            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns) };
+            return entry;
+        }
+
+        fn retain(self: *@This()) void {
+            const previous = self.ref_count.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0);
+        }
+
+        fn release(self: *@This(), alloc: std.mem.Allocator) void {
+            const previous = self.ref_count.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous != 1) return;
+            freeRoutingSnapshotOwned(alloc, &self.snapshot);
+            alloc.destroy(self);
+        }
+    };
+
     const TestFaults = if (@import("builtin").is_test) struct {
         fetch_head_error: ?anyerror = null,
         fetch_head_mismatches_remaining: usize = 0,
@@ -15857,6 +16082,9 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
+    cached_routing_snapshot_at_ms: u64 = 0,
+    routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
     // ordinary snapshot request captures this before I/O and may not publish
     // across a generation change.
@@ -15868,6 +16096,7 @@ const RemoteMetadataSource = struct {
     next_linearizable_snapshot_sequence: u64 = 0,
     published_linearizable_snapshot_sequence: u64 = 0,
     linearizable_snapshot_unsupported_until_ns: []u64,
+    routing_protocol_states: []RoutingProtocolState,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
     internal_service_secret: ?[]const u8 = null,
@@ -15906,10 +16135,14 @@ const RemoteMetadataSource = struct {
         const unsupported_until = try alloc.alloc(u64, base_uris.len);
         errdefer alloc.free(unsupported_until);
         @memset(unsupported_until, 0);
+        const routing_protocol_states = try alloc.alloc(RoutingProtocolState, base_uris.len);
+        errdefer alloc.free(routing_protocol_states);
+        @memset(routing_protocol_states, .{});
         return .{
             .alloc = alloc,
             .base_uris = owned,
             .linearizable_snapshot_unsupported_until_ns = unsupported_until,
+            .routing_protocol_states = routing_protocol_states,
             .http_executors = http_executors,
         };
     }
@@ -15919,7 +16152,9 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.http_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
+        self.alloc.free(self.routing_protocol_states);
         for (self.base_uris) |uri| self.alloc.free(uri);
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
@@ -15985,6 +16220,90 @@ const RemoteMetadataSource = struct {
     fn noteMetadataReadSuccess(self: *RemoteMetadataSource, index: usize) void {
         lockAtomic(&self.cache_mutex);
         self.preferred_read_uri_index = index;
+        self.cache_mutex.unlock();
+    }
+
+    fn noteMetadataReadProbeMiss(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        if (self.preferred_read_uri_index % self.base_uris.len == index) {
+            self.preferred_read_uri_index = (index + 1) % self.base_uris.len;
+        }
+        self.cache_mutex.unlock();
+    }
+
+    fn routingProtocolForEndpoint(
+        self: *RemoteMetadataSource,
+        index: usize,
+        client: *antfly.metadata_http_client.MetadataHttpClient,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+    ) !RoutingProtocol {
+        var probe_generation: u64 = undefined;
+        while (true) {
+            const now_ns = platform_time.monotonicNs();
+            try ensureBudgetActive(budget);
+            lockAtomic(&self.cache_mutex);
+            const state = self.routing_protocol_states[index];
+            const ttl_ns = if (state.protocol == .compact_v2)
+                remote_metadata_routing_capability_refresh_ns
+            else
+                remote_metadata_routing_capability_retry_ns;
+            if (state.protocol != .unknown and now_ns -| state.checked_at_ns < ttl_ns) {
+                self.cache_mutex.unlock();
+                if (state.protocol == .incompatible) return error.MetadataRoutingProtocolIncompatible;
+                return state.protocol;
+            }
+            if (!state.probe_in_flight) {
+                self.routing_protocol_states[index].probe_in_flight = true;
+                probe_generation = state.generation;
+                self.cache_mutex.unlock();
+                break;
+            }
+            self.cache_mutex.unlock();
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), remote_metadata_routing_probe_wait_ns / std.time.ns_per_ms));
+        }
+
+        const capabilities = client.fetchCapabilities(self.base_uris[index], budget) catch |err| switch (err) {
+            // N-1 metadata predates capability advertisement and is adapted
+            // through its admin and linearizable-admin snapshot endpoints.
+            error.UnsupportedOperation => antfly.metadata_api.MetadataCapabilities{
+                .catalog_routing_protocol_min = 1,
+                .catalog_routing_protocol_max = 1,
+            },
+            else => {
+                lockAtomic(&self.cache_mutex);
+                if (self.routing_protocol_states[index].generation == probe_generation) {
+                    self.routing_protocol_states[index].probe_in_flight = false;
+                }
+                self.cache_mutex.unlock();
+                return err;
+            },
+        };
+        const protocol: RoutingProtocol = if (capabilities.supportsCatalogRouting(antfly.metadata_api.catalog_routing_protocol_current))
+            .compact_v2
+        else if (capabilities.supportsCatalogRouting(1))
+            .legacy_v1
+        else
+            .incompatible;
+        lockAtomic(&self.cache_mutex);
+        const state = &self.routing_protocol_states[index];
+        if (state.generation == probe_generation) {
+            state.protocol = protocol;
+            state.checked_at_ns = platform_time.monotonicNs();
+            state.probe_in_flight = false;
+        }
+        const selected = state.protocol;
+        self.cache_mutex.unlock();
+        if (selected == .incompatible) return error.MetadataRoutingProtocolIncompatible;
+        return selected;
+    }
+
+    fn noteRoutingProtocolUnsupported(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        const state = &self.routing_protocol_states[index];
+        state.protocol = .legacy_v1;
+        state.checked_at_ns = platform_time.monotonicNs();
+        state.generation +%= 1;
+        state.probe_in_flight = false;
         self.cache_mutex.unlock();
     }
 
@@ -16121,16 +16440,21 @@ const RemoteMetadataSource = struct {
 
     fn invalidateCache(self: *RemoteMetadataSource) void {
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
+        var retired_routing_snapshot: ?*RoutingSnapshotCacheEntry = null;
         lockAtomic(&self.cache_mutex);
         retired_snapshot = self.cached_snapshot;
+        retired_routing_snapshot = self.cached_routing_snapshot;
         self.cached_snapshot = null;
+        self.cached_routing_snapshot = null;
         self.cached_head = null;
         self.cached_head_at_ms = 0;
         self.cached_snapshot_at_ms = 0;
+        self.cached_routing_snapshot_at_ms = 0;
         self.snapshot_fence_generation +%= 1;
         self.snapshot_invalidation_generation +%= 1;
         self.cache_mutex.unlock();
         if (retired_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        if (retired_routing_snapshot) |snapshot| snapshot.release(self.alloc);
     }
 
     fn acceptLinearizableSnapshot(
@@ -16288,6 +16612,11 @@ const RemoteMetadataSource = struct {
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
+                .routing_snapshot = remoteRoutingSnapshot,
+                .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
+                .free_routing_snapshot = remoteFreeRoutingSnapshot,
+                .wait_for_routing_change = remoteWaitForRoutingChange,
+                .await_route = remoteAwaitRoute,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = remoteValidateCatalogPublication,
                 .validate_table_publication = remoteValidateCatalogTablePublication,
@@ -16299,12 +16628,16 @@ const RemoteMetadataSource = struct {
     fn statusSource(self: *RemoteMetadataSource) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
+            .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
+                .routing_snapshot = remoteRoutingSnapshot,
+                .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
+                .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .restore_table = remoteRestoreTable,
@@ -16647,6 +16980,451 @@ const RemoteMetadataSource = struct {
             .metadata_incarnation = head.metadata_incarnation orelse
                 return error.MetadataIncarnationUnavailable,
         };
+    }
+
+    fn remoteRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteRoutingSnapshotWithMode(deadline_ns, false);
+    }
+
+    fn remoteLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteRoutingSnapshotWithMode(deadline_ns, true);
+    }
+
+    fn remoteRoutingSnapshotWithMode(
+        self: *RemoteMetadataSource,
+        deadline_ns: ?u64,
+        linearizable: bool,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        var refresh_locked = false;
+        defer if (refresh_locked) self.routing_refresh_mutex.unlock();
+        var routing_invalidation_generation: u64 = 0;
+        if (!linearizable) {
+            if (try self.cachedRoutingSnapshotFresh(deadline_ns)) |snapshot| return snapshot;
+            if (!lockAtomicBefore(&self.routing_refresh_mutex, deadline_ns))
+                return error.CatalogRoutingSnapshotTimeout;
+            refresh_locked = true;
+            // Singleflight followers recheck after the active refresh. This
+            // keeps a burst of routed reads to one metadata request.
+            if (try self.cachedRoutingSnapshotFresh(deadline_ns)) |snapshot| return snapshot;
+            if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+                return error.CatalogRoutingSnapshotTimeout;
+            routing_invalidation_generation = self.snapshot_invalidation_generation;
+            self.cache_mutex.unlock();
+        }
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
+            .{ .deadline_ns = deadline }
+        else
+            null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
+                const now_ns = platform_time.monotonicNs();
+                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt) };
+            } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var metadata_client = self.metadataClient(scratch);
+            const protocol = self.routingProtocolForEndpoint(index, &metadata_client, attempt_budget) catch |err| {
+                last_err = normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            const snapshot = switch (protocol) {
+                .compact_v2 => compact: {
+                    var parsed = (if (linearizable)
+                        metadata_client.fetchLinearizableRoutingSnapshot(self.base_uris[index], attempt_budget)
+                    else
+                        metadata_client.fetchRoutingSnapshotWithBudget(self.base_uris[index], attempt_budget)) catch |err| {
+                        if (err == error.UnsupportedOperation) {
+                            // Capability advertisements can outlive a rolling
+                            // rollback, node replacement, or a mixed-version
+                            // load balancer. Downgrade this endpoint and finish
+                            // the request through the N-1 adapter immediately.
+                            self.noteRoutingProtocolUnsupported(index);
+                            break :compact self.fetchLegacyRoutingSnapshotAtEndpoint(
+                                &metadata_client,
+                                index,
+                                attempt_budget,
+                                linearizable,
+                            ) catch |legacy_err| {
+                                if (isCatalogRoutingTimeout(legacy_err)) {
+                                    last_err = error.CatalogRoutingSnapshotTimeout;
+                                    continue;
+                                }
+                                last_err = legacy_err;
+                                continue;
+                            };
+                        }
+                        if (isCatalogRoutingTimeout(err)) {
+                            last_err = error.CatalogRoutingSnapshotTimeout;
+                            continue;
+                        }
+                        last_err = err;
+                        continue;
+                    };
+                    defer parsed.deinit();
+                    break :compact self.ownedRoutingSnapshotUntil(
+                        parsed.value.metadata_group_id,
+                        parsed.value.metadata_incarnation,
+                        parsed.value.catalog_revision,
+                        parsed.value.tables,
+                        parsed.value.ranges,
+                        if (attempt_budget) |budget| budget.deadline_ns else null,
+                    ) catch |err| {
+                        last_err = err;
+                        continue;
+                    };
+                },
+                .legacy_v1 => legacy: {
+                    break :legacy self.fetchLegacyRoutingSnapshotAtEndpoint(
+                        &metadata_client,
+                        index,
+                        attempt_budget,
+                        linearizable,
+                    ) catch |err| {
+                        if (isCatalogRoutingTimeout(err)) {
+                            last_err = error.CatalogRoutingSnapshotTimeout;
+                            continue;
+                        }
+                        last_err = err;
+                        continue;
+                    };
+                },
+                .unknown, .incompatible => unreachable,
+            };
+            self.noteMetadataReadSuccess(index);
+            if (!linearizable) self.publishRoutingSnapshot(snapshot, routing_invalidation_generation, deadline_ns) catch |err| {
+                var owned = snapshot;
+                freeRoutingSnapshotOwned(self.alloc, &owned);
+                if (err == error.MetadataSnapshotHeadMismatch) {
+                    // A mutation raced the eventual fetch. Do not expose the
+                    // stale result or leak an internal cache-generation error
+                    // to the request: refresh through the authoritative path
+                    // while retaining the caller's original deadline.
+                    return try self.remoteRoutingSnapshotWithMode(deadline_ns, true);
+                }
+                return err;
+            };
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) {
+                    var owned = snapshot;
+                    freeRoutingSnapshotOwned(self.alloc, &owned);
+                    return error.CatalogRoutingSnapshotTimeout;
+                }
+            }
+            return snapshot;
+        }
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        return last_err;
+    }
+
+    fn cachedRoutingSnapshotFresh(
+        self: *RemoteMetadataSource,
+        deadline_ns: ?u64,
+    ) !?antfly.metadata_api.CatalogRoutingSnapshot {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+            return error.CatalogRoutingSnapshotTimeout;
+        const entry = self.cached_routing_snapshot orelse {
+            self.cache_mutex.unlock();
+            return null;
+        };
+        if (now_ms -| self.cached_routing_snapshot_at_ms > metadata_snapshot_cache_ttl_ms) {
+            self.cache_mutex.unlock();
+            return null;
+        }
+        entry.retain();
+        self.cache_mutex.unlock();
+        defer entry.release(self.alloc);
+        return try cloneRoutingSnapshotOwnedUntil(self.alloc, entry.snapshot, deadline_ns);
+    }
+
+    fn publishRoutingSnapshot(
+        self: *RemoteMetadataSource,
+        snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+        invalidation_generation: u64,
+        deadline_ns: ?u64,
+    ) !void {
+        const entry = try RoutingSnapshotCacheEntry.createUntil(self.alloc, snapshot, deadline_ns);
+        var published = false;
+        defer if (!published) entry.release(self.alloc);
+        var retired: ?*RoutingSnapshotCacheEntry = null;
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) {
+                self.cache_mutex.unlock();
+                return error.CatalogRoutingSnapshotTimeout;
+            }
+        }
+        if (self.snapshot_invalidation_generation != invalidation_generation) {
+            self.cache_mutex.unlock();
+            return error.MetadataSnapshotHeadMismatch;
+        }
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) {
+                self.cache_mutex.unlock();
+                return error.CatalogRoutingSnapshotTimeout;
+            }
+        }
+        retired = self.cached_routing_snapshot;
+        self.cached_routing_snapshot = entry;
+        self.cached_routing_snapshot_at_ms = now_ms;
+        published = true;
+        self.cache_mutex.unlock();
+        if (retired) |value| value.release(self.alloc);
+    }
+
+    fn fetchLegacyRoutingSnapshotAtEndpoint(
+        self: *RemoteMetadataSource,
+        metadata_client: *antfly.metadata_http_client.MetadataHttpClient,
+        index: usize,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+        linearizable: bool,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        var parsed = if (linearizable)
+            try metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget)
+        else
+            try metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget);
+        defer parsed.deinit();
+        return try self.ownedRoutingSnapshotUntil(
+            parsed.value.status.metadata_group_id,
+            parsed.value.status.metadata_incarnation,
+            0,
+            parsed.value.tables,
+            parsed.value.ranges,
+            if (budget) |value| value.deadline_ns else null,
+        );
+    }
+
+    fn ownedRoutingSnapshotUntil(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation,
+        catalog_revision: u64,
+        source_tables: []const antfly.metadata.table_manager.TableRecord,
+        source_ranges: []const antfly.metadata.table_manager.RangeRecord,
+        deadline_ns: ?u64,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
+        const tables = try cloneRoutingTablesOwnedUntil(self.alloc, source_tables, deadline_ns);
+        errdefer freeTablesOwned(self.alloc, tables);
+        const ranges = try cloneRoutingRangesOwnedUntil(self.alloc, source_ranges, deadline_ns);
+        errdefer freeRangesOwned(self.alloc, ranges);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = metadata_incarnation,
+            .catalog_revision = catalog_revision,
+            .change_token = .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = metadata_incarnation,
+                .revision = catalog_revision,
+            },
+            .tables = tables,
+            .ranges = ranges,
+        };
+    }
+
+    fn remoteFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        freeRoutingSnapshotOwned(self.alloc, snapshot);
+    }
+
+    fn remoteWaitForRoutingChange(ptr: *anyopaque, observed_token: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return .retry;
+        const probe_deadline_ns = catalogRoutingProbeDeadline(now_ns, deadline_ns, probe_interval_ns);
+        const final_probe = probe_deadline_ns == deadline_ns;
+        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = probe_deadline_ns };
+        const index = self.metadataReadApiIndexForAttempt(0);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var metadata_client = self.metadataClient(arena.allocator());
+        var parsed = metadata_client.waitForRoutingChange(
+            self.base_uris[index],
+            observed_token,
+            final_probe,
+            budget,
+        ) catch |err| {
+            if (err == error.UnsupportedOperation) {
+                const fallback_now_ns = platform_time.monotonicNs();
+                if (fallback_now_ns < probe_deadline_ns) {
+                    const wait_ns = probe_deadline_ns - fallback_now_ns;
+                    platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                }
+            }
+            self.noteMetadataReadProbeMiss(index);
+            // Only a completed unchanged watch can confirm absence. Transport
+            // failure at the outer deadline is contention/unavailability and
+            // must remain a timeout rather than becoming not_found.
+            return .retry;
+        };
+        defer parsed.deinit();
+        return switch (parsed.value.effectiveDisposition()) {
+            .advanced, .authority_changed => blk: {
+                self.noteMetadataReadSuccess(index);
+                break :blk .changed;
+            },
+            .unchanged => blk: {
+                self.noteMetadataReadProbeMiss(index);
+                break :blk if (final_probe) .authoritative_absence else .retry;
+            },
+            .replica_behind => blk: {
+                self.noteMetadataReadProbeMiss(index);
+                break :blk .retry;
+            },
+        };
+    }
+
+    fn remoteAwaitRoute(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const request = antfly.metadata_api.CatalogRouteResolveRequest{ .query = routeQueryForWire(table_name, query) };
+        var legacy_count: usize = 0;
+        var incompatible_count: usize = 0;
+        for (0..self.base_uris.len) |attempt| {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return .timed_out;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const budget = antfly.metadata_http_client.RequestBudget{
+                .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt),
+            };
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var metadata_client = self.metadataClient(arena.allocator());
+            const protocol = self.routingProtocolForEndpoint(index, &metadata_client, budget) catch |err| {
+                self.noteMetadataReadProbeMiss(index);
+                if (err == error.MetadataRoutingProtocolIncompatible) incompatible_count += 1;
+                continue;
+            };
+            if (protocol == .legacy_v1) {
+                legacy_count += 1;
+                continue;
+            }
+            var parsed = metadata_client.awaitCatalogRoute(self.base_uris[index], request, budget) catch |err| {
+                self.noteMetadataReadProbeMiss(index);
+                if (err == error.UnsupportedOperation) {
+                    self.noteRoutingProtocolUnsupported(index);
+                    legacy_count += 1;
+                }
+                continue;
+            };
+            defer parsed.deinit();
+            switch (parsed.value.disposition) {
+                .found => {
+                    const plan = parsed.value.plan orelse return error.InvalidCatalogRouteResponse;
+                    try self.acceptMetadataIdentity(plan.metadata_group_id, plan.metadata_incarnation);
+                    var owned_plan = cloneRoutePlanFromWireUntil(alloc, plan, deadline_ns) catch |err| switch (err) {
+                        error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                        else => return err,
+                    };
+                    errdefer owned_plan.deinit(alloc);
+                    self.noteMetadataReadSuccess(index);
+                    if (platform_time.monotonicNs() >= deadline_ns) {
+                        owned_plan.deinit(alloc);
+                        return .timed_out;
+                    }
+                    return .{ .found = owned_plan };
+                },
+                .not_found => {
+                    try self.acceptMetadataIdentity(
+                        parsed.value.token.metadata_group_id,
+                        parsed.value.token.metadata_incarnation,
+                    );
+                    self.noteMetadataReadSuccess(index);
+                    if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+                    return .publication_not_observed;
+                },
+                .timed_out, .authority_changed => {
+                    self.noteMetadataReadProbeMiss(index);
+                    continue;
+                },
+            }
+        }
+        if (legacy_count > 0) return try self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns);
+        if (incompatible_count == self.base_uris.len) return error.MetadataRoutingProtocolIncompatible;
+        return .timed_out;
+    }
+
+    /// N-1 adapter: follower admin snapshots may establish only a positive.
+    /// A terminal miss is returned exclusively after the legacy linearizable
+    /// admin endpoint has captured the same query as absent.
+    fn remoteLegacyAwaitRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
+        const optimistic_deadline_ns = legacyCatalogRoutingOptimisticDeadline(
+            platform_time.monotonicNs(),
+            deadline_ns,
+            probe_interval_ns,
+        );
+        optimistic_loop: while (platform_time.monotonicNs() < optimistic_deadline_ns) {
+            var snapshot = self.remoteRoutingSnapshotWithMode(optimistic_deadline_ns, false) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => break,
+                else => return err,
+            };
+            defer remoteFreeRoutingSnapshot(self, &snapshot);
+            const optimistic_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+                alloc,
+                snapshot,
+                table_name,
+                query,
+                optimistic_deadline_ns,
+            ) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => break :optimistic_loop,
+                else => return err,
+            };
+            if (optimistic_plan) |plan| {
+                return .{ .found = plan };
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= optimistic_deadline_ns or optimistic_deadline_ns - now_ns <= probe_interval_ns) break;
+            const wait_ns = @min(optimistic_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+        }
+        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+        var authoritative = self.remoteRoutingSnapshotWithMode(deadline_ns, true) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return .timed_out,
+            else => return err,
+        };
+        defer remoteFreeRoutingSnapshot(self, &authoritative);
+        const authoritative_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+            alloc,
+            authoritative,
+            table_name,
+            query,
+            deadline_ns,
+        ) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return .timed_out,
+            else => return err,
+        };
+        if (authoritative_plan) |plan| {
+            return .{ .found = plan };
+        }
+        return .publication_not_observed;
     }
 
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
@@ -19121,6 +19899,30 @@ fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
     return out;
 }
 
+fn cloneRoutingTablesOwnedUntil(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.table_manager.TableRecord,
+    deadline_ns: ?u64,
+) ![]antfly.metadata.table_manager.TableRecord {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+    const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        out[i] = try antfly.metadata.table_manager.cloneRoutingTable(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
     var initialized: usize = 0;
@@ -19133,6 +19935,74 @@ fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
         initialized += 1;
     }
     return out;
+}
+
+fn cloneRoutingRangesOwnedUntil(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.table_manager.RangeRecord,
+    deadline_ns: ?u64,
+) ![]antfly.metadata.table_manager.RangeRecord {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+    const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        out[i] = try antfly.metadata.table_manager.cloneRoutingRange(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRoutingSnapshotOwnedUntil(
+    alloc: std.mem.Allocator,
+    snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+    deadline_ns: ?u64,
+) !antfly.metadata_api.CatalogRoutingSnapshot {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+    const tables = try cloneRoutingTablesOwnedUntil(alloc, snapshot.tables, deadline_ns);
+    errdefer freeTablesOwned(alloc, tables);
+    const ranges = try cloneRoutingRangesOwnedUntil(alloc, snapshot.ranges, deadline_ns);
+    errdefer freeRangesOwned(alloc, ranges);
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+    return .{
+        .metadata_group_id = snapshot.metadata_group_id,
+        .metadata_incarnation = snapshot.metadata_incarnation,
+        .catalog_revision = snapshot.catalog_revision,
+        .change_token = snapshot.change_token,
+        .tables = tables,
+        .ranges = ranges,
+    };
+}
+
+fn freeRoutingSnapshotOwned(
+    alloc: std.mem.Allocator,
+    snapshot: *antfly.metadata_api.CatalogRoutingSnapshot,
+) void {
+    freeTablesOwned(alloc, snapshot.tables);
+    freeRangesOwned(alloc, snapshot.ranges);
+    snapshot.* = undefined;
+}
+
+fn freeTablesOwned(alloc: std.mem.Allocator, records: []antfly.metadata.table_manager.TableRecord) void {
+    for (records) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+    if (records.len > 0) alloc.free(records);
+}
+
+fn freeRangesOwned(alloc: std.mem.Allocator, records: []antfly.metadata.table_manager.RangeRecord) void {
+    for (records) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+    if (records.len > 0) alloc.free(records);
 }
 
 fn cloneNodesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.NodeRecord) ![]antfly.metadata.table_manager.NodeRecord {
@@ -20277,6 +21147,9 @@ test "data runtime live writer source follows raft apply ownership" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20373,6 +21246,9 @@ test "data raft retry checkpoints survive changed ready windows and publication 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20588,6 +21464,9 @@ test "data raft replica retirement removes only retired group apply state" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20693,6 +21572,9 @@ test "data raft apply records transaction conflicts without stopping replica pro
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -21780,6 +22662,9 @@ test "data runtime local group status provider collects and caches group statuse
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -22148,6 +23033,9 @@ test "data runtime local split fallback preserves source identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -22320,6 +23208,9 @@ test "data runtime split apply store seeding reuses cached source writer" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -22521,6 +23412,9 @@ test "data runtime local merge fallback uses its durable table contract" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23392,6 +24286,9 @@ test "data runtime background refresh publishes a cold placeholder without DB op
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23441,6 +24338,9 @@ test "data runtime background refresh publishes a cold placeholder without DB op
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23529,6 +24429,9 @@ test "data runtime provisioned cache warmup populates runtime status without pin
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23578,6 +24481,9 @@ test "data runtime provisioned cache warmup populates runtime status without pin
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23693,6 +24599,9 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23728,6 +24637,9 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23811,6 +24723,9 @@ test "data runtime status refresh preserves only the active catch-up group while
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23869,6 +24784,9 @@ test "data runtime status refresh preserves only the active catch-up group while
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24006,6 +24924,9 @@ test "data runtime status refresh skips opening the active startup group when no
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24064,6 +24985,9 @@ test "data runtime status refresh skips opening the active startup group when no
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24130,6 +25054,9 @@ test "data runtime status refresh publishes synthetic missing status for absent 
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24180,6 +25107,9 @@ test "data runtime status refresh publishes synthetic missing status for absent 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24251,6 +25181,9 @@ test "data runtime status refresh budget preserves fresh cached group status for
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24300,6 +25233,9 @@ test "data runtime status refresh budget preserves fresh cached group status for
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24392,6 +25328,9 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24441,6 +25380,9 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24533,6 +25475,9 @@ test "data runtime status refresh falls back to live managed writer status when 
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24582,6 +25527,9 @@ test "data runtime status refresh falls back to live managed writer status when 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24667,6 +25615,9 @@ test "data runtime status refresh publishes placeholder when live managed writer
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24716,6 +25667,9 @@ test "data runtime status refresh publishes placeholder when live managed writer
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24875,6 +25829,9 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -24939,6 +25896,9 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25142,6 +26102,9 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25190,6 +26153,9 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25333,6 +26299,9 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25383,6 +26352,9 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25495,6 +26467,9 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
                         .status = status,
                         .admin_snapshot = adminSnapshot,
                         .free_admin_snapshot = freeAdminSnapshot,
+                        .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                        .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                        .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     },
                 };
             }
@@ -25545,6 +26520,9 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
                     .vtable = &.{
                         .admin_snapshot = adminSnapshot,
                         .free_admin_snapshot = freeAdminSnapshot,
+                        .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                        .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                        .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     },
                 };
             }
@@ -25681,6 +26659,9 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25751,6 +26732,9 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25892,6 +26876,9 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26466,6 +27453,9 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
                     .admin_snapshot = adminSnapshot,
                     .cached_admin_snapshot = cachedAdminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26810,6 +27800,9 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26864,6 +27857,9 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26928,6 +27924,9 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26997,6 +27996,9 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28089,6 +29091,9 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28119,6 +29124,9 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28576,6 +29584,9 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28587,6 +29598,9 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28716,6 +29730,9 @@ test "data server wires configured HA executors into API server" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28770,6 +29787,9 @@ test "data server wires configured HA executors into API server" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29577,6 +30597,9 @@ test "data server mirrors managed primary writes into HA replication log" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29616,6 +30639,9 @@ test "data server mirrors managed primary writes into HA replication log" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29711,6 +30737,9 @@ test "data server fail-closed sync policy rejects primary writes before local co
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29750,6 +30779,9 @@ test "data server fail-closed sync policy rejects primary writes before local co
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29834,6 +30866,9 @@ test "data server block sync policy waits for standby acknowledgement before com
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29873,6 +30908,9 @@ test "data server block sync policy waits for standby acknowledgement before com
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29983,6 +31021,9 @@ test "data server propagates standby HA write gate into provisioned write source
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30013,6 +31054,9 @@ test "data server propagates standby HA write gate into provisioned write source
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30125,6 +31169,9 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30155,6 +31202,9 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30265,6 +31315,9 @@ test "data server applies routed HA replication records through standby write ga
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30304,6 +31357,9 @@ test "data server applies routed HA replication records through standby write ga
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30432,6 +31488,9 @@ test "data server pulls and applies HA standby replication through internal HTTP
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30471,6 +31530,9 @@ test "data server pulls and applies HA standby replication through internal HTTP
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30646,6 +31708,9 @@ test "data server HA replication network wait leaves state mutex available" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30675,6 +31740,9 @@ test "data server HA replication network wait leaves state mutex available" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30847,6 +31915,9 @@ test "data server HA state change synchronously adopts promotion and rewires liv
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30876,6 +31947,9 @@ test "data server HA state change synchronously adopts promotion and rewires liv
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31026,6 +32100,9 @@ test "data server promotion open failure preserves retryable standby" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31055,6 +32132,9 @@ test "data server promotion open failure preserves retryable standby" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31195,6 +32275,9 @@ test "data server resumes HA standby replication from durable progress after res
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31234,6 +32317,9 @@ test "data server resumes HA standby replication from durable progress after res
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31424,6 +32510,9 @@ test "data runtime records and backs off HA standby replication round failures" 
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31454,6 +32543,9 @@ test "data runtime records and backs off HA standby replication round failures" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31578,6 +32670,9 @@ test "data runtime records HA standby apply failures without stopping run round"
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31608,6 +32703,9 @@ test "data runtime records HA standby apply failures without stopping run round"
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31724,6 +32822,9 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -31775,6 +32876,9 @@ test "data runtime background maintenance is due for dense posting cadence witho
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -32314,4 +33418,262 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
     try DataServer.ensureDataRaftBatchRouteActive(cancellable_route);
     cancellation.cancel();
     try std.testing.expectError(error.Cancelled, DataServer.ensureDataRaftBatchRouteActive(cancellable_route));
+}
+
+test "remote routing cache entries retain immutable snapshots outside the cache lock" {
+    const tables = [_]antfly.metadata.table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    const ranges = [_]antfly.metadata.table_manager.RangeRecord{
+        .{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "" },
+    };
+    const source = antfly.metadata_api.CatalogRoutingSnapshot{
+        .catalog_revision = 9,
+        .tables = @constCast(tables[0..]),
+        .ranges = @constCast(ranges[0..]),
+    };
+    const entry = try RemoteMetadataSource.RoutingSnapshotCacheEntry.create(std.testing.allocator, source);
+    defer entry.release(std.testing.allocator);
+
+    entry.retain();
+    defer entry.release(std.testing.allocator);
+    var cloned = try cloneRoutingSnapshotOwnedUntil(
+        std.testing.allocator,
+        entry.snapshot,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer freeRoutingSnapshotOwned(std.testing.allocator, &cloned);
+    try std.testing.expectEqual(@as(u64, 9), cloned.catalog_revision);
+    try std.testing.expectEqualStrings("docs", cloned.tables[0].name);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        cloneRoutingSnapshotOwnedUntil(
+            std.testing.allocator,
+            entry.snapshot,
+            platform_time.monotonicNs(),
+        ),
+    );
+}
+
+test "remote routing never publishes a cache entry after its deadline" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    var tables = [_]antfly.metadata.table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+        .{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "" },
+    };
+    const first = antfly.metadata_api.CatalogRoutingSnapshot{
+        .catalog_revision = 9,
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+    };
+    try source.publishRoutingSnapshot(
+        first,
+        source.snapshot_invalidation_generation,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+
+    lockAtomic(&source.cache_mutex);
+    const published = source.cached_routing_snapshot.?;
+    source.cache_mutex.unlock();
+
+    var replacement = first;
+    replacement.catalog_revision = 10;
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        source.publishRoutingSnapshot(
+            replacement,
+            source.snapshot_invalidation_generation,
+            platform_time.monotonicNs(),
+        ),
+    );
+
+    lockAtomic(&source.cache_mutex);
+    defer source.cache_mutex.unlock();
+    try std.testing.expect(source.cached_routing_snapshot == published);
+    try std.testing.expectEqual(@as(u64, 9), source.cached_routing_snapshot.?.snapshot.catalog_revision);
+}
+
+test "remote routing normalizes every timeout class at the source boundary" {
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Timeout) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.DeadlineExceeded) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.CatalogRoutingSnapshotTimeout) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.NotLeader) == error.NotLeader);
+}
+
+test "remote await route plan cloning preserves its absolute deadline" {
+    var groups = [_]antfly.metadata_api.CatalogGroupRoute{
+        .{
+            .group_id = 7001,
+            .range_id = 71,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 71 },
+        },
+        .{
+            .group_id = 7002,
+            .range_id = 72,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 72 },
+        },
+    };
+    const wire_plan = antfly.metadata_api.CatalogRoutePlan{
+        .metadata_group_id = 91,
+        .metadata_incarnation = null,
+        .catalog_revision = 12,
+        .table_id = 7,
+        .topology_epoch = 8,
+        .groups = groups[0..],
+    };
+
+    var cloned = try cloneRoutePlanFromWireUntil(
+        std.testing.allocator,
+        wire_plan,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer cloned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), cloned.groups.len);
+    try std.testing.expectEqual(@as(u64, 7002), cloned.groups[1].group_id);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        cloneRoutePlanFromWireUntil(
+            std.testing.allocator,
+            wire_plan,
+            platform_time.monotonicNs(),
+        ),
+    );
+}
+
+test "remote metadata catalog source provides compact routing" {
+    var metadata: RemoteMetadataSource = undefined;
+    _ = try metadata.catalogSource().routingSource();
+}
+
+test "remote metadata routing negotiation upgrades the N-1 adapter" {
+    const Executor = struct {
+        status: u16 = 404,
+        protocol: u16 = 2,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) antfly.raft.transport.http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: antfly.raft.transport.http_common.HttpRequest) !antfly.raft.transport.http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, antfly.metadata_http_routes.Routes.capabilities));
+            return .{
+                .status = self.status,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = if (self.status == 200)
+                    try std.fmt.allocPrint(alloc, "{{\"catalog_routing_protocol_min\":{d},\"catalog_routing_protocol_max\":{d}}}", .{ self.protocol, self.protocol })
+                else
+                    try alloc.dupe(u8, "not found"),
+            };
+        }
+    };
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    var executor = Executor{};
+    var client = antfly.metadata_http_client.MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.legacy_v1,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.legacy_v1,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+
+    source.routing_protocol_states[0].checked_at_ns = 0;
+    executor.status = 200;
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.compact_v2,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.compact_v2,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+    source.noteRoutingProtocolUnsupported(0);
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.legacy_v1,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+    source.routing_protocol_states[0].checked_at_ns = 0;
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.compact_v2,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
+
+    source.routing_protocol_states[0].protocol = .unknown;
+    source.routing_protocol_states[0].checked_at_ns = 0;
+    executor.protocol = 3;
+    try std.testing.expectError(
+        error.MetadataRoutingProtocolIncompatible,
+        source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+}
+
+test "remote catalog watches reserve the outer deadline for replica failover" {
+    const now_ns = 10 * std.time.ns_per_s;
+    try std.testing.expectEqual(
+        now_ns + 25 * std.time.ns_per_ms,
+        catalogRoutingProbeDeadline(
+            now_ns,
+            now_ns + std.time.ns_per_s,
+            25 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expectEqual(
+        now_ns + 5 * std.time.ns_per_ms,
+        catalogRoutingProbeDeadline(
+            now_ns,
+            now_ns + 5 * std.time.ns_per_ms,
+            25 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expectEqual(
+        now_ns + 100 * std.time.ns_per_ms,
+        catalogRoutingAttemptDeadline(now_ns, now_ns + 300 * std.time.ns_per_ms, 3),
+    );
+    try std.testing.expectEqual(
+        now_ns + 300 * std.time.ns_per_ms,
+        catalogRoutingAttemptDeadline(now_ns, now_ns + 300 * std.time.ns_per_ms, 1),
+    );
+    try std.testing.expectEqual(
+        now_ns + 200 * std.time.ns_per_ms,
+        legacyCatalogRoutingOptimisticDeadline(
+            now_ns,
+            now_ns + 300 * std.time.ns_per_ms,
+            25 * std.time.ns_per_ms,
+        ),
+    );
 }

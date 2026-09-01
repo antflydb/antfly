@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -171,6 +173,20 @@ pub const CatalogIdentity = struct {
     metadata_incarnation: MetadataClusterIncarnation,
 };
 
+pub const catalog_routing_protocol_current: u16 = 2;
+
+/// Wire capabilities are negotiated before a data node chooses its routing
+/// adapter. Absence of this document identifies the N-1 legacy protocol.
+pub const MetadataCapabilities = struct {
+    catalog_routing_protocol_min: u16 = catalog_routing_protocol_current,
+    catalog_routing_protocol_max: u16 = catalog_routing_protocol_current,
+
+    pub fn supportsCatalogRouting(self: @This(), version: u16) bool {
+        return version >= self.catalog_routing_protocol_min and
+            version <= self.catalog_routing_protocol_max;
+    }
+};
+
 /// Compact, constant-size runtime topology consumed by safety monitors.
 /// Keep this separate from MetadataStatus so frequent topology probes never
 /// walk or clone the projected catalog.
@@ -222,12 +238,203 @@ pub const AdminSnapshot = struct {
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus = &.{},
 };
 
-/// Atomic projected catalog view used only for table-to-group routing. Keep
-/// identity and operational status out of this type so it cannot accidentally
-/// be used as a publication fence or an admin snapshot.
+/// Atomic projected catalog view used only for table-to-group routing. It
+/// includes the authority and range identity needed to consume a route, while
+/// excluding operational and reconciliation status so it cannot accidentally
+/// become an administrative snapshot.
 pub const CatalogRoutingSnapshot = struct {
+    /// Authority and revision are captured with the projection. Remote callers
+    /// must validate the authority before using any route from this snapshot.
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    catalog_revision: u64 = 0,
+    /// Durable authority-scoped publication observation used to wait for a
+    /// newer routing projection. It is safe to compare across replicas and
+    /// process restarts.
+    change_token: CatalogRoutingChangeToken = .{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
+};
+
+pub const CatalogRoutingChangeToken = struct {
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    revision: u64 = 0,
+
+    pub fn fromSnapshot(snapshot: CatalogRoutingSnapshot) @This() {
+        return .{
+            .metadata_group_id = snapshot.metadata_group_id,
+            .metadata_incarnation = snapshot.metadata_incarnation,
+            .revision = snapshot.catalog_revision,
+        };
+    }
+
+    pub fn authorityEql(a: @This(), b: @This()) bool {
+        return a.metadata_group_id == b.metadata_group_id and
+            std.meta.eql(a.metadata_incarnation, b.metadata_incarnation);
+    }
+
+    pub fn eql(a: @This(), b: @This()) bool {
+        return a.authorityEql(b) and a.revision == b.revision;
+    }
+};
+
+pub const CatalogRoutingChangeRequest = struct {
+    observed_token: CatalogRoutingChangeToken,
+    /// Terminal absence is valid only when the server completes a
+    /// linearizable confirmation after its bounded watch. Short failover
+    /// probes leave this false and treat an unchanged replica as retryable.
+    confirm_absence: bool = false,
+};
+
+pub const CatalogRoutingChangeResult = struct {
+    token: CatalogRoutingChangeToken,
+    disposition: ?Disposition = null,
+    /// Retained while old and new metadata/data nodes may coexist.
+    changed: bool = false,
+
+    pub const Disposition = enum {
+        advanced,
+        unchanged,
+        authority_changed,
+        replica_behind,
+    };
+
+    pub fn effectiveDisposition(self: @This()) Disposition {
+        return self.disposition orelse if (self.changed) .advanced else .unchanged;
+    }
+};
+
+pub const CatalogRouteSelector = enum {
+    table,
+    all_ranges,
+    key,
+    span,
+    group,
+};
+
+pub const CatalogRouteQuery = struct {
+    table_name: []const u8,
+    selector: CatalogRouteSelector,
+    key: []const u8 = "",
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    group_id: u64 = 0,
+};
+
+pub const CatalogIdentityNamespace = struct {
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+};
+
+pub const CatalogGroupRoute = struct {
+    group_id: u64,
+    range_id: u64,
+    identity_namespace: CatalogIdentityNamespace,
+};
+
+pub const catalog_route_fence_protocol_current: u16 = 1;
+pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
+pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
+pub const catalog_route_fence_ack_value = "1";
+pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
+pub const catalog_route_default_deadline_ms: u32 = 5_000;
+pub const catalog_route_max_deadline_ms: u32 = 30_000;
+
+/// Immutable authority and identity carried with every first-party
+/// group-local read. The receiver validates this against its compact routing
+/// projection before opening storage, so an independently cached admin
+/// snapshot can never select a different table generation.
+pub const CatalogRouteFence = struct {
+    protocol: u16 = catalog_route_fence_protocol_current,
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    catalog_revision: u64,
+    table_id: u64,
+    topology_epoch: u64,
+    route: CatalogGroupRoute,
+    /// Receiver-local admission context. These fields are intentionally
+    /// excluded from the wire representation: monotonic clocks and borrowed
+    /// cancellation callbacks are process-local capabilities.
+    admission_deadline_ns: ?u64 = null,
+    admission_cancellation: CancellationToken = .none,
+
+    const Wire = struct {
+        protocol: u16 = catalog_route_fence_protocol_current,
+        metadata_group_id: u64,
+        metadata_incarnation: ?MetadataClusterIncarnation = null,
+        catalog_revision: u64,
+        table_id: u64,
+        topology_epoch: u64,
+        route: CatalogGroupRoute,
+    };
+
+    fn wire(self: @This()) Wire {
+        return .{
+            .protocol = self.protocol,
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .catalog_revision = self.catalog_revision,
+            .table_id = self.table_id,
+            .topology_epoch = self.topology_epoch,
+            .route = self.route,
+        };
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.write(self.wire());
+    }
+
+    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(Wire, alloc, source, options);
+        return .{
+            .protocol = value.protocol,
+            .metadata_group_id = value.metadata_group_id,
+            .metadata_incarnation = value.metadata_incarnation,
+            .catalog_revision = value.catalog_revision,
+            .table_id = value.table_id,
+            .topology_epoch = value.topology_epoch,
+            .route = value.route,
+        };
+    }
+
+    pub fn validate(self: @This()) !void {
+        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
+        if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
+        if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
+    }
+};
+
+pub const CatalogRoutePlan = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    table_id: u64,
+    topology_epoch: u64,
+    groups: []CatalogGroupRoute,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+pub const CatalogRouteResolveRequest = struct {
+    query: CatalogRouteQuery,
+};
+
+pub const CatalogRouteResolveResult = struct {
+    disposition: Disposition,
+    token: CatalogRoutingChangeToken = .{},
+    plan: ?CatalogRoutePlan = null,
+
+    pub const Disposition = enum {
+        found,
+        not_found,
+        timed_out,
+        authority_changed,
+    };
 };
 
 /// Compact catalog values consumed while staging one data-Raft generation.
@@ -312,6 +519,16 @@ pub const CatalogProjectionIndex = struct {
         tables: []const table_manager.TableRecord,
         ranges: []const table_manager.RangeRecord,
     ) !CatalogProjectionIndex {
+        return try initUntil(alloc, tables, ranges, null);
+    }
+
+    pub fn initUntil(
+        alloc: std.mem.Allocator,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+        deadline_ns: ?u64,
+    ) !CatalogProjectionIndex {
+        try catalogProjectionCheckpoint(deadline_ns, 0);
         var self: CatalogProjectionIndex = .{};
         errdefer self.deinit(alloc);
         try self.table_indexes.ensureTotalCapacity(alloc, @intCast(tables.len));
@@ -320,6 +537,8 @@ pub const CatalogProjectionIndex = struct {
         try self.table_topologies.ensureTotalCapacity(alloc, @intCast(tables.len));
 
         for (tables, 0..) |table, index| {
+            try catalogProjectionCheckpoint(deadline_ns, index);
+            if (self.table_indexes.contains(table.table_id)) return error.InvalidCatalogProjection;
             self.table_indexes.putAssumeCapacity(table.table_id, index);
             self.table_name_indexes.putAssumeCapacity(table.name, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
@@ -328,19 +547,27 @@ pub const CatalogProjectionIndex = struct {
             });
         }
         for (ranges, 0..) |range, index| {
+            try catalogProjectionCheckpoint(deadline_ns, index);
+            if (self.range_indexes.contains(range.group_id)) return error.InvalidCatalogProjection;
             self.range_indexes.putAssumeCapacity(range.group_id, index);
+            // Partial indexes intentionally ignore ranges for tables outside
+            // the supplied projection; the full reader validates ownership.
             const topology = self.table_topologies.getPtr(range.table_id) orelse continue;
             topology.range_count += 1;
             addCatalogTopologyDigest(&topology.digest, catalogRangeTopologyDigest(range));
         }
         var iterator = self.table_topologies.iterator();
+        var topology_index: usize = 0;
         while (iterator.next()) |entry| {
+            try catalogProjectionCheckpoint(deadline_ns, topology_index);
             entry.value_ptr.digest = finalizeCatalogTableTopology(
                 entry.key_ptr.*,
                 entry.value_ptr.range_count,
                 entry.value_ptr.digest,
             );
+            topology_index += 1;
         }
+        try catalogProjectionDeadline(deadline_ns);
         return self;
     }
 
@@ -411,6 +638,16 @@ pub const CatalogProjectionIndex = struct {
         };
     }
 };
+
+fn catalogProjectionCheckpoint(deadline_ns: ?u64, index: usize) !void {
+    if (index % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+}
+
+fn catalogProjectionDeadline(deadline_ns: ?u64) !void {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+}
 
 fn catalogIdentityMatches(
     expected_group_id: u64,
