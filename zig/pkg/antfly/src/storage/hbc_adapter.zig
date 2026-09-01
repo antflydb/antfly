@@ -608,6 +608,11 @@ const HbcSharedAdmission = struct {
     overcommitted: bool = false,
 };
 
+const HbcVectorLookupStats = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+};
+
 fn sharedVectorFillStripe(namespace: u64, vector_id: u64) usize {
     var value = namespace ^ std.math.rotl(u64, vector_id, 29);
     value ^= value >> 33;
@@ -779,9 +784,219 @@ fn noteHbcKindEviction(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).evictions += 1;
 }
 
+/// Read-optimized ownership fence for the process-wide HBC cache maps.
+///
+/// `ApplyRwLock` intentionally provides a writer-preferring service fence for
+/// apply/runtime coordination, but its shared path takes two mutexes and
+/// updates several global telemetry atomics. A vector query can perform
+/// hundreds of cache lookups, so that design turns read-only hits into one
+/// process-wide serialization point. Cache readers need only stabilize the
+/// maps long enough to retain an entry; entry lifetime is then ref-counted.
+///
+/// This lock therefore uses one atomic word for ownership and a writer-intent
+/// counter to bound writer starvation. A separate writer-admission gate keeps
+/// nonblocking reclaim from bypassing an already queued structural writer. The
+/// read hot path performs one CAS on acquire and one subtraction on release,
+/// with no telemetry writes. Writers retain exclusive map/invalidation
+/// semantics.
+const CacheRwLock = struct {
+    const vector_read_stripe_count = 64;
+    const writer_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const reader_mask: usize = writer_bit - 1;
+
+    state: std.atomic.Value(usize) = .init(0),
+    writers_waiting: std.atomic.Value(u32) = .init(0),
+    writer_gate: std.atomic.Mutex = .unlocked,
+    vector_fence_pending: std.atomic.Value(bool) = .init(false),
+    // Vector lookups dominate the shared-cache hot path. Key-striped reader
+    // ownership lets independent lookups proceed without modifying the same
+    // global reader-count word. Structural writers fence every stripe before
+    // mutating the authoritative hash map.
+    vector_read_stripes: [vector_read_stripe_count]std.atomic.Mutex = .{.unlocked} ** vector_read_stripe_count,
+    exclusive_lock_calls: AtomicU64 = .init(0),
+    exclusive_contended_calls: AtomicU64 = .init(0),
+    exclusive_wait_ns: AtomicU64 = .init(0),
+    exclusive_max_wait_ns: AtomicU64 = .init(0),
+
+    fn backoff(attempts: usize) void {
+        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn lockShared(self: *@This()) void {
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            if (self.writers_waiting.load(.acquire) != 0) {
+                backoff(attempts);
+                continue;
+            }
+            const observed = self.state.load(.monotonic);
+            std.debug.assert(observed & reader_mask != reader_mask);
+            if (observed & writer_bit != 0 or
+                self.state.cmpxchgWeak(observed, observed + 1, .acquire, .monotonic) != null)
+            {
+                backoff(attempts);
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn tryLockShared(self: *@This()) bool {
+        if (self.writers_waiting.load(.acquire) != 0) return false;
+        const observed = self.state.load(.monotonic);
+        if (observed & writer_bit != 0 or observed & reader_mask == reader_mask) return false;
+        return self.state.cmpxchgStrong(observed, observed + 1, .acquire, .monotonic) == null;
+    }
+
+    fn unlockShared(self: *@This()) void {
+        const previous = self.state.fetchSub(1, .release);
+        std.debug.assert(previous & writer_bit == 0 and previous & reader_mask != 0);
+    }
+
+    fn vectorReadStripe(namespace: u64, vector_id: u64) usize {
+        return sharedVectorFillStripe(namespace, vector_id) & (vector_read_stripe_count - 1);
+    }
+
+    fn lockVectorShared(self: *@This(), namespace: u64, vector_id: u64) usize {
+        const stripe = vectorReadStripe(namespace, vector_id);
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            // Once a structural writer publishes intent, stop admitting new
+            // striped readers so it can fence the finite set already active.
+            if (!self.vector_fence_pending.load(.acquire) and
+                self.vector_read_stripes[stripe].tryLock()) break;
+            backoff(attempts);
+        }
+        return stripe;
+    }
+
+    fn unlockVectorShared(self: *@This(), stripe: usize) void {
+        self.vector_read_stripes[stripe].unlock();
+    }
+
+    fn lockVectorStripes(self: *@This()) bool {
+        var contended = false;
+        for (&self.vector_read_stripes) |*stripe| {
+            var attempts: usize = 0;
+            while (!stripe.tryLock()) : (attempts += 1) {
+                contended = true;
+                backoff(attempts);
+            }
+        }
+        return contended;
+    }
+
+    fn tryLockVectorStripes(self: *@This()) ?usize {
+        for (&self.vector_read_stripes, 0..) |*stripe, index| {
+            if (!stripe.tryLock()) return index;
+        }
+        return vector_read_stripe_count;
+    }
+
+    fn unlockVectorStripes(self: *@This(), count: usize) void {
+        var remaining = count;
+        while (remaining != 0) {
+            remaining -= 1;
+            self.vector_read_stripes[remaining].unlock();
+        }
+    }
+
+    fn tryLockExclusive(self: *@This()) bool {
+        _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+
+        // The first check avoids competing for the gate when a blocking writer
+        // has already announced intent. The second closes the race where that
+        // announcement occurs between the first check and gate acquisition.
+        if (self.writers_waiting.load(.acquire) != 0) return false;
+        if (!self.writer_gate.tryLock()) return false;
+        if (self.writers_waiting.load(.acquire) != 0) {
+            self.writer_gate.unlock();
+            return false;
+        }
+
+        // Fence striped readers before testing the global ownership word. A
+        // failed nonblocking acquisition rolls the fence back immediately.
+        self.vector_fence_pending.store(true, .release);
+        if (self.state.cmpxchgStrong(0, writer_bit, .acquire, .monotonic) != null) {
+            self.vector_fence_pending.store(false, .release);
+            self.writer_gate.unlock();
+            return false;
+        }
+        const locked = self.tryLockVectorStripes() orelse unreachable;
+        if (locked != vector_read_stripe_count) {
+            self.unlockVectorStripes(locked);
+            self.state.store(0, .release);
+            self.vector_fence_pending.store(false, .release);
+            self.writer_gate.unlock();
+            return false;
+        }
+        return true;
+    }
+
+    fn lockExclusive(self: *@This()) void {
+        const started_ns = nowNs();
+        _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        _ = self.writers_waiting.fetchAdd(1, .acq_rel);
+
+        var gate_attempts: usize = 0;
+        while (!self.writer_gate.tryLock()) : (gate_attempts += 1) {
+            backoff(gate_attempts);
+        }
+
+        // Publishing this fence while holding the admission gate turns the
+        // striped-reader population into a finite set before the writer drains
+        // either ownership domain.
+        self.vector_fence_pending.store(true, .release);
+
+        var state_attempts: usize = 0;
+        while (self.state.cmpxchgWeak(0, writer_bit, .acquire, .monotonic) != null) : (state_attempts += 1) {
+            backoff(state_attempts);
+        }
+        const stripes_contended = self.lockVectorStripes();
+        _ = self.writers_waiting.fetchSub(1, .release);
+
+        if (gate_attempts != 0 or state_attempts != 0 or stripes_contended) {
+            const waited_ns = elapsedSince(started_ns);
+            _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
+            _ = self.exclusive_wait_ns.fetchAdd(waited_ns, .monotonic);
+            var maximum = self.exclusive_max_wait_ns.load(.monotonic);
+            while (waited_ns > maximum) {
+                maximum = self.exclusive_max_wait_ns.cmpxchgWeak(maximum, waited_ns, .monotonic, .monotonic) orelse break;
+            }
+        }
+    }
+
+    fn unlockExclusive(self: *@This()) void {
+        self.unlockVectorStripes(vector_read_stripe_count);
+        const previous = self.state.swap(0, .release);
+        std.debug.assert(previous == writer_bit);
+        self.vector_fence_pending.store(false, .release);
+        self.writer_gate.unlock();
+    }
+
+    fn snapshot(self: *const @This()) apply_rw_lock_mod.ApplyRwLock.Stats {
+        return .{
+            // Deliberately zero: exact shared telemetry would reintroduce a
+            // globally written cache line on every vector hit.
+            .shared_lock_calls = 0,
+            .shared_contended_calls = 0,
+            .shared_wait_ns = 0,
+            .shared_max_wait_ns = 0,
+            .exclusive_lock_calls = self.exclusive_lock_calls.load(.monotonic),
+            .exclusive_contended_calls = self.exclusive_contended_calls.load(.monotonic),
+            .exclusive_wait_ns = self.exclusive_wait_ns.load(.monotonic),
+            .exclusive_max_wait_ns = self.exclusive_max_wait_ns.load(.monotonic),
+        };
+    }
+};
+
 pub const Cache = struct {
     alloc: Allocator,
-    mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    mutex: CacheRwLock = .{},
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     reclaimer_identity: u64 = 0,
     physical_accounting: HbcPhysicalAccounting = .{},
@@ -818,6 +1033,10 @@ pub const Cache = struct {
     vector_slots: std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize) = .empty,
     vector_clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty,
     vector_hand: usize = 0,
+    // Lookup counters follow the same ownership stripes as vector reads. This
+    // avoids recreating one globally written cache line solely for telemetry.
+    vector_lookup_stats: [CacheRwLock.vector_read_stripe_count]std.AutoHashMapUnmanaged(u64, HbcVectorLookupStats) =
+        .{std.AutoHashMapUnmanaged(u64, HbcVectorLookupStats).empty} ** CacheRwLock.vector_read_stripe_count,
     metadata_cache: std.AutoHashMapUnmanaged(HbcSharedCacheKey, *MetadataCacheEntry) = .empty,
     metadata_slots: std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize) = .empty,
     metadata_clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty,
@@ -850,6 +1069,7 @@ pub const Cache = struct {
         self.vector_cache.deinit(self.alloc);
         self.vector_slots.deinit(self.alloc);
         self.vector_clock.deinit(self.alloc);
+        for (&self.vector_lookup_stats) |*stats| stats.deinit(self.alloc);
         self.metadata_cache.deinit(self.alloc);
         self.metadata_slots.deinit(self.alloc);
         self.metadata_clock.deinit(self.alloc);
@@ -1081,6 +1301,17 @@ pub const Cache = struct {
             snapshotHbcCacheStats(stored)
         else
             HbcCacheStats{};
+        // Shared vector-cache lookups are tracked per read stripe. Structural
+        // map changes require exclusive ownership, so the global shared lock
+        // stabilizes these maps while their counters are loaded atomically.
+        stats.vector.hits = 0;
+        stats.vector.misses = 0;
+        for (&self.vector_lookup_stats) |*lookup_stats| {
+            if (lookup_stats.getPtr(namespace)) |stored| {
+                stats.vector.hits +|= @atomicLoad(u64, &stored.hits, .monotonic);
+                stats.vector.misses +|= @atomicLoad(u64, &stored.misses, .monotonic);
+            }
+        }
         stats.pinned_bytes = self.namespace_pinned_accounting.current(namespace);
         stats.accounted_bytes = stats.total_bytes +| stats.pinned_bytes;
         return stats;
@@ -1099,6 +1330,35 @@ pub const Cache = struct {
                 _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
             } else {
                 _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+            }
+        }
+    }
+
+    fn noteVectorLookupStriped(self: *Cache, stripe: usize, namespace: u64, hit: bool) void {
+        const stats = self.vector_lookup_stats[stripe].getPtr(namespace) orelse return;
+        if (hit) {
+            _ = @atomicRmw(u64, &stats.hits, .Add, 1, .monotonic);
+        } else {
+            _ = @atomicRmw(u64, &stats.misses, .Add, 1, .monotonic);
+        }
+    }
+
+    fn ensureVectorLookupStatsLocked(self: *Cache, namespace: u64) !void {
+        // Stripe entries are installed and removed as one namespace-wide set,
+        // so stripe zero is the allocation-free fast-path sentinel after the
+        // first registration or successful vector admission.
+        if (self.vector_lookup_stats[0].contains(namespace)) return;
+        var created: [CacheRwLock.vector_read_stripe_count]bool =
+            .{false} ** CacheRwLock.vector_read_stripe_count;
+        errdefer for (&self.vector_lookup_stats, 0..) |*lookup_stats, stripe| {
+            if (created[stripe]) std.debug.assert(lookup_stats.remove(namespace));
+        };
+
+        for (&self.vector_lookup_stats, 0..) |*lookup_stats, stripe| {
+            const entry = try lookup_stats.getOrPut(self.alloc, namespace);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+                created[stripe] = true;
             }
         }
     }
@@ -1132,9 +1392,14 @@ pub const Cache = struct {
             return false;
         };
         if (!stats_entry.found_existing) stats_entry.value_ptr.* = .{};
+        self.ensureVectorLookupStatsLocked(namespace) catch {
+            if (!stats_entry.found_existing) _ = self.namespace_stats.remove(namespace);
+            self.alloc.free(stable_path);
+            return false;
+        };
 
         const entry = self.namespace_paths.getOrPut(self.alloc, namespace) catch {
-            if (!stats_entry.found_existing) _ = self.namespace_stats.remove(namespace);
+            if (!stats_entry.found_existing) self.removeNamespaceStateIfUnusedLocked(namespace);
             self.alloc.free(stable_path);
             return false;
         };
@@ -1287,17 +1552,17 @@ pub const Cache = struct {
     }
 
     pub fn borrowVector(self: *Cache, namespace: u64, vector_id: u64) ?BorrowedVectorLease {
-        self.mutex.lockShared();
+        const read_stripe = self.mutex.lockVectorShared(namespace, vector_id);
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
         if (self.vector_cache.get(key)) |entry| {
-            self.noteLookupLocked(.vector, namespace, true);
+            self.noteVectorLookupStriped(read_stripe, namespace, true);
             self.touchSlot(&self.vector_clock, self.vector_slots.get(key));
             retainVectorCacheEntry(entry);
-            self.mutex.unlockShared();
+            self.mutex.unlockVectorShared(read_stripe);
             return .{ .retained = .{ .alloc = self.alloc, .entry = entry } };
         }
-        self.noteLookupLocked(.vector, namespace, false);
-        self.mutex.unlockShared();
+        self.noteVectorLookupStriped(read_stripe, namespace, false);
+        self.mutex.unlockVectorShared(read_stripe);
         return null;
     }
 
@@ -1449,15 +1714,15 @@ pub const Cache = struct {
         defer self.vector_fill_mutexes[fill_stripe].unlock();
 
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
-        self.mutex.lockShared();
+        const read_stripe = self.mutex.lockVectorShared(namespace, vector_id);
         if (self.vector_cache.get(key)) |existing| {
             if (std.mem.eql(f32, existing.vector, vector_data)) {
                 self.touchSlot(&self.vector_clock, self.vector_slots.get(key));
-                self.mutex.unlockShared();
+                self.mutex.unlockVectorShared(read_stripe);
                 return vector_data;
             }
         }
-        self.mutex.unlockShared();
+        self.mutex.unlockVectorShared(read_stripe);
 
         const copied = try self.alloc.dupe(f32, vector_data);
         const entry = self.alloc.create(VectorCacheEntry) catch |err| {
@@ -1496,6 +1761,7 @@ pub const Cache = struct {
             return vector_data;
         };
         errdefer self.rollbackAdmissionLocked(admission);
+        try self.ensureVectorLookupStatsLocked(namespace);
         try self.recordClockSlot(&self.vector_clock, &self.vector_slots, key);
         errdefer removeSlot(&self.vector_clock, &self.vector_slots, key);
         try self.vector_cache.put(self.alloc, key, entry);
@@ -1990,6 +2256,7 @@ pub const Cache = struct {
             const removed = self.namespace_paths.fetchRemove(namespace) orelse return;
             self.alloc.free(removed.value.path);
         }
+        for (&self.vector_lookup_stats) |*lookup_stats| _ = lookup_stats.remove(namespace);
         _ = self.namespace_stats.remove(namespace);
     }
 
@@ -10657,6 +10924,78 @@ test "hbc shared vector replacement cannot return an older external value" {
     try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(namespace).vector.replacements);
 }
 
+test "hbc shared vector leases remain coherent during invalidate and replacement" {
+    const Reader = struct {
+        fn run(
+            cache: *Cache,
+            namespace: u64,
+            ready: *std.atomic.Value(u32),
+            start: *std.atomic.Value(bool),
+            stop: *std.atomic.Value(bool),
+            borrows: *std.atomic.Value(u64),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+            const value_b = [_]f32{ 9.0, 8.0, 7.0, 6.0 };
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            while (!stop.load(.acquire)) {
+                if (cache.borrowVector(namespace, 7)) |lease_value| {
+                    var lease = lease_value;
+                    _ = borrows.fetchAdd(1, .monotonic);
+                    const view = lease.view();
+                    if (!std.mem.eql(f32, view, &value_a) and !std.mem.eql(f32, view, &value_b)) {
+                        failed.store(true, .release);
+                    }
+                    lease.deinit();
+                }
+            }
+        }
+    };
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const namespace = hbcCacheNamespace("/tmp/hbc-vector-lease-replacement-stress");
+    const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const value_b = [_]f32{ 9.0, 8.0, 7.0, 6.0 };
+    _ = try cache.cacheVector(namespace, 7, &value_a);
+
+    var ready = std.atomic.Value(u32).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var borrows = std.atomic.Value(u64).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+    var readers: [8]std.Thread = undefined;
+    for (&readers) |*reader| {
+        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+            &cache,
+            namespace,
+            &ready,
+            &start,
+            &stop,
+            &borrows,
+            &failed,
+        });
+    }
+    while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    while (borrows.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    for (0..512) |iteration| {
+        if (iteration % 4 == 0) cache.invalidateVector(namespace, 7);
+        const value = if (iteration & 1 == 0) &value_a else &value_b;
+        _ = cache.cacheVector(namespace, 7, value) catch {
+            failed.store(true, .release);
+            break;
+        };
+    }
+
+    stop.store(true, .release);
+    for (&readers) |*reader| reader.join();
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(borrows.load(.acquire) > 0);
+}
+
 test "hbc vector fill captured before a committed mutation cannot repopulate stale data" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -11599,6 +11938,158 @@ test "hbc shared vector publication coalesces concurrent duplicate fills" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, borrowed.view());
 }
 
+test "hbc shared vector lookup stats preserve compulsory and cross-stripe misses" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const registered_path = "/tmp/hbc-vector-lookup-stats";
+    const registered_namespace = hbcCacheNamespace(registered_path);
+    try std.testing.expect(cache.registerNamespacePath(registered_namespace, registered_path));
+    try std.testing.expect(cache.borrowVector(registered_namespace, 42) == null);
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(registered_namespace).vector.misses);
+
+    const direct_namespace = hbcCacheNamespace("/tmp/hbc-vector-lookup-stats-direct");
+    const cached_id: u64 = 1;
+    _ = try cache.cacheVector(direct_namespace, cached_id, &.{ 1.0, 2.0, 3.0, 4.0 });
+    const cached_stripe = CacheRwLock.vectorReadStripe(direct_namespace, cached_id);
+    var missing_id: u64 = cached_id + 1;
+    while (CacheRwLock.vectorReadStripe(direct_namespace, missing_id) == cached_stripe) missing_id += 1;
+    try std.testing.expect(cache.borrowVector(direct_namespace, missing_id) == null);
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(direct_namespace).vector.misses);
+}
+
+test "hbc shared cache lock reports striped reader wait" {
+    const Writer = struct {
+        fn run(
+            lock: *CacheRwLock,
+            acquired: *std.atomic.Value(bool),
+            release: *std.atomic.Value(bool),
+        ) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            while (!release.load(.acquire)) std.atomic.spinLoopHint();
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    const read_stripe = lock.lockVectorShared(1, 1);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var release_writer = std.atomic.Value(bool).init(false);
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired, &release_writer });
+    while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    lock.unlockVectorShared(read_stripe);
+    while (!writer_acquired.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(lock.vector_fence_pending.load(.acquire));
+    release_writer.store(true, .release);
+    writer.join();
+
+    try std.testing.expect(writer_acquired.load(.acquire));
+    try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
+    const stats = lock.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_lock_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_contended_calls);
+    try std.testing.expect(stats.exclusive_wait_ns > 0);
+    try std.testing.expect(stats.exclusive_max_wait_ns > 0);
+}
+
+test "hbc shared cache queued writer cannot be bypassed by nonblocking reclaim" {
+    const Writer = struct {
+        fn run(lock: *CacheRwLock, acquired: *std.atomic.Value(bool)) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    lockAtomic(&lock.writer_gate);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
+    while (lock.writers_waiting.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    try std.testing.expect(!lock.tryLockExclusive());
+    try std.testing.expect(!writer_acquired.load(.acquire));
+
+    lock.writer_gate.unlock();
+    writer.join();
+    try std.testing.expect(writer_acquired.load(.acquire));
+
+    try std.testing.expect(lock.tryLockExclusive());
+    try std.testing.expect(lock.vector_fence_pending.load(.acquire));
+    lock.unlockExclusive();
+    try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
+}
+
+test "hbc shared cache writer progresses under continuous striped reads" {
+    const Reader = struct {
+        fn run(
+            lock: *CacheRwLock,
+            namespace: u64,
+            vector_id: u64,
+            ready: *std.atomic.Value(u32),
+            start: *std.atomic.Value(bool),
+            stop: *std.atomic.Value(bool),
+            reads: *std.atomic.Value(u64),
+        ) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            while (!stop.load(.acquire)) {
+                const stripe = lock.lockVectorShared(namespace, vector_id);
+                _ = reads.fetchAdd(1, .monotonic);
+                std.atomic.spinLoopHint();
+                lock.unlockVectorShared(stripe);
+            }
+        }
+    };
+    const Writer = struct {
+        fn run(lock: *CacheRwLock, acquired: *std.atomic.Value(bool)) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    var ready = std.atomic.Value(u32).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var reads = std.atomic.Value(u64).init(0);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var readers: [8]std.Thread = undefined;
+    for (&readers, 0..) |*reader, index| {
+        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+            &lock,
+            @as(u64, @intCast(index + 1)),
+            @as(u64, @intCast(index * 17 + 1)),
+            &ready,
+            &start,
+            &stop,
+            &reads,
+        });
+    }
+    while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    while (reads.load(.acquire) < readers.len) std.atomic.spinLoopHint();
+
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var attempts: usize = 0;
+    while (!writer_acquired.load(.acquire) and attempts < 1_000) : (attempts += 1) {
+        try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const progressed_under_load = writer_acquired.load(.acquire);
+    stop.store(true, .release);
+    for (&readers) |*reader| reader.join();
+    writer.join();
+
+    try std.testing.expect(progressed_under_load);
+}
+
 test "hbc stable cache namespace canonicalizes equivalent path spellings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -11891,6 +12382,9 @@ test "hbc shared cache bounds namespace state across path churn" {
 
     try std.testing.expectEqual(@as(usize, 0), cache.namespace_paths.count());
     try std.testing.expectEqual(@as(usize, 0), cache.namespace_stats.count());
+    for (&cache.vector_lookup_stats) |*lookup_stats| {
+        try std.testing.expectEqual(@as(usize, 0), lookup_stats.count());
+    }
 }
 
 test "hbc cache reports byte usage to resource manager" {
