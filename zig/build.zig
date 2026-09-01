@@ -3674,6 +3674,7 @@ pub fn build(b: *std.Build) void {
         "await route distinguishes persistent absence from capture timeout",
         "await route reports an expired pre-capture deadline as timed out",
         "route projection preserves order and remains bounded after capture",
+        "pinned fanout rejects mismatched fence identity",
         "metadata routing server converts relative budget to local deadline",
         "metadata routing change client forwards an authority-scoped long poll",
         "remote runtime status reports replay debt separately from active catch-up",

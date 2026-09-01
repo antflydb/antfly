@@ -916,6 +916,8 @@ pub fn routedGroupsSnapshotUntil(
     const budget = RoutingBudget.init(deadline_ns);
     try budget.checkpoint();
     if (catalog.vtable.route_fence) |route_fence| {
+        const route_identity = catalog.vtable.route_identity;
+        if (group_ids.len != 0 and route_identity == null) return error.CatalogRouteFenceUnsupported;
         const routes = try alloc.alloc(CatalogGroupRoute, group_ids.len);
         errdefer alloc.free(routes);
         var first: ?metadata_api.CatalogRouteFence = null;
@@ -923,6 +925,10 @@ pub fn routedGroupsSnapshotUntil(
             try budget.checkpointIndex(index);
             const fence = (try route_fence(catalog.ptr, group_id)) orelse return error.TopologyChanged;
             try fence.validate();
+            if (fence.route.group_id != group_id) return error.TopologyChanged;
+            const identity = (try route_identity.?(catalog.ptr, table_name, group_id)) orelse
+                return error.TopologyChanged;
+            if (!std.meta.eql(identity, fence.route.identity_namespace)) return error.TopologyChanged;
             if (first) |expected| {
                 if (fence.metadata_group_id != expected.metadata_group_id or
                     !std.meta.eql(fence.metadata_incarnation, expected.metadata_incarnation) or
@@ -2268,6 +2274,101 @@ test "route projection preserves order and remains bounded after capture" {
         error.CatalogRoutingSnapshotTimeout,
         RoutedSpanSnapshot.fromPlanUntil(std.testing.allocator, plan, RoutingBudget.init(1)),
     );
+}
+
+test "pinned fanout rejects mismatched fence identity" {
+    const Source = struct {
+        mode: enum { valid, wrong_group, wrong_identity },
+
+        fn catalog(self: *@This()) CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .route_identity = routeIdentity,
+                .route_fence = routeFence,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routeIdentity(
+            ptr: *anyopaque,
+            table_name: []const u8,
+            group_id: u64,
+        ) !?metadata_api.CatalogIdentityNamespace {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs") or group_id != 7001) return null;
+            return .{
+                .table_id = 7,
+                .shard_id = 7001,
+                .range_id = if (self.mode == .wrong_identity) 72 else 71,
+            };
+        }
+
+        fn routeFence(ptr: *anyopaque, _: u64) !?metadata_api.CatalogRouteFence {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .metadata_group_id = 3,
+                .catalog_revision = 18,
+                .table_id = 7,
+                .topology_epoch = 19,
+                .route = .{
+                    .group_id = if (self.mode == .wrong_group) 7002 else 7001,
+                    .range_id = 71,
+                    .identity_namespace = .{
+                        .table_id = 7,
+                        .shard_id = 7001,
+                        .range_id = 71,
+                    },
+                },
+            };
+        }
+    };
+
+    var wrong_group = Source{ .mode = .wrong_group };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        routedGroupsSnapshotUntil(
+            std.testing.allocator,
+            wrong_group.catalog(),
+            "docs",
+            &.{7001},
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ),
+    );
+
+    var wrong_identity = Source{ .mode = .wrong_identity };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        routedGroupsSnapshotUntil(
+            std.testing.allocator,
+            wrong_identity.catalog(),
+            "docs",
+            &.{7001},
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ),
+    );
+
+    var valid = Source{ .mode = .valid };
+    var snapshot = try routedGroupsSnapshotUntil(
+        std.testing.allocator,
+        valid.catalog(),
+        "docs",
+        &.{7001},
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7001), snapshot.group_ids[0]);
+    try std.testing.expectEqual(@as(u64, 7001), snapshot.routes[0].group_id);
+    try std.testing.expect(std.meta.eql(snapshot.routes[0].identity_namespace, .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 71,
+    }));
 }
 
 pub const RoutedSpanSnapshot = struct {

@@ -1269,6 +1269,11 @@ fn cloneRoutePlanForWireUntil(
 }
 
 pub const MetadataHttpServer = struct {
+    /// Keep peer-supplied routing work bounded even when an older or malformed
+    /// caller omits a budget. This matches the metadata client's transport
+    /// timeout while still honoring any shorter ingress or forwarded budget.
+    const max_routing_request_budget_ms: u64 = 5_000;
+
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
 
@@ -1623,18 +1628,28 @@ pub const MetadataHttpServer = struct {
     }
 
     fn applyRoutingBudget(ctx: *httpx.Context) !void {
-        if (ctx.application_deadline_ns != null) return;
+        const now_ns = platform_time.monotonicNs();
+        var deadline_ns = now_ns +| max_routing_request_budget_ms * std.time.ns_per_ms;
+        if (ctx.application_deadline_ns) |ingress_deadline_ns| {
+            deadline_ns = @min(deadline_ns, ingress_deadline_ns);
+        }
         if (ctx.header(routes.routing_remaining_ms_header)) |raw| {
             const remaining_ms = std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidArgument;
             if (remaining_ms == 0) return error.CatalogRoutingSnapshotTimeout;
-            ctx.application_deadline_ns = platform_time.monotonicNs() +|
-                remaining_ms *| std.time.ns_per_ms;
+            const bounded_remaining_ms: u64 = @min(remaining_ms, max_routing_request_budget_ms);
+            deadline_ns = @min(
+                deadline_ns,
+                now_ns +| bounded_remaining_ms * std.time.ns_per_ms,
+            );
         }
+        if (now_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        ctx.application_deadline_ns = deadline_ns;
     }
 
     fn metadataLinearizableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
         var result = self.source.linearizableRoutingSnapshot(request) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
@@ -1751,8 +1766,11 @@ pub const MetadataHttpServer = struct {
 
     fn metadataRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
-        var result = self.source.routingSnapshot(ctx.application_deadline_ns) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.routingSnapshot(request.deadline_ns) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
@@ -3816,6 +3834,49 @@ test "metadata routing server converts relative budget to local deadline" {
     const observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(observed >= before_ns + 250 * std.time.ns_per_ms);
     try std.testing.expect(observed <= platform_time.monotonicNs() + 250 * std.time.ns_per_ms);
+
+    var default_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer default_request.deinit();
+    var default_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &default_request);
+    defer default_ctx.deinit();
+    const default_before_ns = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&default_ctx);
+    const default_deadline_ns = default_ctx.application_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(default_deadline_ns >= default_before_ns + (MetadataHttpServer.max_routing_request_budget_ms - 100) * std.time.ns_per_ms);
+    try std.testing.expect(default_deadline_ns <= platform_time.monotonicNs() + MetadataHttpServer.max_routing_request_budget_ms * std.time.ns_per_ms);
+
+    var capped_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer capped_request.deinit();
+    try capped_request.headers.append(routes.routing_remaining_ms_header, "60000");
+    var capped_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &capped_request);
+    defer capped_ctx.deinit();
+    const capped_before_ns = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&capped_ctx);
+    const capped_deadline_ns = capped_ctx.application_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(capped_deadline_ns >= capped_before_ns + (MetadataHttpServer.max_routing_request_budget_ms - 100) * std.time.ns_per_ms);
+    try std.testing.expect(capped_deadline_ns <= platform_time.monotonicNs() + MetadataHttpServer.max_routing_request_budget_ms * std.time.ns_per_ms);
+
+    var ingress_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer ingress_request.deinit();
+    try ingress_request.headers.append(routes.routing_remaining_ms_header, "2000");
+    var ingress_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &ingress_request);
+    defer ingress_ctx.deinit();
+    const ingress_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    ingress_ctx.application_deadline_ns = ingress_deadline_ns;
+    try MetadataHttpServer.applyRoutingBudget(&ingress_ctx);
+    try std.testing.expectEqual(ingress_deadline_ns, ingress_ctx.application_deadline_ns.?);
+
+    source.observed_deadline_ns = null;
+    var canceled = std.atomic.Value(bool).init(true);
+    var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer canceled_request.deinit();
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    defer canceled_ctx.deinit();
+    canceled_ctx.cancellation = &canceled;
+    var canceled_response = try server.metadataRoutingSnapshot(&canceled_ctx);
+    defer canceled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), canceled_response.status.code);
+    try std.testing.expect(source.observed_deadline_ns == null);
 
     source.observed_deadline_ns = null;
     var linearizable_request = try httpx.Request.init(
