@@ -1295,6 +1295,16 @@ const RaftTableApplyStateMachine = struct {
         outcome: ApplyOutcome = .pending,
     };
 
+    const ReadBarrierWaiter = struct {
+        group_id: u64,
+        read_index: ?u64 = null,
+        retired: bool = false,
+    };
+
+    const ReadBarrierState = enum { pending, ready, retired, missing };
+    const read_barrier_context_prefix = "antfly-data-read:";
+    const max_read_barrier_waiters: usize = 4096;
+
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
@@ -1307,6 +1317,18 @@ const RaftTableApplyStateMachine = struct {
     // The map is therefore bounded by live synchronous proposals rather than
     // by Raft history or an eviction policy that could lose an outcome.
     apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcomeWaiter) = .empty,
+    // Linearizable transaction recovery is exceptional, so keep its state
+    // off the ordinary write path. Requests are bounded, keyed by an opaque
+    // Raft read context, and wake together when either the quorum barrier or
+    // local apply progress advances.
+    read_barrier_waiters: std.AutoHashMapUnmanaged(u64, ReadBarrierWaiter) = .empty,
+    next_read_barrier_id: std.atomic.Value(u64) = .init(1),
+    read_barrier_wake_epoch: std.atomic.Value(u32) = .init(0),
+    read_barriers_started_total: std.atomic.Value(u64) = .init(0),
+    read_barriers_completed_total: std.atomic.Value(u64) = .init(0),
+    read_barriers_timed_out_total: std.atomic.Value(u64) = .init(0),
+    read_barriers_retired_total: std.atomic.Value(u64) = .init(0),
+    read_barriers_active: std.atomic.Value(u64) = .init(0),
     test_faults: TestFaults = .{},
 
     fn init(
@@ -1328,6 +1350,7 @@ const RaftTableApplyStateMachine = struct {
         self.applied_indexes.deinit(self.alloc);
         self.retry_apply_checkpoints.deinit(self.alloc);
         self.apply_outcomes.deinit(self.alloc);
+        self.read_barrier_waiters.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1362,6 +1385,111 @@ const RaftTableApplyStateMachine = struct {
         lockAtomic(&self.applied_mutex);
         defer self.applied_mutex.unlock();
         return self.applied_indexes.get(group_id) orelse 0;
+    }
+
+    fn notifyReadBarrierWaiters(self: *RaftTableApplyStateMachine) void {
+        _ = self.read_barrier_wake_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(
+            std.Options.debug_io,
+            u32,
+            &self.read_barrier_wake_epoch.raw,
+            std.math.maxInt(u32),
+        );
+    }
+
+    fn registerReadBarrier(self: *RaftTableApplyStateMachine, group_id: u64) !u64 {
+        const request_id = self.next_read_barrier_id.fetchAdd(1, .monotonic);
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        if (self.read_barrier_waiters.count() >= max_read_barrier_waiters)
+            return error.ResourceBudgetExceeded;
+        const result = try self.read_barrier_waiters.getOrPut(self.alloc, request_id);
+        if (result.found_existing) return error.DuplicateRaftReadBarrier;
+        result.value_ptr.* = .{ .group_id = group_id };
+        _ = self.read_barriers_started_total.fetchAdd(1, .monotonic);
+        _ = self.read_barriers_active.fetchAdd(1, .monotonic);
+        return request_id;
+    }
+
+    fn finishReadBarrier(self: *RaftTableApplyStateMachine, request_id: u64) void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        if (self.read_barrier_waiters.remove(request_id))
+            _ = self.read_barriers_active.fetchSub(1, .monotonic);
+    }
+
+    fn readBarrierState(self: *RaftTableApplyStateMachine, request_id: u64) ReadBarrierState {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const waiter = self.read_barrier_waiters.get(request_id) orelse return .missing;
+        if (waiter.retired) return .retired;
+        const read_index = waiter.read_index orelse return .pending;
+        const applied_index = self.applied_indexes.get(waiter.group_id) orelse 0;
+        return if (applied_index >= read_index) .ready else .pending;
+    }
+
+    fn waitReadBarrier(
+        self: *RaftTableApplyStateMachine,
+        request_id: u64,
+        deadline_ns: u64,
+    ) !void {
+        while (true) {
+            switch (self.readBarrierState(request_id)) {
+                .ready => {
+                    _ = self.read_barriers_completed_total.fetchAdd(1, .monotonic);
+                    return;
+                },
+                .retired => {
+                    _ = self.read_barriers_retired_total.fetchAdd(1, .monotonic);
+                    return error.UnknownGroup;
+                },
+                .missing => return error.RaftReadBarrierMissing,
+                .pending => {},
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) {
+                _ = self.read_barriers_timed_out_total.fetchAdd(1, .monotonic);
+                return error.Timeout;
+            }
+            const observed = self.read_barrier_wake_epoch.load(.acquire);
+            if (self.readBarrierState(request_id) != .pending) continue;
+            std.Io.futexWaitTimeout(
+                std.Options.debug_io,
+                u32,
+                &self.read_barrier_wake_epoch.raw,
+                observed,
+                .{
+                    .duration = .{
+                        .clock = .awake,
+                        // The epoch/state recheck above closes the lost-wakeup
+                        // window. Sleep until a real state transition or the
+                        // caller's deadline rather than polling active barriers.
+                        .raw = .fromNanoseconds(@intCast(deadline_ns - now_ns)),
+                    },
+                },
+            ) catch {};
+        }
+    }
+
+    fn publishReadStates(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        read_states: []const raft_engine.core.ReadState,
+    ) void {
+        if (read_states.len == 0) return;
+        var changed = false;
+        lockAtomic(&self.applied_mutex);
+        for (read_states) |read_state| {
+            if (!std.mem.startsWith(u8, read_state.request_ctx, read_barrier_context_prefix)) continue;
+            const suffix = read_state.request_ctx[read_barrier_context_prefix.len..];
+            const request_id = std.fmt.parseUnsigned(u64, suffix, 10) catch continue;
+            const waiter = self.read_barrier_waiters.getPtr(request_id) orelse continue;
+            if (waiter.group_id != group_id or waiter.retired) continue;
+            waiter.read_index = read_state.index;
+            changed = true;
+        }
+        self.applied_mutex.unlock();
+        if (changed) self.notifyReadBarrierWaiters();
     }
 
     fn prepareRetryApplyCheckpoint(
@@ -1498,7 +1626,7 @@ const RaftTableApplyStateMachine = struct {
         applied_index: u64,
     ) !void {
         lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
+        errdefer self.applied_mutex.unlock();
 
         // A snapshot proves state convergence through its index, but not the
         // typed outcome of a command this process did not execute. Never turn
@@ -1532,6 +1660,8 @@ const RaftTableApplyStateMachine = struct {
             }
             try self.applied_indexes.put(self.alloc, group_id, applied_index);
         }
+        self.applied_mutex.unlock();
+        self.notifyReadBarrierWaiters();
     }
 
     fn registerApplyOutcomeWaiter(
@@ -1583,7 +1713,6 @@ const RaftTableApplyStateMachine = struct {
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
 
         _ = self.applied_indexes.remove(group_id);
         _ = self.retry_apply_checkpoints.remove(group_id);
@@ -1591,6 +1720,12 @@ const RaftTableApplyStateMachine = struct {
         while (outcomes.next()) |entry| {
             if (entry.key_ptr.group_id == group_id) self.apply_outcomes.removeByPtr(entry.key_ptr);
         }
+        var barriers = self.read_barrier_waiters.iterator();
+        while (barriers.next()) |entry| {
+            if (entry.value_ptr.group_id == group_id) entry.value_ptr.retired = true;
+        }
+        self.applied_mutex.unlock();
+        self.notifyReadBarrierWaiters();
     }
 
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
@@ -1608,10 +1743,10 @@ const RaftTableApplyStateMachine = struct {
         group_id: raft_engine.core.types.GroupId,
         snapshot: ?raft_engine.core.types.Snapshot,
         committed_entries: []const raft_engine.core.Entry,
-        _: []const raft_engine.core.ReadState,
+        read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
-        if (snapshot == null and committed_entries.len == 0) return;
+        if (snapshot == null and committed_entries.len == 0 and read_states.len == 0) return;
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
         var last_index: u64 = snapshot_index;
         var completed_index = try self.prepareRetryApplyCheckpoint(group_id, snapshot, committed_entries);
@@ -1690,6 +1825,7 @@ const RaftTableApplyStateMachine = struct {
             try self.publishAppliedReady(group_id, snapshot_index, committed_entries, last_index);
             if (last_index >= completed_index) self.clearRetryApplyCheckpoint(group_id);
         }
+        self.publishReadStates(group_id, read_states);
     }
 };
 
@@ -1823,6 +1959,11 @@ pub const HealthSource = struct {
         if (self.data_server.data_raft_apply) |apply_sm| {
             try health_metrics.appendPromMetric(writer, "antfly_data_raft_writer_unavailable_retries_total", "counter", "Data-Raft document apply retries deferred while another runtime owns the writer", apply_sm.writer_unavailable_retries_total.load(.monotonic));
             try health_metrics.appendPromMetric(writer, "antfly_data_raft_writer_unavailable_logs_suppressed_total", "counter", "Repeated writer-unavailable warnings suppressed by per-group rate limiting", apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_read_barriers_started_total", "counter", "Leader-linearizable Data-Raft read barriers started", apply_sm.read_barriers_started_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_read_barriers_completed_total", "counter", "Leader-linearizable Data-Raft read barriers completed after local apply", apply_sm.read_barriers_completed_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_read_barriers_timed_out_total", "counter", "Leader-linearizable Data-Raft read barriers that exhausted their deadline", apply_sm.read_barriers_timed_out_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_read_barriers_retired_total", "counter", "Leader-linearizable Data-Raft read barriers interrupted by group retirement", apply_sm.read_barriers_retired_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_read_barriers_active", "gauge", "Leader-linearizable Data-Raft read barriers currently registered", apply_sm.read_barriers_active.load(.monotonic));
         }
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
@@ -7548,6 +7689,8 @@ pub const DataServer = struct {
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
+                .txn_status_group = localRaftTxnStatusGroup,
+                .txn_status_group_local = localRaftTxnStatusGroupAuthoritativeLocal,
             },
         };
     }
@@ -7728,6 +7871,158 @@ pub const DataServer = struct {
         );
     }
 
+    fn localRaftTxnStatusGroupAuthoritativeLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: antfly.db.types.TxnId,
+    ) !antfly.db.types.TxnStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.UnsupportedOperation;
+        const apply_sm = self.data_raft_apply orelse return error.UnsupportedOperation;
+        const deadline_ns = platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns;
+        const request_id = try apply_sm.registerReadBarrier(group_id);
+        defer apply_sm.finishReadBarrier(request_id);
+        var request_ctx_buf: [64]u8 = undefined;
+        const request_ctx = try std.fmt.bufPrint(
+            &request_ctx_buf,
+            "{s}{d}",
+            .{ RaftTableApplyStateMachine.read_barrier_context_prefix, request_id },
+        );
+
+        lockAtomic(&self.data_raft_mutex);
+        if (!raft.host.http_host.host.isLocalLeader(group_id)) {
+            self.data_raft_mutex.unlock();
+            return error.LeaderUnavailable;
+        }
+        raft.requestReadableLease(group_id, request_ctx) catch |err| {
+            self.data_raft_mutex.unlock();
+            return switch (err) {
+                error.NotLeader => error.LeaderUnavailable,
+                else => err,
+            };
+        };
+        self.data_raft_mutex.unlock();
+
+        apply_sm.waitReadBarrier(request_id, deadline_ns) catch |err| return switch (err) {
+            error.Timeout => error.LeaderUnavailable,
+            else => err,
+        };
+        return (try apply_sm.write_source.source().txnStatusGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            txn_id,
+        )) orelse error.UnknownGroup;
+    }
+
+    fn localRaftTxnStatusTargetUri(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        local_node_id: u64,
+        preferred_node_id: ?u64,
+        previous_target_node_id: ?u64,
+        deadline_ns: u64,
+    ) !?struct { node_id: u64, base_uri: []u8 } {
+        const remote_metadata = self.remote_metadata orelse return null;
+        var snapshot = try remote_metadata.fetchSnapshotWithBudget(.{ .deadline_ns = deadline_ns });
+        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        var preferred = preferred_node_id;
+        if (preferred == null) {
+            if (findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id)) |status| {
+                if (status.leader_known and status.leader_store_id != 0) {
+                    if (findSnapshotStore(snapshot.stores, status.leader_store_id)) |store|
+                        preferred = store.node_id;
+                }
+            }
+        }
+        const target_node_id = remoteRaftBatchPlacementNode(
+            group_id,
+            local_node_id,
+            preferred,
+            snapshot.placement_intents,
+            true,
+            previous_target_node_id,
+        ) orelse return null;
+        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return null;
+        if (target_store.api_url.len == 0) return null;
+        return .{
+            .node_id = target_node_id,
+            .base_uri = try alloc.dupe(u8, target_store.api_url),
+        };
+    }
+
+    fn localRaftTxnStatusGroup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: antfly.db.types.TxnId,
+    ) !antfly.db.types.TxnStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.UnsupportedOperation;
+        const deadline_ns = platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns;
+        var previous_target_node_id: ?u64 = null;
+        var last_metadata_refresh_ns: u64 = 0;
+        const body = try antfly.public_api.distributed_txn.encodeTxnStatusRequest(alloc, txn_id);
+        defer alloc.free(body);
+
+        while (platform_time.monotonicNs() < deadline_ns) {
+            var local_node_id: u64 = 0;
+            var leader_node_id: ?u64 = null;
+            var local_is_leader = false;
+            lockAtomic(&self.data_raft_mutex);
+            local_node_id = raft.host.http_host.host.cfg.local_node_id;
+            local_is_leader = raft.host.http_host.host.isLocalLeader(group_id);
+            if (raft.host.http_host.host.raftStatus(group_id)) |status|
+                leader_node_id = status.soft.leader_id;
+            self.data_raft_mutex.unlock();
+
+            if (local_is_leader)
+                return try localRaftTxnStatusGroupAuthoritativeLocal(ptr, alloc, group_id, table_name, txn_id);
+
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns -| last_metadata_refresh_ns >= data_raft_metadata_resync_interval_ns) {
+                self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, null) catch {};
+                last_metadata_refresh_ns = now_ns;
+            }
+            var target = self.localRaftTxnStatusTargetUri(
+                alloc,
+                group_id,
+                local_node_id,
+                leader_node_id,
+                previous_target_node_id,
+                deadline_ns,
+            ) catch null;
+            if (target) |*remote| {
+                defer alloc.free(remote.base_uri);
+                previous_target_node_id = remote.node_id;
+                var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
+                _ = client.withInternalServiceAuth(
+                    self.api_server_cfg.internal_service_secret,
+                    self.api_server_cfg.internal_service_issuer,
+                );
+                var response = client.fetchGroupTxnStatusWithTimeout(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    dataRaftBatchHttpTimeoutMs(deadline_ns),
+                ) catch {
+                    sleepDataRaftBatchLeaderRetry();
+                    continue;
+                };
+                defer response.deinit(alloc);
+                const parsed = try antfly.public_api.distributed_txn.parseTxnStatusResponse(alloc, response.body);
+                return parsed.status;
+            }
+            sleepDataRaftBatchLeaderRetry();
+        }
+        return error.LeaderUnavailable;
+    }
+
     fn localRaftBatchGroupForwarded(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7741,7 +8036,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
             .catalog => |fence| fence,
-            .split_replication => null,
+            .transaction, .split_replication => null,
         };
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
@@ -21402,6 +21697,28 @@ test "data raft retry checkpoints survive changed ready windows and publication 
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
     }
+
+    const completed_barrier = try apply_sm.registerReadBarrier(group_id);
+    defer apply_sm.finishReadBarrier(completed_barrier);
+    var completed_context_buf: [64]u8 = undefined;
+    const completed_context = try std.fmt.bufPrint(
+        &completed_context_buf,
+        "{s}{d}",
+        .{ RaftTableApplyStateMachine.read_barrier_context_prefix, completed_barrier },
+    );
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &.{}, &.{.{
+        .index = 5,
+        .request_ctx = completed_context,
+    }});
+    try apply_sm.waitReadBarrier(completed_barrier, platform_time.monotonicNs() + std.time.ns_per_s);
+
+    const retired_barrier = try apply_sm.registerReadBarrier(group_id);
+    defer apply_sm.finishReadBarrier(retired_barrier);
+    RaftTableApplyStateMachine.retireGroup(&apply_sm, group_id);
+    try std.testing.expectError(
+        error.UnknownGroup,
+        apply_sm.waitReadBarrier(retired_barrier, platform_time.monotonicNs() + std.time.ns_per_s),
+    );
 }
 
 test "data raft document apply identity prevents non-idempotent restart replay" {

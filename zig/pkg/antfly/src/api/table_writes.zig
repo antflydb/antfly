@@ -5965,6 +5965,20 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!void = null,
+        txn_status_group: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!db_mod.types.TxnStatus = null,
     };
 
     pub fn batchGroup(
@@ -6038,6 +6052,28 @@ pub const RaftBatcher = struct {
         const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse
             return try self.batchGroupLocalWithCancellation(alloc, group_id, table_name, req, context.cancellation);
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req, context);
+    }
+
+    pub fn txnStatusGroup(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnStatusGroupLocal(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
     }
 };
 
@@ -17361,6 +17397,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_linearizable = txnStatusGroupLinearizable,
+                .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -19141,7 +19179,11 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_id = nextTxnId();
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        return commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation) catch |err| {
+            if (err == error.CommitDecisionUnknown)
+                public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
+            return err;
+        };
     }
 
     /// A transaction with one participant is already atomic at the shard DB
@@ -20071,6 +20113,32 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             return try db.getTransactionStatus(txn_id);
         }
+    }
+
+    fn txnStatusGroupLinearizable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse
+            return try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        return try batcher.txnStatusGroup(alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupAuthoritativeLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse
+            return try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        return try batcher.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
     }
 
     fn txnAcknowledgeGroupLocal(

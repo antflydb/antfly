@@ -401,6 +401,25 @@ pub const TableWriteSource = struct {
             req: db_mod.types.TransactionIntentRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!?void = null,
+        /// Routes a transaction decision observation to the current Raft
+        /// leader and orders it behind a quorum read barrier.
+        txn_status_group_linearizable: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        /// Leader-local half of the linearizable status protocol. Internal
+        /// RPC handlers use this callback so they fail closed on a follower
+        /// instead of recursively forwarding.
+        txn_status_group_authoritative_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!?db_mod.types.TxnStatus = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -770,6 +789,30 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupLinearizable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_linearizable orelse
+            return try self.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        return try BoundaryAbi.call("txn_status_group_linearizable", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupAuthoritativeLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_authoritative_local orelse
+            return try self.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        return try BoundaryAbi.call("txn_status_group_authoritative_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
     }
 
     pub fn txnAcknowledgeGroupLocal(

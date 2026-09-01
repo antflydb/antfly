@@ -57,6 +57,10 @@ pub const RepairCancellationLookup = struct {
 
 pub const RoutedBatchAuthority = union(enum) {
     catalog: metadata_api.CatalogRouteFence,
+    /// Private 2PC records are admitted without a catalog-route header only
+    /// after their replicated command proves the destination identity below.
+    /// Public batch decoding cannot construct this command shape.
+    transaction,
     split_replication,
 };
 
@@ -312,6 +316,34 @@ pub const Operations = struct {
             parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
             parsed_fence.?.value.admission_cancellation = request.cancellation;
             break :fence .{ .catalog = parsed_fence.?.value };
+        } else if (input.transaction) |transaction| transaction: {
+            // A transaction may be forwarded after the originating replica
+            // validated its catalog epoch. Require every pre-decision command
+            // to carry that epoch, and require the coordinator's participant
+            // set to name this exact table/group. Later resolution/recovery
+            // records intentionally omit the epoch so topology changes cannot
+            // strand prepared intents.
+            switch (transaction) {
+                .begin => |begin| {
+                    if (begin.topology_epoch == 0) return error.InvalidArgument;
+                    var names_destination = false;
+                    for (begin.participants) |participant| {
+                        const ref = distributed_txn.parseParticipantRef(participant) orelse
+                            return error.InvalidArgument;
+                        if (ref.group_id == group_id and std.mem.eql(u8, ref.table_name, table_name))
+                            names_destination = true;
+                    }
+                    if (!names_destination) return error.InvalidArgument;
+                },
+                .prepare => |prepare| if (prepare.topology_epoch == 0)
+                    return error.InvalidArgument,
+                .resolve => |resolve| if (resolve.status == .pending)
+                    return error.InvalidArgument,
+                .acknowledge => |acknowledge| if (distributed_txn.parseParticipantRef(acknowledge.participant) == null)
+                    return error.InvalidArgument,
+                .cleanup => {},
+            }
+            break :transaction .transaction;
         } else split: {
             // Publicly routed writes always carry a catalog fence. Split
             // replication is different: its destination is intentionally not
@@ -435,8 +467,12 @@ pub const Operations = struct {
     pub fn txnStatus(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        return (writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id) catch |err| switch (err) {
+        return (writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.LeaderUnavailable,
+            error.NotLeader,
+            error.Timeout,
+            => return error.GroupLeaderUnavailable,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
             else => return error.Internal,
@@ -1201,6 +1237,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         fail_identity: bool = false,
         visibility_error: ?anyerror = null,
         saw_unfenced_split: bool = false,
+        saw_unfenced_transaction: bool = false,
 
         fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1224,6 +1261,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
             try std.testing.expectEqual(@as(u64, 17), group_id);
             switch (authority) {
                 .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
+                .transaction => self.saw_unfenced_transaction = true,
                 .split_replication => self.saw_unfenced_split = true,
             }
             try std.testing.expectEqualStrings("documents", table_name);
@@ -1313,6 +1351,38 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
     ));
     try std.testing.expectEqual(@as(usize, 4), state.calls);
 
+    const txn_id = [_]u8{7} ** 16;
+    const transaction_participants = [_][]const u8{"table:documents:group:17"};
+    _ = try operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 10,
+            .created_at_ns = 11,
+            .topology_epoch = 2,
+            .participants = &transaction_participants,
+        } } },
+        forwarding,
+    );
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expect(state.saw_unfenced_transaction);
+
+    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .transaction = .{ .prepare = .{
+            .txn_id = txn_id,
+            .topology_epoch = 0,
+        } } },
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+
     const split_replication: db_mod.types.SplitReplicationContext = .{
         .transition_id = 91,
         .attempt_epoch = 2,
@@ -1328,7 +1398,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         .{ .split_replication = split_replication },
         forwarding,
     );
-    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expectEqual(@as(usize, 6), state.calls);
     try std.testing.expect(state.saw_unfenced_split);
 
     var mismatched_split = split_replication;
@@ -1341,7 +1411,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         .{ .split_replication = mismatched_split },
         forwarding,
     ));
-    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expectEqual(@as(usize, 6), state.calls);
 }
 
 test "typed internal query workers preserve identity generation validation" {

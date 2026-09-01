@@ -2677,6 +2677,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return try self.fetchGroupTxnStatusWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupTxnStatusWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2693,6 +2704,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {

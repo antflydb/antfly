@@ -480,6 +480,18 @@ class ThreeByThreeBackupCluster:
             self.metadata_procs: list[subprocess.Popen[str]] = []
             self.data_procs: list[subprocess.Popen[str]] = []
             self.last_metadata_statuses: list[dict | None] = []
+            self.last_metadata_snapshots: list[dict | None] = []
+            self.last_metadata_snapshot_observations: list[dict] = []
+            self._metadata_probe_executor = ThreadPoolExecutor(
+                max_workers=len(self.metadata_admin_urls),
+                thread_name_prefix="metadata-probe",
+            )
+            self._metadata_probe_executor_shutdown = False
+            setup.callback(
+                self._metadata_probe_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
             setup.pop_all()
 
         try:
@@ -647,24 +659,57 @@ class ThreeByThreeBackupCluster:
                 f"{self.debug_logs()}"
             )
 
-    def metadata_snapshot(self, index: int) -> dict:
+    def metadata_snapshot(
+        self, index: int, *, request_timeout_s: float = 1.0
+    ) -> dict:
         response = requests.get(
             f"{self.metadata_admin_urls[index]}/metadata/v1/admin/snapshot",
-            timeout=10,
+            timeout=request_timeout_s,
         )
         return _check_response(response)
+
+    def metadata_snapshots(
+        self, *, request_timeout_s: float = 1.0
+    ) -> list[dict | None]:
+        observations: list[dict] = [
+            {"node_id": index + 1, "elapsed_ms": 0, "error": None}
+            for index in range(len(self.metadata_admin_urls))
+        ]
+
+        def fetch(index: int) -> dict | None:
+            started = time.monotonic()
+            try:
+                snapshot = self.metadata_snapshot(
+                    index, request_timeout_s=request_timeout_s
+                )
+                observations[index]["elapsed_ms"] = round(
+                    (time.monotonic() - started) * 1000, 1
+                )
+                return snapshot
+            except (AssertionError, requests.RequestException, ValueError) as exc:
+                observations[index]["elapsed_ms"] = round(
+                    (time.monotonic() - started) * 1000, 1
+                )
+                observations[index]["error"] = f"{type(exc).__name__}: {exc}"
+                return None
+
+        snapshots = list(
+            self._metadata_probe_executor.map(
+                fetch, range(len(self.metadata_admin_urls))
+            )
+        )
+        self.last_metadata_snapshots = snapshots
+        self.last_metadata_snapshot_observations = observations
+        return snapshots
 
     def all_data_nodes_registered(self) -> bool:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
-        try:
-            snapshots = [
-                self.metadata_snapshot(index)
-                for index in range(len(self.metadata_admin_urls))
-            ]
-        except (AssertionError, requests.RequestException, ValueError):
+        snapshots = self.metadata_snapshots()
+        if any(snapshot is None for snapshot in snapshots):
             return False
         for snapshot in snapshots:
+            assert snapshot is not None
             registered = {
                 int(store.get("node_id", 0))
                 for store in snapshot.get("stores", [])
@@ -677,15 +722,12 @@ class ThreeByThreeBackupCluster:
     def table_is_fully_replicated(self, table_name: str) -> bool:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
-        try:
-            snapshots = [
-                self.metadata_snapshot(index)
-                for index in range(len(self.metadata_admin_urls))
-            ]
-        except (AssertionError, requests.RequestException, ValueError):
+        snapshots = self.metadata_snapshots()
+        if any(snapshot is None for snapshot in snapshots):
             return False
 
         for snapshot in snapshots:
+            assert snapshot is not None
             table_id = next(
                 (
                     int(table.get("table_id", 0))
@@ -743,7 +785,7 @@ class ThreeByThreeBackupCluster:
 
     def table_topology(self, table_name: str) -> tuple[int, set[int]] | None:
         try:
-            snapshot = self.metadata_snapshot(0)
+            snapshot = self.metadata_snapshot(0, request_timeout_s=1.0)
         except (AssertionError, requests.RequestException, ValueError):
             return None
         table_id = next(
@@ -766,14 +808,11 @@ class ThreeByThreeBackupCluster:
 
     def restore_progress_cleared(self, table_name: str) -> bool:
         self.assert_processes_alive()
-        try:
-            snapshots = [
-                self.metadata_snapshot(index)
-                for index in range(len(self.metadata_admin_urls))
-            ]
-        except (AssertionError, requests.RequestException, ValueError):
+        snapshots = self.metadata_snapshots()
+        if any(snapshot is None for snapshot in snapshots):
             return False
         for snapshot in snapshots:
+            assert snapshot is not None
             table_id = next(
                 (
                     int(table.get("table_id", 0))
@@ -796,12 +835,8 @@ class ThreeByThreeBackupCluster:
         self, table_name: str, table_id: int, group_ids: set[int]
     ) -> bool:
         self.assert_processes_alive()
-        try:
-            snapshots = [
-                self.metadata_snapshot(index)
-                for index in range(len(self.metadata_admin_urls))
-            ]
-        except (AssertionError, requests.RequestException, ValueError):
+        snapshots = self.metadata_snapshots()
+        if any(snapshot is None for snapshot in snapshots):
             return False
         return all(
             not any(
@@ -817,6 +852,7 @@ class ThreeByThreeBackupCluster:
                 for record in snapshot.get("ranges", [])
             )
             for snapshot in snapshots
+            if snapshot is not None
         )
 
     def assert_processes_alive(self) -> None:
@@ -848,6 +884,11 @@ class ThreeByThreeBackupCluster:
             f"[data-{i + 4}]\n{_read_log_tail(path)}"
             for i, path in enumerate(self.data_log_paths)
         )
+        if self.last_metadata_snapshot_observations:
+            parts.append(
+                "[metadata-snapshot-observations]\n"
+                f"{self.last_metadata_snapshot_observations!r}"
+            )
         return "\n".join(parts)
 
     def metadata_statuses(self, *, request_timeout_s: float = 1.0) -> list[dict | None]:
@@ -860,11 +901,12 @@ class ThreeByThreeBackupCluster:
             except (AssertionError, requests.RequestException, ValueError):
                 return None
 
-        # A serial probe makes one unavailable node consume the complete
-        # election-observation window before healthy peers are considered.
         # Keep one bounded request per node and preserve configured ordering.
-        with ThreadPoolExecutor(max_workers=len(self.metadata_admin_urls)) as executor:
-            statuses = list(executor.map(fetch, self.metadata_admin_urls))
+        # The cluster-owned executor avoids creating three threads on every
+        # election/status poll while retaining parallel failure latency.
+        statuses = list(
+            self._metadata_probe_executor.map(fetch, self.metadata_admin_urls)
+        )
         self.last_metadata_statuses = statuses
         return statuses
 
@@ -935,6 +977,9 @@ class ThreeByThreeBackupCluster:
         return self.metadata_public_urls[leader_id - 1]
 
     def stop(self, *, test_failed: bool = False) -> None:
+        if not self._metadata_probe_executor_shutdown:
+            self._metadata_probe_executor.shutdown(wait=True, cancel_futures=True)
+            self._metadata_probe_executor_shutdown = True
         self.port_reservations.close()
         for proc in reversed(self.data_procs):
             if proc.poll() is None:

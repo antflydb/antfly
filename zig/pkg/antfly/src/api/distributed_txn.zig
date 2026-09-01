@@ -766,7 +766,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        return (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
+        return (try self.writes.txnStatusGroupLinearizable(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
     }
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -1993,9 +1993,13 @@ fn executeMultiTableCommitOnce(
                         visibility_retry_pending = err != error.EnrichmentWorkerFailed;
                     },
                     .pending => {
+                        // Once the commit submission may have crossed the
+                        // Raft proposal boundary, pending means "not observed
+                        // yet", never "safe to abort". The same decision can
+                        // be retried idempotently; the opposite decision is
+                        // permanently forbidden on this path.
                         abort_on_error = false;
-                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
-                        return err;
+                        return error.CommitDecisionUnknown;
                     },
                     .aborted => {
                         abort_on_error = false;
@@ -2108,7 +2112,8 @@ fn executeMultiTableCommitOnce(
     return .{ .committed = result };
 }
 
-const max_coordinator_resolution_attempts: usize = 3;
+const coordinator_resolution_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const coordinator_resolution_retry_ns: u64 = 25 * std.time.ns_per_ms;
 
 /// Resolve an ambiguous coordinator submission without changing transaction
 /// identity. Status is probed after every failed submission; retries are
@@ -2124,49 +2129,71 @@ fn resolveCoordinatorDecisionAfterFailure(
     initial_resolve_error: anyerror,
     cancellation: db_mod.types.CancellationToken,
 ) !db_mod.types.TxnStatus {
+    _ = cancellation;
+    return try resolveCoordinatorDecisionAfterFailureUntil(
+        alloc,
+        worker,
+        participant,
+        txn_id,
+        commit_version,
+        sync_level,
+        initial_resolve_error,
+        platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
+    );
+}
+
+fn resolveCoordinatorDecisionAfterFailureUntil(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    participant: ParticipantTxn,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    sync_level: db_mod.types.SyncLevel,
+    initial_resolve_error: anyerror,
+    deadline_ns: u64,
+) !db_mod.types.TxnStatus {
     var attempts: usize = 1;
     var last_resolve_error = initial_resolve_error;
+    var last_status_error: ?anyerror = null;
     while (true) {
-        const status = worker.statusGroup(
+        const status: ?db_mod.types.TxnStatus = worker.statusGroup(
             alloc,
             participant.group_id,
             participant.table_name,
             txn_id,
-        ) catch |status_err| {
-            if (attempts >= max_coordinator_resolution_attempts) {
-                std.log.warn("transaction commit decision probe exhausted table={s} group_id={} attempts={} resolve_err={s} status_err={s}", .{
-                    participant.table_name,
-                    participant.group_id,
-                    attempts,
-                    @errorName(last_resolve_error),
-                    @errorName(status_err),
-                });
-                return error.CommitDecisionUnknown;
-            }
-            attempts += 1;
-            worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
-                .txn_id = txn_id,
-                .status = .committed,
-                .commit_version = commit_version,
-                .topology_epoch = participant.topology_epoch,
-                .sync_level = sync_level,
-            }, cancellation) catch |retry_err| {
-                last_resolve_error = retry_err;
-                continue;
-            };
-            return .committed;
+        ) catch |status_err| status_failure: {
+            last_status_error = status_err;
+            break :status_failure null;
         };
-
-        if (status != .pending or attempts >= max_coordinator_resolution_attempts) return status;
+        if (status) |observed| switch (observed) {
+            .committed, .aborted => return observed,
+            .pending => {},
+        };
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            std.log.warn("transaction commit decision recovery exhausted table={s} group_id={} attempts={} resolve_err={s} status_err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                attempts,
+                @errorName(last_resolve_error),
+                if (last_status_error) |status_err| @errorName(status_err) else "none",
+            });
+            return error.CommitDecisionUnknown;
+        }
         attempts += 1;
+        // Do not inherit request cancellation after an ambiguous submission:
+        // cancellation cannot prove the first commit was not accepted. This
+        // bounded recovery loop has its own deadline and repeats only the
+        // exact same idempotent decision.
         worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
             .topology_epoch = participant.topology_epoch,
             .sync_level = sync_level,
-        }, cancellation) catch |retry_err| {
+        }, .none) catch |retry_err| {
             last_resolve_error = retry_err;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
             continue;
         };
         return .committed;
@@ -2520,7 +2547,7 @@ test "distributed txn bounds unresolved coordinator decision retries" {
 
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("ffeeddccbbaa99887766554433221100");
-    try std.testing.expectError(error.CommitDecisionUnknown, resolveCoordinatorDecisionAfterFailure(
+    try std.testing.expectError(error.CommitDecisionUnknown, resolveCoordinatorDecisionAfterFailureUntil(
         std.testing.allocator,
         recorder.worker(),
         .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
@@ -2528,10 +2555,10 @@ test "distributed txn bounds unresolved coordinator decision retries" {
         10_001,
         .write,
         error.InjectedResolveFailure,
-        .none,
+        platform_time.monotonicNs() + 10 * std.time.ns_per_ms,
     ));
-    try std.testing.expectEqual(max_coordinator_resolution_attempts, recorder.status_calls);
-    try std.testing.expectEqual(max_coordinator_resolution_attempts - 1, recorder.resolve_calls);
+    try std.testing.expect(recorder.status_calls > 0);
+    try std.testing.expect(recorder.resolve_calls > 0);
 }
 
 test "distributed txn participant fanout is bounded and concurrent" {

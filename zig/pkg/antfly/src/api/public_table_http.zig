@@ -33,9 +33,20 @@ const query_contract = @import("query_contract.zig");
 const operation = @import("operation.zig");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
+threadlocal var last_ambiguous_batch_txn_id: ?[32]u8 = null;
 
 pub fn resetLastBatchFailureName() void {
     last_batch_failure_name = null;
+}
+
+pub fn setLastAmbiguousBatchTxnId(txn_id_hex: [32]u8) void {
+    last_ambiguous_batch_txn_id = txn_id_hex;
+}
+
+fn takeLastAmbiguousBatchTxnId() ?[32]u8 {
+    const txn_id = last_ambiguous_batch_txn_id;
+    last_ambiguous_batch_txn_id = null;
+    return txn_id;
 }
 
 pub fn setLastBatchFailureName(err: anyerror) void {
@@ -1196,6 +1207,7 @@ pub fn handleTableBatch(
     api: TableApi,
 ) !OwnedResponse {
     resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
     var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
@@ -1225,8 +1237,23 @@ pub fn handleTableBatch(
             .body = try alloc.dupe(u8, "write committed locally; standby durability acknowledgment pending"),
         },
         error.OutcomeUnknown => return .{
-            .status = 500,
-            .body = try alloc.dupe(u8, "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits"),
+            // An ambiguous commit is a stable, non-retryable application
+            // outcome, not an internal server failure. Include the immutable
+            // transaction identity for logs/support and reconciliation.
+            .status = 409,
+            .body = if (takeLastAmbiguousBatchTxnId()) |txn_id| try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "transaction_outcome_unknown",
+                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+                .retryable = false,
+                .transaction_id = txn_id[0..],
+                .recovery = "use an explicit transaction session for client-retryable commits",
+            }, .{}) else try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "transaction_outcome_unknown",
+                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+                .retryable = false,
+                .recovery = "use an explicit transaction session for client-retryable commits",
+            }, .{}),
+            .json = true,
         },
         error.CommittedPending => return .{
             .status = 202,
@@ -2865,6 +2892,8 @@ test "public table batch handler maps write unavailable errors" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.err == error.InternalFailure)
                 setLastBatchFailureName(error.InferenceProviderFailure);
+            if (self.err == error.OutcomeUnknown)
+                setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
             return self.err;
         }
     };
@@ -2878,8 +2907,9 @@ test "public table batch handler maps write unavailable errors" {
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
         .{
             .err = error.OutcomeUnknown,
-            .status = 500,
-            .body = "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits",
+            .status = 409,
+            .body = "{\"code\":\"transaction_outcome_unknown\",\"message\":\"transaction outcome is unknown; do not replay this stateless batch because it may already have committed\",\"retryable\":false,\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"recovery\":\"use an explicit transaction session for client-retryable commits\"}",
+            .json = true,
         },
         .{
             .err = error.InternalFailure,
