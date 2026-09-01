@@ -7093,6 +7093,7 @@ pub fn build(b: *std.Build) void {
         "classified batch chooses foreground requester when cache slice is first",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "provisioned dense native authority gate is fail-closed and monotonic",
         "provisioned lsm cache is an elastic share of the node envelope",
         "provisioned HBC cache is an elastic share of the node envelope",
         "standalone resource manager derives elastic storage cache envelopes",

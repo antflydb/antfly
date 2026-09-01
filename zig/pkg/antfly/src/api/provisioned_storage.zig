@@ -156,10 +156,6 @@ const SmartResourceBudgets = struct {
     lsm_cache_budget_bytes: usize,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
-    /// Closed by default for provisioned databases. Metadata opens this only
-    /// after the complete table-serving store set advertises the native HBC
-    /// protocol, so a rolling old binary can never be handed native authority.
-    dense_native_authority_permitted: std.atomic.Value(bool) = .init(false),
 };
 
 fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
@@ -279,6 +275,10 @@ pub const ProvisionedGroupStorage = struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
+    /// Closed by default for provisioned databases. Metadata opens this only
+    /// after the complete table-serving store set advertises the native HBC
+    /// protocol, so a rolling old binary can never be handed native authority.
+    dense_native_authority_permitted: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
         return initWithProcessMemoryLimit(alloc, 0);
