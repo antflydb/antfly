@@ -3055,41 +3055,6 @@ pub const SimMergeRuntime = struct {
         return &self.entries[self.len - 1];
     }
 
-    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
-        _ = self;
-        if (entry.coord) |coord| {
-            coord.deinit();
-            std.heap.page_allocator.destroy(coord);
-            entry.coord = null;
-        }
-    }
-
-    fn withCoordinator(self: *@This(), donor_group_id: u64, receiver_group_id: u64) !*transition_runtime.MergeCoordinatorRuntime {
-        const entry = self.entryFor(donor_group_id, receiver_group_id);
-        if (entry.coord == null) {
-            const alloc = std.heap.page_allocator;
-            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
-            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, donor_group_id);
-            defer alloc.free(donor_root_dir);
-            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
-            defer alloc.free(receiver_root_dir);
-
-            try SimSplitRuntime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
-
-            const coord = try alloc.create(transition_runtime.MergeCoordinatorRuntime);
-            errdefer alloc.destroy(coord);
-            coord.* = try transition_runtime.MergeCoordinatorRuntime.init(alloc, .{
-                .donor_root_dir = donor_root_dir,
-                .receiver_root_dir = receiver_root_dir,
-                .donor_group_id = donor_group_id,
-                .receiver_group_id = receiver_group_id,
-                .receiver = .{ .root_dir = receiver_root_dir },
-            });
-            entry.coord = coord;
-        }
-        return entry.coord.?;
-    }
-
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
@@ -7627,14 +7592,19 @@ pub const VoprPublicClusterFixture = struct {
         if (responses.len != 1) return;
         const graph_results = responses[0].graph_results orelse return;
         const walk = graph_results.map.get("walk") orelse return;
-        const nodes = walk.nodes orelse return;
+        const node_result = switch (walk) {
+            .graph_nodes_result => |result| result,
+            else => return,
+        };
+        const nodes = node_result.nodes;
         var found_z = false;
         var found_y = false;
         for (nodes) |node| {
             found_z = found_z or std.mem.eql(u8, node.key, "doc:z");
             found_y = found_y or std.mem.eql(u8, node.key, "doc:y");
         }
-        self.graph_query_sound = walk.total == 2 and nodes.len == 2 and found_z and found_y;
+        self.graph_query_sound = node_result.stats.returned_items == 2 and
+            !node_result.stats.truncated and nodes.len == 2 and found_z and found_y;
         if (!self.graph_query_sound) std.debug.print(
             "full cluster graph recovery returned incomplete result after mode={s}: {s}\n",
             .{ @tagName(self.fault_mode), query.body },

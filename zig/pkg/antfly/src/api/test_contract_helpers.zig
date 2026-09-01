@@ -552,21 +552,23 @@ pub fn encodeGraphTraverseQueryWithDocumentsRequest(
     max_depth: i64,
     limit: i64,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .traverse,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
+    var query = indexes_openapi.GraphTraverseQuery{
+        .index = index_name,
+        .traverse = .{
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = max_depth,
+            .limit = limit,
+            .include_documents = true,
+            .fields = &.{"title"},
         },
-        .include_documents = true,
-        .fields = &.{"title"},
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_traverse_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
