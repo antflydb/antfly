@@ -494,6 +494,7 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 const max_concurrent_restore_jobs: usize = 2;
 const max_pending_backup_maintenance_targets: usize = 128;
+const max_pending_table_reclaims_per_target: usize = 128;
 /// Retain a repository long enough for a crashed attempt to become eligible
 /// and receive many bounded cleanup passes, while ensuring the fixed-size
 /// registry cannot be exhausted forever by repositories that are no longer
@@ -528,9 +529,16 @@ fn trimBackupMaintenanceLocationTrailingSlash(value: []const u8) []const u8 {
     return value[0..end];
 }
 
-const ClusterBackupMaintenanceTarget = struct {
+const BackupRepositoryMaintenanceTarget = struct {
+    const TableReclaim = struct {
+        backup_id: []u8,
+        not_before_unix_ns: u64,
+    };
+
     location_uri: []u8,
     connection: []u8,
+    table_reclaims: std.ArrayListUnmanaged(TableReclaim) = .empty,
+    cluster_maintenance_requested: bool = false,
     next_run_monotonic_ns: u64 = 0,
     last_scheduled_monotonic_ns: u64,
 
@@ -554,6 +562,8 @@ const ClusterBackupMaintenanceTarget = struct {
     }
 
     fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.table_reclaims.items) |reclaim| alloc.free(reclaim.backup_id);
+        self.table_reclaims.deinit(alloc);
         alloc.free(self.connection);
         alloc.free(self.location_uri);
         alloc.destroy(self);
@@ -573,15 +583,65 @@ const ClusterBackupMaintenanceTarget = struct {
             trimBackupMaintenanceLocationTrailingSlash(location_uri),
         ) and std.mem.eql(u8, self.connection, connection);
     }
+
+    fn enqueueTableReclaim(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        backup_id: []const u8,
+        not_before_unix_ns: u64,
+    ) !void {
+        for (self.table_reclaims.items) |*reclaim| {
+            if (!std.mem.eql(u8, reclaim.backup_id, backup_id)) continue;
+            reclaim.not_before_unix_ns = @min(
+                reclaim.not_before_unix_ns,
+                not_before_unix_ns,
+            );
+            return;
+        }
+        if (self.table_reclaims.items.len >= max_pending_table_reclaims_per_target)
+            return error.BackupMaintenanceQueueFull;
+        const owned_backup_id = try alloc.dupe(u8, backup_id);
+        errdefer alloc.free(owned_backup_id);
+        try self.table_reclaims.append(alloc, .{
+            .backup_id = owned_backup_id,
+            .not_before_unix_ns = not_before_unix_ns,
+        });
+    }
+
+    fn nextDueTableReclaim(self: *const @This(), now_unix_ns: u64) ?[]const u8 {
+        for (self.table_reclaims.items) |reclaim| {
+            if (reclaim.not_before_unix_ns <= now_unix_ns)
+                return reclaim.backup_id;
+        }
+        return null;
+    }
+
+    fn finishTableReclaim(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        backup_id: []const u8,
+        retry_at_unix_ns: ?u64,
+    ) void {
+        for (self.table_reclaims.items, 0..) |*reclaim, index| {
+            if (!std.mem.eql(u8, reclaim.backup_id, backup_id)) continue;
+            if (retry_at_unix_ns) |retry_at| {
+                reclaim.not_before_unix_ns = retry_at;
+            } else {
+                const removed = self.table_reclaims.swapRemove(index);
+                alloc.free(removed.backup_id);
+            }
+            return;
+        }
+    }
 };
 
 /// Bounded FIFO of distinct backup repositories. The queue owns every target
 /// from admission through worker completion. A head index avoids shifting the
 /// tail on every dequeue while retaining strict FIFO fairness.
-const ClusterBackupMaintenanceQueue = struct {
-    pending: std.ArrayListUnmanaged(*ClusterBackupMaintenanceTarget) = .empty,
+const BackupRepositoryMaintenanceQueue = struct {
+    pending: std.ArrayListUnmanaged(*BackupRepositoryMaintenanceTarget) = .empty,
     pending_head: usize = 0,
-    active: ?*ClusterBackupMaintenanceTarget = null,
+    active: ?*BackupRepositoryMaintenanceTarget = null,
 
     fn pendingCount(self: *const @This()) usize {
         return self.pending.items.len - self.pending_head;
@@ -595,7 +655,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self: *@This(),
         location_uri: []const u8,
         connection: []const u8,
-    ) ?*ClusterBackupMaintenanceTarget {
+    ) ?*BackupRepositoryMaintenanceTarget {
         if (self.active) |target| {
             if (target.matches(location_uri, connection)) return target;
         }
@@ -645,7 +705,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pruneExpired(alloc, now_monotonic_ns);
         if (self.targetCount() >= max_pending_backup_maintenance_targets)
             return error.BackupMaintenanceQueueFull;
-        const target = try ClusterBackupMaintenanceTarget.create(
+        const target = try BackupRepositoryMaintenanceTarget.create(
             alloc,
             location_uri,
             connection,
@@ -656,7 +716,7 @@ const ClusterBackupMaintenanceQueue = struct {
         return true;
     }
 
-    fn activateNext(self: *@This()) ?*ClusterBackupMaintenanceTarget {
+    fn activateNext(self: *@This()) ?*BackupRepositoryMaintenanceTarget {
         if (self.active != null or self.pendingCount() == 0) return null;
         const target = self.pending.items[self.pending_head];
         self.pending_head += 1;
@@ -664,7 +724,7 @@ const ClusterBackupMaintenanceQueue = struct {
         return target;
     }
 
-    fn requeueActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn requeueActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         std.debug.assert(self.pending_head > 0);
         self.active = null;
@@ -672,7 +732,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pending.items[self.pending_head] = target;
     }
 
-    fn completeActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn completeActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         self.active = null;
     }
@@ -680,12 +740,12 @@ const ClusterBackupMaintenanceQueue = struct {
     /// Rotate the completed target behind every repository currently waiting.
     /// The active slot already supplies enough storage, so steady-state
     /// maintenance performs no allocation.
-    fn rotateActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn rotateActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         std.debug.assert(self.pending_head > 0);
         const live = self.pending.items[self.pending_head..];
         std.mem.copyForwards(
-            *ClusterBackupMaintenanceTarget,
+            *BackupRepositoryMaintenanceTarget,
             self.pending.items[0..live.len],
             live,
         );
@@ -693,6 +753,20 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pending.items.len = live.len + 1;
         self.pending_head = 0;
         self.active = null;
+    }
+
+    /// Roll back the most recent enqueue while the scheduler mutex is held.
+    /// New targets are appended and cannot become active until submission, so
+    /// task-admission failure can release the otherwise empty queue slot in O(1).
+    fn discardNewestPending(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        target: *BackupRepositoryMaintenanceTarget,
+    ) void {
+        std.debug.assert(self.pending.items.len > self.pending_head);
+        std.debug.assert(self.pending.items[self.pending.items.len - 1] == target);
+        self.pending.items.len -= 1;
+        target.destroy(alloc);
     }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -715,7 +789,7 @@ test "restore repository contention backoff is bounded and increasing" {
 
 test "cluster backup maintenance queue retains distinct locations with bounded deduplication" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
 
     try std.testing.expect(try queue.enqueue(
@@ -765,9 +839,36 @@ test "cluster backup maintenance queue retains distinct locations with bounded d
     try std.testing.expectEqual(@as(usize, 0), queue.pendingCount());
 }
 
+test "backup maintenance target coalesces exact table reclaim intent" {
+    const alloc = std.testing.allocator;
+    const target = try BackupRepositoryMaintenanceTarget.create(
+        alloc,
+        "s3://bucket/backups",
+        "external",
+        1,
+    );
+    defer target.destroy(alloc);
+
+    try target.enqueueTableReclaim(alloc, "docs", 100);
+    try target.enqueueTableReclaim(alloc, "docs", 80);
+    try target.enqueueTableReclaim(alloc, "events", 120);
+    try std.testing.expectEqual(@as(usize, 2), target.table_reclaims.items.len);
+    try std.testing.expect(target.nextDueTableReclaim(79) == null);
+    try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(80).?);
+
+    target.finishTableReclaim(alloc, "docs", 140);
+    try std.testing.expect(target.nextDueTableReclaim(120) != null);
+    try std.testing.expectEqualStrings("events", target.nextDueTableReclaim(120).?);
+    target.finishTableReclaim(alloc, "events", null);
+    try std.testing.expect(target.nextDueTableReclaim(139) == null);
+    try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(140).?);
+    target.finishTableReclaim(alloc, "docs", null);
+    try std.testing.expectEqual(@as(usize, 0), target.table_reclaims.items.len);
+}
+
 test "cluster backup maintenance queue rotates repositories without allocation" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
     _ = try queue.enqueue(alloc, "file:///a", "local", 1);
     _ = try queue.enqueue(alloc, "file:///b", "local", 2);
@@ -785,7 +886,7 @@ test "cluster backup maintenance queue rotates repositories without allocation" 
 
 test "cluster backup maintenance queue expires inactive repositories" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
     _ = try queue.enqueue(alloc, "file:///old", "local", 1);
     _ = try queue.enqueue(
@@ -2518,7 +2619,7 @@ pub const ApiHttpServer = struct {
     index_installation_cursor: usize = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
-    backup_maintenance_queue: ClusterBackupMaintenanceQueue = .{},
+    backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -3666,9 +3767,9 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    const ClusterBackupMaintenanceWork = struct {
+    const BackupRepositoryMaintenanceWork = struct {
         server: *ApiHttpServer,
-        target: ?*ClusterBackupMaintenanceTarget,
+        target: ?*BackupRepositoryMaintenanceTarget,
 
         fn waitUntilDue(self: *@This(), io: std.Io) bool {
             while (!self.server.backup_maintenance_closing.load(.acquire)) {
@@ -3692,6 +3793,19 @@ pub const ApiHttpServer = struct {
                 return error.BackgroundRuntimeUnavailable;
             while (self.waitUntilDue(io)) {
                 const target = self.target orelse break;
+                const now_unix_ns: u64 = @intCast(
+                    std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                );
+                const target_has_due_io = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    break :blk target.cluster_maintenance_requested or
+                        target.nextDueTableReclaim(now_unix_ns) != null;
+                };
+                if (!target_has_due_io) {
+                    self.rotateToNextTarget();
+                    continue;
+                }
                 var location = backups_api.openBackupLocationWithOptions(
                     self.server.owner_alloc,
                     target.location_uri,
@@ -3707,28 +3821,93 @@ pub const ApiHttpServer = struct {
                     self.rotateToNextTarget();
                     continue;
                 };
-                const now_unix_ns: u64 = @intCast(
-                    std.Io.Timestamp.now(io, .real).toNanoseconds(),
-                );
-                _ = backups_api.reclaimStaleClusterBackupAttempts(
-                    self.server.owner_alloc,
-                    io,
-                    &location,
-                    now_unix_ns,
-                ) catch |err| {
-                    std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                const run_cluster_maintenance = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    break :blk target.cluster_maintenance_requested;
                 };
+                if (run_cluster_maintenance) {
+                    _ = backups_api.reclaimStaleClusterBackupAttempts(
+                        self.server.owner_alloc,
+                        io,
+                        &location,
+                        now_unix_ns,
+                    ) catch |err| {
+                        std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                    };
+                }
+                self.reclaimDueTableAttempts(io, &location, now_unix_ns);
                 location.deinit(self.server.owner_alloc);
                 self.rotateToNextTarget();
             }
+        }
+
+        fn reclaimDueTableAttempts(
+            self: *@This(),
+            io: std.Io,
+            location: *backups_api.BackupLocation,
+            now_unix_ns: u64,
+        ) void {
+            var processed: usize = 0;
+            while (processed < backups_api.backup_attempt_reclaim_batch_size) : (processed += 1) {
+                const backup_id = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    const target = self.target orelse return;
+                    const due = target.nextDueTableReclaim(now_unix_ns) orelse return;
+                    break :blk self.server.owner_alloc.dupe(u8, due) catch {
+                        std.log.warn("table backup maintenance identity allocation deferred", .{});
+                        return;
+                    };
+                };
+                defer self.server.owner_alloc.free(backup_id);
+
+                const result = backups_api.reclaimExpiredTableBackupAttemptAtLocation(
+                    self.server.owner_alloc,
+                    io,
+                    location,
+                    backup_id,
+                    now_unix_ns,
+                ) catch |err| {
+                    std.log.warn("table backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                    self.finishTableReclaim(
+                        backup_id,
+                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                    );
+                    continue;
+                };
+                switch (result) {
+                    .reclaimed, .committed => self.finishTableReclaim(backup_id, null),
+                    .active => self.finishTableReclaim(
+                        backup_id,
+                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                    ),
+                }
+            }
+        }
+
+        fn finishTableReclaim(
+            self: *@This(),
+            backup_id: []const u8,
+            retry_at_unix_ns: ?u64,
+        ) void {
+            platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+            defer self.server.backup_maintenance_mutex.unlock();
+            const target = self.target orelse return;
+            target.finishTableReclaim(
+                self.server.owner_alloc,
+                backup_id,
+                retry_at_unix_ns,
+            );
         }
 
         fn rotateToNextTarget(self: *@This()) void {
             const target = self.target orelse return;
             const now_ns = platform_time.monotonicNs();
             platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
-            if (now_ns -| target.last_scheduled_monotonic_ns >=
-                backup_maintenance_target_retention_ns)
+            if ((!target.cluster_maintenance_requested and target.table_reclaims.items.len == 0) or
+                now_ns -| target.last_scheduled_monotonic_ns >=
+                    backup_maintenance_target_retention_ns)
             {
                 self.server.backup_maintenance_queue.completeActive(target);
                 self.target = self.server.backup_maintenance_queue.activateNext();
@@ -3778,7 +3957,6 @@ pub const ApiHttpServer = struct {
             rollback,
             committed_state,
             committed_logical_state,
-            stale_reclaim,
         };
         const Attempt = union(enum) {
             table: struct {
@@ -3815,16 +3993,22 @@ pub const ApiHttpServer = struct {
             defer location.deinit(self.server.owner_alloc);
             switch (self.attempt) {
                 .table => |table| switch (table.action) {
-                    .rollback => try backups_api.cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellation(
-                        self.server.owner_alloc,
-                        io,
-                        &location,
-                        table.backup_id,
-                        table.artifact_backup_id,
-                        table.format,
-                        table.writer_state_cleanup,
-                        cancellation,
-                    ),
+                    .rollback => {
+                        var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
+                        const progress = try backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
+                            self.server.owner_alloc,
+                            io,
+                            &location,
+                            table.backup_id,
+                            table.artifact_backup_id,
+                            table.format,
+                            table.writer_state_cleanup,
+                            &object_budget,
+                            cancellation,
+                        );
+                        if (progress == .incomplete)
+                            return error.BackupCleanupBudgetExceeded;
+                    },
                     .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
                         io,
@@ -3836,13 +4020,6 @@ pub const ApiHttpServer = struct {
                         io,
                         &location,
                         table.backup_id,
-                    ),
-                    .stale_reclaim => _ = try backups_api.reclaimExpiredTableBackupAttemptAtLocation(
-                        self.server.owner_alloc,
-                        io,
-                        &location,
-                        table.backup_id,
-                        @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds()),
                     ),
                 },
                 .cluster => |cluster_attempt| backups_api.cleanupClusterBackupAttemptByIdAtLocation(
@@ -3870,6 +4047,16 @@ pub const ApiHttpServer = struct {
             var backoff_ms: i64 = 25;
             while (true) {
                 self.runOnce(io, control.token()) catch |err| {
+                    // Exhausting a page is successful forward progress, not a
+                    // transient storage failure. Keep consuming bounded pages
+                    // until the shared 30-second deadline; applying the error
+                    // retry cap here stranded every rollback above 1,024
+                    // objects even while the repository was healthy.
+                    if (err == error.BackupCleanupBudgetExceeded and
+                        !Control.isCancelled(&control))
+                    {
+                        continue;
+                    }
                     attempts += 1;
                     if (attempts == max_attempts or Control.isCancelled(&control))
                         return err;
@@ -3979,7 +4166,7 @@ pub const ApiHttpServer = struct {
         try self.submitBackupAttemptCleanup(work);
     }
 
-    fn submitNextClusterBackupMaintenance(self: *ApiHttpServer) !void {
+    fn submitNextBackupRepositoryMaintenance(self: *ApiHttpServer) !void {
         if (self.backup_maintenance_closing.load(.acquire))
             return error.BackupMaintenanceUnavailable;
         const runtime = self.cfg.backend_runtime orelse
@@ -3996,7 +4183,7 @@ pub const ApiHttpServer = struct {
             self.backup_maintenance_mutex.unlock();
             return;
         };
-        const work = self.owner_alloc.create(ClusterBackupMaintenanceWork) catch |err| {
+        const work = self.owner_alloc.create(BackupRepositoryMaintenanceWork) catch |err| {
             self.backup_maintenance_queue.requeueActive(target);
             self.backup_maintenance_mutex.unlock();
             return err;
@@ -4010,8 +4197,8 @@ pub const ApiHttpServer = struct {
             .owner_id = self.backup_maintenance_owner_id,
             .class = .cleanup,
             .ptr = work,
-            .run = ClusterBackupMaintenanceWork.run,
-            .deinit = ClusterBackupMaintenanceWork.deinit,
+            .run = BackupRepositoryMaintenanceWork.run,
+            .deinit = BackupRepositoryMaintenanceWork.deinit,
         }) catch |err| {
             self.backup_maintenance_queue.requeueActive(target);
             self.backup_maintenance_mutex.unlock();
@@ -4046,14 +4233,73 @@ pub const ApiHttpServer = struct {
             connection,
             platform_time.monotonicNs(),
         );
+        if (enqueue_result) |_| {
+            self.backup_maintenance_queue.find(
+                location_uri,
+                connection,
+            ).?.cluster_maintenance_requested = true;
+        } else |_| {}
         self.backup_maintenance_mutex.unlock();
         _ = enqueue_result catch |err| {
             // Preserve progress for already queued repositories even when this
             // caller receives explicit bounded-queue backpressure.
-            self.submitNextClusterBackupMaintenance() catch {};
+            self.submitNextBackupRepositoryMaintenance() catch {};
             return err;
         };
-        try self.submitNextClusterBackupMaintenance();
+        try self.submitNextBackupRepositoryMaintenance();
+    }
+
+    /// Registers an exact standalone reservation with the coalesced repository
+    /// supervisor. The reservation body is the durable work record; this queue
+    /// only carries credentials and wake-up timing, so a retry after process
+    /// loss can cheaply reconstruct it without duplicating cleanup authority.
+    fn scheduleTableBackupReclamation(
+        self: *ApiHttpServer,
+        location_uri: []const u8,
+        connection: []const u8,
+        backup_id: []const u8,
+        not_before_unix_ns: u64,
+    ) !void {
+        if (self.backup_maintenance_closing.load(.acquire))
+            return error.BackupMaintenanceUnavailable;
+        const runtime = self.cfg.backend_runtime orelse
+            return error.BackupMaintenanceUnavailable;
+        if (runtime.threaded_jobs == null or self.backup_maintenance_owner_id == 0)
+            return error.BackupMaintenanceUnavailable;
+
+        platform_sync.lockYielding(&self.backup_maintenance_mutex);
+        if (self.backup_maintenance_closing.load(.acquire)) {
+            self.backup_maintenance_mutex.unlock();
+            return error.BackupMaintenanceUnavailable;
+        }
+        const target_created = self.backup_maintenance_queue.enqueue(
+            self.owner_alloc,
+            location_uri,
+            connection,
+            platform_time.monotonicNs(),
+        ) catch |err| {
+            self.backup_maintenance_mutex.unlock();
+            return err;
+        };
+        const target = self.backup_maintenance_queue.find(
+            location_uri,
+            connection,
+        ).?;
+        target.enqueueTableReclaim(
+            self.owner_alloc,
+            backup_id,
+            not_before_unix_ns,
+        ) catch |err| {
+            if (target_created)
+                self.backup_maintenance_queue.discardNewestPending(
+                    self.owner_alloc,
+                    target,
+                );
+            self.backup_maintenance_mutex.unlock();
+            return err;
+        };
+        self.backup_maintenance_mutex.unlock();
+        try self.submitNextBackupRepositoryMaintenance();
     }
 
     pub fn storageMaintenanceExclusiveActive(self: *const ApiHttpServer) bool {
@@ -7695,7 +7941,8 @@ pub const ApiHttpServer = struct {
     ) anyerror {
         const normalized_err = operation_control.normalizeInterruption(failure);
         if (!isBackupInterruption(normalized_err)) {
-            backups_api.cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellation(
+            var object_budget: usize = backups_api.backup_attempt_request_reclaim_object_budget;
+            const progress = backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
                 self.alloc,
                 io,
                 backup_location,
@@ -7703,6 +7950,7 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
                 format,
                 writer_state_cleanup,
+                &object_budget,
                 operation_control.token(),
             ) catch |cleanup_err| {
                 std.log.err("table backup rollback incomplete phase={s} class={s}", .{ phase, @errorName(cleanup_err) });
@@ -7719,6 +7967,21 @@ pub const ApiHttpServer = struct {
                 };
                 return error.BackupOutcomeAmbiguous;
             };
+            if (progress == .incomplete) {
+                std.log.info("table backup rollback deferred phase={s} reason=quantum_exhausted", .{phase});
+                self.scheduleTableBackupAttemptCleanup(
+                    location_uri,
+                    connection,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                    .rollback,
+                    writer_state_cleanup,
+                ) catch |schedule_err| {
+                    std.log.warn("table backup rollback continuation scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+                };
+                return error.BackupOutcomeAmbiguous;
+            }
             return normalized_err;
         }
         self.scheduleTableBackupAttemptCleanup(
@@ -7794,49 +8057,100 @@ pub const ApiHttpServer = struct {
             }
             return error.BackupAlreadyExists;
         }
-        backups_api.reserveTableBackupAttemptAtLocationWithCancellation(
-            self.alloc,
-            io,
-            backup_location,
-            backup_id,
-            artifact_backup_id,
-            format,
-            writer_fence,
-            operation_control.token(),
-        ) catch |err| switch (err) {
-            error.BackupAlreadyExists => {
-                const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAllocWithCancellation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    backup_id,
-                    operation_control.token(),
-                ) catch |read_err| {
-                    const normalized_err = operation_control.normalizeInterruption(read_err);
-                    if (isBackupInterruption(normalized_err)) return normalized_err;
-                    return error.BackupAlreadyExists;
-                };
-                if (retained_artifact_id) |value| {
-                    defer self.alloc.free(value);
-                    if (receipt) |execution_receipt|
-                        execution_receipt.recordArtifactBackupId(value);
-                    self.scheduleTableBackupAttemptCleanup(
-                        location_uri,
-                        connection,
+        var reclaimed_reservation_retry = false;
+        reservation_admission: while (true) {
+            backups_api.reserveTableBackupAttemptAtLocationWithCancellation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_fence,
+                operation_control.token(),
+            ) catch |err| switch (err) {
+                error.BackupAlreadyExists => {
+                    const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAllocWithCancellation(
+                        self.alloc,
+                        io,
+                        backup_location,
                         backup_id,
-                        value,
-                        format,
-                        .stale_reclaim,
-                        .preserve,
-                    ) catch |schedule_err| {
-                        std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                        operation_control.token(),
+                    ) catch |read_err| {
+                        const normalized_err = operation_control.normalizeInterruption(read_err);
+                        if (isBackupInterruption(normalized_err)) return normalized_err;
+                        return error.BackupAlreadyExists;
                     };
-                    return error.BackupOutcomeAmbiguous;
-                }
-                return error.BackupAlreadyExists;
-            },
-            else => return operation_control.normalizeInterruption(err),
-        };
+                    if (retained_artifact_id) |value| {
+                        defer self.alloc.free(value);
+                        if (receipt) |execution_receipt|
+                            execution_receipt.recordArtifactBackupId(value);
+                        const not_before = backups_api.tableBackupAttemptReclaimNotBeforeAtLocation(
+                            self.alloc,
+                            io,
+                            backup_location,
+                            backup_id,
+                        ) catch |read_err| {
+                            const normalized_err = operation_control.normalizeInterruption(read_err);
+                            if (isBackupInterruption(normalized_err)) return normalized_err;
+                            return error.BackupOutcomeAmbiguous;
+                        };
+                        if (not_before) |eligible_at_unix_ns| {
+                            const now_unix_ns: u64 = @intCast(
+                                std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                            );
+                            if (eligible_at_unix_ns <= now_unix_ns) {
+                                const reclaim_result = backups_api.reclaimExpiredTableBackupAttemptAtLocation(
+                                    self.alloc,
+                                    io,
+                                    backup_location,
+                                    backup_id,
+                                    now_unix_ns,
+                                ) catch |reclaim_err| {
+                                    const retry_at = now_unix_ns +|
+                                        backups_api.backup_attempt_lease_renew_interval_ns;
+                                    self.scheduleTableBackupReclamation(
+                                        location_uri,
+                                        connection,
+                                        backup_id,
+                                        retry_at,
+                                    ) catch |schedule_err| {
+                                        std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                                    };
+                                    const normalized_err = operation_control.normalizeInterruption(reclaim_err);
+                                    if (isBackupInterruption(normalized_err)) return normalized_err;
+                                    return error.BackupOutcomeAmbiguous;
+                                };
+                                switch (reclaim_result) {
+                                    .reclaimed => {
+                                        if (!reclaimed_reservation_retry) {
+                                            reclaimed_reservation_retry = true;
+                                            if (receipt) |execution_receipt|
+                                                execution_receipt.recordArtifactBackupId(artifact_backup_id);
+                                            continue :reservation_admission;
+                                        }
+                                    },
+                                    .committed => return error.BackupAlreadyExists,
+                                    .active => {},
+                                }
+                            }
+                            self.scheduleTableBackupReclamation(
+                                location_uri,
+                                connection,
+                                backup_id,
+                                @max(eligible_at_unix_ns, now_unix_ns),
+                            ) catch |schedule_err| {
+                                std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                            };
+                        }
+                        return error.BackupOutcomeAmbiguous;
+                    }
+                    return error.BackupAlreadyExists;
+                },
+                else => return operation_control.normalizeInterruption(err),
+            };
+            break :reservation_admission;
+        }
         var writer_lease_heartbeat: TableBackupWriterLeaseHeartbeat = .{
             .alloc = self.alloc,
             .io = io,
@@ -38575,6 +38889,87 @@ test "table backup retry preserves the retained ambiguous generation" {
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("retained-generation", retained);
     try std.testing.expectEqualStrings("retained-generation", execution_receipt.artifactBackupId().?);
+}
+
+test "table backup retry reclaims an eligible reservation and admits the new generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stale-table-retry", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupAttemptAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "stale-generation",
+        .portable,
+        fence,
+    );
+    const reservation_path = try std.fmt.allocPrint(alloc, "{s}/logical-reservation", .{root});
+    defer alloc.free(reservation_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = reservation_path,
+        .data =
+        \\{"format_version":1,"created_at_unix_ns":1,"backup_id":"logical","artifact_backup_id":"stale-generation","format":"portable","writer_not_after_unix_ns":2}
+        ,
+    });
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var execution_receipt: public_table_http.TableApi.BackupExecutionReceipt = .{};
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    // UnsupportedOperation is reached only after stale reclamation admitted
+    // the new generation; this test server intentionally has no write source.
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            "docs",
+            &location,
+            "file:///backups",
+            "logical",
+            "new-generation",
+            .portable,
+            "backups",
+            &execution_receipt,
+            .logical_create,
+            .{},
+        ),
+    );
+    try std.testing.expectEqualStrings("new-generation", execution_receipt.artifactBackupId().?);
+    try std.testing.expect((try backups_api.tableBackupAttemptArtifactIdAlloc(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+    )) == null);
 }
 
 test "table backup lease conflict retains the retry address and live writer fence" {
