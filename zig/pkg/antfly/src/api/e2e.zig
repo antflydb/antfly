@@ -92,6 +92,42 @@ fn createTableIndexWithProbeRetry(
     return error.EmbeddingProbeUnavailable;
 }
 
+fn queryResponseTotal(body: []const u8) !i64 {
+    var parsed = try std.json.parseFromSlice(
+        metadata_openapi.QueryResponses,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+    if (parsed.value.responses == null or parsed.value.responses.?.len != 1)
+        return error.TestUnexpectedResult;
+    const hits = parsed.value.responses.?[0].hits orelse return error.TestUnexpectedResult;
+    const total = hits.total orelse return error.TestUnexpectedResult;
+    return total.value;
+}
+
+fn fetchQueryUntilTotal(
+    client: *http_client.ApiHttpClient,
+    wait_io: std.Io,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_total: i64,
+) !http_client.QueryResponse {
+    for (0..600) |_| {
+        var response = try client.fetchQuery(base_uri, table_name, body);
+        const observed_total = queryResponseTotal(response.body) catch |err| {
+            response.deinit(std.testing.allocator);
+            return err;
+        };
+        if (observed_total == expected_total) return response;
+        response.deinit(std.testing.allocator);
+        try wait_io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.QueryVisibilityTimeout;
+}
+
 fn metadataServiceProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
     return .{
         .ptr = svc,
@@ -915,7 +951,19 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{ "title", "body" }, 5);
     defer std.testing.allocator.free(query_body);
-    var query = try client.fetchQuery(base_uri, "docs", query_body);
+    // Batch acknowledgement precedes asynchronous full-text generation
+    // publication. Wait on the observable query contract instead of assuming
+    // an unloaded scheduler makes the first query see the new generation.
+    var query_visibility_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer query_visibility_io.deinit();
+    var query = try fetchQueryUntilTotal(
+        &client,
+        query_visibility_io.io(),
+        base_uri,
+        "docs",
+        query_body,
+        2,
+    );
     defer query.deinit(std.testing.allocator);
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, query.body, .{});
     defer query_responses.deinit();
