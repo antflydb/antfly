@@ -244,6 +244,7 @@ pub const ArtifactIntegrity = struct {
 
 pub const TableBackupPlan = backup_contract.TableBackupPlan;
 pub const TableBackupFence = backup_contract.TableBackupFence;
+pub const BackupOperationControl = backup_contract.BackupOperationControl;
 pub const TableRestorePlan = backup_contract.TableRestorePlan;
 
 pub const backup_fence_metadata_group_id_header = backup_contract.backup_fence_metadata_group_id_header;

@@ -4890,6 +4890,19 @@ pub const MetadataService = struct {
         return try store.listRanges(alloc, self.metadata_group_id);
     }
 
+    pub fn listProjectedActiveRestoreRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.listActiveRestoreRanges(alloc, self.metadata_group_id) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
+        }
+        return error.InvalidDerivedCatalogIndex;
+    }
+
     pub fn freeProjectedRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
@@ -8649,6 +8662,19 @@ pub const MetadataHttpService = struct {
         return try cloneProjectedRangesOwned(alloc, snapshot.ranges);
     }
 
+    pub fn listProjectedActiveRestoreRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.listActiveRestoreRanges(alloc, self.metadata_group_id) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
+        }
+        return error.InvalidDerivedCatalogIndex;
+    }
+
     pub fn freeProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
@@ -10314,13 +10340,21 @@ fn completeRestoreIntentsForService(
     provided_placements: ?[]const raft_reconciler.PlacementIntent,
     provided_progress: ?[]const metadata_table_manager.RestoreProgressRecord,
 ) !void {
-    const ranges = if (provided_ranges) |ranges| ranges else try service.listProjectedRanges(service.alloc);
-    defer if (provided_ranges == null) service.freeProjectedRanges(service.alloc, @constCast(ranges));
+    // HTTP-backed rounds already own one internally consistent catalog
+    // snapshot for provisioning and reconciliation. Reuse it rather than mix
+    // epochs with a second store read; embedded rounds use the compact index
+    // so restore completion does not materialize the global range set.
+    const ranges = if (provided_ranges) |ranges|
+        ranges
+    else
+        try service.listProjectedActiveRestoreRanges(service.alloc);
+    defer if (provided_ranges == null)
+        service.freeProjectedRanges(service.alloc, @constCast(ranges));
 
     // Restore completion runs in the 100 ms metadata control loop. Most
-    // rounds have no active restore, so load only ranges before the fast-path
-    // return. Tables, placements, progress, and their indexes are needed only
-    // while an intent is live.
+    // embedded rounds have no active restore, so the derived index returns
+    // empty without scanning or cloning the global range projection. HTTP
+    // rounds inspect their already-materialized consistent snapshot.
     var active_range_count: usize = 0;
     for (ranges) |range| {
         if (range.restore_backup_id.len != 0 and range.restore_location.len != 0)
@@ -16557,11 +16591,18 @@ test "metadata service clears restore intent once all placement replicas report 
             alloc.free(records);
         }
 
-        fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+        fn listProjectedActiveRestoreRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             self.range_reads += 1;
-            const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            for (self.ranges, 0..) |record, i| out[i] = try metadata_table_manager.cloneRange(alloc, record);
-            return out;
+            var out = std.ArrayListUnmanaged(metadata_table_manager.RangeRecord).empty;
+            errdefer {
+                for (out.items) |record| metadata_table_manager.freeRange(alloc, record);
+                out.deinit(alloc);
+            }
+            for (self.ranges) |record| {
+                if (record.restore_backup_id.len == 0 or record.restore_location.len == 0) continue;
+                try out.append(alloc, try metadata_table_manager.cloneRange(alloc, record));
+            }
+            return try out.toOwnedSlice(alloc);
         }
 
         fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
@@ -16653,8 +16694,8 @@ test "metadata service clears restore intent once all placement replicas report 
     try std.testing.expectEqual(@as(usize, 1), service.placement_reads);
     try std.testing.expectEqual(@as(usize, 1), service.progress_reads);
 
-    // The steady-state control round reads only ranges and returns before
-    // copying the other global projections when no restore intent is active.
+    // The steady-state control round reads the compact active-intent index and
+    // returns before copying any global projection when no restore is active.
     const inactive_ranges = [_]metadata_table_manager.RangeRecord{.{
         .group_id = 7001,
         .table_id = 7,

@@ -5456,7 +5456,7 @@ pub fn build(b: *std.Build) void {
         "api http server durability-pending restore preserves committed metadata",
         "api http server cluster restore rehydrates extension metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
-        "api http server retries stale metadata table-exists restore race",
+        "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",

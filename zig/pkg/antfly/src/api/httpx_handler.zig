@@ -305,6 +305,7 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         establishInternalTxnPreDecisionDeadline(ctx);
+        establishInternalTxnStatusDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
     }
@@ -331,6 +332,22 @@ pub const AntflyApiHandler = struct {
             return;
         };
         if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_pre_decision_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (routes.matchGroupTxnStatus(ctx.request.uri.path) == null) return;
+        const raw = ctx.header(distributed_txn_contract.status_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_status_server_budget_ms) {
             ctx.application_deadline_invalid = true;
             return;
         }
@@ -1482,6 +1499,7 @@ pub const AntflyApiHandler = struct {
             format,
             fence,
             &location,
+            operationContext(ctx, null),
         ) catch |err| return switch (err) {
             error.TableNotFound, error.NotFound => textResponse(ctx, 404, "not found"),
             error.CatalogChanged => textResponse(ctx, 409, "table catalog changed"),
@@ -6539,6 +6557,35 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&invalid_ctx);
     try std.testing.expect(invalid_ctx.application_deadline_ns == null);
     try std.testing.expect(invalid_ctx.application_deadline_invalid);
+
+    var status_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-status",
+    );
+    defer status_request.deinit();
+    try status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "250");
+    var status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &status_request);
+    defer status_ctx.deinit();
+    const status_before_ns = platform_time.monotonicNs();
+    AntflyApiHandler.establishInternalTxnStatusDeadline(&status_ctx);
+    const status_after_ns = platform_time.monotonicNs();
+    const status_deadline_ns = status_ctx.application_deadline_ns.?;
+    try std.testing.expect(status_deadline_ns >= status_before_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(status_deadline_ns <= status_after_ns + budget_ms * std.time.ns_per_ms);
+
+    var invalid_status_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-status",
+    );
+    defer invalid_status_request.deinit();
+    try invalid_status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "5001");
+    var invalid_status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &invalid_status_request);
+    defer invalid_status_ctx.deinit();
+    AntflyApiHandler.establishInternalTxnStatusDeadline(&invalid_status_ctx);
+    try std.testing.expect(invalid_status_ctx.application_deadline_ns == null);
+    try std.testing.expect(invalid_status_ctx.application_deadline_invalid);
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {

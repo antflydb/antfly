@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const platform_time = @import("antfly_platform").time;
 
 pub const format_version: u32 = 2;
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
@@ -182,6 +183,54 @@ pub const TableBackupPlan = struct {
     /// materialization. Durable publication still reports ambiguity according
     /// to the backup protocol once its commit point has been crossed.
     cancellation: CancellationToken = .none,
+    /// Absolute monotonic operation deadline shared by catalog resolution,
+    /// storage capture, hashing, and publication. Null is retained for direct
+    /// embedded callers; production coordinators always provide a deadline.
+    deadline_ns: ?u64 = null,
+
+    pub fn ensureActive(self: @This()) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline_ns|
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+};
+
+/// Borrowed control plane for one table-backup operation. The monotonic
+/// deadline prevents a lost peer from retaining a writer reservation forever;
+/// cancellation lets bounded fanout stop admitting siblings after a failure.
+pub const BackupOperationControl = struct {
+    deadline_ns: u64,
+    cancellation: CancellationToken = .none,
+
+    pub fn ensureActive(self: @This()) !void {
+        try self.cancellation.check();
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+    }
+
+    pub fn isCancelled(self: @This()) bool {
+        return self.cancellation.isCancelled() or platform_time.monotonicNs() >= self.deadline_ns;
+    }
+
+    pub fn token(self: *const @This()) CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const control: *const BackupOperationControl = @ptrCast(@alignCast(raw));
+                    return control.isCancelled();
+                }
+            }.call,
+        };
+    }
+
+    pub fn remainingTimeoutMs(self: @This()) !u32 {
+        try self.cancellation.check();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= self.deadline_ns) return error.Timeout;
+        const remaining_ns = self.deadline_ns - now_ns;
+        const rounded_ms = std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1;
+        return @intCast(@max(@as(u64, 1), @min(rounded_ms, @as(u64, std.math.maxInt(u32)))));
+    }
 };
 
 pub const TableRestorePlan = struct {

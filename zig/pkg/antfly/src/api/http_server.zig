@@ -7662,6 +7662,26 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn backupOperationControl(
+        io: std.Io,
+        fence: backups_api.TableBackupFence,
+        cancellation: CancellationToken,
+        request_deadline_ns: ?u64,
+    ) !backups_api.BackupOperationControl {
+        const writer_not_after = fence.writer_not_after_unix_ns orelse
+            return error.InvalidBackupFence;
+        const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+        if (now_unix_ns >= writer_not_after) return error.BackupAttemptLeaseLost;
+        const lease_deadline_ns = platform_time.monotonicNs() +| (writer_not_after - now_unix_ns);
+        return .{
+            .deadline_ns = if (request_deadline_ns) |deadline_ns|
+                @min(deadline_ns, lease_deadline_ns)
+            else
+                lease_deadline_ns,
+            .cancellation = cancellation,
+        };
+    }
+
     fn executeReservedTableBackup(
         self: *ApiHttpServer,
         io: std.Io,
@@ -7678,7 +7698,8 @@ pub const ApiHttpServer = struct {
         cleanup_safe: *bool,
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location) catch |err| {
+        var operation_control = try backupOperationControl(io, fence, .none, null);
+        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location, operation_control) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
         };
@@ -7732,6 +7753,8 @@ pub const ApiHttpServer = struct {
             .format = format,
             .io = io,
             .fence = fence,
+            .cancellation = operation_control.token(),
+            .deadline_ns = operation_control.deadline_ns,
         }) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
@@ -7790,6 +7813,7 @@ pub const ApiHttpServer = struct {
         format: backups_api.BackupFormat,
         fence: backups_api.TableBackupFence,
         backup_location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) ![]backups_api.ShardSnapshot {
         const io = self.sharedApiIo() orelse return error.BackupStorageUnavailable;
         const writer_not_after = fence.writer_not_after_unix_ns orelse
@@ -7806,6 +7830,7 @@ pub const ApiHttpServer = struct {
         // lease so a long snapshot remains valid and stale-attempt cleanup
         // cannot race an in-flight upload after the coordinator disconnects.
         try ensure_writer_active(io, writer_not_after);
+        var operation_control = try backupOperationControl(io, fence, request.cancellation, request.deadline_ns);
         var writer_lease: TableBackupWriterLeaseHeartbeat = .{
             .alloc = self.alloc,
             .io = io,
@@ -7841,6 +7866,8 @@ pub const ApiHttpServer = struct {
             .io = io,
             .fence = fence,
             .target_group_id = group_id,
+            .cancellation = operation_control.token(),
+            .deadline_ns = operation_control.deadline_ns,
         });
         const shards = maybe_shards orelse return error.TableNotFound;
         errdefer freeBackupShards(self.alloc, shards);
@@ -38056,8 +38083,10 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
             _: []const u8,
             _: []const u8,
             _: *anyopaque,
+            control: backups_api.BackupOperationControl,
         ) !?[]backups_api.ShardSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try control.ensureActive();
             self.calls += 1;
             const shards = try inner_alloc.alloc(backups_api.ShardSnapshot, 1);
             errdefer inner_alloc.free(shards);

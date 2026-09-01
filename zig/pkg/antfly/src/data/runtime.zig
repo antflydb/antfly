@@ -7817,7 +7817,9 @@ pub const DataServer = struct {
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
                 .txn_status_group = localRaftTxnStatusGroup,
+                .txn_status_group_until = localRaftTxnStatusGroupUntil,
                 .txn_status_group_local = localRaftTxnStatusGroupAuthoritativeLocal,
+                .txn_status_group_local_until = localRaftTxnStatusGroupAuthoritativeLocalUntil,
             },
         };
     }
@@ -8005,10 +8007,28 @@ pub const DataServer = struct {
         table_name: []const u8,
         txn_id: antfly.db.types.TxnId,
     ) !antfly.db.types.TxnStatus {
+        return try localRaftTxnStatusGroupAuthoritativeLocalUntil(
+            ptr,
+            alloc,
+            group_id,
+            table_name,
+            txn_id,
+            platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns,
+        );
+    }
+
+    fn localRaftTxnStatusGroupAuthoritativeLocalUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: antfly.db.types.TxnId,
+        deadline_ns: u64,
+    ) !antfly.db.types.TxnStatus {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         const apply_sm = self.data_raft_apply orelse return error.UnsupportedOperation;
-        const deadline_ns = platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns;
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const request_id = try apply_sm.registerReadBarrier(group_id);
         defer apply_sm.finishReadBarrier(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -8088,9 +8108,27 @@ pub const DataServer = struct {
         table_name: []const u8,
         txn_id: antfly.db.types.TxnId,
     ) !antfly.db.types.TxnStatus {
+        return try localRaftTxnStatusGroupUntil(
+            ptr,
+            alloc,
+            group_id,
+            table_name,
+            txn_id,
+            platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns,
+        );
+    }
+
+    fn localRaftTxnStatusGroupUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: antfly.db.types.TxnId,
+        deadline_ns: u64,
+    ) !antfly.db.types.TxnStatus {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const raft = self.data_raft orelse return error.UnsupportedOperation;
-        const deadline_ns = platform_time.monotonicNs() +| data_raft_batch_leader_wait_ns;
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         var previous_target_node_id: ?u64 = null;
         var last_metadata_refresh_ns: u64 = 0;
         const body = try antfly.public_api.distributed_txn.encodeTxnStatusRequest(alloc, txn_id);
@@ -8108,7 +8146,7 @@ pub const DataServer = struct {
             self.data_raft_mutex.unlock();
 
             if (local_is_leader)
-                return try localRaftTxnStatusGroupAuthoritativeLocal(ptr, alloc, group_id, table_name, txn_id);
+                return try localRaftTxnStatusGroupAuthoritativeLocalUntil(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
 
             const now_ns = platform_time.monotonicNs();
             if (now_ns -| last_metadata_refresh_ns >= data_raft_metadata_resync_interval_ns) {

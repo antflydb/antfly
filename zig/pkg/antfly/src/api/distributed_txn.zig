@@ -670,7 +670,10 @@ pub const HostedParticipantWorker = struct {
         defer route.deinit(alloc);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         return switch (route) {
-            .local => (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
+            .local => if (deadline_ns) |deadline|
+                (try self.writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline)) orelse error.UnknownGroup
+            else
+                (try self.writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnStatusRequest(alloc, txn_id);
@@ -878,7 +881,14 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn statusGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
         try ensureDecisionRecoveryDeadline(deadline_ns);
-        return try statusGroup(ptr, alloc, group_id, table_name, txn_id);
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        return (try self.writes.txnStatusGroupLinearizableUntil(
+            alloc,
+            group_id,
+            table_name,
+            txn_id,
+            deadline_ns,
+        )) orelse error.UnknownGroup;
     }
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -2748,6 +2758,49 @@ test "distributed txn propagates one absolute deadline through ambiguous decisio
     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
     try std.testing.expectEqual(@as(usize, 1), recorder.status_until_calls);
     try std.testing.expectEqual(@as(usize, 1), recorder.resolve_until_calls);
+
+    const LocalProbe = struct {
+        expected_deadline_ns: u64,
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .txn_status_group_linearizable_until = statusUntil,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedBatch;
+        }
+
+        fn statusUntil(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            observed_deadline_ns: u64,
+        ) !?db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_deadline_ns, observed_deadline_ns);
+            return .committed;
+        }
+    };
+    var local_probe = LocalProbe{ .expected_deadline_ns = deadline_ns };
+    var local_worker = LocalTableWriteParticipantWorker.init(local_probe.source());
+    try std.testing.expectEqual(
+        db_mod.types.TxnStatus.committed,
+        try local_worker.worker().statusGroupUntil(
+            std.testing.allocator,
+            7001,
+            "docs",
+            try parseTxnIdHex("00112233445566778899aabbccddeeff"),
+            deadline_ns,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), local_probe.calls);
 }
 
 test "distributed txn participant fanout is bounded and concurrent" {

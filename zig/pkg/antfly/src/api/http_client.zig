@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -568,7 +569,9 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
         fence: backup_contract.TableBackupFence,
+        control: backup_contract.BackupOperationControl,
     ) !TablesResponse {
+        try control.ensureActive();
         var metadata_group_id_buffer: [20]u8 = undefined;
         const metadata_group_id = try std.fmt.bufPrint(&metadata_group_id_buffer, "{d}", .{fence.metadata_group_id});
         var table_id_buffer: [20]u8 = undefined;
@@ -608,6 +611,10 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
 
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        var cancellation = http_common.RequestCancellation{
+            .borrowed_context = control.cancellation.ptr,
+            .borrowed_is_cancelled = control.cancellation.is_cancelled_fn,
+        };
         var resp = self.executeRequest(.{
             .method = .POST,
             .uri = uri,
@@ -615,6 +622,8 @@ pub const ApiHttpClient = struct {
             .content_type = "application/json",
             .body = body,
             .delivery_tracker = &delivery_tracker,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = &cancellation,
         }) catch |err| {
             const delivery = delivery_tracker.load();
             if (delivery != .not_sent and !(delivery == .unknown and err == error.ConnectionRefused))
@@ -2700,6 +2709,18 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !QueryResponse {
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_value = if (timeout_ms) |value|
+            try std.fmt.bufPrint(&timeout_buffer, "{d}", .{@min(
+                txn_contract.max_status_server_budget_ms,
+                @max(@as(u32, 1), value),
+            )})
+        else
+            null;
+        const headers = if (timeout_value) |value|
+            &[_]http_common.RequestHeader{.{ .name = txn_contract.status_remaining_ms_header, .value = value }}
+        else
+            &[_]http_common.RequestHeader{};
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2716,6 +2737,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
@@ -4290,6 +4312,36 @@ test "fenced backup forwarding treats post-send transport failure as ambiguous" 
             .topology_digest = [_]u8{0x22} ** 32,
             .writer_not_after_unix_ns = 123,
         },
+    ));
+
+    const ControlledExecutor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expect(req.timeout_ms != null and req.timeout_ms.? > 0);
+            try std.testing.expect(req.cancellation != null);
+            req.delivery_tracker.?.markMayHaveBeenSent();
+            return error.Timeout;
+        }
+    };
+    var controlled_client = ApiHttpClient.init(std.testing.allocator, ControlledExecutor.iface());
+    try std.testing.expectError(error.BackupOutcomeAmbiguous, controlled_client.fetchBackupShardFenced(
+        "http://127.0.0.1:7777",
+        7001,
+        "docs",
+        "{}",
+        .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+            .writer_not_after_unix_ns = 123,
+        },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
     ));
 }
 

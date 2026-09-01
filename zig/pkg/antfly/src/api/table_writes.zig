@@ -5989,12 +5989,28 @@ pub const RaftBatcher = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!db_mod.types.TxnStatus = null,
         txn_status_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             group_id: u64,
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
+        ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_local_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
         ) anyerror!db_mod.types.TxnStatus = null,
     };
 
@@ -6082,6 +6098,19 @@ pub const RaftBatcher = struct {
         return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
     }
 
+    pub fn txnStatusGroupUntil(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
     pub fn txnStatusGroupLocal(
         self: RaftBatcher,
         alloc: std.mem.Allocator,
@@ -6091,6 +6120,19 @@ pub const RaftBatcher = struct {
     ) !db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnStatusGroupLocalUntil(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_local_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
     }
 };
 
@@ -6468,7 +6510,7 @@ pub const BoundTableWriteSource = struct {
         if (plan.target_group_id) |group_id| {
             if (group_id != 0) return error.NotFound;
         }
-        if (plan.cancellation.isCancelled()) return error.Canceled;
+        try plan.ensureActive();
         const db = try self.activeDb();
         if (plan.format == .portable) {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
@@ -17581,7 +17623,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
+                .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
+                .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -18830,7 +18874,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (plan.cancellation.isCancelled()) return error.Canceled;
+        try plan.ensureActive();
         const group_id = (try resolveFencedBackupGroup(
             self.catalog,
             table_name,
@@ -20320,6 +20364,24 @@ pub const ProvisionedTableWriteSource = struct {
         return try batcher.txnStatusGroup(alloc, group_id, table_name, txn_id);
     }
 
+    fn txnStatusGroupLinearizableUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse {
+            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            return status;
+        };
+        return try batcher.txnStatusGroupUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
     fn txnStatusGroupAuthoritativeLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -20331,6 +20393,24 @@ pub const ProvisionedTableWriteSource = struct {
         const batcher = self.raft_batcher orelse
             return try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
         return try batcher.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupAuthoritativeLocalUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse {
+            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            return status;
+        };
+        return try batcher.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -21477,6 +21557,31 @@ test "backup storage resolution rejects a reused table name from another incarna
     try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
 }
 
+fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype) ?anyerror {
+    // A may-have-committed sibling must dominate a deterministic pre-send
+    // failure, otherwise the coordinator could delete an attempt whose remote
+    // publisher is still authoritative.
+    for (result_slots) |slot| if (slot.err) |err| {
+        if (err == error.BackupOutcomeAmbiguous) return err;
+    };
+    for (result_slots) |slot| if (slot.err) |err| return err;
+    for (workers) |worker| if (worker.err) |err| return err;
+    return null;
+}
+
+test "hosted backup fanout makes ambiguous publication dominate ordered failures" {
+    const Slot = struct { err: ?anyerror = null };
+    const slots = [_]Slot{
+        .{ .err = error.ConnectionRefused },
+        .{ .err = error.BackupOutcomeAmbiguous },
+    };
+    const workers = [_]Slot{.{ .err = error.Canceled }};
+    try std.testing.expectEqual(
+        error.BackupOutcomeAmbiguous,
+        selectHostedBackupFanoutError(&slots, &workers).?,
+    );
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -22375,13 +22480,15 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         body: []const u8,
         fence: backups_api.TableBackupFence,
+        control: backups_api.BackupOperationControl,
     ) !backups_api.ShardSnapshot {
+        try control.ensureActive();
         const group_id = range.group_id;
         switch (route) {
             .local => return error.UnsupportedOperation,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
-                var response = try client.fetchBackupShardFenced(remote.base_uri, group_id, table_name, body, fence);
+                var response = try client.fetchBackupShardFenced(remote.base_uri, group_id, table_name, body, fence, control);
                 defer response.deinit(alloc);
                 var parsed = try std.json.parseFromSlice(
                     struct { shards: []backups_api.ShardSnapshot },
@@ -22424,11 +22531,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         body: []const u8,
         fence: backups_api.TableBackupFence,
+        control: backups_api.BackupOperationControl,
     ) !backups_api.ShardSnapshot {
         const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
         var route = resolved_route orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
-        return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence);
+        return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
     }
 
     fn backupTableToLocation(
@@ -22441,8 +22549,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         location_ptr: *anyopaque,
+        control: backups_api.BackupOperationControl,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try control.ensureActive();
         _ = location_ptr;
         const ranges = (try resolveFencedBackupRangesAlloc(alloc, self.catalog, table_name, fence)) orelse return null;
         defer freeFencedBackupRanges(alloc, ranges);
@@ -22472,41 +22582,70 @@ pub const HostedProvisionedTableWriteSource = struct {
         const io_impl = if (self.backend_runtime) |runtime| runtime.apiIoImpl() else null;
         if (io_impl == null or ranges.len <= 1) {
             for (ranges, routes, 0..) |range, route, i| {
-                shards[i] = try self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence);
+                shards[i] = try self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
                 initialized += 1;
             }
         } else {
-            const Slot = struct {
-                arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            const ResultSlot = struct {
                 shard: ?backups_api.ShardSnapshot = null,
                 err: ?anyerror = null,
+            };
+            const Worker = struct {
+                err: ?anyerror = null,
+            };
+            const WorkQueue = struct {
+                next_index: std.atomic.Value(usize) = .init(0),
+                stopped: std.atomic.Value(bool) = .init(false),
+                parent_control: backups_api.BackupOperationControl,
 
-                fn deinit(slot: *@This()) void {
-                    slot.arena.deinit();
-                    slot.* = undefined;
+                fn isCancelled(raw: *const anyopaque) bool {
+                    const queue: *const @This() = @ptrCast(@alignCast(raw));
+                    return queue.stopped.load(.acquire) or
+                        queue.parent_control.cancellation.isCancelled();
+                }
+
+                fn childControl(queue: *@This()) backups_api.BackupOperationControl {
+                    return .{
+                        .deadline_ns = queue.parent_control.deadline_ns,
+                        .cancellation = .{ .ptr = queue, .is_cancelled_fn = isCancelled },
+                    };
                 }
             };
-            const Fiber = struct {
+            const WorkerFiber = struct {
                 fn run(
                     hosted_source: *HostedProvisionedTableWriteSource,
-                    slot: *Slot,
-                    route: table_router.GroupRoute,
-                    range: FencedBackupRange,
+                    queue: *WorkQueue,
+                    worker: *Worker,
+                    result_slots: []ResultSlot,
+                    routes_inner: []const table_router.GroupRoute,
+                    ranges_inner: []const FencedBackupRange,
                     table_name_inner: []const u8,
                     body_inner: []const u8,
                     fence_inner: backups_api.TableBackupFence,
                 ) void {
-                    slot.shard = hosted_source.fetchHostedBackupRangeFromRoute(
-                        slot.arena.allocator(),
-                        route,
-                        range,
-                        table_name_inner,
-                        body_inner,
-                        fence_inner,
-                    ) catch |err| {
-                        slot.err = err;
-                        return;
-                    };
+                    const worker_control = queue.childControl();
+                    while (!queue.stopped.load(.acquire)) {
+                        worker_control.ensureActive() catch |err| {
+                            worker.err = err;
+                            queue.stopped.store(true, .release);
+                            return;
+                        };
+                        const index = queue.next_index.fetchAdd(1, .monotonic);
+                        if (index >= ranges_inner.len) return;
+                        result_slots[index].shard = hosted_source.fetchHostedBackupRangeFromRoute(
+                            std.heap.page_allocator,
+                            routes_inner[index],
+                            ranges_inner[index],
+                            table_name_inner,
+                            body_inner,
+                            fence_inner,
+                            worker_control,
+                        ) catch |err| {
+                            result_slots[index].err = err;
+                            queue.stopped.store(true, .release);
+                            return;
+                        };
+                    }
                 }
             };
 
@@ -22518,48 +22657,48 @@ pub const HostedProvisionedTableWriteSource = struct {
             else
                 @min(ranges.len, async_limit);
             const width = @max(@as(usize, 1), @min(scheduler_width, @as(usize, 4)));
-            // Reuse one independently owned arena per concurrent operation.
-            // This bounds retained HTTP parsing memory by fanout width rather
-            // than total range count, while the final snapshots continue to
-            // use the caller's allocator and lifetime.
-            const slots = try alloc.alloc(Slot, width);
-            var active_slots: usize = 0;
+            const result_slots = try alloc.alloc(ResultSlot, ranges.len);
+            @memset(result_slots, .{});
             defer {
-                for (slots[0..active_slots]) |*slot| slot.deinit();
-                alloc.free(slots);
+                for (result_slots) |slot| if (slot.shard) |shard|
+                    shard.deinit(std.heap.page_allocator);
+                alloc.free(result_slots);
             }
-            var start: usize = 0;
-            while (start < ranges.len) : (start += width) {
-                const end = @min(start + width, ranges.len);
-                const batch_len = end - start;
-                std.debug.assert(active_slots == 0);
-                for (slots[0..batch_len]) |*slot| slot.* = .{};
-                active_slots = batch_len;
+            const workers = try alloc.alloc(Worker, width);
+            defer alloc.free(workers);
+            @memset(workers, .{});
+            var queue = WorkQueue{ .parent_control = control };
+            var group: std.Io.Group = .init;
+            for (workers) |*worker| group.async(io_impl.?.io(), WorkerFiber.run, .{
+                self,
+                &queue,
+                worker,
+                result_slots,
+                routes,
+                ranges,
+                table_name,
+                body,
+                fence,
+            });
+            // Always drain the bounded worker set before borrowed routing and
+            // request state leaves scope. The first failure stops admission;
+            // in-flight requests observe the shared cancellation token.
+            try group.await(io_impl.?.io());
+            // Ambiguity dominates deterministic ordering: a lower-index
+            // pre-send failure must never authorize cleanup when a sibling
+            // may already have published its shard after transport delivery.
+            if (selectHostedBackupFanoutError(result_slots, workers)) |err| return err;
 
-                var group: std.Io.Group = .init;
-                for (ranges[start..end], routes[start..end], slots[0..batch_len]) |range, route, *slot| {
-                    group.async(io_impl.?.io(), Fiber.run, .{ self, slot, route, range, table_name, body, fence });
-                }
-                // Each fiber captures its operation error in its own slot, so
-                // await only owns scheduler completion. Finish the entire
-                // bounded batch before returning to keep borrowed arguments
-                // and route storage alive.
-                try group.await(io_impl.?.io());
-                for (slots[0..batch_len]) |slot| if (slot.err) |err| return err;
-
-                // Clone in catalog order on the request thread before
-                // releasing the batch arenas. This preserves deterministic
-                // output and allocator ownership without retaining completed
-                // HTTP responses across later batches.
-                for (slots[0..batch_len], 0..) |slot, i| {
-                    const remote_shard = slot.shard orelse return error.BackupFailed;
-                    const owned = try cloneShardSnapshots(alloc, &.{remote_shard});
-                    shards[start + i] = owned[0];
-                    alloc.free(owned);
-                    initialized += 1;
-                }
-                for (slots[0..active_slots]) |*slot| slot.deinit();
-                active_slots = 0;
+            // Clone in catalog order on the request thread. Workers allocate
+            // only their compact returned manifests from the page allocator,
+            // so parser memory is released per request and caller allocation
+            // never crosses concurrent fibers.
+            for (result_slots, 0..) |slot, index| {
+                const remote_shard = slot.shard orelse return error.BackupFailed;
+                const owned = try cloneShardSnapshots(alloc, &.{remote_shard});
+                shards[index] = owned[0];
+                alloc.free(owned);
+                initialized += 1;
             }
         }
         std.mem.sort(backups_api.ShardSnapshot, shards, {}, struct {

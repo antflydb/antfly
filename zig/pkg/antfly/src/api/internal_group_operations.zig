@@ -467,11 +467,16 @@ pub const Operations = struct {
     pub fn txnStatus(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        return (writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id) catch |err| switch (err) {
+        const status = if (request.deadline_ns) |deadline_ns|
+            writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns)
+        else
+            writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id);
+        return (status catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.LeaderUnavailable,
             error.NotLeader,
             error.Timeout,
+            error.DeadlineAwareTxnStatusUnsupported,
             => return error.GroupLeaderUnavailable,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,

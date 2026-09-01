@@ -142,7 +142,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "1";
+const derived_catalog_index_version = "2";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -996,7 +996,17 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     const metadata_group_id: u64 = 21;
     const table = metadata.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 2 };
     const ranges = [_]metadata.RangeRecord{
-        .{ .group_id = 301, .range_id = 301, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+        .{
+            .group_id = 301,
+            .range_id = 301,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = "doc:m",
+            .restore_backup_id = "backup-1",
+            .restore_artifact_backup_id = "artifacts-1",
+            .restore_location = "file:///backup",
+            .restore_snapshot_path = "backup-1/groups/301",
+        },
         .{ .group_id = 302, .range_id = 302, .table_id = 7, .start_key = "doc:m", .end_key = null },
     };
     const create = try encodeTransitionCommand(std.testing.allocator, .{
@@ -1027,6 +1037,10 @@ test "table topology mutation atomically creates and drops catalog ranges" {
         defer store.freeRanges(std.testing.allocator, projected_ranges);
         try std.testing.expectEqual(@as(usize, 1), projected_tables.len);
         try std.testing.expectEqual(@as(usize, 2), projected_ranges.len);
+        const active_restores = try store.listActiveRestoreRanges(std.testing.allocator, metadata_group_id);
+        defer store.freeRanges(std.testing.allocator, active_restores);
+        try std.testing.expectEqual(@as(usize, 1), active_restores.len);
+        try std.testing.expectEqual(@as(u64, 301), active_restores[0].group_id);
     }
 
     const create_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
@@ -1222,6 +1236,9 @@ test "table topology mutation atomically creates and drops catalog ranges" {
         try std.testing.expect(restored_projection.fence.membership(table.table_id).eql(
             current_fence.membership(table.table_id),
         ));
+        const restored_active = try restored.listActiveRestoreRanges(std.testing.allocator, metadata_group_id);
+        defer restored.freeRanges(std.testing.allocator, restored_active);
+        try std.testing.expectEqual(@as(usize, 1), restored_active.len);
     }
 
     const drop = try encodeTransitionCommand(std.testing.allocator, .{
@@ -1286,6 +1303,9 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     defer store.freeRanges(std.testing.allocator, projected_ranges);
     try std.testing.expectEqual(@as(usize, 0), projected_tables.len);
     try std.testing.expectEqual(@as(usize, 0), projected_ranges.len);
+    const active_after_drop = try store.listActiveRestoreRanges(std.testing.allocator, metadata_group_id);
+    defer store.freeRanges(std.testing.allocator, active_after_drop);
+    try std.testing.expectEqual(@as(usize, 0), active_after_drop.len);
 
     const delayed_upsert = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_range = ranges[0],
@@ -3178,6 +3198,56 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    /// Returns only ranges carrying a live restore intent. The derived index
+    /// is maintained atomically with primary range rows and rebuilt after
+    /// snapshot install, so the idle 100 ms control loop performs O(1) work.
+    pub fn listActiveRestoreRanges(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) ![]metadata.RangeRecord {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var version_key_buf: [160]u8 = undefined;
+        const version = txn.get(try derivedCatalogIndexVersionKey(&version_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, version, derived_catalog_index_version))
+            return error.InvalidDerivedCatalogIndex;
+
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try activeRestoreRangeIndexPrefixForGroup(&prefix_buf, group_id);
+        const rows = try docstore.DocStore.scanPrefixTxn(alloc, &txn, prefix);
+        defer freeKvs(alloc, rows);
+        var out = std.ArrayListUnmanaged(metadata.RangeRecord).empty;
+        errdefer {
+            for (out.items) |record| metadata_table_manager.freeRange(alloc, record);
+            out.deinit(alloc);
+        }
+        try out.ensureTotalCapacity(alloc, rows.len);
+        for (rows) |row| {
+            if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+            const range_group_id = std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little);
+            var range_key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, range_group_id)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidDerivedCatalogIndex,
+                else => return err,
+            };
+            const record = try decodeRangeRecord(alloc, encoded);
+            errdefer metadata_table_manager.freeRange(alloc, record);
+            if (!rangeHasActiveRestoreIntent(record)) return error.InvalidDerivedCatalogIndex;
+            out.appendAssumeCapacity(record);
+        }
+        std.mem.sort(metadata.RangeRecord, out.items, {}, struct {
+            fn lessThan(_: void, lhs: metadata.RangeRecord, rhs: metadata.RangeRecord) bool {
+                const order = std.mem.order(u8, lhs.start_key, rhs.start_key);
+                return order == .lt or (order == .eq and lhs.group_id < rhs.group_id);
+            }
+        }.lessThan);
+        return try out.toOwnedSlice(alloc);
+    }
+
     /// Builds local, derivable indexes once per metadata projection. These
     /// rows are intentionally excluded from Raft snapshots: snapshot install
     /// removes them and the next apply (or indexed read) reconstructs them
@@ -3335,6 +3405,41 @@ pub const RaftApplyStore = struct {
         try txn.put(key, &value);
     }
 
+    fn updateActiveRestoreRangeIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.RangeRecord,
+    ) !void {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        const key = try activeRestoreRangeIndexKey(&key_buf, group_id, record.group_id);
+        if (!rangeHasActiveRestoreIntent(record)) {
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            return;
+        }
+        var value: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &value, record.group_id, .little);
+        try txn.put(key, &value);
+    }
+
+    fn deleteActiveRestoreRangeIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        range_group_id: u64,
+    ) !void {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        txn.delete(try activeRestoreRangeIndexKey(&key_buf, group_id, range_group_id)) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
     fn putTableNameIndexTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3465,6 +3570,11 @@ pub const RaftApplyStore = struct {
             txn,
             try extensionTableOwnerIndexPrefixForGroup(&owner_index_prefix_buf, group_id),
         );
+        var active_restore_prefix_buf: [128]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(
+            txn,
+            try activeRestoreRangeIndexPrefixForGroup(&active_restore_prefix_buf, group_id),
+        );
 
         var table_prefix_buf: [128]u8 = undefined;
         const table_rows = try docstore.DocStore.scanPrefixTxn(
@@ -3499,6 +3609,7 @@ pub const RaftApplyStore = struct {
             const record = try decodeRangeRecord(self.alloc, row.value);
             defer metadata_table_manager.freeRange(self.alloc, record);
             try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+            try self.updateActiveRestoreRangeIndexTxn(txn, group_id, record);
             const entry = try memberships.getOrPut(self.alloc, record.table_id);
             if (!entry.found_existing) entry.value_ptr.* = .{};
             try entry.value_ptr.add(record.group_id);
@@ -4431,6 +4542,7 @@ pub const RaftApplyStore = struct {
                 defer self.alloc.free(value);
                 try txn.put(key, value);
                 try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+                try self.updateActiveRestoreRangeIndexTxn(txn, group_id, record);
                 if (encoded_existing == null) {
                     try self.advanceTableTransitionGenerationWithRangeChangesTxn(
                         txn,
@@ -4468,6 +4580,7 @@ pub const RaftApplyStore = struct {
                 const value = try encodeRangeRecord(self.alloc, current);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
+                try self.updateActiveRestoreRangeIndexTxn(txn, group_id, current);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .range,
@@ -4500,6 +4613,7 @@ pub const RaftApplyStore = struct {
                 if (existing == null) return;
                 try txn.delete(key);
                 try self.deleteTableRangeIndexTxn(txn, group_id, existing_table_id, record.group_id);
+                try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, record.group_id);
                 try self.advanceTableTransitionGenerationWithRangeChangesTxn(
                     txn,
                     group_id,
@@ -4989,6 +5103,7 @@ pub const RaftApplyStore = struct {
                     defer self.alloc.free(encoded_range);
                     try txn.put(range_key, encoded_range);
                     try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+                    try self.updateActiveRestoreRangeIndexTxn(txn, group_id, record);
                     try added_range_group_ids.append(self.alloc, record.group_id);
                 }
                 if (changed) {
@@ -5086,6 +5201,7 @@ pub const RaftApplyStore = struct {
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
                     try txn.delete(range_key);
                     try self.deleteTableRangeIndexTxn(txn, group_id, drop.table_id, range_group_id);
+                    try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, range_group_id);
                 }
                 try txn.delete(table_key);
                 try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
@@ -10068,6 +10184,18 @@ pub fn rangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_range:{d}:", .{group_id});
 }
 
+fn rangeHasActiveRestoreIntent(record: metadata.RangeRecord) bool {
+    return record.restore_backup_id.len != 0 and record.restore_location.len != 0;
+}
+
+fn activeRestoreRangeIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:active_restore_range:{d}:", .{group_id});
+}
+
+fn activeRestoreRangeIndexKey(buf: []u8, group_id: u64, range_group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:active_restore_range:{d}:{d}", .{ group_id, range_group_id });
+}
+
 fn tableRangeIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:table_range:{d}:", .{group_id});
 }
@@ -12106,7 +12234,7 @@ test "metadata raft apply store projects table and range records from committed 
     );
 }
 
-test "restore admission and verification accept ranges that completed immediately after publication" {
+test "metadata raft apply store restore admission accepts ranges completed immediately after publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12181,6 +12309,9 @@ test "restore admission and verification accept ranges that completed immediatel
         .entries_bytes = entries,
     });
     try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    const active_restores = try store.listActiveRestoreRanges(std.testing.allocator, metadata_group_id);
+    defer store.freeRanges(std.testing.allocator, active_restores);
+    try std.testing.expectEqual(@as(usize, 0), active_restores.len);
 
     const fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     const restore_admission = try store.captureTableRestoreAdmission(
