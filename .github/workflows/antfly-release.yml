@@ -402,5 +402,7 @@ jobs:
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}
-      artifact_source: github
+      # Published amd64 containers require the workflow's glibc runtime
+      # artifact; downloadable release archives remain static musl builds.
+      artifact_source: build
     secrets: inherit

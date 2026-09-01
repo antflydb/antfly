@@ -266,12 +266,19 @@ class L4ReleaseGateTest(unittest.TestCase):
     def test_linux_release_publication_compiles_runtime_loaded_accelerators(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[5]
         release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
+        container = (repo / ".github/workflows/antfly-container.yml").read_text(encoding="utf-8")
+        glibc_runtime = (repo / "zig/Dockerfile.runtime-glibc").read_text(encoding="utf-8")
         archive_builder = (repo / "scripts/packaging/build_zig_release_archive.sh").read_text(encoding="utf-8")
         self.assertFalse((repo / ".github/workflows/cuda-gemma4-l4.yml").exists())
         self.assertNotIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
         self.assertIn("*-linux-*)", archive_builder)
         self.assertIn('-Dcuda="$cuda"', archive_builder)
         self.assertIn('-Dpjrt="$pjrt"', archive_builder)
+        self.assertIn("x86_64-linux-gnu", container)
+        self.assertIn("Dockerfile.runtime-glibc", container)
+        self.assertIn("artifact_source: build", release)
+        self.assertIn("debian:bookworm-slim", glibc_runtime)
+        self.assertIn("-linux-c-api.tar.xz", glibc_runtime)
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
         self.assertNotIn("cuda-gemma4-release-gate", publish)
 

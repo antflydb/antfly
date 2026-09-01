@@ -53,7 +53,9 @@ jobs:
           - arch: amd64
             runner: arc-antfly-publish
             zig_arch: x86_64
-            zig_target: x86_64-linux-musl
+            # The published amd64 container must use glibc so its runtime
+            # loader can open Cloud Run's glibc NVIDIA driver libraries.
+            zig_target: x86_64-linux-gnu
             zig_optimize: ReleaseFast
             zig_jobs: ""
           - arch: arm64
@@ -204,12 +206,16 @@ jobs:
           }
           VERSION="${{ steps.version.outputs.version }}"
           for arch in amd64 arm64; do
+            dockerfile=zig/Dockerfile.runtime
+            if [[ "$arch" == amd64 && "${{ inputs.artifact_source }}" != github ]]; then
+              dockerfile=zig/Dockerfile.runtime-glibc
+            fi
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=${dockerfile},_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
       - name: Create GAR multi-arch manifest with Cloud Build
