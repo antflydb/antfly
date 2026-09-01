@@ -4632,9 +4632,15 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
 /// directly, so shutdown can reject new calls and wait for every admitted call
 /// before destroying the underlying inference node.
 const EmbeddedInferenceProviderLifetime = struct {
+    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const count_mask: usize = closed_bit - 1;
+
     handle: *anyopaque,
-    accepting: std.atomic.Value(bool) = .init(true),
-    in_flight: std.atomic.Value(usize) = .init(0),
+    // Admission and borrower count share one modification order. A separate
+    // accepting flag and counter would leave a check/increment window where
+    // shutdown could observe zero and destroy the node before that borrower
+    // committed its reference.
+    state: std.atomic.Value(usize) = .init(0),
 
     const CallGuard = struct {
         owner: *EmbeddedInferenceProviderLifetime,
@@ -4642,27 +4648,40 @@ const EmbeddedInferenceProviderLifetime = struct {
 
         fn deinit(self: *@This()) void {
             if (!self.active) return;
-            _ = self.owner.in_flight.fetchSub(1, .release);
+            const previous = self.owner.state.fetchSub(1, .acq_rel);
+            std.debug.assert(previous & count_mask > 0);
             self.active = false;
         }
     };
 
     fn acquire(self: *EmbeddedInferenceProviderLifetime) !CallGuard {
-        if (!self.accepting.load(.acquire)) return error.InferenceProviderShuttingDown;
-        _ = self.in_flight.fetchAdd(1, .acquire);
-        if (!self.accepting.load(.acquire)) {
-            _ = self.in_flight.fetchSub(1, .release);
-            return error.InferenceProviderShuttingDown;
+        var observed = self.state.load(.acquire);
+        while (true) {
+            if (observed & closed_bit != 0) return error.InferenceProviderShuttingDown;
+            if (observed & count_mask == count_mask)
+                return error.InferenceProviderCallCapacityExhausted;
+            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return .{ .owner = self };
         }
-        return .{ .owner = self };
     }
 
     fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
-        self.accepting.store(false, .release);
-        while (self.in_flight.load(.acquire) != 0) {
+        _ = self.state.fetchOr(closed_bit, .acq_rel);
+        while (self.activeCallCount() != 0) {
             std.atomic.spinLoopHint();
             std.Thread.yield() catch {};
         }
+    }
+
+    fn isAccepting(self: *const EmbeddedInferenceProviderLifetime) bool {
+        return self.state.load(.acquire) & closed_bit == 0;
+    }
+
+    fn activeCallCount(self: *const EmbeddedInferenceProviderLifetime) usize {
+        return self.state.load(.acquire) & count_mask;
     }
 };
 
@@ -4682,7 +4701,7 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
     };
     var quiesce = Quiesce{ .lifetime = &lifetime };
     const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
-    while (lifetime.accepting.load(.acquire)) std.atomic.spinLoopHint();
+    while (lifetime.isAccepting()) std.atomic.spinLoopHint();
 
     try std.testing.expect(!quiesce.returned.load(.acquire));
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
@@ -4690,7 +4709,7 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
     thread.join();
 
     try std.testing.expect(quiesce.returned.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), lifetime.in_flight.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
 }
 
