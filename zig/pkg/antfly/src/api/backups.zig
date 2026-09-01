@@ -2393,17 +2393,38 @@ pub fn createManifest(
         initialized += 1;
     }
 
-    return .{
+    const owned_backup_id = try alloc.dupe(u8, backup_id);
+    errdefer alloc.free(owned_backup_id);
+    const owned_table_name = try alloc.dupe(u8, table.name);
+    errdefer alloc.free(owned_table_name);
+    const owned_description = try alloc.dupe(u8, table.description);
+    errdefer alloc.free(owned_description);
+    const owned_schema_json = try alloc.dupe(u8, table.schema_json);
+    errdefer alloc.free(owned_schema_json);
+    const owned_read_schema_json = try alloc.dupe(u8, table.read_schema_json);
+    errdefer alloc.free(owned_read_schema_json);
+    const owned_indexes_json = try alloc.dupe(u8, table.indexes_json);
+    errdefer alloc.free(owned_indexes_json);
+    const owned_replication_sources_json = try alloc.dupe(u8, table.replication_sources_json);
+    errdefer alloc.free(owned_replication_sources_json);
+
+    const manifest: TableBackupManifest = .{
         .format = format,
-        .backup_id = try alloc.dupe(u8, backup_id),
-        .table_name = try alloc.dupe(u8, table.name),
-        .description = try alloc.dupe(u8, table.description),
-        .schema_json = try alloc.dupe(u8, table.schema_json),
-        .read_schema_json = try alloc.dupe(u8, table.read_schema_json),
-        .indexes_json = try alloc.dupe(u8, table.indexes_json),
-        .replication_sources_json = try alloc.dupe(u8, table.replication_sources_json),
+        .backup_id = owned_backup_id,
+        .table_name = owned_table_name,
+        .description = owned_description,
+        .schema_json = owned_schema_json,
+        .read_schema_json = owned_read_schema_json,
+        .indexes_json = owned_indexes_json,
+        .replication_sources_json = owned_replication_sources_json,
         .shards = owned_shards,
     };
+    // Constructors produce only complete, publishable table generations.
+    // Shard-artifact helpers may operate on partial sets while work is in
+    // progress, but a manifest cannot escape until its ranges cover the whole
+    // keyspace and every artifact has a declared identity.
+    try validatePublishedTableManifest(alloc, &manifest, backup_id);
+    return manifest;
 }
 
 pub fn writeManifest(

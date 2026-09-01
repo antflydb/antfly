@@ -19985,7 +19985,12 @@ pub const ProvisionedTableWriteSource = struct {
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocalWithCancellation(alloc, group_id, table_name, .{
+            // Resolution is idempotent and may arrive through a stale hosted
+            // route after leadership changes. Use the same leader-aware Raft
+            // dispatcher as begin/prepare; the transaction ID and replicated
+            // decision make retries safe, while the forwarded batch hop remains
+            // cache-only and bounded inside the data runtime.
+            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,

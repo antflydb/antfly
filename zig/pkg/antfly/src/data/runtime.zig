@@ -345,9 +345,22 @@ const public_api_max_connection_threads: u32 = 64;
 // expensive public queries from consuming every worker under client timeouts.
 const public_api_max_active_requests: u32 = 32;
 
+/// Route-discovery authority is explicit at every mutation call site. Public
+/// ingress may refresh the catalog and route to the current leader; an already
+/// forwarded internal request is cache-only so forwarding cannot recurse into
+/// an unbounded metadata/HTTP loop.
+const DataRaftMutationDiscovery = enum {
+    catalog,
+    cached,
+
+    fn mayRefreshCatalog(self: DataRaftMutationDiscovery) bool {
+        return self == .catalog;
+    }
+};
+
 const DataRaftBatchRoute = struct {
     allow_remote_forward: bool = true,
-    refresh_metadata: bool,
+    discovery: DataRaftMutationDiscovery,
     campaign_allowed: bool = true,
     forwards_remaining: u8 = data_raft_batch_initial_forwards,
     cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
@@ -361,7 +374,7 @@ const DataRaftBatchRoute = struct {
 
 const DataRaftBatchForwardState = struct {
     allow_remote_forward: bool,
-    refresh_metadata: bool,
+    discovery: DataRaftMutationDiscovery,
     forwards_remaining: u8,
     local_status_missing: bool,
     local_status_is_voter: bool,
@@ -7621,7 +7634,7 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = true });
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .discovery = .catalog });
     }
 
     fn localRaftBatchGroupWithCancellation(
@@ -7634,7 +7647,7 @@ pub const DataServer = struct {
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
-            .refresh_metadata = true,
+            .discovery = .catalog,
             .visibility_cancellation = cancellation,
         });
     }
@@ -7650,7 +7663,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try fence.validate();
         try self.proposeRaftBatchGroup(alloc, fence.route.group_id, table_name, req, .{
-            .refresh_metadata = true,
+            .discovery = .catalog,
             .visibility_cancellation = cancellation,
             .write_route_fence = fence,
         });
@@ -7664,7 +7677,7 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = false });
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .discovery = .cached });
     }
 
     fn localRaftBatchGroupLocalWithCancellation(
@@ -7677,7 +7690,7 @@ pub const DataServer = struct {
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
-            .refresh_metadata = false,
+            .discovery = .cached,
             .visibility_cancellation = cancellation,
         });
     }
@@ -7704,7 +7717,10 @@ pub const DataServer = struct {
             table_name,
             req,
             .{
-                .refresh_metadata = false,
+                // This is public 2PC ingress, not an already-forwarded hop.
+                // Use the same leader-aware catalog discovery as ordinary
+                // table writes; topology_epoch still fences the participant.
+                .discovery = .catalog,
                 .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
                 .visibility_cancellation = context.cancellation,
             },
@@ -7736,7 +7752,7 @@ pub const DataServer = struct {
             table_name,
             req,
             .{
-                .refresh_metadata = false,
+                .discovery = .cached,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
@@ -8140,7 +8156,7 @@ pub const DataServer = struct {
         var proposal_req = req;
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
-        if (route.refresh_metadata) {
+        if (route.discovery.mayRefreshCatalog()) {
             self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                 error.Timeout => return error.LeaderUnavailable,
                 else => return err,
@@ -8455,7 +8471,7 @@ pub const DataServer = struct {
             const known_leader_unreachable = leader_node_id != null and leader_node_id == failed_known_leader_node_id;
             if (shouldForwardRaftBatchToPlacementReplica(.{
                 .allow_remote_forward = route.allow_remote_forward,
-                .refresh_metadata = route.refresh_metadata,
+                .discovery = route.discovery,
                 .forwards_remaining = route.forwards_remaining,
                 .local_status_missing = local_status_missing,
                 .local_status_is_voter = local_status_is_voter,
@@ -8464,7 +8480,7 @@ pub const DataServer = struct {
                 .known_leader_unreachable = known_leader_unreachable,
             })) {
                 const allow_local_placement_source = known_leader_unreachable or
-                    (route.refresh_metadata and leader_node_id == null);
+                    (route.discovery.mayRefreshCatalog() and leader_node_id == null);
                 const forwarded = self.forwardRaftBatchToPlacementReplica(
                     alloc,
                     group_id,
@@ -8557,7 +8573,7 @@ pub const DataServer = struct {
             }
 
             const now_ns = platform_time.monotonicNs();
-            if (route.refresh_metadata and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
+            if (route.discovery.mayRefreshCatalog() and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
                 self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                     error.Timeout => return error.LeaderUnavailable,
                     else => return err,
@@ -8582,7 +8598,7 @@ pub const DataServer = struct {
         deadline_ns: u64,
     ) !?[]u8 {
         const remote_metadata = self.remote_metadata orelse return null;
-        var snapshot = if (route.refresh_metadata)
+        var snapshot = if (route.discovery.mayRefreshCatalog())
             try remote_metadata.fetchSnapshotWithBudget(.{
                 .deadline_ns = deadline_ns,
                 .cancellation = route.cancellation,
@@ -8664,7 +8680,7 @@ pub const DataServer = struct {
         last_target_node_id: *?u64,
     ) !bool {
         const remote_metadata = self.remote_metadata orelse return false;
-        var snapshot = if (route.refresh_metadata)
+        var snapshot = if (route.discovery.mayRefreshCatalog())
             try remote_metadata.fetchSnapshotWithBudget(.{
                 .deadline_ns = deadline_ns,
                 .cancellation = route.cancellation,
@@ -8751,7 +8767,7 @@ pub const DataServer = struct {
         // A status-missing caller is not a hosted replica and may use one
         // bounded placement hop even for cached-metadata split replication.
         if (state.local_status_missing) return true;
-        if (!state.refresh_metadata) return false;
+        if (!state.discovery.mayRefreshCatalog()) return false;
         if (!state.local_status_is_voter) return true;
         // Immediate forwarding makes the target internal request campaign at
         // the same instant as this voter, which can repeatedly split votes.
@@ -10036,7 +10052,7 @@ pub const DataServer = struct {
             handoff.byte_range,
             handoff.base_delta_sequence,
             .destination_begin,
-            true,
+            .catalog,
         );
 
         const max_writes_per_batch: usize = 128;
@@ -10066,7 +10082,7 @@ pub const DataServer = struct {
             try self.replicateSplitDestinationBatch(destination_group_id, table_contract.table_name, replication, .{
                 .writes = writes,
                 .sync_level = .write,
-            }, false);
+            }, .cached);
             const next_after = try work_alloc.dupe(u8, page.entries[page.entries.len - 1].key);
             if (after_key) |key| work_alloc.free(key);
             after_key = next_after;
@@ -10080,7 +10096,7 @@ pub const DataServer = struct {
             handoff.byte_range,
             handoff.base_delta_sequence,
             .destination_complete,
-            false,
+            .cached,
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -10128,7 +10144,7 @@ pub const DataServer = struct {
                 .destination_group_id = destination_group_id,
                 .split_key = effective_split_key,
             },
-        }, .{ .refresh_metadata = false });
+        }, .{ .discovery = .cached });
     }
 
     fn replicateSplitCatchUp(
@@ -10185,7 +10201,7 @@ pub const DataServer = struct {
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
         const source_ack = try self.splitProgressForSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
-        var refresh_destination_route = true;
+        var destination_discovery: DataRaftMutationDiscovery = .catalog;
         var cursor = after_seq;
         while (cursor < source_seq) {
             const deltas = try source_store.listSplitDeltasPage(
@@ -10230,8 +10246,8 @@ pub const DataServer = struct {
                     .writes = writes.items,
                     .deletes = deletes.items,
                     .sync_level = .write,
-                }, refresh_destination_route);
-                refresh_destination_route = false;
+                }, destination_discovery);
+                destination_discovery = .cached;
             }
             const page_last = deltas[deltas.len - 1].sequence;
             try self.replicateSplitSourceAcknowledgement(
@@ -10251,7 +10267,7 @@ pub const DataServer = struct {
             .{ .start = source_state.split_key, .end = source_state.original_range_end },
             source_seq,
             .destination_complete,
-            refresh_destination_route,
+            destination_discovery,
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -10271,7 +10287,7 @@ pub const DataServer = struct {
         byte_range: antfly.db.types.ByteRange,
         delta_sequence: u64,
         kind: antfly.db.types.SplitReplicationCheckpoint.Kind,
-        refresh_metadata: bool,
+        discovery: DataRaftMutationDiscovery,
     ) !void {
         if (kind == .source_ack) return error.InvalidBatchRequest;
         var checkpoint_replication = replication;
@@ -10289,7 +10305,7 @@ pub const DataServer = struct {
                 .range_end = byte_range.end,
                 .delta_sequence = delta_sequence,
             },
-        }, refresh_metadata);
+        }, discovery);
     }
 
     fn replicateSplitSourceAcknowledgement(
@@ -10310,7 +10326,7 @@ pub const DataServer = struct {
                 .destination_group_id = destination_group_id,
                 .delta_sequence = delta_sequence,
             },
-        }, .{ .refresh_metadata = false });
+        }, .{ .discovery = .cached });
     }
 
     fn replicateSplitDestinationBatch(
@@ -10319,7 +10335,7 @@ pub const DataServer = struct {
         table_name: []const u8,
         replication: antfly.db.types.SplitReplicationContext,
         req: antfly.db.types.BatchRequest,
-        refresh_metadata: bool,
+        discovery: DataRaftMutationDiscovery,
     ) !void {
         if (replication.destination_group_id != destination_group_id) return error.InvalidBatchRequest;
         var replicated_req = req;
@@ -10329,7 +10345,7 @@ pub const DataServer = struct {
             destination_group_id,
             table_name,
             replicated_req,
-            .{ .refresh_metadata = refresh_metadata },
+            .{ .discovery = discovery },
             split_transition_batch_leader_wait_ns,
         );
     }
@@ -33325,7 +33341,7 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
 
     var state = DataRaftBatchForwardState{
         .allow_remote_forward = true,
-        .refresh_metadata = true,
+        .discovery = .catalog,
         .forwards_remaining = 2,
         .local_status_missing = true,
         .local_status_is_voter = false,
@@ -33336,20 +33352,20 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
 
     // Cached split-replication calls must retain their one bounded route from
     // a node that does not host the destination group.
-    state.refresh_metadata = false;
+    state.discovery = .cached;
     try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
 
-    state.refresh_metadata = true;
+    state.discovery = .catalog;
     state.local_status_missing = false;
     try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
     state.local_status_is_voter = true;
     try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
     state.local_campaign_grace_elapsed = true;
     try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
-    state.refresh_metadata = false;
+    state.discovery = .cached;
     try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
 
-    state.refresh_metadata = true;
+    state.discovery = .catalog;
     state.local_status_missing = true;
     state.local_status_is_voter = false;
     state.allow_remote_forward = false;
@@ -33360,7 +33376,7 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
     state.forwards_remaining = 2;
     state.leader_node_id = 102;
     try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
-    state.refresh_metadata = false;
+    state.discovery = .cached;
     state.known_leader_unreachable = true;
     try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
     state.known_leader_unreachable = false;
@@ -33379,7 +33395,7 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
     const consumed_campaign_forwarding = DataServer.dataRaftBatchForwardingAt(
         now_ns,
         deadline_ns,
-        .{ .refresh_metadata = true },
+        .{ .discovery = .catalog },
         true,
     ).?;
     try std.testing.expectEqual(@as(u32, 450), consumed_campaign_forwarding.remaining_ms);
@@ -33393,26 +33409,26 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
     const available_campaign_forwarding = DataServer.dataRaftBatchForwardingAt(
         now_ns,
         deadline_ns,
-        .{ .refresh_metadata = false },
+        .{ .discovery = .cached },
         false,
     ).?;
     try std.testing.expect(available_campaign_forwarding.campaign_allowed);
     try std.testing.expect(DataServer.dataRaftBatchForwardingAt(
         now_ns,
         deadline_ns,
-        .{ .refresh_metadata = true, .forwards_remaining = 0 },
+        .{ .discovery = .catalog, .forwards_remaining = 0 },
         false,
     ) == null);
     try std.testing.expect(DataServer.dataRaftBatchForwardingAt(
         deadline_ns,
         deadline_ns,
-        .{ .refresh_metadata = true },
+        .{ .discovery = .catalog },
         false,
     ) == null);
 
     var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
     const cancellable_route = DataRaftBatchRoute{
-        .refresh_metadata = false,
+        .discovery = .cached,
         .cancellation = &cancellation,
     };
     try DataServer.ensureDataRaftBatchRouteActive(cancellable_route);

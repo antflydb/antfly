@@ -2658,7 +2658,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
         },
         &.{.{
             .group_id = 91,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/91",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -2838,7 +2838,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         },
         &.{.{
             .group_id = 92,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/92",
             .artifact_size_bytes = artifact_integrity.size_bytes,

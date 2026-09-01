@@ -1352,7 +1352,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
         },
         &.{.{
             .group_id = 903,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/903",
             .artifact_size_bytes = artifact_integrity.size_bytes,
