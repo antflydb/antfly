@@ -29,10 +29,15 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
+const graph_work_budget = @import("../graph/work_budget.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
+const graph_exec = @import("../storage/db/query/graph_exec.zig");
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
@@ -46,6 +51,7 @@ const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 const indexes_api = @import("indexes.zig");
 const query_contract = @import("query_contract.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
 /// Production-neutral semantic boundaries in a distributed graph request.
@@ -1509,6 +1515,9 @@ pub const GraphHydrateRequest = struct {
     exclusion_query_json: []const u8 = "",
     exclusion_query_json_owned: bool = false,
     include_stored: bool = true,
+    fields: []const []const u8 = &.{},
+    fields_owned: bool = false,
+    include_all_fields: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
     incoming_index_identity: GraphIndexIdentity = .{},
@@ -1522,6 +1531,7 @@ pub const GraphHydrateRequest = struct {
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
         if (self.keys.len > 0) alloc.free(self.keys);
+        if (self.fields_owned) freeConstStrings(alloc, self.fields);
         if (self.filter_query_json_owned and self.filter_query_json.len > 0) {
             alloc.free(@constCast(self.filter_query_json));
         }
@@ -1560,6 +1570,8 @@ pub const GraphEdgesRequest = struct {
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
+    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
     timeout_ms: ?u32 = null,
     cancellation: ?CancellationToken = null,
 
@@ -1673,6 +1685,21 @@ const GraphHydrateFanoutSlot = struct {
     }
 };
 
+const GraphEdgesFanoutSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    result: ?GraphEdgesResponse = null,
+    err: ?anyerror = null,
+
+    fn init() GraphEdgesFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    }
+
+    fn deinit(self: *GraphEdgesFanoutSlot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 const GraphExpandRequestJson = struct {
     name: []const u8,
     index_name: []const u8,
@@ -1706,8 +1733,8 @@ const GraphExpandParamsJson = struct {
     direction: []const u8 = "out",
     max_depth: u32 = 1,
     max_results: u32 = 0,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     deduplicate: bool = true,
     include_paths: bool = false,
     weight_mode: []const u8 = "min_hops",
@@ -1742,6 +1769,8 @@ const GraphHydrateRequestJson = struct {
     _filter_query_json: []const u8 = "",
     _exclusion_query_json: []const u8 = "",
     include_stored: bool = true,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
     incoming_index_incarnation: u64 = 0,
@@ -1763,6 +1792,8 @@ const GraphEdgesRequestJson = struct {
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
+    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
     tensor_access_path: GraphTensorAccessPathJson,
     tensor_program: std.json.Value,
 };
@@ -1812,12 +1843,51 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
                 if (graph_query.query.k == 0) return false;
             },
             .pattern => {
-                if (graph_query.query.pattern.len == 0) return false;
+                if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
             },
         }
     }
     return true;
 }
+
+pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (graph_query.query.match_pattern != null) return true;
+    }
+    return false;
+}
+
+/// Storage-backed canonical MATCH anchors are consumed as stable `_id` cursor
+/// pages. The page bound controls transient memory only; it is deliberately not
+/// a semantic limit on exact aggregation.
+pub const complete_match_anchor_page_size: u32 = 4096;
+
+pub const MatchAnchorPageSource = struct {
+    ctx: *anyopaque,
+    fetch_fn: *const fn (
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) anyerror!db_mod.types.SearchResult,
+
+    fn fetch(
+        self: MatchAnchorPageSource,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        return self.fetch_fn(self.ctx, alloc, graph_query, search_after);
+    }
+};
+
+pub const MatchAnchorSource = union(enum) {
+    /// Compatibility path for embedded callers and focused tests. Production
+    /// table reads use `paged` so independent MATCH operations never share a
+    /// materialized candidate ceiling.
+    materialized: db_mod.types.SearchResult,
+    paged: MatchAnchorPageSource,
+};
 
 fn resultHasIdentitySnapshot(
     req: db_mod.types.SearchRequest,
@@ -1844,6 +1914,7 @@ fn rejectUnstampedResultRefs(
 fn selectorUsesResultRef(selector: graph_query_mod.NodeSelector) bool {
     return switch (selector) {
         .keys => false,
+        .identities => false,
         .result_ref => true,
     };
 }
@@ -1897,6 +1968,28 @@ fn validateSourceSnapshotGroupSet(
     }
 }
 
+fn validateMatchingSourceSnapshots(
+    base_result: db_mod.types.SearchResult,
+    match_anchor_result: db_mod.types.SearchResult,
+) !void {
+    const base_tokens = base_result.shard_identity_read_generations;
+    const anchor_tokens = match_anchor_result.shard_identity_read_generations;
+    if (base_tokens.len > 0 or anchor_tokens.len > 0) {
+        if (base_tokens.len != anchor_tokens.len) return error.TopologyChanged;
+        for (base_tokens) |base_token| {
+            const anchor_generation = try identityReadGenerationForGroup(
+                null,
+                anchor_tokens,
+                base_token.group_id,
+            );
+            if (anchor_generation.? != base_token.generation) return error.TopologyChanged;
+        }
+        return;
+    }
+    if (base_result.identity_read_generation != match_anchor_result.identity_read_generation)
+        return error.TopologyChanged;
+}
+
 pub fn executeCrossRange(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -1906,9 +1999,54 @@ pub fn executeCrossRange(
     base_result: db_mod.types.SearchResult,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
+    // Embedded/direct callers do not have an outer table-read coordinator to
+    // refresh routing. Preserve their single bounded retry here. Production
+    // table reads use executeCrossRangeWithMatchAnchors and own the retry so a
+    // fresh attempt also refreshes the base scan and MATCH anchor snapshots.
+    var attempts: u32 = 0;
+    while (true) : (attempts += 1) {
+        return executeCrossRangeWithMatchAnchors(
+            alloc,
+            catalog,
+            worker,
+            table_name,
+            req,
+            base_result,
+            if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
+            consistency,
+        ) catch |err| switch (err) {
+            error.TopologyChanged => {
+                if (attempts == 0) continue;
+                return err;
+            },
+            else => return err,
+        };
+    }
+}
+
+pub fn executeCrossRangeWithMatchAnchors(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: Worker,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
+    consistency: raft_mod.ReadConsistency,
+) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
+    if (requiresCompleteMatchAnchors(req) and match_anchor_source == null)
+        return error.UnsupportedQueryRequest;
+    if (match_anchor_source) |source| switch (source) {
+        .materialized => |anchors| {
+            if (anchors.total_hits_relation != .exact or @as(u64, anchors.total_hits) != anchors.hits.len)
+                return error.InvalidQueryResult;
+            try validateMatchingSourceSnapshots(base_result, anchors);
+        },
+        .paged => {},
+    };
 
     var request_worker = worker;
     request_worker.execution_deadline_ns = req.execution_deadline_ns;
@@ -1919,24 +2057,20 @@ pub fn executeCrossRange(
         .group_count = base_result.shard_identity_read_generations.len,
     });
 
-    var attempt: u32 = 0;
-    while (true) : (attempt += 1) {
-        try request_worker.ensureActive();
-        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, consistency) catch |err| {
-            request_worker.reachLifecycle(.{
-                .phase = .attempt_failed,
-                .attempt = attempt,
-                .error_code = @intFromError(err),
-            });
-            switch (err) {
-                error.TopologyChanged, error.UnknownGroup => {
-                    if (attempt == 0) continue;
-                    return err;
-                },
-                else => return err,
-            }
+    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| {
+        request_worker.reachLifecycle(.{
+            .phase = .attempt_failed,
+            .error_code = @intFromError(err),
+        });
+        return switch (err) {
+            // UnknownGroup is topology churn from the coordinator's
+            // perspective. Let the outer table-read attempt refresh the
+            // complete routing and snapshot state instead of retrying
+            // expensive graph work in place.
+            error.UnknownGroup => error.TopologyChanged,
+            else => err,
         };
-    }
+    };
 }
 
 fn executeCrossRangeOnce(
@@ -1946,35 +2080,81 @@ fn executeCrossRangeOnce(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
-    try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
+    // The coordinator also serves single-node and standalone deployments,
+    // where merged runtime status may not be projected even though the
+    // catalog range and the opened DB carry a valid identity namespace.
+    // Reject every reported rebuild/conflict/reassignment, while allowing the
+    // existing range + generation checks below to validate an unstamped
+    // standalone catalog without weakening cross-shard snapshot fencing.
+    try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
     try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
+    if (match_anchor_source) |source| switch (source) {
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors),
+        .paged => {},
+    };
     worker.reachLifecycle(.{
         .phase = .snapshot_validated,
         .group_count = base_result.shard_identity_read_generations.len,
     });
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
+    const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
+    defer alloc.free(sorted_query_indexes);
+    // These are HTTP-query budgets, not per-operation budgets. A request may
+    // contain many named graph operations, but it must not multiply expansion
+    // work or retained distinct-identity memory by that operation count.
+    try req.graph_execution_limits.validate();
+    var request_work_budget = graph_pattern_mod.WorkBudget.initWithLimits(req.graph_execution_limits);
+    var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        req.graph_execution_limits.max_distinct_identities,
+        req.graph_execution_limits.max_distinct_state_bytes,
+    );
     var initialized: usize = 0;
     errdefer {
         for (results[0..initialized]) |*result| result.deinit(alloc);
         alloc.free(results);
     }
 
-    for (req.graph_queries, 0..) |graph_query, i| {
-        results[i] = try executeSingleCrossRange(
+    for (sorted_query_indexes, 0..) |query_index, i| {
+        const graph_query = req.graph_queries[query_index];
+        results[i] = executeSingleCrossRange(
             alloc,
             catalog,
             worker,
             table_name,
             req,
             base_result,
+            match_anchor_source,
             results[0..initialized],
             graph_query,
             consistency,
-        );
+            &request_work_budget,
+            &request_distinct_budget,
+        ) catch |err| {
+            if (graph_path_weight_diagnostic.isDomainError(err)) {
+                graph_path_weight_diagnostic.record(graph_query.name, graph_query.query, err);
+            }
+            if (err == error.GraphWorkBudgetExceeded) {
+                if (request_work_budget.exhaustion()) |exhaustion| {
+                    graph_work_budget_diagnostic.record(graph_query.name, graph_query.query, exhaustion);
+                }
+            }
+            if (err == error.GraphDistinctBudgetExceeded) {
+                graph_distinct_budget_diagnostic.recordBudget(graph_query.name, &request_distinct_budget);
+            }
+            if (graph_query_diagnostic.reasonForError(err)) |reason| {
+                graph_query_diagnostic.record(
+                    graph_query.name,
+                    graph_query_diagnostic.feature(graph_query.query),
+                    reason,
+                );
+            }
+            return err;
+        };
         initialized += 1;
     }
     return results;
@@ -1986,6 +2166,46 @@ const QueryState = struct {
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     path_states: std.ArrayListUnmanaged(PathState) = .empty,
     seen: graph_node_identity.Map(void) = .{},
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    seen_retained_bytes: usize = 0,
+
+    fn putSeenIfAbsent(
+        self: *QueryState,
+        alloc: std.mem.Allocator,
+        ref: graph_node_identity.Ref,
+    ) !bool {
+        if (self.seen.contains(ref)) return false;
+        var retained_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), ref.key.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (ref.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        // Account conservatively for the hash-table bucket and control data,
+        // not only the separately allocated identity bytes.
+        retained_bytes = std.math.add(usize, retained_bytes, 3 * @sizeOf(usize)) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (self.work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+        errdefer if (self.work_budget) |budget| budget.releaseStateBytes(retained_bytes);
+        if (!try self.seen.putIfAbsent(alloc, ref, {})) {
+            if (self.work_budget) |budget| budget.releaseStateBytes(retained_bytes);
+            return false;
+        }
+        self.seen_retained_bytes += retained_bytes;
+        return true;
+    }
+
+    fn releaseSeenBudget(self: *QueryState) void {
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.seen_retained_bytes);
+        self.seen_retained_bytes = 0;
+    }
 
     fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -1996,6 +2216,7 @@ const QueryState = struct {
         for (self.path_states.items) |*path_state| path_state.deinit(alloc);
         self.path_states.deinit(alloc);
         self.seen.deinit(alloc);
+        self.releaseSeenBudget();
         self.* = undefined;
     }
 
@@ -2003,6 +2224,7 @@ const QueryState = struct {
         for (self.path_states.items) |*path_state| path_state.deinit(alloc);
         self.path_states.deinit(alloc);
         self.seen.deinit(alloc);
+        self.releaseSeenBudget();
         self.path_states = .empty;
         self.seen = .{};
     }
@@ -2011,16 +2233,21 @@ const QueryState = struct {
 const TargetNodeSet = struct {
     exact: graph_node_identity.Map(void) = .{},
     wildcard_keys: std.StringHashMapUnmanaged(void) = .empty,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    retained_state_bytes: usize = 0,
 
     fn init(
         alloc: std.mem.Allocator,
+        source_table: []const u8,
         req: db_mod.types.SearchRequest,
         base_result: db_mod.types.SearchResult,
         prior_results: []const db_mod.types.GraphSearchResult,
         selector: graph_query_mod.NodeSelector,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !TargetNodeSet {
         const nodes = try resolveSelectorNodes(
             alloc,
+            source_table,
             req,
             base_result,
             prior_results,
@@ -2028,22 +2255,49 @@ const TargetNodeSet = struct {
         );
         defer freeNodeIdentities(alloc, nodes);
 
-        var out = TargetNodeSet{};
+        var out = TargetNodeSet{ .work_budget = work_budget };
         errdefer out.deinit(alloc);
         switch (selector) {
             .keys => {
                 for (nodes) |node| {
                     if (out.wildcard_keys.contains(node.key)) continue;
+                    const retained_bytes = std.math.add(usize, node.key.len, 3 * @sizeOf(usize)) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+                    errdefer if (work_budget) |budget| budget.releaseStateBytes(retained_bytes);
                     const key = try alloc.dupe(u8, node.key);
                     out.wildcard_keys.putNoClobber(alloc, key, {}) catch |err| {
                         alloc.free(key);
                         return err;
                     };
+                    out.retained_state_bytes += retained_bytes;
                 }
             },
-            .result_ref => {
+            .identities, .result_ref => {
                 for (nodes) |node| {
+                    if (out.exact.contains(node.ref())) continue;
+                    var retained_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), node.key.len) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (node.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    retained_bytes = std.math.add(usize, retained_bytes, 3 * @sizeOf(usize)) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+                    errdefer if (work_budget) |budget| budget.releaseStateBytes(retained_bytes);
                     _ = try out.exact.putIfAbsent(alloc, node.ref(), {});
+                    out.retained_state_bytes += retained_bytes;
                 }
             },
         }
@@ -2064,6 +2318,7 @@ const TargetNodeSet = struct {
         var it = self.wildcard_keys.keyIterator();
         while (it.next()) |key| alloc.free(key.*);
         self.wildcard_keys.deinit(alloc);
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
         self.* = .{};
     }
 };
@@ -2080,6 +2335,7 @@ const GraphAdmissionTableState = struct {
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     allowed: bool,
     requires_admission: bool,
+    graph_index_available: ?bool = null,
     requires_hydration: bool,
     decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
@@ -2281,6 +2537,23 @@ const GraphNodeAdmissionContext = struct {
         return self.tables.getPtr(table_name).?;
     }
 
+    fn graphIndexAvailable(
+        self: *GraphNodeAdmissionContext,
+        state: *GraphAdmissionTableState,
+        index_name: []const u8,
+    ) !bool {
+        if (std.mem.eql(u8, state.table_name, self.source_table)) return true;
+        if (state.graph_index_available) |available| return available;
+        const available = try catalogTableHasGraphIndex(
+            self.alloc,
+            self.catalog,
+            state.table_name,
+            index_name,
+        );
+        state.graph_index_available = available;
+        return available;
+    }
+
     fn filterMany(
         ctx: ?*anyopaque,
         result_alloc: std.mem.Allocator,
@@ -2351,6 +2624,8 @@ const GraphNodeAdmissionContext = struct {
                 state.resolved_doc_filter,
                 state.resolved_doc_filter_wire_context,
                 false,
+                true,
+                &.{},
                 entry.value_ptr.keys.items,
                 self.consistency,
             );
@@ -2398,11 +2673,13 @@ const PathState = struct {
     cost: f64,
     parent: ?u32 = null,
     incoming_edge: ?graph_query_mod.PathEdgeInfo = null,
+    retained_lease: graph_work_budget.RetainedLease = .{},
 
     fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         if (self.incoming_edge) |edge| freeOwnedPathEdge(alloc, edge);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
@@ -2414,13 +2691,158 @@ const FrontierState = struct {
     distance: f64 = 0,
     cost: f64 = 0,
     path_state_id: ?u32 = null,
+    retained_lease: graph_work_budget.RetainedLease = .{},
 
     fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
+
+const PathCostLabels = struct {
+    const Label = struct {
+        depth: u32,
+        cost: f64,
+    };
+
+    values: graph_node_identity.Map(std.ArrayListUnmanaged(Label)) = .{},
+    max_depth: u32,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    retained_state_bytes: usize = 0,
+
+    fn init(max_depth: u32, work_budget: ?*graph_pattern_mod.WorkBudget) PathCostLabels {
+        return .{ .max_depth = max_depth, .work_budget = work_budget };
+    }
+
+    fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
+        var it = self.values.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+        self.values.deinit(alloc);
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
+        self.* = undefined;
+    }
+
+    fn recordIfPareto(
+        self: *PathCostLabels,
+        alloc: std.mem.Allocator,
+        ref: graph_node_identity.Ref,
+        depth: u32,
+        cost: f64,
+    ) !bool {
+        if (depth > self.max_depth) return false;
+        if (self.values.getPtr(ref)) |labels| {
+            for (labels.items) |label| {
+                if (label.depth <= depth and label.cost <= cost) return false;
+            }
+
+            // Keep only the Pareto frontier. This is normally one label per
+            // node and avoids allocating max_depth slots for every identity.
+            var index: usize = 0;
+            while (index < labels.items.len) {
+                const label = labels.items[index];
+                if (depth <= label.depth and cost <= label.cost) {
+                    _ = labels.swapRemove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            const added_bytes: usize = if (labels.capacity == labels.items.len) @sizeOf(Label) else 0;
+            if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
+            errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
+            if (added_bytes > 0) try labels.ensureTotalCapacityPrecise(alloc, labels.items.len + 1);
+            labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
+            self.retained_state_bytes += added_bytes;
+            return true;
+        }
+
+        var added_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), ref.key.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (ref.table) |table| added_bytes = std.math.add(usize, added_bytes, table.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        added_bytes = std.math.add(usize, added_bytes, 3 * @sizeOf(usize) + @sizeOf(Label)) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
+        errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
+        var labels = std.ArrayListUnmanaged(Label).empty;
+        errdefer labels.deinit(alloc);
+        try labels.ensureTotalCapacityPrecise(alloc, 1);
+        labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
+        _ = try self.values.putIfAbsent(alloc, ref, labels);
+        self.retained_state_bytes += added_bytes;
+        return true;
+    }
+
+    fn isCurrentPareto(
+        self: *const PathCostLabels,
+        ref: graph_node_identity.Ref,
+        depth: u32,
+        cost: f64,
+    ) bool {
+        if (depth > self.max_depth) return false;
+        const labels = self.values.get(ref) orelse return false;
+        var exact = false;
+        for (labels.items) |label| {
+            if (label.depth == depth and label.cost == cost) exact = true;
+            if (label.depth < depth and label.cost <= cost) return false;
+        }
+        return exact;
+    }
+};
+
+test "distributed bounded paths retain non-dominated cost and depth labels" {
+    var labels = PathCostLabels.init(2, null);
+    defer labels.deinit(std.testing.allocator);
+    const node = graph_node_identity.Ref{ .table = "docs", .key = "X" };
+    try std.testing.expect(try labels.recordIfPareto(std.testing.allocator, node, 2, 0));
+    try std.testing.expect(try labels.recordIfPareto(std.testing.allocator, node, 1, 1));
+    try std.testing.expect(!try labels.recordIfPareto(std.testing.allocator, node, 2, 1));
+    try std.testing.expect(labels.isCurrentPareto(node, 2, 0));
+    try std.testing.expect(labels.isCurrentPareto(node, 1, 1));
+
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    var bounded = PathCostLabels.init(2, &budget);
+    var bounded_owned = true;
+    defer if (bounded_owned) bounded.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        bounded.recordIfPareto(std.testing.allocator, node, 1, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+    try std.testing.expect(try bounded.recordIfPareto(std.testing.allocator, node, 1, 0));
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    bounded.deinit(std.testing.allocator);
+    bounded_owned = false;
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+fn graphNodeAdmissionRequest(
+    req: db_mod.types.SearchRequest,
+    graph_query: db_mod.types.NamedGraphQuery,
+) db_mod.types.SearchRequest {
+    if (graph_query.query.match_pattern == null) return req;
+    var admission_req = req;
+    admission_req.filter_query_json = req.authorization_filter_query_json;
+    admission_req.exclusion_query_json = "";
+    // The resolved filter belongs to the combined retrieval predicate and
+    // cannot safely be reused for the authorization-only MATCH relation.
+    admission_req.resolved_doc_filter = null;
+    admission_req.resolved_doc_filter_owned = false;
+    admission_req.resolved_doc_filter_wire_context = null;
+    return admission_req;
+}
 
 fn executeSingleCrossRange(
     alloc: std.mem.Allocator,
@@ -2429,11 +2851,15 @@ fn executeSingleCrossRange(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
+    const admission_req = graphNodeAdmissionRequest(req, graph_query);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
         catalog,
@@ -2441,7 +2867,7 @@ fn executeSingleCrossRange(
         table_name,
         graph_query.query.index_name,
         topology_epoch,
-        req,
+        admission_req,
         base_result.identity_read_generation,
         base_result.shard_identity_read_generations,
         graph_query.query.params.node_filter,
@@ -2460,6 +2886,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .shortest_path => try executeDistributedShortestPath(
             alloc,
@@ -2472,6 +2899,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .k_shortest_paths => try executeDistributedKShortestPaths(
             alloc,
@@ -2484,6 +2912,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .pattern => try executeDistributedPattern(
             alloc,
@@ -2492,10 +2921,13 @@ fn executeSingleCrossRange(
             table_name,
             req,
             base_result,
+            match_anchor_source,
             prior_results,
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
+            request_distinct_budget,
         ),
     };
 }
@@ -2508,6 +2940,14 @@ const DistributedEdgeReader = struct {
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
 
+    /// MATCH uses null as the canonical source-table qualifier. Graph edge
+    /// metadata necessarily uses absolute table names when an external hop
+    /// returns to that table, so normalize before the graph matcher performs
+    /// identity-sensitive cycle, predicate, and aggregate work.
+    pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        return canonicalGraphNodeTable(self.source_table, table);
+    }
+
     pub fn getEdges(
         self: @This(),
         a: std.mem.Allocator,
@@ -2516,9 +2956,81 @@ const DistributedEdgeReader = struct {
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
+        return self.getEdgesBounded(
+            a,
+            table,
+            key,
+            edge_types,
+            direction,
+            graph_pattern_mod.default_max_explored_edges,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        ) catch |err| switch (err) {
+            error.GraphExploredEdgesBudgetExceeded,
+            error.GraphExploredEdgeBytesBudgetExceeded,
+            => error.QueryCandidateBudgetExceeded,
+            else => err,
+        };
+    }
+
+    /// Validate every physical source domain before a bounded matcher can fill
+    /// its output sink. This prevents a cross-table `both` query from returning
+    /// only its outgoing half when the incoming source lacks a graph index.
+    pub fn validatePatternSourceTable(
+        self: @This(),
+        table: ?[]const u8,
+        _: bool,
+    ) !void {
+        const table_name = table orelse self.source_table;
+        const table_state = try self.admission.ensureTable(table_name);
+        if (!table_state.allowed) return;
+        if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
+            return error.UnsupportedQueryRequest;
+    }
+
+    pub fn getEdgesBounded(
+        self: @This(),
+        a: std.mem.Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try self.getEdgesBoundedForPattern(
+            a,
+            table,
+            key,
+            edge_types,
+            direction,
+            max_edges,
+            max_owned_bytes,
+            false,
+        );
+    }
+
+    pub fn getEdgesBoundedForPattern(
+        self: @This(),
+        a: std.mem.Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        source_table_declared: bool,
+    ) ![]graph_mod.Edge {
+        if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
+        // Cross-table endpoints remain useful result nodes even when their table
+        // does not expose the same graph index. Treat those nodes as terminals
+        // instead of turning an explicit multi-hop traversal into IndexNotFound.
+        if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
+            return try a.alloc(graph_mod.Edge, 0);
+
         const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
             a,
             self.catalog,
@@ -2526,15 +3038,41 @@ const DistributedEdgeReader = struct {
             key,
             table_state.topology_epoch,
         )) orelse return error.TableNotFound;
+
+        // Outgoing adjacency is colocated with its source and needs one routed
+        // read. Incoming adjacency is deliberately source-shard-local, so an
+        // exact reverse expansion must consult every source shard in the pinned
+        // topology. Never substitute the target owner's partial reverse index:
+        // doing so silently loses bindings after a table split.
         if (direction == .out) {
-            return try self.getEdgesFromGroup(a, table_state, owner_group_id, key, edge_types, .out);
+            var resp = try self.getEdgesFromGroup(
+                a,
+                table_name,
+                table_state,
+                owner_group_id,
+                key,
+                edge_types,
+                .out,
+                max_edges,
+                max_owned_bytes,
+            );
+            const edges = resp.edges;
+            resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
+            resp.deinit(a);
+            return edges;
         }
 
-        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
-        const group_ids = try table_catalog.resolveGroupsForSpan(a, self.catalog, table_name, "", "");
-        defer if (group_ids.len > 0) a.free(group_ids);
-        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
-        if (group_ids.len == 0) return error.TableNotFound;
+        // Legacy reverse expansion carries only the bound target table and
+        // therefore cannot identify an external source index. Canonical MATCH
+        // supplies the declared source-alias table explicitly.
+        if (!std.mem.eql(u8, table_name, self.source_table) and !source_table_declared)
+            return error.UnsupportedQueryRequest;
+
+        const routed = try table_catalog.routedSpanSnapshot(a, self.catalog, table_name, "", "");
+        defer a.free(routed.group_ids);
+        if (table_state.topology_epoch != 0 and routed.topology_epoch != table_state.topology_epoch)
+            return error.TopologyChanged;
+        if (routed.group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
 
         var positive = GraphExpandBatches.empty;
         defer freeFrontierBatches(a, &positive);
@@ -2543,33 +3081,209 @@ const DistributedEdgeReader = struct {
             self.worker,
             &positive,
             table_state,
-            group_ids,
+            routed.group_ids,
             &.{0},
             &.{key},
             self.index_name,
             self.consistency,
         );
 
+        var candidate_group_ids = std.ArrayListUnmanaged(u64).empty;
+        defer candidate_group_ids.deinit(a);
+        for (routed.group_ids) |group_id| {
+            const has_incoming = positive.contains(.{
+                .table_name = table_state.table_name,
+                .group_id = group_id,
+            });
+            if (has_incoming or (direction == .both and group_id == owner_group_id))
+                try candidate_group_ids.append(a, group_id);
+        }
+        if (candidate_group_ids.items.len == 0) return try a.alloc(graph_mod.Edge, 0);
+
         var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
         errdefer {
             for (edges.items) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
             edges.deinit(a);
         }
-        // Iterate in range order for deterministic path and pattern planning.
-        // The target owner is always included for `.both` to read outgoing
-        // adjacency; all other groups are included only after a positive probe.
-        for (group_ids) |group_id| {
-            const has_incoming = positive.contains(.{
-                .table_name = table_state.table_name,
-                .group_id = group_id,
-            });
-            const is_owner = group_id == owner_group_id;
-            if (!has_incoming and !(direction == .both and is_owner)) continue;
-            const group_direction: graph_mod.EdgeDirection = if (direction == .both and is_owner) .both else .in;
-            const group_edges = try self.getEdgesFromGroup(a, table_state, group_id, key, edge_types, group_direction);
-            errdefer graph_mod.GraphIndex.freeEdges(a, group_edges);
-            try edges.appendSlice(a, group_edges);
-            if (group_edges.len > 0) a.free(group_edges);
+        var seen_edges = GraphEdgeIdentitySet.empty;
+        defer seen_edges.deinit(a);
+        const fanout_io = self.worker.fanoutIo();
+        const plan = planGraphFanout(fanout_io != null, self.worker.fanoutWidthCap(), candidate_group_ids.items.len);
+
+        const Appender = struct {
+            fn appendCloned(
+                alloc: std.mem.Allocator,
+                output: *std.ArrayListUnmanaged(graph_mod.Edge),
+                seen: *GraphEdgeIdentitySet,
+                input: []const graph_mod.Edge,
+                deduplicate: bool,
+                edge_limit: usize,
+                byte_limit: usize,
+                owned_bytes: *usize,
+            ) !void {
+                for (input) |edge| {
+                    if (deduplicate and seen.contains(graphEdgeIdentity(edge))) continue;
+                    if (output.items.len >= edge_limit) return error.GraphExploredEdgesBudgetExceeded;
+                    const edge_bytes = graphEdgeOwnedBytes(edge);
+                    if (edge_bytes > byte_limit -| owned_bytes.*) return error.GraphExploredEdgeBytesBudgetExceeded;
+                    const cloned = try cloneOwnedGraphEdge(alloc, edge);
+                    var cloned_owned = true;
+                    errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(alloc, cloned);
+                    try output.append(alloc, cloned);
+                    cloned_owned = false;
+                    owned_bytes.* += edge_bytes;
+                    if (deduplicate) try seen.put(alloc, graphEdgeIdentity(cloned), {});
+                }
+            }
+        };
+        var owned_bytes: usize = 0;
+
+        if (fanout_io) |io| {
+            if (plan.parallel) {
+                const slots = try a.alloc(GraphEdgesFanoutSlot, plan.width);
+                defer {
+                    for (slots) |*slot| slot.deinit();
+                    a.free(slots);
+                }
+                for (slots) |*slot| slot.* = .init();
+
+                const Fiber = struct {
+                    fn run(
+                        reader: DistributedEdgeReader,
+                        slot: *GraphEdgesFanoutSlot,
+                        table_name_inner: []const u8,
+                        table_state_inner: *const GraphAdmissionTableState,
+                        group_id: u64,
+                        key_inner: []const u8,
+                        edge_types_inner: []const []const u8,
+                        direction_inner: graph_mod.EdgeDirection,
+                        max_edges_inner: usize,
+                        max_owned_bytes_inner: usize,
+                    ) void {
+                        slot.result = reader.getEdgesFromGroup(
+                            slot.arena.allocator(),
+                            table_name_inner,
+                            table_state_inner,
+                            group_id,
+                            key_inner,
+                            edge_types_inner,
+                            direction_inner,
+                            max_edges_inner,
+                            max_owned_bytes_inner,
+                        ) catch |err| {
+                            slot.err = err;
+                            return;
+                        };
+                    }
+                };
+
+                var start: usize = 0;
+                while (start < candidate_group_ids.items.len) : (start += plan.width) {
+                    const end = @min(start + plan.width, candidate_group_ids.items.len);
+                    const wave_len = end - start;
+                    const remaining_edges = max_edges -| edges.items.len;
+                    const remaining_bytes = max_owned_bytes -| owned_bytes;
+                    const fair_edges = @max(@as(usize, 1), std.math.divCeil(usize, remaining_edges, wave_len) catch 1);
+                    const fair_bytes = @max(@as(usize, 1), std.math.divCeil(usize, remaining_bytes, wave_len) catch 1);
+                    var group: std.Io.Group = .init;
+                    for (candidate_group_ids.items[start..end], 0..) |group_id, i| {
+                        const group_direction: graph_mod.EdgeDirection = if (direction == .both and group_id == owner_group_id) .both else .in;
+                        group.async(io, Fiber.run, .{
+                            self,
+                            &slots[i],
+                            table_name,
+                            table_state,
+                            group_id,
+                            key,
+                            edge_types,
+                            group_direction,
+                            fair_edges,
+                            fair_bytes,
+                        });
+                    }
+                    group.await(io) catch {};
+
+                    // Balanced shards complete concurrently within a fair share
+                    // of the remaining request budget. A skewed shard retries
+                    // after successful peers have been accounted, preserving
+                    // exactness without multiplying transient memory by fanout.
+                    for (slots[0..wave_len]) |slot| {
+                        if (slot.err) |err| switch (err) {
+                            error.GraphExploredEdgesBudgetExceeded,
+                            error.GraphExploredEdgeBytesBudgetExceeded,
+                            => continue,
+                            else => return err,
+                        };
+                        try Appender.appendCloned(
+                            a,
+                            &edges,
+                            &seen_edges,
+                            slot.result.?.edges,
+                            direction == .both,
+                            max_edges,
+                            max_owned_bytes,
+                            &owned_bytes,
+                        );
+                    }
+                    for (slots[0..wave_len], candidate_group_ids.items[start..end]) |*slot, group_id| {
+                        const slot_err = slot.err orelse continue;
+                        if (slot_err != error.GraphExploredEdgesBudgetExceeded and
+                            slot_err != error.GraphExploredEdgeBytesBudgetExceeded) continue;
+                        var retry = try self.getEdgesFromGroup(
+                            a,
+                            table_name,
+                            table_state,
+                            group_id,
+                            key,
+                            edge_types,
+                            if (direction == .both and group_id == owner_group_id) .both else .in,
+                            @max(@as(usize, 1), max_edges -| edges.items.len),
+                            @max(@as(usize, 1), max_owned_bytes -| owned_bytes),
+                        );
+                        defer retry.deinit(a);
+                        try Appender.appendCloned(
+                            a,
+                            &edges,
+                            &seen_edges,
+                            retry.edges,
+                            direction == .both,
+                            max_edges,
+                            max_owned_bytes,
+                            &owned_bytes,
+                        );
+                    }
+                    for (slots[0..wave_len]) |*slot| {
+                        slot.deinit();
+                        slot.* = .init();
+                    }
+                }
+                return try edges.toOwnedSlice(a);
+            }
+        }
+
+        for (candidate_group_ids.items) |group_id| {
+            var resp = try self.getEdgesFromGroup(
+                a,
+                table_name,
+                table_state,
+                group_id,
+                key,
+                edge_types,
+                if (direction == .both and group_id == owner_group_id) .both else .in,
+                @max(@as(usize, 1), max_edges -| edges.items.len),
+                @max(@as(usize, 1), max_owned_bytes -| owned_bytes),
+            );
+            defer resp.deinit(a);
+            try Appender.appendCloned(
+                a,
+                &edges,
+                &seen_edges,
+                resp.edges,
+                direction == .both,
+                max_edges,
+                max_owned_bytes,
+                &owned_bytes,
+            );
         }
         return try edges.toOwnedSlice(a);
     }
@@ -2577,45 +3291,117 @@ const DistributedEdgeReader = struct {
     fn getEdgesFromGroup(
         self: @This(),
         a: std.mem.Allocator,
+        table_name: []const u8,
         table_state: *const GraphAdmissionTableState,
         group_id: u64,
         key: []const u8,
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
-    ) ![]graph_mod.Edge {
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) !GraphEdgesResponse {
+        if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
+        if (max_edges > graph_pattern_mod.default_max_explored_edges or
+            max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
+            return error.InvalidQueryRequest;
+        var request_owns_fields = false;
         const index_name = try a.dupe(u8, self.index_name);
-        errdefer a.free(index_name);
+        errdefer if (!request_owns_fields) a.free(index_name);
         const owned_key = try a.dupe(u8, key);
-        errdefer a.free(owned_key);
+        errdefer if (!request_owns_fields) a.free(owned_key);
+        const owned_edge_types = try dupConstStrings(a, edge_types);
+        errdefer if (!request_owns_fields) freeConstStrings(a, owned_edge_types);
         var tensor_access_path = try cloneGraphTensorAccessPathAlloc(
             a,
             algebraic_ir.graphEdgeAccessPath(self.index_name),
         );
-        errdefer tensor_access_path.deinit(a);
+        errdefer if (!request_owns_fields) tensor_access_path.deinit(a);
         var tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(a, self.index_name);
-        errdefer tensor_program.deinit(a);
+        errdefer if (!request_owns_fields) tensor_program.deinit(a);
         var req = GraphEdgesRequest{
             .index_name = index_name,
             .key = owned_key,
-            .edge_types = try dupConstStrings(a, edge_types),
+            .edge_types = owned_edge_types,
             .direction = direction,
             .tensor_access_path = tensor_access_path,
             .tensor_program = tensor_program,
             .topology_epoch = table_state.topology_epoch,
             .identity_read_generation = try table_state.generationForGroup(group_id),
+            .max_edges = @intCast(max_edges),
+            .max_owned_bytes = @intCast(max_owned_bytes),
         };
+        request_owns_fields = true;
         defer req.deinit(a);
-        var resp = try self.worker.executeGraphGetEdges(a, group_id, table_state.table_name, req, self.consistency);
-        const edges = resp.edges;
-        resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
-        resp.deinit(a);
-        return edges;
+        return try self.worker.executeGraphGetEdges(a, group_id, table_name, req, self.consistency);
     }
 
     pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
         graph_mod.GraphIndex.freeEdges(a, edges);
     }
 };
+
+const GraphEdgeIdentity = struct {
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+};
+
+const GraphEdgeIdentityContext = struct {
+    pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(value.source);
+        hasher.update("\x00");
+        hasher.update(value.target);
+        hasher.update("\x00");
+        hasher.update(value.edge_type);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), left: GraphEdgeIdentity, right: GraphEdgeIdentity) bool {
+        return std.mem.eql(u8, left.source, right.source) and
+            std.mem.eql(u8, left.target, right.target) and
+            std.mem.eql(u8, left.edge_type, right.edge_type);
+    }
+};
+
+const GraphEdgeIdentitySet = std.HashMapUnmanaged(
+    GraphEdgeIdentity,
+    void,
+    GraphEdgeIdentityContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn graphEdgeIdentity(edge: graph_mod.Edge) GraphEdgeIdentity {
+    return .{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type };
+}
+
+fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mod.Edge {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+        .created_at = edge.created_at,
+        .updated_at = edge.updated_at,
+        .metadata = metadata,
+    };
+}
+
+fn graphEdgeOwnedBytes(edge: graph_mod.Edge) usize {
+    var total: usize = @sizeOf(graph_mod.Edge);
+    total = std.math.add(usize, total, edge.source.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.target.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.edge_type.len) catch return std.math.maxInt(usize);
+    return std.math.add(usize, total, edge.metadata.len) catch std.math.maxInt(usize);
+}
 
 fn executeDistributedPattern(
     alloc: std.mem.Allocator,
@@ -2624,15 +3410,47 @@ fn executeDistributedPattern(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     // Resolve start keys.
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     errdefer state.deinit(alloc);
-    const frontier = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, false);
+    const edge_reader = DistributedEdgeReader{
+        .catalog = catalog,
+        .worker = worker,
+        .source_table = table_name,
+        .index_name = graph_query.query.index_name,
+        .consistency = consistency,
+        .admission = admission,
+    };
+    const canonical_match = graph_query.query.match_pattern != null;
+    if (canonical_match) {
+        return try executeDistributedConjunctivePattern(
+            alloc,
+            edge_reader,
+            req,
+            graph_query,
+            match_anchor_source orelse return error.UnsupportedQueryRequest,
+            base_result,
+            admission,
+            &state,
+            request_work_budget,
+            request_distinct_budget,
+        );
+    }
+    const selector_result = base_result;
+    var selector_req = req;
+    if (canonical_match) selector_req.limit = 0;
+    const frontier = try resolveStartFrontier(alloc, &state, table_name, selector_req, selector_result, prior_results, graph_query.query.start_nodes, false);
     defer freeFrontier(alloc, frontier);
 
     const start_nodes = try alloc.alloc(graph_node_identity.Ref, frontier.len);
@@ -2642,7 +3460,7 @@ fn executeDistributedPattern(
     }
 
     const target_frontier = if (graph_query.query.target_nodes) |selector|
-        try resolveStartFrontier(alloc, &state, req, base_result, prior_results, selector, false)
+        try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, selector, false)
     else
         try alloc.alloc(FrontierState, 0);
     defer freeFrontier(alloc, target_frontier);
@@ -2651,16 +3469,6 @@ fn executeDistributedPattern(
     for (target_frontier, 0..) |item, i| {
         target_nodes[i] = .{ .table = item.table, .key = item.key };
     }
-
-    // Build distributed edge reader.
-    const edge_reader = DistributedEdgeReader{
-        .catalog = catalog,
-        .worker = worker,
-        .source_table = table_name,
-        .index_name = graph_query.query.index_name,
-        .consistency = consistency,
-        .admission = admission,
-    };
 
     // Run pattern matching with distributed edges.
     const raw_matches = try graph_pattern_mod.matchPatternFromRefsWithEdgeReader(
@@ -2675,18 +3483,21 @@ fn executeDistributedPattern(
             .target_required = graph_query.query.target_nodes != null,
             .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
+            .work_budget = request_work_budget,
         },
     );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
 
     // Convert PatternMatch to GraphPatternMatch.
-    const matches = try convertPatternMatches(alloc, raw_matches);
+    const matches = try convertPatternMatches(alloc, raw_matches, request_work_budget);
     errdefer {
         for (matches) |*m| m.deinit(alloc);
         if (matches.len > 0) alloc.free(matches);
     }
 
     // Collect unique node keys from all bindings for hydration.
+    const unique_nodes_reservation = try reserveUniqueMatchNodeUpperBound(raw_matches, request_work_budget);
+    defer request_work_budget.releaseStateBytes(unique_nodes_reservation);
     const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, raw_matches);
     defer {
         for (unique_nodes) |*n| n.deinit(alloc);
@@ -2694,8 +3505,8 @@ fn executeDistributedPattern(
     }
 
     // Hydrate documents if requested.
-    const hits = if (graph_query.query.include_documents)
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes)
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
 
@@ -2717,10 +3528,368 @@ fn executeDistributedPattern(
     };
 }
 
+fn materializeAggregateResults(
+    alloc: std.mem.Allocator,
+    requested: []const graph_query_mod.NamedCountAggregate,
+    aggregate_indexes: []const usize,
+    computed: []graph_pattern_mod.CountAggregateResult,
+) ![]db_mod.types.GraphAggregateResult {
+    if (requested.len != aggregate_indexes.len) return error.InvalidArgument;
+    const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, requested.len);
+    const distinct_value_owners = try alloc.alloc(?usize, computed.len);
+    defer alloc.free(distinct_value_owners);
+    @memset(distinct_value_owners, null);
+    var initialized: usize = 0;
+    errdefer {
+        for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        if (aggregates.len > 0) alloc.free(aggregates);
+    }
+    for (requested, 0..) |aggregate, i| {
+        const accumulator_index = aggregate_indexes[i];
+        if (accumulator_index >= computed.len) return error.InvalidArgument;
+        const accumulator = &computed[accumulator_index];
+        aggregates[i] = blk: {
+            const name = try alloc.dupe(u8, aggregate.name);
+            errdefer alloc.free(name);
+            if (aggregate.distinct) {
+                if (distinct_value_owners[accumulator_index]) |owner| {
+                    break :blk .{
+                        .name = name,
+                        .value = accumulator.value,
+                        .distinct_values = aggregates[owner].distinct_values,
+                        .distinct_values_owned = false,
+                    };
+                }
+                const values = accumulator.distinct_values;
+                accumulator.distinct_values = &.{};
+                distinct_value_owners[accumulator_index] = i;
+                break :blk .{
+                    .name = name,
+                    .value = accumulator.value,
+                    .distinct_values = values,
+                };
+            }
+            break :blk .{
+                .name = name,
+                .value = accumulator.value,
+            };
+        };
+        initialized += 1;
+    }
+    return aggregates;
+}
+
+fn validateMatchAnchorPageOrder(
+    prior_cursor: ?[]const u8,
+    hits: []const db_mod.types.SearchHit,
+) !void {
+    var prior_id = prior_cursor;
+    for (hits) |hit| {
+        if (prior_id) |prior| {
+            if (std.mem.order(u8, prior, hit.id) != .lt) return error.InvalidQueryResult;
+        }
+        prior_id = hit.id;
+    }
+}
+
+/// `_id` seek totals are cursor-relative and may be lower bounds when a page
+/// fills, so they cannot define completion for a streamed relation. Snapshot
+/// pinning and strict cursor order protect consistency; an exact short page is
+/// the storage iterator's end-of-stream signal. An exact multiple deliberately
+/// performs one final empty fetch, while a short lower-bound page fails closed.
+fn matchAnchorPageIsTerminal(
+    source: MatchAnchorSource,
+    hit_count: usize,
+    total_hits: u32,
+    total_hits_relation: db_mod.types.TotalHitsRelation,
+) !bool {
+    return switch (source) {
+        .materialized => {
+            if (total_hits_relation != .exact or @as(u64, total_hits) != hit_count)
+                return error.InvalidQueryResult;
+            return true;
+        },
+        .paged => {
+            if (hit_count > complete_match_anchor_page_size)
+                return error.InvalidQueryResult;
+            if (@as(u64, total_hits) < hit_count) return error.InvalidQueryResult;
+            if (hit_count == complete_match_anchor_page_size) return false;
+            // A short lower-bound page could reflect an early storage stop;
+            // accepting it would silently turn an incomplete scan into an
+            // exact result.
+            if (total_hits_relation != .exact) return error.InvalidQueryResult;
+            return true;
+        },
+    };
+}
+
+fn executeDistributedConjunctivePattern(
+    alloc: std.mem.Allocator,
+    edge_reader: DistributedEdgeReader,
+    req: db_mod.types.SearchRequest,
+    graph_query: db_mod.types.NamedGraphQuery,
+    anchor_source: MatchAnchorSource,
+    base_result: db_mod.types.SearchResult,
+    admission: *GraphNodeAdmissionContext,
+    state: *QueryState,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
+) !db_mod.types.GraphSearchResult {
+    const pattern = graph_query.query.match_pattern orelse return error.InvalidArgument;
+    var filter_evaluator = DistributedPatternFilterEvaluator{ .admission = admission };
+    defer filter_evaluator.deinit();
+    // Source anchors, reached graph nodes, and examined edges consume distinct
+    // dimensions of the request-wide budget across every cursor page. This
+    // keeps exact MATCH exhaustive within explicit resource ceilings and fails
+    // closed instead of publishing a partial result as exact.
+    const base_opts = graph_pattern_mod.MatchOptions{
+        .max_results = if (graph_query.query.return_limit > 0)
+            std.math.add(u32, graph_query.query.return_limit, 1) catch graph_query.query.return_limit
+        else
+            graph_query.query.params.max_results,
+        .return_aliases = graph_query.query.return_aliases,
+        .include_paths = false,
+        .evaluator = .{
+            .ctx = &filter_evaluator,
+            .func = DistributedPatternFilterEvaluator.evaluate,
+            .batch_func = DistributedPatternFilterEvaluator.evaluateMany,
+        },
+        .node_admission = admission.iface(),
+        // Canonical paged anchors were produced by the same snapshot-pinned
+        // source scan with authorization and the explicit anchor filter
+        // already applied. Materialized/legacy starts do not carry that proof.
+        .start_validation = switch (anchor_source) {
+            .paged => .prevalidated,
+            .materialized => .required,
+        },
+        .work_budget = request_work_budget,
+    };
+
+    const requested_specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
+    defer if (requested_specs.len > 0) alloc.free(requested_specs);
+    for (graph_query.query.aggregates, 0..) |aggregate, output_index| {
+        requested_specs[output_index] = .{
+            .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
+            .distinct = aggregate.distinct,
+        };
+    }
+    var aggregate_plan = try graph_pattern_mod.CountAggregatePlan.init(alloc, requested_specs);
+    defer aggregate_plan.deinit(alloc);
+    // Keep one accumulator set for the complete snapshot-pinned anchor
+    // relation. In particular, exact distinct identities are retained once
+    // under the request-wide budget instead of being built in a page-local set
+    // and copied into a second cross-page set.
+    var aggregate_stream: ?graph_pattern_mod.ConjunctiveCountAggregateStream = if (aggregate_plan.unique_specs.len > 0)
+        try graph_pattern_mod.ConjunctiveCountAggregateStream.init(
+            alloc,
+            aggregate_plan.unique_specs,
+            request_distinct_budget,
+        )
+    else
+        null;
+    defer if (aggregate_stream) |*stream| stream.deinit(alloc);
+    var collected_matches = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
+    defer {
+        for (collected_matches.items) |*match| match.deinit(alloc);
+        collected_matches.deinit(alloc);
+    }
+    var cursor_key: ?[]u8 = null;
+    defer if (cursor_key) |key| alloc.free(key);
+    var materialized_consumed = false;
+    var truncated = false;
+
+    while (true) {
+        const cursor = if (cursor_key) |key| &[_]std.json.Value{.{ .string = key }} else &.{};
+        var page_owned = false;
+        var page = switch (anchor_source) {
+            .materialized => |result| blk: {
+                if (materialized_consumed) break;
+                materialized_consumed = true;
+                break :blk result;
+            },
+            .paged => |source| blk: {
+                page_owned = true;
+                break :blk try source.fetch(alloc, graph_query, cursor);
+            },
+        };
+        defer if (page_owned) page.deinit();
+
+        const terminal_page = try matchAnchorPageIsTerminal(
+            anchor_source,
+            page.hits.len,
+            page.total_hits,
+            page.total_hits_relation,
+        );
+        try validateSourceSnapshotGroupSet(alloc, edge_reader.catalog, edge_reader.source_table, page);
+        try validateMatchingSourceSnapshots(base_result, page);
+        try validateMatchAnchorPageOrder(cursor_key, page.hits);
+        if (page.hits.len == 0) break;
+
+        const start_keys = try alloc.alloc([]const u8, page.hits.len);
+        defer alloc.free(start_keys);
+        for (page.hits, 0..) |hit, i| start_keys[i] = hit.id;
+
+        if (aggregate_stream) |*stream| {
+            try stream.consumePageWithEdgeReader(
+                alloc,
+                edge_reader,
+                start_keys,
+                pattern,
+                base_opts,
+            );
+        } else {
+            var page_opts = base_opts;
+            const desired = std.math.add(usize, graph_query.query.return_limit, 1) catch return error.QueryCandidateBudgetExceeded;
+            const remaining = desired -| collected_matches.items.len;
+            page_opts.max_results = @intCast(remaining);
+            const page_matches = try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
+                alloc,
+                edge_reader,
+                start_keys,
+                pattern,
+                page_opts,
+            );
+            defer graph_pattern_mod.freeMatches(alloc, page_matches);
+            try collected_matches.ensureUnusedCapacity(alloc, page_matches.len);
+            for (page_matches) |*match| {
+                collected_matches.appendAssumeCapacity(match.take());
+            }
+            if (collected_matches.items.len >= desired) {
+                truncated = true;
+                break;
+            }
+        }
+
+        if (terminal_page) break;
+        const next_cursor = try alloc.dupe(u8, page.hits[page.hits.len - 1].id);
+        if (cursor_key) |prior| alloc.free(prior);
+        cursor_key = next_cursor;
+    }
+
+    if (aggregate_stream) |*stream| {
+        const computed = try stream.finishAlloc(alloc);
+        defer {
+            for (computed) |*aggregate| aggregate.deinit(alloc);
+            if (computed.len > 0) alloc.free(computed);
+        }
+        const aggregates = try materializeAggregateResults(
+            alloc,
+            graph_query.query.aggregates,
+            aggregate_plan.output_indexes,
+            computed,
+        );
+        const name = state.name;
+        state.name = &.{};
+        return .{ .name = name, .aggregates = aggregates, .hits = &.{}, .total_hits = 0 };
+    }
+
+    const result_len = @min(collected_matches.items.len, graph_query.query.return_limit);
+    const matches = try convertPatternMatches(
+        alloc,
+        collected_matches.items[0..result_len],
+        request_work_budget,
+    );
+    errdefer {
+        for (matches) |*match| match.deinit(alloc);
+        if (matches.len > 0) alloc.free(matches);
+    }
+    const unique_nodes_reservation = try reserveUniqueMatchNodeUpperBound(
+        collected_matches.items[0..result_len],
+        request_work_budget,
+    );
+    defer request_work_budget.releaseStateBytes(unique_nodes_reservation);
+    const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, collected_matches.items[0..result_len]);
+    defer {
+        for (unique_nodes) |*node| node.deinit(alloc);
+        if (unique_nodes.len > 0) alloc.free(unique_nodes);
+    }
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
+    const name = state.name;
+    state.name = &.{};
+    return .{
+        .name = name,
+        .matches = matches,
+        .hits = hits,
+        .total_hits = @intCast(collected_matches.items.len),
+        .truncated = truncated,
+    };
+}
+
+const DistributedPatternFilterEvaluator = struct {
+    admission: *GraphNodeAdmissionContext,
+    contexts: std.StringArrayHashMapUnmanaged(GraphNodeAdmissionContext) = .empty,
+
+    fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (filter.filter_query_json == null) return true;
+        const scoped = try self.contextFor(filter);
+        const nodes = [_]graph_node_admission.NodeRef{.{ .table = node.table, .key = node.key }};
+        const decisions = try GraphNodeAdmissionContext.filterMany(scoped, self.admission.alloc, &nodes);
+        defer self.admission.alloc.free(decisions);
+        return decisions[0];
+    }
+
+    fn evaluateMany(
+        ctx: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        nodes: []const graph_node_identity.Ref,
+        filter: graph_pattern_mod.NodeFilter,
+    ) anyerror![]bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (filter.filter_query_json == null) {
+            const decisions = try alloc.alloc(bool, nodes.len);
+            @memset(decisions, true);
+            return decisions;
+        }
+        const scoped = try self.contextFor(filter);
+        const refs = try alloc.alloc(graph_node_admission.NodeRef, nodes.len);
+        defer alloc.free(refs);
+        for (nodes, 0..) |node, i| refs[i] = .{ .table = node.table, .key = node.key };
+        return try GraphNodeAdmissionContext.filterMany(scoped, alloc, refs);
+    }
+
+    fn contextFor(self: *@This(), filter: graph_pattern_mod.NodeFilter) !*GraphNodeAdmissionContext {
+        const encoded = filter.filter_query_json orelse return error.InvalidArgument;
+        if (self.contexts.getPtr(encoded)) |context| return context;
+        var request = db_mod.types.SearchRequest{};
+        request.graph_table_read_authorizer = self.admission.table_authorizer;
+        var scoped = GraphNodeAdmissionContext.init(
+            self.admission.alloc,
+            self.admission.catalog,
+            self.admission.worker,
+            self.admission.source_table,
+            self.admission.graph_index_name,
+            self.admission.source_topology_epoch,
+            request,
+            self.admission.source_identity_read_generation,
+            self.admission.source_identity_read_generations,
+            filter,
+            self.admission.consistency,
+        );
+        errdefer scoped.deinit();
+        try self.contexts.put(self.admission.alloc, encoded, scoped);
+        return self.contexts.getPtr(encoded).?;
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.contexts.values()) |*context| context.deinit();
+        self.contexts.deinit(self.admission.alloc);
+        self.* = undefined;
+    }
+};
+
 fn convertPatternMatches(
     alloc: std.mem.Allocator,
     raw_matches: []const graph_pattern_mod.PatternMatch,
+    work_budget: *graph_pattern_mod.WorkBudget,
 ) ![]db_mod.types.GraphPatternMatch {
+    const retained_bytes = convertedPatternMatchesRetainedBytes(raw_matches) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    try work_budget.retainStateBytes(retained_bytes);
+    errdefer work_budget.releaseStateBytes(retained_bytes);
     const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, raw_matches.len);
     var initialized: usize = 0;
     errdefer {
@@ -2758,14 +3927,80 @@ fn convertPatternMatches(
             path_init += 1;
         }
 
+        const null_aliases = try cloneOwnedStrings(alloc, raw_match.null_aliases);
+        errdefer {
+            for (null_aliases) |alias| alloc.free(alias);
+            if (null_aliases.len > 0) alloc.free(null_aliases);
+        }
+
         matches[i] = .{
             .bindings = bindings,
             .path = path,
+            .null_aliases = null_aliases,
         };
         initialized += 1;
     }
 
     return matches;
+}
+
+/// Final graph matches outlive the request-local WorkBudget, so their charge is
+/// intentionally consumptive. This preflight happens before any output clone,
+/// bounding the temporary source+destination peak as well as the response.
+fn convertedPatternMatchesRetainedBytes(
+    raw_matches: []const graph_pattern_mod.PatternMatch,
+) !usize {
+    var total = try std.math.mul(usize, raw_matches.len, @sizeOf(db_mod.types.GraphPatternMatch));
+    for (raw_matches) |match| {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.bindings.len, @sizeOf(db_mod.types.GraphPatternBinding)),
+        );
+        for (match.bindings) |binding| {
+            total = try std.math.add(usize, total, binding.alias.len);
+            total = try std.math.add(usize, total, @sizeOf(graph_query_mod.GraphResultNode));
+            total = try std.math.add(usize, total, binding.key.len);
+            if (binding.table) |table| total = try std.math.add(usize, total, table.len);
+        }
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.path.len, @sizeOf(graph_query_mod.PathEdgeInfo)),
+        );
+        for (match.path) |edge| {
+            total = try std.math.add(usize, total, edge.source.len);
+            total = try std.math.add(usize, total, edge.target.len);
+            total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.metadata.len);
+        }
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.null_aliases.len, @sizeOf([]u8)),
+        );
+        for (match.null_aliases) |alias| total = try std.math.add(usize, total, alias.len);
+    }
+    return total;
+}
+
+fn reserveUniqueMatchNodeUpperBound(
+    raw_matches: []const graph_pattern_mod.PatternMatch,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    var total: usize = 0;
+    for (raw_matches) |match| {
+        for (match.bindings) |binding| {
+            total = std.math.add(usize, total, @sizeOf(graph_query_mod.GraphResultNode)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            total = std.math.add(usize, total, binding.key.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            if (binding.table) |table| total = std.math.add(usize, total, table.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        }
+    }
+    try work_budget.retainStateBytes(total);
+    return total;
 }
 
 fn convertPatternBinding(
@@ -2802,6 +4037,7 @@ fn clonePatternPathEdge(
         .edge_type = edge.edge_type,
         .weight = edge.weight,
         .metadata = edge.metadata,
+        .traversal_direction = edge.traversal_direction,
     });
 }
 
@@ -2816,8 +4052,11 @@ fn executeDistributedTraverse(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
     const include_paths = graph_query.query.params.include_paths;
+    const result_limit = graph_query.query.params.max_results;
+    const collection_limit = graph_query_mod.resultCollectionLimit(result_limit);
     const max_depth: u32 = switch (graph_query.query.query_type) {
         .neighbors => 1,
         .traverse => graph_query.query.params.max_depth,
@@ -2830,29 +4069,35 @@ fn executeDistributedTraverse(
     if (graph_query.query.target_nodes) |selector| {
         target_nodes = try TargetNodeSet.init(
             alloc,
+            table_name,
             req,
             base_result,
             prior_results,
             selector,
+            request_work_budget,
         );
     }
 
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     errdefer state.deinit(alloc);
 
-    var frontier = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
+    var frontier = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
     defer freeFrontier(alloc, frontier);
     frontier = try retainAdmittedFrontier(alloc, admission, frontier);
+    try request_work_budget.consumeNodes(frontier.len);
+    try request_work_budget.checkIntermediateStates(frontier.len, graph_pattern_mod.default_max_intermediate_states);
 
     for (frontier) |item| {
-        _ = try state.seen.putIfAbsent(
+        _ = try state.putSeenIfAbsent(
             alloc,
             .{ .table = item.table, .key = item.key },
-            {},
         );
     }
 
-    while (frontier.len > 0) {
+    while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
         var completed_depth: u32 = 0;
         for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
         var next_frontier = std.ArrayListUnmanaged(FrontierState).empty;
@@ -2898,6 +4143,7 @@ fn executeDistributedTraverse(
 
                     var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, batch_table, step_req, consistency);
                     defer step_result.deinit(alloc);
+                    try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                         alloc,
@@ -2921,13 +4167,12 @@ fn executeDistributedTraverse(
                                 batch_table,
                                 node.table,
                             );
-                            if (!try state.seen.putIfAbsent(
+                            if (!try state.putSeenIfAbsent(
                                 alloc,
                                 .{
                                     .table = node_table,
                                     .key = node.key,
                                 },
-                                {},
                             )) continue;
                             const return_node = if (target_nodes) |*targets|
                                 targets.contains(node_table, node.key)
@@ -2938,27 +4183,41 @@ fn executeDistributedTraverse(
                                 try appendPathStateFromStep(alloc, &state, item, node, node_table)
                             else
                                 null;
+                            const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                                &state,
+                                node,
+                                node_table,
+                                include_paths,
+                                path_state_id,
+                                request_work_budget,
+                            );
+                            var merged_node_budget_owned = true;
+                            errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                             var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                             var merged_node_owned = true;
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                             if (merged_node.depth < max_depth) {
                                 try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                merged_node_budget_owned = false;
+                                if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
+                                request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                                merged_node_budget_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (state.nodes.items.len >= collection_limit) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
             } else {
                 const fanout_start_ns = platform_time.monotonicNs();
@@ -2980,6 +4239,7 @@ fn executeDistributedTraverse(
 
                 for (slots, batch_entries) |slot, batch_entry| {
                     const step_result = slot.result.?;
+                    try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                         alloc,
                         admission,
@@ -3002,13 +4262,12 @@ fn executeDistributedTraverse(
                                 batch_entry.table_name,
                                 node.table,
                             );
-                            if (!try state.seen.putIfAbsent(
+                            if (!try state.putSeenIfAbsent(
                                 alloc,
                                 .{
                                     .table = node_table,
                                     .key = node.key,
                                 },
-                                {},
                             )) continue;
                             const return_node = if (target_nodes) |*targets|
                                 targets.contains(node_table, node.key)
@@ -3019,27 +4278,41 @@ fn executeDistributedTraverse(
                                 try appendPathStateFromStep(alloc, &state, item, node, node_table)
                             else
                                 null;
+                            const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                                &state,
+                                node,
+                                node_table,
+                                include_paths,
+                                path_state_id,
+                                request_work_budget,
+                            );
+                            var merged_node_budget_owned = true;
+                            errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                             var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                             var merged_node_owned = true;
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                             if (merged_node.depth < max_depth) {
                                 try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                merged_node_budget_owned = false;
+                                if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
+                                request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                                merged_node_budget_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (state.nodes.items.len >= collection_limit) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
             }
         } else {
@@ -3053,6 +4326,7 @@ fn executeDistributedTraverse(
 
                 var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, batch_table, step_req, consistency);
                 defer step_result.deinit(alloc);
+                try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
                 const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                     alloc,
@@ -3076,13 +4350,12 @@ fn executeDistributedTraverse(
                             batch_table,
                             node.table,
                         );
-                        if (!try state.seen.putIfAbsent(
+                        if (!try state.putSeenIfAbsent(
                             alloc,
                             .{
                                 .table = node_table,
                                 .key = node.key,
                             },
-                            {},
                         )) continue;
                         const return_node = if (target_nodes) |*targets|
                             targets.contains(node_table, node.key)
@@ -3093,27 +4366,41 @@ fn executeDistributedTraverse(
                             try appendPathStateFromStep(alloc, &state, item, node, node_table)
                         else
                             null;
+                        const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                            &state,
+                            node,
+                            node_table,
+                            include_paths,
+                            path_state_id,
+                            request_work_budget,
+                        );
+                        var merged_node_budget_owned = true;
+                        errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                         var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                         var merged_node_owned = true;
                         errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                         if (merged_node.depth < max_depth) {
                             try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                            try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                         }
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
                             merged_node_owned = false;
-                            if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                            merged_node_budget_owned = false;
+                            if (state.nodes.items.len >= collection_limit) break;
                         } else {
                             merged_node.deinit(alloc);
                             merged_node_owned = false;
+                            request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                            merged_node_budget_owned = false;
                         }
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
 
-                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                if (state.nodes.items.len >= collection_limit) break;
             }
         }
 
@@ -3129,17 +4416,31 @@ fn executeDistributedTraverse(
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
 
-    if (graph_query.query.include_documents) {
+    const truncated = graph_query_mod.resultCountIsTruncated(state.nodes.items.len, result_limit);
+    if (truncated) {
+        const public_len: usize = @intCast(result_limit);
+        for (state.nodes.items[public_len..]) |*node| node.deinit(alloc);
+        state.nodes.items.len = public_len;
+    }
+
+    const hydration_requested = graphResultHydrationRequested(req, graph_query.query);
+    if (hydration_requested) {
         worker.reachLifecycle(.{
             .phase = .hydration_started,
             .query_name = graph_query.name,
             .result_count = state.nodes.items.len,
         });
-        state.hits = try adoptHydratedHits(
-            alloc,
-            state.hits,
-            try hydrateHitsForResultNodes(alloc, admission, state.nodes.items),
-        );
+    }
+    const hydrated_hits = if (hydration_requested)
+        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
+    state.hits = try adoptHydratedHits(
+        alloc,
+        state.hits,
+        hydrated_hits,
+    );
+    if (hydration_requested) {
         worker.reachLifecycle(.{
             .phase = .hydration_completed,
             .query_name = graph_query.name,
@@ -3165,6 +4466,7 @@ fn executeDistributedTraverse(
         .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
         .hits = hits,
         .total_hits = total_hits,
+        .truncated = truncated,
     };
 }
 
@@ -3179,9 +4481,24 @@ fn executeDistributedShortestPath(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
-    var path_result = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, null, null, null);
+    var path_result = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, request_work_budget, null, null, null);
     defer if (path_result) |*result| result.deinit(alloc);
+
+    var output_retained_bytes: usize = 0;
+    if (path_result) |result| {
+        output_retained_bytes = graphResultNodeFromPathRetainedBytes(result.path) catch
+            return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+        output_retained_bytes = std.math.add(
+            usize,
+            output_retained_bytes,
+            graphPathRetainedBytes(result.path) catch
+                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+        ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+    }
+    var output_lease = try graph_work_budget.RetainedLease.init(request_work_budget, output_retained_bytes);
+    errdefer output_lease.deinit();
 
     const nodes = if (path_result) |result| blk: {
         var node = try graphPathToResultNode(alloc, result.path);
@@ -3195,19 +4512,33 @@ fn executeDistributedShortestPath(
         alloc.free(nodes);
     };
 
-    const hits = if (graph_query.query.include_documents)
-        try hydrateHitsForResultNodes(alloc, admission, nodes)
+    const paths = if (path_result) |result| blk: {
+        const out = try alloc.alloc(db_mod.types.GraphPath, 1);
+        errdefer alloc.free(out);
+        out[0] = try cloneGraphPath(alloc, result.path);
+        break :blk out;
+    } else @constCast((&[_]db_mod.types.GraphPath{})[0..]);
+    errdefer {
+        for (paths) |path| graph_paths_mod.freePath(alloc, path);
+        if (paths.len > 0) alloc.free(paths);
+    }
+
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
-        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+        try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
     }
 
+    const name = try alloc.dupe(u8, graph_query.name);
+    errdefer alloc.free(name);
+    output_lease.consume();
     return .{
-        .name = try alloc.dupe(u8, graph_query.name),
+        .name = name,
         .nodes = nodes,
-        .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
+        .paths = paths,
         .hits = hits,
         .total_hits = if (path_result != null) 1 else 0,
     };
@@ -3224,9 +4555,11 @@ fn executeDistributedKShortestPaths(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
     const start_nodes = try resolveSelectorNodes(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
@@ -3235,6 +4568,7 @@ fn executeDistributedKShortestPaths(
     defer freeNodeIdentities(alloc, start_nodes);
     const target_nodes = try resolveSelectorNodes(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
@@ -3245,12 +4579,16 @@ fn executeDistributedKShortestPaths(
     if (start_nodes.len != 1 or target_nodes.len != 1)
         return error.UnsupportedQueryRequest;
 
-    var results = std.ArrayListUnmanaged(db_mod.types.GraphPath).empty;
+    var results_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer results_lease.deinit();
+    var results = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer results.deinit(alloc);
     errdefer {
-        for (results.items) |path| graph_paths_mod.freePath(alloc, path);
+        for (results.items) |*path| path.deinit(alloc);
     }
 
+    var seen_paths_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer seen_paths_lease.deinit();
     var seen_paths = std.StringHashMapUnmanaged(void).empty;
     defer {
         var it = seen_paths.keyIterator();
@@ -3258,7 +4596,7 @@ fn executeDistributedKShortestPaths(
         seen_paths.deinit(alloc);
     }
 
-    const first = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, null, null, null);
+    const first = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, request_work_budget, null, null, null);
     if (first == null) {
         return .{
             .name = try alloc.dupe(u8, graph_query.name),
@@ -3269,30 +4607,45 @@ fn executeDistributedKShortestPaths(
         };
     }
     var first_result = first.?;
-    defer first_result.deinit(alloc);
-    const first_path = try cloneGraphPath(alloc, first_result.path);
-    results.append(alloc, first_path) catch |err| {
-        graph_paths_mod.freePath(alloc, first_path);
+    var first_result_owned = true;
+    defer if (first_result_owned) first_result.deinit(alloc);
+    var first_path = first_result.take();
+    first_result_owned = false;
+    ensureBudgetedPathListCapacity(
+        alloc,
+        &results,
+        &results_lease,
+        request_work_budget,
+    ) catch |err| {
+        first_path.deinit(alloc);
         return err;
     };
-    const first_key = try graphPathToKey(alloc, first_result.path);
-    seen_paths.put(alloc, first_key, {}) catch |err| {
-        alloc.free(first_key);
-        return err;
-    };
+    results.appendAssumeCapacity(first_path);
+    const first_identity_inserted = try insertGraphPathIdentity(
+        alloc,
+        &seen_paths,
+        &seen_paths_lease,
+        first_path.path,
+        request_work_budget,
+    );
+    if (!first_identity_inserted) return error.InvalidQueryResult;
 
-    var candidates = std.ArrayListUnmanaged(db_mod.types.GraphPath).empty;
+    var candidates_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer candidates_lease.deinit();
+    var candidates = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer {
-        for (candidates.items) |path| graph_paths_mod.freePath(alloc, path);
+        for (candidates.items) |*path| path.deinit(alloc);
         candidates.deinit(alloc);
     }
 
     var ki: u32 = 1;
     while (ki < graph_query.query.k) : (ki += 1) {
-        const prev_path = &results.items[results.items.len - 1];
+        const prev_path = &results.items[results.items.len - 1].path;
         if (prev_path.nodes.len <= 1) break;
 
         for (0..prev_path.nodes.len - 1) |spur_idx| {
+            var excluded_edges_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+            defer excluded_edges_lease.deinit();
             var excluded_edges = std.StringHashMapUnmanaged(void).empty;
             defer {
                 var eit = excluded_edges.keyIterator();
@@ -3300,39 +4653,45 @@ fn executeDistributedKShortestPaths(
                 excluded_edges.deinit(alloc);
             }
 
+            var excluded_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+            defer excluded_nodes_lease.deinit();
             var excluded_nodes = graph_node_identity.Map(void){};
             defer excluded_nodes.deinit(alloc);
 
-            for (results.items) |result_path| {
+            for (results.items) |result| {
+                const result_path = result.path;
                 if (result_path.nodes.len <= spur_idx + 1) continue;
                 if (!rootPathMatches(prev_path.*, result_path, spur_idx)) continue;
 
-                const edge_key = try allocEdgeExclusionKey(
+                _ = try insertExcludedEdgeIdentity(
                     alloc,
-                    graphPathNodeTable(result_path, spur_idx) orelse table_name,
-                    result_path.nodes[spur_idx],
-                    result_path.nodes[spur_idx + 1],
+                    &excluded_edges,
+                    &excluded_edges_lease,
+                    request_work_budget,
+                    .{
+                        .table = graphPathNodeTable(result_path, spur_idx) orelse table_name,
+                        .key = result_path.nodes[spur_idx],
+                    },
+                    .{
+                        .table = graphPathNodeTable(result_path, spur_idx + 1) orelse table_name,
+                        .key = result_path.nodes[spur_idx + 1],
+                    },
+                    if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].traversal_direction else null,
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
                 );
-                if (!excluded_edges.contains(edge_key)) {
-                    excluded_edges.put(alloc, edge_key, {}) catch |err| {
-                        alloc.free(edge_key);
-                        return err;
-                    };
-                } else {
-                    alloc.free(edge_key);
-                }
             }
 
             for (0..spur_idx) |i| {
                 const node_key = prev_path.nodes[i];
-                _ = try excluded_nodes.putIfAbsent(
+                _ = try insertExcludedNodeIdentity(
                     alloc,
+                    &excluded_nodes,
+                    &excluded_nodes_lease,
+                    request_work_budget,
                     .{
-                        .table = graphPathNodeTable(prev_path.*, i),
+                        .table = graphPathNodeTable(prev_path.*, i) orelse table_name,
                         .key = node_key,
                     },
-                    {},
                 );
             }
 
@@ -3348,6 +4707,9 @@ fn executeDistributedKShortestPaths(
             spur_query.query.start_nodes = .{ .keys = &.{spur_start} };
             spur_query.query.query_type = .shortest_path;
             spur_query.query.k = 1;
+            const root_hops: u32 = @intCast(spur_idx);
+            if (root_hops >= graph_query.query.params.max_depth) continue;
+            spur_query.query.params.max_depth = graph_query.query.params.max_depth - root_hops;
 
             var spur = try findDistributedShortestPath(
                 alloc,
@@ -3360,6 +4722,7 @@ fn executeDistributedKShortestPaths(
                 spur_query,
                 consistency,
                 admission,
+                request_work_budget,
                 graphPathNodeTable(prev_path.*, spur_idx),
                 &excluded_nodes,
                 &excluded_edges,
@@ -3367,43 +4730,70 @@ fn executeDistributedKShortestPaths(
             defer if (spur) |*result| result.deinit(alloc);
             if (spur == null) continue;
 
-            const total_path = try joinDistributedPaths(
+            var total_path = try joinDistributedPathsBudgeted(
                 alloc,
                 root_prefix,
                 root_table_prefix,
                 root_edges,
                 spur.?.path,
+                request_work_budget,
             );
             var total_path_owned = true;
-            errdefer if (total_path_owned) graph_paths_mod.freePath(alloc, total_path);
-            const pkey = try graphPathToKey(alloc, total_path);
-            if (!seen_paths.contains(pkey)) {
-                seen_paths.put(alloc, pkey, {}) catch |err| {
-                    alloc.free(pkey);
+            errdefer if (total_path_owned) total_path.deinit(alloc);
+            if (total_path.path.length > graph_query.query.params.max_depth) {
+                total_path.deinit(alloc);
+                total_path_owned = false;
+                continue;
+            }
+            if (try insertGraphPathIdentity(
+                alloc,
+                &seen_paths,
+                &seen_paths_lease,
+                total_path.path,
+                request_work_budget,
+            )) {
+                ensureBudgetedPathListCapacity(
+                    alloc,
+                    &candidates,
+                    &candidates_lease,
+                    request_work_budget,
+                ) catch |err| {
                     return err;
                 };
-                candidates.append(alloc, total_path) catch |err| {
-                    _ = seen_paths.remove(pkey);
-                    alloc.free(pkey);
-                    return err;
-                };
+                candidates.appendAssumeCapacity(total_path);
                 total_path_owned = false;
             } else {
-                alloc.free(pkey);
-                graph_paths_mod.freePath(alloc, total_path);
+                total_path.deinit(alloc);
                 total_path_owned = false;
             }
         }
 
         if (candidates.items.len == 0) break;
-        const best_idx = bestPathIndex(candidates.items, graph_query.query.params.weight_mode);
-        const best = candidates.swapRemove(best_idx);
-        results.append(alloc, best) catch |err| {
-            graph_paths_mod.freePath(alloc, best);
+        const best_idx = bestBudgetedPathIndex(candidates.items, graph_query.query.params.weight_mode);
+        var best = candidates.swapRemove(best_idx);
+        ensureBudgetedPathListCapacity(
+            alloc,
+            &results,
+            &results_lease,
+            request_work_budget,
+        ) catch |err| {
+            best.deinit(alloc);
             return err;
         };
+        results.appendAssumeCapacity(best);
     }
 
+    var out_nodes_retained_bytes: usize = 0;
+    for (results.items) |result| {
+        out_nodes_retained_bytes = std.math.add(
+            usize,
+            out_nodes_retained_bytes,
+            graphResultNodeFromPathRetainedBytes(result.path) catch
+                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+        ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+    }
+    var out_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, out_nodes_retained_bytes);
+    errdefer out_nodes_lease.deinit();
     const out_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, results.items.len);
     var out_nodes_initialized: usize = 0;
     errdefer {
@@ -3411,29 +4801,40 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_nodes);
     }
     for (results.items, 0..) |path, i| {
-        out_nodes[i] = try graphPathToResultNode(alloc, path);
+        out_nodes[i] = try graphPathToResultNode(alloc, path.path);
         out_nodes_initialized += 1;
     }
 
     const out_paths = try alloc.alloc(db_mod.types.GraphPath, results.items.len);
-    for (results.items, 0..) |path, i| out_paths[i] = path;
+    var final_paths_lease = graph_work_budget.RetainedLease{ .budget = request_work_budget };
+    errdefer final_paths_lease.deinit();
+    for (results.items, 0..) |*path, i| {
+        out_paths[i] = path.path;
+        final_paths_lease.bytes += path.retained_lease.bytes;
+        path.retained_lease = .{};
+        path.* = undefined;
+    }
     results.clearRetainingCapacity();
     errdefer {
         for (out_paths) |path| graph_paths_mod.freePath(alloc, path);
         alloc.free(out_paths);
     }
 
-    const hits = if (graph_query.query.include_documents)
-        try hydrateHitsForResultNodes(alloc, admission, out_nodes)
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
-        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+        try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
     }
 
+    const name = try alloc.dupe(u8, graph_query.name);
+    errdefer alloc.free(name);
+    final_paths_lease.consume();
+    out_nodes_lease.consume();
     return .{
-        .name = try alloc.dupe(u8, graph_query.name),
+        .name = name,
         .nodes = out_nodes,
         .paths = out_paths,
         .hits = hits,
@@ -3443,12 +4844,357 @@ fn executeDistributedKShortestPaths(
 
 const ShortestPathResult = struct {
     path: db_mod.types.GraphPath,
+    retained_lease: graph_work_budget.RetainedLease,
 
     fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
+        self.retained_lease.deinit();
+        self.* = undefined;
+    }
+
+    fn take(self: *ShortestPathResult) BudgetedGraphPath {
+        const out = BudgetedGraphPath{
+            .path = self.path,
+            .retained_lease = self.retained_lease,
+        };
+        self.* = undefined;
+        return out;
+    }
+};
+
+const BudgetedGraphPath = struct {
+    path: db_mod.types.GraphPath,
+    retained_lease: graph_work_budget.RetainedLease,
+
+    fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
+        graph_paths_mod.freePath(alloc, self.path);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
+
+fn growRetainedLease(
+    lease: *graph_work_budget.RetainedLease,
+    added_bytes: usize,
+    budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    const previous = lease.bytes;
+    const next = std.math.add(usize, previous, added_bytes) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    try lease.resize(next);
+    return previous;
+}
+
+const RetainedHashGrowth = struct {
+    capacity: usize,
+    bytes: usize,
+};
+
+fn retainedHashGrowth(
+    comptime Key: type,
+    comptime Value: type,
+    current_capacity: usize,
+    next_count: usize,
+) !RetainedHashGrowth {
+    const target_capacity = try graph_work_budget.hashMapCapacityForCount(
+        next_count,
+        std.hash_map.default_max_load_percentage,
+    );
+    if (target_capacity <= current_capacity) return .{
+        .capacity = current_capacity,
+        .bytes = 0,
+    };
+    const current_bytes = try graph_work_budget.hashMapRetainedBytes(
+        Key,
+        Value,
+        current_capacity,
+    );
+    const target_bytes = try graph_work_budget.hashMapRetainedBytes(
+        Key,
+        Value,
+        target_capacity,
+    );
+    return .{
+        .capacity = target_capacity,
+        .bytes = target_bytes - current_bytes,
+    };
+}
+
+fn restoreRetainedLease(
+    lease: *graph_work_budget.RetainedLease,
+    previous: usize,
+) void {
+    lease.resize(previous) catch unreachable;
+}
+
+fn ensureBudgetedPathListCapacity(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(BudgetedGraphPath),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+) !void {
+    if (list.items.len < list.capacity) return;
+    const next_capacity = std.math.add(usize, list.items.len, 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.mul(usize, next_capacity, @sizeOf(BudgetedGraphPath)) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = lease.bytes;
+    try lease.resize(retained_bytes);
+    list.ensureTotalCapacityPrecise(alloc, next_capacity) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+}
+
+fn insertGraphPathIdentity(
+    alloc: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    lease: *graph_work_budget.RetainedLease,
+    path: db_mod.types.GraphPath,
+    budget: *graph_pattern_mod.WorkBudget,
+) !bool {
+    const key_len = try graphPathIdentityEncodedLen(path);
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        []const u8,
+        void,
+        set.capacity(),
+        next_count,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.add(
+        usize,
+        key_len,
+        growth.bytes,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    const key = graphPathToKey(alloc, path) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    if (set.contains(key)) {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return false;
+    }
+    set.ensureTotalCapacity(alloc, @intCast(next_count)) catch |err| {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putAssumeCapacityNoClobber(key, {});
+    return true;
+}
+
+fn insertExcludedNodeIdentity(
+    alloc: std.mem.Allocator,
+    set: *graph_node_identity.Map(void),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+    identity: graph_node_identity.Ref,
+) !bool {
+    if (set.contains(identity)) return false;
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        graph_node_identity.Key,
+        void,
+        set.capacity(),
+        next_count,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    var key_bytes = identity.key.len;
+    if (identity.table) |table| key_bytes = std.math.add(usize, key_bytes, table.len) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.add(usize, key_bytes, growth.bytes) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    var owned = graph_node_identity.Key.init(alloc, identity) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    set.ensureTotalCapacity(alloc, next_count) catch |err| {
+        owned.deinit(alloc);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putOwnedAssumeCapacityNoClobber(owned, {});
+    return true;
+}
+
+fn insertExcludedEdgeIdentity(
+    alloc: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
+    edge_type: []const u8,
+) !bool {
+    const key_len = try edgeExclusionIdentityEncodedLen(from, to, direction, edge_type);
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        []const u8,
+        void,
+        set.capacity(),
+        next_count,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.add(
+        usize,
+        key_len,
+        growth.bytes,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    const key = allocEdgeExclusionKey(alloc, from, to, direction, edge_type) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    if (set.contains(key)) {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return false;
+    }
+    set.ensureTotalCapacity(alloc, @intCast(next_count)) catch |err| {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putAssumeCapacityNoClobber(key, {});
+    return true;
+}
+
+test "Yen scratch reservations fail before allocation and release exactly" {
+    const alloc = std.testing.allocator;
+    var path_nodes = [_][]const u8{ "a", "b" };
+    const path = db_mod.types.GraphPath{
+        .nodes = &path_nodes,
+        .edges = &.{},
+        .total_weight = 0,
+        .length = 1,
+    };
+
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    {
+        var paths_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer paths_lease.deinit();
+        var paths = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
+        defer paths.deinit(alloc);
+        try std.testing.expectError(
+            error.GraphWorkBudgetExceeded,
+            ensureBudgetedPathListCapacity(alloc, &paths, &paths_lease, &budget),
+        );
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
+        var seen_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer seen_lease.deinit();
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = seen.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            seen.deinit(alloc);
+        }
+        try std.testing.expectError(
+            error.GraphWorkBudgetExceeded,
+            insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget),
+        );
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+        try std.testing.expectEqual(@as(usize, 0), seen.count());
+
+        budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+        try ensureBudgetedPathListCapacity(alloc, &paths, &paths_lease, &budget);
+        try std.testing.expect(paths_lease.bytes >= @sizeOf(BudgetedGraphPath));
+        try std.testing.expect(try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
+        const expected_seen_bytes = try std.math.add(
+            usize,
+            try graphPathIdentityEncodedLen(path),
+            try graph_work_budget.hashMapRetainedBytes([]const u8, void, seen.capacity()),
+        );
+        try std.testing.expectEqual(expected_seen_bytes, seen_lease.bytes);
+        const seen_bytes = budget.retained_state_bytes;
+        try std.testing.expect(seen_bytes > 0);
+        try std.testing.expect(!try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
+        try std.testing.expectEqual(seen_bytes, budget.retained_state_bytes);
+
+        var excluded_nodes_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer excluded_nodes_lease.deinit();
+        var excluded_nodes = graph_node_identity.Map(void){};
+        defer excluded_nodes.deinit(alloc);
+        try std.testing.expect(try insertExcludedNodeIdentity(
+            alloc,
+            &excluded_nodes,
+            &excluded_nodes_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+        ));
+        const expected_node_bytes = try std.math.add(
+            usize,
+            "docs".len + "a".len,
+            try graph_work_budget.hashMapRetainedBytes(
+                graph_node_identity.Key,
+                void,
+                excluded_nodes.capacity(),
+            ),
+        );
+        try std.testing.expectEqual(expected_node_bytes, excluded_nodes_lease.bytes);
+        const node_bytes = budget.retained_state_bytes;
+        try std.testing.expect(!try insertExcludedNodeIdentity(
+            alloc,
+            &excluded_nodes,
+            &excluded_nodes_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+        ));
+        try std.testing.expectEqual(node_bytes, budget.retained_state_bytes);
+
+        var excluded_edges_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer excluded_edges_lease.deinit();
+        var excluded_edges = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = excluded_edges.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            excluded_edges.deinit(alloc);
+        }
+        try std.testing.expect(try insertExcludedEdgeIdentity(
+            alloc,
+            &excluded_edges,
+            &excluded_edges_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+            .{ .table = "docs", .key = "b" },
+            .out,
+            "links",
+        ));
+        const expected_edge_bytes = try std.math.add(
+            usize,
+            try edgeExclusionIdentityEncodedLen(
+                .{ .table = "docs", .key = "a" },
+                .{ .table = "docs", .key = "b" },
+                .out,
+                "links",
+            ),
+            try graph_work_budget.hashMapRetainedBytes([]const u8, void, excluded_edges.capacity()),
+        );
+        try std.testing.expectEqual(expected_edge_bytes, excluded_edges_lease.bytes);
+        const edge_bytes = budget.retained_state_bytes;
+        try std.testing.expect(!try insertExcludedEdgeIdentity(
+            alloc,
+            &excluded_edges,
+            &excluded_edges_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+            .{ .table = "docs", .key = "b" },
+            .out,
+            "links",
+        ));
+        try std.testing.expectEqual(edge_bytes, budget.retained_state_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
 
 fn findDistributedShortestPath(
     alloc: std.mem.Allocator,
@@ -3461,30 +5207,36 @@ fn findDistributedShortestPath(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
     start_table_override: ?[]const u8,
     excluded_nodes: ?*graph_node_identity.Map(void),
     excluded_edges: ?*const std.StringHashMapUnmanaged(void),
 ) !?ShortestPathResult {
     const algebraic_semiring_selected = graph_query.query.params.algebraic_semiring or
         try catalogGraphIndexEnablesAlgebraicSemiring(alloc, catalog, table_name, graph_query.query.index_name);
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     defer state.deinit(alloc);
 
     var target_set = try TargetNodeSet.init(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
         graph_query.query.target_nodes.?,
+        request_work_budget,
     );
     defer target_set.deinit(alloc);
 
-    var frontier = std.ArrayListUnmanaged(FrontierState).empty;
+    var frontier = std.PriorityQueue(FrontierState, void, frontierStateOrder).initContext({});
     defer {
         for (frontier.items) |*item| item.deinit(alloc);
         frontier.deinit(alloc);
     }
-    const roots = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, true);
+    const roots = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, true);
     defer freeFrontier(alloc, roots);
     if (start_table_override) |table| {
         try overrideFrontierTables(alloc, &state, roots, table);
@@ -3492,13 +5244,14 @@ fn findDistributedShortestPath(
     const admitted_roots = try frontierAdmissionMaskAlloc(alloc, admission, roots);
     defer alloc.free(admitted_roots);
 
-    var best_cost = graph_node_identity.Map(f64){};
+    const max_depth = graph_query.query.params.max_depth;
+    var best_cost = PathCostLabels.init(max_depth, request_work_budget);
     defer best_cost.deinit(alloc);
 
     for (roots, admitted_roots) |item, allowed| {
         if (!allowed) continue;
         if (excluded_nodes) |set| {
-            if (set.contains(.{ .table = item.table, .key = item.key })) continue;
+            if (set.contains(.{ .table = item.table orelse table_name, .key = item.key })) continue;
         }
         var owned_item = try initFrontierState(
             alloc,
@@ -3508,37 +5261,40 @@ fn findDistributedShortestPath(
             item.distance,
             item.cost,
             item.path_state_id,
+            request_work_budget,
         );
         errdefer owned_item.deinit(alloc);
-        try frontier.append(alloc, owned_item);
-        _ = try best_cost.putIfAbsent(
+        try frontier.push(alloc, owned_item);
+        try request_work_budget.consumeNode();
+        try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
+        _ = try best_cost.recordIfPareto(
             alloc,
             .{ .table = item.table, .key = item.key },
+            item.depth,
             item.cost,
         );
     }
 
-    var settled = graph_node_identity.Map(void){};
-    defer settled.deinit(alloc);
-
-    const max_depth = graph_query.query.params.max_depth;
-    while (frontier.items.len > 0) {
-        const best_index = popBestFrontierIndex(frontier.items);
-        var item = frontier.swapRemove(best_index);
+    while (frontier.pop()) |popped| {
+        var item = popped;
         defer item.deinit(alloc);
 
         const item_ref = graph_node_identity.Ref{ .table = item.table, .key = item.key };
-        if (settled.contains(item_ref)) continue;
+        if (!best_cost.isCurrentPareto(item_ref, item.depth, item.cost)) continue;
         if (excluded_nodes) |set| {
-            if (set.contains(item_ref) and item.depth > 0) continue;
+            if (set.contains(.{ .table = item.table orelse table_name, .key = item.key }) and item.depth > 0) continue;
         }
-        _ = try settled.putIfAbsent(alloc, item_ref, {});
 
         if (target_set.contains(item.table, item.key) and item.depth > 0) {
             const path_state_id = item.path_state_id orelse return error.InvalidQueryRequest;
-            const path = try pathStateToGraphPath(alloc, state.path_states.items, path_state_id);
-            errdefer graph_paths_mod.freePath(alloc, path);
-            return .{ .path = path };
+            var path_result = try pathStateToGraphPath(
+                alloc,
+                state.path_states.items,
+                path_state_id,
+                request_work_budget,
+            );
+            errdefer path_result.deinit(alloc);
+            return path_result;
         }
 
         if (max_depth > 0 and item.depth >= max_depth) continue;
@@ -3546,6 +5302,7 @@ fn findDistributedShortestPath(
         const expansion_table = item.table orelse table_name;
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
+        if (!(try admission.graphIndexAvailable(table_state, graph_query.query.index_name))) continue;
         const group_id = (try table_catalog.resolveGroupForKeyPinned(
             alloc,
             catalog,
@@ -3554,7 +5311,22 @@ fn findDistributedShortestPath(
             table_state.topology_epoch,
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
-        const exclude_node_refs = try collectCombinedExcludeNodes(alloc, &settled, excluded_nodes);
+        // The caller-facing slices and GraphExpandRequest each own one copy of
+        // every exclusion. Reserve both peaks before the first allocation.
+        const exclusion_copy_bytes = excludedIdentityCopiesRetainedBytes(
+            excluded_nodes,
+            excluded_edges,
+            2,
+        ) catch return request_work_budget.exhaust(
+            .retained_state_bytes,
+            request_work_budget.max_retained_state_bytes,
+        );
+        var exclusion_copies_lease = try graph_work_budget.RetainedLease.init(
+            request_work_budget,
+            exclusion_copy_bytes,
+        );
+        defer exclusion_copies_lease.deinit();
+        const exclude_node_refs = try collectExcludedNodes(alloc, excluded_nodes);
         defer {
             for (exclude_node_refs) |*identity| identity.deinit(alloc);
             if (exclude_node_refs.len > 0) alloc.free(exclude_node_refs);
@@ -3569,6 +5341,7 @@ fn findDistributedShortestPath(
 
         var step_result = try worker.executeGraphExpand(alloc, group_id, expansion_table, step_req, consistency);
         defer step_result.deinit(alloc);
+        try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
         if (step_result.expansions.len == 0) continue;
         const step_graph = step_result.expansions[0].graph_result;
@@ -3588,19 +5361,17 @@ fn findDistributedShortestPath(
                 node.table,
             );
             const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
-            if (settled.contains(node_ref)) continue;
             if (excluded_nodes) |set| {
                 if (set.contains(node_ref)) continue;
             }
 
-            const candidate_cost = item.cost + edgeCost(
+            const candidate_cost = item.cost + try edgeCost(
                 item,
                 node,
                 graph_query.query.params.weight_mode,
             );
-            if (best_cost.get(node_ref)) |cost| {
-                if (candidate_cost >= cost) continue;
-            }
+            const candidate_depth = item.depth + 1;
+            if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
             const path_state_id = try appendPathStateFromWeightedStep(
                 alloc,
                 &state,
@@ -3610,11 +5381,6 @@ fn findDistributedShortestPath(
                 graph_query.query.params.weight_mode,
             );
             const path_state = state.path_states.items[path_state_id];
-            if (best_cost.getPtr(node_ref)) |cost| {
-                cost.* = path_state.cost;
-            } else {
-                _ = try best_cost.putIfAbsent(alloc, node_ref, path_state.cost);
-            }
 
             var next_item = try initFrontierState(
                 alloc,
@@ -3624,9 +5390,11 @@ fn findDistributedShortestPath(
                 path_state.distance,
                 path_state.cost,
                 path_state_id,
+                request_work_budget,
             );
             errdefer next_item.deinit(alloc);
-            try frontier.append(alloc, next_item);
+            try frontier.push(alloc, next_item);
+            try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
         }
     }
 
@@ -3636,19 +5404,15 @@ fn findDistributedShortestPath(
 fn supportsSelectorRef(req: db_mod.types.SearchRequest, selector: graph_query_mod.NodeSelector) bool {
     return switch (selector) {
         .keys => true,
+        .identities => true,
         .result_ref => |result_ref| supportsResultRef(req, result_ref.ref),
     };
 }
 
 fn supportsResultRef(req: db_mod.types.SearchRequest, ref: []const u8) bool {
+    _ = req;
     if (std.mem.startsWith(u8, ref, "$graph_results.")) return true;
-    if (!std.mem.eql(u8, ref, "$fused_results") and
-        !std.mem.eql(u8, ref, "$full_text_results") and
-        !std.mem.eql(u8, ref, "$embeddings_results"))
-    {
-        return false;
-    }
-    return req.full_text_queries.len == 0 and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.merge_config == null;
+    return std.mem.eql(u8, ref, "$query_results");
 }
 
 fn appendFrontierBatch(
@@ -3704,6 +5468,7 @@ fn batchFrontierByGroup(
         const table_name = item.table orelse source_table;
         const table_state = try admission.ensureTable(table_name);
         if (!table_state.allowed) return error.TableNotFound;
+        if (!(try admission.graphIndexAvailable(table_state, index_name))) continue;
         switch (direction) {
             .out => {
                 const group_id = (try table_catalog.resolveGroupForKeyPinned(
@@ -4817,28 +6582,52 @@ fn collectSeenNodes(
     return out;
 }
 
-fn collectCombinedExcludeNodes(
+fn excludedIdentityCopiesRetainedBytes(
+    excluded_nodes: ?*graph_node_identity.Map(void),
+    excluded_edges: ?*const std.StringHashMapUnmanaged(void),
+    copies: usize,
+) !usize {
+    var one_copy: usize = 0;
+    if (excluded_nodes) |set| {
+        one_copy = try std.math.add(
+            usize,
+            one_copy,
+            try std.math.mul(usize, set.count(), @sizeOf(GraphNodeIdentity)),
+        );
+        var node_it = set.iterator();
+        while (node_it.next()) |entry| {
+            one_copy = try std.math.add(usize, one_copy, entry.key_ptr.key().len);
+            if (entry.key_ptr.table()) |table| {
+                one_copy = try std.math.add(usize, one_copy, table.len);
+            }
+        }
+    }
+    if (excluded_edges) |set| {
+        one_copy = try std.math.add(
+            usize,
+            one_copy,
+            try std.math.mul(usize, set.count(), @sizeOf([]u8)),
+        );
+        var edge_it = set.keyIterator();
+        while (edge_it.next()) |key| {
+            one_copy = try std.math.add(usize, one_copy, key.*.len);
+        }
+    }
+    return try std.math.mul(usize, one_copy, copies);
+}
+
+fn collectExcludedNodes(
     alloc: std.mem.Allocator,
-    settled: *graph_node_identity.Map(void),
     excluded_nodes: ?*graph_node_identity.Map(void),
 ) ![]GraphNodeIdentity {
-    const extra_count = if (excluded_nodes) |set| set.count() else 0;
-    const out = try alloc.alloc(GraphNodeIdentity, settled.count() + extra_count);
+    const count = if (excluded_nodes) |set| set.count() else 0;
+    const out = try alloc.alloc(GraphNodeIdentity, count);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |*identity| identity.deinit(alloc);
         alloc.free(out);
     }
 
-    var settled_it = settled.iterator();
-    while (settled_it.next()) |entry| {
-        out[initialized] = try cloneGraphNodeIdentityParts(
-            alloc,
-            entry.key_ptr.key(),
-            entry.key_ptr.table(),
-        );
-        initialized += 1;
-    }
     if (excluded_nodes) |set| {
         var node_it = set.iterator();
         while (node_it.next()) |entry| {
@@ -4883,15 +6672,31 @@ fn adoptHydratedHits(
     for (owned_old_hits.items) |*hit| hit.deinit(alloc);
     owned_old_hits.deinit(alloc);
     var out = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (new_hits) |*hit| hit.deinit(alloc);
+        if (new_hits.len > 0) alloc.free(new_hits);
+    }
     try out.appendSlice(alloc, new_hits);
     if (new_hits.len > 0) alloc.free(new_hits);
     return out;
+}
+
+fn graphResultHydrationRequested(
+    req: db_mod.types.SearchRequest,
+    query: graph_query_mod.GraphQuery,
+) bool {
+    // Expansion consumes hydrated graph hits internally. Otherwise the public
+    // include_documents flag is the sole authority for stored-data reads and
+    // response documents.
+    return query.include_documents or req.expand_strategy != null;
 }
 
 fn hydrateHitsForResultNodes(
     alloc: std.mem.Allocator,
     admission: *GraphNodeAdmissionContext,
     nodes: []const graph_query_mod.GraphResultNode,
+    include_all_fields: bool,
+    fields: []const []const u8,
 ) ![]db_mod.types.SearchHit {
     // Most nodes are hydrated from the query table. Mention/DocRef edges carry a
     // cross-table endpoint (`node.table`, e.g. the canonical "entities" table)
@@ -4926,6 +6731,8 @@ fn hydrateHitsForResultNodes(
             state.resolved_doc_filter,
             state.resolved_doc_filter_wire_context,
             true,
+            include_all_fields,
+            fields,
             keys,
             admission.consistency,
         );
@@ -4979,6 +6786,8 @@ fn hydrateHitsForResultNodes(
             state.resolved_doc_filter,
             state.resolved_doc_filter_wire_context,
             true,
+            include_all_fields,
+            fields,
             entry.value_ptr.items,
             admission.consistency,
         );
@@ -5035,6 +6844,8 @@ fn hydrateHitsForKeys(
     resolved_doc_filter: ?*const anyopaque,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext,
     include_stored: bool,
+    include_all_fields: bool,
+    fields: []const []const u8,
     keys: []const []const u8,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.SearchHit {
@@ -5094,6 +6905,8 @@ fn hydrateHitsForKeys(
                 req.filter_query_json = filter_query_json;
                 req.exclusion_query_json = exclusion_query_json;
                 req.include_stored = include_stored;
+                req.include_all_fields = include_all_fields;
+                req.fields = fields;
                 req.resolved_doc_filter = resolved_doc_filter;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context;
                 defer req.deinit(alloc);
@@ -5144,6 +6957,8 @@ fn hydrateHitsForKeys(
                 resolved_doc_filter_inner: ?*const anyopaque,
                 resolved_doc_filter_wire_context_inner: ?db_mod.types.ResolvedDocFilterWireContext,
                 include_stored_inner: bool,
+                include_all_fields_inner: bool,
+                fields_inner: []const []const u8,
                 consistency_inner: raft_mod.ReadConsistency,
             ) void {
                 const arena = slot.arena.allocator();
@@ -5159,6 +6974,8 @@ fn hydrateHitsForKeys(
                 req.filter_query_json = filter_query_json_inner;
                 req.exclusion_query_json = exclusion_query_json_inner;
                 req.include_stored = include_stored_inner;
+                req.include_all_fields = include_all_fields_inner;
+                req.fields = fields_inner;
                 req.resolved_doc_filter = resolved_doc_filter_inner;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context_inner;
                 slot.result = worker_inner.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
@@ -5173,7 +6990,7 @@ fn hydrateHitsForKeys(
             const end = @min(start + graph_fanout_plan.width, entries.len);
             var group: std.Io.Group = .init;
             for (entries[start..end], start..end) |entry, i| {
-                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, consistency });
+                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
             }
             worker.reachLifecycle(.{
                 .phase = .hydration_fanout_started,
@@ -5209,6 +7026,8 @@ fn hydrateHitsForKeys(
         req.filter_query_json = filter_query_json;
         req.exclusion_query_json = exclusion_query_json;
         req.include_stored = include_stored;
+        req.include_all_fields = include_all_fields;
+        req.fields = fields;
         req.resolved_doc_filter = resolved_doc_filter;
         req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context;
         defer req.deinit(alloc);
@@ -5614,6 +7433,8 @@ pub fn encodeGraphHydrateRequest(alloc: std.mem.Allocator, req: GraphHydrateRequ
         ._filter_query_json = req.filter_query_json,
         ._exclusion_query_json = req.exclusion_query_json,
         .include_stored = req.include_stored,
+        .fields = req.fields,
+        .include_all_fields = req.include_all_fields,
         .include_hits = req.include_hits,
         .incoming_index_name = req.incoming_index_name,
         .incoming_index_incarnation = req.incoming_index_identity.incarnation,
@@ -5652,6 +7473,8 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
     else
         &.{};
     errdefer if (incoming_index_name.len > 0) alloc.free(incoming_index_name);
+    const fields = try dupConstStrings(alloc, parsed.value.fields);
+    errdefer freeConstStrings(alloc, fields);
 
     const out = GraphHydrateRequest{
         .keys = keys,
@@ -5662,6 +7485,9 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
         .exclusion_query_json = exclusion_query_json,
         .exclusion_query_json_owned = exclusion_query_json.len > 0,
         .include_stored = parsed.value.include_stored,
+        .fields = fields,
+        .fields_owned = fields.len > 0,
+        .include_all_fields = parsed.value.include_all_fields,
         .include_hits = parsed.value.include_hits,
         .incoming_index_name = incoming_index_name,
         .incoming_index_identity = .{
@@ -5744,6 +7570,7 @@ fn identityGenerationFromResolvedFilterEnvelope(
 
 pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
     try validateGraphEdgesTensorAccessPath(alloc, req);
+    try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes);
     var fragment_names: ?[][]const u8 = null;
     defer if (fragment_names) |names| alloc.free(names);
     var output_dim_names: ?[][]const u8 = null;
@@ -5765,6 +7592,8 @@ pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest)
         },
         .topology_epoch = req.topology_epoch,
         .identity_read_generation = req.identity_read_generation,
+        .max_edges = req.max_edges,
+        .max_owned_bytes = req.max_owned_bytes,
         .tensor_access_path = try graphTensorAccessPathJsonAlloc(alloc, tensor_path, &fragment_names, &output_dim_names, &law_names),
         .tensor_program = tensor_program_json.value,
     });
@@ -5783,6 +7612,7 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
         tensor_access_path,
         &tensor_program,
     );
+    try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes);
     return .{
         .index_name = try alloc.dupe(u8, parsed.value.index_name),
         .key = try alloc.dupe(u8, parsed.value.key),
@@ -5795,9 +7625,17 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
             .out,
         .topology_epoch = parsed.value.topology_epoch,
         .identity_read_generation = parsed.value.identity_read_generation,
+        .max_edges = parsed.value.max_edges,
+        .max_owned_bytes = parsed.value.max_owned_bytes,
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
+}
+
+fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32) !void {
+    if (max_edges == 0 or max_edges > graph_pattern_mod.default_max_explored_edges or
+        max_owned_bytes == 0 or max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
+        return error.InvalidQueryRequest;
 }
 
 fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge {
@@ -5845,17 +7683,52 @@ pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !Grap
     return .{ .edges = edges };
 }
 
-fn popBestFrontierIndex(frontier: []const FrontierState) usize {
-    var best_index: usize = 0;
-    var i: usize = 1;
-    while (i < frontier.len) : (i += 1) {
-        if (frontier[i].cost < frontier[best_index].cost) {
-            best_index = i;
-        } else if (frontier[i].cost == frontier[best_index].cost and frontier[i].depth < frontier[best_index].depth) {
-            best_index = i;
+/// Charge coordinator-side work from the complete fan-out response, before
+/// admission or deduplication can hide it. This keeps rejected candidates and
+/// every Yen spur search inside the same request-owned budget.
+fn consumeDistributedExpansionWork(
+    budget: *graph_pattern_mod.WorkBudget,
+    expansions: []const GraphExpansion,
+) !void {
+    var node_count: usize = 0;
+    var owned_bytes: usize = 0;
+    for (expansions) |expansion| {
+        for (expansion.graph_result.nodes) |node| {
+            node_count = std.math.add(usize, node_count, 1) catch
+                return budget.exhaust(.explored_nodes, graph_pattern_mod.default_max_explored_nodes);
+            owned_bytes = std.math.add(usize, owned_bytes, @sizeOf(graph_query_mod.GraphResultNode)) catch
+                return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            owned_bytes = std.math.add(usize, owned_bytes, node.key.len) catch
+                return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            if (node.table) |table| {
+                owned_bytes = std.math.add(usize, owned_bytes, table.len) catch
+                    return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            }
+            if (node.path_edges) |edges| {
+                for (edges) |edge| {
+                    owned_bytes = std.math.add(usize, owned_bytes, @sizeOf(graph_query_mod.PathEdgeInfo)) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.source.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.target.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.edge_type.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.metadata.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                }
+            }
         }
     }
-    return best_index;
+    try budget.consumeNodes(node_count);
+    try budget.consumeEdges(node_count);
+    try budget.consumeEdgeBytes(owned_bytes);
+}
+
+fn frontierStateOrder(_: void, a: FrontierState, b: FrontierState) std.math.Order {
+    const cost_order = std.math.order(a.cost, b.cost);
+    if (cost_order != .eq) return cost_order;
+    return std.math.order(a.depth, b.depth);
 }
 
 fn edgeWeightFromNode(node: graph_query_mod.GraphResultNode) f64 {
@@ -5879,6 +7752,11 @@ fn graphPathToResultNode(
         null;
     const nodes = try dupPath(alloc, path.nodes);
     errdefer freePathArray(alloc, nodes);
+    const node_tables = if (path.node_tables.len > 0)
+        try dupOptionalStrings(alloc, path.node_tables)
+    else
+        null;
+    errdefer if (node_tables) |value| freeOptionalStrings(alloc, value);
     const edges = if (path.edges.len > 0)
         try dupPathEdgesFromGraphPath(alloc, path.edges)
     else
@@ -5892,41 +7770,146 @@ fn graphPathToResultNode(
         path.length,
         path.total_weight,
         nodes,
+        node_tables,
         edges,
     );
+}
+
+fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+    var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
+    if (path.nodes.len > 0) {
+        const target_key = path.nodes[path.nodes.len - 1];
+        total = try std.math.add(usize, total, target_key.len);
+        const target_table: ?[]const u8 = if (graphPathNodeTable(path, path.nodes.len - 1)) |table|
+            table
+        else if (path.edges.len > 0 and std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
+            graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+        else
+            null;
+        if (target_table) |table|
+            total = try std.math.add(usize, total, table.len);
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.nodes.len, @sizeOf([]const u8)),
+    );
+    for (path.nodes) |node| total = try std.math.add(usize, total, node.len);
+    if (path.node_tables.len > 0) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, path.node_tables.len, @sizeOf(?[]const u8)),
+        );
+        for (path.node_tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.edges.len, @sizeOf(graph_query_mod.PathEdgeInfo)),
+    );
+    for (path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
 }
 
 fn pathStateToGraphPath(
     alloc: std.mem.Allocator,
     path_states: []const PathState,
     path_state_id: u32,
-) !db_mod.types.GraphPath {
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !ShortestPathResult {
+    const retained_bytes = graphPathFromStatesRetainedBytes(path_states, path_state_id) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const nodes = try reconstructPath(alloc, path_states, path_state_id);
     errdefer freePathArray(alloc, nodes);
     const node_tables = try reconstructPathTables(alloc, path_states, path_state_id);
     errdefer freeOptionalStrings(alloc, node_tables);
-    const edges_info = try reconstructPathEdges(alloc, path_states, path_state_id);
-    errdefer freePathEdges(alloc, edges_info);
-
-    const edges = try alloc.alloc(graph_paths_mod.PathEdge, edges_info.len);
-    var initialized: usize = 0;
+    const edges = try reconstructGraphPathEdges(alloc, path_states, path_state_id);
     errdefer {
-        for (edges[0..initialized]) |edge| freeOwnedGraphPathEdge(alloc, edge);
-        alloc.free(edges);
+        for (edges) |edge| freeOwnedGraphPathEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
     }
-    for (edges_info, 0..) |edge, i| {
-        edges[i] = try dupeGraphPathEdge(alloc, edge);
-        initialized += 1;
-    }
-    freePathEdges(alloc, edges_info);
 
     return .{
-        .nodes = nodes,
-        .node_tables = node_tables,
-        .edges = edges,
-        .total_weight = path_states[path_state_id].distance,
-        .length = @intCast(edges.len),
+        .path = .{
+            .nodes = nodes,
+            .node_tables = node_tables,
+            .edges = edges,
+            .total_weight = try graph_paths_mod.sumPathEdgeWeights(edges),
+            .length = @intCast(edges.len),
+        },
+        .retained_lease = retained_lease,
     };
+}
+
+fn graphPathFromStatesRetainedBytes(path_states: []const PathState, id: u32) !usize {
+    const node_count = pathLength(path_states, id);
+    const edge_count = pathEdgeLength(path_states, id);
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf([]const u8)),
+    );
+    var has_tables = false;
+    var cursor: ?u32 = id;
+    while (cursor) |current_id| {
+        const state = path_states[current_id];
+        total = try std.math.add(usize, total, state.key.len);
+        if (state.table) |table| {
+            has_tables = true;
+            total = try std.math.add(usize, total, table.len);
+        }
+        if (state.incoming_edge) |edge| {
+            total = try std.math.add(usize, total, edge.source.len);
+            total = try std.math.add(usize, total, edge.target.len);
+            total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.metadata.len);
+        }
+        cursor = state.parent;
+    }
+    if (has_tables) total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf(?[]const u8)),
+    );
+    return try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, edge_count, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+}
+
+fn reconstructGraphPathEdges(
+    alloc: std.mem.Allocator,
+    path_states: []const PathState,
+    id: u32,
+) ![]graph_paths_mod.PathEdge {
+    const out = try alloc.alloc(graph_paths_mod.PathEdge, pathEdgeLength(path_states, id));
+    var write_index: usize = out.len;
+    errdefer {
+        for (out[write_index..]) |edge| freeOwnedGraphPathEdge(alloc, edge);
+        if (out.len > 0) alloc.free(out);
+    }
+    var cursor: ?u32 = id;
+    while (cursor) |current_id| {
+        if (path_states[current_id].incoming_edge) |edge| {
+            const owned_edge = try dupeGraphPathEdge(alloc, edge);
+            write_index -= 1;
+            out[write_index] = owned_edge;
+        }
+        cursor = path_states[current_id].parent;
+    }
+    return out;
 }
 
 fn cloneGraphPath(
@@ -5956,6 +7939,38 @@ fn cloneGraphPath(
     };
 }
 
+fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.nodes.len, @sizeOf([]const u8)),
+    );
+    for (path.nodes) |node| total = try std.math.add(usize, total, node.len);
+    if (path.node_tables.len > 0) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, path.node_tables.len, @sizeOf(?[]const u8)),
+        );
+        for (path.node_tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.edges.len, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+    for (path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
+}
+
 fn dupeGraphPathEdge(
     alloc: std.mem.Allocator,
     edge: anytype,
@@ -5974,6 +7989,7 @@ fn dupeGraphPathEdge(
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = edge.traversal_direction,
     };
 }
 
@@ -6004,7 +8020,7 @@ fn dupPathEdgesFromGraphPath(
     return out;
 }
 
-fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 {
+fn graphPathIdentityEncodedLen(path: db_mod.types.GraphPath) !usize {
     var total_len: usize = 0;
     for (path.nodes, 0..) |node, i| {
         const table = graphPathNodeTable(path, i);
@@ -6019,7 +8035,21 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         total_len = std.math.add(usize, total_len, node.len) catch
             return error.PathIdentityTooLarge;
     }
+    for (path.edges) |edge| {
+        total_len = std.math.add(usize, total_len, 1) catch
+            return error.PathIdentityTooLarge;
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
+                return error.PathIdentityTooLarge;
+            total_len = std.math.add(usize, total_len, part.len) catch
+                return error.PathIdentityTooLarge;
+        }
+    }
+    return total_len;
+}
 
+fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 {
+    const total_len = try graphPathIdentityEncodedLen(path);
     const out = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
     for (path.nodes, 0..) |node, i| {
@@ -6038,7 +8068,25 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         @memcpy(out[pos..][0..node.len], node);
         pos += node.len;
     }
+    for (path.edges) |edge| {
+        out[pos] = graphPathTraversalDirectionTag(edge.traversal_direction);
+        pos += 1;
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            std.mem.writeInt(u64, out[pos..][0..8], @intCast(part.len), .little);
+            pos += 8;
+            @memcpy(out[pos..][0..part.len], part);
+            pos += part.len;
+        }
+    }
     return out;
+}
+
+fn graphPathTraversalDirectionTag(direction: ?graph_mod.EdgeDirection) u8 {
+    return if (direction) |value| switch (value) {
+        .out => 1,
+        .in => 2,
+        .both => 3,
+    } else 0;
 }
 
 fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_idx: usize) bool {
@@ -6051,7 +8099,78 @@ fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_id
             graphPathNodeTable(b, i),
         )) return false;
     }
+    if (a.edges.len < spur_idx or b.edges.len < spur_idx) return false;
+    i = 0;
+    while (i < spur_idx) : (i += 1) {
+        if (!std.mem.eql(u8, a.edges[i].source, b.edges[i].source) or
+            !std.mem.eql(u8, a.edges[i].target, b.edges[i].target) or
+            !std.mem.eql(u8, a.edges[i].edge_type, b.edges[i].edge_type) or
+            a.edges[i].traversal_direction != b.edges[i].traversal_direction) return false;
+    }
     return true;
+}
+
+test "distributed K path identity preserves parallel typed edges" {
+    const alloc = std.testing.allocator;
+    var first_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "primary",
+        .weight = 1,
+    }};
+    var second_edge = first_edge;
+    second_edge[0].edge_type = "secondary";
+    var nodes = [_][]const u8{ "a", "b" };
+    const first = db_mod.types.GraphPath{
+        .nodes = &nodes,
+        .edges = &first_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const second = db_mod.types.GraphPath{
+        .nodes = first.nodes,
+        .edges = &second_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const first_key = try graphPathToKey(alloc, first);
+    defer alloc.free(first_key);
+    const second_key = try graphPathToKey(alloc, second);
+    defer alloc.free(second_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, second_key));
+    try std.testing.expect(!rootPathMatches(first, second, 1));
+
+    var outgoing_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "cross_table",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var incoming_edge = outgoing_edge;
+    incoming_edge[0].traversal_direction = .in;
+    var node_tables = [_]?[]const u8{ "left", "right" };
+    var shared_nodes = [_][]const u8{ "shared", "shared" };
+    const outgoing = db_mod.types.GraphPath{
+        .nodes = &shared_nodes,
+        .node_tables = &node_tables,
+        .edges = &outgoing_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const incoming = db_mod.types.GraphPath{
+        .nodes = outgoing.nodes,
+        .node_tables = outgoing.node_tables,
+        .edges = &incoming_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const outgoing_key = try graphPathToKey(alloc, outgoing);
+    defer alloc.free(outgoing_key);
+    const incoming_key = try graphPathToKey(alloc, incoming);
+    defer alloc.free(incoming_key);
+    try std.testing.expect(!std.mem.eql(u8, outgoing_key, incoming_key));
+    try std.testing.expect(!rootPathMatches(outgoing, incoming, 1));
 }
 
 fn joinDistributedPaths(
@@ -6134,9 +8253,104 @@ fn joinDistributedPaths(
         .nodes = nodes,
         .node_tables = node_tables,
         .edges = edges,
-        .total_weight = computeGraphPathScore(root_edges, spur_path.edges),
+        .total_weight = try computeGraphPathWeightSum(root_edges, spur_path.edges),
         .length = @intCast(edge_count),
     };
+}
+
+fn joinDistributedPathsBudgeted(
+    alloc: std.mem.Allocator,
+    root_nodes: []const []const u8,
+    root_node_tables: []const ?[]const u8,
+    root_edges: []const graph_paths_mod.PathEdge,
+    spur_path: db_mod.types.GraphPath,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !BudgetedGraphPath {
+    const retained_bytes = joinedGraphPathRetainedBytes(
+        root_nodes,
+        root_node_tables,
+        root_edges,
+        spur_path,
+    ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
+    return .{
+        .path = try joinDistributedPaths(
+            alloc,
+            root_nodes,
+            root_node_tables,
+            root_edges,
+            spur_path,
+        ),
+        .retained_lease = retained_lease,
+    };
+}
+
+fn joinedGraphPathRetainedBytes(
+    root_nodes: []const []const u8,
+    root_node_tables: []const ?[]const u8,
+    root_edges: []const graph_paths_mod.PathEdge,
+    spur_path: db_mod.types.GraphPath,
+) !usize {
+    const node_count = try std.math.add(usize, root_nodes.len, spur_path.nodes.len);
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf([]const u8)),
+    );
+    for (root_nodes) |node| total = try std.math.add(usize, total, node.len);
+    for (spur_path.nodes) |node| total = try std.math.add(usize, total, node.len);
+
+    const has_root_tables = root_node_tables.len == root_nodes.len and
+        optionalStringsContainValue(root_node_tables);
+    const has_spur_tables = spur_path.node_tables.len == spur_path.nodes.len and
+        optionalStringsContainValue(spur_path.node_tables);
+    if (has_root_tables or has_spur_tables) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, node_count, @sizeOf(?[]const u8)),
+        );
+        if (root_node_tables.len == root_nodes.len) {
+            for (root_node_tables) |table| if (table) |value| {
+                total = try std.math.add(usize, total, value.len);
+            };
+        }
+        if (spur_path.node_tables.len == spur_path.nodes.len) {
+            for (spur_path.node_tables) |table| if (table) |value| {
+                total = try std.math.add(usize, total, value.len);
+            };
+        }
+    }
+
+    const edge_count = try std.math.add(usize, root_edges.len, spur_path.edges.len);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, edge_count, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+    for (root_edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    for (spur_path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
+}
+
+fn bestBudgetedPathIndex(paths: []const BudgetedGraphPath, mode: graph_paths_mod.PathWeightMode) usize {
+    var best_idx: usize = 0;
+    for (paths[1..], 1..) |path, i| {
+        if (comparePathScore(path.path, paths[best_idx].path, mode) < 0) best_idx = i;
+    }
+    return best_idx;
 }
 
 fn bestPathIndex(paths: []const db_mod.types.GraphPath, mode: graph_paths_mod.PathWeightMode) usize {
@@ -6172,37 +8386,88 @@ fn graphPathScore(path: db_mod.types.GraphPath, mode: graph_paths_mod.PathWeight
     };
 }
 
-fn computeGraphPathScore(
+fn computeGraphPathWeightSum(
     root_edges: []const graph_paths_mod.PathEdge,
     spur_edges: []const graph_paths_mod.PathEdge,
-) f64 {
-    var total: f64 = 0;
-    for (root_edges) |edge| total += edge.weight;
-    for (spur_edges) |edge| total += edge.weight;
+) !f64 {
+    var total = try graph_paths_mod.sumPathEdgeWeights(root_edges);
+    for (spur_edges) |edge| {
+        total += edge.weight;
+        if (!std.math.isFinite(total)) return error.GraphPathWeightOverflow;
+    }
     return total;
+}
+
+test "distributed canonical path weight is the checked raw edge sum" {
+    const root = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "e",
+        .weight = 2.0,
+    }};
+    const spur = [_]graph_paths_mod.PathEdge{.{
+        .source = "b",
+        .target = "c",
+        .edge_type = "e",
+        .weight = 3.0,
+    }};
+    try std.testing.expectEqual(@as(f64, 5.0), try computeGraphPathWeightSum(&root, &spur));
+
+    const overflow = [_]graph_paths_mod.PathEdge{.{
+        .source = "b",
+        .target = "c",
+        .edge_type = "e",
+        .weight = std.math.floatMax(f64),
+    }};
+    try std.testing.expectError(error.GraphPathWeightOverflow, computeGraphPathWeightSum(&overflow, &overflow));
 }
 
 fn allocEdgeExclusionKey(
     alloc: std.mem.Allocator,
-    table: []const u8,
-    src: []const u8,
-    tgt: []const u8,
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
     edge_type: []const u8,
 ) ![]u8 {
-    return try compositeIdentityAlloc(alloc, &.{ table, src, tgt, edge_type });
+    const from_table = from.table orelse return error.InvalidGraphPath;
+    const to_table = to.table orelse return error.InvalidGraphPath;
+    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
+    return try compositeIdentityAlloc(alloc, &.{
+        "path-edge-v1",
+        from_table,
+        from.key,
+        to_table,
+        to.key,
+        direction_tag[0..],
+        edge_type,
+    });
+}
+
+fn edgeExclusionIdentityEncodedLen(
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
+    edge_type: []const u8,
+) !usize {
+    const from_table = from.table orelse return error.InvalidGraphPath;
+    const to_table = to.table orelse return error.InvalidGraphPath;
+    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
+    return try compositeIdentityEncodedLen(&.{
+        "path-edge-v1",
+        from_table,
+        from.key,
+        to_table,
+        to.key,
+        direction_tag[0..],
+        edge_type,
+    });
 }
 
 fn compositeIdentityAlloc(
     alloc: std.mem.Allocator,
     parts: []const []const u8,
 ) ![]u8 {
-    var encoded_len: usize = 0;
-    for (parts) |part| {
-        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
-            return error.GraphIdentityTooLarge;
-        encoded_len = std.math.add(usize, encoded_len, part.len) catch
-            return error.GraphIdentityTooLarge;
-    }
+    const encoded_len = try compositeIdentityEncodedLen(parts);
 
     const encoded = try alloc.alloc(u8, encoded_len);
     var cursor: usize = 0;
@@ -6213,6 +8478,17 @@ fn compositeIdentityAlloc(
         cursor += part.len;
     }
     return encoded;
+}
+
+fn compositeIdentityEncodedLen(parts: []const []const u8) !usize {
+    var encoded_len: usize = 0;
+    for (parts) |part| {
+        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
+            return error.GraphIdentityTooLarge;
+        encoded_len = std.math.add(usize, encoded_len, part.len) catch
+            return error.GraphIdentityTooLarge;
+    }
+    return encoded_len;
 }
 
 test "distributed graph identities are length framed" {
@@ -6289,6 +8565,7 @@ test "distributed graph result selectors retain root table provenance" {
     const frontier = try resolveStartFrontier(
         alloc,
         &state,
+        "docs",
         .{ .identity_read_generation = 7 },
         base_result,
         prior_results[0..],
@@ -6327,12 +8604,30 @@ test "distributed graph target refs are table exact while raw keys remain wildca
         .total_hits = 0,
     };
 
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        TargetNodeSet.init(
+            alloc,
+            "docs",
+            req,
+            base_result,
+            prior_results[0..],
+            .{ .result_ref = .{ .ref = "$graph_results.prior" } },
+            &budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
     var exact = try TargetNodeSet.init(
         alloc,
+        "docs",
         req,
         base_result,
         prior_results[0..],
         .{ .result_ref = .{ .ref = "$graph_results.prior" } },
+        null,
     );
     defer exact.deinit(alloc);
     try std.testing.expect(exact.contains("entities", "shared"));
@@ -6340,26 +8635,497 @@ test "distributed graph target refs are table exact while raw keys remain wildca
 
     var wildcard = try TargetNodeSet.init(
         alloc,
+        "docs",
         req,
         base_result,
         prior_results[0..],
         .{ .keys = &.{"shared"} },
+        null,
     );
     defer wildcard.deinit(alloc);
     try std.testing.expect(wildcard.contains(null, "shared"));
     try std.testing.expect(wildcard.contains("entities", "shared"));
+
+    var same_table = try TargetNodeSet.init(
+        alloc,
+        "docs",
+        req,
+        base_result,
+        &.{},
+        .{ .identities = &.{.{ .key = "doc:b", .table = "docs" }} },
+        null,
+    );
+    defer same_table.deinit(alloc);
+    try std.testing.expect(same_table.contains(null, "doc:b"));
+    try std.testing.expect(!same_table.contains("docs", "doc:b"));
 }
 
-fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) f64 {
-    return switch (mode) {
-        .min_hops => 1.0,
-        .min_weight => edgeWeightFromNode(node),
-        .max_weight => blk: {
-            const weight = edgeWeightFromNode(node);
-            if (weight <= 0.0) break :blk std.math.inf(f64);
-            break :blk -@log(weight);
+test "distributed graph MATCH binding refs preserve table identity and deduplicate" {
+    const alloc = std.testing.allocator;
+    var first_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("post"),
+        .node = .{ .key = "post:1", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+    }};
+    var second_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("post"),
+        .node = .{ .key = "post:1", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+    }};
+    const matches = [_]db_mod.types.GraphPatternMatch{
+        .{ .bindings = &first_bindings, .path = &.{} },
+        .{ .bindings = &second_bindings, .path = &.{} },
+    };
+    const nodes = try resolveMatchBindingNodes(alloc, "docs", &matches, "post", 0);
+    defer freeNodeIdentities(alloc, nodes);
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expect(nodes[0].table == null);
+    try std.testing.expectEqualStrings("post:1", nodes[0].key);
+}
+
+test "distributed graph node refs deduplicate typed identities before limit" {
+    const alloc = std.testing.allocator;
+    const result_nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "shared", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+        .{ .key = "shared", .table = "docs", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "shared", .table = "people", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "other", .table = "docs", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+    };
+    const nodes = try resolveUniqueGraphResultNodes(alloc, "docs", &result_nodes, 3);
+    defer freeNodeIdentities(alloc, nodes);
+
+    try std.testing.expectEqual(@as(usize, 3), nodes.len);
+    try std.testing.expect(nodes[0].table == null);
+    try std.testing.expectEqualStrings("shared", nodes[0].key);
+    try std.testing.expectEqualStrings("people", nodes[1].table.?);
+    try std.testing.expectEqualStrings("shared", nodes[1].key);
+    try std.testing.expect(nodes[2].table == null);
+    try std.testing.expectEqualStrings("other", nodes[2].key);
+}
+
+test "distributed graph complete anchors require the source snapshot" {
+    const source_tokens = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const same_tokens_reordered = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 22, .generation = 202 },
+        .{ .group_id = 11, .generation = 101 },
+    };
+    const stale_tokens = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 100 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const empty_hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    const source = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(source_tokens[0..]),
+    };
+    const same_snapshot = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(same_tokens_reordered[0..]),
+    };
+    try validateMatchingSourceSnapshots(source, same_snapshot);
+
+    const stale_snapshot = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(stale_tokens[0..]),
+    };
+    try std.testing.expectError(error.TopologyChanged, validateMatchingSourceSnapshots(source, stale_snapshot));
+}
+
+test "distributed graph complete anchor pages require strict cursor order" {
+    const ordered = [_]db_mod.types.SearchHit{
+        .{ .id = @constCast("doc:b") },
+        .{ .id = @constCast("doc:c") },
+    };
+    try validateMatchAnchorPageOrder("doc:a", &ordered);
+
+    const repeated_cursor = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:a") }};
+    try std.testing.expectError(error.InvalidQueryResult, validateMatchAnchorPageOrder("doc:a", &repeated_cursor));
+
+    const out_of_order = [_]db_mod.types.SearchHit{
+        .{ .id = @constCast("doc:c") },
+        .{ .id = @constCast("doc:b") },
+    };
+    try std.testing.expectError(error.InvalidQueryResult, validateMatchAnchorPageOrder(null, &out_of_order));
+}
+
+test "distributed graph paged anchors use page completion instead of cursor-relative totals" {
+    const paged = MatchAnchorSource{ .paged = undefined };
+
+    // A full `_id` seek page commonly reports only a lower bound for the
+    // cursor-relative scan. It must advance instead of rejecting the page.
+    try std.testing.expect(!try matchAnchorPageIsTerminal(
+        paged,
+        complete_match_anchor_page_size,
+        complete_match_anchor_page_size,
+        .gte,
+    ));
+
+    // A short page completes the stream even though its cursor-relative total
+    // differs from every prior page.
+    try std.testing.expect(try matchAnchorPageIsTerminal(paged, 17, 17, .exact));
+    try std.testing.expectError(
+        error.InvalidQueryResult,
+        matchAnchorPageIsTerminal(paged, 17, 17, .gte),
+    );
+
+    // Exact multiples fetch one final empty page.
+    try std.testing.expect(!try matchAnchorPageIsTerminal(
+        paged,
+        complete_match_anchor_page_size,
+        complete_match_anchor_page_size,
+        .exact,
+    ));
+    try std.testing.expect(try matchAnchorPageIsTerminal(paged, 0, 0, .exact));
+    try std.testing.expectError(
+        error.InvalidQueryResult,
+        matchAnchorPageIsTerminal(paged, complete_match_anchor_page_size + 1, 0, .gte),
+    );
+
+    const materialized = MatchAnchorSource{ .materialized = undefined };
+    try std.testing.expectError(
+        error.InvalidQueryResult,
+        matchAnchorPageIsTerminal(materialized, 2, 1, .exact),
+    );
+}
+
+test "distributed graph paged execution trusts only source-filtered anchors across cursor pages" {
+    const alloc = std.testing.allocator;
+    const Pager = struct {
+        fetches: usize = 0,
+        authorization_rejections: usize = 0,
+        match_filter_rejections: usize = 0,
+
+        fn fetch(
+            ptr: *anyopaque,
+            page_alloc: std.mem.Allocator,
+            _: db_mod.types.NamedGraphQuery,
+            search_after: []const std.json.Value,
+        ) !db_mod.types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fetches += 1;
+            var candidate_index: usize = 0;
+            if (search_after.len > 0) {
+                if (search_after.len != 1) return error.InvalidQueryResult;
+                const cursor = switch (search_after[0]) {
+                    .string => |value| value,
+                    else => return error.InvalidQueryResult,
+                };
+                if (!std.mem.startsWith(u8, cursor, "anchor:")) return error.InvalidQueryResult;
+                candidate_index = try std.fmt.parseInt(usize, cursor["anchor:".len..], 10);
+                candidate_index += 1;
+            }
+
+            var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+            errdefer {
+                for (hits.items) |*hit| hit.deinit(page_alloc);
+                hits.deinit(page_alloc);
+            }
+            while (candidate_index < 4099 and hits.items.len < complete_match_anchor_page_size) : (candidate_index += 1) {
+                if (candidate_index == 1) {
+                    self.authorization_rejections += 1;
+                    continue;
+                }
+                if (candidate_index == 4097) {
+                    self.match_filter_rejections += 1;
+                    continue;
+                }
+                try hits.append(page_alloc, .{
+                    .id = try std.fmt.allocPrint(page_alloc, "anchor:{d:0>5}", .{candidate_index}),
+                });
+            }
+            const owned_hits = try hits.toOwnedSlice(page_alloc);
+            return .{
+                .alloc = page_alloc,
+                .hits = owned_hits,
+                .total_hits = @intCast(owned_hits.len),
+                .total_hits_relation = if (owned_hits.len == complete_match_anchor_page_size) .gte else .exact,
+            };
+        }
+    };
+
+    const nodes = [_]graph_pattern_mod.MatchNode{.{
+        .alias = "anchor",
+        .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"allowed\"}}" },
+    }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const source_req = db_mod.types.SearchRequest{
+        .filter_query_json = "{\"term\":{\"tenant\":\"authorized\"}}",
+    };
+    const base_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+        .total_hits = 0,
+    };
+
+    var pager = Pager{};
+    var admission = GraphNodeAdmissionContext.init(
+        alloc,
+        undefined,
+        undefined,
+        "docs",
+        "graph",
+        0,
+        source_req,
+        null,
+        &.{},
+        .{},
+        .read_index,
+    );
+    defer admission.deinit();
+    const edge_reader = DistributedEdgeReader{
+        .catalog = undefined,
+        .worker = undefined,
+        .source_table = "docs",
+        .index_name = "graph",
+        .consistency = .read_index,
+        .admission = &admission,
+    };
+
+    const row_query = db_mod.types.NamedGraphQuery{
+        .name = "rows",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = pattern,
+            .return_aliases = &.{"anchor"},
+            .return_limit = 5000,
         },
     };
+    var request_work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        graph_pattern_mod.default_max_distinct_identities,
+        graph_pattern_mod.default_max_distinct_state_bytes,
+    );
+    var row_state = QueryState{ .name = try alloc.dupe(u8, row_query.name) };
+    var rows = try executeDistributedConjunctivePattern(
+        alloc,
+        edge_reader,
+        source_req,
+        row_query,
+        .{ .paged = .{ .ctx = &pager, .fetch_fn = Pager.fetch } },
+        base_result,
+        &admission,
+        &row_state,
+        &request_work_budget,
+        &request_distinct_budget,
+    );
+    defer rows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4097), rows.matches.len);
+    try std.testing.expectEqual(@as(usize, 2), pager.fetches);
+    try std.testing.expectEqual(@as(usize, 1), pager.authorization_rejections);
+    try std.testing.expectEqual(@as(usize, 1), pager.match_filter_rejections);
+
+    pager = .{};
+    const aggregates = [_]graph_query_mod.NamedCountAggregate{.{
+        .name = "matches",
+        .of = "*",
+    }};
+    const aggregate_query = db_mod.types.NamedGraphQuery{
+        .name = "counts",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = pattern,
+            .aggregates = &aggregates,
+        },
+    };
+    var aggregate_state = QueryState{ .name = try alloc.dupe(u8, aggregate_query.name) };
+    var counts = try executeDistributedConjunctivePattern(
+        alloc,
+        edge_reader,
+        source_req,
+        aggregate_query,
+        .{ .paged = .{ .ctx = &pager, .fetch_fn = Pager.fetch } },
+        base_result,
+        &admission,
+        &aggregate_state,
+        &request_work_budget,
+        &request_distinct_budget,
+    );
+    defer counts.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), counts.aggregates.len);
+    try std.testing.expectEqual(@as(u128, 4097), counts.aggregates[0].value);
+    try std.testing.expectEqual(@as(usize, 2), pager.fetches);
+    try std.testing.expectEqual(@as(usize, 1), pager.authorization_rejections);
+    try std.testing.expectEqual(@as(usize, 1), pager.match_filter_rejections);
+}
+
+test "distributed graph duplicate distinct aggregates share one result payload" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        fn init(a: std.mem.Allocator) !graph_pattern_mod.CountAggregateResult {
+            const values = try a.alloc(graph_node_identity.Ref, 1);
+            errdefer a.free(values);
+            const table = try a.dupe(u8, "users");
+            errdefer a.free(table);
+            const key = try a.dupe(u8, "user:1");
+            errdefer a.free(key);
+            values[0] = .{ .table = table, .key = key };
+            return .{ .value = 1, .distinct_values = values };
+        }
+    };
+    var computed = [_]graph_pattern_mod.CountAggregateResult{try Fixture.init(alloc)};
+    defer computed[0].deinit(alloc);
+
+    const requested = [_]graph_query_mod.NamedCountAggregate{
+        .{ .name = "authors", .of = "author", .distinct = true },
+        .{ .name = "unique_authors", .of = "author", .distinct = true },
+    };
+    const indexes = [_]usize{ 0, 0 };
+    const aggregates = try materializeAggregateResults(
+        alloc,
+        &requested,
+        &indexes,
+        &computed,
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), aggregates.len);
+    try std.testing.expectEqual(@as(u128, 1), aggregates[0].value);
+    try std.testing.expectEqual(@as(u128, 1), aggregates[1].value);
+    try std.testing.expect(aggregates[0].distinct_values_owned);
+    try std.testing.expect(!aggregates[1].distinct_values_owned);
+    try std.testing.expectEqual(aggregates[0].distinct_values.ptr, aggregates[1].distinct_values.ptr);
+}
+
+test "distributed graph result hydration follows the public document option" {
+    var req = db_mod.types.SearchRequest{};
+    var query = graph_query_mod.GraphQuery{
+        .query_type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+    };
+    try std.testing.expect(!graphResultHydrationRequested(req, query));
+    query.include_documents = true;
+    try std.testing.expect(graphResultHydrationRequested(req, query));
+    query.include_documents = false;
+    req.expand_strategy = .@"union";
+    try std.testing.expect(graphResultHydrationRequested(req, query));
+}
+
+test "distributed graph exact distinct stream budget spans cursor pages" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]graph_pattern_mod.CountAggregateSpec{.{ .alias = "anchor", .distinct = true }};
+    var budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+    var stream = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &budget);
+    defer stream.deinit(alloc);
+
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_identities);
+
+    // A duplicate on a later page neither grows the exact set nor consumes
+    // another unit of request memory.
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:2"}, pattern, .{ .start_validation = .prevalidated }),
+    );
+    const computed = try stream.finishAlloc(alloc);
+    defer {
+        for (computed) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(computed);
+    }
+    try std.testing.expectEqual(@as(u128, 1), computed[0].value);
+}
+
+test "distributed graph exact distinct budget spans named operations" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]graph_pattern_mod.CountAggregateSpec{.{ .alias = "anchor", .distinct = true }};
+    var request_budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+    var first = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &request_budget);
+    defer first.deinit(alloc);
+    var second = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &request_budget);
+    defer second.deinit(alloc);
+
+    try first.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        second.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:2"}, pattern, .{ .start_validation = .prevalidated }),
+    );
+}
+
+test "distributed graph canonical MATCH admission excludes retrieval predicates" {
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const named = db_mod.types.NamedGraphQuery{
+        .name = "matches",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = .{ .anchor_alias = "anchor", .nodes = &nodes, .edges = &.{} },
+        },
+    };
+    const resolved: *const anyopaque = @ptrFromInt(1);
+    const admission = graphNodeAdmissionRequest(.{
+        .filter_query_json = "{\"term\":{\"retrieval\":true}}",
+        .exclusion_query_json = "{\"term\":{\"hidden\":true}}",
+        .authorization_filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .resolved_doc_filter = resolved,
+        .resolved_doc_filter_owned = true,
+        .resolved_doc_filter_wire_context = .{ .namespace = .{}, .identity_read_generation = 7 },
+    }, named);
+
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"tenant\":\"one\"}}",
+        admission.filter_query_json,
+    );
+    try std.testing.expectEqualStrings("", admission.exclusion_query_json);
+    try std.testing.expect(admission.resolved_doc_filter == null);
+    try std.testing.expect(!admission.resolved_doc_filter_owned);
+    try std.testing.expect(admission.resolved_doc_filter_wire_context == null);
+}
+
+fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) !f64 {
+    return try graph_paths_mod.pathEdgeCost(mode, edgeWeightFromNode(node));
 }
 
 fn appendPathStateFromWeightedStep(
@@ -6380,9 +9146,10 @@ fn appendPathStateFromWeightedStep(
         node_table,
         parent.depth + 1,
         parent.distance + edgeWeightFromNode(node),
-        parent.cost + edgeCost(parent, node, mode),
+        parent.cost + try edgeCost(parent, node, mode),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
+        state.work_budget,
     );
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
@@ -6397,6 +9164,12 @@ fn materializePathStateNode(
     const path_state = state.path_states.items[path_state_id];
     const path = try reconstructPath(alloc, state.path_states.items, path_state_id);
     errdefer freePathArray(alloc, path);
+    const path_tables_raw = try reconstructPathTables(alloc, state.path_states.items, path_state_id);
+    errdefer freeOptionalStrings(alloc, path_tables_raw);
+    const path_tables: ?[]const ?[]const u8 = if (path_tables_raw.len > 0)
+        path_tables_raw
+    else
+        null;
     const path_edges = try reconstructPathEdges(alloc, state.path_states.items, path_state_id);
     errdefer freePathEdges(alloc, path_edges);
     const owned_path_edges: ?[]const graph_query_mod.PathEdgeInfo = if (path_edges.len > 0)
@@ -6413,6 +9186,7 @@ fn materializePathStateNode(
         path_state.depth,
         path_state.distance,
         path,
+        path_tables,
         owned_path_edges,
     );
 }
@@ -6420,19 +9194,41 @@ fn materializePathStateNode(
 fn resolveStartFrontier(
     alloc: std.mem.Allocator,
     state: *QueryState,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     selector: graph_query_mod.NodeSelector,
     include_paths: bool,
 ) ![]FrontierState {
-    const nodes = try resolveSelectorNodes(alloc, req, base_result, prior_results, selector);
+    const nodes = try resolveSelectorNodes(alloc, source_table, req, base_result, prior_results, selector);
     var transferred: usize = 0;
     defer {
         for (nodes[transferred..]) |*node| node.deinit(alloc);
         if (nodes.len > 0) alloc.free(nodes);
     }
 
+    var frontier_retained_bytes: usize = 0;
+    for (nodes) |node| {
+        const node_retained_bytes = frontierStateRetainedBytes(node.key, node.table) catch
+            return if (state.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        frontier_retained_bytes = std.math.add(
+            usize,
+            frontier_retained_bytes,
+            node_retained_bytes,
+        ) catch return if (state.work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    }
+    var frontier_reservation = try graph_work_budget.RetainedLease.init(
+        state.work_budget,
+        frontier_retained_bytes,
+    );
+    errdefer frontier_reservation.deinit();
     const out = try alloc.alloc(FrontierState, nodes.len);
     var initialized: usize = 0;
     errdefer {
@@ -6444,6 +9240,7 @@ fn resolveStartFrontier(
             try appendRootPathState(alloc, state, node.key, node.table)
         else
             null;
+        const retained_bytes = frontierStateRetainedBytes(node.key, node.table) catch unreachable;
         out[i] = .{
             .key = node.key,
             .table = node.table,
@@ -6451,7 +9248,9 @@ fn resolveStartFrontier(
             .distance = 0,
             .cost = 0,
             .path_state_id = path_state_id,
+            .retained_lease = .{ .budget = state.work_budget, .bytes = retained_bytes },
         };
+        frontier_reservation.bytes -= retained_bytes;
         transferred += 1;
         initialized += 1;
     }
@@ -6460,6 +9259,7 @@ fn resolveStartFrontier(
 
 fn resolveSelectorNodes(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -6479,8 +9279,26 @@ fn resolveSelectorNodes(
             }
             break :blk out;
         },
+        .identities => |identities| blk: {
+            const out = try alloc.alloc(GraphNodeIdentity, identities.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(out);
+            }
+            for (identities, 0..) |identity, i| {
+                out[i] = try cloneGraphNodeIdentityParts(
+                    alloc,
+                    identity.key,
+                    canonicalGraphNodeTable(source_table, identity.table),
+                );
+                initialized += 1;
+            }
+            break :blk out;
+        },
         .result_ref => |result_ref| resolveResultRefNodes(
             alloc,
+            source_table,
             req,
             base_result,
             prior_results,
@@ -6491,6 +9309,7 @@ fn resolveSelectorNodes(
 
 fn resolveSelectorKeys(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -6498,7 +9317,13 @@ fn resolveSelectorKeys(
 ) ![][]u8 {
     return switch (selector) {
         .keys => |keys| dupKeys(alloc, keys),
-        .result_ref => |result_ref| resolveResultRefKeys(alloc, req, base_result, prior_results, result_ref),
+        .identities => |identities| blk: {
+            const refs = try alloc.alloc([]const u8, identities.len);
+            defer alloc.free(refs);
+            for (identities, 0..) |identity, i| refs[i] = identity.key;
+            break :blk try dupKeys(alloc, refs);
+        },
+        .result_ref => |result_ref| resolveResultRefKeys(alloc, source_table, req, base_result, prior_results, result_ref),
     };
 }
 
@@ -6607,6 +9432,7 @@ fn retainAdmittedFrontier(
 
 fn resolveResultRefNodes(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -6618,111 +9444,158 @@ fn resolveResultRefNodes(
         const name = result_ref.ref["$graph_results.".len..];
         for (prior_results) |graph_result| {
             if (!std.mem.eql(u8, graph_result.name, name)) continue;
+            if (result_ref.binding) |binding| {
+                if (result_ref.limit == 0 and
+                    (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.matches.len))
+                    return error.UnsupportedQueryRequest;
+                return try resolveMatchBindingNodes(
+                    alloc,
+                    source_table,
+                    graph_result.matches,
+                    binding,
+                    result_ref.limit,
+                );
+            }
             if (result_ref.limit == 0 and
-                @as(u64, graph_result.total_hits) > graph_result.nodes.len)
+                (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.nodes.len))
             {
                 return error.UnsupportedQueryRequest;
             }
-            const count: usize = if (result_ref.limit == 0)
-                graph_result.nodes.len
-            else
-                @min(graph_result.nodes.len, result_ref.limit);
-            const out = try alloc.alloc(GraphNodeIdentity, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (out[0..initialized]) |*node| node.deinit(alloc);
-                alloc.free(out);
-            }
-            for (graph_result.nodes[0..count], 0..) |node, i| {
-                out[i] = try cloneGraphNodeIdentityParts(
-                    alloc,
-                    node.key,
-                    node.table,
-                );
-                initialized += 1;
-            }
-            return out;
+            return try resolveUniqueGraphResultNodes(
+                alloc,
+                source_table,
+                graph_result.nodes,
+                result_ref.limit,
+            );
         }
         return error.GraphResultRefNotImplemented;
     }
 
-    if (!std.mem.eql(u8, result_ref.ref, "$fused_results") and
-        !std.mem.eql(u8, result_ref.ref, "$full_text_results") and
-        !std.mem.eql(u8, result_ref.ref, "$embeddings_results"))
-    {
+    if (!std.mem.eql(u8, result_ref.ref, "$query_results") or result_ref.binding != null) {
         return error.GraphResultRefNotImplemented;
     }
 
     if (result_ref.limit == 0 and baseResultRefMayBeIncomplete(req, base_result))
         return error.UnsupportedQueryRequest;
-    const count: usize = if (result_ref.limit == 0)
-        base_result.hits.len
-    else
-        @min(base_result.hits.len, result_ref.limit);
-    const out = try alloc.alloc(GraphNodeIdentity, count);
-    var initialized: usize = 0;
+    return try resolveUniqueSearchHitNodes(
+        alloc,
+        source_table,
+        base_result.hits,
+        result_ref.limit,
+    );
+}
+
+fn resolveUniqueGraphResultNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    result_nodes: []const graph_query_mod.GraphResultNode,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
     errdefer {
-        for (out[0..initialized]) |*node| node.deinit(alloc);
-        alloc.free(out);
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
     }
-    for (base_result.hits[0..count], 0..) |hit, i| {
-        out[i] = try cloneGraphNodeIdentityParts(
-            alloc,
-            hit.id,
-            hit.source_table,
-        );
-        initialized += 1;
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (result_nodes) |result_node| {
+        const table = canonicalGraphNodeTable(source_table, result_node.table);
+        const ref = graph_node_identity.Ref{ .table = table, .key = result_node.key };
+        if (seen.contains(ref)) continue;
+        var node = try cloneGraphNodeIdentityParts(alloc, result_node.key, table);
+        errdefer node.deinit(alloc);
+        _ = try seen.putIfAbsent(alloc, node.ref(), {});
+        try nodes.append(alloc, node);
+        if (limit > 0 and nodes.items.len >= limit) break;
     }
-    return out;
+    return try nodes.toOwnedSlice(alloc);
+}
+
+fn resolveUniqueSearchHitNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    hits: []const db_mod.types.SearchHit,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
+    errdefer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (hits) |hit| {
+        const table = canonicalGraphNodeTable(source_table, hit.source_table);
+        const ref = graph_node_identity.Ref{ .table = table, .key = hit.id };
+        if (seen.contains(ref)) continue;
+        var node = try cloneGraphNodeIdentityParts(alloc, hit.id, table);
+        errdefer node.deinit(alloc);
+        _ = try seen.putIfAbsent(alloc, node.ref(), {});
+        try nodes.append(alloc, node);
+        if (limit > 0 and nodes.items.len >= limit) break;
+    }
+    return try nodes.toOwnedSlice(alloc);
+}
+
+fn resolveMatchBindingNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    matches: []const db_mod.types.GraphPatternMatch,
+    alias: []const u8,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
+    errdefer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            const table = canonicalGraphNodeTable(source_table, binding.node.table);
+            const ref = graph_node_identity.Ref{ .table = table, .key = binding.node.key };
+            if (seen.contains(ref)) break;
+            var node = try cloneGraphNodeIdentityParts(alloc, binding.node.key, table);
+            errdefer node.deinit(alloc);
+            _ = try seen.putIfAbsent(alloc, node.ref(), {});
+            try nodes.append(alloc, node);
+            if (limit > 0 and nodes.items.len >= limit) return try nodes.toOwnedSlice(alloc);
+            break;
+        }
+    }
+    return try nodes.toOwnedSlice(alloc);
 }
 
 fn resolveResultRefKeys(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     result_ref: graph_query_mod.ResultRef,
 ) ![][]u8 {
-    if (!resultHasIdentitySnapshot(req, base_result)) return error.UnsupportedQueryRequest;
-
-    if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
-        const name = result_ref.ref["$graph_results.".len..];
-        for (prior_results) |graph_result| {
-            if (!std.mem.eql(u8, graph_result.name, name)) continue;
-            if (result_ref.limit == 0 and @as(u64, graph_result.total_hits) > graph_result.nodes.len) return error.UnsupportedQueryRequest;
-            const count: usize = if (result_ref.limit == 0) graph_result.nodes.len else @min(graph_result.nodes.len, result_ref.limit);
-            const out = try alloc.alloc([]u8, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (out[0..initialized]) |key| alloc.free(key);
-                alloc.free(out);
-            }
-            for (graph_result.nodes[0..count], 0..) |node, i| {
-                out[i] = try alloc.dupe(u8, node.key);
-                initialized += 1;
-            }
-            return out;
-        }
-        return error.GraphResultRefNotImplemented;
-    }
-
-    if (!std.mem.eql(u8, result_ref.ref, "$fused_results") and
-        !std.mem.eql(u8, result_ref.ref, "$full_text_results") and
-        !std.mem.eql(u8, result_ref.ref, "$embeddings_results"))
-    {
-        return error.GraphResultRefNotImplemented;
-    }
-
-    if (result_ref.limit == 0 and baseResultRefMayBeIncomplete(req, base_result)) return error.UnsupportedQueryRequest;
-    const count: usize = if (result_ref.limit == 0) base_result.hits.len else @min(base_result.hits.len, result_ref.limit);
-    const out = try alloc.alloc([]u8, count);
+    const nodes = try resolveResultRefNodes(
+        alloc,
+        source_table,
+        req,
+        base_result,
+        prior_results,
+        result_ref,
+    );
+    defer freeNodeIdentities(alloc, nodes);
+    const out = try alloc.alloc([]u8, nodes.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |key| alloc.free(key);
         alloc.free(out);
     }
-    for (base_result.hits[0..count], 0..) |hit, i| {
-        out[i] = try alloc.dupe(u8, hit.id);
+    for (nodes, 0..) |node, i| {
+        out[i] = try alloc.dupe(u8, node.key);
         initialized += 1;
     }
     return out;
@@ -7014,6 +9887,61 @@ fn catalogGraphIndexEnablesAlgebraicSemiring(
     return graphConfigEnablesAlgebraicSemiring(lookup.config);
 }
 
+fn catalogTableHasGraphIndex(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    index_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return false;
+    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name)) orelse return false;
+    defer lookup.deinit();
+    return indexes_api.inferIndexType(index_name, lookup.config) == .graph;
+}
+
+test "cross-table graph index availability fails closed for terminal expansion" {
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "with_graph", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}" },
+            .{ .table_id = 8, .name = "without_index", .placement_role = "data" },
+            .{ .table_id = 9, .name = "wrong_kind", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"full_text\"}}" },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "with_graph", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "without_index", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "wrong_kind", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "missing_table", "graph_idx"));
+}
+
 fn catalogGraphIndexIdentity(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -7162,6 +10090,13 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
                 for (keys) |key| alloc.free(@constCast(key));
                 alloc.free(keys);
             },
+            .identities => |identities| {
+                for (identities) |identity| {
+                    alloc.free(@constCast(identity.key));
+                    if (identity.table) |table| alloc.free(@constCast(table));
+                }
+                alloc.free(identities);
+            },
             .result_ref => {},
         }
         if (graph_query.query.target_nodes) |target_nodes| {
@@ -7169,6 +10104,13 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
                 .keys => |keys| {
                     for (keys) |key| alloc.free(@constCast(key));
                     alloc.free(keys);
+                },
+                .identities => |identities| {
+                    for (identities) |identity| {
+                        alloc.free(@constCast(identity.key));
+                        if (identity.table) |table| alloc.free(@constCast(table));
+                    }
+                    alloc.free(identities);
                 },
                 .result_ref => {},
             }
@@ -7491,13 +10433,24 @@ pub fn cloneGraphSearchResult(
         alloc.free(matches);
     };
 
+    const aggregates = if (src.aggregates.len > 0)
+        try cloneGraphAggregates(alloc, src.aggregates)
+    else
+        @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
+    errdefer if (aggregates.len > 0) {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    };
+
     return .{
         .name = try alloc.dupe(u8, src.name),
         .nodes = nodes,
         .paths = paths,
         .matches = matches,
+        .aggregates = aggregates,
         .hits = hits,
         .total_hits = src.total_hits,
+        .truncated = src.truncated,
     };
 }
 
@@ -7512,11 +10465,11 @@ pub fn filterGraphSearchResult(
 
     var exclude = graph_node_identity.Map(void){};
     defer exclude.deinit(alloc);
-    var source_exclude = std.StringHashMapUnmanaged(void).empty;
-    defer source_exclude.deinit(alloc);
     for (exclude_nodes) |identity| {
-        _ = try exclude.putIfAbsent(alloc, identity.ref(), {});
-        if (identity.table == null) try source_exclude.put(alloc, identity.key, {});
+        _ = try exclude.putIfAbsent(alloc, .{
+            .table = identity.table orelse source_table,
+            .key = identity.key,
+        }, {});
     }
 
     var exclude_edge_set = std.StringHashMapUnmanaged(void).empty;
@@ -7530,23 +10483,11 @@ pub fn filterGraphSearchResult(
     }
     for (src.nodes) |node| {
         if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, node.table),
+            .table = canonicalGraphNodeTable(source_table, node.table) orelse source_table,
             .key = node.key,
         })) continue;
         if (exclude_edge_set.count() > 0) {
-            if (node.path_edges) |path_edges| {
-                if (path_edges.len > 0) {
-                    const edge_key = try allocEdgeExclusionKey(
-                        alloc,
-                        source_table,
-                        path_edges[0].source,
-                        path_edges[0].target,
-                        path_edges[0].edge_type,
-                    );
-                    defer alloc.free(edge_key);
-                    if (exclude_edge_set.contains(edge_key)) continue;
-                }
-            }
+            if (try graphResultNodeHasExcludedEdge(alloc, source_table, node, &exclude_edge_set)) continue;
         }
         var owned_node = try cloneGraphNode(alloc, node);
         nodes.append(alloc, owned_node) catch |err| {
@@ -7561,7 +10502,7 @@ pub fn filterGraphSearchResult(
         hits.deinit(alloc);
     }
     for (src.hits) |hit| {
-        if (exclude.contains(.{ .table = hit.source_table, .key = hit.id })) continue;
+        if (exclude.contains(.{ .table = hit.source_table orelse source_table, .key = hit.id })) continue;
         var owned_hit = try hit.clone(alloc);
         hits.append(alloc, owned_hit) catch |err| {
             owned_hit.deinit(alloc);
@@ -7600,7 +10541,6 @@ pub fn filterGraphSearchResult(
             source_table,
             match,
             &exclude,
-            &source_exclude,
             &exclude_edge_set,
         )) continue;
         var owned_match = try cloneGraphPatternMatch(alloc, match);
@@ -7681,7 +10621,7 @@ fn appendRootPathState(
     key: []const u8,
     table: ?[]const u8,
 ) !u32 {
-    var path_state = try initPathState(alloc, key, table, 0, 0, 0, null, null);
+    var path_state = try initPathState(alloc, key, table, 0, 0, 0, null, null, state.work_budget);
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
     return @intCast(state.path_states.items.len - 1);
@@ -7696,7 +10636,15 @@ fn initPathState(
     cost: f64,
     parent: ?u32,
     incoming_edge: ?graph_query_mod.PathEdgeInfo,
+    work_budget: ?*graph_pattern_mod.WorkBudget,
 ) !PathState {
+    const retained_bytes = pathStateRetainedBytes(key, table, incoming_edge) catch
+        return if (work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
@@ -7712,7 +10660,24 @@ fn initPathState(
         .cost = cost,
         .parent = parent,
         .incoming_edge = owned_edge,
+        .retained_lease = retained_lease,
     };
+}
+
+fn pathStateRetainedBytes(
+    key: []const u8,
+    table: ?[]const u8,
+    incoming_edge: ?graph_query_mod.PathEdgeInfo,
+) !usize {
+    var total = try std.math.add(usize, @sizeOf(PathState), key.len);
+    if (table) |value| total = try std.math.add(usize, total, value.len);
+    if (incoming_edge) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
 }
 
 fn appendPathStateFromStep(
@@ -7731,10 +10696,11 @@ fn appendPathStateFromStep(
         node.key,
         node_table,
         parent.depth + 1,
-        parent.distance + node.distance,
-        parent.cost + edgeCost(parent, node, .min_hops),
+        @floatFromInt(parent.depth + 1),
+        parent.cost + try edgeCost(parent, node, .min_hops),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
+        state.work_budget,
     );
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
@@ -7756,7 +10722,8 @@ fn materializeResultNode(
             node.key,
             node_table,
             parent.depth + 1,
-            parent.distance + node.distance,
+            @floatFromInt(parent.depth + 1),
+            null,
             null,
             null,
         );
@@ -7766,6 +10733,12 @@ fn materializeResultNode(
     const path_state = state.path_states.items[id];
     const path = try reconstructPath(alloc, state.path_states.items, id);
     errdefer freePathArray(alloc, path);
+    const path_tables_raw = try reconstructPathTables(alloc, state.path_states.items, id);
+    errdefer freeOptionalStrings(alloc, path_tables_raw);
+    const path_tables: ?[]const ?[]const u8 = if (path_tables_raw.len > 0)
+        path_tables_raw
+    else
+        null;
     const path_edges = try reconstructPathEdges(alloc, state.path_states.items, id);
     errdefer freePathEdges(alloc, path_edges);
     const owned_path_edges: ?[]const graph_query_mod.PathEdgeInfo = if (path_edges.len > 0)
@@ -7782,8 +10755,71 @@ fn materializeResultNode(
         path_state.depth,
         path_state.distance,
         path,
+        path_tables,
         owned_path_edges,
     );
+}
+
+fn reserveMaterializedResultNode(
+    state: *const QueryState,
+    node: graph_query_mod.GraphResultNode,
+    node_table: ?[]const u8,
+    include_paths: bool,
+    path_state_id: ?u32,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    var total = std.math.add(usize, @sizeOf(graph_query_mod.GraphResultNode), node.key.len) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    if (node_table) |table| total = std.math.add(usize, total, table.len) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    if (include_paths) {
+        const id = path_state_id orelse return error.InvalidQueryRequest;
+        const node_count = pathLength(state.path_states.items, id);
+        const edge_count = pathEdgeLength(state.path_states.items, id);
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, node_count, @sizeOf([]const u8)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, edge_count, @sizeOf(graph_query_mod.PathEdgeInfo)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        var has_tables = false;
+        var cursor: ?u32 = id;
+        while (cursor) |current_id| {
+            const path_state = state.path_states.items[current_id];
+            total = std.math.add(usize, total, path_state.key.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            if (path_state.table) |table| {
+                has_tables = true;
+                total = std.math.add(usize, total, table.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            }
+            if (path_state.incoming_edge) |edge| {
+                total = std.math.add(usize, total, edge.source.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.target.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.edge_type.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.metadata.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            }
+            cursor = path_state.parent;
+        }
+        if (has_tables) total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, node_count, @sizeOf(?[]const u8)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    }
+    try work_budget.retainStateBytes(total);
+    return total;
 }
 
 fn frontierFromState(
@@ -7802,6 +10838,7 @@ fn frontierFromState(
             path_state.distance,
             path_state.cost,
             id,
+            state.work_budget,
         );
     }
 
@@ -7813,6 +10850,7 @@ fn frontierFromState(
         node.distance,
         node.distance,
         null,
+        state.work_budget,
     );
 }
 
@@ -7823,6 +10861,21 @@ fn overrideFrontierTables(
     table: []const u8,
 ) !void {
     for (frontier) |*item| {
+        const old_frontier_bytes = item.retained_lease.bytes;
+        const old_frontier_table_len = if (item.table) |old| old.len else 0;
+        const new_frontier_bytes = old_frontier_bytes - old_frontier_table_len + table.len;
+        try item.retained_lease.resize(new_frontier_bytes);
+        errdefer item.retained_lease.resize(old_frontier_bytes) catch unreachable;
+
+        var old_path_bytes: ?usize = null;
+        if (item.path_state_id) |id| {
+            const path_state = &state.path_states.items[id];
+            old_path_bytes = path_state.retained_lease.bytes;
+            const old_path_table_len = if (path_state.table) |old| old.len else 0;
+            try path_state.retained_lease.resize(old_path_bytes.? - old_path_table_len + table.len);
+            errdefer path_state.retained_lease.resize(old_path_bytes.?) catch unreachable;
+        }
+
         const frontier_table = try alloc.dupe(u8, table);
         errdefer alloc.free(frontier_table);
         var path_table: ?[]u8 = null;
@@ -7846,6 +10899,7 @@ fn initGraphResultNode(
     depth: u32,
     distance: f64,
     path: ?[]const []const u8,
+    path_tables: ?[]const ?[]const u8,
     path_edges: ?[]const graph_query_mod.PathEdgeInfo,
 ) !graph_query_mod.GraphResultNode {
     const owned_key = try alloc.dupe(u8, key);
@@ -7859,6 +10913,7 @@ fn initGraphResultNode(
         .depth = depth,
         .distance = distance,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
     };
 }
@@ -7871,7 +10926,15 @@ fn initFrontierState(
     distance: f64,
     cost: f64,
     path_state_id: ?u32,
+    work_budget: ?*graph_pattern_mod.WorkBudget,
 ) !FrontierState {
+    const retained_bytes = frontierStateRetainedBytes(key, table) catch
+        return if (work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
@@ -7884,7 +10947,31 @@ fn initFrontierState(
         .distance = distance,
         .cost = cost,
         .path_state_id = path_state_id,
+        .retained_lease = retained_lease,
     };
+}
+
+fn frontierStateRetainedBytes(key: []const u8, table: ?[]const u8) !usize {
+    var total = try std.math.add(usize, @sizeOf(FrontierState), key.len);
+    if (table) |value| total = try std.math.add(usize, total, value.len);
+    return total;
+}
+
+test "distributed frontier reservations precede allocation and release on deinit" {
+    const alloc = std.testing.allocator;
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        initFrontierState(alloc, "node", "table", 0, 0, 0, null, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
+    budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+    var frontier = try initFrontierState(alloc, "node", "table", 0, 0, 0, null, &budget);
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    frontier.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
 fn cloneGraphFrontierItemParts(
@@ -8005,26 +11092,29 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 0 },
+            .{ .ref = "$query_results", .limit = 0 },
         ));
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .limit = 10 },
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 1 },
+            .{ .ref = "$query_results", .limit = 1 },
         ));
 
         const limited = try resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 1 },
+            .{ .ref = "$query_results", .limit = 1 },
         );
         defer freeKeys(alloc, limited);
         try std.testing.expectEqual(@as(usize, 1), limited.len);
@@ -8043,10 +11133,11 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$fused_results", .limit = 0 },
+            .{ .ref = "$query_results", .limit = 0 },
         ));
     }
 
@@ -8067,6 +11158,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .identity_read_generation = 9 },
             base_result,
             &.{graph_result},
@@ -8075,6 +11167,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{},
             base_result,
             &.{graph_result},
@@ -8083,6 +11176,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         const limited = try resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .identity_read_generation = 9 },
             base_result,
             &.{graph_result},
@@ -8249,6 +11343,7 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:c", "doc:n" } },
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },
@@ -8278,7 +11373,8 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
 
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
     // Two start-admission batches, two expansion-admission batches, and two
-    // final hydration batches. Per-frontier admission would make seven calls.
+    // final document hydration batches. Per-frontier admission would make
+    // seven calls.
     try std.testing.expectEqual(@as(u32, 6), state.hydrate_calls);
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqual(@as(usize, 3), results[0].hits.len);
@@ -8461,7 +11557,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         .read_index,
     );
     defer admission.deinit();
-    const hits = try hydrateHitsForResultNodes(alloc, &admission, nodes[0..]);
+    const hits = try hydrateHitsForResultNodes(alloc, &admission, nodes[0..], true, &.{});
     defer {
         for (hits) |*hit| hit.deinit(alloc);
         alloc.free(hits);
@@ -8652,9 +11748,11 @@ fn graphPathIsExcluded(
     exclude: *graph_node_identity.Map(void),
     exclude_edge_set: *std.StringHashMapUnmanaged(void),
 ) !bool {
+    if (path.nodes.len == 0 or path.edges.len != path.nodes.len - 1)
+        return error.InvalidGraphPath;
     for (path.nodes, 0..) |node, i| {
         if (exclude.contains(.{
-            .table = graphPathNodeTable(path, i),
+            .table = graphPathNodeTable(path, i) orelse source_table,
             .key = node,
         })) return true;
     }
@@ -8662,9 +11760,77 @@ fn graphPathIsExcluded(
     for (path.edges, 0..) |edge, i| {
         const edge_key = try allocEdgeExclusionKey(
             alloc,
-            graphPathNodeTable(path, i) orelse source_table,
-            edge.source,
-            edge.target,
+            .{
+                .table = graphPathNodeTable(path, i) orelse source_table,
+                .key = path.nodes[i],
+            },
+            .{
+                .table = graphPathNodeTable(path, i + 1) orelse source_table,
+                .key = path.nodes[i + 1],
+            },
+            edge.traversal_direction,
+            edge.edge_type,
+        );
+        defer alloc.free(edge_key);
+        if (exclude_edge_set.contains(edge_key)) return true;
+    }
+    return false;
+}
+
+fn graphResultNodePathTable(
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    index: usize,
+) []const u8 {
+    if (node.path_tables) |tables| {
+        if (index < tables.len) return tables[index] orelse source_table;
+    }
+    return source_table;
+}
+
+fn graphResultNodeTouchesExcludedNode(
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    exclude: *graph_node_identity.Map(void),
+) !bool {
+    const path = node.path orelse return false;
+    if (node.path_tables) |tables| {
+        if (tables.len != path.len) return error.InvalidGraphPath;
+    }
+    for (path, 0..) |key, index| {
+        if (exclude.contains(.{
+            .table = graphResultNodePathTable(source_table, node, index),
+            .key = key,
+        })) return true;
+    }
+    return false;
+}
+
+fn graphResultNodeHasExcludedEdge(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    exclude_edge_set: *std.StringHashMapUnmanaged(void),
+) !bool {
+    const edges = node.path_edges orelse return false;
+    if (edges.len == 0) return false;
+    const path = node.path orelse return error.InvalidGraphPath;
+    if (path.len != edges.len + 1) return error.InvalidGraphPath;
+    if (node.path_tables) |tables| {
+        if (tables.len != path.len) return error.InvalidGraphPath;
+    }
+    for (edges, 0..) |edge, index| {
+        const edge_key = try allocEdgeExclusionKey(
+            alloc,
+            .{
+                .table = graphResultNodePathTable(source_table, node, index),
+                .key = path[index],
+            },
+            .{
+                .table = graphResultNodePathTable(source_table, node, index + 1),
+                .key = path[index + 1],
+            },
+            edge.traversal_direction,
             edge.edge_type,
         );
         defer alloc.free(edge_key);
@@ -8678,46 +11844,16 @@ fn graphPatternMatchIsExcluded(
     source_table: []const u8,
     match: db_mod.types.GraphPatternMatch,
     exclude: *graph_node_identity.Map(void),
-    source_exclude: *std.StringHashMapUnmanaged(void),
     exclude_edge_set: *std.StringHashMapUnmanaged(void),
 ) !bool {
     for (match.bindings) |binding| {
         if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, binding.node.table),
+            .table = canonicalGraphNodeTable(source_table, binding.node.table) orelse source_table,
             .key = binding.node.key,
         })) return true;
-        if (binding.node.path) |path| {
-            for (path) |node| {
-                if (source_exclude.contains(node)) return true;
-            }
-        }
-        if (exclude_edge_set.count() > 0) {
-            if (binding.node.path_edges) |edges| {
-                for (edges) |edge| {
-                    const edge_key = try allocEdgeExclusionKey(
-                        alloc,
-                        source_table,
-                        edge.source,
-                        edge.target,
-                        edge.edge_type,
-                    );
-                    defer alloc.free(edge_key);
-                    if (exclude_edge_set.contains(edge_key)) return true;
-                }
-            }
-        }
-    }
-    if (exclude_edge_set.count() == 0) return false;
-    for (match.path) |edge| {
-        const edge_key = try allocEdgeExclusionKey(
-            alloc,
-            source_table,
-            edge.source,
-            edge.target,
-            edge.edge_type,
-        );
-        defer alloc.free(edge_key);
-        if (exclude_edge_set.contains(edge_key)) return true;
+        if (try graphResultNodeTouchesExcludedNode(source_table, binding.node, exclude)) return true;
+        if (exclude_edge_set.count() > 0 and
+            try graphResultNodeHasExcludedEdge(alloc, source_table, binding.node, exclude_edge_set)) return true;
     }
     return false;
 }
@@ -8756,6 +11892,46 @@ fn cloneGraphPatternMatches(
     return out;
 }
 
+fn cloneGraphAggregates(
+    alloc: std.mem.Allocator,
+    aggregates: []const db_mod.types.GraphAggregateResult,
+) ![]db_mod.types.GraphAggregateResult {
+    const out = try alloc.alloc(db_mod.types.GraphAggregateResult, aggregates.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(out);
+    }
+    for (aggregates, 0..) |aggregate, i| {
+        const distinct_values = try alloc.alloc(graph_node_identity.Ref, aggregate.distinct_values.len);
+        var distinct_initialized: usize = 0;
+        errdefer {
+            for (distinct_values[0..distinct_initialized]) |identity| {
+                if (identity.table) |table| alloc.free(table);
+                alloc.free(identity.key);
+            }
+            if (distinct_values.len > 0) alloc.free(distinct_values);
+        }
+        for (aggregate.distinct_values, 0..) |identity, identity_index| {
+            const table = if (identity.table) |table_name| try alloc.dupe(u8, table_name) else null;
+            errdefer if (table) |table_name| alloc.free(table_name);
+            distinct_values[identity_index] = .{
+                .table = table,
+                .key = try alloc.dupe(u8, identity.key),
+            };
+            distinct_initialized += 1;
+        }
+        out[i] = .{
+            .name = try alloc.dupe(u8, aggregate.name),
+            .value = aggregate.value,
+            .exact = aggregate.exact,
+            .distinct_values = distinct_values,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneGraphPatternMatch(
     alloc: std.mem.Allocator,
     match: db_mod.types.GraphPatternMatch,
@@ -8774,9 +11950,16 @@ fn cloneGraphPatternMatch(
     const path = try dupPathEdges(alloc, match.path);
     errdefer freePathEdges(alloc, path);
 
+    const null_aliases = try cloneOwnedStrings(alloc, match.null_aliases);
+    errdefer {
+        for (null_aliases) |alias| alloc.free(alias);
+        if (null_aliases.len > 0) alloc.free(null_aliases);
+    }
+
     return .{
         .bindings = bindings,
         .path = path,
+        .null_aliases = null_aliases,
     };
 }
 
@@ -8815,6 +11998,8 @@ fn cloneGraphNode(
     errdefer alloc.free(key);
     const path = if (node.path) |value| try dupPath(alloc, value) else null;
     errdefer if (path) |value| freePathArray(alloc, value);
+    const path_tables = if (node.path_tables) |value| try dupOptionalStrings(alloc, value) else null;
+    errdefer if (path_tables) |value| freeOptionalStrings(alloc, value);
     const path_edges = if (node.path_edges) |value| try dupPathEdges(alloc, value) else null;
     errdefer if (path_edges) |value| freePathEdges(alloc, value);
     const provenance = if (node.provenance) |value| try dupPath(alloc, value) else null;
@@ -8827,6 +12012,7 @@ fn cloneGraphNode(
         .depth = node.depth,
         .distance = node.distance,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
         .provenance = provenance,
         .table = table,
@@ -8841,6 +12027,20 @@ fn dupPath(alloc: std.mem.Allocator, path: []const []const u8) ![][]const u8 {
         alloc.free(out);
     }
     for (path, 0..) |item, i| {
+        out[i] = try alloc.dupe(u8, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneOwnedStrings(alloc: std.mem.Allocator, items: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, item);
         initialized += 1;
     }
@@ -8928,6 +12128,7 @@ fn clonePathEdge(
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = edge.traversal_direction,
     };
 }
 
@@ -8979,8 +12180,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqualStrings("entities", req.frontier[0].table.?);
     try std.testing.expectEqualStrings("doc:seen", req.exclude_nodes[0].key);
     try std.testing.expectEqualStrings("entities", req.exclude_nodes[0].table.?);
-    try std.testing.expectEqual(@as(f64, 1.25), req.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), req.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), req.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), req.params.max_weight);
     try std.testing.expect(req.tensor_access_path != null);
     try std.testing.expectEqual(algebraic_ir.PhysicalLayout.graph_edges, req.tensor_access_path.?.layout);
     try std.testing.expectEqualStrings("graph_idx", req.tensor_access_path.?.owner);
@@ -9011,8 +12212,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed.resolved_doc_filter_owned);
     try std.testing.expect(parsed.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(parsed.params.algebraic_semiring);
-    try std.testing.expectEqual(@as(f64, 1.25), parsed.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), parsed.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), parsed.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), parsed.params.max_weight);
     try std.testing.expect(parsed.tensor_access_path != null);
     try std.testing.expectEqual(algebraic_ir.PhysicalLayout.graph_edges, parsed.tensor_access_path.?.layout);
     try std.testing.expectEqualStrings("graph_idx", parsed.tensor_access_path.?.owner);
@@ -9033,8 +12234,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(search_req.resolved_doc_filter != null);
     try std.testing.expect(search_req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(search_req.query == .match_all);
-    try std.testing.expectEqual(@as(f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
     try std.testing.expect(search_req.graph_queries[0].query.params.algebraic_semiring);
 
     const generation_field = "\"identity_read_generation\":12345,";
@@ -9058,6 +12259,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
         .topology_epoch = 11,
         .identity_read_generation = 12345,
         .include_stored = false,
+        .fields = &.{ "title", "summary" },
+        .include_all_fields = false,
         .include_hits = false,
         .incoming_index_name = "graph_idx",
         .incoming_index_identity = .{ .incarnation = 41, .config_hash = 99 },
@@ -9075,6 +12278,10 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed_hydrate.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expectEqual(@as(?u64, 12345), parsed_hydrate.identity_read_generation);
     try std.testing.expect(!parsed_hydrate.include_stored);
+    try std.testing.expect(!parsed_hydrate.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), parsed_hydrate.fields.len);
+    try std.testing.expectEqualStrings("title", parsed_hydrate.fields[0]);
+    try std.testing.expectEqualStrings("summary", parsed_hydrate.fields[1]);
     try std.testing.expect(!parsed_hydrate.include_hits);
     try std.testing.expectEqualStrings("graph_idx", parsed_hydrate.incoming_index_name);
     try std.testing.expect(parsed_hydrate.incoming_index_identity.eql(.{ .incarnation = 41, .config_hash = 99 }));
@@ -9263,6 +12470,8 @@ test "distributed graph edges request preserves typed graph edge access path" {
         .direction = .both,
         .topology_epoch = 42,
         .identity_read_generation = 12345,
+        .max_edges = 17,
+        .max_owned_bytes = 4096,
         .tensor_access_path = try cloneGraphTensorAccessPathAlloc(alloc, algebraic_ir.graphEdgeAccessPath("graph_idx")),
         .tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(alloc, "graph_idx"),
     };
@@ -9287,6 +12496,8 @@ test "distributed graph edges request preserves typed graph edge access path" {
     try std.testing.expectEqualStrings("mentions", parsed.edge_types[1]);
     try std.testing.expectEqual(@as(u64, 42), parsed.topology_epoch);
     try std.testing.expectEqual(@as(?u64, 12345), parsed.identity_read_generation);
+    try std.testing.expectEqual(@as(u32, 17), parsed.max_edges);
+    try std.testing.expectEqual(@as(u32, 4096), parsed.max_owned_bytes);
     try std.testing.expect(parsed.tensor_access_path != null);
     try std.testing.expect(parsed.tensor_program != null);
     try std.testing.expectEqualStrings(expected_program_id, parsed.tensor_program.?.program_id);
@@ -9308,7 +12519,7 @@ test "distributed graph edges request preserves typed graph edge access path" {
     try std.testing.expectError(error.InvalidQueryRequest, encodeGraphEdgesRequest(alloc, parsed));
 }
 
-test "distributed graph edge reader carries identity generation" {
+test "distributed graph edge reader routes outgoing and fans out incoming adjacency" {
     const alloc = std.testing.allocator;
 
     const FakeCatalog = struct {
@@ -9409,7 +12620,6 @@ test "distributed graph edge reader carries identity generation" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
-            try std.testing.expectEqualStrings("doc:a", req.key);
             try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
             try std.testing.expectEqualStrings("links", req.edge_types[0]);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
@@ -9652,9 +12862,9 @@ test "distributed graph filtering preserves non-excluded paths matches and prove
 
     const excluded_edge = try allocEdgeExclusionKey(
         alloc,
-        "docs",
-        "doc:a",
-        "doc:b",
+        .{ .table = "docs", .key = "doc:a" },
+        .{ .table = "docs", .key = "doc:b" },
+        null,
         "links",
     );
     defer alloc.free(excluded_edge);
@@ -9736,6 +12946,86 @@ test "distributed graph filtering scopes equal keys by table" {
     try std.testing.expect(external_excluded.hits[0].source_table == null);
 }
 
+test "distributed Yen edge exclusions preserve table-qualified path identity" {
+    const alloc = std.testing.allocator;
+    var entity_nodes = [_][]const u8{ "a", "shared" };
+    var company_nodes = [_][]const u8{ "a", "shared" };
+    var entity_tables = [_]?[]const u8{ null, "entities" };
+    var company_tables = [_]?[]const u8{ null, "companies" };
+    var entity_edges = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "shared",
+        .edge_type = "links",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var company_edges = [_]graph_paths_mod.PathEdge{entity_edges[0]};
+    var paths = [_]db_mod.types.GraphPath{
+        .{
+            .nodes = entity_nodes[0..],
+            .node_tables = entity_tables[0..],
+            .edges = entity_edges[0..],
+            .total_weight = 1,
+            .length = 1,
+        },
+        .{
+            .nodes = company_nodes[0..],
+            .node_tables = company_tables[0..],
+            .edges = company_edges[0..],
+            .total_weight = 1,
+            .length = 1,
+        },
+    };
+    const src = db_mod.types.GraphSearchResult{
+        .name = @constCast("paths"),
+        .nodes = &.{},
+        .paths = paths[0..],
+        .matches = &.{},
+        .hits = &.{},
+        .total_hits = 2,
+    };
+
+    const excluded_entity_edge = try allocEdgeExclusionKey(
+        alloc,
+        .{ .table = "docs", .key = "a" },
+        .{ .table = "entities", .key = "shared" },
+        .out,
+        "links",
+    );
+    defer alloc.free(excluded_entity_edge);
+    const company_edge = try allocEdgeExclusionKey(
+        alloc,
+        .{ .table = "docs", .key = "a" },
+        .{ .table = "companies", .key = "shared" },
+        .out,
+        "links",
+    );
+    defer alloc.free(company_edge);
+    try std.testing.expect(!std.mem.eql(u8, excluded_entity_edge, company_edge));
+
+    var filtered = try filterGraphSearchResult(
+        alloc,
+        "docs",
+        src,
+        &.{},
+        &.{excluded_entity_edge},
+    );
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered.paths.len);
+    try std.testing.expectEqualStrings("companies", filtered.paths[0].node_tables[1].?);
+
+    var node_filtered = try filterGraphSearchResult(
+        alloc,
+        "docs",
+        src,
+        &.{.{ .table = @constCast("entities"), .key = @constCast("shared") }},
+        &.{},
+    );
+    defer node_filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), node_filtered.paths.len);
+    try std.testing.expectEqualStrings("companies", node_filtered.paths[0].node_tables[1].?);
+}
+
 test "distributed graph result_ref fails closed for unbounded paged base results" {
     const alloc = std.testing.allocator;
 
@@ -9750,26 +13040,29 @@ test "distributed graph result_ref fails closed for unbounded paged base results
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 0 },
+        .{ .ref = "$query_results", .limit = 0 },
     ));
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .limit = 10 },
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 1 },
+        .{ .ref = "$query_results", .limit = 1 },
     ));
 
     const limited = try resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 1 },
+        .{ .ref = "$query_results", .limit = 1 },
     );
     defer freeKeys(alloc, limited);
     try std.testing.expectEqual(@as(usize, 1), limited.len);
@@ -9790,10 +13083,11 @@ test "distributed graph result_ref fails closed for saturated base result page" 
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$fused_results", .limit = 0 },
+        .{ .ref = "$query_results", .limit = 0 },
     ));
 }
 
@@ -9816,6 +13110,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .identity_read_generation = 9 },
         base_result,
         &.{graph_result},
@@ -9824,6 +13119,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{},
         base_result,
         &.{graph_result},
@@ -9832,6 +13128,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     const limited = try resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .identity_read_generation = 9 },
         base_result,
         &.{graph_result},
@@ -9850,7 +13147,7 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_idx",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{},
                 },
             },
@@ -10003,7 +13300,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
                 try std.testing.expectEqual(@as(?u64, 101), req.identity_read_generation);
                 try std.testing.expectEqualStrings("a", req.frontier[0].key);
                 const nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 1);
-                nodes[0] = try initGraphResultNode(alloc_inner, "z", null, 1, 1, null, null);
+                nodes[0] = try initGraphResultNode(alloc_inner, "z", null, 1, 1, null, null, null);
                 const expansions = try alloc_inner.alloc(GraphExpansion, 1);
                 expansions[0] = .{
                     .frontier_id = req.frontier[0].id,
@@ -10056,7 +13353,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
                 .query = .{
                     .query_type = .traverse,
                     .index_name = "graph_idx",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .include_documents = true,
                     .params = .{ .max_depth = 2 },
                 },
@@ -10157,6 +13454,38 @@ test "distributed graph supports cross-range traverse target selectors" {
         .identity_read_generation = 9,
     };
     try std.testing.expect(!supportsCrossRange(unsupported_weight_mode));
+}
+
+test "distributed graph supports legacy pattern step reverse directions exactly" {
+    const outgoing_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .out } },
+    };
+    const incoming_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .in } },
+    };
+    const both_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .both } },
+    };
+
+    var query = graph_query_mod.GraphQuery{
+        .query_type = .pattern,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .pattern = &outgoing_steps,
+    };
+    var named = [_]db_mod.types.NamedGraphQuery{.{ .name = "walk", .query = query }};
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
+
+    query.pattern = &incoming_steps;
+    named[0].query = query;
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
+
+    query.pattern = &both_steps;
+    named[0].query = query;
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
 }
 
 test "distributed graph rejects doc identity rebuild before cross-range fanout" {
@@ -10408,6 +13737,7 @@ test "distributed graph traverse target nodes filter returned nodes without prun
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
                     .target_nodes = .{ .keys = &[_][]const u8{"doc:c"} },
                     .params = .{ .max_depth = 2 },
+                    .include_documents = true,
                 },
             },
         },
@@ -10444,6 +13774,174 @@ test "distributed graph traverse target nodes filter returned nodes without prun
     try std.testing.expectEqualStrings("doc:c", results[0].hits[0].id);
 }
 
+test "distributed graph executes result dependencies before declaration order" {
+    const TestState = struct {
+        expand_calls: u32 = 0,
+        hydrate_calls: u32 = 0,
+    };
+
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = null },
+        };
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{ .group_id = 11 },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                },
+            };
+        }
+
+        fn executeGraphExpand(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            req: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.expand_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
+
+            const next_key = if (std.mem.eql(u8, req.name, "seed")) blk: {
+                try std.testing.expectEqualStrings("doc:a", req.frontier[0].key);
+                break :blk "doc:b";
+            } else if (std.mem.eql(u8, req.name, "dependent")) blk: {
+                try std.testing.expectEqualStrings("doc:b", req.frontier[0].key);
+                break :blk "doc:c";
+            } else return error.TestUnexpectedResult;
+
+            const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+            nodes[0] = .{
+                .key = try alloc.dupe(u8, next_key),
+                .depth = 1,
+                .distance = 1.0,
+                .path = null,
+                .path_edges = null,
+            };
+            const expansions = try alloc.alloc(GraphExpansion, 1);
+            expansions[0] = .{
+                .frontier_id = req.frontier[0].id,
+                .frontier_key = try alloc.dupe(u8, req.frontier[0].key),
+                .graph_result = .{
+                    .name = try alloc.dupe(u8, req.name),
+                    .nodes = nodes,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            };
+            return .{ .expansions = expansions };
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.hydrate_calls += 1;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, req.keys.len);
+            for (req.keys, 0..) |key, i| hits[i] = .{ .id = try alloc.dupe(u8, key) };
+            return .{ .hits = hits };
+        }
+    };
+
+    var state = TestState{};
+    const req = db_mod.types.SearchRequest{
+        .graph_queries = &.{
+            .{
+                .name = "dependent",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.seed", .limit = 1 } },
+                    .params = .{ .max_depth = 1 },
+                },
+            },
+            .{
+                .name = "seed",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .max_depth = 1 },
+                },
+            },
+        },
+        .identity_read_generation = 9,
+    };
+    const base_result = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .identity_read_generation = 9,
+    };
+
+    const results = try executeCrossRange(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        req,
+        base_result,
+        .read_index,
+    );
+    defer {
+        for (results) |*result| result.deinit(std.testing.allocator);
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("seed", results[0].name);
+    try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
+    try std.testing.expectEqualStrings("dependent", results[1].name);
+    try std.testing.expectEqualStrings("doc:c", results[1].nodes[0].key);
+    try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.hydrate_calls);
+    try std.testing.expectEqual(@as(usize, 0), results[0].hits.len);
+    try std.testing.expectEqual(@as(usize, 0), results[1].hits.len);
+}
+
 test "distributed graph traverse routes cross-table frontier by table generation" {
     const TestState = struct {
         expand_calls: u32 = 0,
@@ -10453,7 +13951,12 @@ test "distributed graph traverse routes cross-table frontier by table generation
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{
             .{ .table_id = 7, .name = "docs", .placement_role = "data" },
-            .{ .table_id = 8, .name = "entities", .placement_role = "data" },
+            .{
+                .table_id = 8,
+                .name = "entities",
+                .placement_role = "data",
+                .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            },
         };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = null },
@@ -10543,6 +14046,7 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 1,
                 null,
                 null,
+                null,
             );
             errdefer nodes[0].deinit(alloc);
 
@@ -10603,6 +14107,7 @@ test "distributed graph traverse routes cross-table frontier by table generation
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
                     .target_nodes = .{ .keys = &[_][]const u8{"doc:c"} },
                     .params = .{ .max_depth = 2 },
+                    .include_documents = true,
                 },
             },
         },
@@ -10635,6 +14140,35 @@ test "distributed graph traverse routes cross-table frontier by table generation
     try std.testing.expectEqualStrings("entities", results[0].nodes[0].table.?);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("entities", results[0].hits[0].source_table.?);
+}
+
+test "distributed graph path materialization preserves table provenance" {
+    const alloc = std.testing.allocator;
+    var state = QueryState{ .name = try alloc.dupe(u8, "walk") };
+    defer state.deinit(alloc);
+
+    const root = try appendRootPathState(alloc, &state, "doc:a", null);
+    var shared = try initPathState(alloc, "shared", "entities", 1, 1, 1, root, null, null);
+    var shared_owned = true;
+    errdefer if (shared_owned) shared.deinit(alloc);
+    try state.path_states.append(alloc, shared);
+    shared_owned = false;
+    const shared_id: u32 = @intCast(state.path_states.items.len - 1);
+
+    var target = try initPathState(alloc, "doc:c", "entities", 2, 2, 2, shared_id, null, null);
+    var target_owned = true;
+    errdefer if (target_owned) target.deinit(alloc);
+    try state.path_states.append(alloc, target);
+    target_owned = false;
+    const target_id: u32 = @intCast(state.path_states.items.len - 1);
+
+    var node = try materializePathStateNode(alloc, &state, target_id);
+    defer node.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), node.path.?.len);
+    try std.testing.expectEqualStrings("doc:a", node.path.?[0]);
+    try std.testing.expect(node.path_tables.?[0] == null);
+    try std.testing.expectEqualStrings("entities", node.path_tables.?[1].?);
+    try std.testing.expectEqualStrings("entities", node.path_tables.?[2].?);
 }
 
 test "distributed graph retries once on topology change and succeeds" {
@@ -10798,8 +14332,8 @@ test "distributed graph retries once on topology change and succeeds" {
                     .query_type = .neighbors,
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
-                    .include_documents = true,
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },
@@ -11136,6 +14670,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },

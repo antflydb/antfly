@@ -19,6 +19,13 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
+const graph_query_mod = @import("../graph/query.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -126,7 +133,19 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        GraphWorkBudgetExceeded,
+        GraphMinWeightDomainViolation,
+        GraphMaxWeightDomainViolation,
+        GraphPathWeightOverflow,
+        GraphDistinctBudgetExceeded,
+        GraphAnchorFilterRequiresIndex,
+        GraphMatchOperationLimitExceeded,
+        GraphQueryModeUnsupported,
+        GraphExternalAliasDocumentFilterUnsupported,
+        GraphExternalAliasSourceUnsupported,
+        GraphReverseVariablePathUnsupported,
         HierarchyCursorStale,
+        TopologyChanged,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
@@ -709,6 +728,16 @@ pub fn hierarchyCursorStaleBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn topologyChangedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = 409,
+        .@"error" = "topology_changed",
+        .message = "the table topology changed while the query was running",
+        .action = "retry_query",
+        .retryable = true,
+    }, .{});
+}
+
 /// Stable, non-retryable public error for hierarchy grouping that cannot be
 /// represented because at least one selected member lacks durable unit
 /// identity. Keep this in
@@ -807,6 +836,362 @@ fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_work_budget_diagnostic.take() orelse graph_work_budget_diagnostic.Diagnostic{
+        .operation = "$request",
+        .mode = "graph_queries",
+        .dimension = .explored_edges,
+        .maximum = graph_pattern_mod.default_max_explored_edges,
+    };
+    const dimension = graph_work_budget_diagnostic.dimensionName(diagnostic.dimension);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_work_budget_exceeded",
+        .message = "exact graph execution exceeded its bounded work budget",
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .mode = diagnostic.mode,
+        .dimension = dimension,
+        .maximum = diagnostic.maximum,
+        .remediation = "narrow the operation's anchor/filter, reduce path breadth or depth, or split the query",
+    }, .{});
+}
+
+pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_path_weight_diagnostic.take() orelse
+        return error.MissingGraphPathWeightDiagnostic;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_path_weight_domain_error",
+        .message = "an edge weight or accumulated path score is outside the path algorithm's exact numeric domain",
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .objective = @tagName(diagnostic.objective),
+        .violation = @tagName(diagnostic.violation),
+        .remediation = "normalize edge weights or select a compatible path weight mode",
+    }, .{});
+}
+
+test "graph path weight error body fails closed without its diagnostic" {
+    var storage: graph_path_weight_diagnostic.Storage = .{};
+    const binding = graph_path_weight_diagnostic.bind(&storage);
+    defer binding.deinit();
+    graph_path_weight_diagnostic.reset();
+    try std.testing.expectError(
+        error.MissingGraphPathWeightDiagnostic,
+        graphPathWeightDomainErrorBody(std.testing.allocator),
+    );
+}
+
+pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_distinct_budget_diagnostic.take() orelse
+        return error.MissingGraphDistinctBudgetDiagnostic;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_distinct_budget_exceeded",
+        .message = "exact graph distinct aggregation exceeded its request budget",
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .dimension = graph_distinct_budget_diagnostic.dimensionName(diagnostic.dimension),
+        .maximum = diagnostic.maximum,
+        .remediation = "narrow match.anchor, reduce matching cardinality, split the query, or remove distinct",
+    }, .{});
+}
+
+pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_anchor_filter_requires_index",
+        .message = "exact graph anchor enumeration requires native index coverage for stored-field and authorization filters; ids-only filters use the primary identity index",
+        .retryable = false,
+    }, .{});
+}
+
+const GraphQueryUnsupportedDiagnostic = struct {
+    operation: []const u8 = "$request",
+    feature: []const u8 = "graph_queries",
+    reason: []const u8 = "unsupported_mode",
+};
+
+pub fn graphQueryUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    var diagnostic = if (parsed) |value| graphQueryUnsupportedDiagnostic(value.value) else GraphQueryUnsupportedDiagnostic{};
+    if (graph_query_diagnostic.take()) |recorded| {
+        diagnostic = .{
+            .operation = recorded.operation,
+            .feature = recorded.feature,
+            .reason = @tagName(recorded.reason),
+        };
+    }
+    return try graphQueryUnsupportedBodyForDiagnostic(alloc, diagnostic);
+}
+
+pub fn graphQueryCapabilityUnsupportedBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    reason: ?[]const u8,
+) ![]u8 {
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    var diagnostic = if (parsed) |value| graphQueryUnsupportedDiagnostic(value.value) else GraphQueryUnsupportedDiagnostic{};
+    if (reason) |value| {
+        if (graph_query_diagnostic.take()) |recorded| {
+            if (std.mem.eql(u8, value, @tagName(recorded.reason))) {
+                diagnostic = .{
+                    .operation = recorded.operation,
+                    .feature = recorded.feature,
+                    .reason = value,
+                };
+            } else {
+                diagnostic.reason = value;
+            }
+        } else {
+            diagnostic.reason = value;
+        }
+    }
+    return try graphQueryUnsupportedBodyForDiagnostic(alloc, diagnostic);
+}
+
+fn graphQueryUnsupportedBodyForDiagnostic(
+    alloc: std.mem.Allocator,
+    diagnostic: GraphQueryUnsupportedDiagnostic,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_query_unsupported",
+        .message = graphQueryUnsupportedMessage(diagnostic.reason),
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .feature = diagnostic.feature,
+        .reason = diagnostic.reason,
+    }, .{});
+}
+
+fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "expand_strategy_not_supported"))
+        return "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly";
+    if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
+        return "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window";
+    if (std.mem.eql(u8, reason, "request_control_not_supported"))
+        return "this request control cannot be combined with exact graph execution in this runtime; remove the field or run the graph query separately";
+    if (std.mem.eql(u8, reason, "external_alias_document_filter_not_supported"))
+        return "this runtime snapshot cannot evaluate stored-document filters on aliases outside the queried table; remove that alias filter or use coordinator-backed execution";
+    if (std.mem.eql(u8, reason, "external_alias_source_not_supported"))
+        return "this runtime snapshot cannot expand relationships from an alias outside the queried table; use coordinator-backed execution or express table boundaries as terminal aliases";
+    if (std.mem.eql(u8, reason, "reverse_variable_path_not_supported"))
+        return "exact execution cannot prove a planner-required reverse variable-length expansion; use explicit single-hop relationships at table boundaries";
+    return "this graph query mode is not supported by exact public execution; use graph_queries with outgoing, deduplicated traversal semantics";
+}
+
+fn graphQueryUnsupportedDiagnostic(root: std.json.Value) GraphQueryUnsupportedDiagnostic {
+    if (root != .object) return .{};
+    if (root.object.get("expand_strategy")) |value| {
+        if (value != .null) return .{
+            .feature = "expand_strategy",
+            .reason = "expand_strategy_not_supported",
+        };
+    }
+    if (root.object.get("graph_queries")) |queries| {
+        if (queries == .object) return canonicalGraphUnsupportedDiagnostic(queries.object);
+    }
+    if (root.object.get("graph_searches")) |queries| {
+        if (queries == .object) return legacyGraphUnsupportedDiagnostic(queries.object);
+    }
+    return .{};
+}
+
+fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsupportedDiagnostic {
+    var fallback: ?GraphQueryUnsupportedDiagnostic = null;
+    var it = queries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const operation_name = entry.key_ptr.*;
+        const value = entry.value_ptr.object;
+        const mode = canonicalGraphMode(value) orelse "unknown";
+        if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
+        const params = value.get(mode) orelse continue;
+        if (params != .object) continue;
+        if (jsonString(params.object, "direction")) |direction| {
+            if (!std.mem.eql(u8, direction, "out")) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "direction_must_be_out",
+            };
+        }
+        if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
+            return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "deduplicate_nodes_must_be_true",
+            };
+        }
+        if (params.object.get("start")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "start_selector_not_supported",
+            };
+        }
+    }
+    return fallback orelse .{};
+}
+
+fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsupportedDiagnostic {
+    var fallback: ?GraphQueryUnsupportedDiagnostic = null;
+    var it = queries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const operation_name = entry.key_ptr.*;
+        const value = entry.value_ptr.object;
+        const mode = jsonString(value, "type") orelse "unknown";
+        if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
+        if (value.get("params")) |params| {
+            if (params == .object) {
+                if (jsonString(params.object, "direction")) |direction| {
+                    if (!std.mem.eql(u8, direction, "out")) return .{
+                        .operation = operation_name,
+                        .feature = mode,
+                        .reason = "direction_must_be_out",
+                    };
+                }
+                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
+                    .operation = operation_name,
+                    .feature = mode,
+                    .reason = "deduplicate_nodes_must_be_true",
+                };
+            }
+        }
+        if (value.get("start_nodes")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "start_selector_not_supported",
+            };
+        }
+        if (value.get("target_nodes")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "target_selector_not_supported",
+            };
+        }
+        if (value.get("params")) |params| {
+            if (params == .object) {
+                if (std.mem.eql(u8, mode, "neighbors") or std.mem.eql(u8, mode, "traverse")) {
+                    if (jsonString(params.object, "weight_mode")) |weight_mode| {
+                        if (!std.mem.eql(u8, weight_mode, "min_hops")) return .{
+                            .operation = operation_name,
+                            .feature = mode,
+                            .reason = "weight_mode_must_be_min_hops",
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, mode, "shortest_path")) {
+                    if (jsonInteger(params.object, "k")) |k| {
+                        if (k != 1) return .{
+                            .operation = operation_name,
+                            .feature = mode,
+                            .reason = "k_must_equal_one",
+                        };
+                    }
+                }
+            }
+        }
+        if ((std.mem.eql(u8, mode, "shortest_path") or std.mem.eql(u8, mode, "k_shortest_paths")) and
+            value.get("target_nodes") == null)
+        {
+            return .{ .operation = operation_name, .feature = mode, .reason = "target_required" };
+        }
+        if (std.mem.eql(u8, mode, "pattern")) {
+            const pattern = value.get("pattern");
+            if (pattern == null or pattern.? != .array or pattern.?.array.items.len == 0) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "pattern_required",
+            };
+            for (pattern.?.array.items) |step| {
+                if (step != .object) continue;
+                const edge = step.object.get("edge") orelse continue;
+                if (edge != .object) continue;
+                if (jsonString(edge.object, "direction")) |direction| {
+                    if (!std.mem.eql(u8, direction, "out")) return .{
+                        .operation = operation_name,
+                        .feature = mode,
+                        .reason = "direction_must_be_out",
+                    };
+                }
+            }
+        }
+    }
+    return fallback orelse .{};
+}
+
+fn canonicalGraphMode(value: std.json.ObjectMap) ?[]const u8 {
+    inline for ([_][]const u8{ "match", "traverse", "shortest_path", "k_shortest_paths" }) |mode| {
+        if (value.get(mode) != null) return mode;
+    }
+    return null;
+}
+
+fn jsonString(value: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const item = value.get(key) orelse return null;
+    return if (item == .string) item.string else null;
+}
+
+fn jsonBool(value: std.json.ObjectMap, key: []const u8) ?bool {
+    const item = value.get(key) orelse return null;
+    return if (item == .bool) item.bool else null;
+}
+
+fn jsonInteger(value: std.json.ObjectMap, key: []const u8) ?i64 {
+    const item = value.get(key) orelse return null;
+    return if (item == .integer) item.integer else null;
+}
+
+fn selectorRefUnsupported(selector: std.json.Value) bool {
+    if (selector != .object) return false;
+    const result_ref = jsonString(selector.object, "result_ref") orelse return false;
+    if (std.mem.eql(u8, result_ref, "$query_results")) return false;
+    return !std.mem.startsWith(u8, result_ref, "$graph_results.") or result_ref.len == "$graph_results.".len;
+}
+
+fn graphMatchOperationCountFromBody(alloc: std.mem.Allocator, body: []const u8) usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return graph_query_mod.max_match_queries_per_request + 1;
+    defer parsed.deinit();
+    if (parsed.value != .object) return graph_query_mod.max_match_queries_per_request + 1;
+    if (parsed.value.object.get("graph_queries")) |queries| {
+        if (queries != .object) return graph_query_mod.max_match_queries_per_request + 1;
+        var count: usize = 0;
+        var it = queries.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .object and entry.value_ptr.object.get("match") != null) count += 1;
+        }
+        return count;
+    }
+    const queries = parsed.value.object.get("graph_searches") orelse return graph_query_mod.max_match_queries_per_request + 1;
+    if (queries != .object) return graph_query_mod.max_match_queries_per_request + 1;
+    var count: usize = 0;
+    var it = queries.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const query_type = entry.value_ptr.object.get("type") orelse continue;
+        if (query_type == .string and std.mem.eql(u8, query_type.string, "pattern")) count += 1;
+    }
+    return count;
+}
+
+pub fn graphMatchOperationLimitExceededBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_match_operation_limit_exceeded",
+        .message = "too many named MATCH operations; put multiple aggregates over one pattern in the same MATCH return object",
+        .retryable = false,
+        .maximum = graph_query_mod.max_match_queries_per_request,
+        .actual = graphMatchOperationCountFromBody(alloc, body),
+    }, .{});
+}
+
 pub fn handleTableBatch(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -892,12 +1277,20 @@ pub fn handleTableQueryRequest(
     row_filter_json: ?[]const u8,
     api: TableApi,
 ) !OwnedResponse {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+
     if (try bodyHasInternalShardQueryFields(alloc, body)) {
         std.log.warn("public table query rejected internal fields table={s}", .{table_name});
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
     }
 
     db_mod.resetLastSortRejectionDiagnostic();
+    graph_query_diagnostic.reset();
+    graph_distinct_budget_diagnostic.reset();
+    graph_work_budget_diagnostic.reset();
+    graph_path_weight_diagnostic.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -984,9 +1377,53 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
             },
+            error.GraphWorkBudgetExceeded => {
+                std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphWorkBudgetExceededBody(alloc), .json = true };
+            },
+            error.GraphMinWeightDomainViolation, error.GraphMaxWeightDomainViolation, error.GraphPathWeightOverflow => {
+                std.log.warn("public table graph path weight domain violation table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphPathWeightDomainErrorBody(alloc), .json = true };
+            },
+            error.GraphDistinctBudgetExceeded => {
+                std.log.warn("public table graph distinct budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphDistinctBudgetExceededBody(alloc), .json = true };
+            },
+            error.GraphAnchorFilterRequiresIndex => {
+                std.log.warn("public table graph anchor filter lacks native index coverage table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphAnchorFilterRequiresIndexBody(alloc), .json = true };
+            },
+            error.GraphMatchOperationLimitExceeded => {
+                std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
+            },
+            error.GraphQueryModeUnsupported => {
+                std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryUnsupportedBody(alloc, body), .json = true };
+            },
+            error.GraphExternalAliasDocumentFilterUnsupported => {
+                std.log.warn("public table graph external alias filter lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "external_alias_document_filter_not_supported"), .json = true };
+            },
+            error.GraphExternalAliasSourceUnsupported => {
+                std.log.warn("public table graph external alias source lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "external_alias_source_not_supported"), .json = true };
+            },
+            error.GraphReverseVariablePathUnsupported => {
+                std.log.warn("public table graph reverse variable path lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "reverse_variable_path_not_supported"), .json = true };
+            },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
                 return .{ .status = 409, .body = try hierarchyCursorStaleBody(alloc), .json = true };
+            },
+            error.TopologyChanged => {
+                std.log.info("public table query topology changed after retry table={s}", .{table_name});
+                return .{
+                    .status = 409,
+                    .body = try topologyChangedBody(alloc),
+                    .json = true,
+                };
             },
             error.QueryEmbeddingInputTooLarge => {
                 return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
@@ -2223,9 +2660,10 @@ test "public create index returns normalized created resource" {
     try std.testing.expectEqualStrings("{\"name\":\"search\",\"type\":\"full_text\"}", resp.body);
 }
 
-test "public table batch handler rejects unsupported missing-document transform before execution" {
+test "public table batch handler forwards pull transforms" {
     const Backend = struct {
         called: bool = false,
+        op: ?db_mod.types.TransformOpType = null,
 
         fn iface(self: *@This()) TableApi {
             return .{
@@ -2249,12 +2687,14 @@ test "public table batch handler rejects unsupported missing-document transform 
             ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
-            _: db_mod.types.BatchRequest,
+            request: db_mod.types.BatchRequest,
             _: operation.RequestContext,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
-            return error.InternalFailure;
+            if (request.transforms.len != 1 or request.transforms[0].operations.len != 1)
+                return error.InternalFailure;
+            self.op = request.transforms[0].operations[0].op;
         }
     };
 
@@ -2264,9 +2704,9 @@ test "public table batch handler rejects unsupported missing-document transform 
     , backend.iface());
     defer resp.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid batch request", resp.body);
-    try std.testing.expect(!backend.called);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(backend.called);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, backend.op.?);
 }
 
 test "public table batch handler maps backend errors" {
@@ -3358,6 +3798,504 @@ test "public table query handler maps candidate budget exhaustion" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps exact graph execution failures" {
+    const Kind = enum {
+        work_budget,
+        path_weight_domain,
+        distinct_budget,
+        anchor_filter,
+        match_operation_limit,
+        graph_query_mode,
+        external_alias_filter,
+        external_alias_source,
+        reverse_variable_path,
+        topology_changed,
+    };
+    const Backend = struct {
+        fn iface(kind: *Kind) TableApi {
+            return .{
+                .ptr = kind,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const kind: *Kind = @ptrCast(@alignCast(ptr));
+            return switch (kind.*) {
+                .work_budget => {
+                    graph_work_budget_diagnostic.record("pattern", .{
+                        .query_type = .pattern,
+                        .index_name = "relationships",
+                        .start_nodes = .{ .keys = &.{} },
+                        .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
+                    }, .{ .dimension = .intermediate_states, .maximum = 100_000 });
+                    return error.GraphWorkBudgetExceeded;
+                },
+                .path_weight_domain => {
+                    graph_path_weight_diagnostic.record("strongest", .{
+                        .query_type = .neighbors,
+                        .index_name = "relationships",
+                        .start_nodes = .{ .keys = &.{} },
+                        .params = .{ .weight_mode = .max_weight },
+                    }, error.GraphMaxWeightDomainViolation);
+                    return error.GraphMaxWeightDomainViolation;
+                },
+                .distinct_budget => {
+                    graph_distinct_budget_diagnostic.record("unique_people", .{
+                        .dimension = .distinct_identities,
+                        .maximum = 512,
+                    });
+                    return error.GraphDistinctBudgetExceeded;
+                },
+                .anchor_filter => error.GraphAnchorFilterRequiresIndex,
+                .match_operation_limit => error.GraphMatchOperationLimitExceeded,
+                .graph_query_mode => error.GraphQueryModeUnsupported,
+                .external_alias_filter => {
+                    graph_query_diagnostic.record("pattern", "match", .external_alias_document_filter_not_supported);
+                    return error.GraphExternalAliasDocumentFilterUnsupported;
+                },
+                .external_alias_source => {
+                    graph_query_diagnostic.record("pattern", "match", .external_alias_source_not_supported);
+                    return error.GraphExternalAliasSourceUnsupported;
+                },
+                .reverse_variable_path => {
+                    graph_query_diagnostic.record("pattern", "match", .reverse_variable_path_not_supported);
+                    return error.GraphReverseVariablePathUnsupported;
+                },
+                .topology_changed => error.TopologyChanged,
+            };
+        }
+    };
+
+    var kind = Kind.work_budget;
+    var work_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer work_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), work_resp.status);
+    var work = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        work_resp.body,
+        .{},
+    );
+    defer work.deinit();
+    const work_error = switch (work.value) {
+        .graph_work_budget_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!work_error.retryable);
+    try std.testing.expectEqualStrings("pattern", work_error.operation);
+    try std.testing.expectEqualStrings("match", work_error.mode);
+    try std.testing.expectEqualStrings("intermediate_states", work_error.dimension);
+    try std.testing.expectEqual(@as(i64, 100_000), work_error.maximum);
+
+    kind = .path_weight_domain;
+    var weight_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer weight_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), weight_resp.status);
+    var weight = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        weight_resp.body,
+        .{},
+    );
+    defer weight.deinit();
+    const weight_error = switch (weight.value) {
+        .graph_path_weight_domain_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!weight_error.retryable);
+    try std.testing.expectEqualStrings("strongest", weight_error.operation);
+    try std.testing.expectEqual(.max_weight_product, weight_error.objective);
+
+    kind = .distinct_budget;
+    var resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var distinct = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        resp.body,
+        .{},
+    );
+    defer distinct.deinit();
+    const distinct_error = switch (distinct.value) {
+        .graph_distinct_budget_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!distinct_error.retryable);
+    try std.testing.expectEqualStrings("unique_people", distinct_error.operation);
+    try std.testing.expectEqualStrings("distinct_identities", distinct_error.dimension);
+    try std.testing.expectEqual(@as(i64, 512), distinct_error.maximum);
+    try std.testing.expect(distinct_error.remediation.len > 0);
+
+    kind = .anchor_filter;
+    var anchor_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer anchor_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), anchor_resp.status);
+    var anchor = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        anchor_resp.body,
+        .{},
+    );
+    defer anchor.deinit();
+    const anchor_error = switch (anchor.value) {
+        .graph_anchor_filter_requires_index_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!anchor_error.retryable);
+
+    kind = .match_operation_limit;
+    var match_body = std.ArrayListUnmanaged(u8).empty;
+    defer match_body.deinit(std.testing.allocator);
+    try match_body.appendSlice(std.testing.allocator, "{\"graph_queries\":{");
+    for (0..graph_query_mod.max_match_queries_per_request + 1) |i| {
+        if (i > 0) try match_body.append(std.testing.allocator, ',');
+        try match_body.print(std.testing.allocator, "\"q{d}\":{{\"match\":{{}}}}", .{i});
+    }
+    try match_body.appendSlice(std.testing.allocator, "}}");
+    var limit_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        match_body.items,
+        null,
+        Backend.iface(&kind),
+    );
+    defer limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), limit_resp.status);
+    var limit = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        limit_resp.body,
+        .{},
+    );
+    defer limit.deinit();
+    const limit_error = switch (limit.value) {
+        .graph_match_operation_limit_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!limit_error.retryable);
+    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
+    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
+
+    kind = .graph_query_mode;
+    var cross_range_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"graph_searches\":{\"incoming\":{\"type\":\"traverse\",\"index_name\":\"relationships\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"params\":{\"direction\":\"in\"}}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer cross_range_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), cross_range_resp.status);
+    var graph_mode = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        cross_range_resp.body,
+        .{},
+    );
+    defer graph_mode.deinit();
+    const graph_mode_error = switch (graph_mode.value) {
+        .graph_query_unsupported_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!graph_mode_error.retryable);
+    try std.testing.expectEqualStrings("incoming", graph_mode_error.operation);
+    try std.testing.expectEqualStrings("traverse", graph_mode_error.feature);
+    try std.testing.expectEqualStrings("direction_must_be_out", graph_mode_error.reason);
+
+    const CapabilityCase = struct { kind: Kind, reason: []const u8 };
+    const capability_cases = [_]CapabilityCase{
+        .{ .kind = .external_alias_filter, .reason = "external_alias_document_filter_not_supported" },
+        .{ .kind = .external_alias_source, .reason = "external_alias_source_not_supported" },
+        .{ .kind = .reverse_variable_path, .reason = "reverse_variable_path_not_supported" },
+    };
+    for (capability_cases) |case| {
+        kind = case.kind;
+        var capability_resp = try handleTableQueryRequest(
+            std.testing.allocator,
+            "docs",
+            "{\"graph_queries\":{\"first_walk\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]}}},\"pattern\":{\"index\":\"relationships\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
+            null,
+            Backend.iface(&kind),
+        );
+        defer capability_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 422), capability_resp.status);
+        var capability = try ant_json.parseFromSlice(
+            metadata_openapi.QueryUnprocessableError,
+            std.testing.allocator,
+            capability_resp.body,
+            .{},
+        );
+        defer capability.deinit();
+        const capability_error = switch (capability.value) {
+            .graph_query_unsupported_error => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqualStrings(case.reason, capability_error.reason);
+        try std.testing.expectEqualStrings("pattern", capability_error.operation);
+        try std.testing.expectEqualStrings("match", capability_error.feature);
+    }
+
+    kind = .topology_changed;
+    var topology_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"graph_queries\":{\"neighbors\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]}}}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer topology_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), topology_resp.status);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":409,\"error\":\"topology_changed\",\"action\":\"retry_query\",\"retryable\":true}",
+        topology_resp.body,
+    );
+
+    const legacy_limit_body =
+        \\{"graph_searches":{"first":{"type":"pattern"},"neighbors":{"type":"neighbors"},"second":{"type":"pattern"}}}
+    ;
+    const legacy_error_body = try graphMatchOperationLimitExceededBody(std.testing.allocator, legacy_limit_body);
+    defer std.testing.allocator.free(legacy_error_body);
+    var legacy_limit = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        legacy_error_body,
+        .{},
+    );
+    defer legacy_limit.deinit();
+    const legacy_limit_error = switch (legacy_limit.value) {
+        .graph_match_operation_limit_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
+}
+
+test "unsupported graph diagnostics identify the rejected operation feature" {
+    const Case = struct {
+        body: []const u8,
+        operation: []const u8,
+        feature: []const u8,
+        reason: []const u8,
+        message: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{
+            .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
+            .operation = "$request",
+            .feature = "expand_strategy",
+            .reason = "expand_strategy_not_supported",
+            .message = "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",
+            .operation = "walk",
+            .feature = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"start_nodes\":{\"result_ref\":\"$full_text_results\"}}}}",
+            .operation = "walk",
+            .feature = "traverse",
+            .reason = "start_selector_not_supported",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"start_nodes\":{\"keys\":[\"a\"]},\"target_nodes\":{\"result_ref\":\"$embeddings_results\"}}}}",
+            .operation = "path",
+            .feature = "shortest_path",
+            .reason = "target_selector_not_supported",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"neighbors\",\"params\":{\"weight_mode\":\"min_weight\"}}}}",
+            .operation = "walk",
+            .feature = "neighbors",
+            .reason = "weight_mode_must_be_min_hops",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"target_nodes\":{\"keys\":[\"b\"]},\"params\":{\"k\":2}}}}",
+            .operation = "path",
+            .feature = "shortest_path",
+            .reason = "k_must_equal_one",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\"}}}",
+            .operation = "path",
+            .feature = "shortest_path",
+            .reason = "target_required",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\"}}}",
+            .operation = "match",
+            .feature = "pattern",
+            .reason = "pattern_required",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\",\"pattern\":[{\"alias\":\"a\"},{\"alias\":\"b\",\"edge\":{\"direction\":\"both\"}}]}}}",
+            .operation = "match",
+            .feature = "pattern",
+            .reason = "direction_must_be_out",
+        },
+    };
+
+    for (cases) |case| {
+        const body = try graphQueryUnsupportedBody(std.testing.allocator, case.body);
+        defer std.testing.allocator.free(body);
+        var parsed = try ant_json.parseFromSlice(
+            metadata_openapi.GraphQueryUnsupportedError,
+            std.testing.allocator,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.operation, parsed.value.operation);
+        try std.testing.expectEqualStrings(case.feature, parsed.value.feature);
+        try std.testing.expectEqualStrings(case.reason, parsed.value.reason);
+        if (case.message) |message| try std.testing.expectEqualStrings(message, parsed.value.message);
+    }
+}
+
+test "runtime graph capability diagnostics preserve the failing named operation" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "later_match",
+        "match",
+        .external_alias_source_not_supported,
+    );
+    const body = try graphQueryCapabilityUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_queries\":{\"first_walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]}}},\"later_match\":{\"index\":\"g\",\"match\":{}}}}",
+        "external_alias_source_not_supported",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("later_match", parsed.value.operation);
+    try std.testing.expectEqualStrings("match", parsed.value.feature);
+    try std.testing.expectEqualStrings("external_alias_source_not_supported", parsed.value.reason);
+}
+
+test "recorded graph diagnostics explain serverless legacy rejection" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "$request",
+        "graph_searches",
+        .legacy_graph_searches_not_supported,
+    );
+
+    const body = try graphQueryUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\"}}}",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("$request", parsed.value.operation);
+    try std.testing.expectEqualStrings("graph_searches", parsed.value.feature);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed.value.reason,
+    );
+    try std.testing.expectEqualStrings(
+        "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window",
+        parsed.value.message,
+    );
+}
+
+test "recorded graph diagnostics identify unsupported request controls" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "$request",
+        "order_by",
+        .request_control_not_supported,
+    );
+
+    const body = try graphQueryUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"match\":{}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("$request", parsed.value.operation);
+    try std.testing.expectEqualStrings("order_by", parsed.value.feature);
+    try std.testing.expectEqualStrings("request_control_not_supported", parsed.value.reason);
+    try std.testing.expectEqualStrings(
+        "this request control cannot be combined with exact graph execution in this runtime; remove the field or run the graph query separately",
+        parsed.value.message,
+    );
 }
 
 test "public table query handler maps unsupported exact sort" {

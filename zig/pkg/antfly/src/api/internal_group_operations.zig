@@ -28,6 +28,9 @@ pub const Error = operation.ApiError || error{
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    QueryCandidateBudgetExceeded,
+    GraphExploredEdgesBudgetExceeded,
+    GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
@@ -766,6 +769,8 @@ pub const Operations = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.GraphExploredEdgesBudgetExceeded => return error.GraphExploredEdgesBudgetExceeded,
+            error.GraphExploredEdgeBytesBudgetExceeded => return error.GraphExploredEdgeBytesBudgetExceeded,
             error.UnknownGroup, error.TableNotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse error.NotFound;

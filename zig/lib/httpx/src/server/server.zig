@@ -630,6 +630,13 @@ pub const Context = struct {
         return self.response.build();
     }
 
+    /// Sends a schema-aware OpenAPI JSON response. Generic `json` preserves
+    /// explicit null optionals; this method applies OpenAPI absence semantics.
+    pub fn openApiJson(self: *Self, value: anytype) !Response {
+        _ = try self.response.openApiJson(value);
+        return self.response.build();
+    }
+
     /// Sends a redirect response.
     pub fn redirect(self: *Self, url: []const u8, code: u16) !Response {
         _ = self.response.status(code);

@@ -2559,6 +2559,20 @@ pub const Fixture = struct {
         // attempts that production would never schedule.
         const cadence_ms = self.driverCadenceMs();
         while (!self.driver_stop) {
+            if (self.control_round_active) {
+                // Let an explicitly scheduled production control operation
+                // reach its next external boundary before making another Raft
+                // ticker runnable. This is a valid deterministic schedule and
+                // prevents continuously due tickers from starving the control
+                // task that production's runtime scheduler would service.
+                self.sim.io().sleep(.fromMilliseconds(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms), .awake) catch |err| {
+                    if (err == error.Canceled and self.driver_stop) return;
+                    self.driver_failure = err;
+                    self.driver_stop = true;
+                    return;
+                };
+                continue;
+            }
             if (self.data_server_paused[index] or !self.data_server_live[index]) {
                 self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
                     if (err == error.Canceled and self.driver_stop) return;
@@ -2597,6 +2611,82 @@ pub const Fixture = struct {
                 else => return err,
             };
         }
+    }
+
+    fn publishManagedIndexStoreStatus(self: *Fixture, server_index: usize) !void {
+        try self.data_servers[server_index].runStoreStatusRoundOnly();
+    }
+
+    fn runManagedIndexMaintenance(self: *Fixture, server_index: usize) !void {
+        // Root reconciliation can make runtime status dirty after a refresh
+        // that was scheduled in the same turn. Two production scheduling
+        // passes preserve that causal order without running unrelated control
+        // lanes or inspecting derived state from the fixture.
+        for (0..2) |_| {
+            try self.data_servers[server_index].requestIndexPublicationMaintenanceRoundOnly();
+            var settled = false;
+            for (0..512) |_| {
+                if (!self.data_servers[server_index].indexPublicationMaintenanceActive()) {
+                    settled = true;
+                    break;
+                }
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            if (!settled) return error.ProductionManagedIndexMaintenanceTimeout;
+        }
+    }
+
+    fn runManagedIndexStatusRound(
+        self: *Fixture,
+        server_index: usize,
+        run_publication_maintenance: bool,
+    ) !void {
+        if (self.data_server_paused[server_index] or !self.data_server_live[server_index]) return;
+        std.debug.assert(!self.control_round_active);
+        self.control_round_active = true;
+        defer self.control_round_active = false;
+        if (run_publication_maintenance) try self.runManagedIndexMaintenance(server_index);
+        // Status publication is a metadata Raft mutation. Run the production
+        // collector/HTTP request as its own task while the fixture advances
+        // the real metadata group; invoking it synchronously before
+        // `stepAll` creates a circular wait in a deterministic runtime even
+        // though production metadata Raft has an independent ticker.
+        var report = self.sim.io().async(publishManagedIndexStoreStatus, .{ self, server_index });
+        defer if (report.any_future != null) {
+            _ = report.cancel(self.sim.io()) catch {};
+        };
+        var report_finished = false;
+        for (0..512) |_| {
+            const snapshot = self.sim.futureTaskSnapshot(report.any_future orelse break) orelse
+                return error.ProductionManagedIndexStatusTaskMissing;
+            if (snapshot.status == .finished) {
+                report_finished = true;
+                break;
+            }
+            // The metadata mutation owns its own quorum stepping and uses the
+            // shared single-owner election recovery in proposeTransitionCommands.
+            // An independent fixture campaign here can rotate a second
+            // candidate between proposal yields and create an artificial term
+            // storm that no production scheduler would impose.
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        if (!report_finished) return error.ProductionManagedIndexStatusPublicationTimeout;
+        report.await(self.sim.io()) catch |err| switch (err) {
+            // These are the same transient collection/bootstrap races
+            // tolerated by the managed production control loop. A later
+            // round recollects and republishes the full observation.
+            error.LsmRootWriterAlreadyOpen,
+            error.WriterLocked,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            error.StaleLocalGroupStatusGeneration,
+            error.NotLeader,
+            => {},
+            else => return err,
+        };
     }
 
     fn driveGraphOwnerRestart(self: *Fixture) void {
@@ -4621,20 +4711,25 @@ pub const Fixture = struct {
         if (responses.len != 1) return false;
         const graph_results = responses[0].graph_results orelse return false;
         const walk = graph_results.map.get("walk") orelse return false;
-        const nodes = walk.nodes orelse return false;
+        const node_result = switch (walk) {
+            .graph_nodes_result => |result| result,
+            else => return false,
+        };
+        const nodes = node_result.nodes;
         if (!expect_visible) {
-            return walk.total == 0 and nodes.len == 0 and
+            return node_result.stats.returned_items == 0 and
+                !node_result.stats.truncated and nodes.len == 0 and
                 std.mem.indexOf(u8, body, "tenant:q") == null and
                 std.mem.indexOf(u8, body, "production-tenant") == null;
         }
-        if (walk.total != 1 or nodes.len != 1) return false;
+        if (node_result.stats.returned_items != 1 or
+            node_result.stats.truncated or nodes.len != 1) return false;
         const node = nodes[0];
         if (!std.mem.eql(u8, node.key, "tenant:q") or
             node.table == null or
             !std.mem.eql(u8, node.table.?, "tenant_b_docs")) return false;
         const document = node.document orelse return false;
-        if (document != .object) return false;
-        const title = document.object.get("title") orelse return false;
+        const title = document.map.get("title") orelse return false;
         return title == .string and std.mem.eql(u8, title.string, "production-tenant");
     }
 
@@ -4944,32 +5039,52 @@ pub const Fixture = struct {
         // public status endpoint while creation is still in flight can keep
         // adding HTTP/Raft work faster than the derived repair lane drains,
         // exhausting a bounded history without learning a new state.
+        var create_finished = false;
+        for (0..512) |round| {
+            const snapshot = self.sim.futureTaskSnapshot(create_request.any_future orelse break) orelse
+                return error.ProductionManagedIndexCreateTaskMissing;
+            if (snapshot.status == .finished) {
+                create_finished = true;
+                break;
+            }
+            // Index creation waits for production readiness publication.
+            // Schedule only that production operation here: a full control
+            // round also drives unrelated maintenance lanes and obscures the
+            // publication dependency under a bounded transition budget.
+            try self.runManagedIndexStatusRound(round % node_count, false);
+            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+        }
+        if (!create_finished)
+            return error.ProductionManagedIndexCreateDidNotComplete;
         var created = try create_request.await(self.sim.io());
         created.deinit(self.alloc);
         self.managed_index_created = true;
 
+        // Every remote metadata source intentionally caches both the content
+        // head and snapshot. Cross the production provisioning poll interval
+        // in virtual time before asking each owner to reconcile the newly
+        // committed index definition; sub-interval retry loops can only
+        // observe the same legal stale cache entry.
+        try self.sim.advance(6 * std.time.ns_per_s);
         var publication_ready = false;
-        for (0..512) |_| {
-            // This fixture deliberately runs production control/status work
-            // only when requested. Drive one real DataServer control round
-            // before each public observation so a transient metadata
-            // leadership failure is retried and the runtime status cache is
-            // published through the same path used in production.
-            try self.runOneControlRound();
+        for (0..64) |_| {
+            // A strict readiness summary is complete only after every local
+            // group owner has reconciled and published its production store
+            // status. Keep the wave explicit so the deterministic scheduler
+            // cannot spend the history repeatedly polling one stale owner.
+            for (0..node_count) |server_index|
+                try self.runManagedIndexStatusRound(server_index, true);
             const observation = self.managedIndexObservationAt(0) catch |err| switch (err) {
                 error.UnexpectedHttpStatus,
                 error.ProductionManagedIndexReadinessMissing,
-                => {
-                    try self.sim.io().sleep(.fromMilliseconds(50), .awake);
-                    continue;
-                },
+                => continue,
                 else => return err,
             };
             if (observation.ready) {
                 publication_ready = true;
                 break;
             }
-            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+            try self.sim.advance(6 * std.time.ns_per_s);
         }
         if (!publication_ready)
             return error.ProductionManagedIndexPublicationDidNotBecomeReady;
@@ -4977,8 +5092,13 @@ pub const Fixture = struct {
         try self.restartDataServerProcess(self.managed_index_restart_target_index);
         self.managed_index_owner_reconstructed = true;
 
-        for (0..2_048) |_| {
-            try self.runOneControlRound();
+        try self.sim.advance(6 * std.time.ns_per_s);
+        for (0..64) |_| {
+            // Re-run the same production reconciliation and publication
+            // owners after process reconstruction. This proves recovery from
+            // durable state rather than relying on the pre-restart cache.
+            for (0..node_count) |server_index|
+                try self.runManagedIndexStatusRound(server_index, true);
             var ready_nodes: usize = 0;
             var replay_converged = true;
             for (0..node_count) |node_index| {
@@ -4999,7 +5119,7 @@ pub const Fixture = struct {
                 self.managed_index_replay_converged = true;
                 break;
             }
-            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+            try self.sim.advance(6 * std.time.ns_per_s);
         }
         if (!self.managed_index_all_nodes_ready or !self.managed_index_replay_converged)
             return error.ProductionManagedIndexReadinessDidNotConverge;
@@ -5349,8 +5469,14 @@ pub const Fixture = struct {
         if (responses.len != 1) return false;
         const graph_results = responses[0].graph_results orelse return false;
         const walk = graph_results.map.get("walk") orelse return false;
-        const nodes = walk.nodes orelse return false;
-        if (walk.total != expected_keys.len or nodes.len != expected_keys.len) {
+        const node_result = switch (walk) {
+            .graph_nodes_result => |result| result,
+            else => return false,
+        };
+        const nodes = node_result.nodes;
+        if (node_result.stats.returned_items != @as(i64, @intCast(expected_keys.len)) or
+            node_result.stats.truncated or nodes.len != expected_keys.len)
+        {
             std.debug.print(
                 "production graph probe start={s} depth={} returned incomplete result: {s}\n",
                 .{ start_key, max_depth, body },
@@ -5383,8 +5509,13 @@ pub const Fixture = struct {
         if (responses.len != 1) return false;
         const graph_results = responses[0].graph_results orelse return false;
         const walk = graph_results.map.get("walk") orelse return false;
-        const nodes = walk.nodes orelse return false;
-        if (walk.total != 2 or nodes.len != 2) return false;
+        const node_result = switch (walk) {
+            .graph_nodes_result => |result| result,
+            else => return false,
+        };
+        const nodes = node_result.nodes;
+        if (node_result.stats.returned_items != 2 or
+            node_result.stats.truncated or nodes.len != 2) return false;
         for ([_]struct { key: []const u8, title: []const u8 }{
             .{ .key = "doc:x", .title = "production-right" },
             .{ .key = "doc:k", .title = "production-split" },
@@ -5393,8 +5524,7 @@ pub const Fixture = struct {
                 if (std.mem.eql(u8, candidate.key, expected.key)) break candidate;
             } else return false;
             const document = node.document orelse return false;
-            if (document != .object) return false;
-            const title = document.object.get("title") orelse return false;
+            const title = document.map.get("title") orelse return false;
             if (title != .string or !std.mem.eql(u8, title.string, expected.title))
                 return false;
         }

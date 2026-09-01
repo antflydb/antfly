@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const ant_json = @import("antfly-json");
+const Allocator = std.mem.Allocator;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("../../api/backups.zig");
@@ -23,7 +23,13 @@ const indexes_api = @import("../../api/indexes.zig");
 const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
+const query_contract = @import("../../api/query_contract.zig");
+const graph_wire_envelope = @import("../../api/graph_wire_envelope.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
+const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
+const graph_distinct_budget_diagnostic = @import("../../graph/distinct_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../../graph/path_weight_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../../graph/work_budget_diagnostic.zig");
 const public_search_request = @import("../../api/public_search_request.zig");
 const public_text_query = @import("../../api/public_text_query.zig");
 const public_table_http = @import("../../api/public_table_http.zig");
@@ -40,9 +46,12 @@ const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_work_budget_mod = @import("../../graph/work_budget.zig");
+const graph_node_admission = @import("../../graph/node_admission.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const graph_paths = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
+const graph_traversal = @import("../../graph/traversal.zig");
 const http_routes = @import("http_routes.zig");
 const http_types = @import("http_types.zig");
 const api_service = @import("service.zig");
@@ -147,6 +156,7 @@ const GraphResultSet = struct {
     name: []const u8,
     hits: []const db_types.SearchHit,
     total_hits: u32,
+    graph_result: ?*const db_types.GraphSearchResult = null,
 };
 
 fn publicGraphSeedTotalHits(hits_len: usize, limit: u32) u32 {
@@ -170,10 +180,9 @@ const JoinedQueryStats = query_execution.JoinedQueryStats;
 const JoinTableStats = query_execution.JoinTableStats;
 const PlannedJoinExecution = query_execution.PlannedJoinExecution;
 const RightJoinQueryResult = query_execution.RightJoinQueryResult;
-const ParsedSupportedJoinRequest = query_execution.ParsedSupportedJoinRequest;
 const freeSupportedJoinRequest = query_execution.freeSupportedJoinRequest;
 const joinUsesForeignSource = query_execution.joinUsesForeignSource;
-const parseSupportedJoinRequest = query_execution.parseSupportedJoinRequest;
+const parseSupportedJoinRequestValueAlloc = query_execution.parseSupportedJoinRequestValueAlloc;
 const parseSupportedJoinClauseValue = query_execution.parseSupportedJoinClauseValue;
 
 fn normalizeServerlessCreateIndexConfig(
@@ -205,6 +214,7 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
@@ -230,6 +240,13 @@ pub const HttpHandler = struct {
 
     pub fn setIo(self: *HttpHandler, io: ?std.Io) void {
         self.io = io;
+    }
+
+    /// Install operator-owned graph ceilings. Public query bodies cannot
+    /// override these values.
+    pub fn setGraphExecutionLimits(self: *HttpHandler, limits: @import("../../graph/work_budget.zig").Limits) !void {
+        try limits.validate();
+        self.graph_execution_limits = limits;
     }
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
@@ -882,15 +899,27 @@ pub const HttpHandler = struct {
             return try textResponse(self.alloc, 429, "table backpressured");
         }
 
-        const req = parseTableIngestBatchRequest(self.alloc, table_name, body) catch return try textResponse(self.alloc, 400, "invalid ingest request");
-        defer freeDocumentMutations(self.alloc, req.mutations);
+        var parsed = ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, self.alloc, body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return try textResponse(self.alloc, 400, "invalid ingest request"),
+        };
+        defer parsed.deinit();
+        const mutations = lowerTableIngestMutationsAlloc(self.alloc, parsed.value.mutations) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidDocumentMutation => return try textResponse(
+                self.alloc,
+                400,
+                "upserts require an object document and deletes must omit document",
+            ),
+        };
+        defer self.alloc.free(mutations);
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
         var result = self.api.ingestBatch(.{
             .namespace = namespace,
-            .timestamp_ns = req.timestamp_ns,
-            .mutations = req.mutations,
+            .timestamp_ns = parsed.value.timestamp_ns,
+            .mutations = mutations,
         }) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
 
@@ -1144,19 +1173,6 @@ pub const HttpHandler = struct {
         }
         try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
-        var profile_requested = false;
-        var public_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| switch (err) {
-            error.UnexpectedToken,
-            error.UnknownField,
-            error.InvalidEnumTag,
-            => return error.InvalidQueryRequest,
-            else => return err,
-        };
-        defer public_request.deinit();
-        profile_requested = public_request.value.profile orelse false;
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
@@ -1174,20 +1190,43 @@ pub const HttpHandler = struct {
             .execution_stats = execution_stats,
             .requested_offset = requested_offset,
             .requested_limit = requested_limit,
-            .profile_requested = profile_requested,
+            .profile_requested = plan.profile_requested,
         };
     }
 
     fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
         try cancellation.check();
-        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body, cancellation) catch |err| switch (err) {
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        if (raw_request.value != .object) return error.InvalidQueryRequest;
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+
+        // Serverless exposes only the current graph contract. Preserve the
+        // OpenAPI distinction between omission and explicit null before feature
+        // routing can let another request mode claim the envelope.
+        if (raw_request.value.object.get("graph_queries")) |value|
+            if (value == .null) return error.InvalidQueryRequest;
+        if (raw_request.value.object.get("graph_searches")) |value|
+            if (value == .null) return error.InvalidQueryRequest;
+
+        if (public_search_request.hasNonNullField(raw_request.value.object, "graph_searches")) {
+            graph_query_diagnostic.record(
+                "$request",
+                "graph_searches",
+                .legacy_graph_searches_not_supported,
+            );
+            return error.GraphQueryModeUnsupported;
+        }
+
+        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         }) |json| {
             return json;
         }
 
-        const join_req = parseSupportedJoinRequest(self.alloc, body) catch |err| switch (err) {
+        const join_req = parseSupportedJoinRequestValueAlloc(self.alloc, body, raw_request.value) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         };
@@ -1199,17 +1238,22 @@ pub const HttpHandler = struct {
             return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
         }
 
-        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation);
     }
 
-    fn executeForeignPublicTableQueryJsonAlloc(
+    fn executeForeignPublicTableQueryJsonValueAlloc(
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
+        raw_request: std.json.Value,
         cancellation: CancellationToken,
     ) anyerror!?[]u8 {
         try cancellation.check();
-        var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        if (raw_request != .object) return error.InvalidQueryRequest;
+        if (!public_search_request.hasNonNullField(raw_request.object, "foreign_sources"))
+            return null;
+
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
@@ -1225,17 +1269,15 @@ pub const HttpHandler = struct {
         try validateSupportedForeignPublicQueryRequest(request);
 
         if (request.join != null) {
-            const parsed_join = (try parseSupportedJoinRequest(self.alloc, body)) orelse return error.InvalidQueryRequest;
-            defer {
-                var owned = parsed_join;
-                owned.deinit(self.alloc);
-            }
+            const join_value = raw_request.object.get("join") orelse return error.InvalidQueryRequest;
+            var parsed_join = try parseSupportedJoinClauseValue(self.alloc, join_value);
+            defer parsed_join.deinit(self.alloc);
             return try self.executeSupportedJoinedForeignPublicTableQueryJsonAlloc(
                 table_name,
                 body,
                 foreign_source,
-                parsed_join.join,
-                parsed_join.foreign_sources,
+                parsed_join,
+                foreign_sources,
                 cancellation,
             );
         }
@@ -1267,10 +1309,9 @@ pub const HttpHandler = struct {
         defer query_api.freeAggregationRequests(self.alloc, aggregation_requests);
 
         const raw_filter_query_json = if (request.filter_query) |query|
-            try stringifyJsonValueAlloc(self.alloc, query)
+            query.bytes
         else
             null;
-        defer if (raw_filter_query_json) |query| self.alloc.free(query);
         const filter_query_json = try foreign_sources_api.buildEffectiveFilterQueryJsonAlloc(
             self.alloc,
             foreign_source,
@@ -1470,8 +1511,7 @@ pub const HttpHandler = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_searches != null) return error.UnsupportedQueryRequest;
-        if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
         if (request.search_after != null) return error.UnsupportedQueryRequest;
@@ -1554,17 +1594,37 @@ pub const HttpHandler = struct {
     }
 
     fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
-        try cancellation.check();
-        const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            else => return error.InternalQueryFailure,
-        };
-        defer if (aggregations_json) |json| self.alloc.free(json);
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+        return self.executePlainPublicTableQueryJsonValueAlloc(
+            table_name,
+            body,
+            raw_request.value,
+            cancellation,
+        );
+    }
 
+    fn executePlainPublicTableQueryJsonValueAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        body: []const u8,
+        raw_request: std.json.Value,
+        cancellation: CancellationToken,
+    ) anyerror![]u8 {
+        try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation)) |owned_response| {
+        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation) catch |err| switch (err) {
+            // Once the graph boundary has recognized the request, unsupported
+            // semantics are an exact-execution capability response, not a
+            // malformed request or an internal server failure.
+            error.UnsupportedQueryRequest => return error.GraphQueryModeUnsupported,
+            else => return err,
+        };
+        if (graph_response) |owned_response| {
             var response = owned_response;
             defer response.deinit(self.alloc);
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
@@ -1575,6 +1635,12 @@ pub const HttpHandler = struct {
                 else => error.InternalQueryFailure,
             };
         }
+
+        const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            else => return error.InternalQueryFailure,
+        };
+        defer if (aggregations_json) |json| self.alloc.free(json);
 
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
@@ -1784,9 +1850,6 @@ pub const HttpHandler = struct {
         var computed = try computeServerlessAggregationResultsAlloc(self, execution, aggregations_json);
         defer computed.deinit(self.alloc);
 
-        const db_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
-        defer freeDbSearchHits(self.alloc, db_hits);
-
         var meta: query_api.QueryResponseMeta = .{
             .aggregation_results = computed.results,
         };
@@ -1797,30 +1860,33 @@ pub const HttpHandler = struct {
             self.alloc,
             table_name,
             .{
-                .count_only = execution.plan.request.count_only,
-                .profile = execution.profile_requested,
+                // This private adapter extracts only the aggregation member.
+                // Avoid materializing and validating discarded hit payloads.
+                .count_only = true,
                 .aggregations_json = aggregations_json,
             },
             meta,
             .{
                 .alloc = self.alloc,
-                .hits = db_hits,
+                .hits = &.{},
                 .total_hits = computed.total_hits,
             },
         );
         defer response.deinit(self.alloc);
 
-        var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, self.alloc, response.json, .{});
-        defer parsed.deinit();
-
-        const responses = parsed.value.responses orelse return error.InternalQueryFailure;
-        if (responses.len == 0) return error.InternalQueryFailure;
-        const aggregations = responses[0].aggregations orelse return .null;
-        const encoded_aggregations = try std.json.Stringify.valueAlloc(self.alloc, aggregations, .{});
-        defer self.alloc.free(encoded_aggregations);
-        var parsed_aggregations = try parseOwnedJsonValueAlloc(self.alloc, encoded_aggregations);
-        errdefer deinitJsonValue(self.alloc, &parsed_aggregations);
-        return parsed_aggregations;
+        // This adapter needs only the canonical aggregation member from the
+        // response it just encoded. Keep that boundary as owned dynamic JSON:
+        // reparsing through the full generated response type couples this
+        // internal projection to unrelated response-union validation.
+        var parsed = try parseOwnedJsonValueAlloc(self.alloc, response.json);
+        defer deinitJsonValue(self.alloc, &parsed);
+        if (parsed != .object) return error.InternalQueryFailure;
+        const responses = parsed.object.get("responses") orelse return error.InternalQueryFailure;
+        if (responses != .array or responses.array.items.len != 1) return error.InternalQueryFailure;
+        const first = responses.array.items[0];
+        if (first != .object) return error.InternalQueryFailure;
+        const aggregations = first.object.get("aggregations") orelse return .null;
+        return try cloneJsonValue(self.alloc, aggregations);
     }
 
     fn collectServerlessAggregationContextAlloc(
@@ -2633,38 +2699,80 @@ pub const HttpHandler = struct {
         body: []const u8,
         cancellation: CancellationToken,
     ) !?HttpResponse {
-        try cancellation.check();
-        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
-        };
-        var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch return null;
-        defer parsed_request.deinit();
-        const request = parsed_request.value;
-        if (request.graph_searches == null) return null;
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+        return self.handleTablePublicGraphQueryRequestValue(
+            table_name,
+            namespace,
+            body,
+            raw_request.value,
+            cancellation,
+        );
+    }
 
-        if (request.aggregations != null or
-            request.analyses != null or
-            request.order_by != null or
-            request.search_after != null or
-            request.search_before != null or
-            request.document_renderer != null or
-            request.join != null or
-            request.foreign_sources != null or
-            request.merge_config != null or
-            request.pruner != null or
-            request.reranker != null or
-            request.expand_strategy != null or
-            request.distance_over != null or
-            request.distance_under != null)
-        {
+    fn handleTablePublicGraphQueryRequestValue(
+        self: *HttpHandler,
+        table_name: []const u8,
+        namespace: []const u8,
+        body: []const u8,
+        raw_request: std.json.Value,
+        cancellation: CancellationToken,
+    ) !?HttpResponse {
+        try cancellation.check();
+        if (raw_request != .object) return error.InvalidQueryRequest;
+        if (raw_request.object.get("graph_searches")) |legacy_graph_request| {
+            if (legacy_graph_request == .null) return error.InvalidQueryRequest;
+            graph_query_diagnostic.record(
+                "$request",
+                "graph_searches",
+                .legacy_graph_searches_not_supported,
+            );
             return error.UnsupportedQueryRequest;
         }
+        const graph_request = raw_request.object.get("graph_queries") orelse return null;
+        if (graph_request == .null) return error.InvalidQueryRequest;
+
+        const unsupported_controls = [_][]const u8{
+            "aggregations",
+            "analyses",
+            "order_by",
+            "search_after",
+            "search_before",
+            "document_renderer",
+            "join",
+            "foreign_sources",
+            "merge_config",
+            "pruner",
+            "reranker",
+            "expand_strategy",
+            "distance_over",
+            "distance_under",
+        };
+        for (unsupported_controls) |field| {
+            if (public_search_request.hasNonNullField(raw_request.object, field)) {
+                graph_query_diagnostic.record(
+                    "$request",
+                    field,
+                    .request_control_not_supported,
+                );
+                return error.UnsupportedQueryRequest;
+            }
+        }
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidQueryRequest;
+        defer parsed_request.deinit();
+        const request = parsed_request.value;
+        if (request.graph_queries == null)
+            return error.InvalidQueryRequest;
 
         const started_ns = platform_time.monotonicNs();
-        const graph_queries = try public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request);
+        const graph_queries = public_graph_query.parseCanonicalGraphQueriesAlloc(self.alloc, request) catch |err| {
+            std.log.warn("serverless public graph request admission failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer public_graph_query.freeNamedGraphQueries(self.alloc, graph_queries);
 
         var req: db_types.SearchRequest = .{
@@ -2675,6 +2783,17 @@ pub const HttpHandler = struct {
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
+        const canonical_operations = raw_request.object.get("graph_queries") orelse
+            return error.InvalidQueryRequest;
+        req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
+            self.alloc,
+            canonical_operations,
+            graph_queries,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        defer req.graph_query_transport.?.deinit(self.alloc);
         var search_hits: []db_types.SearchHit = &.{};
         defer if (search_hits.len > 0) freeDbSearchHits(self.alloc, search_hits);
         var search_total_hits: u32 = 0;
@@ -2687,7 +2806,7 @@ pub const HttpHandler = struct {
 
         if (requestHasSearchInputs(request)) {
             var search_request = request;
-            search_request.graph_searches = null;
+            search_request.graph_queries = null;
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -2711,6 +2830,11 @@ pub const HttpHandler = struct {
             req.profile = execution.profile_requested;
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
             search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
+            try initial_sets.append(self.alloc, .{
+                .name = "$query_results",
+                .hits = search_hits,
+                .total_hits = search_total_hits,
+            });
             try initial_sets.append(self.alloc, .{
                 .name = "$fused_results",
                 .hits = search_hits,
@@ -2748,8 +2872,10 @@ pub const HttpHandler = struct {
             session_initialized = true;
             session.setCancellation(cancellation);
         }
-
-        const results = try self.executePublicGraphQueriesAlloc(&session, graph_queries, initial_sets.items);
+        const results = self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items) catch |err| {
+            std.log.warn("serverless public graph request execution failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer {
             for (results) |*result| result.deinit(self.alloc);
             if (results.len > 0) self.alloc.free(results);
@@ -2762,13 +2888,16 @@ pub const HttpHandler = struct {
             .graph_results = results,
         };
 
-        var response = try query_api.encodeQueryResponses(
+        var response = query_api.encodeQueryResponses(
             self.alloc,
             table_name,
             req,
             .{ .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - started_ns, std.time.ns_per_ms)) },
             result,
-        );
+        ) catch |err| {
+            std.log.warn("serverless public graph response encoding failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer response.deinit(self.alloc);
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
     }
@@ -3066,11 +3195,27 @@ pub const HttpHandler = struct {
     fn executePublicGraphQueriesAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         graph_queries: []const db_types.NamedGraphQuery,
         initial_sets: []const GraphResultSet,
     ) ![]db_types.GraphSearchResult {
         const sorted_query_indexes = try public_graph_query.sortQueriesByDependencies(self.alloc, graph_queries);
         defer self.alloc.free(sorted_query_indexes);
+
+        // MATCH work and exact-distinct state are request resources, not
+        // operation resources. Sharing these counters prevents a batch of
+        // named MATCH operations from multiplying the documented bounds.
+        var request_work_budget = graph_pattern_mod.WorkBudget.initWithLimits(self.graph_execution_limits);
+        var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+            self.graph_execution_limits.max_distinct_identities,
+            self.graph_execution_limits.max_distinct_state_bytes,
+        );
+        var request_graph_read_budget = ServerlessGraphReadBudget{
+            .cancellation = session.cancellation,
+            .work_budget = &request_work_budget,
+        };
+        var request_cache = PublicGraphRequestCache.init(self, session, &request_work_budget);
+        defer request_cache.deinit();
 
         var available_sets = std.ArrayListUnmanaged(GraphResultSet).empty;
         defer available_sets.deinit(self.alloc);
@@ -3084,205 +3229,291 @@ pub const HttpHandler = struct {
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
             try session.checkCancellation();
-            results[idx] = try self.executePublicGraphQueryAlloc(session, graph_queries[query_index], available_sets.items);
+            const named_query = graph_queries[query_index];
+            results[idx] = self.executePublicGraphQueryAlloc(
+                source_table,
+                named_query,
+                available_sets.items,
+                &request_work_budget,
+                &request_distinct_budget,
+                &request_graph_read_budget,
+                &request_cache,
+            ) catch |err| {
+                std.log.warn(
+                    "serverless public graph operation failed operation={s} mode={s} err={}",
+                    .{ named_query.name, graph_query_diagnostic.feature(named_query.query), err },
+                );
+                if (graph_path_weight_diagnostic.isDomainError(err)) {
+                    graph_path_weight_diagnostic.record(named_query.name, named_query.query, err);
+                }
+                if (err == error.GraphWorkBudgetExceeded) {
+                    if (request_work_budget.exhaustion()) |exhaustion| {
+                        graph_work_budget_diagnostic.record(named_query.name, named_query.query, exhaustion);
+                    }
+                }
+                if (err == error.GraphDistinctBudgetExceeded) {
+                    graph_distinct_budget_diagnostic.recordBudget(named_query.name, &request_distinct_budget);
+                }
+                if (graph_query_diagnostic.reasonForError(err)) |reason| {
+                    graph_query_diagnostic.record(
+                        named_query.name,
+                        graph_query_diagnostic.feature(named_query.query),
+                        reason,
+                    );
+                }
+                return err;
+            };
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
                 .hits = results[idx].hits,
                 .total_hits = results[idx].total_hits,
+                .graph_result = &results[idx],
             });
             initialized += 1;
         }
+        // The shared request budget is stack-owned. Preserve its output
+        // charges across all named operations, then detach release hooks only
+        // once the completed results cross this ownership boundary.
+        for (results[0..initialized]) |*result| result.consumeRetainedState();
         return results;
     }
 
     fn executePublicGraphQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_distinct_budget: *graph_pattern_mod.DistinctBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
         return switch (named_query.query.query_type) {
-            .neighbors => try self.executePublicNeighborsQueryAlloc(session, named_query, available_sets),
-            .traverse => try self.executePublicTraverseQueryAlloc(session, named_query, available_sets),
-            .shortest_path => try self.executePublicShortestPathQueryAlloc(session, named_query, available_sets),
-            .pattern => try self.executePublicPatternQueryAlloc(session, named_query, available_sets),
-            else => error.UnsupportedQueryRequest,
+            .neighbors => try self.executePublicNeighborsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .traverse => try self.executePublicTraverseQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .shortest_path => try self.executePublicShortestPathQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .k_shortest_paths => try self.executePublicKShortestPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .pattern => try self.executePublicPatternQueryAlloc(
+                source_table,
+                named_query,
+                available_sets,
+                request_work_budget,
+                request_distinct_budget,
+                request_graph_read_budget,
+                request_cache,
+            ),
         };
     }
 
     fn executePublicNeighborsQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
-        defer freeOwnedKeySlice(self.alloc, start_keys);
-
-        var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
-        errdefer {
-            for (nodes.items) |*node| node.deinit(self.alloc);
-            nodes.deinit(self.alloc);
-        }
-        var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
-        errdefer {
-            for (hits.items) |*hit| hit.deinit(self.alloc);
-            hits.deinit(self.alloc);
-        }
-
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer {
-            var it = seen.keyIterator();
-            while (it.next()) |key| self.alloc.free(key.*);
-            seen.deinit(self.alloc);
-        }
-
-        for (start_keys) |start_key| {
-            var req = query_mod.GraphNeighborsRequest{
-                .index_name = try self.alloc.dupe(u8, named_query.query.index_name),
-                .doc_id = try self.alloc.dupe(u8, start_key),
-                .direction = toServerlessGraphDirection(named_query.query.params.direction),
-                .edge_types = try dupFieldsAlloc(self.alloc, named_query.query.params.edge_types),
-                .limit = named_query.query.params.max_results,
-            };
-            defer req.deinit(self.alloc);
-
-            const neighbors = try query_mod.graphNeighborsAlloc(self.alloc, session, req);
-            defer query_mod.freeGraphNeighbors(self.alloc, neighbors);
-
-            for (neighbors) |neighbor| {
-                if (named_query.query.params.deduplicate) {
-                    const seen_key = try self.alloc.dupe(u8, neighbor.doc_id);
-                    const gop = try seen.getOrPut(self.alloc, seen_key);
-                    if (gop.found_existing) {
-                        self.alloc.free(seen_key);
-                        continue;
-                    }
-                }
-
-                try nodes.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, neighbor.doc_id),
-                    .depth = 1,
-                    .distance = neighbor.weight,
-                    .path = if (named_query.query.params.include_paths)
-                        try allocPathNodes(self.alloc, &.{ start_key, neighbor.doc_id })
-                    else
-                        null,
-                    .path_edges = if (named_query.query.params.include_paths)
-                        try allocSinglePathEdgeInfo(self.alloc, start_key, neighbor.doc_id, neighbor.edge_type, neighbor.weight)
-                    else
-                        null,
-                });
-                try hits.append(self.alloc, .{
-                    .id = try self.alloc.dupe(u8, neighbor.doc_id),
-                    .score = neighbor.weight,
-                    .stored_data = null,
-                });
-            }
-        }
-
-        const total_hits: u32 = @intCast(nodes.items.len);
-        return .{
-            .name = try self.alloc.dupe(u8, named_query.name),
-            .nodes = try nodes.toOwnedSlice(self.alloc),
-            .hits = try hits.toOwnedSlice(self.alloc),
-            .total_hits = total_hits,
-        };
+        var effective = named_query;
+        effective.query.params.max_depth = 1;
+        return try self.executePublicTraversalQueryAlloc(source_table, effective, available_sets, request_work_budget, request_graph_read_budget, request_cache);
     }
 
     fn executePublicTraverseQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        return try self.executePublicTraversalQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache);
+    }
+
+    fn executePublicTraversalQueryAlloc(
+        self: *HttpHandler,
+        source_table: []const u8,
+        named_query: db_types.NamedGraphQuery,
+        available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
+    ) !db_types.GraphSearchResult {
+        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
+
+        const cached = try request_cache.graphSegment(named_query.query.index_name);
+        const edge_reader = ServerlessTraversalEdgeReader{ .cached = cached, .budget = request_graph_read_budget };
+        var filter_ctx = PatternDocumentFilterContext{
+            .alloc = self.alloc,
+            .documents = request_cache,
+            .cache = &request_cache.filter_cache,
+            .source_table = source_table,
+        };
+        var admission_ctx = ServerlessGraphAdmissionContext{
+            .filter_ctx = &filter_ctx,
+            .filter = named_query.query.params.node_filter,
+        };
+        const admission: ?graph_node_admission.NodeAdmission = if (graph_query_mod.nodeFilterActive(named_query.query.params.node_filter)) .{
+            .ctx = @ptrCast(&admission_ctx),
+            .filter_many = serverlessGraphNodeAdmission,
+        } else null;
 
         var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
         errdefer {
             for (nodes.items) |*node| node.deinit(self.alloc);
             nodes.deinit(self.alloc);
         }
-        var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
-        errdefer {
-            for (hits.items) |*hit| hit.deinit(self.alloc);
-            hits.deinit(self.alloc);
-        }
+        var seen = graph_node_identity.Map(void){};
+        defer seen.deinit(self.alloc);
 
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer {
-            var it = seen.keyIterator();
-            while (it.next()) |key| self.alloc.free(key.*);
-            seen.deinit(self.alloc);
-        }
-
+        const result_limit = named_query.query.params.max_results;
+        const bounded = result_limit > 0;
+        const collection_limit = graph_query_mod.resultCollectionLimit(result_limit);
+        var truncated = false;
         for (start_keys) |start_key| {
-            var req = query_mod.GraphTraverseRequest{
-                .index_name = try self.alloc.dupe(u8, named_query.query.index_name),
-                .start_doc_id = try self.alloc.dupe(u8, start_key),
-                .direction = toServerlessGraphDirection(named_query.query.params.direction),
-                .edge_types = try dupFieldsAlloc(self.alloc, named_query.query.params.edge_types),
+            if (nodes.items.len >= collection_limit) {
+                truncated = true;
+                break;
+            }
+            const remaining: usize = if (bounded)
+                collection_limit - nodes.items.len
+            else
+                0;
+            // Ask an individual traversal for one result beyond the remaining
+            // collection budget. This preserves completeness signaling when its
+            // local cap is reached, including when global de-duplication consumes
+            // that probe.
+            const traversal_limit: u32 = if (bounded)
+                @intCast(@min(remaining + 1, std.math.maxInt(u32)))
+            else
+                0;
+            const traversal_nodes = try graph_traversal.traverseWithEdgeReader(self.alloc, edge_reader, start_key, .{
+                .direction = named_query.query.params.direction,
+                .edge_types = named_query.query.params.edge_types,
                 .max_depth = named_query.query.params.max_depth,
-                .limit = named_query.query.params.max_results,
-                .include_start = false,
-            };
-            defer req.deinit(self.alloc);
-
-            const traversal_nodes = try query_mod.graphTraverseAlloc(self.alloc, session, req);
-            defer query_mod.freeGraphTraversalNodes(self.alloc, traversal_nodes);
+                .min_weight = named_query.query.params.min_weight,
+                .max_weight = named_query.query.params.max_weight,
+                .max_results = traversal_limit,
+                .deduplicate = named_query.query.params.deduplicate,
+                .include_paths = named_query.query.params.include_paths,
+                .node_admission = admission,
+                .work_budget = request_work_budget,
+            });
+            defer graph_traversal.freeOwnedResults(self.alloc, traversal_nodes);
+            const traversal_overflow = bounded and traversal_nodes.len > remaining;
 
             for (traversal_nodes) |node| {
                 if (named_query.query.params.deduplicate) {
-                    const seen_key = try self.alloc.dupe(u8, node.doc_id);
-                    const gop = try seen.getOrPut(self.alloc, seen_key);
-                    if (gop.found_existing) {
-                        self.alloc.free(seen_key);
-                        continue;
-                    }
+                    if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
-                try nodes.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, node.doc_id),
-                    .depth = node.depth,
-                    .distance = traversalDistance(node),
-                    .path = if (named_query.query.params.include_paths and node.path != null)
-                        try normalizeTraversalPathAlloc(self.alloc, start_key, node.path.?)
-                    else
-                        null,
-                    .path_edges = if (named_query.query.params.include_paths and node.edge_path != null)
-                        try allocPathEdgeInfos(self.alloc, node.edge_path.?)
-                    else
-                        null,
-                });
-                try hits.append(self.alloc, .{
-                    .id = try self.alloc.dupe(u8, node.doc_id),
-                    .score = @floatCast(traversalDistance(node)),
-                    .stored_data = null,
-                });
+                var result_node = try graphResultNodeFromTraversalAlloc(self.alloc, node);
+                errdefer result_node.deinit(self.alloc);
+                try nodes.append(self.alloc, result_node);
+                if (nodes.items.len >= collection_limit) {
+                    truncated = true;
+                    break;
+                }
             }
+            if (traversal_overflow) truncated = true;
+            if (nodes.items.len >= collection_limit) break;
+        }
+
+        if (graph_query_mod.resultCountIsTruncated(nodes.items.len, result_limit)) {
+            truncated = true;
+            const public_len: usize = @intCast(result_limit);
+            for (nodes.items[public_len..]) |*node| node.deinit(self.alloc);
+            nodes.items.len = public_len;
         }
 
         const total_hits: u32 = @intCast(nodes.items.len);
+        const owned_nodes = try nodes.toOwnedSlice(self.alloc);
+        errdefer {
+            for (owned_nodes) |*node| node.deinit(self.alloc);
+            if (owned_nodes.len > 0) self.alloc.free(owned_nodes);
+        }
+        const hits = try self.buildGraphNodeDocumentHitsAlloc(source_table, named_query.query, owned_nodes, request_cache);
+        errdefer {
+            for (hits) |*hit| hit.deinit(self.alloc);
+            if (hits.len > 0) self.alloc.free(hits);
+        }
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
-            .nodes = try nodes.toOwnedSlice(self.alloc),
-            .hits = try hits.toOwnedSlice(self.alloc),
+            .nodes = owned_nodes,
+            .hits = hits,
             .total_hits = total_hits,
+            .truncated = truncated,
         };
     }
 
     fn executePublicShortestPathQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache, false);
+    }
+
+    fn executePublicKShortestPathsQueryAlloc(
+        self: *HttpHandler,
+        source_table: []const u8,
+        named_query: db_types.NamedGraphQuery,
+        available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
+    ) !db_types.GraphSearchResult {
+        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache, true);
+    }
+
+    fn executePublicPathsQueryAlloc(
+        self: *HttpHandler,
+        source_table: []const u8,
+        named_query: db_types.NamedGraphQuery,
+        available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
+        multiple: bool,
+    ) !db_types.GraphSearchResult {
+        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
         const target_selector = named_query.query.target_nodes orelse return error.UnsupportedQueryRequest;
-        const target_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, target_selector, available_sets);
+        const target_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, target_selector, available_sets);
         defer freeOwnedKeySlice(self.alloc, target_keys);
+
+        const cached = try request_cache.graphSegment(named_query.query.index_name);
+        const edge_reader = ServerlessPathEdgeReader{ .cached = cached, .budget = request_graph_read_budget };
+        var filter_ctx = PatternDocumentFilterContext{
+            .alloc = self.alloc,
+            .documents = request_cache,
+            .cache = &request_cache.filter_cache,
+            .source_table = source_table,
+        };
+        var admission_ctx = ServerlessGraphAdmissionContext{
+            .filter_ctx = &filter_ctx,
+            .filter = named_query.query.params.node_filter,
+        };
+        const admission: ?graph_node_admission.NodeAdmission = if (graph_query_mod.nodeFilterActive(named_query.query.params.node_filter)) .{
+            .ctx = @ptrCast(&admission_ctx),
+            .filter_many = serverlessGraphNodeAdmission,
+        } else null;
+        const opts = graph_paths.PathFindOptions{
+            .weight_mode = named_query.query.params.weight_mode,
+            .edge_types = named_query.query.params.edge_types,
+            .direction = named_query.query.params.direction,
+            .max_depth = named_query.query.params.max_depth,
+            .min_weight = named_query.query.params.min_weight,
+            .max_weight = named_query.query.params.max_weight,
+            .node_admission = admission,
+            .work_budget = request_work_budget,
+        };
 
         var paths = std.ArrayListUnmanaged(db_types.GraphPath).empty;
         errdefer {
@@ -3292,46 +3523,81 @@ pub const HttpHandler = struct {
 
         for (start_keys) |start_key| {
             for (target_keys) |target_key| {
-                var req = query_mod.GraphShortestPathRequest{
-                    .index_name = try self.alloc.dupe(u8, named_query.query.index_name),
-                    .start_doc_id = try self.alloc.dupe(u8, start_key),
-                    .end_doc_id = try self.alloc.dupe(u8, target_key),
-                    .direction = toServerlessGraphDirection(named_query.query.params.direction),
-                    .edge_types = try dupFieldsAlloc(self.alloc, named_query.query.params.edge_types),
-                    .max_depth = named_query.query.params.max_depth,
-                };
-                defer req.deinit(self.alloc);
-
-                const maybe_path = try query_mod.graphShortestPathAlloc(self.alloc, session, req);
-                if (maybe_path) |owned_path| {
-                    var path = owned_path;
-                    defer query_mod.freeGraphShortestPath(self.alloc, &path);
-                    try paths.append(self.alloc, try toDbGraphPath(self.alloc, path));
+                if (multiple) {
+                    const found = try graph_paths.findKShortestPathsWithEdgeReader(
+                        self.alloc,
+                        edge_reader,
+                        start_key,
+                        target_key,
+                        named_query.query.k,
+                        opts,
+                    );
+                    var found_owned = true;
+                    defer if (found_owned) graph_paths.freePaths(self.alloc, found);
+                    try paths.ensureUnusedCapacity(self.alloc, found.len);
+                    paths.appendSliceAssumeCapacity(found);
+                    if (found.len > 0) self.alloc.free(found);
+                    found_owned = false;
+                } else if (try graph_paths.findShortestPathWithEdgeReader(self.alloc, edge_reader, start_key, target_key, opts)) |path| {
+                    try paths.append(self.alloc, path);
                 }
             }
         }
 
         const total_hits: u32 = @intCast(paths.items.len);
+        const owned_paths = try paths.toOwnedSlice(self.alloc);
+        errdefer {
+            for (owned_paths) |path| graph_paths.freePath(self.alloc, path);
+            if (owned_paths.len > 0) self.alloc.free(owned_paths);
+        }
+        const nodes = try self.alloc.alloc(graph_query_mod.GraphResultNode, owned_paths.len);
+        var initialized_nodes: usize = 0;
+        errdefer {
+            for (nodes[0..initialized_nodes]) |*node| node.deinit(self.alloc);
+            if (nodes.len > 0) self.alloc.free(nodes);
+        }
+        for (owned_paths, 0..) |*path, i| {
+            nodes[i] = try graph_query_mod.pathToResultNode(self.alloc, path);
+            initialized_nodes += 1;
+        }
+        // Result identities exist independently of document hydration. This
+        // keeps `$graph_results.<name>` composition stable when callers toggle
+        // include_documents and mirrors the distributed path executor.
+        const hits = try self.buildGraphNodeDocumentHitsAlloc(source_table, named_query.query, nodes, request_cache);
+        errdefer {
+            for (hits) |*hit| hit.deinit(self.alloc);
+            if (hits.len > 0) self.alloc.free(hits);
+        }
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
-            .paths = try paths.toOwnedSlice(self.alloc),
-            .hits = &.{},
+            .nodes = nodes,
+            .paths = owned_paths,
+            .hits = hits,
             .total_hits = total_hits,
         };
     }
 
     fn executePublicPatternQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_distinct_budget: *graph_pattern_mod.DistinctBudget,
+        request_graph_read_budget: *ServerlessGraphReadBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
-        defer freeOwnedKeySlice(self.alloc, start_keys);
-        const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
-        defer self.alloc.free(start_key_refs);
+        const conjunctive_pattern = named_query.query.match_pattern;
+        if (conjunctive_pattern) |pattern| {
+            // This snapshot can evaluate stored-document predicates only for
+            // the queried table. Reject the unsupported query shape up front
+            // so its outcome never depends on whether an external candidate
+            // happens to be present in the current graph.
+            if (conjunctivePatternHasExternalDocumentFilter(source_table, pattern))
+                return error.GraphExternalAliasDocumentFilterUnsupported;
+        }
         const target_keys = if (named_query.query.target_nodes) |selector|
-            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, selector, available_sets)
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, selector, available_sets)
         else
             try self.alloc.alloc([]u8, 0);
         defer freeOwnedKeySlice(self.alloc, target_keys);
@@ -3341,172 +3607,187 @@ pub const HttpHandler = struct {
         defer self.alloc.free(target_nodes);
         for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
-        const need_docs = named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
-        const docs: []const query_materializer.Document = if (need_docs) try self.allocPublishedDocumentsAlloc(session) else &.{};
-        defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
-
-        const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
-        const payload = try session.fetchArtifactAlloc(graph_index);
-        defer self.alloc.free(payload);
-        var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
-        defer graph_segment_mod.freeSegment(self.alloc, &segment);
-
-        const ServerlessPatternEdgeReader = struct {
-            segment: *const graph_segment_mod.Segment,
-
-            pub fn getEdges(
-                reader: @This(),
-                alloc: Allocator,
-                table: ?[]const u8,
-                key: []const u8,
-                edge_types: []const []const u8,
-                direction: graph_mod.EdgeDirection,
-            ) ![]graph_mod.Edge {
-                // Serverless snapshots contain one table-local graph segment.
-                if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
-                const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
-                var edge_count: usize = 0;
-                if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
-                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
-                };
-                if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
-                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
-                };
-                const edges = try alloc.alloc(graph_mod.Edge, edge_count);
-                var initialized: usize = 0;
-                errdefer {
-                    for (edges[0..initialized]) |edge| freeOwnedGraphEdge(alloc, edge);
-                    if (edges.len > 0) alloc.free(edges);
-                }
-
-                if (direction == .out or direction == .both) {
-                    for (adjacency.out_edges) |edge| {
-                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
-                        const source = try alloc.dupe(u8, adjacency.node_id);
-                        errdefer alloc.free(source);
-                        const target = try alloc.dupe(u8, edge.neighbor_id);
-                        errdefer alloc.free(target);
-                        const edge_type = try alloc.dupe(u8, edge.edge_type);
-                        errdefer alloc.free(edge_type);
-                        edges[initialized] = .{
-                            .source = source,
-                            .target = target,
-                            .edge_type = edge_type,
-                            .weight = edge.weight,
-                            .created_at = 0,
-                            .updated_at = 0,
-                            .metadata = &.{},
-                        };
-                        initialized += 1;
-                    }
-                }
-                if (direction == .in or direction == .both) {
-                    for (adjacency.in_edges) |edge| {
-                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
-                        const source = try alloc.dupe(u8, edge.neighbor_id);
-                        errdefer alloc.free(source);
-                        const target = try alloc.dupe(u8, adjacency.node_id);
-                        errdefer alloc.free(target);
-                        const edge_type = try alloc.dupe(u8, edge.edge_type);
-                        errdefer alloc.free(edge_type);
-                        edges[initialized] = .{
-                            .source = source,
-                            .target = target,
-                            .edge_type = edge_type,
-                            .weight = edge.weight,
-                            .created_at = 0,
-                            .updated_at = 0,
-                            .metadata = &.{},
-                        };
-                        initialized += 1;
-                    }
-                }
-                return edges;
-            }
-
-            pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
-                for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
-                if (edges.len > 0) alloc.free(edges);
-            }
-
-            pub fn probeEdges(
-                reader: @This(),
-                alloc: Allocator,
-                table: ?[]const u8,
-                probes: []const graph_mod.EdgeProbe,
-            ) ![]?graph_mod.Edge {
-                const results = try alloc.alloc(?graph_mod.Edge, probes.len);
-                @memset(results, null);
-                errdefer {
-                    for (results) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
-                    alloc.free(results);
-                }
-                if (table != null) return results;
-                for (probes, 0..) |probe, probe_index| {
-                    const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, probe.source) orelse continue;
-                    for (adjacency.out_edges) |edge| {
-                        if (!std.mem.eql(u8, edge.neighbor_id, probe.target) or
-                            !std.mem.eql(u8, edge.edge_type, probe.edge_type)) continue;
-                        const source = try alloc.dupe(u8, probe.source);
-                        errdefer alloc.free(source);
-                        const target = try alloc.dupe(u8, probe.target);
-                        errdefer alloc.free(target);
-                        const edge_type = try alloc.dupe(u8, probe.edge_type);
-                        errdefer alloc.free(edge_type);
-                        results[probe_index] = .{
-                            .source = source,
-                            .target = target,
-                            .edge_type = edge_type,
-                            .weight = edge.weight,
-                            .created_at = 0,
-                            .updated_at = 0,
-                            .metadata = &.{},
-                        };
-                        break;
-                    }
-                }
-                return results;
-            }
-
-            pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
-                for (edges) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
-                alloc.free(edges);
-            }
-        };
+        // Canonical MATCH needs the complete published document relation both
+        // to enumerate its selected anchor and to evaluate alias filters.
+        const need_docs = conjunctive_pattern != null or named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
+        const docs: []const PublicDocumentRef = if (need_docs) try request_cache.documents() else &.{};
 
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
-            .docs = docs,
-            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
+            .documents = request_cache,
+            .cache = &request_cache.filter_cache,
+            .source_table = source_table,
         };
-        defer filter_ctx.cache.deinit();
 
-        const raw_matches = try graph_pattern_mod.matchPatternWithEdgeReader(
+        const start_keys = if (conjunctive_pattern == null)
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets)
+        else
+            try self.alloc.alloc([]u8, 0);
+        defer freeOwnedKeySlice(self.alloc, start_keys);
+        const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
+        defer self.alloc.free(start_key_refs);
+
+        const cached = try request_cache.graphSegment(named_query.query.index_name);
+        const edge_reader = ServerlessPatternEdgeReader{
+            .cached = cached,
+            .budget = request_graph_read_budget,
+            .source_table = source_table,
+        };
+        const match_opts = graph_pattern_mod.MatchOptions{
+            .max_results = if (named_query.query.return_limit > 0)
+                std.math.add(u32, named_query.query.return_limit, 1) catch named_query.query.return_limit
+            else
+                named_query.query.params.max_results,
+            .return_aliases = named_query.query.return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = named_query.query.target_nodes != null,
+            .include_paths = named_query.query.params.include_paths,
+            .evaluator = if (need_docs) .{
+                .ctx = @ptrCast(&filter_ctx),
+                .func = publishedPatternNodeFilterEvaluator,
+                .batch_func = publishedPatternNodeFilterBatchEvaluator,
+            } else null,
+            .work_budget = request_work_budget,
+            .distinct_budget = request_distinct_budget,
+            .start_validation = if (conjunctive_pattern != null) .prevalidated else .required,
+            .anchors_precharged = conjunctive_pattern != null,
+        };
+
+        if (conjunctive_pattern) |pattern| {
+            if (named_query.query.aggregates.len > 0) {
+                const requested_specs = try self.alloc.alloc(graph_pattern_mod.CountAggregateSpec, named_query.query.aggregates.len);
+                defer self.alloc.free(requested_specs);
+                for (named_query.query.aggregates, 0..) |aggregate, i| requested_specs[i] = .{
+                    .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
+                    .distinct = aggregate.distinct,
+                };
+                var aggregate_plan = try graph_pattern_mod.CountAggregatePlan.init(self.alloc, requested_specs);
+                defer aggregate_plan.deinit(self.alloc);
+                var stream = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(
+                    self.alloc,
+                    aggregate_plan.unique_specs,
+                    request_distinct_budget,
+                );
+                defer stream.deinit(self.alloc);
+                var cursor: usize = 0;
+                var anchor_buffer: [public_graph_anchor_page_size][]const u8 = undefined;
+                while (cursor < docs.len) {
+                    const page = try nextConjunctiveAnchorPage(
+                        docs,
+                        &cursor,
+                        &anchor_buffer,
+                        pattern,
+                        &filter_ctx,
+                        request_work_budget,
+                    );
+                    if (page.len == 0) continue;
+                    try request_cache.session.checkCancellation();
+                    try stream.consumePageWithEdgeReader(self.alloc, edge_reader, page, pattern, match_opts);
+                }
+                const computed = try stream.finishAlloc(self.alloc);
+                defer {
+                    for (computed) |*aggregate| aggregate.deinit(self.alloc);
+                    if (computed.len > 0) self.alloc.free(computed);
+                }
+                const aggregates = try self.alloc.alloc(db_types.GraphAggregateResult, named_query.query.aggregates.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(self.alloc);
+                    if (aggregates.len > 0) self.alloc.free(aggregates);
+                }
+                const distinct_value_owners = try self.alloc.alloc(?usize, computed.len);
+                defer if (distinct_value_owners.len > 0) self.alloc.free(distinct_value_owners);
+                @memset(distinct_value_owners, null);
+                for (named_query.query.aggregates, 0..) |aggregate, i| {
+                    const computed_index = aggregate_plan.output_indexes[i];
+                    const value = &computed[computed_index];
+                    const name = try self.alloc.dupe(u8, aggregate.name);
+                    errdefer self.alloc.free(name);
+                    if (distinct_value_owners[computed_index]) |owner| {
+                        aggregates[i] = .{
+                            .name = name,
+                            .value = value.value,
+                            .distinct_values = aggregates[owner].distinct_values,
+                            .distinct_values_owned = false,
+                        };
+                    } else {
+                        distinct_value_owners[computed_index] = i;
+                        aggregates[i] = .{
+                            .name = name,
+                            .value = value.value,
+                            .distinct_values = value.distinct_values,
+                        };
+                        value.distinct_values = &.{};
+                    }
+                    initialized += 1;
+                }
+                return .{
+                    .name = try self.alloc.dupe(u8, named_query.name),
+                    .aggregates = aggregates,
+                    .hits = &.{},
+                    .total_hits = 0,
+                };
+            }
+        }
+
+        const raw_matches = if (conjunctive_pattern) |pattern| blk: {
+            var collected = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
+            errdefer {
+                for (collected.items) |*match| match.deinit(self.alloc);
+                collected.deinit(self.alloc);
+            }
+            var cursor: usize = 0;
+            var anchor_buffer: [public_graph_anchor_page_size][]const u8 = undefined;
+            while (cursor < docs.len and (match_opts.max_results == 0 or collected.items.len < match_opts.max_results)) {
+                const page = try nextConjunctiveAnchorPage(
+                    docs,
+                    &cursor,
+                    &anchor_buffer,
+                    pattern,
+                    &filter_ctx,
+                    request_work_budget,
+                );
+                if (page.len == 0) continue;
+                try request_cache.session.checkCancellation();
+                var page_opts = match_opts;
+                if (match_opts.max_results > 0) {
+                    page_opts.max_results = match_opts.max_results - @as(u32, @intCast(collected.items.len));
+                }
+                const page_matches = try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
+                    self.alloc,
+                    edge_reader,
+                    page,
+                    pattern,
+                    page_opts,
+                );
+                var page_owned = true;
+                defer if (page_owned) graph_pattern_mod.freeMatches(self.alloc, page_matches);
+                try collected.ensureUnusedCapacity(self.alloc, page_matches.len);
+                collected.appendSliceAssumeCapacity(page_matches);
+                if (page_matches.len > 0) self.alloc.free(page_matches);
+                page_owned = false;
+            }
+            break :blk try collected.toOwnedSlice(self.alloc);
+        } else try graph_pattern_mod.matchPatternWithEdgeReader(
             self.alloc,
-            ServerlessPatternEdgeReader{ .segment = &segment },
+            edge_reader,
             start_key_refs,
             named_query.query.pattern,
-            .{
-                .max_results = named_query.query.params.max_results,
-                .return_aliases = named_query.query.return_aliases,
-                .target_nodes = target_nodes,
-                .target_required = named_query.query.target_nodes != null,
-                .include_paths = named_query.query.params.include_paths,
-                .evaluator = if (need_docs) .{
-                    .ctx = @ptrCast(&filter_ctx),
-                    .func = publishedPatternNodeFilterEvaluator,
-                } else null,
-            },
+            match_opts,
         );
         defer graph_pattern_mod.freeMatches(self.alloc, raw_matches);
 
-        const matches = try self.convertPatternMatchesToGraphMatchesAlloc(raw_matches);
+        const result_len = if (named_query.query.return_limit > 0)
+            @min(raw_matches.len, named_query.query.return_limit)
+        else
+            raw_matches.len;
+        const matches = try self.convertPatternMatchesToGraphMatchesAlloc(raw_matches[0..result_len]);
         errdefer {
             for (matches) |*match| match.deinit(self.alloc);
             if (matches.len > 0) self.alloc.free(matches);
         }
 
-        const hits = try self.buildPatternDocumentHitsAlloc(named_query.query, matches, if (need_docs) docs else null);
+        const hits = try self.buildPatternDocumentHitsAlloc(source_table, named_query.query, matches, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
@@ -3519,6 +3800,7 @@ pub const HttpHandler = struct {
             .matches = matches,
             .hits = hits,
             .total_hits = @intCast(raw_matches.len),
+            .truncated = named_query.query.return_limit > 0 and raw_matches.len > named_query.query.return_limit,
         };
     }
 
@@ -3545,6 +3827,7 @@ pub const HttpHandler = struct {
                     .alias = try self.alloc.dupe(u8, binding.alias),
                     .node = .{
                         .key = try self.alloc.dupe(u8, binding.key),
+                        .table = if (binding.table) |table| try self.alloc.dupe(u8, table) else null,
                         .depth = binding.depth,
                         .distance = @floatFromInt(binding.depth),
                         .path = null,
@@ -3574,9 +3857,21 @@ pub const HttpHandler = struct {
                 initialized_path += 1;
             }
 
+            const null_aliases = try self.alloc.alloc([]u8, raw_match.null_aliases.len);
+            var initialized_null_aliases: usize = 0;
+            errdefer {
+                for (null_aliases[0..initialized_null_aliases]) |alias| self.alloc.free(alias);
+                if (null_aliases.len > 0) self.alloc.free(null_aliases);
+            }
+            for (raw_match.null_aliases, 0..) |alias, alias_index| {
+                null_aliases[alias_index] = try self.alloc.dupe(u8, alias);
+                initialized_null_aliases += 1;
+            }
+
             matches[i] = .{
                 .bindings = bindings,
                 .path = path,
+                .null_aliases = null_aliases,
             };
             initialized += 1;
         }
@@ -3586,17 +3881,22 @@ pub const HttpHandler = struct {
 
     fn buildPatternDocumentHitsAlloc(
         self: *HttpHandler,
+        source_table: []const u8,
         query: graph_query_mod.GraphQuery,
         matches: []const db_types.GraphPatternMatch,
-        docs_override: ?[]const query_materializer.Document,
+        request_cache: *PublicGraphRequestCache,
     ) ![]db_types.SearchHit {
-        const docs = if (query.include_documents) docs_override orelse return error.InvalidArgument else &.{};
-
         var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
         errdefer {
             for (hits.items) |*hit| hit.deinit(self.alloc);
             hits.deinit(self.alloc);
         }
+
+        const projected_fields = if (query.include_documents and !query.include_all_fields)
+            try dupFieldsAlloc(self.alloc, query.fields)
+        else
+            null;
+        defer freeFields(self.alloc, projected_fields);
 
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -3607,17 +3907,26 @@ pub const HttpHandler = struct {
 
         for (matches) |match| {
             for (match.bindings) |binding| {
+                // This request cache owns one source-table snapshot. Fail
+                // closed when document hydration would require a different
+                // snapshot rather than returning a partial response.
+                if (binding.node.table) |table| {
+                    if (!std.mem.eql(u8, table, source_table)) {
+                        if (query.include_documents) return error.UnsupportedQueryRequest;
+                        continue;
+                    }
+                    // A same-table qualifier is part of the canonical graph
+                    // identity, but it still belongs to this exact published
+                    // snapshot and is safe to hydrate.
+                }
                 if (seen.contains(binding.node.key)) continue;
                 try seen.put(self.alloc, try self.alloc.dupe(u8, binding.node.key), {});
                 const body = if (query.include_documents)
-                    if (findMaterializedDocumentBody(docs, binding.node.key)) |stored|
+                    if (try request_cache.documentBody(binding.node.key)) |stored|
                         if (query.include_all_fields)
                             try self.alloc.dupe(u8, stored)
-                        else blk: {
-                            const projected_fields = try dupFieldsAlloc(self.alloc, query.fields);
-                            defer freeFields(self.alloc, projected_fields);
-                            break :blk try projectBodyFieldsAlloc(self.alloc, stored, projected_fields.?);
-                        }
+                        else
+                            try projectBodyFieldsAlloc(self.alloc, stored, projected_fields.?)
                     else
                         null
                 else
@@ -3630,6 +3939,48 @@ pub const HttpHandler = struct {
             }
         }
 
+        return try hits.toOwnedSlice(self.alloc);
+    }
+
+    fn buildGraphNodeDocumentHitsAlloc(
+        self: *HttpHandler,
+        source_table: []const u8,
+        query: graph_query_mod.GraphQuery,
+        nodes: []const graph_query_mod.GraphResultNode,
+        request_cache: *PublicGraphRequestCache,
+    ) ![]db_types.SearchHit {
+        if (!query.include_documents) return try self.alloc.alloc(db_types.SearchHit, 0);
+        var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(self.alloc);
+            hits.deinit(self.alloc);
+        }
+        const projected_fields = if (!query.include_all_fields)
+            try dupFieldsAlloc(self.alloc, query.fields)
+        else
+            null;
+        defer freeFields(self.alloc, projected_fields);
+        for (nodes) |node| {
+            // This request cache owns one source-table snapshot. Same-table
+            // qualifiers are safe; external qualified nodes cannot be
+            // hydrated from this snapshot.
+            if (node.table) |table| {
+                if (!std.mem.eql(u8, table, source_table)) return error.UnsupportedQueryRequest;
+            }
+            const stored_data = if (try request_cache.documentBody(node.key)) |body|
+                if (query.include_all_fields)
+                    try self.alloc.dupe(u8, body)
+                else
+                    try projectBodyFieldsAlloc(self.alloc, body, projected_fields.?)
+            else
+                null;
+            errdefer if (stored_data) |body| self.alloc.free(body);
+            try hits.append(self.alloc, .{
+                .id = try self.alloc.dupe(u8, node.key),
+                .score = @floatCast(node.distance),
+                .stored_data = stored_data,
+            });
+        }
         return try hits.toOwnedSlice(self.alloc);
     }
 
@@ -4221,22 +4572,14 @@ pub const HttpHandler = struct {
     }
 
     fn allocSessionMutationOverlayAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Mutation {
-        var total_entries: usize = 0;
-        for (0..session.artifactCount()) |artifact_index| {
-            const artifact_ref = session.artifactRef(artifact_index) orelse continue;
-            if (artifact_ref.kind != .mutation_segment) continue;
-            const contents = try session.fetchArtifactAlloc(artifact_index);
-            defer self.alloc.free(contents);
-            const entries = try segment_mod.decodeAlloc(self.alloc, contents);
-            defer segment_mod.freeEntries(self.alloc, entries);
-            total_entries += entries.len;
+        var mutations = std.ArrayListUnmanaged(query_materializer.Mutation).empty;
+        errdefer {
+            for (mutations.items) |mutation| {
+                self.alloc.free(@constCast(mutation.doc_id));
+                if (mutation.body) |body| self.alloc.free(@constCast(body));
+            }
+            mutations.deinit(self.alloc);
         }
-        if (total_entries == 0) return try self.alloc.alloc(query_materializer.Mutation, 0);
-
-        const mutations = try self.alloc.alloc(query_materializer.Mutation, total_entries);
-        errdefer self.alloc.free(mutations);
-        var initialized: usize = 0;
-        errdefer freeMaterializerMutations(self.alloc, mutations[0..initialized]);
 
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
@@ -4246,17 +4589,20 @@ pub const HttpHandler = struct {
             const entries = try segment_mod.decodeAlloc(self.alloc, contents);
             defer segment_mod.freeEntries(self.alloc, entries);
             for (entries) |entry| {
-                mutations[initialized] = .{
+                const doc_id = try self.alloc.dupe(u8, entry.doc_id);
+                errdefer self.alloc.free(doc_id);
+                const body = if (entry.body) |value| try self.alloc.dupe(u8, value) else null;
+                errdefer if (body) |value| self.alloc.free(value);
+                try mutations.append(self.alloc, .{
                     .lsn = entry.lsn,
                     .timestamp_ns = entry.timestamp_ns,
                     .kind = entry.kind,
-                    .doc_id = try self.alloc.dupe(u8, entry.doc_id),
-                    .body = if (entry.body) |body| try self.alloc.dupe(u8, body) else null,
-                };
-                initialized += 1;
+                    .doc_id = doc_id,
+                    .body = body,
+                });
             }
         }
-        return mutations;
+        return try mutations.toOwnedSlice(self.alloc);
     }
 
     fn allocArtifactMutations(self: *HttpHandler, session: *query_mod.QuerySession, artifact_index: usize) ![]query_types.QueryMutation {
@@ -4603,6 +4949,18 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
+            error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
+            error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
+            error.GraphPathWeightOverflow => return error.GraphPathWeightOverflow,
+            error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
+            error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
+            error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
+            error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
+            error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
+            error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -4888,15 +5246,1248 @@ fn findMaterializedDocumentBody(docs: []const query_materializer.Document, doc_i
 
 const PatternDocumentFilterContext = struct {
     alloc: Allocator,
-    docs: []const query_materializer.Document,
-    cache: db_query_graph.PreparedPatternFilterCache,
+    documents: *PublicGraphRequestCache,
+    cache: *db_query_graph.PreparedPatternFilterCache,
+    source_table: []const u8,
 };
+
+const ServerlessGraphAdmissionContext = struct {
+    filter_ctx: *PatternDocumentFilterContext,
+    filter: graph_pattern_mod.NodeFilter,
+};
+
+const CachedPublicGraphSegment = struct {
+    index_name: []u8,
+    segment: graph_segment_mod.Segment,
+    adjacency_index: graph_segment_mod.AdjacencyIndex,
+    /// Canonical edge metadata aligned with segment.neighbor_tables. Building
+    /// it once avoids serializing the same table qualifier for every edge scan
+    /// and clone in a request.
+    neighbor_table_metadata: [][]u8 = &.{},
+
+    fn edgeMetadata(self: @This(), edge: graph_segment_mod.Edge) ?[]const u8 {
+        const table_id = edge.neighbor_table_id orelse return null;
+        if (table_id >= self.neighbor_table_metadata.len) return null;
+        return self.neighbor_table_metadata[table_id];
+    }
+};
+
+const PublicDocumentArtifactBody = struct {
+    artifact_index: usize,
+    offset: u64,
+    len: u32,
+};
+
+const PublicDocumentBodyPrefetch = struct {
+    document_index: usize,
+    locator: PublicDocumentArtifactBody,
+
+    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+        if (lhs.locator.artifact_index != rhs.locator.artifact_index)
+            return lhs.locator.artifact_index < rhs.locator.artifact_index;
+        if (lhs.locator.offset != rhs.locator.offset)
+            return lhs.locator.offset < rhs.locator.offset;
+        return lhs.document_index < rhs.document_index;
+    }
+};
+
+fn deduplicateSortedDocumentPrefetches(
+    locators: []PublicDocumentBodyPrefetch,
+) []PublicDocumentBodyPrefetch {
+    if (locators.len < 2) return locators;
+    var unique_count: usize = 1;
+    for (locators[1..]) |candidate| {
+        if (candidate.document_index == locators[unique_count - 1].document_index) continue;
+        locators[unique_count] = candidate;
+        unique_count += 1;
+    }
+    return locators[0..unique_count];
+}
+
+const PublicDocumentRefsAllocation = struct {
+    items: []PublicDocumentRef,
+    retained_bytes: usize,
+};
+
+const BudgetedMutationOverlay = struct {
+    items: []query_materializer.Mutation,
+    lease: graph_work_budget_mod.RetainedLease,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        freeMaterializerMutations(alloc, self.items);
+        self.lease.deinit();
+        self.* = undefined;
+    }
+};
+
+const PublicDocumentBody = union(enum) {
+    artifact: PublicDocumentArtifactBody,
+    owned: []u8,
+    cached: []const u8,
+    deleted,
+    moved,
+};
+
+/// Request-owned identity plus a lazy body locator. The exact anchor relation
+/// retains IDs and locations, not every stored document body.
+const PublicDocumentRef = struct {
+    doc_id: []u8,
+    body: PublicDocumentBody,
+    last_lsn: u64,
+    last_timestamp_ns: u64,
+
+    fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
+        switch (self.body) {
+            .owned => |body| {
+                alloc.free(self.doc_id);
+                alloc.free(body);
+            },
+            .artifact, .cached, .deleted => alloc.free(self.doc_id),
+            .moved => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn freePublicDocumentRefs(alloc: Allocator, docs: []PublicDocumentRef) void {
+    for (docs) |*doc| doc.deinit(alloc);
+    alloc.free(docs);
+}
+
+fn lessPublicDocumentRef(_: void, lhs: PublicDocumentRef, rhs: PublicDocumentRef) bool {
+    return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
+}
+
+/// Immutable published data and compiled node filters are request resources.
+/// Keep one copy per source snapshot/index so named MATCH operations share
+/// decoding and materialization costs while their execution remains ordered.
+const PublicGraphRequestCache = struct {
+    handler: *HttpHandler,
+    session: *query_mod.QuerySession,
+    work_budget: *graph_pattern_mod.WorkBudget,
+    retained_lease: graph_work_budget_mod.RetainedLease,
+    published_documents: ?[]PublicDocumentRef = null,
+    published_document_index: std.StringHashMapUnmanaged(usize) = .empty,
+    published_body_blocks: std.ArrayListUnmanaged([]u8) = .empty,
+    segments: std.ArrayListUnmanaged(CachedPublicGraphSegment) = .empty,
+    filter_cache: db_query_graph.PreparedPatternFilterCache,
+
+    fn init(
+        handler: *HttpHandler,
+        session: *query_mod.QuerySession,
+        work_budget: *graph_pattern_mod.WorkBudget,
+    ) PublicGraphRequestCache {
+        return .{
+            .handler = handler,
+            .session = session,
+            .work_budget = work_budget,
+            .retained_lease = .{ .budget = work_budget },
+            .filter_cache = db_query_graph.PreparedPatternFilterCache.init(handler.alloc),
+        };
+    }
+
+    fn deinit(self: *PublicGraphRequestCache) void {
+        self.filter_cache.deinit();
+        self.published_document_index.deinit(self.handler.alloc);
+        if (self.published_documents) |docs| freePublicDocumentRefs(self.handler.alloc, docs);
+        for (self.published_body_blocks.items) |block| self.handler.alloc.free(block);
+        self.published_body_blocks.deinit(self.handler.alloc);
+        for (self.segments.items) |*entry| {
+            self.handler.alloc.free(entry.index_name);
+            entry.adjacency_index.deinit(self.handler.alloc);
+            for (entry.neighbor_table_metadata) |metadata| self.handler.alloc.free(metadata);
+            if (entry.neighbor_table_metadata.len > 0)
+                self.handler.alloc.free(entry.neighbor_table_metadata);
+            graph_segment_mod.freeSegment(self.handler.alloc, &entry.segment);
+        }
+        self.segments.deinit(self.handler.alloc);
+        self.retained_lease.deinit();
+        self.* = undefined;
+    }
+
+    fn reserveRetained(self: *PublicGraphRequestCache, additional: usize) !void {
+        const total = std.math.add(usize, self.retained_lease.bytes, additional) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        try self.retained_lease.resize(total);
+    }
+
+    fn ensureRetainedListCapacity(
+        self: *PublicGraphRequestCache,
+        comptime T: type,
+        list: *std.ArrayListUnmanaged(T),
+        required_capacity: usize,
+    ) !void {
+        if (required_capacity <= list.capacity) return;
+        const replaced_bytes = std.math.mul(usize, list.capacity, @sizeOf(T)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const replacement_bytes = std.math.mul(usize, required_capacity, @sizeOf(T)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var replacement = try self.retained_lease.reserveReplacement(replaced_bytes, replacement_bytes);
+        defer replacement.deinit();
+        try list.ensureTotalCapacityPrecise(self.handler.alloc, required_capacity);
+        replacement.commit();
+    }
+
+    fn documents(self: *PublicGraphRequestCache) ![]const PublicDocumentRef {
+        if (self.published_documents == null) {
+            self.published_documents = try self.allocPublishedDocumentRefs();
+            const docs = self.published_documents.?;
+            const capacity = std.math.cast(std.StringHashMapUnmanaged(usize).Size, docs.len) orelse
+                return error.QueryCandidateBudgetExceeded;
+            const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+                docs.len,
+                std.hash_map.default_max_load_percentage,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            const map_bytes = graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            try self.reserveRetained(map_bytes);
+            try self.published_document_index.ensureTotalCapacity(self.handler.alloc, capacity);
+            for (docs, 0..) |doc, idx| {
+                const gop = self.published_document_index.getOrPutAssumeCapacity(doc.doc_id);
+                if (gop.found_existing) return error.InvalidDocumentSegment;
+                gop.value_ptr.* = idx;
+            }
+        }
+        return self.published_documents.?;
+    }
+
+    fn documentBody(self: *PublicGraphRequestCache, doc_id: []const u8) !?[]const u8 {
+        _ = try self.documents();
+        const idx = self.published_document_index.get(doc_id) orelse return null;
+        const doc = &self.published_documents.?[idx];
+        switch (doc.body) {
+            .owned => |body| return body,
+            .cached => |body| return body,
+            .deleted, .moved => return null,
+            .artifact => |locator| {
+                try self.reserveRetained(locator.len);
+                const body = self.session.fetchArtifactRangeAlloc(
+                    locator.artifact_index,
+                    locator.offset,
+                    locator.len,
+                ) catch |err| {
+                    self.retained_lease.resize(self.retained_lease.bytes - locator.len) catch unreachable;
+                    return err;
+                };
+                if (body.len != locator.len) {
+                    self.handler.alloc.free(body);
+                    self.retained_lease.resize(self.retained_lease.bytes - locator.len) catch unreachable;
+                    return error.InvalidDocumentSegment;
+                }
+                doc.body = .{ .owned = body };
+                return body;
+            },
+        }
+    }
+
+    fn prefetchDocumentBodies(
+        self: *PublicGraphRequestCache,
+        docs: []const PublicDocumentRef,
+        filter_prefix: []const u8,
+    ) !void {
+        const max_coalesced_bytes: usize = 4 * 1024 * 1024;
+        const max_gap_bytes: u64 = 64 * 1024;
+        var pending_count: usize = 0;
+        for (docs) |candidate| {
+            if (self.pendingDocumentBodyPrefetch(candidate, filter_prefix) != null) pending_count += 1;
+        }
+        const locator_bytes = std.math.mul(usize, pending_count, @sizeOf(PublicDocumentBodyPrefetch)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var locator_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, locator_bytes);
+        defer locator_lease.deinit();
+        const locators = try self.handler.alloc.alloc(PublicDocumentBodyPrefetch, pending_count);
+        defer self.handler.alloc.free(locators);
+        var locator_count: usize = 0;
+        for (docs) |candidate| {
+            if (self.pendingDocumentBodyPrefetch(candidate, filter_prefix)) |pending| {
+                locators[locator_count] = pending;
+                locator_count += 1;
+            }
+        }
+        std.debug.assert(locator_count == pending_count);
+        std.mem.sort(PublicDocumentBodyPrefetch, locators[0..locator_count], {}, PublicDocumentBodyPrefetch.lessThan);
+        locator_count = deduplicateSortedDocumentPrefetches(locators[0..locator_count]).len;
+
+        var cursor: usize = 0;
+        while (cursor < locator_count) {
+            const first_locator = locators[cursor].locator;
+            var end_cursor = cursor + 1;
+            var range_end = std.math.add(u64, first_locator.offset, first_locator.len) catch
+                return error.InvalidDocumentSegment;
+            while (end_cursor < locator_count) : (end_cursor += 1) {
+                const next_locator = locators[end_cursor].locator;
+                if (next_locator.artifact_index != first_locator.artifact_index or next_locator.offset < range_end) break;
+                const gap = next_locator.offset - range_end;
+                const next_end = std.math.add(u64, next_locator.offset, next_locator.len) catch
+                    return error.InvalidDocumentSegment;
+                const total_len = next_end - first_locator.offset;
+                if (gap > max_gap_bytes or total_len > max_coalesced_bytes) break;
+                range_end = next_end;
+            }
+            const range_len_u64 = range_end - first_locator.offset;
+            const range_len = std.math.cast(usize, range_len_u64) orelse return error.InvalidDocumentSegment;
+            try self.ensureRetainedListCapacity(
+                []u8,
+                &self.published_body_blocks,
+                self.published_body_blocks.items.len + 1,
+            );
+            try self.reserveRetained(range_len);
+            const block = self.session.fetchArtifactRangeAlloc(
+                first_locator.artifact_index,
+                first_locator.offset,
+                range_len,
+            ) catch |err| {
+                self.retained_lease.resize(self.retained_lease.bytes - range_len) catch unreachable;
+                return err;
+            };
+            if (block.len != range_len) {
+                self.handler.alloc.free(block);
+                self.retained_lease.resize(self.retained_lease.bytes - range_len) catch unreachable;
+                return error.InvalidDocumentSegment;
+            }
+            self.published_body_blocks.appendAssumeCapacity(block);
+            for (locators[cursor..end_cursor]) |candidate| {
+                const doc = &self.published_documents.?[candidate.document_index];
+                const locator = switch (doc.body) {
+                    .artifact => |value| value,
+                    .owned, .cached, .deleted, .moved => continue,
+                };
+                if (locator.artifact_index != first_locator.artifact_index or locator.offset < first_locator.offset)
+                    continue;
+                const local_start = std.math.cast(usize, locator.offset - first_locator.offset) orelse
+                    return error.InvalidDocumentSegment;
+                const local_end = std.math.add(usize, local_start, locator.len) catch
+                    return error.InvalidDocumentSegment;
+                if (local_end > block.len) return error.InvalidDocumentSegment;
+                doc.body = .{ .cached = block[local_start..local_end] };
+            }
+            cursor = end_cursor;
+        }
+    }
+
+    fn pendingDocumentBodyPrefetch(
+        self: *PublicGraphRequestCache,
+        candidate: PublicDocumentRef,
+        filter_prefix: []const u8,
+    ) ?PublicDocumentBodyPrefetch {
+        if (filter_prefix.len > 0 and !std.mem.startsWith(u8, candidate.doc_id, filter_prefix)) return null;
+        const document_index = self.published_document_index.get(candidate.doc_id) orelse return null;
+        const locator = switch (self.published_documents.?[document_index].body) {
+            .artifact => |value| value,
+            .owned, .cached, .deleted, .moved => return null,
+        };
+        return .{ .document_index = document_index, .locator = locator };
+    }
+
+    fn allocPublishedDocumentRefs(self: *PublicGraphRequestCache) ![]PublicDocumentRef {
+        const base_allocation = blk: {
+            for (0..self.session.artifactCount()) |artifact_index| {
+                const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
+                if (artifact_ref.kind != .document_segment) continue;
+                break :blk try self.allocDocumentArtifactRefs(artifact_index, artifact_ref);
+            }
+            break :blk PublicDocumentRefsAllocation{
+                .items = try self.handler.alloc.alloc(PublicDocumentRef, 0),
+                .retained_bytes = 0,
+            };
+        };
+        var base = base_allocation.items;
+        var base_retained_bytes = base_allocation.retained_bytes;
+        errdefer freePublicDocumentRefs(self.handler.alloc, base);
+        errdefer if (base_retained_bytes > 0)
+            self.retained_lease.resize(self.retained_lease.bytes - base_retained_bytes) catch unreachable;
+
+        var mutation_overlay = try self.allocBudgetedMutationOverlay();
+        defer mutation_overlay.deinit(self.handler.alloc);
+        if (mutation_overlay.items.len == 0) {
+            base_retained_bytes = 0;
+            return base;
+        }
+        const mutations = mutation_overlay.items;
+        const application_peak_bytes = try self.mutationApplicationPeakBytes(base.len, mutations);
+        var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
+        defer application_lease.deinit();
+
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        base = &.{};
+        defer {
+            for (slots.items) |*slot| slot.deinit(self.handler.alloc);
+            slots.deinit(self.handler.alloc);
+        }
+        var slot_by_id = std.StringHashMapUnmanaged(usize).empty;
+        defer slot_by_id.deinit(self.handler.alloc);
+        const slot_capacity = std.math.add(usize, slots.items.len, mutations.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        try slots.ensureTotalCapacityPrecise(self.handler.alloc, slot_capacity);
+        try slot_by_id.ensureTotalCapacity(self.handler.alloc, @intCast(slot_capacity));
+        for (slots.items, 0..) |slot, idx| {
+            const gop = slot_by_id.getOrPutAssumeCapacity(slot.doc_id);
+            if (gop.found_existing) return error.InvalidDocumentSegment;
+            gop.value_ptr.* = idx;
+        }
+
+        for (mutations) |mutation| {
+            const idx = slot_by_id.get(mutation.doc_id) orelse blk: {
+                const doc_id = try self.handler.alloc.dupe(u8, mutation.doc_id);
+                errdefer self.handler.alloc.free(doc_id);
+                slots.appendAssumeCapacity(.{
+                    .doc_id = doc_id,
+                    .body = .deleted,
+                    .last_lsn = 0,
+                    .last_timestamp_ns = 0,
+                });
+                const new_idx = slots.items.len - 1;
+                const gop = slot_by_id.getOrPutAssumeCapacity(slots.items[new_idx].doc_id);
+                std.debug.assert(!gop.found_existing);
+                gop.value_ptr.* = new_idx;
+                break :blk new_idx;
+            };
+            var slot = &slots.items[idx];
+            if (mutation.lsn < slot.last_lsn or
+                (mutation.lsn == slot.last_lsn and mutation.timestamp_ns < slot.last_timestamp_ns)) continue;
+            switch (slot.body) {
+                .owned => |body| self.handler.alloc.free(body),
+                .artifact, .cached, .deleted, .moved => {},
+            }
+            slot.body = switch (mutation.kind) {
+                .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
+                .delete => .deleted,
+            };
+            slot.last_lsn = mutation.lsn;
+            slot.last_timestamp_ns = mutation.timestamp_ns;
+        }
+
+        var live_count: usize = 0;
+        for (slots.items) |slot| switch (slot.body) {
+            .deleted, .moved => {},
+            .artifact, .owned, .cached => live_count += 1,
+        };
+        var out_bytes = std.math.mul(usize, live_count, @sizeOf(PublicDocumentRef)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        for (slots.items) |slot| switch (slot.body) {
+            .deleted, .moved => {},
+            .artifact, .cached => out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+            .owned => |body| {
+                out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                out_bytes = std.math.add(usize, out_bytes, body.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            },
+        };
+        const before_out = self.retained_lease.bytes;
+        try self.reserveRetained(out_bytes);
+        errdefer self.retained_lease.resize(before_out) catch unreachable;
+        const out = try self.handler.alloc.alloc(PublicDocumentRef, live_count);
+        var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |*doc| doc.deinit(self.handler.alloc);
+            self.handler.alloc.free(out);
+        }
+        for (slots.items) |*slot| {
+            switch (slot.body) {
+                .deleted, .moved => continue,
+                .artifact, .owned, .cached => {},
+            }
+            out[out_idx] = slot.*;
+            slot.body = .moved;
+            out_idx += 1;
+        }
+        std.mem.sort(PublicDocumentRef, out, {}, lessPublicDocumentRef);
+        try self.retained_lease.resize(self.retained_lease.bytes - base_retained_bytes);
+        base_retained_bytes = 0;
+        return out;
+    }
+
+    /// Decode the mutation tail under one lease that follows its actual live
+    /// allocation shape. The lease grows before each fetch, decode, list
+    /// reallocation, and copy, then contracts as transient owners are freed.
+    fn allocBudgetedMutationOverlay(self: *PublicGraphRequestCache) !BudgetedMutationOverlay {
+        var lease = graph_work_budget_mod.RetainedLease{ .budget = self.work_budget };
+        errdefer lease.deinit();
+        var mutations = std.ArrayListUnmanaged(query_materializer.Mutation).empty;
+        errdefer {
+            for (mutations.items) |mutation| {
+                self.handler.alloc.free(@constCast(mutation.doc_id));
+                if (mutation.body) |body| self.handler.alloc.free(@constCast(body));
+            }
+            mutations.deinit(self.handler.alloc);
+        }
+        var copied_bytes: usize = 0;
+        for (0..self.session.artifactCount()) |artifact_index| {
+            const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
+            if (artifact_ref.kind != .mutation_segment) continue;
+            const artifact_bytes = std.math.cast(usize, artifact_ref.byte_len) orelse
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            const owned_before = std.math.add(
+                usize,
+                std.math.mul(usize, mutations.capacity, @sizeOf(query_materializer.Mutation)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                copied_bytes,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            try lease.resize(std.math.add(usize, owned_before, artifact_bytes) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+            var retained_after = owned_before;
+            {
+                const contents = try self.session.fetchArtifactAlloc(artifact_index);
+                defer self.handler.alloc.free(contents);
+                if (contents.len != artifact_bytes) return error.InvalidSegment;
+
+                const header = try segment_mod.decodeHeader(contents);
+                const decoded_struct_bytes = std.math.mul(usize, header.count, @sizeOf(segment_mod.Entry)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                const wire_fixed_entry_bytes: usize = 8 + 8 + 1 + 4 + 4;
+                const encoded_fixed_bytes = std.math.mul(usize, header.count, wire_fixed_entry_bytes) catch
+                    return error.InvalidSegment;
+                const minimum_bytes = std.math.add(usize, segment_mod.header_len, encoded_fixed_bytes) catch
+                    return error.InvalidSegment;
+                if (minimum_bytes > contents.len) return error.InvalidSegment;
+                const variable_bytes = contents.len - minimum_bytes;
+                const decoded_bytes = std.math.add(usize, decoded_struct_bytes, variable_bytes) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                try lease.resize(std.math.add(
+                    usize,
+                    std.math.add(usize, owned_before, artifact_bytes) catch
+                        return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                    decoded_bytes,
+                ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+                const entries = try segment_mod.decodeAlloc(self.handler.alloc, contents);
+                defer segment_mod.freeEntries(self.handler.alloc, entries);
+
+                const required_capacity = std.math.add(usize, mutations.items.len, entries.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                const new_array_bytes = std.math.mul(usize, required_capacity, @sizeOf(query_materializer.Mutation)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                // During list growth both the old and new arrays may be live. The
+                // decoded strings and their copied owners also overlap briefly.
+                try lease.resize(std.math.add(
+                    usize,
+                    std.math.add(
+                        usize,
+                        std.math.add(usize, owned_before, artifact_bytes) catch
+                            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                        decoded_bytes,
+                    ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                    std.math.add(usize, new_array_bytes, variable_bytes) catch
+                        return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+                try mutations.ensureTotalCapacityPrecise(self.handler.alloc, required_capacity);
+                for (entries) |entry| {
+                    const doc_id = try self.handler.alloc.dupe(u8, entry.doc_id);
+                    errdefer self.handler.alloc.free(doc_id);
+                    const body = if (entry.body) |value| try self.handler.alloc.dupe(u8, value) else null;
+                    errdefer if (body) |value| self.handler.alloc.free(value);
+                    mutations.appendAssumeCapacity(.{
+                        .lsn = entry.lsn,
+                        .timestamp_ns = entry.timestamp_ns,
+                        .kind = entry.kind,
+                        .doc_id = doc_id,
+                        .body = body,
+                    });
+                    copied_bytes = std.math.add(usize, copied_bytes, doc_id.len) catch unreachable;
+                    if (body) |value| copied_bytes = std.math.add(usize, copied_bytes, value.len) catch unreachable;
+                }
+                retained_after = std.math.add(
+                    usize,
+                    std.math.mul(usize, mutations.capacity, @sizeOf(query_materializer.Mutation)) catch unreachable,
+                    copied_bytes,
+                ) catch unreachable;
+            }
+            try lease.resize(retained_after);
+        }
+        const items = try mutations.toOwnedSlice(self.handler.alloc);
+        return .{ .items = items, .lease = lease };
+    }
+
+    fn mutationApplicationPeakBytes(
+        self: *PublicGraphRequestCache,
+        base_count: usize,
+        mutations: []const query_materializer.Mutation,
+    ) !usize {
+        const slot_count = std.math.add(usize, base_count, mutations.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+            slot_count,
+            std.hash_map.default_max_load_percentage,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var bytes = std.math.mul(usize, slot_count, @sizeOf(PublicDocumentRef)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        bytes = std.math.add(
+            usize,
+            bytes,
+            graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        for (mutations) |mutation| {
+            bytes = std.math.add(usize, bytes, mutation.doc_id.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            if (mutation.body) |body| bytes = std.math.add(usize, bytes, body.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        }
+        return bytes;
+    }
+
+    fn allocDocumentArtifactRefs(
+        self: *PublicGraphRequestCache,
+        artifact_index: usize,
+        artifact_ref: manifest_mod.ArtifactRef,
+    ) !PublicDocumentRefsAllocation {
+        if (artifact_ref.byte_len < 12) return error.InvalidDocumentSegment;
+        const initial_len: usize = @intCast(@min(artifact_ref.byte_len, document_segment_mod.header_len));
+        var header_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, initial_len);
+        defer header_lease.deinit();
+        const header_bytes = try self.session.fetchArtifactRangeAlloc(artifact_index, 0, initial_len);
+        defer self.handler.alloc.free(header_bytes);
+        const header = try document_segment_mod.decodeHeader(header_bytes);
+
+        const directory_len = try header.indexedBytes();
+        if (@as(u64, directory_len) > artifact_ref.byte_len) return error.InvalidDocumentSegment;
+        const identity_bytes = header.identityBytes() catch return error.InvalidDocumentSegment;
+        const transient_bytes = std.math.add(
+            usize,
+            directory_len,
+            std.math.add(
+                usize,
+                std.math.mul(
+                    usize,
+                    header.count,
+                    @sizeOf(document_segment_mod.IndexEntry),
+                ) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                identity_bytes,
+            ) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var directory_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, transient_bytes);
+        defer directory_lease.deinit();
+        const directory = try self.session.fetchArtifactRangeAlloc(artifact_index, 0, directory_len);
+        defer self.handler.alloc.free(directory);
+        const index = try document_segment_mod.decodeIndexAlloc(self.handler.alloc, directory, artifact_ref.byte_len);
+        defer document_segment_mod.freeIndexEntries(self.handler.alloc, index);
+
+        const retained_bytes = std.math.add(
+            usize,
+            std.math.mul(usize, index.len, @sizeOf(PublicDocumentRef)) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+            identity_bytes,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const prior_retained = self.retained_lease.bytes;
+        try self.reserveRetained(retained_bytes);
+        errdefer self.retained_lease.resize(prior_retained) catch unreachable;
+        const refs = try self.handler.alloc.alloc(PublicDocumentRef, index.len);
+        errdefer self.handler.alloc.free(refs);
+        var initialized: usize = 0;
+        errdefer for (refs[0..initialized]) |*entry| entry.deinit(self.handler.alloc);
+        for (index, refs) |entry, *ref| {
+            ref.* = .{
+                .doc_id = try self.handler.alloc.dupe(u8, entry.doc_id),
+                .body = .{ .artifact = .{
+                    .artifact_index = artifact_index,
+                    .offset = entry.body_offset,
+                    .len = entry.body_len,
+                } },
+                .last_lsn = entry.last_lsn,
+                .last_timestamp_ns = entry.last_timestamp_ns,
+            };
+            initialized += 1;
+        }
+        return .{ .items = refs, .retained_bytes = retained_bytes };
+    }
+
+    fn graphSegment(self: *PublicGraphRequestCache, index_name: []const u8) !*const CachedPublicGraphSegment {
+        for (self.segments.items) |*entry| {
+            if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
+        }
+        const graph_index = query_mod.graph_reader.findGraphArtifactIndex(self.session, index_name) orelse
+            return error.GraphSegmentNotFound;
+        const artifact_ref = self.session.artifactRef(graph_index) orelse return error.GraphSegmentNotFound;
+        const payload_len = std.math.cast(usize, artifact_ref.byte_len) orelse
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var payload_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, payload_len);
+        defer payload_lease.deinit();
+        const payload = try self.session.fetchArtifactAlloc(graph_index);
+        defer self.handler.alloc.free(payload);
+        if (payload.len != payload_len) return error.InvalidGraphSegment;
+
+        var persistent_bytes = graph_segment_mod.decodedRetainedBytes(payload) catch |err| switch (err) {
+            error.UnsupportedGraphSegmentVersion => return err,
+            else => return error.InvalidGraphSegment,
+        };
+        const adjacency_count = blk: {
+            if (payload.len < 14) return error.InvalidGraphSegment;
+            break :blk std.mem.readInt(u32, payload[10..14], .little);
+        };
+        const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+            adjacency_count,
+            std.hash_map.default_max_load_percentage,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        persistent_bytes = std.math.add(
+            usize,
+            persistent_bytes,
+            graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const table_count = std.mem.readInt(u32, payload[6..10], .little);
+        persistent_bytes = std.math.add(
+            usize,
+            persistent_bytes,
+            std.math.mul(usize, table_count, @sizeOf([]u8)) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        // JSON string escaping expands one source byte to at most six bytes.
+        // Reserve that hard upper bound before metadata serialization.
+        var table_pos: usize = 14;
+        var reserved_metadata_payload_bytes: usize = 0;
+        for (0..table_count) |_| {
+            if (table_pos > payload.len or payload.len - table_pos < 4) return error.InvalidGraphSegment;
+            const table_len = std.mem.readInt(u32, payload[table_pos..][0..4], .little);
+            table_pos += 4;
+            if (table_len > payload.len - table_pos) return error.InvalidGraphSegment;
+            const metadata_len = std.math.add(
+                usize,
+                std.math.mul(usize, table_len, 6) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                "{\"target_table\":\"\"}".len,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            persistent_bytes = std.math.add(usize, persistent_bytes, metadata_len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            reserved_metadata_payload_bytes = std.math.add(usize, reserved_metadata_payload_bytes, metadata_len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            table_pos += table_len;
+        }
+        persistent_bytes = std.math.add(usize, persistent_bytes, index_name.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const prior_retained = self.retained_lease.bytes;
+        try self.reserveRetained(persistent_bytes);
+        errdefer self.retained_lease.resize(prior_retained) catch unreachable;
+
+        var segment = try graph_segment_mod.decodeAlloc(self.handler.alloc, payload);
+        errdefer graph_segment_mod.freeSegment(self.handler.alloc, &segment);
+        var adjacency_index = try graph_segment_mod.AdjacencyIndex.initWithCancellation(
+            self.handler.alloc,
+            segment,
+            self.session.cancellation,
+        );
+        errdefer adjacency_index.deinit(self.handler.alloc);
+        const neighbor_table_metadata = try self.handler.alloc.alloc([]u8, segment.neighbor_tables.len);
+        var initialized_metadata: usize = 0;
+        errdefer {
+            for (neighbor_table_metadata[0..initialized_metadata]) |metadata|
+                self.handler.alloc.free(metadata);
+            if (neighbor_table_metadata.len > 0) self.handler.alloc.free(neighbor_table_metadata);
+        }
+        for (segment.neighbor_tables, 0..) |table, i| {
+            neighbor_table_metadata[i] = try std.json.Stringify.valueAlloc(
+                self.handler.alloc,
+                .{ .target_table = table },
+                .{},
+            );
+            initialized_metadata += 1;
+        }
+        var actual_metadata_payload_bytes: usize = 0;
+        for (neighbor_table_metadata) |metadata| {
+            actual_metadata_payload_bytes = std.math.add(usize, actual_metadata_payload_bytes, metadata.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        }
+        if (actual_metadata_payload_bytes < reserved_metadata_payload_bytes) {
+            try self.retained_lease.resize(
+                self.retained_lease.bytes - (reserved_metadata_payload_bytes - actual_metadata_payload_bytes),
+            );
+        }
+        const owned_name = try self.handler.alloc.dupe(u8, index_name);
+        errdefer self.handler.alloc.free(owned_name);
+        try self.ensureRetainedListCapacity(
+            CachedPublicGraphSegment,
+            &self.segments,
+            self.segments.items.len + 1,
+        );
+        self.segments.appendAssumeCapacity(.{
+            .index_name = owned_name,
+            .segment = segment,
+            .adjacency_index = adjacency_index,
+            .neighbor_table_metadata = neighbor_table_metadata,
+        });
+        return &self.segments.items[self.segments.items.len - 1];
+    }
+};
+
+const public_graph_max_edges_scanned: usize = 1_000_000;
+const public_graph_anchor_page_size: usize = 256;
+
+const ServerlessGraphReadBudget = struct {
+    cancellation: CancellationToken,
+    edges_scanned: usize = 0,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+
+    fn admitEdges(self: *ServerlessGraphReadBudget, count: usize) !void {
+        self.edges_scanned = std.math.add(usize, self.edges_scanned, count) catch {
+            if (self.work_budget) |budget| return budget.exhaust(.explored_edges, budget.max_edges);
+            return error.GraphTraversalQueryBudgetExceeded;
+        };
+        if (self.edges_scanned > public_graph_max_edges_scanned) {
+            if (self.work_budget) |budget| return budget.exhaust(.explored_edges, budget.max_edges);
+            return error.GraphTraversalQueryBudgetExceeded;
+        }
+        try self.cancellation.check();
+    }
+};
+
+const ServerlessTraversalEdgeReader = struct {
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+
+    pub fn getEdges(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, true);
+    }
+
+    pub fn getEdgesBoundedForTraversal(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdgesBounded(alloc, self.cached, self.budget, null, key, edge_types, direction, true, max_edges, max_bytes);
+    }
+
+    pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
+        for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+};
+
+/// Canonical serverless path selectors are table-local. A qualified edge is a
+/// valid terminal result for traversal and MATCH, but it cannot satisfy or be
+/// expanded as an unqualified local path endpoint.
+const ServerlessPathEdgeReader = struct {
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+
+    pub fn getEdges(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, false);
+    }
+
+    pub fn getEdgesBoundedForPath(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdgesBounded(alloc, self.cached, self.budget, null, key, edge_types, direction, false, max_edges, max_bytes);
+    }
+
+    pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
+        for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+};
+
+const ServerlessPatternEdgeReader = struct {
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+    source_table: []const u8,
+
+    /// MATCH represents nodes in the queried table with a null qualifier. Keep
+    /// explicit source-table spelling equivalent to omission in every runtime.
+    pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        const value = table orelse return null;
+        return if (std.mem.eql(u8, value, self.source_table)) null else value;
+    }
+
+    /// Serverless artifacts contain exactly one physical source table. Perform
+    /// this check before streaming any half of a split cross-table traversal.
+    pub fn validatePatternSourceTable(
+        self: @This(),
+        table: ?[]const u8,
+        _: bool,
+    ) !void {
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
+    }
+
+    pub fn getEdges(
+        self: @This(),
+        alloc: Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
+        return try self.getEdgesBounded(
+            alloc,
+            table,
+            key,
+            edge_types,
+            direction,
+            graph_pattern_mod.default_max_explored_edges,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        );
+    }
+
+    pub fn getEdgesBounded(
+        self: @This(),
+        alloc: Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) ![]graph_mod.Edge {
+        // A serverless snapshot contains only the queried table's source
+        // segment. Treating an external alias as a local source would turn an
+        // incomplete MATCH into an exact-looking empty relation.
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
+        return try allocPublicSegmentEdgesBounded(
+            alloc,
+            self.cached,
+            self.budget,
+            null,
+            key,
+            edge_types,
+            direction,
+            true,
+            max_edges,
+            max_owned_bytes,
+        );
+    }
+
+    pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
+        for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+
+    pub fn probeEdgesBounded(
+        self: @This(),
+        alloc: Allocator,
+        table: ?[]const u8,
+        probes: []const graph_mod.EdgeProbe,
+        max_owned_bytes: usize,
+    ) ![]?graph_mod.Edge {
+        const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+        @memset(results, null);
+        errdefer {
+            for (results) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+            alloc.free(results);
+        }
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
+        var owned_bytes: usize = 0;
+        for (probes, 0..) |probe, probe_index| {
+            const adjacency = self.cached.adjacency_index.find(self.cached.segment, probe.source) orelse continue;
+            const lookup = graph_segment_mod.findEdgeByTypeAndNeighbor(
+                adjacency.out_edges,
+                probe.edge_type,
+                probe.target,
+            );
+            try self.budget.admitEdges(lookup.inspected);
+            if (lookup.edge) |edge| {
+                const metadata = self.cached.edgeMetadata(edge);
+                var edge_bytes: usize = @sizeOf(graph_mod.Edge);
+                edge_bytes = std.math.add(usize, edge_bytes, probe.source.len) catch
+                    return error.QueryCandidateBudgetExceeded;
+                edge_bytes = std.math.add(usize, edge_bytes, probe.target.len) catch
+                    return error.QueryCandidateBudgetExceeded;
+                edge_bytes = std.math.add(usize, edge_bytes, edge.edge_type.len) catch
+                    return error.QueryCandidateBudgetExceeded;
+                edge_bytes = std.math.add(usize, edge_bytes, if (metadata) |value| value.len else 0) catch
+                    return error.QueryCandidateBudgetExceeded;
+                owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch
+                    return error.QueryCandidateBudgetExceeded;
+                if (owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
+                results[probe_index] = try clonePublicSegmentEdge(
+                    alloc,
+                    probe.source,
+                    probe.target,
+                    edge.edge_type,
+                    edge.weight,
+                    metadata,
+                );
+            }
+        }
+        return results;
+    }
+
+    pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+        for (edges) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+        alloc.free(edges);
+    }
+};
+
+fn allocPublicSegmentEdges(
+    alloc: Allocator,
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+    table: ?[]const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    include_qualified_targets: bool,
+) ![]graph_mod.Edge {
+    return try allocPublicSegmentEdgesBounded(
+        alloc,
+        cached,
+        budget,
+        table,
+        key,
+        edge_types,
+        direction,
+        include_qualified_targets,
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+    );
+}
+
+fn allocPublicSegmentEdgesBounded(
+    alloc: Allocator,
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+    table: ?[]const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    include_qualified_targets: bool,
+    max_edges: usize,
+    max_owned_bytes: usize,
+) ![]graph_mod.Edge {
+    if (max_edges == 0 or max_owned_bytes == 0) return error.QueryCandidateBudgetExceeded;
+    // Serverless snapshots contain one table-local graph segment. Never alias a
+    // cross-table identity into that local key space.
+    if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
+    const adjacency = cached.adjacency_index.find(cached.segment, key) orelse
+        return try alloc.alloc(graph_mod.Edge, 0);
+    // Charge physical adjacency work even when a mirrored self-loop is later
+    // suppressed from the logical result.
+    const scanned = (if (direction == .out or direction == .both) adjacency.out_edges.len else 0) +
+        (if (direction == .in or direction == .both) adjacency.in_edges.len else 0);
+    try budget.admitEdges(scanned);
+
+    var edge_count: usize = 0;
+    var owned_bytes: usize = 0;
+    if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
+        if (!include_qualified_targets and edge.neighbor_table_id != null) continue;
+        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+        edge_count = std.math.add(usize, edge_count, 1) catch return error.QueryCandidateBudgetExceeded;
+        const metadata_len = if (cached.edgeMetadata(edge)) |metadata| metadata.len else 0;
+        var edge_bytes: usize = @sizeOf(graph_mod.Edge);
+        edge_bytes = std.math.add(usize, edge_bytes, adjacency.node_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.neighbor_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.edge_type.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, metadata_len) catch return error.QueryCandidateBudgetExceeded;
+        owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch return error.QueryCandidateBudgetExceeded;
+        if (edge_count > max_edges or owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
+    };
+    if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
+        if (isMirroredBothSelfLoop(direction, adjacency.node_id, edge)) continue;
+        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+        edge_count = std.math.add(usize, edge_count, 1) catch return error.QueryCandidateBudgetExceeded;
+        var edge_bytes: usize = @sizeOf(graph_mod.Edge);
+        edge_bytes = std.math.add(usize, edge_bytes, edge.neighbor_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, adjacency.node_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.edge_type.len) catch return error.QueryCandidateBudgetExceeded;
+        owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch return error.QueryCandidateBudgetExceeded;
+        if (edge_count > max_edges or owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
+    };
+
+    const edges = try alloc.alloc(graph_mod.Edge, edge_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (edges[0..initialized]) |edge| freeOwnedGraphEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+    if (direction == .out or direction == .both) {
+        for (adjacency.out_edges) |edge| {
+            if (!include_qualified_targets and edge.neighbor_table_id != null) continue;
+            if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+            edges[initialized] = try clonePublicSegmentEdge(
+                alloc,
+                adjacency.node_id,
+                edge.neighbor_id,
+                edge.edge_type,
+                edge.weight,
+                cached.edgeMetadata(edge),
+            );
+            initialized += 1;
+        }
+    }
+    if (direction == .in or direction == .both) {
+        for (adjacency.in_edges) |edge| {
+            if (isMirroredBothSelfLoop(direction, adjacency.node_id, edge)) continue;
+            if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+            edges[initialized] = try clonePublicSegmentEdge(
+                alloc,
+                edge.neighbor_id,
+                adjacency.node_id,
+                edge.edge_type,
+                edge.weight,
+                null,
+            );
+            initialized += 1;
+        }
+    }
+    return edges;
+}
+
+fn isMirroredBothSelfLoop(
+    direction: graph_mod.EdgeDirection,
+    node_id: []const u8,
+    edge: graph_segment_mod.Edge,
+) bool {
+    return direction == .both and std.mem.eql(u8, node_id, edge.neighbor_id);
+}
+
+fn clonePublicSegmentEdge(
+    alloc: Allocator,
+    source_value: []const u8,
+    target_value: []const u8,
+    edge_type_value: []const u8,
+    weight: f32,
+    metadata_value: ?[]const u8,
+) !graph_mod.Edge {
+    const source = try alloc.dupe(u8, source_value);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, target_value);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge_type_value);
+    errdefer alloc.free(edge_type);
+    const metadata: []const u8 = if (metadata_value) |value|
+        try alloc.dupe(u8, value)
+    else
+        &.{};
+    errdefer if (metadata.len > 0) alloc.free(metadata);
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = weight,
+        .created_at = 0,
+        .updated_at = 0,
+        .metadata = metadata,
+    };
+}
+
+fn nextConjunctiveAnchorPage(
+    docs: []const PublicDocumentRef,
+    cursor: *usize,
+    buffer: [][]const u8,
+    pattern: graph_pattern_mod.ConjunctivePattern,
+    filter_ctx: *PatternDocumentFilterContext,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) ![]const []const u8 {
+    const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+    var page_len: usize = 0;
+    while (cursor.* < docs.len and page_len < buffer.len) {
+        const raw_end = @min(docs.len, cursor.* + (buffer.len - page_len));
+        if (anchor.filter.filter_query_json != null)
+            try filter_ctx.documents.prefetchDocumentBodies(
+                docs[cursor.*..raw_end],
+                anchor.filter.filter_prefix,
+            );
+        while (cursor.* < raw_end) {
+            const doc = docs[cursor.*];
+            cursor.* += 1;
+            try work_budget.consumeAnchors(1);
+            if (!try publishedPatternNodeFilterEvaluator(
+                @ptrCast(filter_ctx),
+                .{ .table = null, .key = doc.doc_id },
+                anchor.filter,
+            )) continue;
+            buffer[page_len] = doc.doc_id;
+            page_len += 1;
+        }
+    }
+    return buffer[0..page_len];
+}
 
 fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep) bool {
     for (pattern) |step| {
         if (step.node_filter.filter_query_json != null) return true;
     }
     return false;
+}
+
+fn matchNodesHaveExternalDocumentFilter(source_table: []const u8, nodes: []const graph_pattern_mod.MatchNode) bool {
+    for (nodes) |node| {
+        const external = if (node.table) |table| !std.mem.eql(u8, table, source_table) else false;
+        if (external and node.filter.filter_query_json != null) return true;
+    }
+    return false;
+}
+
+fn conjunctivePatternHasExternalDocumentFilter(source_table: []const u8, pattern: graph_pattern_mod.ConjunctivePattern) bool {
+    if (matchNodesHaveExternalDocumentFilter(source_table, pattern.nodes)) return true;
+    for (pattern.optional) |optional_pattern| {
+        if (matchNodesHaveExternalDocumentFilter(source_table, optional_pattern.nodes)) return true;
+    }
+    return false;
+}
+
+test "serverless document body prefetch order is artifact monotonic" {
+    var locators = [_]PublicDocumentBodyPrefetch{
+        .{ .document_index = 0, .locator = .{ .artifact_index = 1, .offset = 90, .len = 5 } },
+        .{ .document_index = 1, .locator = .{ .artifact_index = 0, .offset = 40, .len = 5 } },
+        .{ .document_index = 2, .locator = .{ .artifact_index = 1, .offset = 10, .len = 5 } },
+        .{ .document_index = 2, .locator = .{ .artifact_index = 1, .offset = 10, .len = 5 } },
+    };
+    std.mem.sort(PublicDocumentBodyPrefetch, &locators, {}, PublicDocumentBodyPrefetch.lessThan);
+    const unique = deduplicateSortedDocumentPrefetches(&locators);
+    try std.testing.expectEqual(@as(usize, 3), unique.len);
+    try std.testing.expectEqual(@as(usize, 0), unique[0].locator.artifact_index);
+    try std.testing.expectEqual(@as(u64, 10), unique[1].locator.offset);
+    try std.testing.expectEqual(@as(u64, 90), unique[2].locator.offset);
+}
+
+test "serverless detects document filters on required and optional external aliases" {
+    const local = graph_pattern_mod.MatchNode{ .alias = "local" };
+    const external = graph_pattern_mod.MatchNode{
+        .alias = "external",
+        .table = "entities",
+        .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"person\"}}" },
+    };
+    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter("docs", .{
+        .nodes = &.{ local, external },
+        .edges = &.{},
+    }));
+    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter("docs", .{
+        .nodes = &.{local},
+        .edges = &.{},
+        .optional = &.{.{
+            .nodes = &.{external},
+            .edges = &.{},
+        }},
+    }));
+    try std.testing.expect(!conjunctivePatternHasExternalDocumentFilter("docs", .{
+        .nodes = &.{
+            local,
+            .{ .alias = "external", .table = "entities", .filter = .{ .filter_prefix = "person:" } },
+        },
+        .edges = &.{},
+    }));
+    const explicitly_local = graph_pattern_mod.MatchNode{
+        .alias = "local",
+        .table = "docs",
+        .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"document\"}}" },
+    };
+    try std.testing.expect(!conjunctivePatternHasExternalDocumentFilter("docs", .{
+        .nodes = &.{explicitly_local},
+        .edges = &.{},
+    }));
 }
 
 fn patternEdgeTypeRequested(edge_type: []const u8, requested: []const []const u8) bool {
@@ -4907,12 +6498,87 @@ fn patternEdgeTypeRequested(edge_type: []const u8, requested: []const []const u8
     return false;
 }
 
-fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    if (filter.filter_prefix.len > 0 and !std.mem.startsWith(u8, node.key, filter.filter_prefix)) return false;
     if (filter.filter_query_json == null) return true;
-    const body = findMaterializedDocumentBody(active.docs, key) orelse return false;
+    if (node.table) |table| {
+        if (!std.mem.eql(u8, table, active.source_table))
+            return error.GraphExternalAliasDocumentFilterUnsupported;
+    }
+    const body = try active.documents.documentBody(node.key) orelse return false;
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
-    return try prepared.matchesStored(active.alloc, key, body);
+    return try prepared.matchesStored(active.alloc, node.key, body);
+}
+
+fn publishedPatternNodeFilterBatchEvaluator(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    nodes: []const graph_node_identity.Ref,
+    filter: graph_pattern_mod.NodeFilter,
+) anyerror![]bool {
+    const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    if (filter.filter_query_json != null) {
+        const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+        defer alloc.free(refs);
+        var refs_len: usize = 0;
+        _ = try active.documents.documents();
+        for (nodes) |node| {
+            if (filter.filter_prefix.len > 0 and !std.mem.startsWith(u8, node.key, filter.filter_prefix)) continue;
+            if (node.table) |table| {
+                if (!std.mem.eql(u8, table, active.source_table)) continue;
+            }
+            const idx = active.documents.published_document_index.get(node.key) orelse continue;
+            refs[refs_len] = active.documents.published_documents.?[idx];
+            refs_len += 1;
+        }
+        try active.documents.prefetchDocumentBodies(refs[0..refs_len], filter.filter_prefix);
+    }
+    const decisions = try alloc.alloc(bool, nodes.len);
+    errdefer alloc.free(decisions);
+    for (nodes, 0..) |node, idx| {
+        decisions[idx] = try publishedPatternNodeFilterEvaluator(ctx, node, filter);
+    }
+    return decisions;
+}
+
+fn serverlessGraphNodeAdmission(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    nodes: []const graph_node_admission.NodeRef,
+) anyerror![]bool {
+    const active: *ServerlessGraphAdmissionContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    if (active.filter.filter_query_json != null) {
+        const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+        defer alloc.free(refs);
+        var refs_len: usize = 0;
+        _ = try active.filter_ctx.documents.documents();
+        for (nodes) |node| {
+            if (active.filter.filter_prefix.len > 0 and
+                !std.mem.startsWith(u8, node.key, active.filter.filter_prefix)) continue;
+            if (node.external and if (node.table) |table|
+                !std.mem.eql(u8, table, active.filter_ctx.source_table)
+            else
+                false) continue;
+            const idx = active.filter_ctx.documents.published_document_index.get(node.key) orelse continue;
+            refs[refs_len] = active.filter_ctx.documents.published_documents.?[idx];
+            refs_len += 1;
+        }
+        try active.filter_ctx.documents.prefetchDocumentBodies(refs[0..refs_len], active.filter.filter_prefix);
+    }
+    const admitted = try alloc.alloc(bool, nodes.len);
+    errdefer alloc.free(admitted);
+    for (nodes, 0..) |node, i| {
+        admitted[i] = (!node.external or if (node.table) |table|
+            std.mem.eql(u8, table, active.filter_ctx.source_table)
+        else
+            true) and try publishedPatternNodeFilterEvaluator(
+            @ptrCast(active.filter_ctx),
+            .{ .table = node.table, .key = node.key },
+            active.filter,
+        );
+    }
+    return admitted;
 }
 
 fn removeDocumentMutationById(
@@ -5026,16 +6692,6 @@ fn freeOwnedGraphEdge(alloc: Allocator, edge: graph_mod.Edge) void {
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
-fn findGraphSegmentAdjacency(
-    adjacencies: []const graph_segment_mod.Adjacency,
-    doc_id: []const u8,
-) ?graph_segment_mod.Adjacency {
-    for (adjacencies) |adjacency| {
-        if (std.mem.eql(u8, adjacency.node_id, doc_id)) return adjacency;
-    }
-    return null;
-}
-
 fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
     return request.full_text_search != null or
         request.embeddings != null or
@@ -5048,14 +6704,6 @@ fn firstEdgeType(edge_types: ?[]const []const u8) ?[]const u8 {
     const values = edge_types orelse return null;
     if (values.len != 1) return null;
     return values[0];
-}
-
-fn toServerlessGraphDirection(direction: graph_mod.EdgeDirection) query_mod.GraphQueryDirection {
-    return switch (direction) {
-        .out => .out,
-        .in => .in,
-        .both => .both,
-    };
 }
 
 fn dupFieldsAlloc(alloc: Allocator, values: []const []const u8) !?[][]u8 {
@@ -5093,152 +6741,50 @@ fn allocPathNodes(alloc: Allocator, nodes: []const []const u8) ![]const []const 
     return out;
 }
 
-fn allocSinglePathEdgeInfo(
+fn graphResultNodeFromTraversalAlloc(
     alloc: Allocator,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f32,
-) ![]const graph_query_mod.PathEdgeInfo {
-    const out = try alloc.alloc(graph_query_mod.PathEdgeInfo, 1);
-    errdefer alloc.free(out);
-    const source_copy = try alloc.dupe(u8, source);
-    errdefer alloc.free(source_copy);
-    const target_copy = try alloc.dupe(u8, target);
-    errdefer alloc.free(target_copy);
-    const edge_type_copy = try alloc.dupe(u8, edge_type);
-    out[0] = .{
-        .source = source_copy,
-        .target = target_copy,
-        .edge_type = edge_type_copy,
-        .weight = weight,
-    };
-    return out;
-}
-
-fn allocPathEdgeInfos(
-    alloc: Allocator,
-    path: []query_mod.GraphPathHop,
-) ![]const graph_query_mod.PathEdgeInfo {
-    const out = try alloc.alloc(graph_query_mod.PathEdgeInfo, path.len);
-    errdefer alloc.free(out);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |edge| {
-            alloc.free(edge.source);
-            alloc.free(edge.target);
-            alloc.free(edge.edge_type);
-        }
-    }
-    for (path, 0..) |hop, idx| {
-        const source = try alloc.dupe(u8, hop.from_doc_id);
-        errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, hop.to_doc_id);
-        errdefer alloc.free(target);
-        const edge_type = try alloc.dupe(u8, hop.edge_type);
-        out[idx] = .{
-            .source = source,
-            .target = target,
-            .edge_type = edge_type,
-            .weight = hop.weight,
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn dupConstGraphPathAlloc(alloc: Allocator, path: []const []u8) ![]const []const u8 {
-    const out = try alloc.alloc([]const u8, path.len);
-    errdefer alloc.free(out);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |segment| alloc.free(segment);
-    }
-    for (path, 0..) |segment, idx| {
-        out[idx] = try alloc.dupe(u8, segment);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn normalizeTraversalPathAlloc(
-    alloc: Allocator,
-    start_key: []const u8,
-    path: []const []u8,
-) ![]const []const u8 {
-    if (path.len > 0 and std.mem.eql(u8, path[0], start_key)) {
-        return try dupConstGraphPathAlloc(alloc, path);
-    }
-
-    const out = try alloc.alloc([]const u8, path.len + 1);
-    errdefer alloc.free(out);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |segment| alloc.free(segment);
-    }
-
-    out[0] = try alloc.dupe(u8, start_key);
-    initialized += 1;
-    for (path, 0..) |segment, idx| {
-        out[idx + 1] = try alloc.dupe(u8, segment);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn traversalDistance(node: query_mod.GraphTraversalNode) f64 {
-    const edge_path = node.edge_path orelse return @floatFromInt(node.depth);
-    var total: f64 = 0;
-    for (edge_path) |hop| total += hop.weight;
-    return total;
-}
-
-fn toDbGraphPath(alloc: Allocator, path: query_mod.GraphShortestPath) !db_types.GraphPath {
-    const nodes = try alloc.alloc([]const u8, path.path.len);
-    errdefer alloc.free(nodes);
-    var initialized_nodes: usize = 0;
-    errdefer {
-        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
-    }
-    for (path.path, 0..) |node, idx| {
-        nodes[idx] = try alloc.dupe(u8, node);
-        initialized_nodes += 1;
-    }
-
-    const edges = try alloc.alloc(graph_paths.PathEdge, path.edge_path.len);
-    errdefer alloc.free(edges);
-    var initialized_edges: usize = 0;
-    errdefer {
-        for (edges[0..initialized_edges]) |edge| {
-            alloc.free(edge.source);
-            alloc.free(edge.target);
-            alloc.free(edge.edge_type);
-        }
-    }
-
-    var total_weight: f64 = 0;
-    for (path.edge_path, 0..) |hop, idx| {
-        const source = try alloc.dupe(u8, hop.from_doc_id);
-        errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, hop.to_doc_id);
-        errdefer alloc.free(target);
-        const edge_type = try alloc.dupe(u8, hop.edge_type);
-        edges[idx] = .{
-            .source = source,
-            .target = target,
-            .edge_type = edge_type,
-            .weight = hop.weight,
-        };
-        total_weight += hop.weight;
-        initialized_edges += 1;
-    }
+    node: graph_traversal.TraversalResult,
+) !graph_query_mod.GraphResultNode {
+    const key = try alloc.dupe(u8, node.key);
+    errdefer alloc.free(key);
+    const table = if (node.target_table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
+    const path = if (node.path) |value| try allocPathNodes(alloc, value) else null;
+    errdefer if (path) |value| freeGraphPath(alloc, value);
+    const path_tables = if (path) |value|
+        try allocPathTablesFromTerminal(alloc, value.len, node.target_table)
+    else
+        null;
+    errdefer if (path_tables) |values| freeOptionalPathTables(alloc, values);
 
     return .{
-        .nodes = nodes,
-        .edges = edges,
-        .total_weight = total_weight,
-        .length = path.depth,
+        .key = key,
+        .table = table,
+        .depth = node.depth,
+        .distance = node.distance,
+        .path = path,
+        .path_tables = path_tables,
+        .path_edges = null,
     };
+}
+
+fn allocPathTablesFromTerminal(
+    alloc: Allocator,
+    path_len: usize,
+    terminal_table: ?[]const u8,
+) !?[]const ?[]const u8 {
+    const table = terminal_table orelse return null;
+    if (path_len == 0) return null;
+    const out = try alloc.alloc(?[]const u8, path_len);
+    @memset(out, null);
+    errdefer alloc.free(out);
+    out[path_len - 1] = try alloc.dupe(u8, table);
+    return out;
+}
+
+fn freeOptionalPathTables(alloc: Allocator, tables: []const ?[]const u8) void {
+    for (tables) |table| if (table) |value| alloc.free(value);
+    alloc.free(tables);
 }
 
 fn dupGraphPathAlloc(alloc: Allocator, path: [][]u8) ![][]u8 {
@@ -5557,10 +7103,14 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
     }
 
     for (parsed.value.mutations, 0..) |mutation, idx| {
+        const doc_id = try alloc.dupe(u8, mutation.doc_id);
+        errdefer alloc.free(doc_id);
+        const mutation_body = if (mutation.body) |body_value| try alloc.dupe(u8, body_value) else null;
+        errdefer if (mutation_body) |owned| alloc.free(owned);
         mutations[idx] = .{
             .kind = try parseMutationKind(mutation.kind),
-            .doc_id = try alloc.dupe(u8, mutation.doc_id),
-            .body = if (mutation.body) |body_value| try alloc.dupe(u8, body_value) else null,
+            .doc_id = doc_id,
+            .body = mutation_body,
         };
         initialized += 1;
     }
@@ -5572,14 +7122,72 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
     };
 }
 
-fn parseTableIngestBatchRequest(alloc: Allocator, table_name: []const u8, body: []const u8) !api_types.TableIngestBatchRequest {
-    const req = try parseIngestBatchRequest(alloc, table_name, body);
-    errdefer freeDocumentMutations(alloc, req.mutations);
-    return .{
-        .table_name = req.namespace,
-        .timestamp_ns = req.timestamp_ns,
-        .mutations = req.mutations,
-    };
+fn lowerTableIngestMutationsAlloc(
+    alloc: Allocator,
+    input_mutations: []const api_types.TableIngestMutationInput,
+) ![]api_types.DocumentMutation {
+    const mutations = try alloc.alloc(api_types.DocumentMutation, input_mutations.len);
+    errdefer alloc.free(mutations);
+    for (input_mutations, 0..) |mutation, idx| {
+        mutations[idx] = switch (mutation.kind) {
+            .upsert => switch (mutation.document) {
+                .object => |document| .{
+                    .kind = .upsert,
+                    .doc_id = mutation.doc_id,
+                    .body = document.bytes,
+                },
+                .absent, .null_value, .non_object => return error.InvalidDocumentMutation,
+            },
+            .delete => switch (mutation.document) {
+                .absent => .{
+                    .kind = .delete,
+                    .doc_id = mutation.doc_id,
+                },
+                .null_value, .object, .non_object => return error.InvalidDocumentMutation,
+            },
+        };
+    }
+    return mutations;
+}
+
+test "serverless public table mutation admission lowers embedded object documents without copying" {
+    const alloc = std.testing.allocator;
+    var valid = try ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}},{"kind":"delete","doc_id":"doc-b"}]}
+    , .{});
+    defer valid.deinit();
+    const mutations = try lowerTableIngestMutationsAlloc(alloc, valid.value.mutations);
+    defer alloc.free(mutations);
+    try std.testing.expectEqual(@as(usize, 2), mutations.len);
+    try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", mutations[0].body.?);
+    try std.testing.expect(mutations[0].body.?.ptr == valid.value.mutations[0].document.object.bytes.ptr);
+
+    inline for (.{
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"plain text"}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":42}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":[1,2]}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a"}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":null}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":{}}]}
+        ,
+    }) |invalid| {
+        var parsed = try ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc, invalid, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidDocumentMutation,
+            lowerTableIngestMutationsAlloc(alloc, parsed.value.mutations),
+        );
+    }
+
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc, "[]", .{}),
+    );
 }
 
 fn parseEnsureNamespaceRequest(alloc: Allocator, body: []const u8) !api_types.EnsureNamespaceRequest {
@@ -6547,7 +8155,7 @@ test "typed index status response rejects extended variant fields but raw json p
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{
+    return try ant_json.parseFromSlice(T, alloc, body, .{
         .ignore_unknown_fields = true,
     });
 }
@@ -6611,7 +8219,15 @@ fn parseTestQueryHitsAlloc(alloc: Allocator, body: []const u8) !OwnedJsonValueSl
 
 fn testQueryHitSourcePathValue(hit: anytype, path: []const u8) ?std.json.Value {
     const source = hit._source orelse return null;
-    return extractJsonPathValue(source, path);
+    if (source.map.get(path)) |direct| return direct;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    const first = parts.next() orelse return null;
+    var current = source.map.get(first) orelse return null;
+    while (parts.next()) |part| {
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
 }
 
 fn testOwnedHitSourcePathValue(hit: std.json.Value, path: []const u8) ?std.json.Value {
@@ -7505,7 +9121,7 @@ test "http handler serves public table joins on published heads" {
         const source = hit._source.?;
         if (testQueryHitSourcePathValue(hit, "title")) |title| {
             if (title == .string and std.mem.eql(u8, title.string, "Orphan order")) {
-                try std.testing.expect(source.object.get("customers.name") == null);
+                try std.testing.expect(source.map.get("customers.name") == null);
                 found_left_unmatched = true;
             }
         }
@@ -7604,9 +9220,9 @@ test "http handler serves public table joins on published heads" {
     var found_nested_foreign_city = false;
     for (nested_foreign_hits) |hit| {
         const source = hit._source.?;
-        if (source.object.get("customers.name")) |name| {
+        if (source.map.get("customers.name")) |name| {
             if (name == .string and std.mem.eql(u8, name.string, "Alice")) {
-                try std.testing.expectEqualStrings("Seattle", source.object.get("customers.pg_addresses.city").?.string);
+                try std.testing.expectEqualStrings("Seattle", source.map.get("customers.pg_addresses.city").?.string);
                 found_nested_foreign_city = true;
             }
         }
@@ -7699,7 +9315,9 @@ test "http handler join parser accepts foreign source maps" {
     const body =
         \\{"fields":["title"],"join":{"right_table":"customers","join_type":"inner","on":{"left_field":"customer_id","right_field":"_id","operator":"eq"}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
     ;
-    const parsed = (try parseSupportedJoinRequest(alloc, body)).?;
+    var raw = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw.deinit();
+    const parsed = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
     defer {
         var owned = parsed;
         owned.deinit(alloc);
@@ -7860,7 +9478,14 @@ test "http handler executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body, .none)).?;
+    var raw_request = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw_request.deinit();
+    const json = (try handler.executeForeignPublicTableQueryJsonValueAlloc(
+        "pg_customers",
+        body,
+        raw_request.value,
+        .none,
+    )).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -8926,7 +10551,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"version\":1,\"embedding\":[1,0,0]}"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","version":1,"embedding":[1,0,0]}}]}
         ,
     });
     defer ingest.deinit(alloc);
@@ -9163,7 +10788,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"bravo\",\"priority\":10,\"version\":1,\"embedding\":[1,0,0]}"}]}
+        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"bravo","priority":10,"version":1,"embedding":[1,0,0]}}]}
         ,
     });
     defer text_only_update.deinit(alloc);
@@ -9217,7 +10842,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":789,"mutations":[{"kind":"upsert","doc_id":"doc-b","body":"beta"}]}
+        \\{"timestamp_ns":789,"mutations":[{"kind":"upsert","doc_id":"doc-b","document":{"body":"beta"}}]}
         ,
     });
     defer next_ingest.deinit(alloc);
@@ -9371,7 +10996,7 @@ test "http handler accepts structured table updates for metadata-only republish 
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","_embeddings":{"semantic_idx":[1,0,0]}}}]}
         ,
     });
     defer ingest.deinit(alloc);
@@ -9508,10 +11133,10 @@ test "http handler query publication exposes vector compaction targets" {
 
     const ingest_body =
         \\{"timestamp_ns":456,"mutations":[
-        \\{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"embedding\":[0,0]}"},
-        \\{"kind":"upsert","doc_id":"doc-b","body":"{\"body\":\"bravo\",\"embedding\":[10,0]}"},
-        \\{"kind":"upsert","doc_id":"doc-c","body":"{\"body\":\"charlie\",\"embedding\":[0,10]}"},
-        \\{"kind":"upsert","doc_id":"doc-d","body":"{\"body\":\"delta\",\"embedding\":[10,10]}"}
+        \\{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","embedding":[0,0]}},
+        \\{"kind":"upsert","doc_id":"doc-b","document":{"body":"bravo","embedding":[10,0]}},
+        \\{"kind":"upsert","doc_id":"doc-c","document":{"body":"charlie","embedding":[0,10]}},
+        \\{"kind":"upsert","doc_id":"doc-d","document":{"body":"delta","embedding":[10,10]}}
         \\]}
     ;
     var ingest = try handler.handle(.{
@@ -9639,11 +11264,34 @@ test "http handler resolves table routes through persisted serving namespace map
     defer runtime_status.deinit(alloc);
     var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
 
+    var invalid_ingest = try handler.handle(.{
+        .method = .put,
+        .path = "/tables/docs/ingest-batch",
+        .body =
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"alpha"}]}
+        ,
+    });
+    defer invalid_ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_ingest.status);
+    try std.testing.expectEqualStrings(
+        "upserts require an object document and deletes must omit document",
+        invalid_ingest.body,
+    );
+
+    var malformed_ingest = try handler.handle(.{
+        .method = .put,
+        .path = "/tables/docs/ingest-batch",
+        .body = "[]",
+    });
+    defer malformed_ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), malformed_ingest.status);
+    try std.testing.expectEqualStrings("invalid ingest request", malformed_ingest.body);
+
     var ingest = try handler.handle(.{
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"alpha"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}}]}
         ,
     });
     defer ingest.deinit(alloc);
@@ -10180,7 +11828,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_searches":{"neighbors_from_search":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$full_text_results","limit":1},"params":{"edge_types":["cites","related"]}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_search":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_search.deinit(alloc);
@@ -10189,17 +11837,20 @@ test "http handler serves published graph query endpoints" {
     defer parsed_from_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
-    const neighbors_from_search = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_search.type);
-    try std.testing.expectEqual(@as(i64, 2), neighbors_from_search.total);
-    try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes.?[1].key);
+    const neighbors_from_search_result = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
+    const neighbors_from_search = switch (neighbors_from_search_result) {
+        .graph_nodes_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
 
     var from_fused = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_searches":{"neighbors_from_fused":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$fused_results","limit":1},"params":{"edge_types":["cites","related"]}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_fused":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_fused.deinit(alloc);
@@ -10208,35 +11859,141 @@ test "http handler serves published graph query endpoints" {
     defer parsed_from_fused.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
-    const neighbors_from_fused = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_fused.type);
-    try std.testing.expectEqual(@as(i64, 2), neighbors_from_fused.total);
-    try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes.?[1].key);
+    const neighbors_from_fused_result = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
+    const neighbors_from_fused = switch (neighbors_from_fused_result) {
+        .graph_nodes_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_fused.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes[1].key);
+
+    const pattern_request_json =
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","path":"/title"}},"c":{"filter":{"prefix":"ga","path":"/title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
+    ;
+    var typed_pattern_request = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        pattern_request_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer typed_pattern_request.deinit();
+    const generated_pattern_body = try std.json.Stringify.valueAlloc(
+        alloc,
+        typed_pattern_request.value,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer alloc.free(generated_pattern_body);
+    var generated_pattern_value = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        generated_pattern_body,
+        .{},
+    );
+    defer generated_pattern_value.deinit();
+    try std.testing.expect(generated_pattern_value.value.object.get("aggregations") == null);
 
     var pattern = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body =
-        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"target_nodes":{"keys":["doc-c"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"params":{"include_paths":false},"include_documents":true,"fields":["title"]}},"limit":10}
-        ,
+        .body = generated_pattern_body,
     });
     defer pattern.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), pattern.status);
     var parsed_pattern = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, pattern.body);
     defer parsed_pattern.deinit();
-    const two_hop = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, two_hop.type);
-    try std.testing.expectEqual(@as(i64, 1), two_hop.total);
-    try std.testing.expectEqual(@as(usize, 1), two_hop.matches.?.len);
-    try std.testing.expect(two_hop.matches.?[0].path == null);
-    const bindings = two_hop.matches.?[0].bindings.?;
-    try std.testing.expect(bindings.map.get("a") != null);
-    try std.testing.expect(bindings.map.get("b") != null);
-    try std.testing.expect(bindings.map.get("c") != null);
-    try std.testing.expectEqualStrings("alpha", bindings.map.get("a").?.document.?.object.get("title").?.string);
-    try std.testing.expectEqualStrings("beta", bindings.map.get("b").?.document.?.object.get("title").?.string);
-    try std.testing.expectEqualStrings("gamma", bindings.map.get("c").?.document.?.object.get("title").?.string);
+    const two_hop_result = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
+    const two_hop = switch (two_hop_result) {
+        .graph_bindings_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), two_hop.rows.len);
+    const row = two_hop.rows[0].map;
+    const binding_a = row.get("a").? orelse return error.TestUnexpectedResult;
+    const binding_b = row.get("b").? orelse return error.TestUnexpectedResult;
+    const binding_c = row.get("c").? orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc-a", binding_a.key);
+    try std.testing.expectEqualStrings("doc-b", binding_b.key);
+    try std.testing.expectEqualStrings("doc-c", binding_c.key);
+
+    var legacy_pattern = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_searches":{"two_hop":{"type":"neighbors","index":"graph_idx","start_nodes":{"keys":["doc-a"]}}},"limit":10}
+        ,
+    });
+    defer legacy_pattern.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), legacy_pattern.status);
+    var parsed_legacy_pattern = try parseJsonTestBody(
+        metadata_openapi.GraphQueryUnsupportedError,
+        alloc,
+        legacy_pattern.body,
+    );
+    defer parsed_legacy_pattern.deinit();
+    try std.testing.expectEqualStrings("$request", parsed_legacy_pattern.value.operation);
+    try std.testing.expectEqualStrings("graph_searches", parsed_legacy_pattern.value.feature);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed_legacy_pattern.value.reason,
+    );
+
+    // Legacy rejection is a request-envelope invariant. Feature routing must
+    // not let a foreign-source control claim the request first.
+    var mixed_legacy_pattern = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_searches":{"two_hop":{"type":"neighbors","index":"graph_idx","start_nodes":{"keys":["doc-a"]}}},"foreign_sources":{"ignored":{"type":"unsupported"}}}
+        ,
+    });
+    defer mixed_legacy_pattern.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), mixed_legacy_pattern.status);
+    var parsed_mixed_legacy = try parseJsonTestBody(
+        metadata_openapi.GraphQueryUnsupportedError,
+        alloc,
+        mixed_legacy_pattern.body,
+    );
+    defer parsed_mixed_legacy.deinit();
+    try std.testing.expectEqualStrings("graph_searches", parsed_mixed_legacy.value.feature);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed_mixed_legacy.value.reason,
+    );
+
+    // Internal storage controls are rejected by the common raw envelope before
+    // foreign, join, graph, or ordinary retrieval routing can consume them.
+    var internal_foreign = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"foreign_sources":{"ignored":{"type":"unsupported"}},"identity_read_generation":1}
+        ,
+    });
+    defer internal_foreign.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), internal_foreign.status);
+
+    var unsupported_control = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}]},"return":{"bindings":["a","b"]}}},"order_by":[{"field":"created_at"}]}
+        ,
+    });
+    defer unsupported_control.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_control.status);
+    var parsed_unsupported_control = try parseJsonTestBody(
+        metadata_openapi.GraphQueryUnsupportedError,
+        alloc,
+        unsupported_control.body,
+    );
+    defer parsed_unsupported_control.deinit();
+    try std.testing.expectEqualStrings("$request", parsed_unsupported_control.value.operation);
+    try std.testing.expectEqualStrings("order_by", parsed_unsupported_control.value.feature);
+    try std.testing.expectEqualStrings(
+        "request_control_not_supported",
+        parsed_unsupported_control.value.reason,
+    );
 
     var invalid_version_neighbors = try handler.handle(.{
         .method = .post,
@@ -10444,18 +12201,436 @@ test "serverless public graph query rejects exact sort controls" {
         .runtime_status = undefined,
     };
 
+    var diagnostic_storage: graph_query_diagnostic.Storage = .{};
+    const diagnostic_binding = graph_query_diagnostic.bind(&diagnostic_storage);
+    defer diagnostic_binding.deinit();
+
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
-        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"order_by\":[{\"field\":\"created_at\"}]}",
         .none,
     ));
+    const order_by_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", order_by_diagnostic.operation);
+    try std.testing.expectEqualStrings("order_by", order_by_diagnostic.feature);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.request_control_not_supported,
+        order_by_diagnostic.reason,
+    );
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
-        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
+    const search_after_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", search_after_diagnostic.operation);
+    try std.testing.expectEqualStrings("search_after", search_after_diagnostic.feature);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.request_control_not_supported,
+        search_after_diagnostic.reason,
+    );
+    try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"limti\":10}",
+        .none,
+    ));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}}}",
+        .none,
+    ));
+    const legacy_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", legacy_diagnostic.operation);
+    try std.testing.expectEqualStrings("graph_searches", legacy_diagnostic.feature);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.legacy_graph_searches_not_supported,
+        legacy_diagnostic.reason,
+    );
+
+    // Serverless implements only the current non-nullable graph contract; a
+    // legacy field remains invalid even when its value is null.
+    try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":null}",
+        .none,
+    ));
+
+    const null_graph_options = [_][]const u8{
+        "{\"graph_queries\":null}",
+        "{\"graph_queries\":{\"path\":{\"index\":\"graph_idx\",\"shortest_path\":{\"from\":{\"key\":\"doc:1\"},\"to\":{\"key\":\"doc:2\"},\"objective\":null}}}}",
+        "{\"graph_queries\":{\"path\":{\"index\":\"graph_idx\",\"shortest_path\":{\"from\":{\"key\":\"doc:1\"},\"to\":{\"key\":\"doc:2\"},\"edge_weight\":null}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"edge_weight\":{\"min\":null,\"max\":1}}}}}",
+    };
+    for (null_graph_options) |body| {
+        try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
+            "docs",
+            "docs",
+            body,
+            .none,
+        ));
+    }
+
+    var typed_plain_request = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        "{\"order_by\":[{\"field\":\"_id\"}],\"limit\":10}",
+        .{ .allocate = .alloc_always },
+    );
+    defer typed_plain_request.deinit();
+    const generated_plain_body = try std.json.Stringify.valueAlloc(
+        alloc,
+        typed_plain_request.value,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer alloc.free(generated_plain_body);
+    try std.testing.expect((try handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        generated_plain_body,
+        .none,
+    )) == null);
+}
+
+test "serverless public graph reader shares weighted traversal and k shortest semantics" {
+    const alloc = std.testing.allocator;
+    const EdgeDef = struct { neighbor: []const u8, weight: f32 };
+    const Builder = struct {
+        fn edges(a: Allocator, defs: []const EdgeDef) ![]graph_segment_mod.Edge {
+            const out = try a.alloc(graph_segment_mod.Edge, defs.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*edge| edge.deinit(a);
+                a.free(out);
+            }
+            for (defs, 0..) |def, i| {
+                out[i] = .{
+                    .neighbor_id = try a.dupe(u8, def.neighbor),
+                    .edge_type = try a.dupe(u8, "e"),
+                    .weight = def.weight,
+                };
+                initialized += 1;
+            }
+            return out;
+        }
+
+        fn adjacency(a: Allocator, key: []const u8, out_defs: []const EdgeDef, in_defs: []const EdgeDef) !graph_segment_mod.Adjacency {
+            const node_id = try a.dupe(u8, key);
+            errdefer a.free(node_id);
+            const out_edges = try edges(a, out_defs);
+            errdefer {
+                for (out_edges) |*edge| edge.deinit(a);
+                a.free(out_edges);
+            }
+            return .{
+                .node_id = node_id,
+                .out_edges = out_edges,
+                .in_edges = try edges(a, in_defs),
+            };
+        }
+    };
+
+    var segment = graph_segment_mod.Segment{ .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 4) };
+    var initialized: usize = 0;
+    errdefer {
+        for (segment.adjacencies[0..initialized]) |*adjacency| adjacency.deinit(alloc);
+        alloc.free(segment.adjacencies);
+    }
+    segment.adjacencies[0] = try Builder.adjacency(alloc, "a", &.{ .{ .neighbor = "b", .weight = 1 }, .{ .neighbor = "c", .weight = 2 } }, &.{});
+    initialized += 1;
+    segment.adjacencies[1] = try Builder.adjacency(alloc, "b", &.{.{ .neighbor = "d", .weight = 1 }}, &.{.{ .neighbor = "a", .weight = 1 }});
+    initialized += 1;
+    segment.adjacencies[2] = try Builder.adjacency(alloc, "c", &.{.{ .neighbor = "d", .weight = 2 }}, &.{.{ .neighbor = "a", .weight = 2 }});
+    initialized += 1;
+    segment.adjacencies[3] = try Builder.adjacency(alloc, "d", &.{}, &.{ .{ .neighbor = "b", .weight = 1 }, .{ .neighbor = "c", .weight = 2 } });
+    initialized += 1;
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const cached = CachedPublicGraphSegment{
+        .index_name = @constCast("g"),
+        .segment = segment,
+        .adjacency_index = adjacency_index,
+    };
+
+    var path_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const path_reader = ServerlessTraversalEdgeReader{ .cached = &cached, .budget = &path_budget };
+    const shortest = (try graph_paths.findShortestPathWithEdgeReader(alloc, path_reader, "a", "d", .{
+        .weight_mode = .min_weight,
+        .max_depth = 4,
+    })).?;
+    defer graph_paths.freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(f64, 2), shortest.total_weight);
+    try std.testing.expectEqualStrings("b", shortest.nodes[1]);
+
+    const alternatives = try graph_paths.findKShortestPathsWithEdgeReader(alloc, path_reader, "a", "d", 2, .{
+        .weight_mode = .min_weight,
+        .max_depth = 4,
+    });
+    defer graph_paths.freePaths(alloc, alternatives);
+    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    try std.testing.expectEqual(@as(f64, 2), alternatives[0].total_weight);
+    try std.testing.expectEqual(@as(f64, 4), alternatives[1].total_weight);
+
+    var traversal_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const traversal_reader = ServerlessTraversalEdgeReader{ .cached = &cached, .budget = &traversal_budget };
+    const reached = try graph_traversal.traverseWithEdgeReader(alloc, traversal_reader, "a", .{
+        .edge_types = &.{"e"},
+        .max_depth = 2,
+        .min_weight = 1.5,
+        .max_results = 10,
+        .include_paths = true,
+    });
+    defer graph_traversal.freeOwnedResults(alloc, reached);
+    try std.testing.expectEqual(@as(usize, 2), reached.len);
+    try std.testing.expectEqualStrings("c", reached[0].key);
+    try std.testing.expectEqualStrings("d", reached[1].key);
+}
+
+test "serverless public graph reader preserves qualified endpoint identity" {
+    const alloc = std.testing.allocator;
+    var segment = graph_segment_mod.Segment{
+        .neighbor_tables = try alloc.alloc([]u8, 1),
+        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    };
+    segment.neighbor_tables[0] = try alloc.dupe(u8, "entities");
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "doc:a"),
+        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "shared"),
+        .edge_type = try alloc.dupe(u8, "mentions"),
+        .weight = 1,
+        .neighbor_table_id = 0,
+    };
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const neighbor_table_metadata = try alloc.alloc([]u8, 1);
+    defer alloc.free(neighbor_table_metadata);
+    neighbor_table_metadata[0] = try std.json.Stringify.valueAlloc(
+        alloc,
+        .{ .target_table = "entities" },
+        .{},
+    );
+    defer alloc.free(neighbor_table_metadata[0]);
+    const cached = CachedPublicGraphSegment{
+        .index_name = @constCast("g"),
+        .segment = segment,
+        .adjacency_index = adjacency_index,
+        .neighbor_table_metadata = neighbor_table_metadata,
+    };
+    var budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const reader = ServerlessTraversalEdgeReader{ .cached = &cached, .budget = &budget };
+    const reached = try graph_traversal.traverseWithEdgeReader(alloc, reader, "doc:a", .{
+        .max_depth = 2,
+        .max_results = 10,
+        .include_paths = true,
+    });
+    defer graph_traversal.freeOwnedResults(alloc, reached);
+    try std.testing.expectEqual(@as(usize, 1), reached.len);
+    try std.testing.expectEqualStrings("shared", reached[0].key);
+    try std.testing.expectEqualStrings("entities", reached[0].target_table.?);
+    var result_node = try graphResultNodeFromTraversalAlloc(alloc, reached[0]);
+    defer result_node.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", result_node.path.?[0]);
+    try std.testing.expect(result_node.path_tables.?[0] == null);
+    try std.testing.expectEqualStrings("entities", result_node.path_tables.?[1].?);
+
+    var path_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const path_reader = ServerlessPathEdgeReader{ .cached = &cached, .budget = &path_budget };
+    const qualified_path = try graph_paths.findShortestPathWithEdgeReader(
+        alloc,
+        path_reader,
+        "doc:a",
+        "shared",
+        .{},
+    );
+    defer if (qualified_path) |path| graph_paths.freePath(alloc, path);
+    try std.testing.expect(qualified_path == null);
+
+    var pattern_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const pattern_reader = ServerlessPatternEdgeReader{
+        .cached = &cached,
+        .budget = &pattern_budget,
+        .source_table = "docs",
+    };
+    const bounded = try pattern_reader.getEdgesBounded(
+        alloc,
+        null,
+        "doc:a",
+        &.{"mentions"},
+        .out,
+        1,
+        graph_pattern_mod.default_max_explored_edge_bytes,
+    );
+    defer pattern_reader.freeEdges(alloc, bounded);
+    try std.testing.expectEqual(@as(usize, 1), bounded.len);
+    const explicitly_local = try pattern_reader.getEdgesBounded(
+        alloc,
+        "docs",
+        "doc:a",
+        &.{"mentions"},
+        .out,
+        1,
+        graph_pattern_mod.default_max_explored_edge_bytes,
+    );
+    defer pattern_reader.freeEdges(alloc, explicitly_local);
+    try std.testing.expectEqual(@as(usize, 1), explicitly_local.len);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        pattern_reader.getEdgesBounded(alloc, null, "doc:a", &.{"mentions"}, .out, 1, 1),
+    );
+    const probe = graph_mod.EdgeProbe{
+        .source = "doc:a",
+        .target = "shared",
+        .edge_type = "mentions",
+    };
+    const probe_bytes = @sizeOf(graph_mod.Edge) + probe.source.len + probe.target.len +
+        probe.edge_type.len + neighbor_table_metadata[0].len;
+    const probed = try pattern_reader.probeEdgesBounded(alloc, null, &.{probe}, probe_bytes);
+    defer pattern_reader.freeProbedEdges(alloc, probed);
+    try std.testing.expect(probed[0] != null);
+    try std.testing.expectEqualStrings(neighbor_table_metadata[0], probed[0].?.metadata);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        pattern_reader.probeEdgesBounded(alloc, null, &.{probe}, probe_bytes - 1),
+    );
+    const missing_probe = graph_mod.EdgeProbe{
+        .source = "doc:a",
+        .target = "missing",
+        .edge_type = "mentions",
+    };
+    const missing_probe_result = try pattern_reader.probeEdgesBounded(alloc, null, &.{missing_probe}, 0);
+    defer pattern_reader.freeProbedEdges(alloc, missing_probe_result);
+    try std.testing.expect(missing_probe_result[0] == null);
+    try std.testing.expectError(
+        error.GraphExternalAliasSourceUnsupported,
+        pattern_reader.getEdgesBounded(
+            alloc,
+            "entities",
+            "shared",
+            &.{"mentions"},
+            .in,
+            1,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        ),
+    );
+}
+
+test "serverless exact match counts one physical self loop for both direction" {
+    const alloc = std.testing.allocator;
+    var segment = graph_segment_mod.Segment{
+        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    };
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "same"),
+        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "same"),
+        .edge_type = try alloc.dupe(u8, "LOOP"),
+        .weight = 1,
+    };
+    segment.adjacencies[0].in_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "same"),
+        .edge_type = try alloc.dupe(u8, "LOOP"),
+        .weight = 1,
+    };
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const cached = CachedPublicGraphSegment{
+        .index_name = @constCast("g"),
+        .segment = segment,
+        .adjacency_index = adjacency_index,
+    };
+    var read_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const reader = ServerlessPatternEdgeReader{
+        .cached = &cached,
+        .budget = &read_budget,
+        .source_table = "docs",
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const match_edges = [_]graph_pattern_mod.MatchEdge{.{
+        .from = "a",
+        .to = "b",
+        .step = .{ .types = &.{"LOOP"}, .direction = .both },
+    }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "a",
+        .nodes = &nodes,
+        .edges = &match_edges,
+    };
+    const aggregate_specs = [_]graph_pattern_mod.CountAggregateSpec{.{}};
+    const aggregates = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"same"},
+        pattern,
+        &aggregate_specs,
+        .{},
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 1), aggregates[0].value);
+    // The work budget reflects both physical adjacency entries even though the
+    // logical relationship is emitted once.
+    try std.testing.expectEqual(@as(usize, 2), read_budget.edges_scanned);
+}
+
+test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
+    const docs = [_]PublicDocumentRef{
+        .{ .doc_id = @constCast("a"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("c"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("d"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("e"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    var filter_ctx = PatternDocumentFilterContext{
+        .alloc = std.testing.allocator,
+        .documents = undefined,
+        .cache = undefined,
+        .source_table = "docs",
+    };
+    var cursor: usize = 0;
+    var buffer: [2][]const u8 = undefined;
+    var work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    const first = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
+    try std.testing.expectEqualSlices([]const u8, &.{ "a", "b" }, first);
+    const second = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
+    try std.testing.expectEqualSlices([]const u8, &.{ "c", "d" }, second);
+    const third = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
+    try std.testing.expectEqualSlices([]const u8, &.{"e"}, third);
+    try std.testing.expectEqual(docs.len, cursor);
+    try std.testing.expectEqual(
+        graph_pattern_mod.default_max_scanned_anchors - docs.len,
+        work_budget.remaining_anchors,
+    );
 }
 
 test "serverless graph HTTP result copies are allocation-failure safe" {

@@ -4398,9 +4398,9 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     }
     if (cfg.query_shape.usesGraph()) {
         if (wrote_field) try out.append(alloc, ',');
-        try out.appendSlice(alloc, "\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"" ++ graph_index_name ++ "\",\"start_nodes\":{\"keys\":[\"");
+        try out.appendSlice(alloc, "\"graph_queries\":{\"neighbors\":{\"index\":\"" ++ graph_index_name ++ "\",\"traverse\":{\"start\":{\"keys\":[\"");
         try out.print(alloc, "doc:{d:0>8}", .{source_doc_idx});
-        try out.appendSlice(alloc, "\"]},\"params\":{\"edge_types\":[\"cites\"]}}}");
+        try out.appendSlice(alloc, "\"]},\"edge_types\":[\"cites\"],\"max_depth\":1}}}");
         wrote_field = true;
     }
     if (cfg.query_shape == .exact_sort_match_all or

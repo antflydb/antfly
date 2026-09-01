@@ -72,6 +72,7 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
 };
 
@@ -495,6 +496,7 @@ pub const OwnedStack = struct {
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);
@@ -1072,7 +1074,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
     var dense_graph_resp = try stack.handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body = "{\"embeddings\":{\"serverless_chunk\":[1,0,0]},\"graph_searches\":{\"neighbors_from_dense\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"result_ref\":\"$embeddings_results\",\"limit\":1},\"params\":{\"edge_types\":[\"cites\"]}}},\"limit\":5}",
+        .body = "{\"embeddings\":{\"serverless_chunk\":[1,0,0]},\"graph_queries\":{\"neighbors_from_dense\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$query_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
     });
     defer dense_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), dense_graph_resp.status);
@@ -1082,7 +1084,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
     var sparse_graph_resp = try stack.handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body = "{\"embeddings\":{\"serverless_sparse\":{\"indices\":[1,2],\"values\":[1.0,0.5]}},\"graph_searches\":{\"neighbors_from_sparse\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"result_ref\":\"$embeddings_results\",\"limit\":1},\"params\":{\"edge_types\":[\"cites\"]}}},\"limit\":5}",
+        .body = "{\"embeddings\":{\"serverless_sparse\":{\"indices\":[1,2],\"values\":[1.0,0.5]}},\"graph_queries\":{\"neighbors_from_sparse\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$query_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
     });
     defer sparse_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), sparse_graph_resp.status);

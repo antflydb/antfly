@@ -6973,6 +6973,44 @@ pub const DataServer = struct {
         self.runRaftRoundOnly() catch |err| return handleRaftProgressError(err);
     }
 
+    /// Publishes one full production store-status observation without running
+    /// unrelated maintenance lanes. Managed runtimes normally reach this work
+    /// through `runControlRoundOnly`; deterministic runtimes use this seam to
+    /// make status publication an independently schedulable operation while
+    /// retaining the production collector, metadata transport, and retry
+    /// ownership rules.
+    pub fn runStoreStatusRoundOnly(self: *DataServer) !void {
+        if (self.remote_metadata == null or self.store_registration == null) return;
+        if (!self.store_registration_confirmed) try self.registerNodeIfConfigured();
+        _ = self.store_status_ticks.fetchAdd(1, .monotonic);
+        self.store_status_ticks.store(0, .release);
+        try self.reportStoreStatus();
+    }
+
+    /// Schedules only the production maintenance lanes that can turn newly
+    /// committed index metadata into an authoritative runtime observation.
+    /// The jobs retain their normal durable-lane ownership; deterministic
+    /// runtimes may wait on `indexPublicationMaintenanceActive` before
+    /// scheduling the subsequent full store-status publication.
+    pub fn requestIndexPublicationMaintenanceRoundOnly(self: *DataServer) !void {
+        if (self.remote_metadata != null and self.store_registration != null) {
+            try self.maybeRequestProvisionedRootRefresh();
+        }
+        try self.maybeRequestRuntimeStatusRefresh();
+        try self.maybeRequestProvisionedStartupCatchUp();
+        try self.maybeRequestProvisionedIndexRepair();
+    }
+
+    /// Reports whether a production index-publication maintenance owner still
+    /// has work in flight. This exposes scheduler state, never derived index
+    /// state, so callers must still use public status as the readiness oracle.
+    pub fn indexPublicationMaintenanceActive(self: *const DataServer) bool {
+        return self.provisioned_root_refresh_active.load(.acquire) or
+            self.runtime_status_refresh_active.load(.acquire) or
+            self.provisioned_startup_catch_up_active.load(.acquire) or
+            self.provisioned_index_repair_active.load(.acquire);
+    }
+
     fn raftProgressSource(self: *DataServer) antfly.raft.ProgressSource {
         return .{
             .ptr = self,
@@ -20367,6 +20405,7 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,

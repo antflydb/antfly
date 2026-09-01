@@ -451,12 +451,24 @@ pub const SupportedJoinFilters = struct {
 
 pub fn combineFilterQueryWithRowFilterJson(
     alloc: std.mem.Allocator,
-    existing_filter_query: ?std.json.Value,
+    existing_filter_query: anytype,
     row_filter_json: []const u8,
 ) !std.json.Value {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_filter_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    return try combineFilterQueryValues(alloc, existing_filter_query, parsed.value);
+    const Optional = @TypeOf(existing_filter_query);
+    const Child = @typeInfo(Optional).optional.child;
+    if (comptime Child == std.json.Value) {
+        return try combineFilterQueryValues(alloc, existing_filter_query, parsed.value);
+    }
+    if (existing_filter_query) |raw| {
+        if (comptime @hasField(Child, "bytes")) {
+            const existing = std.json.parseFromSlice(std.json.Value, alloc, raw.bytes, .{}) catch return error.InvalidQueryRequest;
+            defer existing.deinit();
+            return try combineFilterQueryValues(alloc, existing.value, parsed.value);
+        }
+    }
+    return try combineFilterQueryValues(alloc, null, parsed.value);
 }
 
 pub fn applyRightTableRowFilterJson(
@@ -4434,11 +4446,11 @@ pub fn parseSupportedJoinRequestWithSecrets(
     };
 }
 
-pub fn parseSupportedJoinClauseValue(
+pub fn parseSupportedJoinClauseObject(
     alloc: std.mem.Allocator,
-    join_value: std.json.Value,
+    join_value: std.json.ArrayHashMap(std.json.Value),
 ) anyerror!SupportedJoinRequest {
-    const encoded = try stringifyJsonValueAlloc(alloc, join_value);
+    const encoded = try stringifyJsonValueAlloc(alloc, .{ .object = join_value.map });
     defer alloc.free(encoded);
     var parsed = std.json.parseFromSlice(metadata_openapi.JoinClause, alloc, encoded, .{
         .ignore_unknown_fields = true,
@@ -4476,11 +4488,11 @@ pub fn supportedJoinRequestFromOpenApi(
         nested.deinit(alloc);
         alloc.destroy(nested);
     };
-    if (join.nested_join) |value| {
+    if (join.nested_join.valueOrNull()) |value| {
         const initialized_nested = blk: {
             const nested = try alloc.create(SupportedJoinRequest);
             errdefer alloc.destroy(nested);
-            nested.* = try parseSupportedJoinClauseValue(alloc, value);
+            nested.* = try parseSupportedJoinClauseObject(alloc, value);
             break :blk nested;
         };
         nested_join = initialized_nested;
@@ -4509,7 +4521,10 @@ fn supportedJoinFiltersFromOpenApi(
 ) !?SupportedJoinFilters {
     const value = filters orelse return null;
     return .{
-        .filter_query = if (value.filter_query) |query| try cloneJsonValue(alloc, query) else null,
+        .filter_query = if (value.filter_query) |query|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, query.bytes, .{})
+        else
+            null,
         .filter_prefix = if (value.filter_prefix) |prefix| try alloc.dupe(u8, prefix) else null,
         .limit = if (value.limit) |limit|
             if (limit < 0)
@@ -4523,7 +4538,7 @@ fn supportedJoinFiltersFromOpenApi(
 
 pub fn rewriteJoinedBaseQueryBodyAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     join_left_field: []const u8,
 ) !JoinedBaseQueryRewrite {
     var effective_fields = try maybeAppendRequestedFieldAlloc(alloc, request.fields, join_left_field);

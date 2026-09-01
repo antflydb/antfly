@@ -23,7 +23,7 @@ class QueryRequestForeignSources:
     product catalogs, etc.) without ingesting that data into Antfly.
 
     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-    **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+    **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
     **Example - Join Antfly products with Postgres customers:**
     ```json

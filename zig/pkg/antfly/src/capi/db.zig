@@ -3993,7 +3993,7 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
 fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "\"full_text_search\"") != null or
         std.mem.indexOf(u8, bytes, "\"embeddings\"") != null or
-        std.mem.indexOf(u8, bytes, "\"graph_searches\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_queries\"") != null or
         std.mem.indexOf(u8, bytes, "\"merge_config\"") != null or
         std.mem.indexOf(u8, bytes, "\"indexes\"") != null or
         std.mem.indexOf(u8, bytes, "\"query\"") != null;
@@ -5214,8 +5214,8 @@ fn parseGraphQueryRequestOwned(alloc: Allocator, request: JsonGraphQueryRequest)
             .direction = parseGraphDirection(request.direction),
             .max_depth = request.max_depth,
             .max_results = request.max_results,
-            .min_weight = request.min_weight,
-            .max_weight = request.max_weight,
+            .min_weight = legacyGraphWeightBound(request.min_weight),
+            .max_weight = legacyGraphWeightBound(request.max_weight),
             .deduplicate = request.deduplicate,
             .include_paths = request.include_paths,
             .weight_mode = parseGraphWeightMode(request.weight_mode),
@@ -5283,6 +5283,13 @@ fn deinitOwnedNodeSelector(alloc: Allocator, selector: *graph_query_mod.NodeSele
             for (keys) |key| alloc.free(@constCast(key));
             if (keys.len > 0) alloc.free(keys);
         },
+        .identities => |identities| {
+            for (identities) |identity| {
+                alloc.free(@constCast(identity.key));
+                if (identity.table) |table| alloc.free(@constCast(table));
+            }
+            if (identities.len > 0) alloc.free(identities);
+        },
         .result_ref => |result_ref| {
             alloc.free(@constCast(result_ref.ref));
         },
@@ -5332,6 +5339,10 @@ fn parseGraphWeightMode(mode: []const u8) db_mod.types.GraphPathWeightMode {
     if (std.mem.eql(u8, mode, "min_weight")) return .min_weight;
     if (std.mem.eql(u8, mode, "max_weight")) return .max_weight;
     return .min_hops;
+}
+
+fn legacyGraphWeightBound(value: f64) ?f64 {
+    return if (value > 0 and std.math.isFinite(value)) value else null;
 }
 
 fn computeSearchAggregations(
@@ -6342,8 +6353,8 @@ pub export fn antfly_db_traverse_edges_json(
         .edge_types = parsed.value.edge_types,
         .direction = direction,
         .max_depth = parsed.value.max_depth,
-        .min_weight = parsed.value.min_weight,
-        .max_weight = parsed.value.max_weight,
+        .min_weight = legacyGraphWeightBound(parsed.value.min_weight),
+        .max_weight = legacyGraphWeightBound(parsed.value.max_weight),
         .max_results = parsed.value.max_results,
         .deduplicate = parsed.value.deduplicate_nodes,
         .include_paths = parsed.value.include_paths,
@@ -6429,7 +6440,7 @@ pub export fn antfly_db_find_shortest_path_json(
         .max_weight
     else
         .min_hops;
-    const maybe_path = handle.db.findShortestPath(handle.alloc, parsed.value.index_name, source, target, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, parsed.value.min_weight, parsed.value.max_weight) catch |err| return capi.mapError(err);
+    const maybe_path = handle.db.findShortestPath(handle.alloc, parsed.value.index_name, source, target, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, legacyGraphWeightBound(parsed.value.min_weight), legacyGraphWeightBound(parsed.value.max_weight)) catch |err| return capi.mapError(err);
     if (maybe_path == null) return .not_found;
     var payload = JsonPath.init(handle.alloc, maybe_path.?) catch return .internal;
     defer payload.deinit(handle.alloc);
@@ -6474,7 +6485,7 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         .max_weight
     else
         .min_hops;
-    const paths = handle.db.findKShortestPaths(handle.alloc, parsed.value.index_name, source, target, parsed.value.k, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, parsed.value.min_weight, parsed.value.max_weight) catch |err| return capi.mapError(err);
+    const paths = handle.db.findKShortestPaths(handle.alloc, parsed.value.index_name, source, target, parsed.value.k, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, legacyGraphWeightBound(parsed.value.min_weight), legacyGraphWeightBound(parsed.value.max_weight)) catch |err| return capi.mapError(err);
     defer paths_mod.freePaths(handle.alloc, paths);
     var payload = handle.alloc.alloc(JsonPath, paths.len) catch return .internal;
     var count: usize = 0;
@@ -6553,8 +6564,8 @@ pub export fn antfly_db_match_pattern_json(
                 .direction = direction,
                 .min_hops = step.edge.min_hops,
                 .max_hops = step.edge.max_hops,
-                .min_weight = step.edge.min_weight,
-                .max_weight = step.edge.max_weight,
+                .min_weight = legacyGraphWeightBound(step.edge.min_weight),
+                .max_weight = legacyGraphWeightBound(step.edge.max_weight),
                 .types = step.edge.types,
             },
             .node_filter = .{

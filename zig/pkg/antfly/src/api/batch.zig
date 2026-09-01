@@ -118,7 +118,7 @@ fn parseBatchRequestWithOptions(
     const writes: []db_mod.types.BatchWrite = writes: {
         if (root.get("inserts")) |inserts| {
             if (inserts == .null) break :writes &.{};
-            const parsed_writes = try parseInserts(alloc, inserts);
+            const parsed_writes = try parseInserts(alloc, inserts, !allow_internal);
             errdefer freeWrites(alloc, parsed_writes);
             break :writes parsed_writes;
         }
@@ -828,7 +828,11 @@ fn parseInternalU64(value: std.json.Value) !u64 {
     };
 }
 
-fn parseInserts(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.BatchWrite {
+fn parseInserts(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    require_document_objects: bool,
+) ![]db_mod.types.BatchWrite {
     if (value != .object) return error.InvalidBatchRequest;
     const inserts = value.object;
     const writes = try alloc.alloc(db_mod.types.BatchWrite, inserts.count());
@@ -843,6 +847,12 @@ fn parseInserts(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types
 
     var it = inserts.iterator();
     while (it.next()) |entry| {
+        // Public BatchRequest.inserts is map[string]object in OpenAPI. Enforce
+        // that contract before storage so every admitted document can be
+        // returned through QueryHit._source. Internal decoding stays opaque to
+        // preserve replay and movement of durable data written by older nodes.
+        if (require_document_objects and entry.value_ptr.* != .object)
+            return error.InvalidBatchRequest;
         writes[initialized] = .{
             .key = try alloc.dupe(u8, entry.key_ptr.*),
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
@@ -946,6 +956,7 @@ fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$unset")) return .unset;
     if (std.mem.eql(u8, op, "$inc")) return .inc;
     if (std.mem.eql(u8, op, "$push")) return .push;
+    if (std.mem.eql(u8, op, "$pull")) return .pull;
     if (std.mem.eql(u8, op, "$addToSet")) return .add_to_set;
     if (std.mem.eql(u8, op, "$min")) return .min;
     if (std.mem.eql(u8, op, "$max")) return .max;
@@ -1002,6 +1013,29 @@ test "batch parser accepts inserts and deletes" {
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
     try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+}
+
+test "public batch parser rejects non-object documents while internal replay remains opaque" {
+    const alloc = std.testing.allocator;
+    inline for (.{
+        \\{"inserts":{"doc:a":"text"}}
+        ,
+        \\{"inserts":{"doc:a":42}}
+        ,
+        \\{"inserts":{"doc:a":[1,2]}}
+        ,
+        \\{"inserts":{"doc:a":null}}
+        ,
+    }) |body| {
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
+    }
+
+    var replay = try parseInternalBatchRequest(alloc,
+        \\{"inserts":{"doc:a":"legacy durable value"}}
+    );
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay.writes.len);
+    try std.testing.expectEqualStrings("\"legacy durable value\"", replay.writes[0].value);
 }
 
 test "batch parser preserves oversized value errors" {
@@ -1314,9 +1348,16 @@ test "batch parser accepts push for graph edge arrays" {
     try std.testing.expectEqual(db_mod.types.TransformOpType.push, owned.transforms[0].operations[0].op);
 }
 
+test "batch parser accepts pull for exact array values" {
+    var owned = try parseBatchRequest(std.testing.allocator,
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$pull","path":"edges","value":{"target":"doc:b"}}]}]}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, owned.transforms[0].operations[0].op);
+}
+
 test "batch parser rejects every recognized but unsupported transform operator" {
     const unsupported = [_][]const u8{
-        "$pull",
         "$pop",
         "$mul",
         "$currentDate",
@@ -1338,7 +1379,7 @@ test "batch parser rejects every recognized but unsupported transform operator" 
 
 test "batch parser safely rejects unsupported transform after initialized operations" {
     const body =
-        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$pull","path":"items","value":1}]}]}
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$pop","path":"items","value":1}]}]}
     ;
     for (0..32) |_| {
         try std.testing.expectError(

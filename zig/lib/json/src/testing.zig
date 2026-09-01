@@ -42,6 +42,23 @@ pub fn expectSubset(expected: Value, actual: Value) !void {
     try expectMatch(expected, actual, .subset);
 }
 
+/// Assert omission rather than conflating an absent object member with an
+/// explicitly present JSON null. This distinction matters for OpenAPI optional
+/// properties, whose generated serializers omit values that are not present.
+pub fn expectObjectFieldAbsent(actual: Value, field: []const u8) !void {
+    const object = switch (actual) {
+        .object => |object| object,
+        else => {
+            std.debug.print("expected JSON object while checking absent field {s}; actual: {f}\n", .{ field, std.json.fmt(actual, .{}) });
+            return error.TestExpectedJsonObject;
+        },
+    };
+    if (object.get(field)) |value| {
+        std.debug.print("expected JSON field {s} to be absent; actual value: {f}\n", .{ field, std.json.fmt(value, .{}) });
+        return error.TestUnexpectedJsonField;
+    }
+}
+
 pub fn expectEqualJsonText(alloc: std.mem.Allocator, expected_json: []const u8, actual_json: []const u8) !void {
     var expected = try std.json.parseFromSlice(Value, alloc, expected_json, .{});
     defer expected.deinit();
@@ -68,6 +85,12 @@ pub fn expectSubsetJsonValue(alloc: std.mem.Allocator, expected_json: []const u8
     var expected = try std.json.parseFromSlice(Value, alloc, expected_json, .{});
     defer expected.deinit();
     try expectSubset(expected.value, actual);
+}
+
+test "object field absence distinguishes omission from null" {
+    var omitted = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"present\":null}", .{});
+    defer omitted.deinit();
+    try expectObjectFieldAbsent(omitted.value, "missing");
 }
 
 fn expectMatch(expected: Value, actual: Value, mode: MatchMode) !void {

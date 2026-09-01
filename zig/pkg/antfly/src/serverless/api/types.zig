@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("../catalog/types.zig");
 const search_sources = @import("../search_sources.zig");
@@ -41,7 +42,209 @@ pub const IngestBatchRequest = struct {
     mutations: []const DocumentMutation,
 };
 
+pub const TableUpsertMutation = struct {
+    doc_id: []const u8,
+    document: ant_json.RawObject,
+};
+
+pub const TableDeleteMutation = struct {
+    doc_id: []const u8,
+};
+
+/// Canonical public table mutation. The structural union keeps invalid states
+/// out of client code: upserts always carry an object document and deletes
+/// cannot carry one. Internal WAL/domain mutations deliberately remain the
+/// byte-oriented `DocumentMutation` above.
+pub const TableIngestMutation = union(enum) {
+    upsert: TableUpsertMutation,
+    delete: TableDeleteMutation,
+
+    pub fn initUpsert(doc_id: []const u8, document_json: []const u8) error{InvalidDocumentMutation}!@This() {
+        return .{ .upsert = .{
+            .doc_id = doc_id,
+            .document = ant_json.RawObject.init(document_json) catch return error.InvalidDocumentMutation,
+        } };
+    }
+
+    pub fn initDelete(doc_id: []const u8) @This() {
+        return .{ .delete = .{ .doc_id = doc_id } };
+    }
+
+    /// Validate caller-constructed mutations before they enter a serializer.
+    /// RawObject keeps its bytes public for general Zig ergonomics, so public
+    /// clients must not rely on the JSON writer's intentionally narrow error
+    /// set to report malformed document bytes.
+    pub fn validate(self: @This()) error{InvalidDocumentMutation}!void {
+        switch (self) {
+            .upsert => |mutation| mutation.document.validate() catch
+                return error.InvalidDocumentMutation,
+            .delete => {},
+        }
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        self.validate() catch return error.WriteFailed;
+        try self.jsonStringifyValidated(jw);
+    }
+
+    fn jsonStringifyValidated(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .upsert => |mutation| {
+                try jw.objectField("kind");
+                try jw.write("upsert");
+                try jw.objectField("doc_id");
+                try jw.write(mutation.doc_id);
+                try jw.objectField("document");
+                try jw.beginWriteRaw();
+                try jw.writer.writeAll(mutation.document.bytes);
+                jw.endWriteRaw();
+            },
+            .delete => |mutation| {
+                try jw.objectField("kind");
+                try jw.write("delete");
+                try jw.objectField("doc_id");
+                try jw.write(mutation.doc_id);
+            },
+        }
+        try jw.endObject();
+    }
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        const parsed = try std.json.innerParse(TableIngestMutationInput, allocator, source, options);
+        return try fromInput(parsed);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        const parsed = try std.json.innerParseFromValue(TableIngestMutationInput, allocator, source, options);
+        return try fromInput(parsed);
+    }
+
+    fn fromInput(input: TableIngestMutationInput) error{UnexpectedToken}!@This() {
+        return switch (input.kind) {
+            .upsert => switch (input.document) {
+                .object => |document| .{ .upsert = .{
+                    .doc_id = input.doc_id,
+                    .document = document,
+                } },
+                .absent, .null_value, .non_object => error.UnexpectedToken,
+            },
+            .delete => switch (input.document) {
+                .absent => .{ .delete = .{ .doc_id = input.doc_id } },
+                .null_value, .object, .non_object => error.UnexpectedToken,
+            },
+        };
+    }
+};
+
+pub const TableMutationDocumentPresence = union(enum) {
+    absent,
+    null_value,
+    object: ant_json.RawObject,
+    non_object,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        if (try source.peekNextTokenType() == .null) {
+            _ = try source.next();
+            return .null_value;
+        }
+        if (try source.peekNextTokenType() == .object_begin) {
+            return .{ .object = try std.json.innerParse(ant_json.RawObject, allocator, source, options) };
+        }
+        // The value is retained only to distinguish mutation-shape failures
+        // from malformed JSON. Consume it for syntax validation without
+        // materializing bytes that admission will immediately reject.
+        try source.skipValue();
+        return .non_object;
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        if (source == .null) return .null_value;
+        if (source == .object) {
+            return .{ .object = try std.json.innerParseFromValue(ant_json.RawObject, allocator, source, options) };
+        }
+        return .non_object;
+    }
+};
+
+test "serverless non-object table mutation documents are discarded without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var scanner = std.json.Scanner.initCompleteInput(failing.allocator(), "\"plain text\"");
+    defer scanner.deinit();
+
+    const presence = try TableMutationDocumentPresence.jsonParse(failing.allocator(), &scanner, .{});
+    try std.testing.expect(presence == .non_object);
+    try std.testing.expectEqual(std.json.TokenType.end_of_document, try scanner.peekNextTokenType());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+pub const TableIngestMutationInput = struct {
+    kind: MutationKind,
+    doc_id: []const u8,
+    document: TableMutationDocumentPresence = .absent,
+};
+
+/// Server-side parse shape. It deliberately retains invalid document variants
+/// so JSON syntax/type failures and mutation-semantic failures can receive
+/// distinct diagnostics without reparsing or copying document bodies.
+pub const TableIngestBatchInputBody = struct {
+    timestamp_ns: u64,
+    mutations: []const TableIngestMutationInput,
+};
+
+pub const TableIngestBatchBody = struct {
+    timestamp_ns: u64,
+    mutations: []const TableIngestMutation,
+
+    /// Validate and encode in one boundary pass. After validation, raw object
+    /// bytes can be emitted directly, avoiding the extra full-document scan
+    /// that a generic nested JSON writer must perform defensively.
+    pub fn stringifyAlloc(self: @This(), alloc: Allocator) error{ OutOfMemory, InvalidDocumentMutation }![]u8 {
+        for (self.mutations) |mutation| try mutation.validate();
+
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &output.writer };
+        stringify.beginObject() catch return error.OutOfMemory;
+        stringify.objectField("timestamp_ns") catch return error.OutOfMemory;
+        stringify.write(self.timestamp_ns) catch return error.OutOfMemory;
+        stringify.objectField("mutations") catch return error.OutOfMemory;
+        stringify.beginArray() catch return error.OutOfMemory;
+        for (self.mutations) |mutation|
+            mutation.jsonStringifyValidated(&stringify) catch return error.OutOfMemory;
+        stringify.endArray() catch return error.OutOfMemory;
+        stringify.endObject() catch return error.OutOfMemory;
+        return try output.toOwnedSlice();
+    }
+};
+
 pub const TableIngestBatchRequest = struct {
+    table_name: []const u8,
+    timestamp_ns: u64,
+    mutations: []const TableIngestMutation,
+};
+
+/// Internal service request after the public table wire has been admitted.
+/// Its raw byte payload is also used by WAL replay and other trusted runtime
+/// paths, so it intentionally does not carry public JSON shape semantics.
+pub const TableIngestBatchDomainRequest = struct {
     table_name: []const u8,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,

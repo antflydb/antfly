@@ -789,6 +789,10 @@ pub const Cache = struct {
     admission_target_bytes: std.atomic.Value(u64) = .init(0),
     concurrent_vector_admission_stride: std.atomic.Value(u32) = .init(1),
     concurrent_vector_admission_counter: std.atomic.Value(u64) = .init(0),
+    // Counts live query-level decoded-residency leases across namespaces.
+    // Serial cold starts fill eagerly; only genuinely overlapping fills use
+    // the normal-pressure sampling doorkeeper.
+    decoded_query_active_leases: std.atomic.Value(u64) = .init(0),
     decoded_query_reserved_bytes: std.atomic.Value(u64) = .init(0),
     // Query leases claim logical capacity before their primary-store batch is
     // read, then atomically transfer that entitlement to physical precharge.
@@ -939,7 +943,8 @@ pub const Cache = struct {
         const committed = current +| entitled;
         const free_bytes = if (target > 0) target -| @min(target, committed) else std.math.maxInt(u64);
         var stride = self.concurrent_vector_admission_stride.load(.acquire);
-        if (target > 0 and stride != 0) {
+        if (stride != 0) {
+            if (self.decoded_query_active_leases.load(.acquire) != 0) stride = @max(stride, 8);
             if (requested_bytes > free_bytes) stride = @max(stride, 8);
         }
         if (stride == 0) return null;
@@ -974,6 +979,8 @@ pub const Cache = struct {
             noteHbcKindSampledAdmission(&self.global_stats, .vector);
             if (self.namespace_stats.getPtr(namespace)) |stats| noteHbcKindSampledAdmission(stats, .vector);
         }
+        const previous_active = self.decoded_query_active_leases.fetchAdd(1, .acq_rel);
+        std.debug.assert(previous_active != std.math.maxInt(u64));
         return .{
             .cache = self,
             .namespace = namespace,
@@ -1044,6 +1051,16 @@ pub const Cache = struct {
         if (bytes == 0) return;
         const previous = self.decoded_query_reserved_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
+    }
+
+    fn releaseDecodedQueryLease(self: *Cache, reserved_bytes: u64, entitled_bytes: u64, replacement: bool) void {
+        self.releaseDecodedQueryReservation(reserved_bytes);
+        self.releaseDecodedQueryEntitlement(entitled_bytes, replacement);
+        // Publish the lease retirement only after all of its physical and
+        // logical capacity is returned. A concurrent acquirer may sample once
+        // unnecessarily, but can never observe false serial availability.
+        const previous = self.decoded_query_active_leases.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
     }
 
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
@@ -2009,8 +2026,7 @@ pub const DecodedVectorResidencyLease = struct {
 
     pub fn deinit(self: *@This()) void {
         if (!self.active) return;
-        self.cache.releaseDecodedQueryReservation(self.reserved_bytes);
-        self.cache.releaseDecodedQueryEntitlement(self.entitled_bytes, self.replacement_entitlement);
+        self.cache.releaseDecodedQueryLease(self.reserved_bytes, self.entitled_bytes, self.replacement_entitlement);
         self.active = false;
     }
 
@@ -10837,8 +10853,10 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
     idx.attachSharedCache(&cache);
 
     var abandoned = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
     try std.testing.expect(abandoned.ensureCapacity(vector_bytes));
     abandoned.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_active_leases.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 
@@ -10863,7 +10881,7 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
     try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 }
 
-test "hbc overlapping cold-start leases claim free capacity once and sample replacement" {
+test "hbc sequential cold-start leases fill eagerly and sample replacement at capacity" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -10887,28 +10905,19 @@ test "hbc overlapping cold-start leases claim free capacity once and sample repl
     idx.attachResourceManager(&resource_manager);
     idx.attachSharedCache(&cache);
 
-    // Deterministically model concurrent acquisition: every lease is created
-    // before any batch transfers entitlement to physical residency.
-    var fill_leases: [fill_count]DecodedVectorResidencyLease = undefined;
-    var acquired: usize = 0;
-    defer for (fill_leases[0..acquired]) |*lease| lease.deinit();
-    for (&fill_leases) |*lease| {
-        lease.* = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
-        acquired += 1;
-    }
-    try std.testing.expectEqual(target_bytes, cache.decoded_query_entitled_bytes.load(.acquire));
-    try std.testing.expect(idx.acquireDecodedVectorResidency(1) == null);
-
-    // Optional admissions cannot consume capacity promised to the queries.
-    _ = try cache.cacheMetadata(idx.cache_namespace, 99, "not admitted");
-    try std.testing.expectEqual(@as(u64, 0), cache.namespaceStats(idx.cache_namespace).metadata.used_bytes);
-
-    for (&fill_leases, 0..) |*lease, i| {
+    // A serial calibration pass owns at most one lease at a time and should
+    // populate decoded residency eagerly until it reaches the byte target.
+    for (0..fill_count) |i| {
+        var lease = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
         try std.testing.expect(lease.ensureCapacity(vector_bytes));
-        _ = try idx.cacheVectorForResidencyLease(lease, @intCast(i + 1), &vector);
+        _ = try idx.cacheVectorForResidencyLease(&lease, @intCast(i + 1), &vector);
+        lease.deinit();
+        try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_active_leases.load(.acquire));
     }
     try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_entitled_bytes.load(.acquire));
     try std.testing.expectEqual(target_bytes, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), cache.namespaceStats(idx.cache_namespace).vector.sampled_admissions);
 
     // At steady saturation, one ticket receives one bounded replacement
     // window. Other overlapping requests cannot all retain stale full-query
@@ -10926,6 +10935,105 @@ test "hbc overlapping cold-start leases claim free capacity once and sample repl
     try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_entitled_bytes.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_replacement_entitled_bytes.load(.acquire));
     try std.testing.expectEqual(target_bytes, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "hbc overlapping cold-start leases activate the admission doorkeeper" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const vector_bytes = estimateVectorCacheBytes(&vector);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes * 16,
+        .hard_limit_bytes = vector_bytes * 16,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = vector.len, .max_cached_vectors = 32 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+
+    var first = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
+
+    // Ticket zero admits one bounded overlapping fill. The following seven
+    // requests retain LSM residency instead of joining the publication wave.
+    var sampled = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer sampled.deinit();
+    for (0..7) |_| try std.testing.expect(idx.acquireDecodedVectorResidency(1) == null);
+    try std.testing.expectEqual(@as(u64, 2), cache.decoded_query_active_leases.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(idx.cache_namespace).vector.sampled_admissions);
+
+    sampled.deinit();
+    first.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_active_leases.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_entitled_bytes.load(.acquire));
+
+    // Once overlap ends, normal-pressure admission is eager again regardless
+    // of the doorkeeper ticket's current phase.
+    var serial = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    serial.deinit();
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(idx.cache_namespace).vector.sampled_admissions);
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "hbc concurrent cold-start lease acquisition remains bounded" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const worker_count = 8;
+    const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes * 32,
+        .hard_limit_bytes = vector_bytes * 32,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 64 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+
+    var first = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+
+    const Worker = struct {
+        fn run(index: *HBCIndex, start: *std.atomic.Value(bool), admitted: *std.atomic.Value(u32)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            if (index.acquireDecodedVectorResidency(1)) |lease_value| {
+                var lease = lease_value;
+                _ = admitted.fetchAdd(1, .monotonic);
+                lease.deinit();
+            }
+        }
+    };
+
+    var start = std.atomic.Value(bool).init(false);
+    var admitted = std.atomic.Value(u32).init(0);
+    var workers: [worker_count]std.Thread = undefined;
+    for (&workers) |*worker| worker.* = try std.Thread.spawn(.{}, Worker.run, .{ &idx, &start, &admitted });
+    start.store(true, .release);
+    for (&workers) |*worker| worker.join();
+
+    try std.testing.expectEqual(@as(u32, 1), admitted.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(idx.cache_namespace).vector.sampled_admissions);
+
+    first.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_active_leases.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_entitled_bytes.load(.acquire));
 }
 
 test "hbc sampled decoded residency evolves a full resident set within its byte target" {

@@ -337,16 +337,17 @@ const Parser = struct {
     fn parseRange(self: *Parser, field: []const u8) ParseError!Filter {
         const start_delim = self.input[self.pos];
         const inclusive_min = start_delim == '[';
-        const end_delim: u8 = if (inclusive_min) ']' else '}';
         self.pos += 1;
         self.skipWhitespace();
-        const min_raw = self.readRangeBound(end_delim);
+        const min_raw = self.readRangeBound();
         self.skipWhitespace();
         if (!self.matchKeyword("TO")) return ParseError.InvalidSyntax;
         self.skipWhitespace();
-        const max_raw = self.readRangeBound(end_delim);
+        const max_raw = self.readRangeBound();
         self.skipWhitespace();
-        if (self.pos >= self.input.len or self.input[self.pos] != end_delim) return ParseError.InvalidSyntax;
+        if (self.pos >= self.input.len) return ParseError.InvalidSyntax;
+        const end_delim = self.input[self.pos];
+        if (end_delim != ']' and end_delim != '}') return ParseError.InvalidSyntax;
         self.pos += 1;
         const inclusive_max = end_delim == ']';
 
@@ -382,10 +383,10 @@ const Parser = struct {
         } };
     }
 
-    fn readRangeBound(self: *Parser, end_delim: u8) []const u8 {
+    fn readRangeBound(self: *Parser) []const u8 {
         const start = self.pos;
         while (self.pos < self.input.len) {
-            if (self.input[self.pos] == end_delim) break;
+            if (self.input[self.pos] == ']' or self.input[self.pos] == '}') break;
             if (std.mem.startsWith(u8, self.input[self.pos..], " TO")) break;
             self.pos += 1;
         }

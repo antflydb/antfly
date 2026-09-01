@@ -5,6 +5,8 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.exact_sort_error_error import ExactSortErrorError
+from ..models.exact_sort_error_status import ExactSortErrorStatus
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="ExactSortError")
@@ -14,7 +16,7 @@ T = TypeVar("T", bound="ExactSortError")
 class ExactSortError:
     """
     Attributes:
-        error (str): Stable error class. Example: unsupported_exact_sort.
+        error (ExactSortErrorError): Stable error class. Example: unsupported_exact_sort.
         message (str): Human-readable error summary. Example: exact sort is unsupported for this query.
         reason (str): Stable machine-readable rejection reason. Known exact-sort
             reasons include `unmapped_field`, `non_sortable_field`,
@@ -34,7 +36,7 @@ class ExactSortError:
             debug surfaces.
              Example: field_not_sort_ready.
         sort_rejection_field (str): Sort field associated with the rejection when safe to expose. Example: created_at.
-        status (int):  Example: 422.
+        status (ExactSortErrorStatus):  Example: 422.
         budget_rejection_reason (str | Unset): Stable budget rejection reason when the rejection was
             budget-driven. Known values include
             `text_exact_late_visibility_totals`,
@@ -46,17 +48,17 @@ class ExactSortError:
              Example: text_field_sort_candidate_window.
     """
 
-    error: str
+    error: ExactSortErrorError
     message: str
     reason: str
     sort_rejection_reason: str
     sort_rejection_detail: str
     sort_rejection_field: str
-    status: int
+    status: ExactSortErrorStatus
     budget_rejection_reason: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        error = self.error
+        error = self.error.value
 
         message = self.message
 
@@ -68,7 +70,7 @@ class ExactSortError:
 
         sort_rejection_field = self.sort_rejection_field
 
-        status = self.status
+        status = self.status.value
 
         budget_rejection_reason = self.budget_rejection_reason
 
@@ -93,7 +95,7 @@ class ExactSortError:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        error = d.pop("error")
+        error = ExactSortErrorError(d.pop("error"))
 
         message = d.pop("message")
 
@@ -105,7 +107,7 @@ class ExactSortError:
 
         sort_rejection_field = d.pop("sort_rejection_field")
 
-        status = d.pop("status")
+        status = ExactSortErrorStatus(d.pop("status"))
 
         budget_rejection_reason = d.pop("budget_rejection_reason", UNSET)
 

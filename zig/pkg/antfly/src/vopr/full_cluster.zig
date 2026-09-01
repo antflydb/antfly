@@ -3854,7 +3854,7 @@ test "full cluster production disk capacity pressure exact replay" {
     );
 }
 
-test "full cluster production managed index publication recovery exact replay" {
+test "full cluster production managed index publication bounded lifecycle exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_managed_index_publication_ordinal;
@@ -3862,8 +3862,8 @@ test "full cluster production managed index publication recovery exact replay" {
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
         ordinal,
-        180_000,
-        .complete,
+        35_000,
+        .bounded_lifecycle,
     );
 }
 

@@ -185,6 +185,7 @@ pub const Compactor = struct {
         const graph_refs = try builder_mod.buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
+            namespace,
             current,
             before_docs,
             latest_docs,

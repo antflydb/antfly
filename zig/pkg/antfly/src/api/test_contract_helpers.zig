@@ -322,11 +322,8 @@ pub fn encodeMatchQueryRequestWithFlags(
     });
     defer alloc.free(full_text_json);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer parsed.deinit();
-
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = parsed.value,
+        .full_text_search = .{ .bytes = full_text_json },
         .fields = fields,
         .limit = limit,
         .count = count,
@@ -350,29 +347,23 @@ pub fn encodeFilteredQueryRequest(
         .field = match_field,
     });
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
     const filter_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = filter_term,
         .field = filter_field,
     });
     defer alloc.free(filter_json);
-    var filter = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
-    defer filter.deinit();
 
     const exclusion_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = exclusion_term,
         .field = exclusion_field,
     });
     defer alloc.free(exclusion_json);
-    var exclusion = try std.json.parseFromSlice(std.json.Value, alloc, exclusion_json, .{});
-    defer exclusion.deinit();
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
-        .filter_query = filter.value,
-        .exclusion_query = exclusion.value,
+        .full_text_search = .{ .bytes = full_text_json },
+        .filter_query = .{ .bytes = filter_json },
+        .exclusion_query = .{ .bytes = exclusion_json },
         .fields = fields,
         .limit = limit,
     });
@@ -386,11 +377,9 @@ pub fn encodeQueryRequest(
 ) ![]u8 {
     const full_text_json = try stringifyJsonAlloc(alloc, query_value);
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
+        .full_text_search = .{ .bytes = full_text_json },
         .fields = fields,
         .limit = limit,
     });
@@ -507,18 +496,21 @@ pub fn encodeGraphNeighborsQueryRequest(
     edge_types: []const []const u8,
     limit: i64,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .neighbors,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
+    var query = indexes_openapi.GraphTraverseQuery{
+        .index = index_name,
+        .traverse = .{
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
+            .max_depth = 1,
+            .limit = limit,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_traverse_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -532,19 +524,21 @@ pub fn encodeGraphTraverseQueryRequest(
     max_depth: i64,
     limit: i64,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .traverse,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
+    var query = indexes_openapi.GraphTraverseQuery{
+        .index = index_name,
+        .traverse = .{
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = max_depth,
+            .limit = limit,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_traverse_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -586,20 +580,22 @@ pub fn encodeGraphTraverseQueryRequestWithPaths(
     max_depth: i64,
     limit: i64,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .traverse,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
+    var query = indexes_openapi.GraphTraverseQuery{
+        .index = index_name,
+        .traverse = .{
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = max_depth,
+            .limit = limit,
             .include_paths = true,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_traverse_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -614,21 +610,21 @@ pub fn encodeGraphShortestPathQueryRequest(
     max_depth: i64,
     limit: i64,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .shortest_path,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .target_nodes = .{ .keys = target_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    if (start_keys.len == 0 or target_keys.len == 0) return error.InvalidQueryRequest;
+    var query = indexes_openapi.GraphShortestPathQuery{
+        .index = index_name,
+        .shortest_path = .{
+            .from = .{ .key = start_keys[0] },
+            .to = .{ .key = target_keys[0] },
             .edge_types = edge_types,
             .max_depth = max_depth,
-            .include_paths = true,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_shortest_path_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -642,24 +638,24 @@ pub fn encodeWeightedGraphShortestPathQueryRequest(
     edge_types: []const []const u8,
     max_depth: i64,
     limit: i64,
-    weight_mode: indexes_openapi.PathWeightMode,
+    objective: indexes_openapi.GraphPathObjective,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .shortest_path,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .target_nodes = .{ .keys = target_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    if (start_keys.len == 0 or target_keys.len == 0) return error.InvalidQueryRequest;
+    var query = indexes_openapi.GraphShortestPathQuery{
+        .index = index_name,
+        .shortest_path = .{
+            .from = .{ .key = start_keys[0] },
+            .to = .{ .key = target_keys[0] },
             .edge_types = edge_types,
             .max_depth = max_depth,
-            .include_paths = true,
-            .weight_mode = weight_mode,
+            .objective = objective,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_shortest_path_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -674,25 +670,25 @@ pub fn encodeWeightedGraphKShortestPathsQueryRequest(
     max_depth: i64,
     limit: i64,
     k: i64,
-    weight_mode: indexes_openapi.PathWeightMode,
+    objective: indexes_openapi.GraphPathObjective,
 ) ![]u8 {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, name, .{
-        .type = .k_shortest_paths,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = start_keys },
-        .target_nodes = .{ .keys = target_keys },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    if (start_keys.len == 0 or target_keys.len == 0) return error.InvalidQueryRequest;
+    var query = indexes_openapi.GraphKShortestPathsQuery{
+        .index = index_name,
+        .k_shortest_paths = .{
+            .from = .{ .key = start_keys[0] },
+            .to = .{ .key = target_keys[0] },
             .edge_types = edge_types,
             .max_depth = max_depth,
-            .include_paths = true,
-            .weight_mode = weight_mode,
+            .objective = objective,
             .k = k,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, name, .{ .graph_k_shortest_paths_query = &query });
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
@@ -712,23 +708,23 @@ pub fn encodeMatchGraphTraverseFromResultRefQueryRequest(
         .field = field,
     });
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, graph_name, .{
-        .type = .traverse,
-        .index_name = index_name,
-        .start_nodes = .{ .result_ref = result_ref },
-        .params = .{
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphResultRefNodeSelector{ .result_ref = result_ref };
+    var query = indexes_openapi.GraphTraverseQuery{
+        .index = index_name,
+        .traverse = .{
+            .start = .{ .graph_result_ref_node_selector = &start },
             .max_depth = max_depth,
+            .limit = limit,
         },
-    });
+    };
+    try graph_queries.map.put(alloc, graph_name, .{ .graph_traverse_query = &query });
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
-        .graph_searches = graph_searches,
+        .full_text_search = .{ .bytes = full_text_json },
+        .graph_queries = graph_queries,
         .limit = limit,
     });
 }
