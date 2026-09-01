@@ -267,8 +267,12 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	if pool.Spec.Models.RegistryURL != "" {
 		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
 	}
-	if backend := inferencePreferredBackend(pool); backend != "" {
-		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backend
+	backendPolicy := inferenceBackendPolicyForPool(pool)
+	if backendPolicy.preferred != "" {
+		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backendPolicy.preferred
+	}
+	if backendPolicy.required != "" {
+		cm.Data["ANTFLY_INFERENCE_REQUIRED_BACKEND"] = backendPolicy.required
 	}
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		cm.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"] = pjrtPluginPath
@@ -407,14 +411,19 @@ func isTPUAccelerator(accelerator string) bool {
 	return strings.Contains(strings.ToLower(accelerator), "tpu")
 }
 
-func inferencePreferredBackend(pool *antflyaiv1alpha1.InferencePool) string {
+type inferenceBackendPolicy struct {
+	preferred string
+	required  string
+}
+
+func inferenceBackendPolicyForPool(pool *antflyaiv1alpha1.InferencePool) inferenceBackendPolicy {
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
-		return "pjrt"
+		return inferenceBackendPolicy{preferred: "pjrt"}
 	}
 	if pool.Spec.Hardware.Accelerator != "" || hasInferenceGPUResources(pool.Spec.Resources) {
-		return "cuda"
+		return inferenceBackendPolicy{preferred: "cuda", required: "cuda"}
 	}
-	return ""
+	return inferenceBackendPolicy{}
 }
 
 func hasInferenceGPUResources(resources *corev1.ResourceRequirements) bool {

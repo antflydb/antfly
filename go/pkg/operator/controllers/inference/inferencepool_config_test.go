@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -23,6 +24,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	antflyaiv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 )
@@ -133,19 +137,28 @@ func TestGenerateCompleteConfigPreservesLazyAcceleratorStrategy(t *testing.T) {
 	g.Expect(config).To(HaveKeyWithValue("keep_alive_ms", float64(defaultInferenceKeepAliveMillis)))
 }
 
-func TestInferencePreferredBackend(t *testing.T) {
+func TestInferenceBackendPolicy(t *testing.T) {
 	g := NewWithT(t)
 	tests := []struct {
-		name     string
-		pool     *antflyaiv1alpha1.InferencePool
-		expected string
+		name              string
+		pool              *antflyaiv1alpha1.InferencePool
+		expectedPreferred string
+		expectedRequired  string
 	}{
 		{
 			name: "tpu",
 			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
 				Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "TPU-v5-lite-podslice"},
 			}},
-			expected: "pjrt",
+			expectedPreferred: "pjrt",
+		},
+		{
+			name: "gpu accelerator",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+			}},
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
 		},
 		{
 			name: "gpu resource",
@@ -154,19 +167,48 @@ func TestInferencePreferredBackend(t *testing.T) {
 					"nvidia.com/gpu": resource.MustParse("1"),
 				}},
 			}},
-			expected: "cuda",
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
 		},
 		{
-			name:     "cpu",
-			pool:     &antflyaiv1alpha1.InferencePool{},
-			expected: "",
+			name: "cpu",
+			pool: &antflyaiv1alpha1.InferencePool{},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			g.Expect(inferencePreferredBackend(test.pool)).To(Equal(test.expected))
+			policy := inferenceBackendPolicyForPool(test.pool)
+			g.Expect(policy.preferred).To(Equal(test.expectedPreferred))
+			g.Expect(policy.required).To(Equal(test.expectedRequired))
 		})
 	}
+}
+
+func TestReconcileConfigMapRequiresCUDAForGPUPools(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	g.Expect(antflyaiv1alpha1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	pool := &antflyaiv1alpha1.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-pool",
+			Namespace: "default",
+			UID:       types.UID("gpu-pool"),
+		},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+	reconciler := &InferencePoolReconciler{Client: client, Scheme: scheme}
+
+	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())
+	configMap := &corev1.ConfigMap{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "gpu-pool-config", Namespace: "default"}, configMap)).To(Succeed())
+	g.Expect(configMap.Data).To(HaveKeyWithValue("ANTFLY_INFERENCE_PREFERRED_BACKEND", "cuda"))
+	g.Expect(configMap.Data).To(HaveKeyWithValue("ANTFLY_INFERENCE_REQUIRED_BACKEND", "cuda"))
 }
 
 func TestEnsureTPUResourcesIgnoresNonTPUAccelerator(t *testing.T) {
