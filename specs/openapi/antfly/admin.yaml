@@ -1356,6 +1356,7 @@ components:
         - promoted_node_id
         - new_timeline_id
         - new_epoch
+        - generation
         - required_lsn
         - observed_lsn
         - force
@@ -1375,6 +1376,11 @@ components:
           type: integer
           format: uint64
           minimum: 1
+        generation:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Exact Kubernetes Lease transition generation authorizing this fence.
         required_lsn:
           type: integer
           format: uint64

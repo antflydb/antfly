@@ -188,6 +188,7 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         value: *const fn (*u32, u32) anyerror!u32,
         fail: ?*const fn (*u32) anyerror!void = null,
         retryable_fail: ?*const fn (*u32) anyerror!void = null,
+        durability_pending: ?*const fn (*u32) anyerror!void = null,
     };
     const TestBoundary = BoundaryImpl(TestVTable);
     const callbacks = struct {
@@ -204,6 +205,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
 
         fn retryableFail(_: *u32) anyerror!void {
             return error.ProposalDropped;
+        }
+
+        fn durabilityPending(_: *u32) anyerror!void {
+            return error.HASyncCommitWouldBlock;
         }
 
         fn foreignDispatch(
@@ -247,6 +252,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ProposalDropped,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.retryableFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.HASyncCommitWouldBlock,
+        TestBoundary.call("durability_pending", &callbacks.foreignDispatch, &callbacks.durabilityPending, .{&base}),
     );
     try std.testing.expectError(
         error.InvalidArgument,
