@@ -36,6 +36,7 @@ const activations = @import("../backends/activations.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const runtime = @import("../runtime/root.zig");
 const jinja = @import("jinja");
 const grammar_mod = @import("grammar.zig");
@@ -1737,15 +1738,8 @@ fn gemma4MetalDirectGreedyDefault() bool {
     return true;
 }
 
-fn pipelinedMetalDecodeEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
-    return enable_requested and !disable_requested;
-}
-
 fn pipelinedMetalDecodeEnabled() bool {
-    return pipelinedMetalDecodeEnabledForFlags(
-        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
-        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
-    );
+    return metal_runtime.pipelinedDecodeFrameEnabled();
 }
 
 fn gemma4MetalDirectGreedyEnabled() bool {
@@ -3084,6 +3078,17 @@ pub const GenerationPipeline = struct {
     }
 };
 
+/// Prompt tokenization computed before the pipeline runs (e.g. by server
+/// admission). All slices are borrowed; the owner must keep them alive for the
+/// whole generate call and frees them afterwards.
+pub const PreEncodedPrompt = struct {
+    ids: []const i32,
+    attention_mask: []const i32,
+    /// Truncation limit the encode was validated against. Reuse requires an
+    /// exact match with the limit the pipeline derives for the request.
+    prompt_token_limit: usize,
+};
+
 /// Native generation pipeline using ComputeBackend + GPT arch directly.
 /// Runs autoregressive decoding: tokenize → loop(gpt_arch.forward → sample → append).
 pub const NativeGenerationPipeline = struct {
@@ -3099,6 +3104,14 @@ pub const NativeGenerationPipeline = struct {
     bos_token: []const u8 = "",
     chat_template: ?*const ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    /// Optional pre-rendered chat prompt (borrowed) from the caller's
+    /// admission estimate. Only valid when rendered from the exact messages,
+    /// template, and enable_thinking option this generate call receives;
+    /// ignored when prompt_override is set.
+    preformatted_prompt: ?[]const u8 = null,
+    /// Optional pre-encoded tokenization of `preformatted_prompt`. Used only
+    /// when its recorded token limit matches the request's derived limit.
+    pre_encoded_prompt: ?PreEncodedPrompt = null,
     /// Optional lightweight cancellation/progress hook. Unlike TokenCallback,
     /// this is polled for every decoded step even when channel projection is
     /// intentionally withholding private reasoning text.
@@ -3251,18 +3264,26 @@ pub const NativeGenerationPipeline = struct {
             }
         }
 
-        // Format prompt
-        var prompt = if (self.prompt_override) |override|
-            try allocator.dupe(u8, override)
-        else if (self.chat_template) |ct|
-            try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = config.enable_thinking })
-        else
-            try formatMessages(allocator, messages);
-        defer allocator.free(prompt);
+        // Format prompt. A caller-provided pre-render is borrowed as-is; see
+        // the preformatted_prompt field contract.
+        const use_preformatted_prompt = self.prompt_override == null and self.preformatted_prompt != null;
+        var prompt: []const u8 = undefined;
+        var prompt_borrowed = use_preformatted_prompt;
+        if (self.prompt_override) |override| {
+            prompt = try allocator.dupe(u8, override);
+        } else if (self.preformatted_prompt) |preformatted| {
+            prompt = preformatted;
+        } else if (self.chat_template) |ct| {
+            prompt = try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = config.enable_thinking });
+        } else {
+            prompt = try formatMessages(allocator, messages);
+        }
+        defer if (!prompt_borrowed) allocator.free(prompt);
         if (grammar_opens_public_final_channel) {
             const public_prompt = try openGemma4FinalChannelForGrammar(allocator, prompt);
-            allocator.free(prompt);
+            if (!prompt_borrowed) allocator.free(prompt);
             prompt = public_prompt;
+            prompt_borrowed = false;
         }
         const prompt_opens_public_final_channel =
             configPromptOpensGemma4FinalChannel(self.gpt_config, prompt);
@@ -3342,19 +3363,39 @@ pub const NativeGenerationPipeline = struct {
             speculative_bonus_tokens,
             preliminary_media_allowance,
         );
-        var encoded = try encodeNativeGenerationPrompt(
-            self.tokenizer,
-            allocator,
-            prompt,
-            text_prompt_token_limit,
-            self.add_bos_token,
-            self.bos_token,
-        );
+        // Reuse the caller's pre-encode only when it tokenized these exact
+        // prompt bytes under this exact truncation limit; the grammar channel
+        // rewrite above changes the prompt and invalidates both.
+        const reusable_pre_encoded: ?PreEncodedPrompt = if (use_preformatted_prompt and !grammar_opens_public_final_channel)
+            if (self.pre_encoded_prompt) |pre|
+                (if (pre.prompt_token_limit == text_prompt_token_limit) pre else null)
+            else
+                null
+        else
+            null;
+        var owned_encoded: ?tokenizer_mod.EncodeResult = null;
+        defer if (owned_encoded) |*owned| owned.deinit();
+        var encoded_ids: []const i32 = undefined;
+        var encoded_attention_mask: []const i32 = undefined;
+        if (reusable_pre_encoded) |pre| {
+            encoded_ids = pre.ids;
+            encoded_attention_mask = pre.attention_mask;
+        } else {
+            owned_encoded = try encodeNativeGenerationPrompt(
+                self.tokenizer,
+                allocator,
+                prompt,
+                text_prompt_token_limit,
+                self.add_bos_token,
+                self.bos_token,
+            );
+            encoded_ids = owned_encoded.?.ids;
+            encoded_attention_mask = owned_encoded.?.attention_mask;
+        }
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        defer encoded.deinit();
 
         var actual_prompt_tokens: usize = 0;
-        while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
+        while (actual_prompt_tokens < encoded_attention_mask.len and encoded_attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
         if (actual_prompt_tokens == 0) return error.EmptyPrompt;
         debugGenerationStage(
             "encoded prompt chars={d} actual_prompt_tokens={d}",
@@ -3530,7 +3571,7 @@ pub const NativeGenerationPipeline = struct {
         if (prepared_multimodal_prompt) |prepared| {
             @memcpy(token_ids[0..prepared.token_ids.len], prepared.token_ids);
         } else {
-            for (0..actual_prompt_tokens) |i| token_ids[i] = @intCast(encoded.ids[i]);
+            for (0..actual_prompt_tokens) |i| token_ids[i] = @intCast(encoded_ids[i]);
         }
         var seq_len = prompt_token_count;
         debugGenerationStage(
@@ -13430,11 +13471,10 @@ test "Metal pipelined greedy EOS policy honors ignore_eos" {
     try std.testing.expect(!pipeline.shouldStopOnEos(.{}, 6));
 }
 
-test "Gemma4 speculative Metal decode frames are opt in" {
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, false));
-    try std.testing.expect(pipelinedMetalDecodeEnabledForFlags(true, false));
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, true));
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(true, true));
+test "Gemma4 pipelined Metal decode frames delegate to the shared policy" {
+    // Policy precedence (disable > enable > device default) is owned and
+    // tested by metal_runtime.pipelinedDecodeFrameEnabledForFlags.
+    try std.testing.expect(!metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, true, true));
 }
 
 test "gemma4 mtp adaptive k starts with probe and ramps on accepted windows" {

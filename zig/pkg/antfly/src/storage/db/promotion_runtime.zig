@@ -557,7 +557,13 @@ pub const PromotionRuntime = struct {
                 }
                 self.catchUp() catch |err| {
                     std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
-                    _ = self.waitForWorkerSignal(io, wake_generation, 50);
+                    // Persistent routing/capability failures must not turn a
+                    // durable retry queue into a log and CPU hot loop. The
+                    // bounded delay is interrupted immediately by a source,
+                    // ownership, or work-generation wake, preserving recovery
+                    // latency when the dependency becomes available.
+                    _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
+                    retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
                     continue;
                 };
                 if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
