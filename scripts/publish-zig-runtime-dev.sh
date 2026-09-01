@@ -65,8 +65,8 @@ fi
 
 host_arch="$(uname -m)"
 case "$host_arch" in
-  x86_64) native_arch=amd64; zig_target=x86_64-linux-musl ;;
-  arm64|aarch64) native_arch=arm64; zig_target=aarch64-linux-musl ;;
+  x86_64) native_arch=amd64; zig_target=x86_64-linux-gnu ;;
+  arm64|aarch64) native_arch=arm64; zig_target=aarch64-linux-gnu ;;
   *) echo "unsupported host architecture: $host_arch" >&2; exit 2 ;;
 esac
 
@@ -81,7 +81,7 @@ if [[ "$arch" != "$native_arch" ]]; then
 fi
 
 image_base="${gar_registry}/${gcp_project}/${gcp_repository}/antfly"
-artifact_uri="gs://${artifact_bucket}/zig/dev/${tag}/antfly-zig-${arch}.tar.gz"
+artifact_uri="gs://${artifact_bucket}/zig/dev/${tag}/antfly-zig-${arch}-gnu.tar.gz"
 
 inspect_image() {
   local image="$1"
@@ -129,15 +129,19 @@ echo "Building $arch Zig runtime artifact for $zig_target"
     antfly \
     -Dtarget="$zig_target" \
     -Doptimize=ReleaseFast \
+    -Dcuda=true \
+    -Dpjrt=true \
     --prefix "$out_dir" \
     --global-cache-dir "$cache_dir"
 )
 
 test -x "$out_dir/bin/antfly"
-tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}.tar.gz" bin share
+test -d "$out_dir/share/antfly"
+cp "$out_dir/bin/antfly" "$out_dir/antfly"
+tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}-gnu.tar.gz" antfly share
 
 echo "Uploading $artifact_uri"
-gcloud storage cp "$tmpdir/antfly-zig-${arch}.tar.gz" "$artifact_uri" --project="$gcp_project"
+gcloud storage cp "$tmpdir/antfly-zig-${arch}-gnu.tar.gz" "$artifact_uri" --project="$gcp_project"
 
 echo "Packaging ${image_base}:${tag}-${arch}"
 gcloud builds submit "$repo_root" \

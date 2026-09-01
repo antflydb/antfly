@@ -1,28 +1,34 @@
-FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS wasmtime
 
 ARG WASMTIME_VERSION=v45.0.2
 ARG TARGETARCH
 
-RUN apk add --no-cache ca-certificates curl xz
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl xz-utils && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN case "${TARGETARCH}" in \
         amd64) wasmtime_arch="x86_64" ;; \
         arm64) wasmtime_arch="aarch64" ;; \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    archive="wasmtime-${WASMTIME_VERSION}-${wasmtime_arch}-musl-c-api.tar.xz" && \
+    archive="wasmtime-${WASMTIME_VERSION}-${wasmtime_arch}-linux-c-api.tar.xz" && \
     curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}" && \
     mkdir -p /opt/wasmtime && \
     tar -xJf "/tmp/${archive}" -C /opt/wasmtime --strip-components=1 && \
     test -f /opt/wasmtime/lib/libwasmtime.so
 
-FROM --platform=$TARGETPLATFORM alpine:3.21
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
-RUN apk add --no-cache ca-certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates wget && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 antfly && \
+    useradd --uid 10001 --gid antfly --create-home --home-dir /home/antfly --shell /usr/sbin/nologin antfly
 
 WORKDIR /
 COPY antfly /antfly
@@ -32,6 +38,12 @@ COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime
 ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
+
+# Exercise the target architecture's glibc loader during the image build.
+# Wasmtime is loaded at runtime, so verify its dynamic dependencies separately.
+RUN ldd /antfly && \
+    ldd /usr/local/lib/libwasmtime.so && \
+    /antfly --version
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -qO- http://localhost:4200/readyz || exit 1

@@ -11,8 +11,8 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_VERSION: 0.16.0
-  # Keep the glibc-linked host compiler reproducible. The release targets are
-  # still the musl and Darwin targets selected by the matrix below.
+  # Keep the glibc-linked host compiler reproducible. Linux release artifacts
+  # include portable musl builds and GNU builds for containers and plugins.
   NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
   MACOS_SDK_VERSION: "15.5"
   MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
@@ -34,6 +34,20 @@ jobs:
             zig_target: x86_64-linux-musl
             archive_os: Linux
             archive_arch: x86_64
+            archive_suffix: ""
+            macos_sdk: "false"
+            metal: "false"
+            system_blas: "false"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
+          - artifact_name: antfly-zig-linux-amd64-gnu
+            runner: arc-antfly-publish
+            os: linux
+            zig_arch: x86_64
+            zig_target: x86_64-linux-gnu
+            archive_os: Linux
+            archive_arch: x86_64
+            archive_suffix: _gnu
             macos_sdk: "false"
             metal: "false"
             system_blas: "false"
@@ -48,6 +62,20 @@ jobs:
             zig_target: aarch64-linux-musl
             archive_os: Linux
             archive_arch: arm64
+            archive_suffix: ""
+            macos_sdk: "false"
+            metal: "false"
+            system_blas: "false"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
+          - artifact_name: antfly-zig-linux-arm64-gnu
+            runner: arc-antfly-publish-arm64
+            os: linux
+            zig_arch: aarch64
+            zig_target: aarch64-linux-gnu
+            archive_os: Linux
+            archive_arch: arm64
+            archive_suffix: _gnu
             macos_sdk: "false"
             metal: "false"
             system_blas: "false"
@@ -63,6 +91,7 @@ jobs:
             zig_target: aarch64-macos
             archive_os: Darwin
             archive_arch: arm64
+            archive_suffix: ""
             macos_sdk: "true"
             metal: "true"
             system_blas: "true"
@@ -121,7 +150,7 @@ jobs:
       - name: Build archive
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz"
+          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
           jobs_arg=()
           if [ -n "${{ matrix.zig_jobs }}" ]; then
             jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
@@ -402,7 +431,7 @@ jobs:
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}
-      # Published amd64 containers require the workflow's glibc runtime
-      # artifact; downloadable release archives remain static musl builds.
-      artifact_source: build
+      # Reuse the GNU release artifacts; the unsuffixed musl archives remain
+      # the portable CLI/install defaults.
+      artifact_source: github
     secrets: inherit

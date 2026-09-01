@@ -33,8 +33,8 @@ env:
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
   ZIG_VERSION: 0.16.0
-  # Keep the glibc-linked host compiler reproducible while continuing to emit
-  # static musl release artifacts for both architectures.
+  # Keep the glibc-linked host compiler reproducible. Container artifacts use
+  # GNU libc on both architectures so the multi-arch image has one runtime ABI.
   NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
 
 jobs:
@@ -53,15 +53,13 @@ jobs:
           - arch: amd64
             runner: arc-antfly-publish
             zig_arch: x86_64
-            # The published amd64 container must use glibc so its runtime
-            # loader can open Cloud Run's glibc NVIDIA driver libraries.
             zig_target: x86_64-linux-gnu
             zig_optimize: ReleaseFast
             zig_jobs: ""
           - arch: arm64
             runner: arc-antfly-publish-arm64
             zig_arch: aarch64
-            zig_target: aarch64-linux-musl
+            zig_target: aarch64-linux-gnu
             zig_optimize: ReleaseFast
             zig_jobs: ""
     steps:
@@ -124,7 +122,7 @@ jobs:
             --target "${{ matrix.zig_target }}" \
             --optimize "${{ matrix.zig_optimize }}" \
             "${jobs_arg[@]}" \
-            --archive-name "antfly-zig-${{ matrix.arch }}.tar.gz" \
+            --archive-name "antfly-zig-${{ matrix.arch }}-gnu.tar.gz" \
             --out-dir "$RUNNER_TEMP" \
             --metal false \
             --system-blas false
@@ -132,8 +130,8 @@ jobs:
       - name: Upload runtime artifact to GCS
         run: |
           gsutil cp \
-            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" \
-            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}.tar.gz"
+            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}-gnu.tar.gz" \
+            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}-gnu.tar.gz"
 
   publish:
     runs-on: arc-antfly-publish
@@ -164,7 +162,7 @@ jobs:
         if: ${{ inputs.artifact_source == 'github' }}
         uses: actions/download-artifact@v6
         with:
-          pattern: antfly-zig-linux-*
+          pattern: antfly-zig-linux-*-gnu
           merge-multiple: true
           path: dist/release-archives
 
@@ -173,12 +171,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/container-artifacts"
-          cp dist/release-archives/antfly_*_Linux_x86_64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-amd64.tar.gz"
-          cp dist/release-archives/antfly_*_Linux_arm64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-arm64.tar.gz"
+          cp dist/release-archives/antfly_*_Linux_x86_64_gnu.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-amd64-gnu.tar.gz"
+          cp dist/release-archives/antfly_*_Linux_arm64_gnu.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-arm64-gnu.tar.gz"
           for arch in amd64 arm64; do
             gsutil cp \
-              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz" \
-              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz"
+              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}-gnu.tar.gz" \
+              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}-gnu.tar.gz"
           done
 
       - name: Extract version
@@ -206,16 +204,12 @@ jobs:
           }
           VERSION="${{ steps.version.outputs.version }}"
           for arch in amd64 arm64; do
-            dockerfile=zig/Dockerfile.runtime
-            if [[ "$arch" == amd64 && "${{ inputs.artifact_source }}" != github ]]; then
-              dockerfile=zig/Dockerfile.runtime-glibc
-            fi
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=${dockerfile},_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
       - name: Create GAR multi-arch manifest with Cloud Build
