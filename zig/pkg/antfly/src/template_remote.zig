@@ -41,6 +41,7 @@ const RenderContext = struct {
     secret_store: ?*common_secrets.FileStore = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
+    cancellation: ?scraping.CancellationToken = null,
     remote_bytes_remaining: u64,
     max_media_parts: ?usize = null,
     emitted_media_parts: usize = 0,
@@ -55,6 +56,9 @@ pub const RenderConfig = struct {
     io: ?std.Io = null,
     /// Absolute monotonic request deadline shared by every remote helper.
     deadline_ns: ?u64 = null,
+    /// Operation cancellation shared by template evaluation and every remote
+    /// transport it invokes.
+    cancellation: ?scraping.CancellationToken = null,
     max_media_parts: ?usize = null,
 };
 
@@ -144,6 +148,7 @@ pub fn renderJsonToTextWithConfig(
         .secret_store = config.secret_store,
         .io = config.io,
         .deadline_ns = config.deadline_ns,
+        .cancellation = config.cancellation,
         .remote_bytes_remaining = remoteByteBudget(config.remote_content),
         .max_media_parts = config.max_media_parts,
     };
@@ -173,6 +178,7 @@ fn completeRenderedText(alloc: Allocator, rendered: []const u8, render_ctx: *con
 fn ensureRenderActive(render_ctx: *const RenderContext) !void {
     if (render_ctx.fatal_error) |err| return err;
     if (render_ctx.io) |io| try io.checkCancel();
+    if (render_ctx.cancellation) |token| try token.check();
     if (render_ctx.deadline_ns) |deadline_ns| {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
@@ -563,7 +569,7 @@ fn remoteFetchDownloadContext(
     render_ctx: *const RenderContext,
     security: *const scraping.ContentSecurityConfig,
 ) !?scraping.DownloadContext {
-    if (render_ctx.io == null and render_ctx.deadline_ns == null) return null;
+    if (render_ctx.io == null and render_ctx.deadline_ns == null and render_ctx.cancellation == null) return null;
     return .{
         .io = render_ctx.io orelse std.Io.Threaded.global_single_threaded.io(),
         // Leave this null when there is no request deadline. HTTP/S3 still
@@ -577,7 +583,26 @@ fn remoteFetchDownloadContext(
             )
         else
             null,
+        .cancellation = render_ctx.cancellation,
     };
+}
+
+test "template remote preserves a cancellation-only download context" {
+    var canceled = std.atomic.Value(bool).init(false);
+    const token = scraping.CancellationToken.fromAtomic(&canceled);
+    const security: scraping.ContentSecurityConfig = .{};
+    const render_ctx: RenderContext = .{
+        .alloc = std.testing.allocator,
+        .pdf_backend = pdf_mod.Backend.system(),
+        .cancellation = token,
+        .remote_bytes_remaining = default_remote_fetch_max_download_size_bytes,
+    };
+
+    const context = (try remoteFetchDownloadContext(&render_ctx, &security)) orelse
+        return error.TestUnexpectedResult;
+    try context.cancellation.?.check();
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, context.cancellation.?.check());
 }
 
 fn requestBoundedRemoteFetchTimeoutMs(

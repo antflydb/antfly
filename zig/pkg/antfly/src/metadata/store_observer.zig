@@ -134,10 +134,12 @@ fn preserveCommittedRuntimeRepairStatus(
     for (next) |*next_runtime| {
         const prior_runtime = findRuntimeRepairIdentity(existing, next_runtime.*);
         for (next_runtime.indexes) |*next_index| {
+            next_index.lifecycle_work_class = .none;
             next_index.repair_status = null;
             next_index.repair_active_generation_serviceable = false;
             const prior = prior_runtime orelse continue;
             const prior_index = findRuntimeIndexRepairIdentity(prior.indexes, next_index.*) orelse continue;
+            next_index.lifecycle_work_class = prior_index.lifecycle_work_class;
             next_index.repair_status = prior_index.repair_status;
             next_index.repair_active_generation_serviceable =
                 prior_index.repair_status != null and prior_index.repair_active_generation_serviceable;
@@ -497,7 +499,8 @@ fn runtimeStatusEqual(
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
             !runtimeIndexSourceReplayEqual(left.source_replay, right.source_replay) or
-            (include_repair_status and (left.repair_status != right.repair_status or
+            (include_repair_status and (left.lifecycle_work_class != right.lifecycle_work_class or
+                left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
             return false;
@@ -792,6 +795,7 @@ test "store observer can ignore unactivated repair fields without hiding other c
         .doc_count = 10,
     }};
     var observed_indexes = existing_indexes;
+    observed_indexes[0].lifecycle_work_class = .repair;
     observed_indexes[0].repair_status = .rebuilding;
     observed_indexes[0].repair_active_generation_serviceable = true;
     var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
@@ -874,6 +878,7 @@ test "store observer fences repair transitions by registered reporter incarnatio
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -940,6 +945,7 @@ test "store observer preserves committed repair facts while capability is unknow
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -964,6 +970,7 @@ test "store observer preserves committed repair facts while capability is unknow
 
     var observed_indexes = existing_indexes;
     observed_indexes[0].doc_count = 11;
+    observed_indexes[0].lifecycle_work_class = .repair;
     observed_indexes[0].repair_status = .failed;
     observed_indexes[0].repair_active_generation_serviceable = false;
     var observed_runtime = existing_runtime;

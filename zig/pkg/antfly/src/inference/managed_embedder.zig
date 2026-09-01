@@ -736,6 +736,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_parts_fn = embedDenseParts,
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
+            .set_cancellation_fn = setEmbedderCancellation,
             .foreground_bounded = self.denseForegroundBounded(),
         };
     }
@@ -746,6 +747,7 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_fn = embedSparse,
             .sparse_embed_batch_fn = embedSparseBatch,
             .deinit_fn = deinitSparseEmbedder,
+            .set_cancellation_fn = setEmbedderCancellation,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
     }
@@ -970,6 +972,11 @@ pub const ManagedEmbedder = struct {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findEntry(embedding_name) orelse return null;
         return if (isAntflyProvider(entry.provider)) 1 else null;
+    }
+
+    fn setEmbedderCancellation(ptr: *anyopaque, cancellation: CancellationToken) void {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        for (self.entries) |*entry| entry.cancellation = cancellation;
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -2186,6 +2193,14 @@ fn queryTemplateRenderConfig(entry: *const ManagedEmbeddingEntry) template_remot
     if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
         config.deadline_ns = entry.deadline_ns;
     }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        if (entry.cancellation) |token| {
+            config.cancellation = scraping.CancellationToken.fromCallback(
+                token.ptr,
+                token.is_cancelled_fn,
+            );
+        }
+    }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         if (isAntflyProvider(entry.provider)) config.max_media_parts = 1;
     }
@@ -2450,6 +2465,7 @@ fn embedWithEntryParts(
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
         defer provider.deinit();
+        provider.setRequestCancellation(entry.cancellation);
         if (entry.api_key) |*api_key_ref| {
             if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                 defer alloc.free(auth_header);
@@ -2713,10 +2729,11 @@ fn embedBatchWithEntry(
                     AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                context.check() catch |err| {
-                    db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                    return err;
-                };
+                // The errdefer is the sole owner of failure cleanup. Native
+                // kernels may return successfully after lifecycle cancellation;
+                // manually freeing here as well would double-release their
+                // allocator-owned result while unwinding the cancellation.
+                try context.check();
                 try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
@@ -3632,6 +3649,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
     const DelayedApp = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -3640,9 +3658,13 @@ pub fn testRemoteEmbeddingCancellation() !void {
         fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            try std.testing.expect(
+                std.mem.endsWith(u8, req.uri, "/v1/embeddings") or
+                    std.mem.endsWith(u8, req.uri, "/embed"),
+            );
             self.entered.store(true, .release);
             while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            self.completed.store(true, .release);
             return .{
                 .status = 200,
                 .content_type = try response_alloc.dupe(u8, "application/json"),
@@ -3696,9 +3718,60 @@ pub fn testRemoteEmbeddingCancellation() !void {
     worker.join();
     const elapsed_ns = monotonicNowNs() - started_ns;
     app.release.store(true, .release);
+    while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
 
     try std.testing.expectEqual(error.Cancelled, err_out.?);
     try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
+
+    // Multimodal Antfly requests use a distinct provider path from dense text
+    // batches. It must carry the same runtime lifecycle cancellation or a
+    // ClipClap invocation can pin synchronous index activation until its full
+    // transport deadline.
+    app.entered.store(false, .release);
+    app.release.store(false, .release);
+    app.completed.store(false, .release);
+    const antfly_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"visual_idx":{{"type":"embeddings","field":"image","dimension":3,"embedder":{{"provider":"antfly","model":"antflydb/clipclap","api_url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(antfly_indexes_json);
+    var parts_cancellation = std.atomic.Value(bool).init(false);
+    var multimodal = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, antfly_indexes_json, .{
+        .io = io_impl.io(),
+        .cancellation = CancellationToken.fromAtomic(&parts_cancellation),
+    });
+    defer multimodal.deinit();
+
+    const PartsWorker = struct {
+        fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror) void {
+            const parts = [_]template_mod.ContentPart{.{
+                .media_url = "data:image/png;base64,iVBORw0KGgo=",
+            }};
+            const vector = target.denseInterface().embedDenseParts(
+                alloc,
+                "visual_idx",
+                &parts,
+                3,
+            ) catch |err| {
+                err_out_ptr.* = err;
+                return;
+            };
+            alloc.free(vector);
+            err_out_ptr.* = error.TestUnexpectedResult;
+        }
+    };
+    err_out = null;
+    const parts_worker = try std.Thread.spawn(.{}, PartsWorker.run, .{ &multimodal, &err_out });
+    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    const parts_started_ns = monotonicNowNs();
+    parts_cancellation.store(true, .release);
+    parts_worker.join();
+    const parts_elapsed_ns = monotonicNowNs() - parts_started_ns;
+    app.release.store(true, .release);
+    while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
+
+    try std.testing.expectEqual(error.Cancelled, err_out.?);
+    try std.testing.expect(parts_elapsed_ns < 250 * std.time.ns_per_ms);
 }
 
 pub fn testFileBackedApiKeyRotation() !void {

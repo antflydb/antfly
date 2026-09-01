@@ -1823,10 +1823,14 @@ class PacingSensitiveOpenAiEmbeddingServer:
 
 
 class InferenceEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1"):
+    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
         self.url = inference_public_api_url(self.base_url)
+        self.response_delay_s = response_delay_s
+        self._embedding_request_active = threading.Event()
+        self._delay_enabled = threading.Event()
+        self._delay_released = threading.Event()
 
         outer = self
 
@@ -1899,6 +1903,9 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    if outer._delay_enabled.is_set():
+                        outer._embedding_request_active.set()
+                        outer._delay_released.wait(outer.response_delay_s)
                     model = payload.get("model", "")
                     input_value = payload.get("input", [])
                     if isinstance(input_value, list):
@@ -1943,11 +1950,16 @@ class InferenceEmbeddingServer:
                         }
                     ).encode("utf-8")
 
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # An activation request may preempt the worker that
+                        # owns this provider call.
+                        pass
                     return
 
                 self.send_error(404)
@@ -1974,6 +1986,18 @@ class InferenceEmbeddingServer:
         if '"mime_type": "image/png"' in lowered or '"type": "media"' in lowered:
             return [1.0, 0.0, 0.0]
         return [0.0, 0.0, 1.0]
+
+    def wait_for_embedding_request(self, timeout_s: float) -> bool:
+        return self._embedding_request_active.wait(timeout_s)
+
+    def arm_delay(self) -> None:
+        self._embedding_request_active.clear()
+        self._delay_released.clear()
+        self._delay_enabled.set()
+
+    def release_delay(self) -> None:
+        self._delay_enabled.clear()
+        self._delay_released.set()
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -2272,6 +2296,13 @@ def openai_embedder():
 def slow_openai_embedder():
     server = OpenAiEmbeddingServer(response_delay_s=2.0)
     yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
+def slow_inference_embedder():
+    server = InferenceEmbeddingServer(response_delay_s=30.0)
+    yield server
     server.stop()
 
 
@@ -3082,6 +3113,11 @@ def backup_api(request: pytest.FixtureRequest):
             self._server = server_ref
             self._request_lock = threading.Lock()
             self._created_tables: set[str] = set()
+
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)

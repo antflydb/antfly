@@ -1014,15 +1014,23 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         status = backup_api.get_index(table_name, index_name)["status"]
         readiness = status.get("readiness") or {}
         observed_states[readiness.get("state", "missing")] = status
-        if readiness.get("state") == "queryable_partial":
+        # `queryable` is the safety/admission milestone and an empty published
+        # generation is valid. The quickstart's time-to-first-result outcome
+        # additionally requires a published searchable artifact from the same
+        # status observation.
+        if (
+            readiness.get("state") == "queryable_partial"
+            and int(status.get("searchable_vectors", 0)) >= 1
+            and int((status.get("source_coverage") or {}).get("covered", 0)) >= 1
+        ):
             partial_status = status
             break
         __import__("time").sleep(0.05)
     assert partial_status is not None, __import__("json").dumps(
         observed_states, indent=2, sort_keys=True
     )
-    time_to_queryable_s = __import__("time").monotonic() - started
-    assert time_to_queryable_s < 30.0
+    time_to_first_artifact_s = __import__("time").monotonic() - started
+    assert time_to_first_artifact_s < 30.0
 
     readiness = partial_status["readiness"]
     coverage = partial_status["coverage"]
@@ -1094,6 +1102,80 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert hits
     assert int(hits[0]["_id"].removeprefix("doc:")) < 10
 
+    # Create a second managed index while the first owner is blocked on its
+    # provider. Live activation must publish an exact runtime observation
+    # without waiting behind generic structural/repair work, and the second
+    # index must make progress on its independent title inputs.
+    second_index_name = "semantic_title_live"
+    activation_started = __import__("time").monotonic()
+    second_created = backup_api.create_index(
+        table_name,
+        second_index_name,
+        {
+            "name": second_index_name,
+            "type": "embeddings",
+            "field": "title",
+            "dimension": 3,
+            "execution": {"embedding": {"batch_items": 1}},
+            "embedder": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": progressive_openai_embedder.url,
+            },
+        },
+    )
+    assert_created_index(second_created, second_index_name, "embeddings")
+
+    activation_samples = []
+
+    def second_index_has_runtime_observation() -> dict | None:
+        status = backup_api.get_index(table_name, second_index_name)["status"]
+        activation_samples.append(status)
+        assert status.get("repair") is None, status
+        readiness = status.get("readiness") or {}
+        pending_reasons = readiness.get("pending_reasons") or []
+        if "runtime_unavailable" in pending_reasons:
+            return None
+        if not str(readiness.get("incarnation", "")).startswith("g-"):
+            return None
+        return status
+
+    activated = wait_until(
+        second_index_has_runtime_observation,
+        timeout_s=5.0,
+        interval_s=0.05,
+    )
+    assert activated is not None, __import__("json").dumps(
+        activation_samples[-3:], indent=2, sort_keys=True
+    )
+    assert __import__("time").monotonic() - activation_started < 5.0
+    second_incarnation = activated["readiness"]["incarnation"]
+
+    def second_index_has_published_artifact() -> dict | None:
+        status = backup_api.get_index(table_name, second_index_name)["status"]
+        readiness = status.get("readiness") or {}
+        pending_reasons = readiness.get("pending_reasons") or []
+        assert "runtime_unavailable" not in pending_reasons, status
+        assert status.get("repair") is None, status
+        assert readiness.get("incarnation") == second_incarnation, status
+        if (
+            readiness.get("queryable") is True
+            and int(status.get("searchable_vectors", 0)) >= 1
+        ):
+            return status
+        return None
+
+    second_partial = wait_until(
+        second_index_has_published_artifact,
+        timeout_s=30.0,
+        interval_s=0.05,
+    )
+    assert second_partial is not None
+    assert (
+        backup_api.get_index(table_name, index_name)["status"]["readiness"]["complete"]
+        is False
+    )
+
     progressive_openai_embedder.allow_rate_limited_requests()
     complete = backup_api.wait_index_ready(
         table_name,
@@ -1113,6 +1195,150 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert complete["milestones"]["complete"]["blockers"] == []
     assert complete["searchable_vectors"] == 100
     assert complete["total_indexed"] == 100
+    second_complete = backup_api.wait_index_ready(
+        table_name,
+        second_index_name,
+        timeout_s=120.0,
+        interval_s=0.1,
+        until="complete",
+        require_query_fresh=True,
+    )
+    assert second_complete["readiness"]["complete"] is True
+    assert second_complete["searchable_vectors"] == 100
+
+
+def test_live_index_activation_preempts_an_active_enrichment_quantum(
+    single_item_enrichment_batches,
+    backup_api,
+    inference_embedder,
+    slow_inference_embedder,
+):
+    """Quickstart-style live DDL preempts active remote-media enrichment."""
+    _ = single_item_enrichment_batches
+    table_name = f"quickstart_live_activation_{__import__('time').time_ns()}"
+    first_index = "thumbnail_active"
+    second_index = "title_live"
+    backup_api.create_table(table_name, num_shards=1)
+
+    try:
+        created = backup_api.create_index(
+            table_name,
+            first_index,
+            {
+                "name": first_index,
+                "type": "embeddings",
+                "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+                "coverage_policy": "partial",
+                "dimension": 3,
+                "execution": {"embedding": {"batch_items": 1}},
+                "embedder": {
+                    "provider": "antfly",
+                    "model": CLIPCLAP_MODEL,
+                    "api_url": slow_inference_embedder.url,
+                },
+            },
+        )
+        assert_created_index(created, first_index, "embeddings")
+        backup_api.wait_index_ready(
+            table_name,
+            first_index,
+            timeout_s=30.0,
+            until="complete",
+        )
+        slow_inference_embedder.arm_delay()
+
+        tiny_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mNk+M/wHwAF/gL+X3GQAAAAAElFTkSuQmCC"
+        )
+        documents = {
+            f"doc:{i:03d}": {
+                "title": f"Live activation {i}",
+                "body": f"alpha quickstart activation document {i}",
+                "thumbnail_url": tiny_png,
+            }
+            for i in range(32)
+        }
+        assert backup_api.batch_write(
+            table_name,
+            inserts=documents,
+            sync_level="write",
+        )["inserted"] == len(documents)
+
+        # This is the real quickstart shape: a ClipClap image projection owns
+        # an inference request while another embeddings index is created.
+        assert slow_inference_embedder.wait_for_embedding_request(20.0), (
+            __import__("json").dumps(
+                backup_api.get_index(table_name, first_index)["status"],
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+            + backup_api.debug_logs()
+        )
+        first_active = backup_api.get_index(table_name, first_index)["status"]
+        first_incarnation = first_active["incarnation"]
+
+        # The provider will not answer for 30 seconds. Activation must cancel
+        # the borrowed maintenance wait and active transport rather than
+        # inheriting that latency or draining the corpus window.
+        activation_started = __import__("time").monotonic()
+        second_created = backup_api.create_index(
+            table_name,
+            second_index,
+            {
+                "name": second_index,
+                "type": "embeddings",
+                "field": "title",
+                "dimension": 3,
+                "execution": {"embedding": {"batch_items": 1}},
+                "embedder": {
+                    "provider": "antfly",
+                    "model": "antfly-embed-v1",
+                    "api_url": inference_embedder,
+                },
+            },
+        )
+        activation_elapsed = __import__("time").monotonic() - activation_started
+        assert_created_index(second_created, second_index, "embeddings")
+        assert activation_elapsed < 8.0, (
+            f"live activation waited {activation_elapsed:.3f}s for corpus work\n"
+            f"{backup_api.debug_logs()}"
+        )
+
+        def activated_status() -> dict | None:
+            status = backup_api.get_index(table_name, second_index)["status"]
+            readiness = status.get("readiness") or {}
+            if "runtime_unavailable" in (readiness.get("pending_reasons") or []):
+                return None
+            if not str(readiness.get("incarnation", "")).startswith("g-"):
+                return None
+            return status
+
+        second_status = wait_until(
+            activated_status,
+            timeout_s=5.0,
+            interval_s=0.05,
+        )
+        assert second_status is not None, backup_api.debug_logs()
+        assert second_status.get("repair") is None
+
+        # Installing a sibling incarnation cannot revoke the already-published
+        # generation or identity of the first index.
+        first_after = backup_api.get_index(table_name, first_index)["status"]
+        assert first_after["incarnation"] == first_incarnation
+        assert first_after["readiness"]["queryable"] is True
+        assert first_after.get("repair") is None, (
+            __import__("json").dumps(first_after, indent=2, sort_keys=True)
+            + "\n"
+            + backup_api.debug_logs()
+        )
+    finally:
+        # The delay exists only to hold the old owner inside one observable
+        # provider call. Remove it before the fixture drops its owned table so
+        # the deliberately small corpus does not dominate suite latency.
+        slow_inference_embedder.release_delay()
 
 
 @pytest.mark.fresh_antfly_process
@@ -1213,9 +1439,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
             status = stateful_api.get_index(table_name, index_name)["status"]
             if status.get("incarnation") != incarnation:
                 return None
-            if not (status.get("milestones") or {}).get("queryable", {}).get(
-                "reached"
-            ):
+            if not (status.get("milestones") or {}).get("queryable", {}).get("reached"):
                 return None
             if int(status.get("searchable_vectors", 0)) < searchable_vectors:
                 return None

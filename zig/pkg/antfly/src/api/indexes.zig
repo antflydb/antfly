@@ -1824,6 +1824,12 @@ fn appendMinimalIndexRuntimeStatus(
 /// available through internal diagnostics.
 fn publicIndexRepairState(item: anytype) ?[]const u8 {
     const T = @TypeOf(item);
+    // Current observations carry an explicit lifecycle class. Treat it as the
+    // authority: a stale or independently sampled status enum cannot invent
+    // repair debt for normal backfill. Folded/legacy aggregate types without
+    // this field have already applied that classification at their boundary.
+    if (@hasField(T, "index_lifecycle_work_class") and
+        item.index_lifecycle_work_class != .repair) return null;
     if (@hasField(T, "repair_state")) return item.repair_state;
     if (@hasField(T, "index_repair_status")) {
         if (item.index_repair_status) |status| return @tagName(status);
@@ -1841,6 +1847,8 @@ fn publicIndexRepairState(item: anytype) ?[]const u8 {
 
 fn publicIndexRepairActionRequired(item: anytype) bool {
     const T = @TypeOf(item);
+    if (@hasField(T, "index_lifecycle_work_class") and
+        item.index_lifecycle_work_class != .repair) return false;
     if (@hasField(T, "repair_action_required")) return item.repair_action_required;
     if (@hasField(T, "index_repair_action_required")) return item.index_repair_action_required;
     if (@hasField(T, "index_repair_automation") and
@@ -1861,6 +1869,8 @@ fn publicIndexRepairActionRequired(item: anytype) bool {
 
 fn publicIndexRepairReason(item: anytype) ?[]const u8 {
     const T = @TypeOf(item);
+    if (@hasField(T, "index_lifecycle_work_class") and
+        item.index_lifecycle_work_class != .repair) return null;
     if (@hasField(T, "repair_reason")) return item.repair_reason;
     if (@hasField(T, "index_repair_last_error")) {
         if (item.index_repair_last_error) |reason| return reason;
@@ -3290,6 +3300,7 @@ test "index status exposes compact repair state without internal diagnostics" {
         .kind = .dense_vector,
         .load_error = "TransientCandidateOpenFailure",
         .index_repair_id = 1,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "building",
         .index_repair_automation = "enabled",
         .index_repair_wait_reason = "none",
@@ -3371,6 +3382,43 @@ test "index status exposes compact repair state without internal diagnostics" {
     var waiting = item;
     waiting.index_repair_wait_reason = "backoff";
     try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
+
+    var admission = item;
+    admission.load_error = null;
+    admission.index_lifecycle_work_class = .initial_build;
+    admission.index_repair_trigger = "catalog_admission";
+    admission.backfill_active = true;
+    try std.testing.expect(publicIndexRepairState(admission) == null);
+    try std.testing.expect(!publicIndexRepairActionRequired(admission));
+    try std.testing.expect(publicIndexRepairReason(admission) == null);
+
+    encoded.clearRetainingCapacity();
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        admission,
+        1,
+        .external,
+        false,
+        0,
+        0,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    var parsed_admission = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
+    defer parsed_admission.deinit();
+    try std.testing.expect(parsed_admission.value.object.get("repair") == null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"backfill_state\":\"running\"}",
+        encoded.items,
+    );
 }
 
 test "runnable repair owns its load error without becoming a terminal aggregate failure" {
@@ -3383,6 +3431,7 @@ test "runnable repair owns its load error without becoming a terminal aggregate 
         .coverage_identity_ready = true,
         .coverage_summary_ready = true,
         .publication_target_ready = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
@@ -3438,6 +3487,7 @@ test "index status aggregation preserves actionable repair diagnostics for the r
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_last_error = "candidate_retry_pending",
     }};
@@ -3451,6 +3501,7 @@ test "index status aggregation preserves actionable repair diagnostics for the r
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_generation = 42,
         .projection_checkpoint_config_hash = 99,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .failed,
         .index_repair_action_required = true,
         .index_repair_last_error = "activation_manifest_missing",
@@ -3527,6 +3578,7 @@ test "complete partial embeddings coverage is ready after active generation proo
         .backfill_active = true,
         .backfill_progress = 1.0,
         .repair_degraded = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
@@ -3585,6 +3637,7 @@ test "actionable repair remains visible while retained generation stays queryabl
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_generation = 42,
         .projection_checkpoint_config_hash = 99,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .failed,
         .index_repair_action_required = true,
         .index_repair_last_error = "activation_manifest_missing",
@@ -3624,6 +3677,7 @@ test "serviceable full text replacement remains queryable while rebuilding" {
         .term_count = 40,
         .backfill_active = true,
         .backfill_progress = 0.3,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
@@ -3676,6 +3730,7 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
         .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
         .backfill_progress = 0.5,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
@@ -3725,6 +3780,7 @@ test "empty embeddings readiness distinguishes gated installation from a publish
         .projection_checkpoint_generation = 42,
         .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
@@ -3811,6 +3867,7 @@ test "published embeddings snapshot remains queryable while completion checkpoin
         .projection_checkpoint_generation = 42,
         .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
@@ -3857,6 +3914,7 @@ test "stale in-place status preserves an incarnation-scoped serviceability proof
         .projection_checkpoint_config_hash = 99,
         .publication_target_count = 2,
         .publication_target_ready = true,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     }};
@@ -4284,6 +4342,7 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
         .replay_catch_up_required = true,
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_applied_sequence = 2,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     }};
@@ -4398,6 +4457,7 @@ test "serviceable repair cannot mask sibling shard serving failures" {
         .coverage_summary_ready = true,
         .backfill_active = true,
         .backfill_progress = 0.5,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     }};
@@ -7612,6 +7672,7 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
         .replay_catch_up_required = true,
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_applied_sequence = 2,
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
         .coverage_generation = identity.incarnation,

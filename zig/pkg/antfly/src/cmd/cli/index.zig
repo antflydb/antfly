@@ -163,7 +163,7 @@ test "index route accepts flags before and after the action" {
     try std.testing.expectEqualStrings("create", policy.subcommand.?);
     try std.testing.expect(policy.unknown_arg == null);
 
-    var wait_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--until", "queryable" };
+    var wait_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--until", "searchable-artifacts=1" };
     const wait = parseRoute(std.process.Args.Iterator.init(.{ .vector = wait_argv[0..] }));
     try std.testing.expectEqualStrings("wait", wait.subcommand.?);
     try std.testing.expect(wait.unknown_arg == null);
@@ -469,20 +469,20 @@ fn getIndexByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
 const IndexSummary = struct {
     index_type: []const u8 = "unknown",
     state: []const u8,
-    progress: ?f64,
+    progress: ?f64 = null,
     source_covered: ?i64 = null,
     source_total: ?i64 = null,
     source_pending: ?i64 = null,
     source_skipped: ?i64 = null,
     source_failed: ?i64 = null,
-    indexed: ?i64,
-    visible: ?i64,
+    indexed: ?i64 = null,
+    visible: ?i64 = null,
     publication_target: ?i64 = null,
     publication_visible: ?i64 = null,
     publication_complete: ?bool = null,
-    complete: bool,
+    complete: bool = false,
     queryable: bool = false,
-    failed: bool,
+    failed: bool = false,
     pending_reasons: []const antfly_client.types.IndexReadinessReason = &.{},
     queryable_blockers: []const []const u8 = &.{},
     complete_blockers: []const []const u8 = &.{},
@@ -760,13 +760,13 @@ test "index wait source coverage keeps its stable public label" {
 
 fn blockersForTarget(summary: IndexSummary, target: WaitTarget) []const []const u8 {
     return switch (target) {
-        .queryable => summary.queryable_blockers,
         .complete => summary.complete_blockers,
+        .source_covered, .searchable_artifacts => summary.queryable_blockers,
     };
 }
 
-fn writeBlockers(writer: anytype, milestone: WaitTarget, blockers: []const []const u8) !void {
-    try writer.print(" {s}_blockers=[", .{@tagName(milestone)});
+fn writeBlockers(writer: anytype, label: []const u8, blockers: []const []const u8) !void {
+    try writer.print(" {s}_blockers=[", .{label});
     for (blockers, 0..) |blocker, index| {
         if (index > 0) try writer.writeAll(",");
         try writer.writeAll(blocker);
@@ -780,12 +780,9 @@ fn writeIndexFailureDiagnostic(
     target: WaitTarget,
     summary: IndexSummary,
 ) !void {
-    try writer.print("{s} index {s} failed while waiting until {s}: state={s}", .{
-        summary.index_type,
-        index_name,
-        @tagName(target),
-        summary.state,
-    });
+    try writer.print("{s} index {s} failed while waiting until ", .{ summary.index_type, index_name });
+    try writeWaitTarget(writer, target);
+    try writer.print(": state={s}", .{summary.state});
     try writeSourceCoverage(writer, summary);
     try writePublication(writer, summary);
     if (summary.incarnation) |incarnation| try writer.print(" incarnation={s}", .{incarnation});
@@ -798,7 +795,7 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
     if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
     try writePendingReasons(writer, summary.pending_reasons);
-    try writeBlockers(writer, target, blockersForTarget(summary, target));
+    try writeBlockers(writer, waitTargetBlockerLabel(target), blockersForTarget(summary, target));
     try writer.writeAll("; run index list --output json for full diagnostics");
 }
 
@@ -822,12 +819,9 @@ fn fatalIndexFailure(
 fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexSummary, embeddings_per_second: ?f64) void {
     var buffer: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    writer.print("Waiting for {s} index {s} until {s}: {s}", .{
-        summary.index_type,
-        index_name,
-        @tagName(target),
-        summary.state,
-    }) catch return;
+    writer.print("Waiting for {s} index {s} until ", .{ summary.index_type, index_name }) catch return;
+    writeWaitTarget(&writer, target) catch return;
+    writer.print(": {s}", .{summary.state}) catch return;
     writeSourceCoverage(&writer, summary) catch return;
     writePublication(&writer, summary) catch return;
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
@@ -845,18 +839,88 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         if (summary.visible) |visible| writer.print(" searchable={d}", .{visible}) catch return;
     }
     writePendingReasons(&writer, summary.pending_reasons) catch return;
-    writeBlockers(&writer, target, blockersForTarget(summary, target)) catch return;
+    writeBlockers(&writer, waitTargetBlockerLabel(target), blockersForTarget(summary, target)) catch return;
     writer.writeByte('\n') catch return;
     std.debug.print("{s}", .{writer.buffered()});
 }
 
-const WaitTarget = enum { complete, queryable };
+const WaitThreshold = union(enum) {
+    count: u64,
+    percent_basis_points: u32,
+
+    fn reached(self: @This(), value: ?i64, total: ?i64) bool {
+        const observed = value orelse return false;
+        if (observed < 0) return false;
+        return switch (self) {
+            .count => |minimum| @as(u64, @intCast(observed)) >= minimum,
+            .percent_basis_points => |minimum| blk: {
+                const denominator = total orelse break :blk false;
+                if (denominator <= 0) break :blk false;
+                const lhs = @as(u128, @intCast(observed)) * 10_000;
+                const rhs = @as(u128, @intCast(denominator)) * @as(u128, minimum);
+                break :blk lhs >= rhs;
+            },
+        };
+    }
+};
+
+const WaitTarget = union(enum) {
+    complete,
+    source_covered: WaitThreshold,
+    searchable_artifacts: u64,
+};
 const WaitDisposition = enum { ready, waiting, failed };
 
 fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
-    if (summary.complete or target == .queryable and summary.queryable) return .ready;
+    const reached = switch (target) {
+        .complete => summary.complete,
+        .source_covered => |threshold| summary.queryable and
+            threshold.reached(summary.source_covered, summary.source_total) and
+            // Dense coverage can advance ahead of the query-visible HBC
+            // checkpoint. When an exact publication proof is available, do
+            // not claim the covered-source outcome until that snapshot has
+            // caught up. Sparse/direct projections omit this optional proof.
+            (summary.publication_complete orelse true),
+        .searchable_artifacts => |minimum| summary.queryable and summary.visible != null and
+            summary.visible.? >= 0 and @as(u64, @intCast(summary.visible.?)) >= minimum,
+    };
+    if (reached) return .ready;
     if (summary.failed) return .failed;
     return .waiting;
+}
+
+fn waitTargetBlockerLabel(target: WaitTarget) []const u8 {
+    return switch (target) {
+        .complete => "complete",
+        .source_covered, .searchable_artifacts => "queryable",
+    };
+}
+
+fn writeWaitThreshold(writer: anytype, threshold: WaitThreshold) !void {
+    switch (threshold) {
+        .count => |count| try writer.print("{d}", .{count}),
+        .percent_basis_points => |basis_points| {
+            const whole = basis_points / 100;
+            const fractional = basis_points % 100;
+            if (fractional == 0)
+                try writer.print("{d}%", .{whole})
+            else if (fractional % 10 == 0)
+                try writer.print("{d}.{d}%", .{ whole, fractional / 10 })
+            else
+                try writer.print("{d}.{d:0>2}%", .{ whole, fractional });
+        },
+    }
+}
+
+fn writeWaitTarget(writer: anytype, target: WaitTarget) !void {
+    switch (target) {
+        .complete => try writer.writeAll("complete"),
+        .source_covered => |threshold| {
+            try writer.writeAll("source-covered=");
+            try writeWaitThreshold(writer, threshold);
+        },
+        .searchable_artifacts => |minimum| try writer.print("searchable-artifacts={d}", .{minimum}),
+    }
 }
 
 fn writeIndexSummary(allocator: std.mem.Allocator, io: std.Io, index: antfly_client.types.IndexStatus) !void {
@@ -901,12 +965,12 @@ fn writeWaitSuccess(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
-    try writer.print("Index {s} ({s}) reached {s}: state={s}", .{
+    try writer.print("Index {s} ({s}) reached ", .{
         index_readiness.createdIndexName(index.config),
         summary.index_type,
-        @tagName(target),
-        summary.state,
     });
+    try writeWaitTarget(writer, target);
+    try writer.print(": state={s}", .{summary.state});
     try writeSourceCoverage(writer, summary);
     try writePublication(writer, summary);
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
@@ -923,13 +987,13 @@ fn writeWaitSuccess(
         if (summary.visible) |visible| try writer.print(" searchable={d}", .{visible});
     }
     try writePendingReasons(writer, summary.pending_reasons);
-    // Once queryability is reached, the only useful remaining blockers are
-    // those for full completion. Keep that label stable even when completion
-    // happened before the successful sample.
-    if (target == .queryable)
-        try writeBlockers(writer, .complete, summary.complete_blockers)
-    else
-        try writeBlockers(writer, target, blockersForTarget(summary, target));
+    // Threshold waits always prove query admission as part of their success.
+    // Show the remaining completion debt so the user can decide whether to
+    // keep indexing in the background or wait for a fixed corpus.
+    switch (target) {
+        .complete => try writeBlockers(writer, "complete", summary.complete_blockers),
+        .source_covered, .searchable_artifacts => try writeBlockers(writer, "complete", summary.complete_blockers),
+    }
     if (summary.repair_action_required orelse false) {
         try writer.writeAll(" warning=repair_action_required");
         if (summary.repair_state) |state| try writer.print(" repair_state={s}", .{state});
@@ -939,6 +1003,123 @@ fn writeWaitSuccess(
     }
     try writer.writeAll("\n");
     cli.writeStdout(io, out.written());
+}
+
+fn parsePercentBasisPoints(raw: []const u8) !u32 {
+    if (raw.len == 0 or raw[raw.len - 1] != '%') return error.InvalidWaitTarget;
+    const number = raw[0 .. raw.len - 1];
+    if (number.len == 0) return error.InvalidWaitTarget;
+    const dot = std.mem.indexOfScalar(u8, number, '.');
+    const whole_raw = if (dot) |index| number[0..index] else number;
+    const fractional_raw = if (dot) |index| number[index + 1 ..] else "";
+    if (whole_raw.len == 0 or fractional_raw.len > 2) return error.InvalidWaitTarget;
+    const whole = std.fmt.parseInt(u32, whole_raw, 10) catch return error.InvalidWaitTarget;
+    var fractional: u32 = 0;
+    if (fractional_raw.len > 0) {
+        fractional = std.fmt.parseInt(u32, fractional_raw, 10) catch return error.InvalidWaitTarget;
+        if (fractional_raw.len == 1) fractional *= 10;
+    }
+    const basis_points = std.math.mul(u32, whole, 100) catch return error.InvalidWaitTarget;
+    const total = std.math.add(u32, basis_points, fractional) catch return error.InvalidWaitTarget;
+    if (total == 0 or total > 10_000) return error.InvalidWaitTarget;
+    return total;
+}
+
+fn parseWaitThreshold(raw: []const u8) !WaitThreshold {
+    if (std.mem.endsWith(u8, raw, "%")) return .{ .percent_basis_points = try parsePercentBasisPoints(raw) };
+    const count = std.fmt.parseInt(u64, raw, 10) catch return error.InvalidWaitTarget;
+    if (count == 0) return error.InvalidWaitTarget;
+    return .{ .count = count };
+}
+
+fn parseWaitTarget(raw: []const u8) !WaitTarget {
+    if (std.mem.eql(u8, raw, "complete")) return .complete;
+    const source_prefix = "source-covered=";
+    if (std.mem.startsWith(u8, raw, source_prefix)) {
+        return .{ .source_covered = try parseWaitThreshold(raw[source_prefix.len..]) };
+    }
+    const artifacts_prefix = "searchable-artifacts=";
+    if (std.mem.startsWith(u8, raw, artifacts_prefix)) {
+        const count = std.fmt.parseInt(u64, raw[artifacts_prefix.len..], 10) catch return error.InvalidWaitTarget;
+        if (count == 0) return error.InvalidWaitTarget;
+        return .{ .searchable_artifacts = count };
+    }
+    return error.InvalidWaitTarget;
+}
+
+fn waitTargetSupportsIndex(target: WaitTarget, summary: IndexSummary) bool {
+    return switch (target) {
+        .complete => true,
+        .source_covered => std.mem.eql(u8, summary.index_type, "embeddings"),
+        .searchable_artifacts => summary.visible != null,
+    };
+}
+
+fn waitTargetRequiresIncarnation(target: WaitTarget) bool {
+    return switch (target) {
+        .complete => false,
+        .source_covered, .searchable_artifacts => true,
+    };
+}
+
+test "index wait parses generic artifact and embedding coverage outcomes" {
+    try std.testing.expectEqualDeep(
+        WaitTarget{ .searchable_artifacts = 3 },
+        try parseWaitTarget("searchable-artifacts=3"),
+    );
+    try std.testing.expectEqualDeep(
+        WaitTarget{ .source_covered = .{ .count = 25 } },
+        try parseWaitTarget("source-covered=25"),
+    );
+    try std.testing.expectEqualDeep(
+        WaitTarget{ .source_covered = .{ .percent_basis_points = 125 } },
+        try parseWaitTarget("source-covered=1.25%"),
+    );
+    try std.testing.expectError(error.InvalidWaitTarget, parseWaitTarget("searchable-artifacts=0"));
+    try std.testing.expectError(error.InvalidWaitTarget, parseWaitTarget("source-covered=101%"));
+
+    const text = IndexSummary{
+        .index_type = "full_text",
+        .state = "queryable_partial",
+        .queryable = true,
+        .visible = 3,
+        .incarnation = "g-text",
+    };
+    try std.testing.expect(waitTargetSupportsIndex(.{ .searchable_artifacts = 1 }, text));
+    try std.testing.expectEqual(
+        WaitDisposition.ready,
+        waitDisposition(text, .{ .searchable_artifacts = 3 }),
+    );
+    try std.testing.expectEqual(
+        WaitDisposition.waiting,
+        waitDisposition(text, .{ .searchable_artifacts = 4 }),
+    );
+    try std.testing.expect(!waitTargetSupportsIndex(.{ .source_covered = .{ .count = 1 } }, text));
+
+    const embeddings = IndexSummary{
+        .index_type = "embeddings",
+        .state = "queryable_partial",
+        .queryable = true,
+        .source_total = 10_000,
+        .source_covered = 100,
+        .source_skipped = 9_900,
+        .publication_complete = true,
+        .incarnation = "g-embeddings",
+    };
+    try std.testing.expectEqual(
+        WaitDisposition.ready,
+        waitDisposition(embeddings, .{ .source_covered = .{ .percent_basis_points = 100 } }),
+    );
+    try std.testing.expectEqual(
+        WaitDisposition.waiting,
+        waitDisposition(embeddings, .{ .source_covered = .{ .percent_basis_points = 101 } }),
+    );
+    var unpublished_coverage = embeddings;
+    unpublished_coverage.publication_complete = false;
+    try std.testing.expectEqual(
+        WaitDisposition.waiting,
+        waitDisposition(unpublished_coverage, .{ .source_covered = .{ .percent_basis_points = 100 } }),
+    );
 }
 
 fn waitForIndex(
@@ -975,20 +1156,16 @@ fn waitForIndex(
             poll_set = true;
         } else if (std.mem.eql(u8, arg, "--until")) {
             if (target != null) cli.fatal("--until may only be provided once", .{});
-            const value = args.next() orelse cli.fatal("--until requires queryable or complete", .{});
-            target = if (std.mem.eql(u8, value, "queryable"))
-                .queryable
-            else if (std.mem.eql(u8, value, "complete"))
-                .complete
-            else
-                cli.fatal("invalid --until milestone: {s}; expected queryable or complete", .{value});
+            const value = args.next() orelse cli.fatal("--until requires complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
+            target = parseWaitTarget(value) catch
+                cli.fatal("invalid --until condition: {s}; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{value});
         } else {
             cli.fatal("unknown index wait option: {s}", .{arg});
         }
     }
 
     const name = index_name orelse cli.fatal("--index is required", .{});
-    const wait_target = target orelse cli.fatal("--until is required; expected queryable or complete", .{});
+    const wait_target = target orelse cli.fatal("--until is required; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
     const outcome = try waitForIndexWithFetcher(
         allocator,
         io,
@@ -1068,6 +1245,7 @@ fn waitForIndexWithFetcher(
     var progress_reporter = WaitProgressReporter{};
     var consecutive_failures: u32 = 0;
     var consecutive_ready: u8 = 0;
+    var ready_incarnation_hash: ?u64 = null;
     while (true) {
         const request_timeout_ms = requestWaitTimeoutMs(started_ns, timeout_ns, clock.now()) orelse
             return timedOut(progress_reporter.last_state);
@@ -1078,13 +1256,10 @@ fn waitForIndexWithFetcher(
             }
             if (!retryableWaitTransportError(err)) return err;
             consecutive_ready = 0;
+            ready_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", now_ns)) {
-                std.debug.print("Waiting for index {s} until {s}: unavailable ({s}); retrying\n", .{
-                    name,
-                    @tagName(target),
-                    @errorName(err),
-                });
+                std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
             }
             sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, now_ns), name);
             continue;
@@ -1100,13 +1275,10 @@ fn waitForIndexWithFetcher(
                 cli.fatal("index {s} returned HTTP {d}", .{ name, resp.status_code });
             }
             consecutive_ready = 0;
+            ready_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", response_ns)) {
-                std.debug.print("Waiting for index {s} until {s}: unavailable (HTTP {d}); retrying\n", .{
-                    name,
-                    @tagName(target),
-                    resp.status_code,
-                });
+                std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
             }
             resp.deinit();
             sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, response_ns), name);
@@ -1116,10 +1288,35 @@ fn waitForIndexWithFetcher(
         consecutive_failures = 0;
         if (resp.data) |parsed| {
             const summary = summarizeIndex(parsed.value);
+            if (!waitTargetSupportsIndex(target, summary)) {
+                var target_buffer: [128]u8 = undefined;
+                var target_writer = std.Io.Writer.fixed(&target_buffer);
+                writeWaitTarget(&target_writer, target) catch cli.fatal("invalid wait condition for {s} index", .{summary.index_type});
+                cli.fatal("wait condition {s} is not supported for {s} indexes", .{ target_writer.buffered(), summary.index_type });
+            }
             const embeddings_per_second = progress_reporter.observeEmbeddingRate(summary, response_ns);
             switch (waitDisposition(summary, target)) {
                 .ready => {
-                    consecutive_ready +|= 1;
+                    if (waitTargetRequiresIncarnation(target) and summary.incarnation == null) {
+                        consecutive_ready = 0;
+                        ready_incarnation_hash = null;
+                        if (progress_reporter.shouldReport(summary.state, response_ns)) {
+                            printWaitProgress(name, target, summary, embeddings_per_second);
+                        }
+                        resp.deinit();
+                        sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, poll_ms, name);
+                        continue;
+                    }
+                    const incarnation_hash = if (summary.incarnation) |incarnation|
+                        std.hash.Wyhash.hash(0, incarnation)
+                    else
+                        0;
+                    if (ready_incarnation_hash == incarnation_hash) {
+                        consecutive_ready +|= 1;
+                    } else {
+                        ready_incarnation_hash = incarnation_hash;
+                        consecutive_ready = 1;
+                    }
                     if (consecutive_ready >= ready_confirmation_observations) {
                         try writeWaitSuccess(allocator, io, parsed.value, target, embeddings_per_second);
                         resp.deinit();
@@ -1127,7 +1324,10 @@ fn waitForIndexWithFetcher(
                     }
                 },
                 .failed => fatalIndexFailure(allocator, name, target, summary),
-                .waiting => consecutive_ready = 0,
+                .waiting => {
+                    consecutive_ready = 0;
+                    ready_incarnation_hash = null;
+                },
             }
             if (progress_reporter.shouldReport(summary.state, response_ns)) {
                 printWaitProgress(name, target, summary, embeddings_per_second);
@@ -1222,10 +1422,13 @@ fn sleepForNextWaitAttempt(
 }
 
 fn fatalWaitTimeout(timeout_ms: u64, index_name: []const u8, target: WaitTarget, last_state: []const u8) noreturn {
+    var target_buffer: [128]u8 = undefined;
+    var target_writer = std.Io.Writer.fixed(&target_buffer);
+    writeWaitTarget(&target_writer, target) catch cli.fatal("timed out after {d}ms waiting for index {s}", .{ timeout_ms, index_name });
     cli.fatal("timed out after {d}ms waiting for index {s} until {s} (last state: {s}); run index list --output json for diagnostics", .{
         timeout_ms,
         index_name,
-        @tagName(target),
+        target_writer.buffered(),
         last_state,
     });
 }
@@ -1446,6 +1649,7 @@ test "index wait prefers authoritative readiness contract" {
         .index_type = .embeddings,
         .rebuilding = true,
         .backfill_state = "running",
+        .searchable_vectors = 1,
         .readiness = .{
             .state = .queryable_partial,
             .queryable = true,
@@ -1458,7 +1662,7 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expect(summary.queryable);
     try std.testing.expect(!summary.complete);
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, .complete));
-    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .queryable));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .{ .searchable_artifacts = 1 }));
 
     // The explicit booleans are the wait contract. Do not let a stale or
     // mixed-version state label make --until complete return before the server's
@@ -1467,6 +1671,7 @@ test "index wait prefers authoritative readiness contract" {
         .index_type = .embeddings,
         .rebuilding = false,
         .backfill_state = "ready",
+        .searchable_vectors = 1,
         .readiness = .{
             .state = .ready,
             .queryable = true,
@@ -1479,7 +1684,7 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expect(summary.queryable);
     try std.testing.expect(!summary.complete);
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, .complete));
-    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .queryable));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .{ .searchable_artifacts = 1 }));
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
         .index_type = .embeddings,
@@ -1534,9 +1739,9 @@ test "index wait prefers authoritative readiness contract" {
 
     var failure_buffer: [512]u8 = undefined;
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
-    try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
+    try writeIndexFailureDiagnostic(&failure_writer, "dense", .{ .searchable_artifacts = 1 }, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair] queryable_blockers=[]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until searchable-artifacts=1: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair] queryable_blockers=[]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
 
@@ -1544,6 +1749,7 @@ test "index wait prefers authoritative readiness contract" {
         .index_type = .embeddings,
         .rebuilding = false,
         .backfill_state = "failed",
+        .searchable_vectors = 1,
         .repair = .{
             .state = "failed",
             .action_required = true,
@@ -1563,7 +1769,7 @@ test "index wait prefers authoritative readiness contract" {
     });
     try std.testing.expect(retained_failure.failed);
     try std.testing.expect(retained_failure.queryable);
-    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(retained_failure, .queryable));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(retained_failure, .{ .searchable_artifacts = 1 }));
     try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(retained_failure, .complete));
 
     var empty_reasons_buffer: [64]u8 = undefined;

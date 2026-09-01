@@ -194,12 +194,55 @@ Activity explains why counters are moving; it never proves readiness or
 failure, and losing volatile activity state on restart must not make an index
 less queryable.
 
-`index wait` mirrors those names. It prints `source_coverage`, `publication`,
-`searchable_vectors`, and optional activity/chunk counters; it does not emit a
+Initial materialization and corruption recovery share a crash-resumable,
+bounded generation scheduler, but remain distinct durable work classes. A
+normal initial build is exposed through backfill, coverage, publication, and
+activity; it must not manufacture `repair` or `ArtifactRepairRequired`
+diagnostics. Those are reserved for damaged or operator-rebuilt generations.
+Before the first safe publication, query admission still fails closed.
+
+Plain dense embedding backoff is scoped to the exact provider/config work key.
+A retryable failure yields that key for the current quantum while independent
+index keys continue and publish their successful artifacts. The durable source
+prefix does not advance past the failed request, so replay retries it after
+bounded backoff without losing ordering, idempotence, or crash recovery. This
+prevents one throttled embeddings index from head-of-line blocking live
+activation of another index in the same group.
+
+Live index activation is a control-plane handoff, not a request to drain the
+current corpus window. Once consensus commits the definition, a provisioned
+request acknowledges an incarnation-fenced activation job; it never joins an
+in-flight inference call. That job owns its repair-scheduler cancellation lease
+from enqueue through final runtime acknowledgement. Leases are reference-counted
+per group so overlapping activations cannot release one another. The repair
+scheduler checks the lease before opening the resident writer, retains its
+durable cursor, and resumes after activation releases the lease. Remote template
+HTTP/S3 fetches and embedding transports also receive cooperative cancellation,
+while native model kernels observe it at safe operation boundaries rather than
+being unsafely preempted. Runtime shutdown closes admission first and then
+drains the authoritative single-flight replay owner before destroying provider
+or allocator state; a non-preemptible native kernel may therefore delay
+teardown, but can never outlive it. The structural owner installs the new
+producer runtime paused, commits the exact index incarnation and durable build intent,
+then starts that replacement once. This makes API latency independent of corpus
+size and native or remote inference latency, avoids starting and immediately
+stopping a replacement worker, and preserves any previously published serving
+generation while the new incarnation begins backfill. Embedded/manual owners
+without a background activation lane retain their synchronous installation
+contract.
+
+`index wait` exposes outcome predicates instead of treating the internal
+`queryable` safety milestone as proof that useful results exist. It prints
+`source_coverage`, `publication`, `searchable_vectors`, and optional activity/chunk counters; it does not emit a
 generic `progress` percentage that could read as complete while publication is
 still pending. Blockers are labeled for the milestone they gate
-(`queryable_blockers` or `complete_blockers`). Reaching `--until queryable`
-while later work remains therefore reports `complete_blockers` explicitly.
+(`queryable_blockers` or `complete_blockers`). `--until searchable-artifacts=N`
+normalizes each index type's published result-bearing unit (vectors/chunks for
+embeddings and query-visible documents for document indexes), and requires
+query admission for the same incarnation. `--until source-covered=N%` uses
+covered source documents only; skipped outcomes never inflate the percentage.
+When dense publication exposes an exact target, the coverage threshold also
+waits for that target to be query-visible.
 
 The work owner, rather than coverage debt, controls the activity phase:
 claim/preparation sets `preparing`, a provider batch sets `embedding`, durable

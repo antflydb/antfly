@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 
 import pytest
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
@@ -106,7 +105,9 @@ def assert_no_unexpected_semantic_warning(
     result: subprocess.CompletedProcess[str], index_name: str
 ) -> None:
     warning_lines = [
-        line.lower() for line in result.stderr.splitlines() if "warning:" in line.lower()
+        line.lower()
+        for line in result.stderr.splitlines()
+        if "warning:" in line.lower()
     ]
     if not warning_lines:
         return
@@ -184,6 +185,13 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 "model": "antfly-embed-v1",
                 "api_url": embedder_url,
             },
+            "chunker": {
+                "provider": "antfly",
+                "text": {
+                    "target_tokens": 200,
+                    "overlap_tokens": 25,
+                },
+            },
         }
     )
     tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII="
@@ -259,14 +267,17 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--index",
             "title_body",
             "--until",
-            "queryable",
+            "searchable-artifacts=1",
             "--timeout",
             "20s",
             "--poll-interval",
             "25ms",
             timeout_s=30.0,
         )
-        assert "Index title_body (embeddings) reached queryable:" in text_wait.stdout
+        assert (
+            "Index title_body (embeddings) reached searchable-artifacts=1:"
+            in text_wait.stdout
+        )
         assert "source_coverage=" in text_wait.stdout
         assert "searchable_vectors=" in text_wait.stdout
         assert "pending_reasons=" in text_wait.stdout
@@ -325,7 +336,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--index",
             "thumbnail",
             "--until",
-            "queryable",
+            "searchable-artifacts=1",
             "--timeout",
             "20s",
             "--poll-interval",
@@ -337,7 +348,10 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             f"{image_wait.stderr}\nindex diagnostics:\n"
             f"{cli('index', 'list', '--table', table, '--output', 'json').stdout}"
         )
-        assert "Index thumbnail (embeddings) reached queryable:" in image_wait.stdout
+        assert (
+            "Index thumbnail (embeddings) reached searchable-artifacts=1:"
+            in image_wait.stdout
+        )
         image_status = parse_json(
             cli("index", "get", "--table", table, "--index", "thumbnail").stdout
         )

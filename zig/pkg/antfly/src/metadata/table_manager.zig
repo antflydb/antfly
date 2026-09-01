@@ -954,6 +954,15 @@ pub const RuntimeEmbeddingActivityStatusReport = struct {
     last_progress_at_ms: u64 = 0,
 };
 
+/// Exact scheduler meaning for an incarnation-scoped lifecycle record. This
+/// travels with V15 repair state so readers never infer corruption from the
+/// implementation lane used to build a new index.
+pub const IndexLifecycleWorkClass = enum(u8) {
+    none = 0,
+    initial_build = 1,
+    repair = 2,
+};
+
 pub const RuntimeIndexStatusReport = struct {
     name: []const u8 = "",
     kind: []const u8 = "",
@@ -992,6 +1001,7 @@ pub const RuntimeIndexStatusReport = struct {
     embedding_activity_observed: bool = false,
     embedding_activity: RuntimeEmbeddingActivityStatusReport = .{},
     source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
+    lifecycle_work_class: IndexLifecycleWorkClass = .none,
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
@@ -1005,6 +1015,7 @@ pub const RuntimeIndexStatusReport = struct {
 pub fn runtimeIndexRequiresCurrentProfile(record: RuntimeIndexStatusReport) bool {
     return record.publication_target_ready or
         record.serving_snapshot_ready or
+        record.lifecycle_work_class != .none or
         record.repair_status != null or
         record.source_replay.len != 0;
 }
@@ -2488,6 +2499,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .embedding_activity_observed = record.embedding_activity_observed,
         .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,
+        .lifecycle_work_class = record.lifecycle_work_class,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };

@@ -95,6 +95,9 @@ pub const Config = struct {
     enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Runtime-owned cancellation propagated through template remote I/O and
+    /// provider calls. Set by `start`; callers do not configure this directly.
+    cancellation: CancellationToken = .none,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
@@ -1511,6 +1514,19 @@ fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
     runtime.retry_error_has_request_identity = false;
+}
+
+fn restoreDeferredRequestRetryAuthorization(runtime: *EnrichmentRuntime, fingerprint: u64) void {
+    std.debug.assert(fingerprint != 0);
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    runtime.active_failure_fingerprint = fingerprint;
+    // shouldYieldRequestError already admitted this exact request against its
+    // durable budget. Independent work may temporarily replace the active
+    // fingerprint, but it must not turn the deferred request into a synthetic
+    // pipeline failure at the supervisor boundary.
+    runtime.retry_error_has_request_identity = true;
 }
 
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
@@ -3200,6 +3216,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sync_waiter_count: std.atomic.Value(u32) = .init(0),
     replay_pass_active: bool = false,
     shutdown: bool = false,
+    /// Provider-visible cooperative cancellation for lifecycle handoff. The
+    /// runtime's bool is mutex-protected for worker coordination; this atomic
+    /// is intentionally separate so provider callbacks can observe shutdown
+    /// without acquiring a lock held by the lifecycle owner.
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     applied_sequence: u64 = 0,
@@ -3339,6 +3360,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stop(self: *EnrichmentRuntime) void {
+        self.shutdown_requested.store(true, .release);
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
@@ -3347,6 +3369,20 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.mutex.unlock(io);
 
             if (self.future) |*future| _ = future.await(io);
+
+            // Cancellation is an admission signal, not proof that a native
+            // provider callback has left the runtime. In particular, an
+            // in-process inference kernel may observe cancellation only after
+            // returning its allocator-owned result. The background future is
+            // not the lifetime authority for foreground/drain replay owners,
+            // so runtime/provider teardown must also drain the single-flight
+            // replay ownership fence. shutdown=true prevents new passes from
+            // entering while the current owner exits.
+            self.mutex.lockUncancelable(io);
+            while (self.replay_pass_active) {
+                self.cond.waitUncancelable(io, &self.mutex);
+            }
+            self.mutex.unlock(io);
         }
         self.future = null;
         self.shutdown = false;
@@ -3360,6 +3396,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn start(self: *EnrichmentRuntime) !void {
         if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.shutdown_requested.store(false, .release);
+        const cancellation = CancellationToken.fromAtomic(&self.shutdown_requested);
+        self.config.cancellation = cancellation;
+        if (self.config.dense_embedder) |dense_embedder| dense_embedder.setCancellation(cancellation);
+        if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setCancellation(cancellation);
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
     }
@@ -5164,9 +5205,12 @@ fn flushDeferredGeneratedWork(
     deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
     window: *GeneratedReplayWindow,
 ) !void {
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     try flushAssetProducerBatch(runtime, deferred_assets, window);
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     try processPlainDenseWindow(runtime, deferred_plain_dense.items, window);
     deferred_plain_dense.clearRetainingCapacity();
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     try processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window);
     deferred_chunked_dense.clearRetainingCapacity();
     try flushGeneratedReplayWindow(runtime, window);
@@ -5330,6 +5374,7 @@ fn flushAssetProducerBatch(
     window: *GeneratedReplayWindow,
 ) !void {
     if (items.items.len == 0) return;
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
@@ -5371,6 +5416,7 @@ fn flushAssetProducerBatch(
     }
 
     for (items.items, produced, 0..) |*item, output, idx| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
             runtime.alloc.free(output);
             produced[idx] = "";
@@ -5391,6 +5437,7 @@ fn flushAssetProducerBatchSequential(
     window: *GeneratedReplayWindow,
 ) !void {
     for (items) |item| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(item.request));
         const request = item.asRequest();
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
@@ -10033,9 +10080,12 @@ fn processPlainDenseWindow(
     const processed = try runtime.alloc.alloc(bool, requests.len);
     defer runtime.alloc.free(processed);
     @memset(processed, false);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
 
     var i: usize = 0;
     while (i < requests.len) : (i += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
 
@@ -10078,10 +10128,36 @@ fn processPlainDenseWindow(
         }
 
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
-            if (shouldYieldRequestError(runtime, err)) return err;
+            if (shouldYieldRequestError(runtime, err)) {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                    return err;
+                // One provider/config key must not monopolize the group-wide
+                // replay owner. Skip the rest of this exact key for the
+                // current quantum, continue independent indexes, publish their
+                // successful work, and only then yield the original retry to
+                // the durable supervisor. The applied source prefix remains
+                // unchanged, so the failed key is retried after backoff while
+                // successful artifacts are crash-idempotent on replay.
+                if (deferred_retry_error == null) {
+                    deferred_retry_error = err;
+                    deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                }
+                var remaining = i + 1;
+                while (remaining < requests.len) : (remaining += 1) {
+                    if (samePlainDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                }
+                continue;
+            }
             for (items.items) |item| try recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
+    }
+    if (deferred_retry_error) |err| {
+        // Do not discard independent progress just because this replay quantum
+        // must retain an earlier request's durable retry identity.
+        try flushGeneratedReplayWindow(runtime, window);
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
     }
 }
 
@@ -10100,6 +10176,7 @@ fn processChunkedDenseWindow(
 
     var i: usize = 0;
     while (i < requests.len) : (i += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
 
@@ -10129,6 +10206,7 @@ fn processChunkedDenseWindow(
 
         var j: usize = i;
         while (j < requests.len) : (j += 1) {
+            if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
             if (processed[j] and j != i) continue;
             const request = requests[j];
             if (!sameChunkedDenseBatchKey(seed, request)) continue;
@@ -10157,6 +10235,7 @@ fn processChunkedDenseWindow(
             }
 
             source_loop: for (source_set.sources) |*source| {
+                if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
@@ -14365,6 +14444,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    cancellation: CancellationToken,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
@@ -14376,6 +14456,12 @@ fn remoteRenderConfig(
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        config.cancellation = scraping.CancellationToken.fromCallback(
+            cancellation.ptr,
+            cancellation.is_cancelled_fn,
+        );
     }
     return config;
 }
@@ -14422,14 +14508,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, null),
+            remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, null),
+        remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, null),
     );
 }
 
@@ -14480,7 +14566,7 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }

@@ -1231,6 +1231,7 @@ fn reportsHaveRuntimeReporterFence(reports: []const metadata_table_manager.Store
 fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
         for (runtime_status.indexes) |*index_status| {
+            index_status.lifecycle_work_class = .none;
             index_status.repair_status = null;
             index_status.repair_active_generation_serviceable = false;
         }
@@ -7700,6 +7701,7 @@ test "metadata runtime repair status downgrade clears state and serviceability p
     var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -7735,6 +7737,7 @@ test "metadata service transition commands negotiate runtime status payload vers
     var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
         .publication_target_count = 17,
@@ -7892,6 +7895,7 @@ test "metadata service projects optional activity without freezing older status"
         .name = "visual_idx",
         .kind = "dense_vector",
         .doc_count = 10,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .embedding_activity = .{ .epoch = 7, .embeddings_computed = 11 },
     }};
@@ -8274,6 +8278,7 @@ test "metadata service status reporting never proposes deletion of committed rep
         .coverage_generation = 7,
         .coverage_config_hash = 8,
         .coverage_identity_ready = true,
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -8313,6 +8318,7 @@ test "metadata service status reporting never proposes deletion of committed rep
     // Absence is also a repair-state transition. A legacy/null heartbeat must
     // not clear a committed repair fact while activation is unavailable.
     observed_indexes[0].doc_count = 12;
+    observed_indexes[0].lifecycle_work_class = .none;
     observed_indexes[0].repair_status = null;
     observed_indexes[0].repair_active_generation_serviceable = false;
     try std.testing.expectEqual(

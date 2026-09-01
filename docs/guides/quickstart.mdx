@@ -340,12 +340,13 @@ workflow with bounded batches and retries.
 Embedding generation runs in the background. Managed embeddings indexes use
 progressive publication by default, so a safely checkpointed partial generation
 can serve semantic queries while source coverage continues in the background.
-To wait only for that first queryable generation, run:
+To continue as soon as at least one result-bearing artifact has been safely
+published, run:
 
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
-  --until queryable \
+  --until searchable-artifacts=1 \
   --timeout 20m
 ```
 
@@ -359,7 +360,7 @@ Use `antfly index list --table wikipedia` for a compact progress summary, or
 add `--output json` for the complete diagnostic payload.
 Model startup and time-to-first-result depend on hardware. The wait command
 reports bounded periodic progress and enforces the timeout; do not continue if
-it times out before the index becomes queryable. Use `publication_policy:
+it times out before the index publishes a searchable artifact. Use `publication_policy:
 atomic` when a replacement generation must remain unavailable until fully built
 and validated. See [Troubleshooting](#troubleshooting) below.
 
@@ -905,12 +906,12 @@ let created_index = client
   </TabsContent>
 </Tabs>
 
-Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index is queryable before continuing:
+Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index has published at least one searchable artifact before continuing:
 
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
-  --until queryable \
+  --until searchable-artifacts=1 \
   --timeout 20m
 ```
 
@@ -1383,9 +1384,10 @@ Pull the missing model again, or pass the intended directory explicitly with
 
 ### An index remains pending or `index wait` times out
 
-Do not continue to semantic, image, or RAG steps until the relevant index is
-queryable. `queryable_partial` is safe to use while coverage grows; `pending` is
-not. If `index wait --until queryable` times out, capture the full status and recent
+Do not continue to semantic, image, or RAG steps until the relevant index has
+published enough searchable artifacts for the example. `queryable_partial` is
+safe to use while coverage grows, but an empty published generation cannot
+produce results. If `index wait --until searchable-artifacts=1` times out, capture the full status and recent
 watchdog messages:
 
 ```bash

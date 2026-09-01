@@ -3037,6 +3037,15 @@ pub const IndexSourceReplayStatus = struct {
     observation_count: u64 = 1,
 };
 
+/// Internal durable lifecycle class. This is carried with shard observations
+/// so API projection can distinguish ordinary materialization from recovery
+/// without interpreting repair trigger strings.
+pub const IndexLifecycleWorkClass = enum {
+    none,
+    initial_build,
+    repair,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
@@ -3098,6 +3107,7 @@ pub const DBIndexStats = struct {
     repair_issue_count_estimated: bool = false,
     repair_scan_issue_count: u64 = 0,
     index_repair_id: ?u128 = null,
+    index_lifecycle_work_class: IndexLifecycleWorkClass = .none,
     index_repair_trigger: []const u8 = "none",
     index_repair_phase: []const u8 = "none",
     index_repair_automation: []const u8 = "none",

@@ -26,7 +26,7 @@ const magic = "AFIDXRP1";
 // admission. It deliberately does not overload the shadow candidate's build
 // cursor: source replay precedes candidate creation and has a different crash
 // boundary.
-const format_version: u32 = 11;
+const format_version: u32 = 12;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -82,6 +82,19 @@ pub const Trigger = enum(u8) {
     /// Rebuild the missing coverage in a shadow while retaining query access
     /// until the replacement reaches its fenced activation boundary.
     replay_artifact_unavailable = 8,
+    /// A catalog definition was admitted over an existing corpus. The
+    /// independent work class determines that this is initial materialization,
+    /// not repair; the trigger preserves the exact control-plane cause.
+    catalog_admission = 9,
+};
+
+/// Durable scheduler work and its user-visible meaning are separate from the
+/// observation which caused the work. Initial materialization may share the
+/// bounded generation builder with repair, but must never be reported as
+/// evidence that a previously published generation is damaged.
+pub const WorkClass = enum(u8) {
+    repair = 1,
+    initial_build = 2,
 };
 
 /// Durable admission work which discovers generated-enrichment requests from
@@ -149,6 +162,7 @@ pub const IndexRepairIntent = struct {
     kind: types.IndexKind,
     config_hash: u64,
     trigger: Trigger = .incomplete_bulk_publish,
+    work_class: WorkClass = .repair,
     /// Stable API job identity for crash-idempotent forced generation rebuilds.
     /// Both values are zero until an operator job attaches to the intent.
     operator_job_id: u64 = 0,
@@ -808,6 +822,7 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u64, intent.owner_epoch);
         try appendInt(alloc, &out, u8, @intFromEnum(intent.automation));
         try appendOptionalString(alloc, &out, intent.last_error, max_error_bytes);
+        try appendInt(alloc, &out, u8, @intFromEnum(intent.work_class));
         try appendInt(alloc, &out, u8, if (entry.pin != null) 1 else 0);
         if (entry.pin) |pin| {
             try appendInt(alloc, &out, u8, pin.version);
@@ -908,6 +923,9 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         intent.owner_epoch = try readInt(raw[0..payload_end], &pos, u64);
         intent.automation = try readEnum(Automation, raw[0..payload_end], &pos);
         intent.last_error = try readOptionalString(alloc, raw[0..payload_end], &pos, max_error_bytes);
+        if (decoded_format_version >= 12) {
+            intent.work_class = try readEnum(WorkClass, raw[0..payload_end], &pos);
+        }
         const has_pin = try readInt(raw[0..payload_end], &pos, u8);
         if (has_pin > 1) return error.InvalidIndexRepairState;
         var pin: ?IndexRepairReplayPin = null;
@@ -1072,6 +1090,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     entry.intent.source_replay_state = .pending;
     entry.intent.failure_streak = 3;
     entry.intent.trigger = .projection_generation_invalid;
+    entry.intent.work_class = .initial_build;
     entry.intent.operator_job_id = 77;
     entry.intent.operator_job_created_at_ms = 1234;
     entry.intent.previous_pointer_captured = true;
@@ -1101,6 +1120,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqual(SourceReplayState.pending, reopened.entries.items[0].intent.source_replay_state);
     try std.testing.expectEqual(@as(u32, 3), reopened.entries.items[0].intent.failure_streak);
     try std.testing.expectEqual(Trigger.projection_generation_invalid, reopened.entries.items[0].intent.trigger);
+    try std.testing.expectEqual(WorkClass.initial_build, reopened.entries.items[0].intent.work_class);
     try std.testing.expectEqual(@as(u64, 77), reopened.entries.items[0].intent.operator_job_id);
     try std.testing.expectEqual(@as(u64, 1234), reopened.entries.items[0].intent.operator_job_created_at_ms);
     try std.testing.expect(reopened.entries.items[0].intent.previous_pointer_captured);

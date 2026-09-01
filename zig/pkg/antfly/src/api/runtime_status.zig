@@ -574,7 +574,8 @@ pub const TableRuntimeSnapshotCache = struct {
                 owned.deinit(self.alloc);
                 return .stale_observation;
             }
-            preserveArtifactVisibilityOnReplayRegression(
+            try preserveArtifactVisibilityOnReplayRegression(
+                self.alloc,
                 previous.*,
                 &owned,
                 &state.targeted_index_fences,
@@ -642,7 +643,8 @@ pub const TableRuntimeSnapshotCache = struct {
                     next.deinit(self.alloc);
                     continue;
                 }
-                preserveArtifactVisibilityOnReplayRegression(
+                try preserveArtifactVisibilityOnReplayRegression(
+                    self.alloc,
                     previous.*,
                     next,
                     &state.targeted_index_fences,
@@ -856,7 +858,7 @@ pub const TableRuntimeSnapshotCache = struct {
             status.* = merged;
             return;
         }
-        preserveArtifactVisibilityOnReplayRegression(cached.*, status, targeted_index_fences);
+        try preserveArtifactVisibilityOnReplayRegression(self.alloc, cached.*, status, targeted_index_fences);
     }
 
     pub fn summary(self: *@This()) TableRuntimeSummary {
@@ -1096,10 +1098,11 @@ fn lessThanGroupId(_: void, lhs: LocalTableRuntimeStatus, rhs: LocalTableRuntime
 }
 
 fn preserveArtifactVisibilityOnReplayRegression(
+    alloc: std.mem.Allocator,
     previous: LocalTableRuntimeStatus,
     incoming: *LocalTableRuntimeStatus,
     targeted_index_fences: ?*const std.StringHashMapUnmanaged(TargetedIndexPublicationFence),
-) void {
+) !void {
     var preserved_visibility = false;
     for (incoming.stats.indexes) |*dst| {
         // Serviceability is a cache-local continuity proof. Re-derive it for
@@ -1164,7 +1167,8 @@ fn preserveArtifactVisibilityOnReplayRegression(
         if (!targeted_sibling_continuity and !applied_regressed and !projection_regressed and !visibility_regressed_without_newer_replay) continue;
 
         preserveIndexArtifactVisibility(dst, cached);
-        if (targeted_sibling_continuity or projection_regressed or visibility_regressed_without_newer_replay) preserveIndexProjectionLifecycle(dst, cached);
+        if (targeted_sibling_continuity or projection_regressed or visibility_regressed_without_newer_replay)
+            try preserveIndexProjectionLifecycle(alloc, dst, cached);
         dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
         dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
         dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
@@ -1194,7 +1198,11 @@ fn preserveArtifactVisibilityOnReplayRegression(
     }
 }
 
-fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
+fn preserveIndexProjectionLifecycle(
+    alloc: std.mem.Allocator,
+    dst: *db_mod.types.DBIndexStats,
+    cached: db_mod.types.DBIndexStats,
+) !void {
     dst.coverage_produced_count = cached.coverage_produced_count;
     dst.coverage_skipped_count = cached.coverage_skipped_count;
     dst.coverage_terminal_failed_count = cached.coverage_terminal_failed_count;
@@ -1208,6 +1216,33 @@ fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_
     dst.backfill_active = cached.backfill_active;
     dst.backfill_progress = cached.backfill_progress;
     dst.enrichment_failed = cached.enrichment_failed;
+    // Projection visibility and its lifecycle classification form one
+    // incarnation-scoped observation. Mixing a cached work class with an
+    // incoming repair state (or vice versa) can turn normal backfill into a
+    // synthetic repair, or hide genuine recovery. Preserve the whole durable
+    // lifecycle bundle whenever the corresponding projection is retained.
+    const retained_last_error = if (cached.index_repair_last_error) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    if (dst.index_repair_last_error) |value| alloc.free(value);
+    dst.index_repair_id = cached.index_repair_id;
+    dst.index_lifecycle_work_class = cached.index_lifecycle_work_class;
+    dst.index_repair_trigger = cached.index_repair_trigger;
+    dst.index_repair_phase = cached.index_repair_phase;
+    dst.index_repair_automation = cached.index_repair_automation;
+    dst.index_repair_attempts = cached.index_repair_attempts;
+    dst.index_repair_started_at_ms = cached.index_repair_started_at_ms;
+    dst.index_repair_updated_at_ms = cached.index_repair_updated_at_ms;
+    dst.index_repair_build_floor_sequence = cached.index_repair_build_floor_sequence;
+    dst.index_repair_applied_sequence = cached.index_repair_applied_sequence;
+    dst.index_repair_target_sequence = cached.index_repair_target_sequence;
+    dst.index_repair_next_retry_at_ms = cached.index_repair_next_retry_at_ms;
+    dst.index_repair_last_error = retained_last_error;
+    dst.index_repair_wait_reason = cached.index_repair_wait_reason;
+    dst.index_repair_status = cached.index_repair_status;
+    dst.index_repair_action_required = cached.index_repair_action_required;
+    dst.index_repair_active_generation_serviceable = cached.index_repair_active_generation_serviceable;
     dst.projection_checkpoint_status = cached.projection_checkpoint_status;
     dst.projection_checkpoint_applied_sequence = cached.projection_checkpoint_applied_sequence;
     dst.projection_checkpoint_generation = cached.projection_checkpoint_generation;
@@ -1818,6 +1853,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
             .repair_scan_issue_count = item.repair_scan_issue_count,
             .index_repair_id = item.index_repair_id,
+            .index_lifecycle_work_class = item.index_lifecycle_work_class,
             .index_repair_trigger = item.index_repair_trigger,
             .index_repair_phase = item.index_repair_phase,
             .index_repair_automation = item.index_repair_automation,
@@ -3216,7 +3252,7 @@ test "live writer artifact regression keeps authoritative source deletions" {
         },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
 }
@@ -3262,7 +3298,7 @@ test "catching up observation preserves same-incarnation published visibility" {
         },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.indexes[0].node_count);
@@ -3271,6 +3307,64 @@ test "catching up observation preserves same-incarnation published visibility" {
     try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_produced_count);
+}
+
+test "projection continuity preserves lifecycle classification as one bundle" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .projection_checkpoint_applied_sequence = 10,
+        .projection_checkpoint_generation = 4,
+        .projection_checkpoint_config_hash = 77,
+        .index_repair_id = 91,
+        .index_lifecycle_work_class = .initial_build,
+        .index_repair_trigger = "catalog_admission",
+        .index_repair_phase = "building",
+        .index_repair_status = .rebuilding,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .projection_checkpoint_applied_sequence = 0,
+        .projection_checkpoint_generation = 4,
+        .projection_checkpoint_config_hash = 77,
+        // A separately sampled lifecycle must not be combined with the
+        // retained projection generation.
+        .index_repair_id = 92,
+        .index_lifecycle_work_class = .repair,
+        .index_repair_trigger = "artifact_coverage_mismatch",
+        .index_repair_phase = "preflight",
+        .index_repair_status = .waiting,
+        .index_repair_action_required = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+    };
+
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
+    const retained = incoming.stats.indexes[0];
+    try std.testing.expectEqual(@as(?u128, 91), retained.index_repair_id);
+    try std.testing.expectEqual(db_mod.types.IndexLifecycleWorkClass.initial_build, retained.index_lifecycle_work_class);
+    try std.testing.expectEqualStrings("catalog_admission", retained.index_repair_trigger);
+    try std.testing.expectEqualStrings("building", retained.index_repair_phase);
+    try std.testing.expectEqual(db_mod.types.IndexRepairStatus.rebuilding, retained.index_repair_status.?);
+    try std.testing.expect(!retained.index_repair_action_required);
 }
 
 test "catching up observation cannot preserve a same-config replacement incarnation" {
@@ -3313,7 +3407,7 @@ test "catching up observation cannot preserve a same-config replacement incarnat
         },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 43), incoming.stats.indexes[0].coverage_generation);
@@ -3350,7 +3444,7 @@ test "catching up observation cannot preserve across an lsm root change" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
     try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
@@ -3385,7 +3479,7 @@ test "unpublished embeddings incarnation cannot mint catch up serviceability" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].coverage_produced_count);
@@ -3421,7 +3515,7 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
         .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
@@ -3496,7 +3590,7 @@ test "all-skipped embeddings incarnation preserves logical publication during ca
         .stats = .{ .source_doc_count = 2, .index_count = 1, .indexes = incoming_indexes[0..] },
     };
 
-    preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
+    try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_skipped_count);

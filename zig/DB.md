@@ -1073,7 +1073,17 @@ reported separately from generation-scoped source coverage; clients must not
 infer completeness from physical cardinality.
 
 `antfly index wait --until complete` waits for complete readiness. `antfly
-index wait --until queryable` exits for either `queryable_partial` or `ready`.
+index wait --until searchable-artifacts=N` waits for at least N published,
+query-admitted result-bearing units for the same incarnation. Embeddings also
+support `--until source-covered=N` or `N%`; percentages count covered sources,
+not skipped outcomes. When a dense publication target is available, that
+threshold does not succeed until the matching physical publication is visible.
+
+Ordinary initial materialization is durable build work, not repair debt. It is
+reported through backfill, coverage, publication, and activity while query
+admission remains fail-closed until the first safe publication. Public repair
+and action-required diagnostics are reserved for damaged generations and
+explicit rebuild operations.
 Search uses the best safely published generation by default. Long waits belong
 in this waiter, not in a held search request.
 
@@ -1233,6 +1243,18 @@ idempotent hints, not repair authority: the durable checkpoint determines what
 work remains, aggregate debt auditing retires routes after every intent clears,
 and bounded fallback discovery is recovery for a missed notification rather
 than the normal scheduling path.
+
+Provisioned live creation returns after the catalog commit and durable,
+target-scoped activation enqueue; it does not wait for the resident worker to
+finish its current inference kernel. The activation request owns cancellation
+of borrowed maintenance for every affected group across all retries. Repair
+checks that lease before opening a writer, so canceled no-op passes cannot race
+the structural owner for the same lock. These leases are reference-counted per
+group, so completing one of several overlapping index activations cannot resume
+repair underneath another. Status remains fenced as `activating`
+until the exact incarnation publishes an authoritative runtime observation.
+Direct embedded owners, which have no asynchronous control-plane lane, keep the
+explicit synchronous installation behavior.
 
 The identity generation captured by the marker is monotonic evidence. Recovery
 fails closed if the current identity summary regresses below it. Concurrent

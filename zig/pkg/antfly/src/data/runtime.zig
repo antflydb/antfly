@@ -5098,7 +5098,10 @@ pub const DataServer = struct {
     provisioned_index_repair_scan_cursor: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_queue_mutex: std.atomic.Mutex = .unlocked,
     provisioned_index_repair_cancel_mutex: std.atomic.Mutex = .unlocked,
-    provisioned_index_repair_cancel_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Reference-counted control-plane leases. Multiple index activations may
+    /// overlap on one shard; repair remains canceled until the last exact
+    /// activation owner releases its lease.
+    provisioned_index_repair_cancel_groups: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     // Known debt is an O(1) linked hash queue. The cursor lets every pass inspect
     // a fixed window without copying or sorting the entire node's repair debt.
     provisioned_index_repair_group_ages: std.AutoHashMapUnmanaged(u64, IndexRepairQueueEntry) = .empty,
@@ -9235,7 +9238,6 @@ pub const DataServer = struct {
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
-                self.clearProvisionedIndexRepairCancellation(group_id);
             },
             .cancel => self.requestProvisionedIndexRepairCancellation(group_id) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -13194,13 +13196,22 @@ pub const DataServer = struct {
     fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
         lockAtomic(&self.provisioned_index_repair_cancel_mutex);
         defer self.provisioned_index_repair_cancel_mutex.unlock();
-        try self.provisioned_index_repair_cancel_groups.put(self.alloc, group_id, {});
+        const result = try self.provisioned_index_repair_cancel_groups.getOrPut(self.alloc, group_id);
+        if (!result.found_existing) {
+            result.value_ptr.* = 1;
+            return;
+        }
+        result.value_ptr.* = std.math.add(u32, result.value_ptr.*, 1) catch
+            return error.IndexRepairCancellationLeaseOverflow;
     }
 
     fn clearProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) void {
         lockAtomic(&self.provisioned_index_repair_cancel_mutex);
         defer self.provisioned_index_repair_cancel_mutex.unlock();
-        _ = self.provisioned_index_repair_cancel_groups.remove(group_id);
+        const count = self.provisioned_index_repair_cancel_groups.getPtr(group_id) orelse return;
+        std.debug.assert(count.* > 0);
+        count.* -= 1;
+        if (count.* == 0) _ = self.provisioned_index_repair_cancel_groups.remove(group_id);
     }
 
     fn provisionedIndexRepairCancellationRequested(self: *DataServer, group_id: u64) bool {
@@ -13841,6 +13852,17 @@ pub const DataServer = struct {
             }
             const group_id = candidate.group_id;
             const table_name = candidate.table_name;
+
+            // A structural activation owns this group's control-plane lease.
+            // Do not open the resident writer merely to discover cancellation
+            // inside DB repair: repeated no-op opens can continuously beat the
+            // structural owner to the same writer lock. Keep the durable queue
+            // entry intact and let clear_cancel re-arm it after activation.
+            if (self.provisionedIndexRepairCancellationRequested(group_id)) {
+                found_pending = true;
+                _ = self.provisioned_index_repair_cooperative_deferrals.fetchAdd(1, .monotonic);
+                continue;
+            }
 
             // Healthy resident writers own ordinary async replay and publish
             // runtime status directly. A resident writer with repair metadata
@@ -18107,8 +18129,22 @@ fn runtimeIndexStatusReportFromLocalIndex(
             .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
         },
         .source_replay = source_replay,
-        .repair_status = index.index_repair_status,
-        .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
+        .lifecycle_work_class = switch (index.index_lifecycle_work_class) {
+            .none => .none,
+            .initial_build => .initial_build,
+            .repair => if (index.index_repair_status != null) .repair else .none,
+        },
+        // Initial materialization uses the same bounded durable generation
+        // scheduler, but it is not repair debt. Carry its progress through the
+        // backfill/publication fields and reserve the compact repair channel
+        // for an actually damaged or operator-rebuilt generation.
+        .repair_status = if (index.index_lifecycle_work_class == .initial_build)
+            null
+        else
+            index.index_repair_status,
+        .repair_active_generation_serviceable = index.index_lifecycle_work_class == .repair and
+            index.index_repair_status != null and
+            index.index_repair_active_generation_serviceable,
     };
 }
 
@@ -18132,6 +18168,7 @@ test "data runtime report preserves compact managed repair admission state" {
             .retrying = true,
             .last_progress_at_ms = 1_787_990_400_000,
         },
+        .index_lifecycle_work_class = .repair,
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
     });
@@ -18150,6 +18187,23 @@ test "data runtime report preserves compact managed repair admission state" {
         "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"serving_snapshot_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
+}
+
+test "data runtime report projects initial build through lifecycle rather than repair" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .index_lifecycle_work_class = .initial_build,
+        .backfill_active = true,
+        .index_repair_status = .waiting,
+        .index_repair_active_generation_serviceable = true,
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expect(report.backfill_active);
+    try std.testing.expect(report.repair_status == null);
+    try std.testing.expect(!report.repair_active_generation_serviceable);
 }
 
 test "data runtime report does not forward a locally retained activity sample as fresh" {
@@ -26599,13 +26653,21 @@ test "data runtime repair debt hook targets the affected group queue" {
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
-    // A visibility clear is an aggregate audit enqueue, not a destructive
-    // lifecycle remove, and cannot consume another owner's cancellation.
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
+    try std.testing.expectEqual(@as(u32, 2), server.provisioned_index_repair_cancel_groups.get(7001).?);
+    // Queue state and control-plane lease ownership are independent. Neither
+    // an aggregate audit enqueue nor durable-debt removal can consume an
+    // activation owner's cancellation lease.
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
 
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_queue_depth.load(.monotonic));

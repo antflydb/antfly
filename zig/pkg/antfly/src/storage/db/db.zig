@@ -890,11 +890,20 @@ pub const IndexRepairAdmission = enum {
     blocked,
 };
 
+/// Durable lifecycle class carried with visibility edges. Consumers must use
+/// this fact instead of interpreting trigger strings: initial materialization
+/// shares the generation scheduler with repair but is not corruption debt.
+pub const IndexLifecycleWorkClass = enum {
+    repair,
+    initial_build,
+};
+
 /// Incarnation-scoped identity for a durable repair visibility edge. The
 /// slices are borrowed for the synchronous notification only; consumers that
 /// retain an event must clone them.
 pub const IndexRepairVisibility = struct {
     index_name: []const u8,
+    work_class: IndexLifecycleWorkClass = .repair,
     repair_id: u128 = 0,
     revision: u64 = 0,
     config_hash: u64 = 0,
@@ -4848,6 +4857,10 @@ pub const DB = struct {
             .change = change,
             .repair = .{
                 .index_name = intent.index_name,
+                .work_class = switch (intent.work_class) {
+                    .repair => .repair,
+                    .initial_build => .initial_build,
+                },
                 .repair_id = intent.repair_id,
                 .revision = persisted_revision,
                 .config_hash = intent.config_hash,
@@ -5004,7 +5017,28 @@ pub const DB = struct {
         deinitOwnedEnrichmentConfig(self.runtime_alloc, cfg);
     }
 
+    const EnrichmentReconfigureOptions = struct {
+        start_replacement: bool = true,
+    };
+
     pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{});
+    }
+
+    /// Install a replacement producer set without starting it. Structural
+    /// activation uses this form to quiesce the old owner once, mutate the
+    /// index catalog, and then start the exact replacement after the durable
+    /// admission is established. Starting here would make addIndex stop the
+    /// new worker a second time and let corpus work delay control-plane DDL.
+    pub fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{ .start_replacement = false });
+    }
+
+    fn reconfigureEnrichmentRuntimeWithOptions(
+        self: *DB,
+        cfg: enrichment_runtime_mod.Config,
+        options: EnrichmentReconfigureOptions,
+    ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
         var owned_cfg = cfg;
@@ -5028,17 +5062,16 @@ pub const DB = struct {
             }
         }
 
-        const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+        const replacement_can_run = detached != null and self.open_mode.allowsOptionalRuntimes();
+        const should_start_replacement = replacement_can_run and options.start_replacement;
         const previous_desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
         var stopped_existing_runtime = false;
-        if (should_start_replacement) {
-            lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
-            if (self.async_context.enrichment_runtime) |runtime| {
-                runtime.stop();
-                stopped_existing_runtime = true;
-            }
-            self.async_context.enrichment_lifecycle_mutex.unlock();
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+        if (self.async_context.enrichment_runtime) |runtime| {
+            stopped_existing_runtime = runtime.isStarted();
+            runtime.stop();
         }
+        self.async_context.enrichment_lifecycle_mutex.unlock();
         errdefer if (stopped_existing_runtime) {
             self.async_context.enrichment_desired_running.store(previous_desired or stopped_existing_runtime, .release);
             self.restartEnrichmentAfterStructuralMutation("failed enrichment reconfiguration", "") catch |err| {
@@ -5046,7 +5079,7 @@ pub const DB = struct {
             };
         };
 
-        if (should_start_replacement) {
+        if (replacement_can_run) {
             // stop() joins the previous worker. Only now is its durable
             // checkpoint/status/repair-marker state final enough to seed the
             // replacement. Taking this snapshot before the join can resurrect
@@ -5058,7 +5091,7 @@ pub const DB = struct {
                 const target_sequence = self.core.nextEnrichmentSequence();
                 if (target_sequence != 0) replacement.resumeTargetPreservingRetryDebt(target_sequence);
             }
-            try replacement.start();
+            if (should_start_replacement) try replacement.start();
         }
 
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
@@ -5082,6 +5115,11 @@ pub const DB = struct {
         self.async_context.enrichment_desired_running.store(should_start_replacement, .release);
         self.async_context.enrichment_lifecycle_mutex.unlock();
         if (!query_visibility_hook_present) self.setQueryVisibilityHook(null);
+    }
+
+    pub fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        if (self.enrichment_runtime == null) return;
+        try self.restartEnrichmentAfterStructuralMutation(operation, index_name);
     }
 
     fn initResolutionRuntime(self: *DB) !void {
@@ -12088,7 +12126,7 @@ pub const DB = struct {
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
         if ((intent.kind != .dense_vector and intent.kind != .sparse_vector) or
-            intent.trigger != .projection_generation_invalid or
+            intent.work_class != .initial_build or
             intent.candidate_relative_path != null or
             intent.phase != .detected)
         {
@@ -12127,7 +12165,7 @@ pub const DB = struct {
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
         if ((intent.kind != .dense_vector and intent.kind != .sparse_vector) or
-            intent.trigger != .projection_generation_invalid or
+            intent.work_class != .initial_build or
             intent.candidate_relative_path != null or
             intent.phase != .detected)
         {
@@ -12429,6 +12467,7 @@ pub const DB = struct {
             .root_generation_rebuild,
             .projection_generation_invalid,
             .operator_generation_validation,
+            .catalog_admission,
             => intent.phase != .cleanup,
         };
     }
@@ -13197,7 +13236,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         index_name: []const u8,
-    ) !void {
+    ) !bool {
         return try self.markDenseReplayRepairRequired(
             alloc,
             index_name,
@@ -13211,7 +13250,7 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !void {
-        return try self.markDenseReplayRepairRequired(
+        _ = try self.markDenseReplayRepairRequired(
             alloc,
             index_name,
             .artifact_coverage_mismatch,
@@ -13225,7 +13264,7 @@ pub const DB = struct {
         index_name: []const u8,
         blocking_trigger: index_repair_state.Trigger,
         reason: []const u8,
-    ) !void {
+    ) !bool {
         const cfg = self.core.index_manager.get(index_name) orelse return error.NotFound;
         if (cfg.kind != .dense_vector) return error.InvalidArgument;
         if (try self.indexRepairIdForIndex(alloc, index_name)) |repair_id| {
@@ -13235,12 +13274,23 @@ pub const DB = struct {
             // serviceability proof that created this shadow-repair intent.
             // Only an unrelated pre-existing intent is promoted to the
             // conservative blocking classification below.
-            if (entry.intent.trigger == .replay_artifact_unavailable) return;
+            if (entry.intent.trigger == .replay_artifact_unavailable) return true;
+            // Source replay for a newly admitted managed index can reach its
+            // canonical consumer before the producer publishes the referenced
+            // artifact. That is an expected dependency edge owned by the same
+            // durable admission job, not evidence that a serving generation
+            // is corrupt. Preserve the job class so the worker can retry via
+            // ReplayDocumentNotVisible without manufacturing repair debt.
+            if (entry.intent.work_class == .initial_build and
+                entry.intent.phase != .terminal)
+            {
+                return false;
+            }
             // A resumable shadow already owns recovery. Do not replace its
             // phase or candidate merely because the stale active generation
             // still cannot consume replay.
             const classifiable_phase = entry.intent.phase == .detected or entry.intent.phase == .preflight;
-            if (!classifiable_phase or entry.intent.candidate_relative_path != null) return;
+            if (!classifiable_phase or entry.intent.candidate_relative_path != null) return true;
             try self.updateIndexRepairIntent(alloc, repair_id, .{
                 // Preserve the pre-existing intent's fail-closed contract.
                 // Only debt created from this replay observation has proof
@@ -13250,7 +13300,7 @@ pub const DB = struct {
                 .last_error = reason,
                 .replace_last_error = true,
             });
-            return;
+            return true;
         }
         _ = try self.createGenerationRepairIntent(
             alloc,
@@ -13260,6 +13310,7 @@ pub const DB = struct {
             0,
             reason,
         );
+        return true;
     }
 
     fn createGenerationRepairIntent(
@@ -13280,6 +13331,7 @@ pub const DB = struct {
             last_error,
             null,
             .not_required,
+            .repair,
         );
     }
 
@@ -13293,6 +13345,7 @@ pub const DB = struct {
         last_error: ?[]const u8,
         minimum_target_sequence: ?u64,
         source_replay_state: index_repair_state.SourceReplayState,
+        work_class: index_repair_state.WorkClass,
     ) !u128 {
         lockAtomic(&self.async_context.index_repair_control_mutex);
         var control_locked = true;
@@ -13322,6 +13375,7 @@ pub const DB = struct {
             .kind = cfg.kind,
             .config_hash = types.indexConfigHash(cfg),
             .trigger = trigger,
+            .work_class = work_class,
             .operator_job_id = operator_job_id,
             .operator_job_created_at_ms = operator_job_created_at_ms,
             .detected_sequence = target_sequence,
@@ -13464,12 +13518,13 @@ pub const DB = struct {
         return try self.createGenerationRepairIntentAtTarget(
             alloc,
             cfg.*,
-            .projection_generation_invalid,
+            .catalog_admission,
             0,
             0,
             managed_catalog_admission_rebuild_reason,
             marker.replay_target_sequence,
             source_replay_state,
+            .initial_build,
         );
     }
 
@@ -13594,7 +13649,7 @@ pub const DB = struct {
             .operator_generation_rebuild, .operator_generation_validation => 0,
             .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
-            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => 3,
+            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
         };
     }
 
@@ -19053,6 +19108,7 @@ pub const DB = struct {
                     @tagName(invalid.reason),
                     native_generation.value().capture_target_sequence,
                     .not_required,
+                    .repair,
                 );
             }
             try restored.core.index_manager.syncAll(true);
@@ -22840,10 +22896,16 @@ pub const DB = struct {
     const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
         wait_for_enrichment_retries: bool = false,
+        cancellation: types.CancellationToken = .none,
     };
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         if (sequence == 0) return;
+        if (options.cancellation.ptr != null) {
+            return try self.runDerivedUntilWithVisibilityWait(sequence, .{
+                .cancellation = options.cancellation,
+            });
+        }
         if (!self.executor.hasWorkers()) {
             try replayPendingDerivedBatches(self, null, null, options);
             return;
@@ -22927,7 +22989,7 @@ pub const DB = struct {
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         while (true) {
-            self.runEnrichmentUntil(sequence) catch |err| switch (err) {
+            self.runEnrichmentUntilWithCancellation(sequence, options.cancellation) catch |err| switch (err) {
                 error.EnrichmentRetryInProgress => {
                     if (!options.wait_for_enrichment_retries) return err;
                     sleepNs(25 * std.time.ns_per_ms);
@@ -23433,6 +23495,17 @@ pub const DB = struct {
     /// indefinitely waiting owner of the same replay tail.
     pub fn runUntilIdleWithoutWaitingForEnrichmentRetries(self: *DB) !void {
         try self.runUntilIdleWithReplayDrainOptions(.{});
+    }
+
+    /// Borrowed maintenance owners must release their group quantum when a
+    /// higher-priority lifecycle operation arrives. This cancels only the
+    /// waiter's ownership; the resident enrichment worker retains durable work
+    /// and continues (or is explicitly reconfigured) under its own lifecycle.
+    pub fn runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(
+        self: *DB,
+        cancellation: types.CancellationToken,
+    ) !void {
+        try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -25752,6 +25825,7 @@ pub const DB = struct {
         item: *types.DBIndexStats,
     ) !void {
         if (repair_state_corrupt) {
+            item.index_lifecycle_work_class = .repair;
             item.index_repair_trigger = "corrupt_local_repair_state";
             item.index_repair_phase = "terminal";
             item.index_repair_wait_reason = "terminal";
@@ -25764,6 +25838,10 @@ pub const DB = struct {
         const i = durable.findIndex(item.name) orelse return;
         const intent = durable.entries.items[i].intent;
         item.index_repair_id = intent.repair_id;
+        item.index_lifecycle_work_class = switch (intent.work_class) {
+            .initial_build => .initial_build,
+            .repair => .repair,
+        };
         item.index_repair_trigger = @tagName(intent.trigger);
         item.index_repair_phase = @tagName(intent.phase);
         item.index_repair_automation = @tagName(intent.automation);
@@ -25835,11 +25913,18 @@ pub const DB = struct {
         item.index_repair_active_generation_serviceable = active_generation_complete or
             active_generation_queryable or
             admitted_serving_generation;
-        switch (intent.trigger) {
+        if (intent.work_class == .initial_build) {
+            // A new catalog definition over an existing corpus is normal
+            // restartable build work. It remains gated until publication,
+            // but is neither corruption nor degraded service.
+            item.backfill_active = intent.phase != .terminal;
+            item.repair_degraded = false;
+        } else switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
             .projection_generation_invalid,
             .operator_generation_validation,
+            .catalog_admission,
             => item.repair_degraded = true,
             .artifact_coverage_mismatch, .artifact_counter_missing => {
                 // Source-coverage proof is incomplete or false. Keep the
@@ -28020,7 +28105,7 @@ pub const DB = struct {
     }
 
     /// Converts an idle-watermark/source-coverage mismatch into the existing
-    /// durable, bounded generation-repair state machine. Source discovery is
+    /// durable, bounded generation-materialization state machine. Source discovery is
     /// paged at 128 documents per owner quantum and crash-resumes from its
     /// fenced cursor; the currently published partial generation remains
     /// serviceable until the replacement is atomically activated.
@@ -28041,6 +28126,11 @@ pub const DB = struct {
                 "generated_source_coverage_incomplete_after_replay",
                 null,
                 .pending,
+                // A missing terminal source outcome after replay is unfinished
+                // materialization, not evidence that the published generation
+                // is corrupt. It shares the bounded generation scheduler with
+                // repair, while retaining its non-repair lifecycle class.
+                .initial_build,
             );
             ensured += 1;
         }
@@ -49488,12 +49578,14 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     };
     applyDerivedBatchToIndexContext(&ctx, batch, index_ref) catch |err| switch (err) {
         // External-vector dense indexes can discover a missing artifact while
-        // replaying an otherwise valid journal window. Treat that as repair
-        // debt so startup can finish and the generation-repair path remains
-        // reachable instead of failing every attempt to open the table.
+        // replaying an otherwise valid journal window. Existing generations
+        // turn that into durable repair debt; initial materialization keeps it
+        // as an expected producer dependency so startup can retry without
+        // falsely reporting corruption.
         error.NotFound => if (index_ref.kind == .dense_vector) {
-            try self.markDenseReplayArtifactRepairRequired(self.alloc, index_ref.name);
-            return error.ArtifactRepairRequired;
+            if (try self.markDenseReplayArtifactRepairRequired(self.alloc, index_ref.name))
+                return error.ArtifactRepairRequired;
+            return error.ReplayDocumentNotVisible;
         } else return err,
         error.ArtifactRepairRequired => if (index_ref.kind == .dense_vector) {
             try self.markDenseReplayArtifactCoverageRepairRequired(self.alloc, index_ref.name);
@@ -79027,6 +79119,7 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
     var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
     defer entry.deinit(alloc);
     try std.testing.expectEqual(index_repair_state.Trigger.replay_artifact_unavailable, entry.intent.trigger);
+    try std.testing.expectEqual(index_repair_state.WorkClass.initial_build, entry.intent.work_class);
     try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, entry.intent.source_replay_state);
     try std.testing.expectEqual(index_repair_state.Phase.detected, entry.intent.phase);
     try std.testing.expect(!db.core.index_manager.repairUnavailable("semantic"));
@@ -84881,7 +84974,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
         saw_partial_repair_degraded = index_stats.repair_degraded;
     }
-    try std.testing.expect(saw_partial_repair_degraded);
+    try std.testing.expect(!saw_partial_repair_degraded);
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
     try db.failIfIndexQuarantined(cfg.name);
 
@@ -86627,7 +86720,7 @@ test "db dense replay failure upgrades a preflight validation intent" {
         .replace_last_error = true,
     });
 
-    try db.markDenseReplayArtifactRepairRequired(alloc, cfg.name);
+    try std.testing.expect(try db.markDenseReplayArtifactRepairRequired(alloc, cfg.name));
     var upgraded = try db.loadIndexRepairEntryById(alloc, repair_id);
     try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, upgraded.intent.trigger);
     try std.testing.expectEqual(index_repair_state.Phase.preflight, upgraded.intent.phase);
@@ -86645,6 +86738,37 @@ test "db dense replay failure upgrades a preflight validation intent" {
     defer upgraded.deinit(alloc);
     try std.testing.expectEqual(index_repair_state.Trigger.artifact_coverage_mismatch, upgraded.intent.trigger);
     try std.testing.expectEqualStrings("dense_replay_artifact_unreadable", upgraded.intent.last_error.?);
+}
+
+test "db dense replay missing artifact remains a normal managed admission dependency" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const cfg = types.IndexConfig{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}",
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(!try db.markDenseReplayArtifactRepairRequired(alloc, cfg.name));
+    var retained = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.WorkClass.initial_build, retained.intent.work_class);
+    try std.testing.expectEqual(index_repair_state.Trigger.catalog_admission, retained.intent.trigger);
+    try std.testing.expectEqual(index_repair_state.Phase.detected, retained.intent.phase);
+    try std.testing.expectEqualStrings("managed_catalog_admission_rebuild", retained.intent.last_error.?);
 }
 
 test "db durable repair classification emits exact admission and action edges" {

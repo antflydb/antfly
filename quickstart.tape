@@ -45,11 +45,11 @@ Type@75ms `antfly load -t wikipedia -f wiki-articles.json --id-field title`
 Enter
 Sleep 2s
 
-# Wait for embeddings to be queryable. This returns immediately on fast
+# Wait for a published embedding artifact. This returns immediately on fast
 # machines and fails clearly instead of silently continuing after five minutes.
-Type@75ms `antfly index wait -t wikipedia -i title_body --until queryable --timeout 20m`
+Type@75ms `antfly index wait -t wikipedia -i title_body --until searchable-artifacts=1 --timeout 20m`
 Enter
-Wait@1200s /reached queryable:/
+Wait@1200s /reached searchable-artifacts=1:/
 Sleep 1s
 
 # --- Full-text search ---

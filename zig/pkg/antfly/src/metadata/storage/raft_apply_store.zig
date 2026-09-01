@@ -721,6 +721,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var repair_indexes = [_]metadata.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
+        .lifecycle_work_class = .repair,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -5975,6 +5976,9 @@ fn appendRuntimeIndexStatusRecord(
         try appendInt(alloc, out, u64, record.publication_target_count);
         try out.append(alloc, if (record.publication_target_ready) 1 else 0);
         try out.append(alloc, if (record.serving_snapshot_ready) 1 else 0);
+        if ((record.repair_status != null) != (record.lifecycle_work_class == .repair))
+            return error.InvalidMetadataTransitionEncoding;
+        try out.append(alloc, @intFromEnum(record.lifecycle_work_class));
         try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
         try out.append(
             alloc,
@@ -6046,6 +6050,17 @@ fn readRuntimeIndexStatusRecord(
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
+    const lifecycle_work_class: metadata.IndexLifecycleWorkClass = if (version == runtime_status_protocol.current_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        break :blk switch (tag) {
+            @intFromEnum(metadata.IndexLifecycleWorkClass.none) => .none,
+            @intFromEnum(metadata.IndexLifecycleWorkClass.initial_build) => .initial_build,
+            @intFromEnum(metadata.IndexLifecycleWorkClass.repair) => .repair,
+            else => return error.InvalidMetadataTransitionEncoding,
+        };
+    } else .none;
     const repair_status: ?metadata.IndexRepairStatus = if (version == runtime_status_protocol.current_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
@@ -6059,6 +6074,8 @@ fn readRuntimeIndexStatusRecord(
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else null;
+    if ((repair_status != null) != (lifecycle_work_class == .repair))
+        return error.InvalidMetadataTransitionEncoding;
     const repair_active_generation_serviceable = if (version == runtime_status_protocol.current_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
@@ -6121,6 +6138,7 @@ fn readRuntimeIndexStatusRecord(
         .replay_catch_up_required = replay_catch_up_required,
         .embedding_activity = .{},
         .source_replay = source_replay,
+        .lifecycle_work_class = lifecycle_work_class,
         .repair_status = repair_status,
         .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
@@ -11641,6 +11659,7 @@ test "metadata raft apply store runtime status codec preserves document identity
                 .target_sequence = 19,
                 .failed = true,
             }})[0..]),
+            .lifecycle_work_class = .repair,
             .repair_status = .rebuilding,
             .repair_active_generation_serviceable = true,
         }})[0..]),
@@ -11863,6 +11882,7 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     indexes[0].serving_snapshot_ready = false;
 
     encoded.clearRetainingCapacity();
+    indexes[0].lifecycle_work_class = .repair;
     indexes[0].repair_status = .rebuilding;
     indexes[0].repair_active_generation_serviceable = true;
     try appendRuntimeGroupStatusRecord(
@@ -11915,6 +11935,7 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     try std.testing.expectEqual(@as(u64, 0), native_decoded.embedding_activity.epoch);
 
     encoded.clearRetainingCapacity();
+    indexes[0].lifecycle_work_class = .none;
     indexes[0].repair_status = null;
     indexes[0].repair_active_generation_serviceable = false;
     indexes[0].embedding_activity = .{ .epoch = 17, .embeddings_computed = 23 };

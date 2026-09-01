@@ -2705,6 +2705,7 @@ const ParsedRuntimeIndexStatus = struct {
     embedding_activity_observed: ?bool = null,
     embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
+    lifecycle_work_class: ?metadata_table_manager.IndexLifecycleWorkClass = null,
     repair_status: ?metadata_table_manager.IndexRepairStatus = null,
     repair_active_generation_serviceable: ?bool = null,
 };
@@ -3077,6 +3078,9 @@ fn cloneParsedRuntimeIndexStatus(
     alloc: std.mem.Allocator,
     parsed: ParsedRuntimeIndexStatus,
 ) !metadata_table_manager.RuntimeIndexStatusReport {
+    const lifecycle_work_class = parsed.lifecycle_work_class orelse .none;
+    if ((parsed.repair_status != null) != (lifecycle_work_class == .repair))
+        return error.InvalidRuntimeStatus;
     const name = try alloc.dupe(u8, parsed.name orelse "");
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, parsed.kind orelse "");
@@ -3137,6 +3141,7 @@ fn cloneParsedRuntimeIndexStatus(
             .last_progress_at_ms = activity.last_progress_at_ms orelse 0,
         } else .{},
         .source_replay = source_replay,
+        .lifecycle_work_class = lifecycle_work_class,
         .repair_status = parsed.repair_status,
         .repair_active_generation_serviceable = parsed.repair_status != null and
             (parsed.repair_active_generation_serviceable orelse false),
@@ -3146,7 +3151,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 

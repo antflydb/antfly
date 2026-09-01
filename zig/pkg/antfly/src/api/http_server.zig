@@ -4005,6 +4005,11 @@ pub const ApiHttpServer = struct {
                     .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
                 },
                 .source_replay = source_replay,
+                .index_lifecycle_work_class = switch (index.lifecycle_work_class) {
+                    .none => .none,
+                    .initial_build => .initial_build,
+                    .repair => .repair,
+                },
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
@@ -10779,11 +10784,11 @@ pub const ApiHttpServer = struct {
                 std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
                 break :projection false;
             };
-            // Install the local write capability before the create request
-            // returns. Provisioned sources make this an O(groups) online-DDL
-            // barrier; embedded sources preserve their synchronous contract.
-            // Generic reconciliation is separate because the same queue also
-            // repairs index deletion.
+            // Ask the local owner to activate the committed definition.
+            // Embedded sources preserve synchronous installation; provisioned
+            // sources acknowledge the durable target-fenced activation job and
+            // let their dedicated control-plane executor converge it. The HTTP
+            // request must never join an in-flight native inference kernel.
             var local_installation_complete = false;
             if (projection_ready) {
                 const installed = install: {
@@ -20347,6 +20352,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .kind = .dense_vector,
         .repair_degraded = true,
         .index_repair_id = 42,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "terminal",
         .index_repair_status = .failed,
         .index_repair_action_required = true,
@@ -20365,6 +20371,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .name = "semantic_idx",
         .kind = .dense_vector,
         .index_repair_id = 42,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "building",
         .index_repair_automation = "paused",
         .index_repair_status = .paused,
@@ -20386,6 +20393,7 @@ test "api http missing index classification requires active rebuild evidence" {
         .load_error = "CandidateManifestInvalid",
         .repair_degraded = true,
         .index_repair_id = 45,
+        .index_lifecycle_work_class = .repair,
         .index_repair_phase = "terminal",
         .index_repair_status = .failed,
         .index_repair_action_required = true,
@@ -20436,6 +20444,7 @@ test "api http missing index classification requires active rebuild evidence" {
             .kind = .dense_vector,
             .repair_degraded = true,
             .index_repair_id = 44,
+            .index_lifecycle_work_class = .repair,
             .index_repair_phase = "terminal",
             .index_repair_status = .failed,
             .index_repair_action_required = true,
@@ -35087,6 +35096,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .replay_applied_sequence = 225,
             .replay_target_sequence = 300,
             .replay_catch_up_required = true,
+            .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
             .embedding_activity_observed = true,
