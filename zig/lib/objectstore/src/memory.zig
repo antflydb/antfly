@@ -97,6 +97,7 @@ pub const MemoryClient = struct {
     }
 
     fn putObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         self.recordOperation();
         var object_map = try self.ensureBucket(bucket);
 
@@ -120,6 +121,7 @@ pub const MemoryClient = struct {
             .etag = owned_etag,
             .content_type = owned_content_type,
         };
+        if (opts.cancellation) |token| try token.check();
 
         // Fully construct before swapping the published value. Allocation
         // failure therefore leaves the old object intact and cannot leak a

@@ -128,6 +128,10 @@ pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; streaming providers check between bounded
+    /// chunks and before the final publication step.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const GetOptions = struct {

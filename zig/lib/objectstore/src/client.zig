@@ -56,6 +56,7 @@ pub const Client = struct {
     }
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
     }
 
@@ -66,7 +67,10 @@ pub const Client = struct {
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
-        if (self.vtable.put_file) |put_file| return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        if (opts.cancellation) |token| try token.check();
+        if (self.vtable.put_file) |put_file| {
+            return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        }
         const file = try openFilePath(io, src_path);
         defer file.close(io);
         const stat = try file.stat(io);
@@ -76,6 +80,7 @@ pub const Client = struct {
         if (try file.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
         var extra: [1]u8 = undefined;
         if (try file.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+        if (opts.cancellation) |token| try token.check();
         return try self.putObject(bucket, key, body, opts);
     }
 

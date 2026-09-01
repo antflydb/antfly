@@ -7722,6 +7722,10 @@ pub const ApiHttpServer = struct {
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         var operation_control = try backupOperationControl(io, fence, request);
+        const remote_repository = switch (backup_location.*) {
+            .file => false,
+            .remote => true,
+        };
         const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location, operation_control) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
@@ -7729,6 +7733,7 @@ pub const ApiHttpServer = struct {
         if (forwarded_shards) |shards| {
             defer freeBackupShards(self.alloc, shards);
             try writer_lease.ensureOwned();
+            try operation_control.ensureActive();
             for (shards) |shard| {
                 std.log.debug(
                     "fenced backup shard captured group_id={d} start={s} end={s} path={s} bytes={d}",
@@ -7737,13 +7742,27 @@ pub const ApiHttpServer = struct {
             }
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
+            try operation_control.ensureActive();
             cleanup_safe.* = false;
-            backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-                cleanup_safe.* = switch (err) {
+            backups_api.writeManifestToLocationWithIoAndCancellation(
+                self.alloc,
+                io,
+                backup_location,
+                &manifest,
+                operation_control.token(),
+            ) catch |err| {
+                const normalized_err = operation_control.normalizeInterruption(err);
+                cleanup_safe.* = switch (normalized_err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                    error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                     else => false,
                 };
-                return err;
+                if (remote_repository and
+                    (normalized_err == error.Canceled or
+                        normalized_err == error.Cancelled or
+                        normalized_err == error.Timeout))
+                    return error.BackupOutcomeAmbiguous;
+                return normalized_err;
             };
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 backups_api.retireForwardedTableBackupEnvelopeAtLocation(
@@ -7786,42 +7805,57 @@ pub const ApiHttpServer = struct {
         defer freeBackupShards(self.alloc, shards);
         try writer_lease.ensureOwned();
 
-        if (switch (backup_location.*) {
-            .remote => true,
-            .file => false,
-        }) {
+        if (remote_repository) {
             for (shards) |shard| {
+                try operation_control.ensureActive();
                 const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(snapshot_root);
                 switch (format) {
-                    .portable => try backups_api.copyFileToLocation(
+                    .portable => backups_api.copyFileToLocationWithCancellation(
                         self.alloc,
                         backup_location,
                         shard.snapshot_path,
                         snapshot_root,
                         "application/vnd.antfly.backup",
-                    ),
-                    .native => try backups_api.copyDirectoryToLocation(
+                        operation_control.token(),
+                    ) catch |err| return operation_control.normalizeInterruption(err),
+                    .native => backups_api.copyDirectoryToLocationWithCancellation(
                         self.alloc,
                         backup_location,
                         artifact_backup_id,
                         shard.group_id,
                         snapshot_root,
-                    ),
+                        operation_control.token(),
+                    ) catch |err| return operation_control.normalizeInterruption(err),
                 }
             }
         }
 
+        try operation_control.ensureActive();
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
         try writer_lease.ensureOwned();
+        try operation_control.ensureActive();
         cleanup_safe.* = false;
-        backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-            cleanup_safe.* = switch (err) {
+        backups_api.writeManifestToLocationWithIoAndCancellation(
+            self.alloc,
+            io,
+            backup_location,
+            &manifest,
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            cleanup_safe.* = switch (normalized_err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                 else => false,
             };
-            return err;
+            if (remote_repository and
+                (normalized_err == error.Canceled or
+                    normalized_err == error.Cancelled or
+                    normalized_err == error.Timeout))
+                return error.BackupOutcomeAmbiguous;
+            return normalized_err;
         };
     }
 
@@ -7903,26 +7937,30 @@ pub const ApiHttpServer = struct {
             .remote => true,
             .file => false,
         }) {
+            try operation_control.ensureActive();
             const shard = shards[0];
             const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
             defer self.alloc.free(snapshot_root);
             switch (format) {
-                .portable => try backups_api.copyFileToLocation(
+                .portable => backups_api.copyFileToLocationWithCancellation(
                     self.alloc,
                     backup_location,
                     shard.snapshot_path,
                     snapshot_root,
                     "application/vnd.antfly.backup",
-                ),
-                .native => try backups_api.copyDirectoryToLocation(
+                    operation_control.token(),
+                ) catch |err| return operation_control.normalizeInterruption(err),
+                .native => backups_api.copyDirectoryToLocationWithCancellation(
                     self.alloc,
                     backup_location,
                     artifact_backup_id,
                     shard.group_id,
                     snapshot_root,
-                ),
+                    operation_control.token(),
+                ) catch |err| return operation_control.normalizeInterruption(err),
             }
         }
+        try operation_control.ensureActive();
         try writer_lease.ensureOwned();
         return shards;
     }
@@ -7950,19 +7988,22 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         backup_id: []const u8,
         owner_id: []const u8,
+        control: *const backups_api.BackupOperationControl,
     ) !void {
         var reclaimed_expired = false;
         while (true) {
+            try control.ensureActive();
             const now_unix_ns: u64 =
                 @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
-            backups_api.reserveClusterBackupAttemptLeaseAtLocation(
+            backups_api.reserveClusterBackupAttemptLeaseAtLocationWithCancellation(
                 alloc,
                 io,
                 location,
                 backup_id,
                 owner_id,
                 now_unix_ns +| backups_api.backup_attempt_lease_duration_ns,
-            ) catch |err| switch (err) {
+                control.token(),
+            ) catch |err| switch (control.normalizeInterruption(err)) {
                 error.BackupAlreadyExists => {
                     const reclaimed = if (!reclaimed_expired)
                         try backups_api.reclaimExpiredClusterBackupAttemptAtLocation(
@@ -7980,7 +8021,7 @@ pub const ApiHttpServer = struct {
                     }
                     return error.BackupRepositoryBusy;
                 },
-                else => return err,
+                else => |normalized_err| return normalized_err,
             };
             return;
         }
@@ -11703,6 +11744,14 @@ pub const ApiHttpServer = struct {
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
         };
+        var operation_control: backups_api.BackupOperationControl = .{
+            .deadline_ns = operation_request.deadline_ns.?,
+            .cancellation = operation_request.cancellation,
+        };
+        const remote_repository = switch (location.*) {
+            .file => false,
+            .remote => true,
+        };
         const op_alloc = self.alloc;
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
@@ -11820,12 +11869,37 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         trace.enter(.attempt_marker);
-        backups_api.writeClusterBackupAttemptMarker(
+        backups_api.writeClusterBackupAttemptMarkerWithCancellation(
             op_alloc,
             backup_io,
             location,
             &attempt_marker,
-        ) catch |err| return trace.internal(err);
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            // A canceled conditional PUT can still have reached the provider.
+            // Resolve that ambiguity with an uncancelled, owner-specific
+            // delete so a stopped request cannot strand an undiscoverable
+            // marker before repository maintenance has been scheduled.
+            backups_api.deleteClusterBackupAttemptMarker(
+                op_alloc,
+                backup_io,
+                location,
+                &attempt_marker,
+            ) catch |cleanup_err| {
+                std.log.warn("cluster backup interrupted marker cleanup deferred class={s}", .{@errorName(cleanup_err)});
+            };
+            // Local publication may already have exposed the reclaim ticket;
+            // remote publication may have committed despite cancellation.
+            // Maintenance handles either orphan form without delaying the
+            // request's cancellation response.
+            self.scheduleClusterBackupMaintenance(req.location, connection) catch |schedule_err| {
+                std.log.warn("cluster backup interrupted marker maintenance scheduling deferred class={s}", .{@errorName(schedule_err)});
+            };
+            if (normalized_err == error.Canceled) return error.Canceled;
+            if (normalized_err == error.Timeout) return error.DeadlineExceeded;
+            return trace.internal(normalized_err);
+        };
         // Admission must establish the durable journal before this repository
         // becomes visible to asynchronous maintenance. On a new filesystem
         // repository, scheduling first lets the reclaimer and publisher race
@@ -11857,6 +11931,7 @@ pub const ApiHttpServer = struct {
             location,
             req.backup_id,
             attempt_id,
+            &operation_control,
         ) catch |err| switch (err) {
             error.BackupRepositoryBusy => {
                 backups_api.deleteClusterBackupAttemptMarker(
@@ -11868,6 +11943,21 @@ pub const ApiHttpServer = struct {
                     std.log.warn("cluster backup duplicate marker cleanup deferred phase=admission class={s}", .{@errorName(cleanup_err)});
                 };
                 return error.BackupRepositoryBusy;
+            },
+            error.Canceled, error.Timeout => |interruption| {
+                // Conditional reservation writes are ambiguous when their
+                // transport is interrupted. Exact-owner cleanup is safe even
+                // if the request never reached storage; scheduled maintenance
+                // remains the fallback if cleanup cannot complete.
+                self.cleanupClusterBackupAttempt(
+                    backup_io,
+                    location,
+                    &attempt_marker,
+                ) catch |cleanup_err| {
+                    std.log.warn("cluster backup interrupted admission cleanup deferred class={s}", .{@errorName(cleanup_err)});
+                };
+                if (interruption == error.Canceled) return error.Canceled;
+                return error.DeadlineExceeded;
             },
             // An unknown conditional-write outcome may have acquired the
             // reservation. Retain the marker so recovery can resolve it.
@@ -11895,12 +11985,18 @@ pub const ApiHttpServer = struct {
         // every attempt that can produce side effects is visible to restore.
         // Cleanup conditionally retires an ambiguous or failed publication.
         trace.enter(.attempt_head);
-        backups_api.writeClusterBackupAttemptHead(
+        backups_api.writeClusterBackupAttemptHeadWithCancellation(
             op_alloc,
             backup_io,
             location,
             attempt_id,
-        ) catch |err| return trace.internal(err);
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            if (normalized_err == error.Canceled) return error.Canceled;
+            if (normalized_err == error.Timeout) return error.DeadlineExceeded;
+            return trace.internal(normalized_err);
+        };
         const initial_lease_expiration =
             @as(u64, @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds())) +|
             backups_api.backup_attempt_lease_duration_ns;
@@ -11930,6 +12026,10 @@ pub const ApiHttpServer = struct {
 
         trace.enter(.table_snapshots);
         for (table_names, attempt_tables, 0..) |table_name, attempt_table, i| {
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             if (lease_heartbeat.lost.load(.acquire))
                 return trace.internal(error.BackupAttemptLeaseLost);
             const status_name = op_alloc.dupe(u8, table_name) catch |err| return trace.internal(err);
@@ -12024,6 +12124,10 @@ pub const ApiHttpServer = struct {
         // status without exposing a partial aggregate as a restore candidate.
         if (cluster_tables.items.len == table_names.len) {
             trace.enter(.aggregate_publish);
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             // Close the last renewal/publication race. If another process took
             // an expired lease, this conditional renewal fences publication.
             lease_heartbeat.ensureOwned() catch |err| return trace.internal(err);
@@ -12040,16 +12144,35 @@ pub const ApiHttpServer = struct {
                 extension_dependencies,
             ) catch |err| return trace.internal(err);
             defer manifest.deinit(op_alloc);
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             cluster_cleanup_safe = false;
-            backups_api.writeClusterManifestToLocationWithIo(op_alloc, backup_io, location, &manifest) catch |err| {
-                cluster_cleanup_safe = switch (err) {
+            backups_api.writeClusterManifestToLocationWithIoAndCancellation(
+                op_alloc,
+                backup_io,
+                location,
+                &manifest,
+                operation_control.token(),
+            ) catch |err| {
+                const normalized_err = operation_control.normalizeInterruption(err);
+                cluster_cleanup_safe = switch (normalized_err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                    error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                     else => false,
                 };
-                return switch (err) {
+                if (remote_repository and
+                    (normalized_err == error.Canceled or
+                        normalized_err == error.Cancelled or
+                        normalized_err == error.Timeout))
+                    return error.BackupOutcomeAmbiguous;
+                return switch (normalized_err) {
                     error.BackupAlreadyExists => error.BackupAlreadyExists,
                     error.BackupManifestTooLarge => error.BackupManifestTooLarge,
-                    else => trace.internal(err),
+                    error.Canceled => error.Canceled,
+                    error.Timeout => error.DeadlineExceeded,
+                    else => trace.internal(normalized_err),
                 };
             };
             if (!(backups_api.commitClusterBackupAttemptHeadIfOwned(

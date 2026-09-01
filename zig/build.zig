@@ -6877,6 +6877,8 @@ pub fn build(b: *std.Build) void {
             "api http server cluster overwrite restores from read-only repository without dropping live table",
             "api http server rejects an empty cluster backup without publishing a manifest",
             "backup manifest validation rejects ambiguous or unbound artifacts",
+            "backup manifest cancellation prevents late publication",
+            "backup root publication cancellation leaves no visible control record",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",

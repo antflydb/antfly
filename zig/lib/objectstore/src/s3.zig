@@ -526,7 +526,7 @@ test "request-scoped S3 transport preserves caller IO and client config" {
     try std.testing.expectError(error.Timeout, remainingRequestTimeoutMs(250, 250 * std.time.ns_per_ms));
 }
 
-test "s3 read cancellation reaches active GET and HEAD transport requests" {
+test "s3 cancellation reaches active read and write transport requests" {
     const alloc = std.testing.allocator;
     const State = struct {
         signal: *std.atomic.Value(bool),
@@ -589,6 +589,16 @@ test "s3 read cancellation reaches active GET and HEAD transport requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .PUT;
+    try std.testing.expectError(
+        error.Canceled,
+        client.putObject("bucket", "object", "payload", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 pub const Client = struct {
@@ -704,6 +714,7 @@ pub const Client = struct {
         body: []const u8,
         opts: types.PutOptions,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         var target = try objectTargetAlloc(alloc, self.cfg, bucket, key);
         defer target.deinit(alloc);
 
@@ -712,7 +723,15 @@ pub const Client = struct {
         const owned_if_match = try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
         defer if (owned_if_match) |value| alloc.free(value);
 
-        var response = try self.perform(.PUT, target, headers.items, body, opts.content_type);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .PUT,
+            target,
+            headers.items,
+            body,
+            opts.content_type,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -749,6 +768,7 @@ pub const Client = struct {
         opts: types.PutOptions,
         multipart_threshold: u64,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
@@ -760,6 +780,7 @@ pub const Client = struct {
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
             if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            if (opts.cancellation) |token| try token.check();
             return try self.putObject(alloc, bucket, key, body, opts);
         }
         if (opts.if_match_etag != null or opts.if_none_match) return error.ConditionalMultipartUnsupported;
@@ -777,7 +798,15 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, initiate_pairs);
         var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
         defer initiate_target.deinit(alloc);
-        var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
+        var initiated = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            initiate_target,
+            &.{},
+            null,
+            opts.content_type,
+            null,
+            opts.cancellation,
+        );
         defer initiated.deinit(alloc);
         if (initiated.status != 200) return unexpectedStatusError(initiated.status);
         const upload_id = try requiredTagAlloc(alloc, initiated.body, "UploadId");
@@ -795,6 +824,7 @@ pub const Client = struct {
         var offset: u64 = 0;
         var part_number: u32 = 1;
         while (offset < stat.size) : (part_number += 1) {
+            if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -809,7 +839,15 @@ pub const Client = struct {
             defer freeQueryPairs(alloc, query_pairs);
             var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
             defer target.deinit(alloc);
-            var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
+            var response = try self.performWithResponseLimitAndCancellation(
+                .PUT,
+                target,
+                &.{},
+                buffer[0..wanted],
+                null,
+                null,
+                opts.cancellation,
+            );
             defer response.deinit(alloc);
             if (response.status != 200) return unexpectedStatusError(response.status);
             const etag = response.etag orelse return error.MissingMultipartEtag;
@@ -818,6 +856,7 @@ pub const Client = struct {
         }
         var extra: [1]u8 = undefined;
         if (try source.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+        if (opts.cancellation) |token| try token.check();
 
         const completion_xml = try completeMultipartXmlAlloc(alloc, etags.items);
         defer alloc.free(completion_xml);
@@ -828,7 +867,15 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, complete_pairs);
         var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
         defer complete_target.deinit(alloc);
-        var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
+        var response = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            complete_target,
+            &.{},
+            completion_xml,
+            "application/xml",
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
         if (response.status != 200) return unexpectedStatusError(response.status);
         if (findBlock(response.body, "Error", 0) != null) return error.MultipartCompletionFailed;

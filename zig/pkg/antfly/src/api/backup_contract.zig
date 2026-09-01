@@ -238,6 +238,16 @@ pub const BackupOperationControl = struct {
         const rounded_ms = std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1;
         return @intCast(@max(@as(u64, 1), @min(rounded_ms, @as(u64, std.math.maxInt(u32)))));
     }
+
+    /// Object-store transports expose cancellation as one portable error even
+    /// when the callback fired because this control's deadline elapsed. Recover
+    /// the operator-facing cause after the synchronous operation has drained.
+    pub fn normalizeInterruption(self: @This(), err: anyerror) anyerror {
+        if (err != error.Canceled and err != error.Cancelled) return err;
+        if (self.cancellation.isCancelled()) return error.Canceled;
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+        return err;
+    }
 };
 
 pub const TableRestorePlan = struct {
@@ -254,3 +264,18 @@ pub const TableRestorePlan = struct {
     /// borrowed only for the synchronous restore callback.
     cancellation: CancellationToken = .none,
 };
+
+test "backup operation control preserves cancellation and deadline causes" {
+    const elapsed_deadline = BackupOperationControl{
+        .deadline_ns = platform_time.monotonicNs(),
+    };
+    try std.testing.expectEqual(error.Timeout, elapsed_deadline.normalizeInterruption(error.Canceled));
+
+    var cancellation = std.atomic.Value(bool).init(true);
+    const explicitly_cancelled = BackupOperationControl{
+        .deadline_ns = std.math.maxInt(u64),
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
+    };
+    try std.testing.expectEqual(error.Canceled, explicitly_cancelled.normalizeInterruption(error.Cancelled));
+    try std.testing.expectEqual(error.Unexpected, explicitly_cancelled.normalizeInterruption(error.Unexpected));
+}

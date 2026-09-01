@@ -335,6 +335,7 @@ pub const JsonApiClient = struct {
         body: []const u8,
         opts: types.PutOptions,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const url = try uploadMediaUrlAlloc(alloc, self.cfg, bucket, key, opts);
         defer alloc.free(url);
 
@@ -342,7 +343,15 @@ pub const JsonApiClient = struct {
         defer headers.deinit(alloc);
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
 
-        var response = try self.perform(.POST, url, headers.items, body, opts.content_type orelse "application/octet-stream");
+        var response = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            url,
+            headers.items,
+            body,
+            opts.content_type orelse "application/octet-stream",
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -381,6 +390,7 @@ pub const JsonApiClient = struct {
         opts: types.PutOptions,
         resumable_threshold: u64,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
@@ -392,6 +402,7 @@ pub const JsonApiClient = struct {
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
             if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            if (opts.cancellation) |token| try token.check();
             return try self.putObject(alloc, bucket, key, body, opts);
         }
         if (opts.if_match_etag != null) return error.ConditionalResumableUploadUnsupported;
@@ -409,7 +420,15 @@ pub const JsonApiClient = struct {
             .{ "X-Upload-Content-Length", size_text },
             .{ "X-Upload-Content-Type", upload_type },
         };
-        var initiated = try self.perform(.POST, initiate_url, &initiate_headers, "{}", "application/json");
+        var initiated = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            initiate_url,
+            &initiate_headers,
+            "{}",
+            "application/json",
+            null,
+            opts.cancellation,
+        );
         defer initiated.deinit(alloc);
         if (initiated.status != 200 and initiated.status != 201) return mapUnexpectedStatus(initiated.status);
         const session_url = initiated.location orelse return error.MissingResumableUploadLocation;
@@ -422,6 +441,7 @@ pub const JsonApiClient = struct {
         var final_response: ?TransportResponse = null;
         defer if (final_response) |*response| response.deinit(alloc);
         while (offset < stat.size) {
+            if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -430,7 +450,15 @@ pub const JsonApiClient = struct {
             const content_range = try std.fmt.allocPrint(alloc, "bytes {d}-{d}/{d}", .{ offset, last, stat.size });
             defer alloc.free(content_range);
             const headers = [_]HeaderPair{.{ "Content-Range", content_range }};
-            var response = try self.perform(.PUT, session_url, &headers, buffer[0..wanted], upload_type);
+            var response = try self.performWithResponseLimitAndCancellation(
+                .PUT,
+                session_url,
+                &headers,
+                buffer[0..wanted],
+                upload_type,
+                null,
+                opts.cancellation,
+            );
             if (offset + wanted < stat.size) {
                 defer response.deinit(alloc);
                 if (response.status != 308) return mapUnexpectedStatus(response.status);
@@ -1537,10 +1565,11 @@ test "json api metadata falls back to the always-available crc32c checksum" {
     try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
 }
 
-test "gcs read cancellation reaches active media and metadata requests" {
+test "gcs cancellation reaches active read and write requests" {
     const alloc = std.testing.allocator;
     const State = struct {
         signal: *std.atomic.Value(bool),
+        expected_method: HttpMethod = .GET,
         calls: usize = 0,
 
         fn request(
@@ -1556,7 +1585,7 @@ test "gcs read cancellation reaches active media and metadata requests" {
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
-            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expectEqual(self.expected_method, method);
             self.signal.store(true, .release);
             try cancellation.?.check();
             return error.TestExpectedCancellation;
@@ -1589,6 +1618,16 @@ test "gcs read cancellation reaches active media and metadata requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .POST;
+    try std.testing.expectError(
+        error.Canceled,
+        client.putObject("bucket", "object", "payload", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 test "json api client put object encodes upload url and returns etag" {
