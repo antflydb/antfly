@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -17,6 +18,14 @@ import (
 )
 
 const haTopologyIDAnnotation = "antfly.io/ha-topology-id"
+
+const (
+	defaultHAPrimaryLogPath      = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath    = "/antflydb/ha/slots"
+	defaultHAStandbyLogPath      = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath = "/antflydb/ha/standby-progress.wal"
+	promotedPrimarySlotsSuffix   = ".promoted-primary-slots"
+)
 
 var (
 	// irsaARNPattern matches AWS IAM Role ARNs including China and GovCloud partitions.
@@ -51,7 +60,76 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 	if err := r.ValidateImmutability(oldCluster); err != nil {
 		return err
 	}
-	return r.ValidateAntflyCluster()
+	if err := r.ValidateAntflyCluster(); err != nil {
+		return err
+	}
+	return r.validateHAPromotedPrimaryStorageBinding(oldCluster)
+}
+
+// validateHAPromotedPrimaryStorageBinding preserves both pieces of durable
+// storage authority across an in-place standby promotion: the activated PVC
+// binding and the exact WAL/slot paths adopted by the running process.
+func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyCluster) error {
+	if old == nil || old.Spec.HighAvailability == nil || old.Spec.HighAvailability.Runtime == nil ||
+		r.Spec.HighAvailability == nil || r.Spec.HighAvailability.Runtime == nil {
+		return nil
+	}
+	oldRuntime := old.Spec.HighAvailability.Runtime
+	newRuntime := r.Spec.HighAvailability.Runtime
+	if oldRuntime.Role == HARuntimeRoleStandby && newRuntime.Role == HARuntimeRolePrimary {
+		oldLogPath, oldProgressPath := effectiveHAStandbyPaths(oldRuntime.Standby)
+		newLogPath, newSlotsPath := effectiveHAPrimaryPaths(newRuntime.Primary)
+		expectedSlotsPath := oldProgressPath + promotedPrimarySlotsSuffix
+		if newLogPath != oldLogPath || newSlotsPath != expectedSlotsPath {
+			return fmt.Errorf(
+				"spec.highAvailability.runtime.primary must reopen the promoted standby storage: logPath=%q and slotsPath=%q",
+				oldLogPath,
+				expectedSlotsPath,
+			)
+		}
+	}
+	oldGate := oldRuntime.StartupGate
+	newGate := newRuntime.StartupGate
+	oldBoundPrimary := oldRuntime.Role == HARuntimeRolePrimary && oldGate != nil && oldGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	newBoundPrimary := newRuntime.Role == HARuntimeRolePrimary && newGate != nil && newGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	// A physically fenced primary may subsequently be rewritten as a standby
+	// with a repair/suspension gate. Immutability applies only while entering or
+	// remaining in the Primary role.
+	if newRuntime.Role != HARuntimeRolePrimary || (!oldBoundPrimary && !newBoundPrimary) {
+		return nil
+	}
+	if !reflect.DeepEqual(oldGate, newGate) {
+		return fmt.Errorf("spec.highAvailability.runtime.startupGate activated-volume binding is immutable across and after promotion")
+	}
+	return nil
+}
+
+func effectiveHAStandbyPaths(standby *HAStandbyRuntimeSpec) (string, string) {
+	logPath := defaultHAStandbyLogPath
+	progressPath := defaultHAStandbyProgressPath
+	if standby != nil {
+		if value := strings.TrimSpace(standby.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(standby.ProgressPath); value != "" {
+			progressPath = value
+		}
+	}
+	return logPath, progressPath
+}
+
+func effectiveHAPrimaryPaths(primary *HAPrimaryRuntimeSpec) (string, string) {
+	logPath := defaultHAPrimaryLogPath
+	slotsPath := defaultHAPrimarySlotsPath
+	if primary != nil {
+		if value := strings.TrimSpace(primary.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(primary.SlotsPath); value != "" {
+			slotsPath = value
+		}
+	}
+	return logPath, slotsPath
 }
 
 // Default applies admission defaults to AntflyCluster.
@@ -1479,6 +1557,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if admin := ha.Admin; admin != nil {
 		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		errors = append(errors, validateHAAdminURL(admin.PrimaryActionURL, "spec.highAvailability.admin.primaryActionURL")...)
 		if strings.TrimSpace(admin.TokenEnvVar) == "" && admin.TokenEnvVar != "" {
 			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must not be whitespace")
 		}
@@ -1633,7 +1712,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		} else if fencingAuthority != HAFencingAuthorityKubernetesLease {
 			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must be KubernetesLease for operator-managed automatic failover")
 		}
-		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
+		stagedStandby := ha.Runtime != nil && ha.Runtime.Role == HARuntimeRoleStandby &&
+			ha.Admin != nil && !ha.Admin.ExecutePlannedActions
+		if ha.Admin == nil || (!ha.Admin.ExecutePlannedActions && !stagedStandby) {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
 		}
 		for i, standby := range ha.Standbys {
@@ -1743,10 +1824,10 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	gate := ha.Runtime.StartupGate
 	fieldPath := "spec.highAvailability.runtime.startupGate"
 	var errors []string
-	if ha.Runtime.Role != HARuntimeRoleStandby {
-		errors = append(errors, fieldPath+" requires runtime.role Standby")
-	}
 	if gate.Policy == HAStartupGatePolicySuspend {
+		if ha.Runtime.Role != HARuntimeRoleStandby {
+			errors = append(errors, fieldPath+".policy Suspend requires runtime.role Standby")
+		}
 		if gate.RuntimeEligible {
 			errors = append(errors, fieldPath+".policy Suspend requires runtimeEligible=false")
 		}
@@ -1760,6 +1841,9 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	}
 	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
 		errors = append(errors, fieldPath+".policy must be Suspend or RequireActivatedSeed")
+	}
+	if ha.Runtime.Role == HARuntimeRolePrimary && !gate.RuntimeEligible {
+		errors = append(errors, fieldPath+" on runtime.role Primary requires runtimeEligible=true")
 	}
 	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
 		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact for RequireActivatedSeed")
@@ -1800,7 +1884,8 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	if strings.TrimSpace(required.NodeID) != strings.TrimSpace(ha.Runtime.NodeID) {
 		errors = append(errors, fieldPath+".requiredReceipt.nodeID must match runtime.nodeID")
 	}
-	if ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName) {
+	if ha.Runtime.Role == HARuntimeRoleStandby &&
+		(ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName)) {
 		errors = append(errors, fieldPath+".requiredReceipt.slotName must match runtime.standby.slotName")
 	}
 
@@ -1813,26 +1898,39 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 		errors = append(errors, fmt.Sprintf("%s.requiredReceipt.targetPVCName %q is invalid: %s", fieldPath, targetPVCName, strings.Join(nameErrs, "; ")))
 	}
 
-	var artifact *HASeedArtifactSpec
-	for i := range ha.Standbys {
-		standby := &ha.Standbys[i]
-		slotName := strings.TrimSpace(standby.SlotName)
-		if slotName == "" {
-			slotName = strings.TrimSpace(standby.Name)
+	if ha.Runtime.Role == HARuntimeRolePrimary {
+		// A promoted seeded runtime keeps the exact gate as durable storage
+		// provenance after its standby slot leaves the new primary topology.
+		// Require incarnation-level bindings so it can never fall back to a
+		// newly-created empty claim if that retained volume disappears.
+		if required.TopologyGeneration <= 0 {
+			errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must be greater than zero for runtime.role Primary")
 		}
-		if slotName == strings.TrimSpace(required.SlotName) {
-			artifact = standby.SeedArtifact
-			break
+		if strings.TrimSpace(required.TargetPVCUID) == "" {
+			errors = append(errors, fieldPath+".requiredReceipt.targetPVCUID is required for runtime.role Primary")
 		}
-	}
-	if artifact == nil {
-		errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
 	} else {
-		if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
-			errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+		var artifact *HASeedArtifactSpec
+		for i := range ha.Standbys {
+			standby := &ha.Standbys[i]
+			slotName := strings.TrimSpace(standby.SlotName)
+			if slotName == "" {
+				slotName = strings.TrimSpace(standby.Name)
+			}
+			if slotName == strings.TrimSpace(required.SlotName) {
+				artifact = standby.SeedArtifact
+				break
+			}
 		}
-		if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
-			errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+		if artifact == nil {
+			errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
+		} else {
+			if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
+				errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+			}
+			if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+				errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+			}
 		}
 	}
 

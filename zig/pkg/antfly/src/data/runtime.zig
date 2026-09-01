@@ -3617,6 +3617,17 @@ pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.Replic
 pub const HAStandbyReplicationResult = antfly.ha.http_replication_client.Result;
 pub const HAStandbyReplicationLoopResult = antfly.ha.http_replication_client.LoopResult;
 
+fn haReplicationWindowReachedEnd(
+    upstream_end_of_wal: bool,
+    fetched_count: usize,
+    received_count: usize,
+    progress: antfly.ha.standby.Progress,
+) bool {
+    return upstream_end_of_wal and
+        received_count == fetched_count and
+        progress.applied_lsn == progress.received_lsn;
+}
+
 const HAStandbyReplicationErrorCode = enum(u8) {
     none = 0,
     HttpConnectionClosing,
@@ -3625,6 +3636,14 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     BrokenPipe,
     EndOfStream,
     NoAddressReturned,
+    Timeout,
+    ConnectionTimedOut,
+    NetworkUnreachable,
+    HostUnreachable,
+    NetworkDown,
+    AddressUnavailable,
+    TemporaryNameServerFailure,
+    NameServerFailure,
     InvalidInternalReplicationRequest,
     InternalReplicationEndpointNotFound,
     UnsupportedOperation,
@@ -3671,6 +3690,14 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
         error.NoAddressReturned => .NoAddressReturned,
+        error.Timeout => .Timeout,
+        error.ConnectionTimedOut => .ConnectionTimedOut,
+        error.NetworkUnreachable => .NetworkUnreachable,
+        error.HostUnreachable => .HostUnreachable,
+        error.NetworkDown => .NetworkDown,
+        error.AddressUnavailable => .AddressUnavailable,
+        error.TemporaryNameServerFailure => .TemporaryNameServerFailure,
+        error.NameServerFailure => .NameServerFailure,
         error.InvalidInternalReplicationRequest => .InvalidInternalReplicationRequest,
         error.InternalReplicationEndpointNotFound => .InternalReplicationEndpointNotFound,
         error.UnsupportedOperation => .UnsupportedOperation,
@@ -3719,6 +3746,14 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
         .NoAddressReturned => "NoAddressReturned",
+        .Timeout => "Timeout",
+        .ConnectionTimedOut => "ConnectionTimedOut",
+        .NetworkUnreachable => "NetworkUnreachable",
+        .HostUnreachable => "HostUnreachable",
+        .NetworkDown => "NetworkDown",
+        .AddressUnavailable => "AddressUnavailable",
+        .TemporaryNameServerFailure => "TemporaryNameServerFailure",
+        .NameServerFailure => "NameServerFailure",
         .InvalidInternalReplicationRequest => "InvalidInternalReplicationRequest",
         .InternalReplicationEndpointNotFound => "InternalReplicationEndpointNotFound",
         .UnsupportedOperation => "UnsupportedOperation",
@@ -3758,7 +3793,33 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
     };
 }
 
+fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+    return switch (haStandbyReplicationErrorCode(err)) {
+        .HttpConnectionClosing,
+        .ConnectionResetByPeer,
+        .ConnectionRefused,
+        .BrokenPipe,
+        .EndOfStream,
+        .NoAddressReturned,
+        .Timeout,
+        .ConnectionTimedOut,
+        .NetworkUnreachable,
+        .HostUnreachable,
+        .NetworkDown,
+        .AddressUnavailable,
+        .TemporaryNameServerFailure,
+        .NameServerFailure,
+        .NotListening,
+        => true,
+        else => false,
+    };
+}
+
 fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
+    // Losing the upstream transport is expected during primary failure. Keep
+    // the standby control plane alive so it can expose its durable safe-read
+    // boundary and complete the separately fenced promotion protocol.
+    if (isHAStandbyUpstreamTransportError(err)) return true;
     return switch (err) {
         // Promotion is durably committed before the runtime adopts the
         // standby's resources. Keep the process available and fail closed so
@@ -3775,12 +3836,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.WriterLocked,
         error.InvalidPromotionHandoff,
         error.MissingPromotionSwitch,
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.NoAddressReturned,
-        error.BrokenPipe,
-        error.EndOfStream,
         // Upstream route/resource availability and protocol negotiation are
         // operational degradation, not local process integrity failures. Keep
         // stale reads and promotion controls available while reporting the
@@ -3792,7 +3847,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.InternalReplicationEndpointNotReady,
         error.SlotNotFound,
         error.UnexpectedHttpStatus,
-        error.NotListening,
         error.UnsupportedReplicationFormat,
         error.InternalReplicationDidNotAdvance,
         error.ReplicationResponseLsnMismatch,
@@ -3848,6 +3902,29 @@ fn isSupersededHAStandbyReplicationRound(err: anyerror) bool {
 
 test "data server keeps upstream replication availability failures nonfatal" {
     inline for (.{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.NoAddressReturned,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.NotListening,
+    }) |err| {
+        try std.testing.expect(isHAStandbyUpstreamTransportError(err));
+        try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
+        const code = haStandbyReplicationErrorCode(err);
+        try std.testing.expect(code != .Other);
+        try std.testing.expectEqualStrings(@errorName(err), haStandbyReplicationErrorName(code).?);
+    }
+    inline for (.{
         error.InvalidInternalReplicationRequest,
         error.InternalReplicationEndpointNotFound,
         error.UnsupportedOperation,
@@ -3855,6 +3932,7 @@ test "data server keeps upstream replication availability failures nonfatal" {
         error.InternalReplicationEndpointNotReady,
         error.SlotNotFound,
     }) |err| {
+        try std.testing.expect(!isHAStandbyUpstreamTransportError(err));
         try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
         try std.testing.expect(haStandbyReplicationErrorCode(err) != .Other);
     }
@@ -4976,9 +5054,6 @@ pub const DataServer = struct {
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
-    /// Immutable startup role used by lock-free ingress policy snapshots.
-    /// Mutable HA context fields remain protected by `ha_state_mutex`.
-    ha_ingress_started_as_standby: bool = false,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5043,15 +5118,33 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
-    const ha_replication_default_max_records_per_apply = 256;
+    // Receiving and applying a fetched batch holds ha_state_mutex so promotion
+    // cannot consume the standby while records are in flight. Bound both the
+    // durable work count and elapsed apply time: record cost varies with LSM
+    // pressure, so a count-only window does not guarantee control-plane
+    // responsiveness. Pending apply debt is drained before accepting more WAL.
+    const ha_replication_default_max_records_per_apply = 8;
+    const ha_replication_default_apply_window_ns = 250 * std.time.ns_per_ms;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
     const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
+    const ha_standby_replication_connect_timeout_ms = 10_000;
+    const ha_seed_snapshot_preflight_timeout_ns = 30 * std.time.ns_per_s;
 
     fn haStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
         return .{
             .max_response_bytes = ha_replication_default_max_response_bytes,
             .resolve_before_connect = true,
+            // DNS and connect are part of the failover transport. Bound that
+            // phase without imposing an absolute deadline on a replication
+            // response that is still making byte-level progress; the latter
+            // must remain safe to validate after a concurrent promotion.
+            .connect_timeout_ms = ha_standby_replication_connect_timeout_ms,
+            // The upstream is a Kubernetes headless Service. Resolve every
+            // bounded replication request so Pod replacement, fencing, and
+            // endpoint-based isolation take effect even while the old Pod is
+            // still reachable by its former IP.
+            .cache_resolved_addresses = false,
         };
     }
 
@@ -5226,7 +5319,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5268,7 +5360,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5310,7 +5401,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5375,7 +5465,6 @@ pub const DataServer = struct {
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
-        api_server_cfg.ha_mutation_policy_source = self.haMutationPolicySource();
         self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
@@ -5613,11 +5702,20 @@ pub const DataServer = struct {
             return error.HAStandbyStateChanged;
         }
 
-        const applied = client.applyFetched(
+        const apply_deadline_ns = platform_time.monotonicNs() +|
+            ha_replication_default_apply_window_ns;
+        const applied = client.applyFetchedWithOptions(
             &batch,
             standby,
             self,
             DataServer.applyHAReplicationRecordCallback,
+            .{
+                .standby_apply = .{
+                    .max_records = ha_replication_default_max_records_per_apply,
+                    .deadline_ns = apply_deadline_ns,
+                },
+                .drain_pending_before_receive = true,
+            },
         ) catch |err| {
             const status = standby.snapshot();
             const status_identity = status.identity;
@@ -5649,7 +5747,12 @@ pub const DataServer = struct {
             .current_lsn = batch.current_lsn,
             .last_sent_lsn = batch.last_sent_lsn,
             .next_lsn = batch.next_lsn,
-            .end_of_wal = batch.end_of_wal,
+            .end_of_wal = haReplicationWindowReachedEnd(
+                batch.end_of_wal,
+                batch.frames.len,
+                applied.received_count,
+                applied.progress,
+            ),
         };
     }
 
@@ -5894,32 +5997,6 @@ pub const DataServer = struct {
         return null;
     }
 
-    fn haMutationPolicySource(self: *const DataServer) antfly.public_api.http_server.HAMutationPolicySource {
-        return .{
-            .ptr = self,
-            .snapshot_fn = haMutationPolicySnapshotCallback,
-        };
-    }
-
-    fn haMutationPolicySnapshotCallback(ptr: *const anyopaque) antfly.public_api.http_server.HAMutationPolicySnapshot {
-        const self: *const DataServer = @ptrCast(@alignCast(ptr));
-        const configured = antfly.public_api.http_server.HAMutationPolicySnapshot{
-            .failover_safe_mutations_only = self.api_server_cfg.ha_failover_safe_mutations_only,
-            .remote_apply_mutations_enabled = self.api_server_cfg.ha_remote_apply_mutations_enabled,
-        };
-        if (!configured.failover_safe_mutations_only) return configured;
-
-        // A node started as a standby must remain fail-closed until promotion
-        // has atomically opened its promoted Primary and published that role.
-        // Once promoted it is the sole authority for the new timeline; its
-        // next continuous-HA topology is established by a fresh seed and
-        // runtime configuration rather than the obsolete standby role.
-        if (self.ha_ingress_started_as_standby and self.ha_public_gate_state.currentRole() == .primary) {
-            return .{};
-        }
-        return configured;
-    }
-
     fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
         if (self.ha_cfg.admin_context) |ctx| {
             if (ctx.standby != null) return null;
@@ -6044,6 +6121,17 @@ pub const DataServer = struct {
                 return left.group_id < right.group_id;
             }
         }.lessThan);
+        // Legacy catalog records leave the document-identity fields at zero and
+        // derive their namespace from the group/range IDs at runtime. Seed
+        // topologies are portable, explicit contracts: persist the effective
+        // namespace in both the catalog and replica entries so a promoted
+        // runtime opens the copied store with the same identity it was created
+        // with. Keeping zeros here would make activation fail closed with
+        // IdentityNamespaceMismatch.
+        for (metadata_snapshot.ranges) |*range| {
+            range.doc_identity_shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range.*);
+            range.doc_identity_range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*);
+        }
         std.mem.sort(antfly.extensions.PackageManifest, metadata_snapshot.extension_packages, {}, struct {
             fn lessThan(_: void, left: antfly.extensions.PackageManifest, right: antfly.extensions.PackageManifest) bool {
                 const name_order = std.mem.order(u8, left.name, right.name);
@@ -6180,6 +6268,30 @@ pub const DataServer = struct {
             try std.Io.Dir.rename(std.Io.Dir.cwd(), building_root, std.Io.Dir.cwd(), published_root, io);
         try fs_paths.syncDirPortable(io, snapshots_root);
         return .{ .root = published_root };
+    }
+
+    /// Converge process-local replay/enrichment work before seed capture takes
+    /// the exclusive HA mutation boundary. Background enrichment completion is
+    /// itself a durable primary mutation and must never be waited on while that
+    /// boundary is closed; doing so deadlocks capture and every HA state route.
+    /// The bounded verification inside DB.snapshotHASeed closes the remaining
+    /// race and converts it into a retryable busy result.
+    fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
+        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
+            return error.HASeedSnapshotIncompleteTopology;
+
+        const deadline_ns = platform_time.monotonicNs() +| ha_seed_snapshot_preflight_timeout_ns;
+        for (metadata_snapshot.ranges) |range| {
+            const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
+                return error.HASeedSnapshotTableMissingFromTopology;
+            try self.write_source.prepareHASeedReplicaSnapshot(
+                table.name,
+                range.group_id,
+                deadline_ns,
+            );
+        }
     }
 
     fn findHASeedRange(ranges: []const antfly.metadata.RangeRecord, group_id: u64) ?antfly.metadata.RangeRecord {
@@ -6484,6 +6596,21 @@ pub const DataServer = struct {
             return error.HASeedCaptureAlreadyInProgress;
         }
         defer self.ha_seed_capture_active.store(false, .release);
+
+        // Stop new public writers and let already-admitted requests finish
+        // before preflight. Holding this logical reservation (rather than the
+        // activity mutex) lets those requests publish completion without a
+        // lock cycle, while keeping continuous traffic from reopening the
+        // promoted cache-owner race between preflight and the global freeze.
+        var table_request_admission = try self.write_source.acquireHASeedTableRequestAdmissionLease();
+        defer table_request_admission.release();
+
+        // The production provider snapshots live managed DBs. Drain their
+        // finite replay/enrichment tail before closing the process-wide
+        // mutation barrier; the provider performs a second bounded check after
+        // the close. Custom providers own their own immutable source contract.
+        if (self.ha_cfg.seed_snapshot_provider == null)
+            try self.prepareDefaultHASeedSnapshotMaintenance();
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
@@ -15176,7 +15303,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
@@ -28637,8 +28763,10 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                     .table_id = 7,
                     .start_key = "",
                     .end_key = null,
-                    .doc_identity_shard_id = 77,
-                    .doc_identity_range_id = 77,
+                    // Legacy metadata omitted these fields. The store still
+                    // uses the canonical group/range fallback namespace.
+                    .doc_identity_shard_id = 0,
+                    .doc_identity_range_id = 0,
                 }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
@@ -28719,6 +28847,11 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
     try std.testing.expectEqual(@as(usize, 1), topology.value.replicas.len);
     try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].group_id);
     try std.testing.expectEqualStrings("docs", topology.value.replicas[0].table_name);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_range_id);
+    try std.testing.expectEqual(@as(u64, 7), topology.value.replicas[0].identity_table_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_range_id);
 
     var distributed = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
@@ -30023,6 +30156,22 @@ test "data server block sync policy waits for standby acknowledgement before com
     var found = (try server.read_source.source().lookup(alloc, "docs", "doc:block", .{}, .read_index)) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+
+    // The next write commits locally but cannot reach the same RemoteApply
+    // boundary. This error crosses the independently generated storage
+    // archive before the public API classifies it as pending durability; its
+    // exact identity must never collapse to RuntimeBoundaryFailure.
+    server.ha_primary_sync_wait.max_rounds = 1;
+    server.ha_primary_sync_wait.poll_ctx = null;
+    server.ha_primary_sync_wait.poll_fn = null;
+    try std.testing.expectError(error.HASyncCommitWouldBlock, server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:pending", .value = "{\"title\":\"pending\"}" }},
+        .timestamp_ns = 124,
+        .sync_level = .write,
+    }));
+    var pending = (try server.read_source.source().lookup(alloc, "docs", "doc:pending", .{}, .read_index)) orelse return error.TestExpectedEqual;
+    defer pending.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"pending\"}", pending.json);
 }
 
 test "data server propagates standby HA write gate into provisioned write sources" {
@@ -30297,7 +30446,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
         .uri = antfly.admin.routes.ha_fence,
         .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
     });
     defer fence_response.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);
@@ -31019,6 +31168,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
         .api_server_cfg = .{
             .admin_bearer_token = "runtime-secret-token",
             .ha_failover_safe_mutations_only = true,
+            .ha_remote_apply_mutations_enabled = true,
         },
         .ha = .{
             .admin_context = .{
@@ -31040,6 +31190,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
@@ -31061,13 +31212,27 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
     try std.testing.expect(server.ha_admin_server.?.auth.primary_fence_barrier == &server.ha_mutation_barrier);
     try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
-    try std.testing.expect(!server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    // Promotion changes authority, not durability coverage. This process is
+    // still participating in continuous HA, so local-only mutations must
+    // remain rejected while RemoteApply-backed document writes stay enabled.
+    try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
     const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     try std.testing.expect(std.meta.eql(public_read_gate_before, public_read_gate_after));
     try std.testing.expect(std.meta.eql(public_write_gate_before, public_write_gate_after));
     try public_read_gate_before.check(.stale);
     try public_write_gate_before.check();
+
+    var backup = try executeApiHttpxTestRequest(&server.http_server.?, .{
+        .method = .POST,
+        .uri = "/backup",
+        .body = "{}",
+    });
+    defer backup.deinit(server.http_server.?.alloc);
+    try std.testing.expectEqual(@as(u16, 503), backup.status);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"code\":\"ha_mutation_not_replicated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"surface\":\"backup\"") != null);
 
     var write_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
@@ -31672,6 +31837,32 @@ test "data runtime HA replication HTTP budget covers base64 apply envelope" {
     );
     try std.testing.expect(cfg.max_response_bytes >= encoded_batch_bytes + 64 * 1024);
     try std.testing.expect(cfg.resolve_before_connect);
+    try std.testing.expect(!cfg.cache_resolved_addresses);
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), cfg.request_timeout_ms);
+}
+
+test "data runtime HA apply window remains bounded for control-plane liveness" {
+    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply > 0);
+    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply <= 8);
+    try std.testing.expect(DataServer.ha_replication_default_apply_window_ns > 0);
+    try std.testing.expect(DataServer.ha_replication_default_apply_window_ns <= std.time.ns_per_s);
+}
+
+test "data runtime HA apply window does not report caught up with pending or deferred WAL" {
+    const caught_up = antfly.ha.standby.Progress{
+        .received_lsn = 10,
+        .applied_lsn = 10,
+        .safe_read_lsn = 10,
+    };
+    try std.testing.expect(haReplicationWindowReachedEnd(true, 8, 8, caught_up));
+    try std.testing.expect(!haReplicationWindowReachedEnd(false, 8, 8, caught_up));
+    try std.testing.expect(!haReplicationWindowReachedEnd(true, 8, 0, caught_up));
+
+    var pending = caught_up;
+    pending.applied_lsn = 9;
+    pending.safe_read_lsn = 9;
+    try std.testing.expect(!haReplicationWindowReachedEnd(true, 8, 8, pending));
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {
