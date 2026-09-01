@@ -17,6 +17,8 @@ export function resolvePlatformPackage(platform, arch, report = process.report) 
     return undefined;
   }
 
-  const libc = detectLinuxLibc(report);
-  return libc === "glibc" ? `@antfly/cli-linux-${arch}-gnu` : `@antfly/cli-linux-${arch}`;
+  if (detectLinuxLibc(report) !== "glibc") {
+    return undefined;
+  }
+  return `@antfly/cli-linux-${arch}`;
 }

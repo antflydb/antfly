@@ -1,4 +1,4 @@
-name: Publish CLI packages
+name: Package CLI artifacts
 
 on:
   workflow_call:
@@ -7,14 +7,6 @@ on:
         description: "Antfly version to publish, with or without v prefix"
         required: true
         type: string
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Antfly version to publish, with or without v prefix"
-        required: true
-  push:
-    tags:
-      - "cli/v*"
 
 permissions:
   contents: read
@@ -32,13 +24,10 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          RAW_VERSION: ${{ inputs.version }}
         run: |
-          input_version="${{ inputs.version || '' }}"
-          if [ -n "$input_version" ]; then
-            raw="$input_version"
-          else
-            raw="${GITHUB_REF_NAME#cli/}"
-          fi
+          raw="$RAW_VERSION"
           version="${raw#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
@@ -52,9 +41,7 @@ jobs:
           mkdir -p dist/release-archives
           for archive in \
             "antfly_${version}_Darwin_arm64.tar.gz" \
-            "antfly_${version}_Linux_arm64.tar.gz" \
             "antfly_${version}_Linux_arm64_gnu.tar.gz" \
-            "antfly_${version}_Linux_x86_64.tar.gz" \
             "antfly_${version}_Linux_x86_64_gnu.tar.gz"
           do
             curl -fsSL \
@@ -107,9 +94,7 @@ jobs:
           mkdir -p dist/cli-packages/npm
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64-gnu
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64-gnu
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
 
       - name: Upload Python wheels
@@ -123,62 +108,3 @@ jobs:
         with:
           name: antfly-cli-npm
           path: dist/cli-packages/npm/*.tgz
-
-  publish-pypi:
-    name: Publish antfly-cli to PyPI
-    needs: package
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/antfly-cli
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v6
-        with:
-          name: antfly-cli-wheels
-          path: dist/
-
-      - name: Publish wheels
-        uses: pypa/gh-action-pypi-publish@release/v1
-
-  publish-npm:
-    name: Publish @antfly/cli to npm
-    needs: package
-    runs-on: ubuntu-latest
-    environment: npm
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v6
-        with:
-          name: antfly-cli-npm
-          path: dist/
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version-file: ts/package.json
-          registry-url: https://registry.npmjs.org/
-
-      - name: Upgrade npm for OIDC support
-        # npm 12.0.0 omitted sigstore from its published bundle: npm/cli#9722.
-        # Keep this recovery path aligned with the main release workflow.
-        run: npm install -g npm@11
-
-      - name: Publish npm packages
-        run: |
-          set -euo pipefail
-          raw="${{ inputs.version || github.ref_name }}"
-          version="${raw#cli/}"
-          version="${version#v}"
-          npm_tag="latest"
-          case "$version" in
-            *-*) npm_tag="next" ;;
-          esac
-          echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
-          npm publish ./dist/antfly-cli-darwin-arm64-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-arm64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-arm64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-x64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-x64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-[0-9]*.tgz --access public --provenance --tag "$npm_tag"

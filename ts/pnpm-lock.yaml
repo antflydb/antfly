@@ -313,25 +313,15 @@ importers:
       '@antfly/cli-linux-arm64':
         specifier: workspace:*
         version: link:../cli-linux-arm64
-      '@antfly/cli-linux-arm64-gnu':
-        specifier: workspace:*
-        version: link:../cli-linux-arm64-gnu
       '@antfly/cli-linux-x64':
         specifier: workspace:*
         version: link:../cli-linux-x64
-      '@antfly/cli-linux-x64-gnu':
-        specifier: workspace:*
-        version: link:../cli-linux-x64-gnu
 
   packages/cli-darwin-arm64: {}
 
   packages/cli-linux-arm64: {}
 
-  packages/cli-linux-arm64-gnu: {}
-
   packages/cli-linux-x64: {}
-
-  packages/cli-linux-x64-gnu: {}
 
   packages/components:
     dependencies:

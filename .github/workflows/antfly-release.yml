@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*" # Triggers on tags like v1.0.0, v0.0.0-dev10
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing Antfly release version to republish to PyPI/npm"
+        required: true
 
 permissions:
   contents: read
@@ -20,6 +25,7 @@ env:
 jobs:
   build-zig-runtime-archives:
     name: Build Zig archive (${{ matrix.artifact_name }})
+    if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -237,85 +243,14 @@ jobs:
 
   package-cli-artifacts:
     name: Build CLI package artifacts
-    needs:
-      - build-zig-runtime-archives
-      - publish-release-assets
-    runs-on: arc-antfly-standard
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Resolve version
-        id: version
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
-
-      - name: Download release archives
-        uses: actions/download-artifact@v6
-        with:
-          pattern: antfly-zig-*
-          merge-multiple: true
-          path: dist/release-archives
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version-file: ts/package.json
-          registry-url: https://registry.npmjs.org/
-
-      - name: Set up Zig
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xz-utils
-          curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
-      - name: Test Antfly C ABI packaging
-        run: python scripts/packaging/test_cabi_packaging.py
-
-      - name: Build wheels and populate npm packages
-        run: |
-          python scripts/packaging/package_cli_release.py \
-            --version "${{ steps.version.outputs.version }}" \
-            --archive-dir dist/release-archives \
-            --out-dir dist/cli-packages
-
-      - name: Smoke check package wrappers
-        run: |
-          python -m compileall -q py/packages/cli/src/antfly_cli
-          node --test ts/packages/cli/test/*.test.js
-          node --check ts/packages/cli/bin/antfly.js
-
-      - name: Pack npm packages
-        run: |
-          set -euo pipefail
-          mkdir -p dist/cli-packages/npm
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64-gnu
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64-gnu
-          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
-
-      - name: Upload Python wheels
-        uses: actions/upload-artifact@v6
-        with:
-          name: antfly-cli-wheels
-          path: dist/cli-packages/python/*.whl
-
-      - name: Upload npm tarballs
-        uses: actions/upload-artifact@v6
-        with:
-          name: antfly-cli-npm
-          path: dist/cli-packages/npm/*.tgz
+    needs: publish-release-assets
+    if: >-
+      ${{ always() &&
+          (github.event_name == 'workflow_dispatch' ||
+           needs.publish-release-assets.result == 'success') }}
+    uses: ./.github/workflows/cli-package.yml
+    with:
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
@@ -334,6 +269,8 @@ jobs:
 
       - name: Publish wheels
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm
@@ -341,8 +278,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-npm
@@ -358,20 +298,31 @@ jobs:
         run: npm install -g npm@11
 
       - name: Publish npm packages
+        env:
+          RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          raw="$RAW_VERSION"
+          version="${raw#v}"
           npm_tag="latest"
           case "$version" in
             *-*) npm_tag="next" ;;
           esac
           echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
-          npm publish ./dist/antfly-cli-darwin-arm64-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-arm64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-arm64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-x64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-x64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
+          sh scripts/packaging/publish_npm_package.sh \
+            @antfly/cli-darwin-arm64 "$version" "$npm_tag" \
+            "./dist/antfly-cli-darwin-arm64-${version}.tgz"
+          sh scripts/packaging/publish_npm_package.sh \
+            @antfly/cli-linux-arm64 "$version" "$npm_tag" \
+            "./dist/antfly-cli-linux-arm64-${version}.tgz"
+          sh scripts/packaging/publish_npm_package.sh \
+            @antfly/cli-linux-x64 "$version" "$npm_tag" \
+            "./dist/antfly-cli-linux-x64-${version}.tgz"
+          # Publish the top-level selector only after every platform package is
+          # present, so users never receive a version with missing dependencies.
+          sh scripts/packaging/publish_npm_package.sh \
+            @antfly/cli "$version" "$npm_tag" \
+            "./dist/antfly-cli-${version}.tgz"
 
   publish-zig-homebrew:
     name: Publish antfly Homebrew formula

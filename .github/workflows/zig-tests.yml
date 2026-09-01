@@ -199,7 +199,7 @@ jobs:
             zig/cloudbuild.runtime.yaml \
             .github/workflows/antfly-container.yml \
             .github/workflows/antfly-release.yml \
-            .github/workflows/cli-publish.yml \
+            .github/workflows/cli-package.yml \
             .github/workflows/zig-tests.yml
           then
             echo "release_tooling=false" >> "$GITHUB_OUTPUT"

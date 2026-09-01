@@ -23,7 +23,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Platform:
     key: str
-    npm_package_dir: str
+    npm_package_dir: str | None
     release_os: str
     release_arch: str
     wheel_platform: str | None
@@ -33,19 +33,25 @@ class Platform:
     def __post_init__(self) -> None:
         if self.wheel_platform and self.wheel_platform.startswith("manylinux_") and self.release_variant != "gnu":
             raise ValueError(f"manylinux platform {self.key} must use a GNU release archive")
-        if self.release_os == "Linux":
+        if self.npm_package_dir and self.release_os == "Linux":
             expected_libc = "glibc" if self.release_variant == "gnu" else "musl"
             if self.npm_libc != expected_libc:
                 raise ValueError(f"Linux platform {self.key} must declare npm libc {expected_libc}")
+        if not self.npm_package_dir and self.npm_libc:
+            raise ValueError(f"non-npm platform {self.key} must not declare npm libc")
 
 
 PLATFORMS = (
     Platform("darwin-arm64", "cli-darwin-arm64", "Darwin", "arm64", "macosx_11_0_arm64"),
-    Platform("linux-arm64-gnu", "cli-linux-arm64-gnu", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu", "glibc"),
-    Platform("linux-x64-gnu", "cli-linux-x64-gnu", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu", "glibc"),
-    Platform("linux-arm64-musl", "cli-linux-arm64", "Linux", "arm64", None, None, "musl"),
-    Platform("linux-x64-musl", "cli-linux-x64", "Linux", "x86_64", None, None, "musl"),
+    Platform("linux-arm64-gnu", "cli-linux-arm64", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu", "glibc"),
+    Platform("linux-x64-gnu", "cli-linux-x64", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu", "glibc"),
+    # Portable musl archives are standalone distributions. npm and Python use
+    # the GNU builds supported by their standard Linux runtimes.
+    Platform("linux-arm64-musl", None, "Linux", "arm64", None),
+    Platform("linux-x64-musl", None, "Linux", "x86_64", None),
 )
+
+PACKAGE_PLATFORMS = tuple(platform for platform in PLATFORMS if platform.npm_package_dir)
 
 
 def normalize_release_version(raw: str) -> str:
@@ -183,6 +189,8 @@ def update_pyproject_version(path: Path, version: str) -> None:
 
 
 def validate_npm_package(repo_root: Path, platform: Platform) -> None:
+    if not platform.npm_package_dir:
+        raise ValueError(f"platform {platform.key} does not produce an npm package")
     package_json = repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json"
     data = json.loads(package_json.read_text())
     expected_name = f"@antfly/{platform.npm_package_dir}"
@@ -194,6 +202,8 @@ def validate_npm_package(repo_root: Path, platform: Platform) -> None:
 
 
 def populate_npm_package(repo_root: Path, platform: Platform, extracted: Path) -> None:
+    if not platform.npm_package_dir:
+        raise ValueError(f"platform {platform.key} does not produce an npm package")
     package_dir = repo_root / "ts" / "packages" / platform.npm_package_dir
     clean_path(package_dir / "bin")
     clean_path(package_dir / "include")
@@ -302,12 +312,13 @@ def main() -> int:
 
     update_pyproject_version(repo_root / "py" / "packages" / "cli" / "pyproject.toml", python_version)
     update_json_version(repo_root / "ts" / "packages" / "cli" / "package.json", version, optional_deps=True)
-    for platform in PLATFORMS:
+    for platform in PACKAGE_PLATFORMS:
         validate_npm_package(repo_root, platform)
+        assert platform.npm_package_dir is not None
         update_json_version(repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json", version)
 
     clean_path(py_out)
-    for platform in PLATFORMS:
+    for platform in PACKAGE_PLATFORMS:
         with tempfile.TemporaryDirectory() as tmp_raw:
             extracted = Path(tmp_raw)
             extract_archive(archive_dir, version, platform, extracted)

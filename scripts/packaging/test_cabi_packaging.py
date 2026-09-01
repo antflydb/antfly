@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
+import os
 import re
 import stat
 import subprocess
@@ -112,6 +115,23 @@ class CAbiPackagingTests(unittest.TestCase):
         npm_cli = json.loads((REPO_ROOT / "ts" / "packages" / "cli" / "package.json").read_text())
         self.assertEqual(npm_cli["engines"]["node"], ">=24.0")
 
+        package_workflow = (REPO_ROOT / ".github" / "workflows" / "cli-package.yml").read_text()
+        self.assertNotIn("workflow_dispatch:", package_workflow)
+        self.assertNotIn('tags:\n      - "cli/v*"', package_workflow)
+        self.assertNotIn("cli-linux-arm64-gnu", package_workflow)
+        self.assertNotIn("cli-linux-x64-gnu", package_workflow)
+        self.assertNotIn("npm publish", package_workflow)
+        self.assertNotIn("gh-action-pypi-publish", package_workflow)
+        self.assertIn("publish_npm_package.sh", release_workflow)
+        self.assertIn("uses: ./.github/workflows/cli-package.yml", release_workflow)
+        self.assertIn("workflow_dispatch:", release_workflow)
+        platform_publish = [
+            release_workflow.index(f"@antfly/cli-{name} \"$version\"")
+            for name in ("darwin-arm64", "linux-arm64", "linux-x64")
+        ]
+        selector_publish = release_workflow.index('@antfly/cli "$version"')
+        self.assertLess(max(platform_publish), selector_publish)
+
         cloud_build = (REPO_ROOT / "zig" / "cloudbuild.runtime.yaml").read_text()
         self.assertIn("_ARTIFACT_URI: __required__", cloud_build)
         self.assertIn("_ARTIFACT_URI must be an explicit gs:// GNU runtime artifact", cloud_build)
@@ -135,12 +155,57 @@ class CAbiPackagingTests(unittest.TestCase):
 
     def test_npm_platform_manifests_declare_the_expected_libc(self) -> None:
         expected_dependencies = set()
-        for platform in package_cli_release.PLATFORMS:
+        for platform in package_cli_release.PACKAGE_PLATFORMS:
             package_cli_release.validate_npm_package(REPO_ROOT, platform)
             expected_dependencies.add(f"@antfly/{platform.npm_package_dir}")
 
+        musl_platforms = [platform for platform in package_cli_release.PLATFORMS if platform.key.endswith("-musl")]
+        self.assertEqual(len(musl_platforms), 2)
+        self.assertTrue(all(platform.npm_package_dir is None for platform in musl_platforms))
+
         top_level = json.loads((REPO_ROOT / "ts" / "packages" / "cli" / "package.json").read_text())
         self.assertEqual(set(top_level["optionalDependencies"]), expected_dependencies)
+
+    def test_npm_publish_is_retry_safe_and_rejects_content_drift(self) -> None:
+        helper = REPO_ROOT / "scripts" / "packaging" / "publish_npm_package.sh"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            npm = fake_bin / "npm"
+            npm.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = view ]; then\n"
+                "  if [ -n \"${FAKE_NPM_INTEGRITY:-}\" ]; then printf '%s\\n' \"$FAKE_NPM_INTEGRITY\"; exit 0; fi\n"
+                "  exit 1\n"
+                "fi\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_NPM_LOG\"\n"
+            )
+            npm.chmod(0o755)
+            tarball = root / "package.tgz"
+            tarball.write_bytes(b"npm package")
+            digest = base64.b64encode(hashlib.sha512(tarball.read_bytes()).digest()).decode()
+            integrity = f"sha512-{digest}"
+            log = root / "npm.log"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_NPM_LOG": str(log),
+                "FAKE_NPM_INTEGRITY": integrity,
+            }
+            command = ["sh", str(helper), "@antfly/cli", "1.2.3", "latest", str(tarball)]
+
+            subprocess.run(command, check=True, env=env, capture_output=True, text=True)
+            self.assertFalse(log.exists())
+
+            env["FAKE_NPM_INTEGRITY"] = "sha512-different"
+            mismatch = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("exists with different contents", mismatch.stderr)
+
+            env["FAKE_NPM_INTEGRITY"] = ""
+            subprocess.run(command, check=True, env=env, capture_output=True, text=True)
+            self.assertIn("publish", log.read_text())
 
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

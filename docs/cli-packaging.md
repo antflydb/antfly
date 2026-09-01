@@ -40,12 +40,16 @@ consumers.
 1. Publish the normal Antfly release tag, for example `v0.2.0`.
 2. The main release workflow uploads native archives under
    `https://releases.antfly.io/antfly/v0.2.0/`.
-3. The release workflow downloads those archives, repacks them, and publishes
-   `antfly-cli` and `@antfly/cli`.
+3. The release workflow calls the reusable CLI packaging workflow to download
+   and repack the canonical archives, then top-level jobs publish `antfly-cli`
+   and `@antfly/cli`.
 
-The CLI workflow also supports manual runs with a version input and `cli/v*`
-tags for republishing or recovery. Trusted publishing for the normal release
-path should be configured against `.github/workflows/antfly-release.yml`.
+For recovery, manually dispatch `.github/workflows/antfly-release.yml` with an
+existing release version that contains the GNU archives. The same top-level
+workflow calls the same reusable packaging workflow, preserving one
+trusted-publisher identity. The reusable `.github/workflows/cli-package.yml`
+workflow only builds artifacts and cannot be dispatched directly; both trusted
+publication jobs remain in the top-level release workflow.
 
 Linux releases have two libc variants. The unsuffixed archive is the portable,
 CPU-only musl build used by musl hosts and direct portable downloads. The
@@ -57,7 +61,7 @@ integrations:
 | `scripts/install.sh` | auto-detected | `_gnu` on glibc 2.28+; musl on older glibc, musl, or unknown Linux |
 | Direct portable archive downloads | musl (unsuffixed) | Portable standalone CLI |
 | Python `manylinux` wheels | `_gnu` | glibc-compatible executable and C ABI library |
-| npm Linux platform packages | libc-specific | GNU and musl packages preserve both supported Linux ABIs |
+| npm Linux platform packages | `_gnu` | The supported Node.js 24 runtime and npm packages use glibc 2.28+ |
 | Homebrew on Linux | `_gnu` | Linuxbrew runs on glibc and installs `libantfly.so` |
 | Container images | `_gnu` | CUDA, PJRT/XLA, and other host plugins use the glibc ABI |
 
@@ -71,12 +75,13 @@ antfly_0.2.0_Linux_x86_64.tar.gz
 antfly_0.2.0_Linux_x86_64_gnu.tar.gz
 ```
 
-The packaging script consumes the Darwin archive and both variants for each
-Linux architecture. Python wheels use only the GNU archives. npm publishes GNU
-and musl platform packages and selects between them at runtime. The GNU targets
-pin glibc 2.28 to match the wheel platform tag and keep that compatibility floor
-stable across Zig upgrades. All archives include `include/antfly.h` and the
-platform library under `lib/`;
+The packaging script consumes the Darwin archive and GNU archive for each Linux
+architecture. Python wheels and npm packages both use the GNU archives. The
+portable musl archives remain release assets for direct downloads and the shell
+installer, but are not repackaged for Python or npm. The GNU targets pin glibc
+2.28 to match the wheel platform tag and supported Node.js runtime, keeping that
+compatibility floor stable across Zig upgrades. All archives include
+`include/antfly.h` and the platform library under `lib/`;
 `scripts/packaging/build_zig_release_archive.sh` builds the runtime and then the
 `capi` target into the same archive prefix. GNU Linux archives compile in the
 CUDA and PJRT/XLA backends, which discover their driver or plugin at runtime and
@@ -110,16 +115,19 @@ and populates npm platform packages:
 ```text
 @antfly/cli-darwin-arm64
 @antfly/cli-linux-arm64
-@antfly/cli-linux-arm64-gnu
 @antfly/cli-linux-x64
-@antfly/cli-linux-x64-gnu
 ```
 
-The existing unsuffixed npm Linux packages remain musl packages for backwards
-compatibility. The `-gnu` packages declare `libc: glibc`; the unsuffixed Linux
-packages declare `libc: musl`. The top-level `@antfly/cli` package exposes the
-`antfly` bin and selects the package matching the host OS, CPU, and libc.
+The existing unsuffixed Linux package names now contain the GNU builds and
+declare `libc: glibc`; no additional npm packages need to be bootstrapped. This
+is an explicit compatibility change from versions that placed musl builds in
+those packages. Alpine and other musl users should install via `install.sh`.
+The top-level `@antfly/cli` package exposes the `antfly` bin and selects the
+package matching the host OS and CPU, while rejecting musl with that migration
+guidance.
 
-Before the first automated release, bootstrap `@antfly/cli-linux-arm64-gnu` and
-`@antfly/cli-linux-x64-gnu`, then configure npm trusted publishing against the
-same release workflows as the existing platform packages.
+The main release workflow is the sole npm trusted publisher. Platform packages
+publish first and the top-level selector publishes last. Each publish skips an
+exact version only when the registry integrity matches the local tarball,
+allowing a partially completed release to be retried safely without hiding
+content drift or creating a selector whose platform package is absent.

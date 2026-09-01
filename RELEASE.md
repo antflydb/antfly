@@ -36,10 +36,11 @@ Linux has an explicit two-ABI contract:
   PJRT/XLA integrations. Containers, Linux Homebrew, and Python manylinux wheels
   consume these archives.
 
-The npm CLI publishes both Linux ABIs and selects by OS, CPU, and libc. Its
-supported Node.js 24 runtime has the same glibc 2.28 floor as the GNU archive.
-The standalone shell installer also checks the glibc version and falls back to
-the portable musl archive when the GNU compatibility floor is not met.
+The npm CLI publishes only GNU Linux packages under the existing unsuffixed npm
+package names. Its supported Node.js 24 runtime has the same glibc 2.28 floor as
+the GNU archive. The standalone shell installer still checks the glibc version
+and falls back to the portable musl archive when the GNU compatibility floor is
+not met.
 
 All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
 native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
@@ -56,19 +57,23 @@ SDK and enables Metal and Accelerate.
 2. `publish-release-assets` builds the release payload, creates or updates the
    draft GitHub Release, uploads the Zig archives and release metadata as GitHub
    Release assets, then publishes the payload to object storage.
-3. `package-cli-artifacts` builds the `antfly-cli` wheels and `@antfly/cli` npm
-   packages from the same Zig archives.
-4. `publish-cli-pypi` and `publish-cli-npm` publish the CLI installer packages
-   with trusted publishing/provenance.
-5. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
+3. `package-cli-artifacts` calls `.github/workflows/cli-package.yml` to build the
+   `antfly-cli` wheels and `@antfly/cli` npm packages from the canonical release
+   archives. Top-level `publish-cli-pypi` and `publish-cli-npm` jobs publish
+   them with trusted publishing/provenance. A manual dispatch of the main
+   workflow uses this same path for recovery.
+4. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
    Zig archive checksums. RC tags do not update the stable tap formula.
-6. `publish-container` calls `.github/workflows/antfly-container.yml` with
+5. `publish-container` calls `.github/workflows/antfly-container.yml` with
    `artifact_source: github`, so the container image uses the Linux archives
    already built by the release.
 
 After the native archives and release payload are published, package registry
 publishes, Homebrew, and container publishing fan out independently. A PyPI or
-npm publish failure must not block the container image for the same tag.
+npm publish failure must not block the container image for the same tag. npm
+platform packages publish before the top-level selector, and existing versions
+are skipped only when their registry integrity matches, so a partial publication
+is safe to retry without hiding content drift.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the GNU Linux archives on native Linux

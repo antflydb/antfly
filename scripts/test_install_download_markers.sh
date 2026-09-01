@@ -258,7 +258,7 @@ assert_installed_payload
 assert_activation_failure_rolls_back
 assert_checksum_failure_preserves_install
 
-publish_workflow="$repo_root/.github/workflows/cli-publish.yml"
+publish_workflow="$repo_root/.github/workflows/cli-package.yml"
 for expected in \
   '--max-redirs 0' \
   'X-Antfly-Download-Channel: release-automation' \

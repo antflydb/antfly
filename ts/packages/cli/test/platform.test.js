@@ -18,15 +18,15 @@ test("detects GNU libc and musl", () => {
   );
 });
 
-test("selects a package by operating system, CPU, and libc", () => {
+test("selects GNU Linux packages and rejects npm on musl", () => {
   const glibc = report({ glibcVersionRuntime: "2.36" });
   const musl = report({});
 
   assert.equal(resolvePlatformPackage("darwin", "arm64", glibc), "@antfly/cli-darwin-arm64");
-  assert.equal(resolvePlatformPackage("linux", "arm64", glibc), "@antfly/cli-linux-arm64-gnu");
-  assert.equal(resolvePlatformPackage("linux", "x64", glibc), "@antfly/cli-linux-x64-gnu");
-  assert.equal(resolvePlatformPackage("linux", "arm64", musl), "@antfly/cli-linux-arm64");
-  assert.equal(resolvePlatformPackage("linux", "x64", musl), "@antfly/cli-linux-x64");
+  assert.equal(resolvePlatformPackage("linux", "arm64", glibc), "@antfly/cli-linux-arm64");
+  assert.equal(resolvePlatformPackage("linux", "x64", glibc), "@antfly/cli-linux-x64");
+  assert.equal(resolvePlatformPackage("linux", "arm64", musl), undefined);
+  assert.equal(resolvePlatformPackage("linux", "x64", musl), undefined);
   assert.equal(resolvePlatformPackage("darwin", "x64", glibc), undefined);
   assert.equal(resolvePlatformPackage("win32", "x64", glibc), undefined);
 });

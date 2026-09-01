@@ -26,9 +26,7 @@
   "optionalDependencies": {
     "@antfly/cli-darwin-arm64": "workspace:*",
     "@antfly/cli-linux-arm64": "workspace:*",
-    "@antfly/cli-linux-arm64-gnu": "workspace:*",
-    "@antfly/cli-linux-x64": "workspace:*",
-    "@antfly/cli-linux-x64-gnu": "workspace:*"
+    "@antfly/cli-linux-x64": "workspace:*"
   },
   "engines": {
     "node": ">=24.0"
