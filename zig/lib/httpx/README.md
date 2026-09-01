@@ -141,7 +141,7 @@ zig build test --summary all
 
 | Requirement | Version |
 |-------------|---------|
-| **Zig** | 0.16.0+ |
+| **Zig** | 0.17.0-dev.1936+5a625d5f3 |
 | **OS** | Linux, macOS, Windows, FreeBSD |
 
 ## License

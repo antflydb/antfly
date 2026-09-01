@@ -4918,7 +4918,7 @@ fn transposeGpt2Conv1dResidentGpuHostedWeights(
         }
 
         const name = std.mem.span(key);
-        const name_z = try allocator.dupeZ(u8, name);
+        const name_z = try allocator.dupeSentinel(u8, name, 0);
         defer allocator.free(name_z);
 
         if (isGpt2Conv1dWeight(name) and
@@ -5698,7 +5698,7 @@ pub fn beginMetalWorkloadProfile(session: Session, regime: ops.WorkloadRegime) !
     if (arch_session.backend_type != .metal) return false;
     const provider = gpuBackendData(arch_session).shared_metal_native_provider orelse
         return error.MetalWorkloadProfileUnavailable;
-    try provider.workloadProfileBegin(@enumFromInt(@intFromEnum(regime)));
+    try provider.workloadProfileBegin(@fromBackingInt(@intCast(@backingInt(regime))));
     return true;
 }
 
@@ -6050,9 +6050,10 @@ pub fn cudaOpProfileLoggingEnabled() bool {
 pub fn cudaStatsDelta(after: CudaRuntimeStats, before: CudaRuntimeStats) CudaRuntimeStats {
     if (comptime !build_options.enable_cuda) return after;
     var delta = after;
-    inline for (std.meta.fields(CudaRuntimeStats)) |field| {
-        switch (@typeInfo(field.type)) {
-            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
+    const info = @typeInfo(CudaRuntimeStats).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        switch (@typeInfo(Field)) {
+            .int => @field(delta, field_name) = @field(after, field_name) -| @field(before, field_name),
             else => {},
         }
     }
@@ -7946,11 +7947,11 @@ test "deepseek v4 required tensors use canonical hf names" {
         names.deinit(allocator);
     }
 
-    var attention_schedule = [_]gpt_mod.DeepseekV4AttentionKind{.sliding_attention} ** gpt_mod.deepseek_v4_max_layers;
+    var attention_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4AttentionKind, @splat(.sliding_attention));
     attention_schedule[1] = .compressed_sparse_attention;
     attention_schedule[2] = .heavily_compressed_attention;
 
-    var mlp_schedule = [_]gpt_mod.DeepseekV4MlpKind{.moe} ** gpt_mod.deepseek_v4_max_layers;
+    var mlp_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4MlpKind, @splat(.moe));
     mlp_schedule[0] = .hash_moe;
 
     var missing = std.ArrayListUnmanaged([]const u8).empty;

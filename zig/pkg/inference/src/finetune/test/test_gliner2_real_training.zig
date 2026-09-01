@@ -825,9 +825,9 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     {
         const out_dir = try std.fmt.allocPrint(allocator, "/private/tmp/termite_gliner2_real_reload_{d}", .{std.posix.system.getpid()});
         defer allocator.free(out_dir);
-        compat.cwd().deleteTree(compat.io(), out_dir) catch {};
-        try compat.cwd().createDirPath(compat.io(), out_dir);
-        defer compat.cwd().deleteTree(compat.io(), out_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), out_dir) catch {};
+        try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
+        defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), out_dir) catch {};
 
         const adapter_params = try collectAutodiffAdapterParams(allocator, &trainer);
         defer allocator.free(adapter_params);

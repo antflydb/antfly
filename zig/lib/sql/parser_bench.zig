@@ -323,7 +323,11 @@ fn freeTokenizedCorpus(allocator: std.mem.Allocator, cases: []TokenizedCase) voi
 }
 
 fn freeTokenSlice(allocator: std.mem.Allocator, tokens: []token_mod.Token) void {
-    var list = std.ArrayListUnmanaged(token_mod.Token){ .items = tokens, .capacity = tokens.len };
+    var list = std.ArrayListUnmanaged(token_mod.Token){
+        .items = tokens,
+        .capacity = tokens.len,
+        .pointer_stability = .{},
+    };
     lexer.freeTokens(allocator, &list);
 }
 

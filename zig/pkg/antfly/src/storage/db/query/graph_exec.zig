@@ -271,7 +271,7 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
             .start_nodes = .{ .keys = &.{"doc:a"} },
         },
     };
-    const too_many = [_]types.NamedGraphQuery{item} ** (graph_query_mod.max_named_queries + 1);
+    const too_many = @as([graph_query_mod.max_named_queries + 1]types.NamedGraphQuery, @splat(item));
     try std.testing.expectError(
         error.InvalidQueryRequest,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many),
@@ -283,8 +283,10 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
         .nodes = &.{.{ .alias = "anchor" }},
         .edges = &.{},
     };
-    const too_many_complete_matches = [_]types.NamedGraphQuery{complete_match} **
-        (graph_query_mod.max_match_queries_per_request + 1);
+    const too_many_complete_matches = @as(
+        [graph_query_mod.max_match_queries_per_request + 1]types.NamedGraphQuery,
+        @splat(complete_match),
+    );
     try std.testing.expectError(
         error.GraphMatchOperationLimitExceeded,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many_complete_matches),
@@ -305,7 +307,7 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
     defer std.testing.allocator.free(empty_sorted);
     try std.testing.expectEqualSlices(usize, &.{0}, empty_sorted);
 
-    const too_long_name = [_]u8{'q'} ** (graph_query_mod.max_query_name_codepoints + 1);
+    const too_long_name = @as([graph_query_mod.max_query_name_codepoints + 1]u8, @splat('q'));
     var overlong = item;
     overlong.name = &too_long_name;
     const overlong_sorted = try sortGraphQueriesByDependencies(std.testing.allocator, &.{overlong});

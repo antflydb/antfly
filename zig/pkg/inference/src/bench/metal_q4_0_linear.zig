@@ -671,7 +671,7 @@ fn encodeFfnOutput(
         cfg.rows,
         cfg.in_dim,
         cfg.out_dim,
-        @intFromEnum(ops.DecoderRuntimeActivationKind.gelu_new),
+        @backingInt(ops.DecoderRuntimeActivationKind.gelu_new),
         0,
         1,
         none,
@@ -696,7 +696,7 @@ fn applyFfnOnce(
 ) !u64 {
     const start = nowNanos();
     try metal_runtime.beginFrame(runtime);
-    try metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(metal_runtime.ComputeSource.ffn), .ffn);
+    try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.ffn), .ffn);
     var produced: usize = 0;
     errdefer {
         _ = metal_runtime.endPlannedComputeScope(runtime) catch {};
@@ -718,7 +718,7 @@ fn applyFfnOutput(
     cfg: Config,
 ) !MetalTensor {
     try metal_runtime.beginFrame(runtime);
-    try metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(metal_runtime.ComputeSource.ffn), .ffn);
+    try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.ffn), .ffn);
     errdefer _ = metal_runtime.endPlannedComputeScope(runtime) catch {};
     var output = try encodeFfnOutput(runtime, input, cfg);
     errdefer output.deinit();

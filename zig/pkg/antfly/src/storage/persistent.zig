@@ -38,13 +38,14 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const native_artifact_sink = @import("native_artifact_sink.zig");
-const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
+const supports_main_lmdb = !is_hostless and build_options.lmdb_enabled;
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
         sync,
@@ -266,7 +267,7 @@ const SegmentFileStore = struct {
         root_dir: []const u8,
         storage: ?storage_io.Storage,
         create_if_missing: bool,
-        io_runtime: storage_io.RuntimeKind,
+        io_runtime: storage_io.Runtime,
         native_storage_pool: ?*storage_io.NativeStoragePool,
     ) !SegmentFileStore {
         const owned_root = try allocator.dupe(u8, root_dir);
@@ -1334,10 +1335,10 @@ pub const PersistentIndex = struct {
         // Create subdirectories
         const index_path_raw = try std.fmt.allocPrint(alloc, "{s}/index", .{path_span});
         defer alloc.free(index_path_raw);
-        const index_path = try alloc.dupeZ(u8, index_path_raw);
+        const index_path = try alloc.dupeSentinel(u8, index_path_raw, 0);
         defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
-        if (builtin.os.tag != .freestanding and needs_host_dirs) {
+        if (!is_hostless and needs_host_dirs) {
             var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try storage_io.createDirPathPortable(io_impl.io(), path_span);
@@ -1346,7 +1347,7 @@ pub const PersistentIndex = struct {
 
         const wal_path_raw = try std.fmt.allocPrint(alloc, "{s}/wal", .{path_span});
         defer alloc.free(wal_path_raw);
-        const wal_path = try alloc.dupeZ(u8, wal_path_raw);
+        const wal_path = try alloc.dupeSentinel(u8, wal_path_raw, 0);
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
@@ -5513,7 +5514,7 @@ fn reportReducedPersistentCrashSchedule(
 fn randomPersistentAction(random: std.Random) PersistentSimAction {
     if (random.uintLessThan(u8, 5) == 0) return .reopen;
     const spec_index = random.uintLessThan(u8, 4);
-    return .{ .index_segment = @enumFromInt(spec_index) };
+    return .{ .index_segment = @fromBackingInt(@intCast(spec_index)) };
 }
 
 fn runPersistentReplayCase(
@@ -5545,7 +5546,7 @@ fn runPersistentReplayCase(
 }
 
 fn randomPersistentCrashAction(random: std.Random) PersistentSimAction {
-    return .{ .index_segment = @enumFromInt(random.uintLessThan(u8, 4)) };
+    return .{ .index_segment = @fromBackingInt(@intCast(random.uintLessThan(u8, 4))) };
 }
 
 fn runPersistentCrashCase(

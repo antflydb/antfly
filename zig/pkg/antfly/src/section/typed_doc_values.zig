@@ -172,13 +172,13 @@ fn decodeSerializableBool(raw: u8) !bool {
 
 fn parseValueType(raw: u8) !ValueType {
     return switch (raw) {
-        @intFromEnum(ValueType.u64_val) => .u64_val,
-        @intFromEnum(ValueType.f64_val) => .f64_val,
-        @intFromEnum(ValueType.bytes_val) => .bytes_val,
-        @intFromEnum(ValueType.geo_point) => .geo_point,
-        @intFromEnum(ValueType.bool_val) => .bool_val,
-        @intFromEnum(ValueType.i64_val) => .i64_val,
-        @intFromEnum(ValueType.numeric_val) => .numeric_val,
+        @backingInt(ValueType.u64_val) => .u64_val,
+        @backingInt(ValueType.f64_val) => .f64_val,
+        @backingInt(ValueType.bytes_val) => .bytes_val,
+        @backingInt(ValueType.geo_point) => .geo_point,
+        @backingInt(ValueType.bool_val) => .bool_val,
+        @backingInt(ValueType.i64_val) => .i64_val,
+        @backingInt(ValueType.numeric_val) => .numeric_val,
         else => error.InvalidData,
     };
 }
@@ -278,7 +278,7 @@ pub const TypedDocValuesWriter = struct {
         const num_chunks: u32 = if (num_entries == 0) 0 else (num_entries - 1) / self.chunk_size + 1;
 
         // Header: value_type + num_chunks
-        try out.append(self.alloc, @intFromEnum(self.value_type));
+        try out.append(self.alloc, @backingInt(self.value_type));
         try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_chunks))));
 
         // Reserve space for chunk offset table
@@ -800,7 +800,7 @@ fn buildSingleDocFixedSectionAlloc(alloc: Allocator, value_type: ValueType, doc_
 
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
-    try data.append(alloc, @intFromEnum(value_type));
+    try data.append(alloc, @backingInt(value_type));
     try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
     try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
@@ -961,7 +961,7 @@ test "typed doc values reader rejects malformed bytes value lengths" {
 
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
-    try data.append(alloc, @intFromEnum(ValueType.bytes_val));
+    try data.append(alloc, @backingInt(ValueType.bytes_val));
     try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
     try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));

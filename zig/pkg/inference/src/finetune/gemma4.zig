@@ -487,7 +487,7 @@ const PreparedInputsSummaryFile = struct {
 // ---------------------------------------------------------------------------
 
 pub fn resolveArtifactPaths(allocator: std.mem.Allocator, input: []const u8) !ArtifactPaths {
-    const stat = compat.cwd().statFile(compat.io(), input, .{}) catch return error.InputNotFound;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), input, .{}) catch return error.InputNotFound;
     const model_dir = if (stat.kind == .directory)
         try allocator.dupe(u8, input)
     else
@@ -696,7 +696,7 @@ pub fn bootstrapLoRABundle(
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
 
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(adapter_checkpoint_path);
@@ -804,7 +804,7 @@ pub fn materializeRecursiveCompressedBase(
     const checkpoint_path = base_inspect.checkpoint_path orelse return error.MissingMergedCheckpoint;
     if (base_inspect.gguf_path != null) return error.UnsupportedRecursiveCompressedBaseSource;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const compressed_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
     errdefer allocator.free(compressed_checkpoint_path);
     const metadata_path = try std.fs.path.join(allocator, &.{ out_dir, options.metadata_file_name });
@@ -1166,7 +1166,7 @@ pub fn loadLoRABundleScoped(
 
 pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
     const allocator = bundle.allocator;
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
 
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
@@ -1301,12 +1301,12 @@ pub fn materializeMergedModel(
         try merged.put(allocator, try allocator.dupe(u8, layer.base_tensor_name), tensor);
     }
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
     errdefer allocator.free(output_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = output_checkpoint_path, .data = bytes });
 
     try copySupportingArtifactIfPresent(allocator, base_paths.config_path, out_dir, hf_config_file_name);
     try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_config_path, out_dir, tokenizer_config_file_name);
@@ -1595,7 +1595,7 @@ pub fn savePreparedInputsSummary(allocator: std.mem.Allocator, path: []const u8,
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn freePreparedInputsSummary(allocator: std.mem.Allocator, summary: *const PreparedInputsSummary) void {
@@ -2868,7 +2868,7 @@ fn applyScheduleFreeInPlace(params: []f32, grads: []const f32, z: []f32, v: []f3
 }
 
 test "hash supervised token transitions ignores masked labels" {
-    var row: [32]f32 = [_]f32{0} ** 32;
+    var row: [32]f32 = @as([32]f32, @splat(0));
     const input_ids = [_]i32{ 10, 11, 12, 13, 14 };
     const labels = [_]i32{ -100, -100, 12, -100, 14 };
     hashSupervisedTokenTransitionsIntoRow(&row, &input_ids, &labels, 1.0);
@@ -3295,8 +3295,8 @@ fn writeBootstrapAdapterCheckpointAtomic(
 ) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{output_path});
     defer allocator.free(tmp_path);
-    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
+    std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
 
     try writeBootstrapAdapterCheckpoint(
         allocator,
@@ -3310,7 +3310,7 @@ fn writeBootstrapAdapterCheckpointAtomic(
         lora_ga_stats_path,
         recursive_config,
     );
-    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), output_path, compat.io());
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), output_path, compat.testingIo());
 }
 
 const InitialLoRAFactors = struct {
@@ -3437,19 +3437,19 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
         for (tensor.data) |item| {
             const bits: u32 = @bitCast(item);
             var bits_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
+            try file.writeStreamingAll(compat.testingIo(), &bits_buf);
         }
     }
 }
@@ -3473,8 +3473,8 @@ fn writeHeaderAndRawTensors(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
@@ -3533,7 +3533,7 @@ fn writeAdapterConfigJson(
             .init_lora_weights = options.init_lora_weights,
         }, .{ .whitespace = .indent_2 }, &buffer.writer);
     }
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn bundleHasDoRA(bundle: *const LoadedLoRABundle) bool {
@@ -3564,13 +3564,13 @@ fn copySupportingArtifactIfPresent(
 
     const size = try c_file.fileSize(allocator, src_path);
     if (size == 0) {
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = "" });
         return;
     }
     if (size <= 100 * 1024 * 1024) {
         const contents = try c_file.readFile(allocator, src_path);
         defer allocator.free(contents);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = contents });
         return;
     }
 
@@ -3578,8 +3578,8 @@ fn copySupportingArtifactIfPresent(
     defer mapped.deinit();
     mapped.adviseSequentialPrefix(mapped.data.len);
 
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, dst_path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, dst_path, .{ .truncate = true });
     defer file.close(io);
     try writeFileBytesChunked(io, &file, mapped.data);
 }
@@ -3637,7 +3637,7 @@ fn writeRecursiveCompressedBaseMetadata(
         .compression_ratio = compression_ratio,
     }, .{ .whitespace = .indent_2 }, &buf.writer);
     try buf.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buf.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buf.written() });
 }
 
 fn writeFileBytesChunked(io: std.Io, file: *std.Io.File, bytes: []const u8) !void {
@@ -3820,7 +3820,7 @@ fn buildZeroF32(allocator: std.mem.Allocator, len: usize) ![]f32 {
 fn optionalPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(allocator, &.{ dir_path, basename });
     errdefer allocator.free(path);
-    compat.cwd().access(compat.io(), path, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch {
         allocator.free(path);
         return null;
     };
@@ -3828,8 +3828,8 @@ fn optionalPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basenam
 }
 
 fn findDecoderGgufPathInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]u8 {
-    var dir = compat.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close(compat.io());
+    var dir = std.Io.Dir.cwd().openDir(compat.testingIo(), dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(compat.testingIo());
 
     var candidates = std.ArrayListUnmanaged([]u8).empty;
     defer {
@@ -3838,7 +3838,7 @@ fn findDecoderGgufPathInDir(allocator: std.mem.Allocator, dir_path: []const u8) 
     }
 
     var iter = dir.iterate();
-    while (try iter.next(compat.io())) |entry| {
+    while (try iter.next(compat.testingIo())) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
         if (isProjectorGgufName(entry.name)) continue;
@@ -3868,7 +3868,7 @@ fn isProjectorGgufName(name: []const u8) bool {
 }
 
 fn isRegularFilePath(path: []const u8) bool {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return false;
     return stat.kind == .file;
 }
 
@@ -4000,9 +4000,9 @@ test "gemma4 bootstrap EVA and LoRA-GA require and consume stats files" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_real_initializer_stats_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
@@ -4069,9 +4069,9 @@ test "gemma4 moe expert preset targets only expert parameter tensors" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_moe_expert_targets_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);

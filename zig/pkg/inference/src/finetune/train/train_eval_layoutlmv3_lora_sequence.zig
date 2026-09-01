@@ -108,7 +108,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
 
     var bundle = try finetune.loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
     defer bundle.deinit();
-    var summary = try finetune.trainEvalSequenceLoRABundle(allocator, &bundle, train_examples, val_examples, label_vocab, out_dir, .{
+    var summary = try finetune.trainEvalSequenceLoRABundle(allocator, io, &bundle, train_examples, val_examples, label_vocab, out_dir, .{
         .max_train_examples = max_train_examples,
         .max_val_examples = max_val_examples,
         .epochs = epochs,
@@ -124,7 +124,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
 
     const training_config_path = try std.fs.path.join(allocator, &.{ out_dir, "training_config.json" });
     defer allocator.free(training_config_path);
-    try artifact_writer.writeJsonFile(allocator, training_config_path, .{
+    try artifact_writer.writeJsonFile(allocator, io, training_config_path, .{
         .contract_version = run_contract.training_config_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_sequence_train_eval",
@@ -161,10 +161,10 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .label_vocab = label_vocab,
         .summary = summary,
     };
-    try artifact_writer.writeJsonFile(allocator, report_path, report_payload);
+    try artifact_writer.writeJsonFile(allocator, io, report_path, report_payload);
     const training_report_path = try std.fs.path.join(allocator, &.{ out_dir, "training_report.json" });
     defer allocator.free(training_report_path);
-    try artifact_writer.writeJsonFile(allocator, training_report_path, .{
+    try artifact_writer.writeJsonFile(allocator, io, training_report_path, .{
         .contract_version = run_contract.training_report_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_sequence_train_eval",

@@ -348,7 +348,7 @@ const CudaA4bRuntime = struct {
     config: backend_contracts.A4bInferenceConfig,
     sources: std.ArrayListUnmanaged(CudaA4bSource) = .empty,
     packed_markers: std.StringHashMapUnmanaged(CudaTensor) = .empty,
-    layers: [max_a4b_layers]?CudaA4bLayer = [_]?CudaA4bLayer{null} ** max_a4b_layers,
+    layers: [max_a4b_layers]?CudaA4bLayer = @as([max_a4b_layers]?CudaA4bLayer, @splat(null)),
     route_ids: buffer_mod.DeviceBuffer = .{},
     route_weights: buffer_mod.DeviceBuffer = .{},
     input_q8: buffer_mod.DeviceBuffer = .{},
@@ -644,7 +644,7 @@ const CudaDispatchFallback = enum {
     specialized_span,
 };
 
-const cuda_dispatch_route_count = @typeInfo(CudaDispatchRoute).@"enum".fields.len;
+const cuda_dispatch_route_count = @typeInfo(CudaDispatchRoute).@"enum".field_names.len;
 const cuda_dispatch_max_entries: usize = 256;
 const cuda_q4_route_census_max_entries: usize = 128;
 
@@ -689,7 +689,7 @@ const CudaQ4KernelLaunch = struct {
     block: [3]usize,
 };
 
-const cuda_q4_route_provider_count = @typeInfo(CudaQ4RouteProvider).@"enum".fields.len;
+const cuda_q4_route_provider_count = @typeInfo(CudaQ4RouteProvider).@"enum".field_names.len;
 
 const CudaQ4RouteEntry = struct {
     op: CudaQ4RouteOp,
@@ -776,12 +776,12 @@ const CudaDispatchEntry = struct {
 };
 
 const CudaDispatchStats = struct {
-    route_counts: [cuda_dispatch_route_count]u64 = [_]u64{0} ** cuda_dispatch_route_count,
+    route_counts: [cuda_dispatch_route_count]u64 = @as([cuda_dispatch_route_count]u64, @splat(0)),
     entries: std.ArrayListUnmanaged(CudaDispatchEntry) = .empty,
     dropped_entries: u64 = 0,
     q4_entries: std.ArrayListUnmanaged(CudaQ4RouteEntry) = .empty,
-    q4_provider_calls: [cuda_q4_route_provider_count]u64 = [_]u64{0} ** cuda_q4_route_provider_count,
-    q4_provider_weighted_bytes: [cuda_q4_route_provider_count]u64 = [_]u64{0} ** cuda_q4_route_provider_count,
+    q4_provider_calls: [cuda_q4_route_provider_count]u64 = @as([cuda_q4_route_provider_count]u64, @splat(0)),
+    q4_provider_weighted_bytes: [cuda_q4_route_provider_count]u64 = @as([cuda_q4_route_provider_count]u64, @splat(0)),
     q4_dropped_entries: u64 = 0,
 
     fn note(
@@ -797,7 +797,7 @@ const CudaDispatchStats = struct {
         out_dim: usize,
         tc_pack_bytes: usize,
     ) void {
-        self.route_counts[@intFromEnum(route)] += 1;
+        self.route_counts[@backingInt(route)] += 1;
         if (!cudaDispatchStatsEnabled()) return;
         for (self.entries.items) |*entry| {
             if (entry.matches(op, quant, route, epilogue, fallback, rows, in_dim, out_dim)) {
@@ -848,7 +848,7 @@ const CudaDispatchStats = struct {
         // their dedicated fallback counters.
         if (!enabled) return;
         const bytes_per_call = q4RouteBytesPerCall(rows, k, n, bundle);
-        const provider_index = @intFromEnum(provider);
+        const provider_index = @backingInt(provider);
         self.q4_provider_calls[provider_index] +|= 1;
         self.q4_provider_weighted_bytes[provider_index] +|= bytes_per_call;
         for (self.q4_entries.items) |*entry| {
@@ -884,9 +884,9 @@ const CudaDispatchStats = struct {
     fn printIfEnabled(self: *const CudaDispatchStats, q4_census_enabled: bool) void {
         if (!cudaDispatchStatsEnabled() and !q4_census_enabled) return;
         std.debug.print("ANTFLY_CUDA_DISPATCH_STATS {{\"routes\":{{", .{});
-        inline for (@typeInfo(CudaDispatchRoute).@"enum".fields, 0..) |field, i| {
+        inline for (@typeInfo(CudaDispatchRoute).@"enum".field_names, 0..) |field_name, i| {
             if (i != 0) std.debug.print(",", .{});
-            std.debug.print("\"{s}\":{d}", .{ field.name, self.route_counts[i] });
+            std.debug.print("\"{s}\":{d}", .{ field_name, self.route_counts[i] });
         }
         std.debug.print("}},\"entries\":[", .{});
         for (self.entries.items, 0..) |entry, i| {
@@ -911,11 +911,11 @@ const CudaDispatchStats = struct {
             "],\"dropped_entries\":{d},\"q4_route_census\":{{\"schema_version\":1,\"scope\":\"q4_0_weight_traffic_plus_gqa_phase_markers\",\"providers\":{{",
             .{self.dropped_entries},
         );
-        inline for (@typeInfo(CudaQ4RouteProvider).@"enum".fields, 0..) |field, i| {
+        inline for (@typeInfo(CudaQ4RouteProvider).@"enum".field_names, 0..) |field_name, i| {
             if (i != 0) std.debug.print(",", .{});
             std.debug.print(
                 "\"{s}\":{{\"calls\":{d},\"weighted_q4_bytes\":{d}}}",
-                .{ field.name, self.q4_provider_calls[i], self.q4_provider_weighted_bytes[i] },
+                .{ field_name, self.q4_provider_calls[i], self.q4_provider_weighted_bytes[i] },
             );
         }
         std.debug.print("}},\"entries\":[", .{});
@@ -1186,10 +1186,10 @@ pub const RuntimeStats = struct {
     download_bucket_gt_256k: usize = 0,
     add_scalar_calls: usize = 0,
     rms_norm_bare_calls: usize = 0,
-    upload_top_sizes: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
-    upload_top_counts: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
-    download_top_sizes: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
-    download_top_counts: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
+    upload_top_sizes: [top_transfer_size_count]usize = @as([top_transfer_size_count]usize, @splat(0)),
+    upload_top_counts: [top_transfer_size_count]usize = @as([top_transfer_size_count]usize, @splat(0)),
+    download_top_sizes: [top_transfer_size_count]usize = @as([top_transfer_size_count]usize, @splat(0)),
+    download_top_counts: [top_transfer_size_count]usize = @as([top_transfer_size_count]usize, @splat(0)),
     launch_embedding: usize = 0,
     launch_linear: usize = 0,
     launch_linear_qkv: usize = 0,
@@ -2040,7 +2040,7 @@ test "CUDA Q4 route census aggregates by full launch identity" {
     try std.testing.expectEqual(@as(usize, 2), stats.q4_entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), stats.q4_entries.items[0].calls);
     try std.testing.expectEqual(@as(u64, 10_616_832), stats.q4_entries.items[0].weighted_q4_bytes);
-    try std.testing.expectEqual(@as(u64, 1), stats.q4_provider_calls[@intFromEnum(CudaQ4RouteProvider.fallback)]);
+    try std.testing.expectEqual(@as(u64, 1), stats.q4_provider_calls[@backingInt(CudaQ4RouteProvider.fallback)]);
 }
 
 pub const CudaCompute = struct {
@@ -2089,7 +2089,7 @@ pub const CudaCompute = struct {
     debug_cuda_graph_capture_active: bool = false,
     debug_cuda_graph_capture_disabled: bool = false,
     debug_cuda_graph_capture_inhibit_once: bool = false,
-    debug_cuda_graph_slots: [max_cuda_graph_replay_slots]CudaGraphReplaySlot = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots,
+    debug_cuda_graph_slots: [max_cuda_graph_replay_slots]CudaGraphReplaySlot = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{})),
     debug_cuda_graph_active_slot: ?usize = null,
     debug_cuda_graph_prepared_slot: ?usize = null,
     debug_cuda_graph_prepared_output_kind: CudaGraphReplayOutputKind = .tensor,
@@ -5479,7 +5479,7 @@ const TestEnvGuard = struct {
 
     fn captureAndClear(allocator: std.mem.Allocator, name: [:0]const u8) !TestEnvGuard {
         const saved: ?[:0]u8 = if (platform.env.getenv(name.ptr)) |value|
-            try allocator.dupeZ(u8, value)
+            try allocator.dupeSentinel(u8, value, 0)
         else
             null;
         _ = unsetenv(name.ptr);
@@ -5959,7 +5959,7 @@ fn generatedQ4_0E2BFfnPairOnlyEligible(
         rows,
         hidden_dim,
         intermediate_dim,
-        @intFromEnum(activation),
+        @backingInt(activation),
     );
 }
 
@@ -7206,7 +7206,7 @@ fn tryFusedGateUpBf16(
     errdefer self.allocator.free(shape);
     var dst = try allocDeviceBuffer(self, try checkedMul(out_count, @sizeOf(f32)));
     errdefer dst.free(&self.ctx);
-    try self.kernels.launchActivationMultiplyFusedGateUpF32(&self.ctx, dst, combined_out, rows, ffn, @intFromEnum(activation));
+    try self.kernels.launchActivationMultiplyFusedGateUpF32(&self.ctx, dst, combined_out, rows, ffn, @backingInt(activation));
     self.stats.launch_elementwise += 1;
     if (self.stats.fused_gate_up_bf16_hits == 0) {
         std.log.info("cuda_fused_gate_up_bf16: status=active rows={d} in_dim={d} ffn={d}", .{ rows, in_dim, ffn });
@@ -8332,7 +8332,7 @@ fn allocGreedyTokenDeviceBuffer(self: *CudaCompute, byte_len: usize) !DeviceBuff
 
 test "CUDA greedy graph output borrows only the prepared replay slot" {
     var self: CudaCompute = undefined;
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_prepared_slot = 3;
     self.debug_cuda_graph_active_slot = null;
     self.debug_cuda_graph_capture_active = false;
@@ -8356,7 +8356,7 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
 test "CUDA greedy graph output lease remains armed for retry and consumes on tensor creation" {
     var self: CudaCompute = undefined;
     self.allocator = std.testing.allocator;
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_prepared_slot = 1;
     self.debug_cuda_graph_active_slot = null;
     self.debug_cuda_graph_capture_active = false;
@@ -9188,7 +9188,7 @@ fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
 test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
     self.allocator = std.testing.allocator;
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_slots[1].valid = true;
     self.debug_cuda_graph_slots[1].kv_replay_capacity_valid = true;
     self.debug_cuda_graph_slots[1].kv_replay_capacity_tokens = 2432;
@@ -9235,7 +9235,7 @@ fn preparePersistentCudaBufferReallocation(self: *CudaCompute) !void {
 test "CUDA persistent buffer reallocation invalidates graph pointers and rejects capture" {
     var self: CudaCompute = undefined;
     self.allocator = std.testing.allocator;
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_slots[2].valid = true;
     self.debug_cuda_graph_capture_active = false;
     self.debug_cuda_graph_active_slot = 2;
@@ -9280,7 +9280,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
     self.ctx.debug_graph_capture_active = false;
     self.generated_gqa_score_prework_templates = .empty;
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
     self.debug_cuda_graph_active_slot = 2;
@@ -9319,7 +9319,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     defer self.temp_pinned_slots.deinit(std.testing.allocator);
     self.temp_arena_planner = .{};
     defer self.temp_arena_planner.deinit(std.testing.allocator);
-    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_active_slot = null;
     self.debug_cuda_graph_prepared_slot = null;
     self.temp_arena_generation = 1;
@@ -9488,9 +9488,9 @@ fn generatedGqaAttentionTopologyForConsumerMode(
             every_policy_uses_score_prework = false;
             continue;
         };
-        const shift: u3 = @intCast(@intFromEnum(route.route));
+        const shift: u3 = @intCast(@backingInt(route.route));
         score_route_mask |= @as(u8, 1) << shift;
-        const consumer_shift: u3 = @intCast(@intFromEnum(route.consumer));
+        const consumer_shift: u3 = @intCast(@backingInt(route.consumer));
         score_consumer_mask |= @as(u8, 1) << consumer_shift;
     }
 
@@ -9524,14 +9524,14 @@ fn cudaGraphReplayKeyForDecodeSchedule(self: *const CudaCompute, label: []const 
 test "CUDA graph replay key separates generated attention schedules" {
     const label = "gpt.final_hidden_decode";
     const base = cudaGraphReplayKey(label);
-    const serial = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.serial), 0, 0 });
-    const split2 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split2), 0, 0 });
-    const split4 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split4), 0, 0 });
-    const split8 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split8), 0, 0 });
-    const local_route_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local);
-    const global_route_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global);
-    const serial_consumer_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial);
-    const tiled64_consumer_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64);
+    const serial = cudaGraphReplayKeyWithAttentionTopology(label, .{ @backingInt(kernels_mod.GeneratedGqaDecodeSchedule.serial), 0, 0 });
+    const split2 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @backingInt(kernels_mod.GeneratedGqaDecodeSchedule.split2), 0, 0 });
+    const split4 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @backingInt(kernels_mod.GeneratedGqaDecodeSchedule.split4), 0, 0 });
+    const split8 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @backingInt(kernels_mod.GeneratedGqaDecodeSchedule.split8), 0, 0 });
+    const local_route_mask = @as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local);
+    const global_route_mask = @as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global);
+    const serial_consumer_mask = @as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.serial);
+    const tiled64_consumer_mask = @as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64);
     const score_local = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, local_route_mask, serial_consumer_mask });
     const score_local_tiled64 = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, local_route_mask, tiled64_consumer_mask });
     const score_global = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, global_route_mask, serial_consumer_mask });
@@ -9595,14 +9595,14 @@ test "CUDA graph topology retains score route and consumer masks" {
     var templates = [_]kernels_mod.GeneratedGqaScorePreworkRequest{ local, global };
     const serial = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .serial);
     const tiled64 = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .tiled64);
-    const route_mask = (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local)) |
-        (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global));
+    const route_mask = (@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local)) |
+        (@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global));
     try std.testing.expectEqual(@as(u8, 0), serial[0]);
     try std.testing.expectEqual(route_mask, serial[1]);
-    try std.testing.expectEqual(@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial), serial[2]);
+    try std.testing.expectEqual(@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.serial), serial[2]);
     try std.testing.expectEqual(@as(u8, 0), tiled64[0]);
     try std.testing.expectEqual(route_mask, tiled64[1]);
-    try std.testing.expectEqual(@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64), tiled64[2]);
+    try std.testing.expectEqual(@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64), tiled64[2]);
     try std.testing.expect(!std.mem.eql(u8, &serial, &tiled64));
 
     // A mixed qualified/unqualified set retains both consumer bits rather than
@@ -9614,8 +9614,8 @@ test "CUDA graph topology retains score route and consumer masks" {
     const mixed = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .tiled64);
     try std.testing.expectEqual(route_mask, mixed[1]);
     try std.testing.expectEqual(
-        (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial)) |
-            (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64)),
+        (@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.serial)) |
+            (@as(u8, 1) << @backingInt(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64)),
         mixed[2],
     );
 }
@@ -10857,7 +10857,7 @@ fn primitiveReduceF32(
     try ensureF32(input);
     const rank = input_shape.len;
     if (rank == 0 or rank > 8 or input.shape.len != rank) return error.InvalidShape;
-    var dims = [_]u32{1} ** 8;
+    var dims = @as([8]u32, @splat(1));
     var input_count: usize = 1;
     for (0..rank) |idx| {
         const dim_i64 = input.shape[idx];
@@ -10900,7 +10900,7 @@ fn primitiveReduceF32(
         dims,
         rank,
         reduce_mask,
-        @intFromEnum(mode),
+        @backingInt(mode),
         reduce_count,
     );
     return createTensor(self, device, output_shape, output_count);
@@ -10930,9 +10930,9 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input_ct: CT, target_shape: []const i64
     if (input_rank > 8 or output_rank == 0 or output_rank > 8) return error.InvalidShape;
     if (broadcast_axes.len < input_rank) return error.InvalidShape;
 
-    var input_dims = [_]u32{1} ** 8;
-    var output_dims = [_]u32{1} ** 8;
-    var axes = [_]u32{0} ** 8;
+    var input_dims = @as([8]u32, @splat(1));
+    var output_dims = @as([8]u32, @splat(1));
+    var axes = @as([8]u32, @splat(0));
     var input_count: usize = 1;
     var seen_axes: u32 = 0;
     for (0..input_rank) |idx| {
@@ -11598,7 +11598,7 @@ fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []cons
     }
     if (numel != input_tensor.elem_count) return error.InvalidShape;
 
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     var out_shape_usize: [8]usize = undefined;
     var out_shape_i64: [8]i64 = undefined;
     for (perm, 0..) |axis, i| {
@@ -11608,8 +11608,8 @@ fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []cons
         out_shape_i64[i] = @intCast(out_shape_usize[i]);
     }
 
-    var dims = [_]u32{1} ** 8;
-    var perm_u32 = [_]u32{0} ** 8;
+    var dims = @as([8]u32, @splat(1));
+    var perm_u32 = @as([8]u32, @splat(0));
     for (0..input_shape.len) |idx| {
         if (resolved_shape[idx] > std.math.maxInt(u32)) return error.InvalidShape;
         dims[idx] = @intCast(resolved_shape[idx]);
@@ -11778,10 +11778,10 @@ fn primSliceOp(ctx: *anyopaque, input_ct: CT, starts_raw: []const i64, limits_ra
     try ensureF32(input);
     const rank = input.shape.len;
     if (rank == 0 or rank > 8 or input_shape.len != rank or starts_raw.len < rank or limits_raw.len < rank or strides_raw.len < rank) return error.UnsupportedShape;
-    var input_dims = [_]u32{1} ** 8;
-    var output_dims = [_]u32{1} ** 8;
-    var starts = [_]u32{0} ** 8;
-    var strides = [_]u32{1} ** 8;
+    var input_dims = @as([8]u32, @splat(1));
+    var output_dims = @as([8]u32, @splat(1));
+    var starts = @as([8]u32, @splat(0));
+    var strides = @as([8]u32, @splat(1));
     const output_shape = try self.allocator.alloc(i64, rank);
     errdefer self.allocator.free(output_shape);
     var input_count: usize = 1;
@@ -13349,7 +13349,7 @@ fn tryLinearNoBiasGatedDownQ8_1Dp4a(
     };
     defer releaseDeviceBuffer(self, &q8_input);
 
-    self.kernels.launchQuantizeGatedF32Q8_1Rows(&self.ctx, q8_input, gate_tensor.buffer, up_tensor.buffer, rows, in_dim, @intFromEnum(activation)) catch |err| switch (err) {
+    self.kernels.launchQuantizeGatedF32Q8_1Rows(&self.ctx, q8_input, gate_tensor.buffer, up_tensor.buffer, rows, in_dim, @backingInt(activation)) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             device.free(&self.ctx);
             device_owned = true;
@@ -14578,7 +14578,7 @@ fn gemma4MtpPreproject(ctx: *anyopaque, request: *const ops.Gemma4MtpPreprojectR
         weight_tensor.buffer,
         request.backbone_hidden,
         request.draft_hidden,
-        @intFromEnum(request.concat_order),
+        @backingInt(request.concat_order),
         weight_dtype_code,
     );
     if (!launched) {
@@ -15914,7 +15914,7 @@ fn linearNoBiasPairActivationQ4_0(
                 rows,
                 in_dim,
                 out_dim,
-                @intFromEnum(activation),
+                @backingInt(activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
                 else => return err,
@@ -15935,7 +15935,7 @@ fn linearNoBiasPairActivationQ4_0(
                 rows,
                 in_dim,
                 out_dim,
-                @intFromEnum(activation),
+                @backingInt(activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
                 else => return err,
@@ -15955,7 +15955,7 @@ fn linearNoBiasPairActivationQ4_0(
                 rows,
                 in_dim,
                 out_dim,
-                @intFromEnum(activation),
+                @backingInt(activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
                 else => return err,
@@ -15978,7 +15978,7 @@ fn linearNoBiasPairActivationQ4_0(
         rows,
         in_dim,
         out_dim,
-        @intFromEnum(activation),
+        @backingInt(activation),
     ) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             device.free(&self.ctx);
@@ -16832,9 +16832,9 @@ fn binaryElementwise(ctx: *anyopaque, a: CT, b: CT, op: kernels_mod.ElementwiseO
     if (!sameShape(a_tensor.shape, b_tensor.shape)) {
         const output_rank = @max(a_tensor.shape.len, b_tensor.shape.len);
         if (output_rank == 0 or output_rank > 8) return error.InvalidShape;
-        var a_dims = [_]u32{1} ** 8;
-        var b_dims = [_]u32{1} ** 8;
-        var output_dims = [_]u32{1} ** 8;
+        var a_dims = @as([8]u32, @splat(1));
+        var b_dims = @as([8]u32, @splat(1));
+        var output_dims = @as([8]u32, @splat(1));
         for (a_tensor.shape, 0..) |dim, idx| {
             if (dim <= 0 or dim > std.math.maxInt(u32)) return error.InvalidShape;
             a_dims[idx] = @intCast(dim);
@@ -16976,7 +16976,7 @@ fn broadcastRightAligned(ctx: *anyopaque, input_ct: CT, target_shape: []const i6
     const input = tensorFromCt(input_ct);
     if (input.shape.len > target_shape.len or input.shape.len > 8) return error.InvalidShape;
 
-    var broadcast_axes = [_]u8{0} ** 8;
+    var broadcast_axes = @as([8]u8, @splat(0));
     const leading_dims = target_shape.len - input.shape.len;
     for (0..input.shape.len) |idx| {
         broadcast_axes[idx] = @intCast(leading_dims + idx);
@@ -17001,7 +17001,7 @@ fn primWhereSelectOp(ctx: *anyopaque, cond_ct: CT, true_ct: CT, false_ct: CT) an
 
     const output_rank = @max(cond.shape.len, @max(on_true.shape.len, on_false.shape.len));
     if (output_rank == 0 or output_rank > 8) return error.InvalidShape;
-    var target_shape_storage = [_]i64{1} ** 8;
+    var target_shape_storage = @as([8]i64, @splat(1));
     const input_shapes = [_][]const i64{ cond.shape, on_true.shape, on_false.shape };
     for (0..output_rank) |output_axis| {
         var output_dim: i64 = 1;
@@ -17121,7 +17121,7 @@ fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.Decoder
     const act_rows: usize = if (gate_tensor.shape.len == 2 and gate_tensor.shape[0] > 1) @intCast(gate_tensor.shape[0]) else 1;
     var elementwise_profile_scope = beginPrefillProfile(self, .elementwise, act_rows);
     defer if (elementwise_profile_scope) |*scope| scope.end();
-    try self.kernels.launchActivationMultiplyF32(&self.ctx, device, gate_tensor.buffer, up_tensor.buffer, gate_tensor.elem_count, @intFromEnum(activation));
+    try self.kernels.launchActivationMultiplyF32(&self.ctx, device, gate_tensor.buffer, up_tensor.buffer, gate_tensor.elem_count, @backingInt(activation));
     self.stats.launch_elementwise += 1;
     self.stats.activation_multiply_fused += 1;
     return createTensor(self, device, shape, gate_tensor.elem_count);
@@ -17158,7 +17158,7 @@ fn activationMultiplySliceLastDim(ctx: *anyopaque, gate: CT, source: CT, start: 
         source_cols,
         start,
         out_cols,
-        @intFromEnum(activation),
+        @backingInt(activation),
     ) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             device.free(&self.ctx);
@@ -17265,7 +17265,7 @@ fn linearNoBiasActivationSliceLastDim(
             out_dim,
             source_cols,
             start,
-            @intFromEnum(activation),
+            @backingInt(activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
@@ -17284,7 +17284,7 @@ fn linearNoBiasActivationSliceLastDim(
         out_dim,
         source_cols,
         start,
-        @intFromEnum(activation),
+        @backingInt(activation),
     ) catch |tile4_err| switch (tile4_err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => self.kernels.launchLinearQ4_0ActivationSliceLastDimTile4W4F32(
             &self.ctx,
@@ -17297,7 +17297,7 @@ fn linearNoBiasActivationSliceLastDim(
             out_dim,
             source_cols,
             start,
-            @intFromEnum(activation),
+            @backingInt(activation),
         ) catch |tile4_w4_err| switch (tile4_w4_err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 device.free(&self.ctx);
@@ -17395,7 +17395,7 @@ fn linearNoBiasGatedDown(
             rows,
             in_dim,
             out_dim,
-            @intFromEnum(activation),
+            @backingInt(activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 self.stats.gated_down_fallbacks += 1;
@@ -17418,7 +17418,7 @@ fn linearNoBiasGatedDown(
                     rows,
                     in_dim,
                     out_dim,
-                    @intFromEnum(activation),
+                    @backingInt(activation),
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk .tile4,
                     else => return err,
@@ -17435,7 +17435,7 @@ fn linearNoBiasGatedDown(
                     rows,
                     in_dim,
                     out_dim,
-                    @intFromEnum(activation),
+                    @backingInt(activation),
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk .tile4,
                     else => return err,
@@ -17452,7 +17452,7 @@ fn linearNoBiasGatedDown(
                     rows,
                     in_dim,
                     out_dim,
-                    @intFromEnum(activation),
+                    @backingInt(activation),
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk .tile4,
                     else => return err,
@@ -17471,7 +17471,7 @@ fn linearNoBiasGatedDown(
                 rows,
                 in_dim,
                 out_dim,
-                @intFromEnum(activation),
+                @backingInt(activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => {
                     self.stats.gated_down_fallbacks += 1;
@@ -17498,7 +17498,7 @@ fn linearNoBiasGatedDown(
             rows,
             in_dim,
             out_dim,
-            @intFromEnum(activation),
+            @backingInt(activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 self.stats.gated_down_fallbacks += 1;
@@ -17520,7 +17520,7 @@ fn linearNoBiasGatedDown(
             rows,
             in_dim,
             out_dim,
-            @intFromEnum(activation),
+            @backingInt(activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 self.stats.gated_down_fallbacks += 1;
@@ -20499,7 +20499,7 @@ fn tryRunQ4_0Sm89GgmlQ8_1E2BFfn(
             rows,
             request.hidden_size,
             request.intermediate_size,
-            @intFromEnum(request.activation),
+            @backingInt(request.activation),
         ) or
         !kernels_mod.generatedQ4_0DownQ8E2BShapeEligible(
             rows,
@@ -20580,7 +20580,7 @@ fn tryRunQ4_0Sm89GgmlQ8_1E2BFfn(
         rows,
         request.hidden_size,
         request.intermediate_size,
-        @intFromEnum(request.activation),
+        @backingInt(request.activation),
     ) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             if (pair_profile_scope) |*scope| scope.end();
@@ -20720,7 +20720,7 @@ fn tryRunQ4_0GeneratedExactE2BFfn(
         rows,
         request.hidden_size,
         request.intermediate_size,
-        @intFromEnum(request.activation),
+        @backingInt(request.activation),
     ) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             if (pair_profile_scope) |*scope| scope.end();
@@ -20934,7 +20934,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
                 rows,
                 request.hidden_size,
                 request.intermediate_size,
-                @intFromEnum(request.activation),
+                @backingInt(request.activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => {
                     if (pair_profile_scope) |*scope| scope.end();
@@ -20977,7 +20977,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
                 rows,
                 request.hidden_size,
                 request.intermediate_size,
-                @intFromEnum(request.activation),
+                @backingInt(request.activation),
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => {
                     noteGeneratedQ4_0CatalogFfnResult(&self.stats, .pair_q8, false);
@@ -21018,7 +21018,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             rows,
             request.hidden_size,
             request.intermediate_size,
-            @intFromEnum(request.activation),
+            @backingInt(request.activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 self.stats.q4_0_generated_pair_q8_fallbacks += 1;
@@ -21052,7 +21052,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             rows,
             request.hidden_size,
             request.intermediate_size,
-            @intFromEnum(request.activation),
+            @backingInt(request.activation),
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 if (pair_profile_scope) |*scope| scope.end();
@@ -21917,7 +21917,7 @@ fn runA4bMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) any
         request.top_k,
         request.hidden_size,
         request.inter_size,
-        @intFromEnum(request.activation),
+        @backingInt(request.activation),
     );
     try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, activated_q8, activated, routes, request.inter_size);
     const down = try layer.down.view();
@@ -22453,7 +22453,7 @@ test "cuda A4B router tiled decode shape is exact" {
 }
 
 test "cuda A4B packed projection layout preserves fused source offsets" {
-    var raw = [_]u8{0} ** (2 * 8 * 18);
+    var raw = @as([2 * 8 * 18]u8, @splat(0));
     const shape = [_]i64{ 2, 8, 32 };
     const base = weight_source_mod.QuantizedStorage{
         .tensor_type = .{ .known = .Q4_0 },

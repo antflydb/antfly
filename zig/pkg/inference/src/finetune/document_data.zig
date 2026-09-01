@@ -250,7 +250,7 @@ pub fn resolveImagePath(allocator: std.mem.Allocator, dataset_root: []const u8, 
 }
 
 fn loadExamplesFromFile(allocator: std.mem.Allocator, path: []const u8, out: *std.ArrayListUnmanaged(PageExample)) !void {
-    const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(128 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(128 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -292,7 +292,7 @@ fn lessThanString(_: void, a: []const u8, b: []const u8) bool {
 }
 
 fn fileSizeOrZero(path: []const u8) u64 {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return 0;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return 0;
     return stat.size;
 }
 
@@ -302,8 +302,8 @@ test "load document examples and build vocabs" {
     defer allocator.free(root);
     const root_dir = try std.fs.path.join(allocator, &.{ "/tmp", root, "document-data" });
     defer allocator.free(root_dir);
-    defer compat.cwd().deleteTree(compat.io(), root_dir) catch {};
-    try compat.cwd().createDirPath(compat.io(), root_dir);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root_dir);
 
     const train_jsonl =
         \\{"document_id":"d1","page_id":"p1","image_path":"a.png","tokens":[{"text":"hello","bbox":[0,0,10,10]}],"label":"email"}
@@ -312,7 +312,7 @@ test "load document examples and build vocabs" {
     ;
     const jsonl_path = try std.fs.path.join(allocator, &.{ root_dir, "train-00000.jsonl" });
     defer allocator.free(jsonl_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = jsonl_path, .data = train_jsonl });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = jsonl_path, .data = train_jsonl });
 
     const path = try allocator.dupe(u8, root_dir);
     defer allocator.free(path);

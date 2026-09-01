@@ -1,0 +1,81 @@
+name: Zig Latest Nightly Probe
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-latest-nightly-probe
+  cancel-in-progress: true
+
+jobs:
+  latest-nightly:
+    name: latest Zig nightly compatibility
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve official latest nightly
+        id: nightly
+        shell: bash
+        run: |
+          set -euo pipefail
+          source zig/toolchain.env
+          index_file="$RUNNER_TEMP/zig-download-index.json"
+          curl --fail --silent --show-error --location \
+            https://ziglang.org/download/index.json \
+            --output "$index_file"
+          latest="$(python3 - "$index_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              print(json.load(source)["master"]["version"])
+          PY
+          )"
+          echo "pinned=$ZIG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [[ "$latest" == "$ZIG_VERSION" ]]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            echo "Pinned Zig already matches the official latest nightly: $latest"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=New Zig nightly available::Pinned $ZIG_VERSION; latest $latest"
+          fi
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up official latest Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.nightly.outputs.latest }}
+          use-cache: false
+
+      - name: Test latest nightly
+        working-directory: zig
+        run: |
+          test "$(zig version)" = "${{ steps.nightly.outputs.latest }}"
+          zig build root-test --cache-poison=disallowed
+          zig build wasm --cache-poison=disallowed
+          cd pkg/inference
+          zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm --cache-poison=disallowed
+
+      - name: Publish probe summary
+        if: always()
+        run: |
+          {
+            echo "## Zig latest-nightly probe"
+            echo
+            echo "- Pinned: \`${{ steps.nightly.outputs.pinned }}\`"
+            echo "- Official latest: \`${{ steps.nightly.outputs.latest }}\`"
+            echo "- Pin current: \`${{ steps.nightly.outputs.is_latest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

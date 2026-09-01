@@ -157,7 +157,7 @@ pub fn writeVectorSection(
     writeUvarint(&buf, alloc, field_not_uninverted);
 
     // Optimization type
-    writeUvarint(&buf, alloc, @intFromEnum(content.optimization));
+    writeUvarint(&buf, alloc, @backingInt(content.optimization));
 
     // Number of vectors
     writeUvarint(&buf, alloc, @intCast(nvecs));
@@ -171,7 +171,7 @@ pub fn writeVectorSection(
     }
 
     // Index type: rabitq = 1
-    writeUvarint(&buf, alloc, @intFromEnum(IndexType.rabitq));
+    writeUvarint(&buf, alloc, @backingInt(IndexType.rabitq));
 
     // --- Build RaBitQ index data ---
     const index_data = try buildRaBitQIndex(alloc, content, seed);
@@ -247,7 +247,7 @@ fn buildRaBitQIndex(
     try blob.appendSlice(alloc, &dims_le);
 
     // Metric (u8)
-    try blob.append(alloc, @as(u8, @intCast(@intFromEnum(content.metric))));
+    try blob.append(alloc, @as(u8, @intCast(@backingInt(content.metric))));
 
     // Seed (u64 LE)
     const seed_le: [8]u8 = @bitCast(std.mem.nativeToLittle(u64, seed));
@@ -448,10 +448,10 @@ pub fn readSectionHeader(alloc: Allocator, data: []const u8) !VectorSectionHeade
     const index_data = data[pos..][0..@intCast(index_size)];
 
     return .{
-        .optimization = @enumFromInt(@as(u8, @intCast(opt))),
+        .optimization = @fromBackingInt(@intCast(@as(u8, @intCast(opt)))),
         .num_vecs = @intCast(nvecs),
         .vec_doc_ids = vec_doc_ids,
-        .index_type = @enumFromInt(@as(u8, @intCast(index_type))),
+        .index_type = @fromBackingInt(@intCast(@as(u8, @intCast(index_type)))),
         .index_data = index_data,
     };
 }
@@ -478,7 +478,7 @@ pub fn readRaBitQIndex(alloc: Allocator, data: []const u8, vec_doc_ids: []u32) !
     pos += 4;
 
     // Metric
-    const metric: vec.DistanceMetric = @enumFromInt(data[pos]);
+    const metric: vec.DistanceMetric = @fromBackingInt(@intCast(data[pos]));
     pos += 1;
 
     // Seed

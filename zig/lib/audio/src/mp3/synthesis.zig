@@ -17,17 +17,17 @@ const F32x4 = @Vector(4, f32);
 const pcm_scale = 4.5 / 32768.0;
 
 pub const HybridState = struct {
-    overlap: [32][18]f32 = [_][18]f32{[_]f32{0} ** 18} ** 32,
+    overlap: [32][18]f32 = @as([32][18]f32, @splat(@as([18]f32, @splat(0)))),
 };
 
 pub const QmfState = struct {
-    values: [15 * 64]f32 = [_]f32{0} ** (15 * 64),
+    values: [15 * 64]f32 = @as([(15 * 64)]f32, @splat(0)),
 };
 
 pub const SynthesisState = struct {
     hybrid: HybridState = .{},
     qmf: QmfState = .{},
-    v: [1024]f32 = [_]f32{0} ** 1024,
+    v: [1024]f32 = @as([1024]f32, @splat(0)),
 };
 
 const enwindow = [_]i32{
@@ -119,7 +119,7 @@ pub fn synthesizeFrameMono(
     @memcpy(left[0..], subband_samples);
     dctIIMonoInPlace(left[0..], 18);
 
-    var lins: [33 * 64]f32 = [_]f32{0} ** (33 * 64);
+    var lins: [33 * 64]f32 = @as([(33 * 64)]f32, @splat(0));
     @memcpy(lins[0 .. 15 * 64], qmf_state.values[0..]);
 
     var slot: usize = 0;
@@ -151,7 +151,7 @@ pub fn synthesizeFrameStereo(
     dctIIMonoInPlace(left[0..], 18);
     dctIIMonoInPlace(right[0..], 18);
 
-    var lins: [33 * 64]f32 = [_]f32{0} ** (33 * 64);
+    var lins: [33 * 64]f32 = @as([(33 * 64)]f32, @splat(0));
     @memcpy(lins[0 .. 15 * 64], qmf_state.values[0..]);
 
     var slot: usize = 0;
@@ -440,7 +440,7 @@ fn applyWindow(v: []const f32, pcm_out: []f32) void {
 }
 
 fn buildWindow() [512]f32 {
-    var window: [512]f32 = [_]f32{0} ** 512;
+    var window: [512]f32 = @as([512]f32, @splat(0));
     // The synthesis window table is stored in 16.16-style fixed-point form:
     // its peak entry is ~75038, which maps to the expected ~1.145 window gain
     // only when normalized by 2^16. Dividing by 2^31 collapses decoded PCM
@@ -459,8 +459,8 @@ fn buildWindow() [512]f32 {
 
 test "overlap add rejects invalid dimensions" {
     var state = HybridState{};
-    var out: [32 * 18]f32 = [_]f32{0} ** (32 * 18);
-    const blocks = [_]f32{0} ** (32 * 36);
+    var out: [32 * 18]f32 = @as([(32 * 18)]f32, @splat(0));
+    const blocks = @as([(32 * 36)]f32, @splat(0));
     var short_out = [_]f32{ 0, 1 };
 
     try std.testing.expectError(error.InvalidDimensions, overlapAddGranule(&state, &.{ 0, 1 }, out[0..]));
@@ -486,11 +486,11 @@ test "overlap add copies first half and stores second half" {
 test "overlap add carries previous tail into next granule" {
     var state = HybridState{};
 
-    const first_blocks = [_]f32{1} ** (32 * 36);
+    const first_blocks = @as([(32 * 36)]f32, @splat(1));
     var first_out: [32 * 18]f32 = undefined;
     try overlapAddGranule(&state, first_blocks[0..], first_out[0..]);
 
-    const second_blocks = [_]f32{2} ** (32 * 36);
+    const second_blocks = @as([(32 * 36)]f32, @splat(2));
     var second_out: [32 * 18]f32 = undefined;
     try overlapAddGranule(&state, second_blocks[0..], second_out[0..]);
 
@@ -503,8 +503,8 @@ test "overlap add carries previous tail into next granule" {
 
 test "synthesize slot rejects invalid dimensions" {
     var state = SynthesisState{};
-    var out: [32]f32 = [_]f32{0} ** 32;
-    const input = [_]f32{0} ** 32;
+    var out: [32]f32 = @as([32]f32, @splat(0));
+    const input = @as([32]f32, @splat(0));
     var short_out = [_]f32{ 0, 1 };
 
     try std.testing.expectError(error.InvalidDimensions, synthesizeSlot(&state, &.{ 0, 1 }, out[0..]));
@@ -513,8 +513,8 @@ test "synthesize slot rejects invalid dimensions" {
 
 test "synthesize slot keeps zero input at zero" {
     var state = SynthesisState{};
-    const input = [_]f32{0} ** 32;
-    var out: [32]f32 = [_]f32{1} ** 32;
+    const input = @as([32]f32, @splat(0));
+    var out: [32]f32 = @as([32]f32, @splat(1));
 
     try synthesizeSlot(&state, input[0..], out[0..]);
     for (out) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-7);
@@ -522,10 +522,10 @@ test "synthesize slot keeps zero input at zero" {
 
 test "synthesize frame emits nonzero pcm for subband impulse" {
     var state = SynthesisState{};
-    var input: [32 * 18]f32 = [_]f32{0} ** (32 * 18);
+    var input: [32 * 18]f32 = @as([(32 * 18)]f32, @splat(0));
     input[0] = 1;
 
-    var out: [32 * 18]f32 = [_]f32{0} ** (32 * 18);
+    var out: [32 * 18]f32 = @as([(32 * 18)]f32, @splat(0));
     try synthesizeFrame(&state, input[0..], out[0..]);
 
     var energy: f32 = 0;
@@ -535,9 +535,9 @@ test "synthesize frame emits nonzero pcm for subband impulse" {
 
 test "synthesis slot shifts synthesis history without underflow" {
     var state = SynthesisState{};
-    var input = [_]f32{0} ** 32;
+    var input = @as([32]f32, @splat(0));
     input[0] = 1;
-    var out: [32]f32 = [_]f32{0} ** 32;
+    var out: [32]f32 = @as([32]f32, @splat(0));
 
     try synthesizeSlot(&state, input[0..], out[0..]);
     var first_head: [64]f32 = undefined;

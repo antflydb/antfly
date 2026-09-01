@@ -304,7 +304,7 @@ pub const Tokenizer = struct {
         const tokenizer_path = try resolveTokenizerJsonPath(allocator, model_input);
         defer allocator.free(tokenizer_path);
 
-        const raw = try compat.cwd().readFileAlloc(compat.io(), tokenizer_path, allocator, .limited(32 * 1024 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), tokenizer_path, allocator, .limited(32 * 1024 * 1024));
         defer allocator.free(raw);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
@@ -2747,7 +2747,7 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     const arena_alloc = arena.allocator();
 
     if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.EmptyPath;
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind == .file) {
         const one = try arena_alloc.alloc([]const u8, 1);
         one[0] = try arena_alloc.dupe(u8, path);
@@ -2759,12 +2759,12 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     }
     if (stat.kind != .directory) return error.UnsupportedPathType;
 
-    var dir = try compat.cwd().openDir(compat.io(), path, .{ .iterate = true });
-    defer dir.close(compat.io());
+    var dir = try std.Io.Dir.cwd().openDir(compat.testingIo(), path, .{ .iterate = true });
+    defer dir.close(compat.testingIo());
     var iter = dir.iterate();
     var paths = std.ArrayListUnmanaged([]const u8).empty;
     defer paths.deinit(arena_alloc);
-    while (try iter.next(compat.io())) |entry| {
+    while (try iter.next(compat.testingIo())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         if (split) |want_split| {
@@ -2791,8 +2791,8 @@ fn loadJsonlFile(
     out: *std.ArrayListUnmanaged(T),
     comptime appendValue: fn (std.mem.Allocator, std.json.Value, *std.ArrayListUnmanaged(T)) anyerror!void,
 ) !void {
-    const io = compat.io();
-    var file = try compat.cwd().openFile(io, path, .{});
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     // Dataset values use the caller's long-lived arena; keep transient I/O storage outside it.
     const reader_buffer = try std.heap.page_allocator.alloc(u8, max_jsonl_line_bytes);
@@ -3842,7 +3842,7 @@ fn hasUpstreamNonWhitespace(text: []const u8) bool {
 }
 
 fn resolveTokenizerJsonPath(allocator: std.mem.Allocator, model_input: []const u8) ![]u8 {
-    const stat = compat.cwd().statFile(compat.io(), model_input, .{}) catch return error.FileNotFound;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), model_input, .{}) catch return error.FileNotFound;
     if (stat.kind == .directory) return try std.fs.path.join(allocator, &.{ model_input, "tokenizer.json" });
     return error.InvalidArguments;
 }
@@ -4187,9 +4187,9 @@ test "load gliner2 examples and compute stats" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_data_stats_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const train_jsonl =
         \\{"text":"hello world","entities":[{"text":"world","label":"location","start":6,"end":11}]}
@@ -4198,7 +4198,7 @@ test "load gliner2 examples and compute stats" {
     ;
     const path = try std.fs.path.join(allocator, &.{ root, "train-00000.jsonl" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = train_jsonl });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = train_jsonl });
 
     var loaded = try loadExamples(allocator, root, "train");
     defer loaded.deinit();

@@ -214,7 +214,8 @@ pub const Socket = struct {
 
     /// Closes the socket.
     pub fn close(self: *Self) void {
-        self.io.vtable.netClose(self.io.userdata, @ptrCast((&self.handle)[0..1]));
+        const socket: net.Socket = .{ .handle = self.handle, .address = undefined };
+        self.io.vtable.netClose(self.io.userdata, (&socket)[0..1]);
     }
 
     /// Shuts down reads and writes without releasing the handle. This is used
@@ -228,7 +229,10 @@ pub const Socket = struct {
         while (true) {
             try self.checkRequestCancellation();
             try self.applyRequestDeadline(.send);
-            const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch |err| {
+            const sent = (try self.io.operate(.{ .net_write = .{
+                .socket_handle = self.handle,
+                .data = &.{data},
+            } })).net_write catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
@@ -604,10 +608,15 @@ pub const SocketIoWriter = struct {
             p.socket.sendAll(buffered) catch return error.WriteFailed;
             return w.consumeAll();
         }
-        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch |err| {
+        const n = (p.socket.io.operate(.{ .net_write = .{
+            .socket_handle = p.socket.handle,
+            .header = w.buffered(),
+            .data = bufs,
+            .splat = splat,
+        } }) catch |err| {
             if (err == error.Canceled) p.socket.io.recancel();
             return error.WriteFailed;
-        };
+        }).net_write catch return error.WriteFailed;
         return w.consume(n);
     }
 
@@ -1094,7 +1103,7 @@ fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.S
     const socket_flags = posix.SOCK.STREAM |
         if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
     const socket_fd: posix.socket_t = socket: while (true) {
-        const rc = posix.system.socket(family, socket_flags, @intFromEnum(net.Protocol.tcp));
+        const rc = posix.system.socket(family, socket_flags, @backingInt(net.Protocol.tcp));
         switch (posix.errno(rc)) {
             .SUCCESS => break :socket @intCast(rc),
             .INTR => continue,

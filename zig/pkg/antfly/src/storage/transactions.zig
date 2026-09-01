@@ -1395,7 +1395,7 @@ pub const TxnManager = struct {
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
         const buf = try self.alloc.alloc(u8, txn_record_v6_size);
-        buf[0] = @intFromEnum(record.status);
+        buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
         std.mem.writeInt(u64, buf[17..25], record.created_at, .little);
@@ -1922,7 +1922,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v6_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -1939,7 +1939,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v5_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -1954,7 +1954,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v4_size) {
         if (raw[49] > 1 or raw[50] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -1969,7 +1969,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v3_size) {
         if (raw[49] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -1983,7 +1983,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     }
     if (raw.len == txn_record_v2_size) {
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -1997,7 +1997,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     }
     if (raw.len == txn_record_v1_size) {
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -2008,7 +2008,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
         };
     }
     if (raw.len == txn_record_v0_size) {
-        const status: TxnStatus = @enumFromInt(raw[0]);
+        const status: TxnStatus = @fromBackingInt(@intCast(raw[0]));
         const ts = std.mem.readInt(u64, raw[1..9], .little);
         return .{
             .status = status,
@@ -2133,7 +2133,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================
@@ -2331,12 +2331,12 @@ test "idempotent begin upgrades a legacy transaction coordinator role" {
 
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{6} ** 16;
+    const txn_id: TxnId = @splat(6);
     const participants = [_][]const u8{ "table2:4:docs:group:7", "table2:4:docs:group:8" };
     try mgr.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 900, &participants, false);
 
     var legacy: [txn_record_v3_size]u8 = @splat(0);
-    legacy[0] = @intFromEnum(TxnStatus.pending);
+    legacy[0] = @backingInt(TxnStatus.pending);
     std.mem.writeInt(u64, legacy[1..9], 1_000, .little);
     std.mem.writeInt(u64, legacy[17..25], 900, .little);
     const record_key = makeRecordKey(txn_id);
@@ -2349,8 +2349,8 @@ test "idempotent begin upgrades a legacy transaction coordinator role" {
     try std.testing.expect(txns[0].coordinator_known);
     try std.testing.expect(txns[0].coordinator);
 
-    const txn_id_2: TxnId = .{7} ** 16;
-    const txn_id_3: TxnId = .{8} ** 16;
+    const txn_id_2: TxnId = @splat(7);
+    const txn_id_3: TxnId = @splat(8);
     try mgr.initTransaction(txn_id_2, 1_001);
     try mgr.initTransaction(txn_id_3, 1_002);
     const first_page = try mgr.listTransactionsPage(alloc, null, 2);
@@ -2485,7 +2485,7 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
 
-    const txn_id: TxnId = .{3} ** 16;
+    const txn_id: TxnId = @splat(3);
     try mgr.initTransaction(txn_id, 1000);
     try mgr.writeIntents(txn_id, &.{.{ .key = "shared", .value = "pending" }}, &.{});
     const before = backend.snapshotMaintenanceStats();
@@ -2505,8 +2505,8 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(txn_id));
     const after_point_reads = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(
-        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
-        after_point_reads.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_point_reads.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
     );
 
     try std.testing.expect(try mgr.hasIntents(txn_id));
@@ -2517,8 +2517,8 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     try std.testing.expect(!try mgr.hasIntents(txn_id));
     const after_lifecycle = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(
-        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
-        after_lifecycle.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_lifecycle.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
     );
 }
 
@@ -2532,7 +2532,7 @@ test "transaction intent manifest rolls forward legacy in-flight intents" {
     var mgr = try TxnManager.init(alloc, &runtime);
     defer mgr.deinit();
 
-    const txn_id: TxnId = .{5} ** 16;
+    const txn_id: TxnId = @splat(5);
     try mgr.initTransaction(txn_id, 1000);
     try mgr.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "a" }}, &.{});
 
@@ -2694,7 +2694,7 @@ test "coordinator recovery durably aborts a stale prepared transaction" {
 
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{9} ** 16;
+    const txn_id: TxnId = @splat(9);
     try mgr.initTransactionWithParticipantsCreatedAtAndRole(
         txn_id,
         10_000,
@@ -3080,7 +3080,7 @@ test "retained terminal transactions honor the extended retry cutoff" {
 
     var mgr = try TxnManager.init(alloc, &runtime_store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{5} ** 16;
+    const txn_id: TxnId = @splat(5);
     try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(
         txn_id,
         1_000,

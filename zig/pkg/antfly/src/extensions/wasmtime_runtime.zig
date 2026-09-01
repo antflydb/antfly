@@ -328,7 +328,7 @@ const WasmtimeExternUnion = extern union {
 
 const WasmtimeExtern = extern struct {
     kind: WasmtimeExternKind = 0,
-    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 32 },
+    of: WasmtimeExternUnion = .{ .bytes = @as([32]u8, @splat(0)) },
 };
 
 const WasmtimeValRaw = extern union {

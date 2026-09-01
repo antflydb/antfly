@@ -33,7 +33,7 @@ pub const ImageU8 = struct {
     format: PixelFormat,
 
     pub fn channels(self: ImageU8) usize {
-        return @intFromEnum(self.format);
+        return @backingInt(self.format);
     }
 };
 

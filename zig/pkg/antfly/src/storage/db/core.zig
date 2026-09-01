@@ -1933,7 +1933,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
     defer alloc.free(change_journal_path);
-    const change_journal_path_z = try alloc.dupeZ(u8, change_journal_path);
+    const change_journal_path_z = try alloc.dupeSentinel(u8, change_journal_path, 0);
     defer alloc.free(change_journal_path_z);
     change_journal.* = try change_journal_mod.Journal.open(
         change_journal_path_z,
@@ -2411,8 +2411,8 @@ fn storeSnapshotHasV2Magic(io: std.Io, path: []const u8) !bool {
     return std.mem.eql(u8, &magic, store_snapshot_v2_magic);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
-    if (builtin.os.tag == .freestanding) return;
+fn threadedIo() if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) void else std.Io.Threaded {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return;
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 

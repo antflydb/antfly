@@ -63,7 +63,7 @@ generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-ge
 
 generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
 
-tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has not drifted.
+tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh
 
 openapi-generate: mcp-schema-fragments-generate

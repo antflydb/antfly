@@ -1097,7 +1097,7 @@ test "async dense zero-applied replay window advances only through target covera
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-zero-applied-target-advance-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1204,7 +1204,7 @@ test "async dense workers advance zero-applied target while catch-up sessions ar
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-worker-target-advance-open-session-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1257,7 +1257,7 @@ test "async dense publish NotFound retries without failing runtime" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-publish-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1307,7 +1307,7 @@ test "async dense catch-up NotFound retries without failing runtime" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-catch-up-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1357,7 +1357,7 @@ test "async full-text catch-up uses generic publish lifecycle" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-full-text-generic-catch-up-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1408,7 +1408,7 @@ test "async worker retries idle applied sequence persist and releases backlog" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-idle-persist-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1420,7 +1420,7 @@ test "async worker retries idle applied sequence persist and releases backlog" {
     });
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 1 << 20,
         .hard_limit_bytes = 2 << 20,
     };
@@ -1449,13 +1449,13 @@ test "async worker retries idle applied sequence persist and releases backlog" {
     var waited: usize = 0;
     while (waited < 2_000) : (waited += 1) {
         const stats = manager.snapshot();
-        if (stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes == 0) break;
+        if (stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes == 0) break;
         sleepNs(std.time.ns_per_ms);
     }
 
     try runtime.failIfUnhealthy();
     const stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
     try std.testing.expect(capture.persist_calls.load(.monotonic) >= 2);
     try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }
@@ -1467,7 +1467,7 @@ test "async worker backoffs and retries replay truncation writer lock" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-truncate-writer-lock-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1518,7 +1518,7 @@ test "async dense publishes applied window before target tail is visible" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-bounded-publish-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());

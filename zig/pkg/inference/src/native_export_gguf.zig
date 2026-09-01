@@ -40,7 +40,7 @@ const qwen2vl_multimodal_mod = @import("pipelines/qwen2vl_multimodal.zig");
 const variants_manifest = @import("quantize/variants_manifest.zig");
 
 const print = std.debug.print;
-const io_compat = compat.io;
+const io_compat = compat.testingIo;
 
 const QuantizationMode = enum {
     none,
@@ -457,7 +457,7 @@ fn exportColqwenBundleSidecars(
     defer allocator.free(model_manifest_out);
     const manifest_json = try synthesizeColqwenModelManifestJson(allocator, manifest);
     defer allocator.free(manifest_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = model_manifest_out, .data = manifest_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = model_manifest_out, .data = manifest_json });
 
     try writeColqwenBundleMarker(allocator, out_dir, output_path);
 }
@@ -483,12 +483,12 @@ fn trimRightSlash(value: []const u8) []const u8 {
 }
 
 fn copyFileStreaming(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
-    const io = compat.io();
+    const io = compat.testingIo();
     if (try pathsReferToSameFile(allocator, io, src_path, dst_path)) return;
 
-    var src = try compat.cwd().openFile(io, src_path, .{});
+    var src = try std.Io.Dir.cwd().openFile(io, src_path, .{});
     defer src.close(io);
-    var dst = try compat.cwd().createFile(io, dst_path, .{ .truncate = true });
+    var dst = try std.Io.Dir.cwd().createFile(io, dst_path, .{ .truncate = true });
     defer dst.close(io);
 
     var buf: [1024 * 1024]u8 = undefined;
@@ -505,9 +505,9 @@ fn copyFileStreaming(allocator: std.mem.Allocator, src_path: []const u8, dst_pat
 fn pathsReferToSameFile(allocator: std.mem.Allocator, io: std.Io, src_path: []const u8, dst_path: []const u8) !bool {
     if (std.mem.eql(u8, trimRightSlash(src_path), trimRightSlash(dst_path))) return true;
 
-    const src_real = try compat.cwd().realPathFileAlloc(io, src_path, allocator);
+    const src_real = try std.Io.Dir.cwd().realPathFileAlloc(io, src_path, allocator);
     defer allocator.free(src_real);
-    const dst_real = compat.cwd().realPathFileAlloc(io, dst_path, allocator) catch |err| switch (err) {
+    const dst_real = std.Io.Dir.cwd().realPathFileAlloc(io, dst_path, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -519,13 +519,13 @@ test "copyFileStreaming skips same file through canonical alias" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "same-file-streaming-copy");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const source_path = try std.fs.path.join(allocator, &.{ dir_path, "payload.bin" });
     defer allocator.free(source_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = source_path, .data = "payload-data" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = source_path, .data = "payload-data" });
 
     const alias_path = try std.fmt.allocPrint(allocator, "{s}/./payload.bin", .{dir_path});
     defer allocator.free(alias_path);
@@ -564,7 +564,7 @@ fn writeColqwenBundleMarker(
         .inputs = &[_][]const u8{ "text", "image" },
     }, .{});
     defer allocator.free(marker_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_marker_path, .data = marker_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = bundle_marker_path, .data = marker_json });
 }
 
 fn synthesizeColqwenModelManifestJson(
@@ -599,7 +599,7 @@ fn exportFlorence2BundleSidecars(
 ) !void {
     const io = io_compat();
     const out_dir = std.fs.path.dirname(output_path) orelse ".";
-    if (out_dir.len > 0) try compat.cwd().createDirPath(io, out_dir);
+    if (out_dir.len > 0) try std.Io.Dir.cwd().createDirPath(io, out_dir);
     try copyFlorence2BundleAssets(allocator, model_dir, out_dir);
     try writeFlorence2BundleMarker(allocator, out_dir, std.fs.path.basename(output_path));
     try variants_manifest.writeFlorence2VariantsManifestForModel(allocator, io, out_dir, std.fs.path.basename(output_path));
@@ -712,7 +712,7 @@ fn exportFlorence2BundleToGguf(
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
 
-    try compat.cwd().createDirPath(io_compat(), bundle_dir);
+    try std.Io.Dir.cwd().createDirPath(io_compat(), bundle_dir);
     const model_name = try variants_manifest.florence2GgufName(allocator, @tagName(quantization));
     defer allocator.free(model_name);
     const model_path = try std.fs.path.join(allocator, &.{ bundle_dir, model_name });
@@ -725,7 +725,7 @@ fn exportFlorence2BundleToGguf(
     } else if (!c_file.fileExistsInDir(allocator, bundle_dir, "antfly_inference_bundle.json")) {
         try writeFlorence2BundleMarker(allocator, bundle_dir, model_name);
     }
-    try variants_manifest.writeFlorence2VariantsManifest(allocator, compat.io(), bundle_dir);
+    try variants_manifest.writeFlorence2VariantsManifest(allocator, compat.testingIo(), bundle_dir);
 }
 
 fn copyFlorence2BundleAssets(
@@ -757,7 +757,7 @@ fn writeFlorence2ModelManifest(allocator: std.mem.Allocator, bundle_dir: []const
         .inputs = &[_][]const u8{ "text", "image" },
     }, .{});
     defer allocator.free(manifest_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = manifest_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = manifest_json });
 }
 
 fn writeFlorence2BundleMarker(
@@ -778,7 +778,7 @@ fn writeFlorence2BundleMarker(
         .inputs = &[_][]const u8{ "text", "image" },
     }, .{});
     defer allocator.free(marker_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = marker_path, .data = marker_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = marker_path, .data = marker_json });
 }
 
 const ClipclapBundlePlans = struct {
@@ -975,7 +975,7 @@ fn exportClipclapBundleToGguf(
     var plans = try buildClipclapBundlePlans(allocator, model_dir, manifest, access, quantization, filter);
     defer plans.deinit(allocator);
 
-    try compat.cwd().createDirPath(io_compat(), bundle_dir);
+    try std.Io.Dir.cwd().createDirPath(io_compat(), bundle_dir);
 
     const clip_name = try variants_manifest.clipclapGgufName(allocator, "clip", @tagName(quantization));
     defer allocator.free(clip_name);
@@ -992,7 +992,7 @@ fn exportClipclapBundleToGguf(
     if (quantization == .none) {
         try writeClipclapBundleMarker(allocator, bundle_dir, clip_name, clap_name);
     }
-    try variants_manifest.writeClipclapVariantsManifest(allocator, compat.io(), bundle_dir);
+    try variants_manifest.writeClipclapVariantsManifest(allocator, compat.testingIo(), bundle_dir);
 }
 
 fn copyClipclapBundleAssets(
@@ -1037,7 +1037,7 @@ fn writeClipclapBundleMarker(
         .projections_embedded = true,
     }, .{});
     defer allocator.free(marker_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_marker_path, .data = marker_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = bundle_marker_path, .data = marker_json });
 }
 
 fn formatGlinerBundleDryRunReport(
@@ -1502,7 +1502,7 @@ fn copyGlinerBundleAssets(
 ) !void {
     const io = io_compat();
     const out_dir = std.fs.path.dirname(output_path) orelse ".";
-    if (out_dir.len > 0) try compat.cwd().createDirPath(io, out_dir);
+    if (out_dir.len > 0) try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const asset_names = [_][]const u8{
         "config.json",
         "gliner_config.json",
@@ -1522,7 +1522,7 @@ fn copyGlinerBundleAssets(
         defer allocator.free(bytes);
         const target = try std.fs.path.join(allocator, &.{ out_dir, asset_name });
         defer allocator.free(target);
-        try compat.cwd().writeFile(io, .{ .sub_path = target, .data = bytes });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = target, .data = bytes });
     }
     try writeGlinerBundleMarker(allocator, out_dir, output_path);
 }
@@ -1538,7 +1538,7 @@ fn writeGlinerBundleMarker(allocator: std.mem.Allocator, out_dir: []const u8, ou
         .head = "gliner_head.gguf",
     }, .{});
     defer allocator.free(marker_bytes);
-    try compat.cwd().writeFile(io_compat(), .{
+    try std.Io.Dir.cwd().writeFile(io_compat(), .{
         .sub_path = marker_path,
         .data = marker_bytes,
     });
@@ -3427,7 +3427,7 @@ fn copyProjectorGguf(allocator: std.mem.Allocator, source_path: []const u8, targ
     if (std.mem.eql(u8, source_path, target_path)) return;
     const raw = try c_file.readFile(allocator, source_path);
     defer allocator.free(raw);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = target_path, .data = raw });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = target_path, .data = raw });
 }
 
 fn resolveRequestedProjectorFormat(
@@ -4645,7 +4645,7 @@ fn appendSentencePieceTokenizerMetadata(
         tokens[piece_index].deinit(allocator);
         tokens[piece_index] = .{ .string = try allocator.dupe(u8, piece.text) };
         scores[piece_index] = .{ .f32 = piece.score };
-        token_types[piece_index] = .{ .i32 = @intCast(@intFromEnum(piece.piece_type)) };
+        token_types[piece_index] = .{ .i32 = @intCast(@backingInt(piece.piece_type)) };
     }
 
     var extra_it = sp.extra_id_to_text.iterator();
@@ -5043,10 +5043,10 @@ fn writeExportFile(
 ) !void {
     const io = io_compat();
     if (std.fs.path.dirname(output_path)) |parent| {
-        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
     }
 
-    var file = try compat.cwd().createFile(io, output_path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
     defer file.close(io);
 
     try file.writeStreamingAll(io, layout.header_bytes);
@@ -5080,7 +5080,7 @@ fn writeExportFile(
 
 fn writeZeroPadding(io: std.Io, file: anytype, count: usize) !void {
     if (count == 0) return;
-    var buf: [256]u8 = [_]u8{0} ** 256;
+    var buf: [256]u8 = @as([256]u8, @splat(0));
     var remaining = count;
     while (remaining > 0) {
         const chunk = @min(remaining, buf.len);
@@ -5425,13 +5425,13 @@ test "dense export writes parseable gguf with reversed dims and mapped names" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-dense");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -5524,7 +5524,7 @@ test "gguf passthrough preserves quantized tensor type and metadata" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-passthrough");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -5550,13 +5550,13 @@ test "dense export emits standalone hf tokenizer metadata arrays" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-hf-tokenizer");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -5565,7 +5565,7 @@ test "dense export emits standalone hf tokenizer metadata arrays" {
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{
@@ -5690,7 +5690,7 @@ test "dense export golden fixture round trips through gguf re-export" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-golden-roundtrip");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -5707,10 +5707,10 @@ test "dense export golden fixture round trips through gguf re-export" {
 
     const roundtrip_dir = try std.fs.path.join(allocator, &.{ dir_path, "roundtrip-dir" });
     defer allocator.free(roundtrip_dir);
-    try compat.cwd().createDirPath(compat.io(), roundtrip_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), roundtrip_dir);
     const roundtrip_model_path = try std.fs.path.join(allocator, &.{ roundtrip_dir, "model.gguf" });
     defer allocator.free(roundtrip_model_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = roundtrip_model_path, .data = first_raw });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = roundtrip_model_path, .data = first_raw });
 
     const second_path = try std.fs.path.join(allocator, &.{ roundtrip_dir, "second.gguf" });
     defer allocator.free(second_path);
@@ -5788,13 +5788,13 @@ test "multimodal export writes decoder gguf and preserves companion projector gg
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-multimodal-companion");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gemma3","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5,"image_token_index":1,"mm_tokens_per_image":2,"vision_patch_size":14,"vision_hidden_size":8}
@@ -5865,8 +5865,8 @@ test "multimodal export writes decoder gguf and preserves companion projector gg
             17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32,
         } },
-        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
+        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
     });
 
     const projector_source_path = try std.fs.path.join(allocator, &.{ dir_path, "mmproj.gguf" });
@@ -5905,13 +5905,13 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-multimodal-synth-projector");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gemma3","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5,"image_token_index":1,"mm_tokens_per_image":2,"vision_config":{"hidden_size":8,"num_hidden_layers":3,"num_attention_heads":4,"intermediate_size":16,"patch_size":14,"image_size":224}}
@@ -5982,8 +5982,8 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
             17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32,
         } },
-        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &([_]f32{2.0} ** 8) },
+        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(2.0))) },
         .{ .name = "multi_modal_projector.mm_input_projection_weight", .shape = &.{ 8, 4 }, .data = &[_]f32{
             0,  1,  2,  3,
             4,  5,  6,  7,
@@ -6049,13 +6049,13 @@ test "requesting clip projector export for integrated gemma3 tensors fails" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-multimodal-clip-unsupported");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gemma3","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5,"image_token_index":1,"mm_tokens_per_image":2,"vision_config":{"hidden_size":8,"num_hidden_layers":3,"num_attention_heads":4,"intermediate_size":16,"patch_size":14,"image_size":224}}
@@ -6075,16 +6075,16 @@ test "requesting clip projector export for integrated gemma3 tensors fails" {
         } },
         .{ .name = "model.norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{1.0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{2.0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{3.0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{4.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(1.0))) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(2.0))) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(3.0))) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(4.0))) },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 2, 2, 2, 2 } },
-        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{2.0} ** 32) },
-        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{3.0} ** 32) },
-        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &([_]f32{2.0} ** 8) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(2.0))) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(3.0))) },
+        .{ .name = "vision_tower.vision_model.post_layernorm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "multi_modal_projector.mm_soft_emb_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(2.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "decoder.gguf" });
@@ -6117,13 +6117,13 @@ test "dense deberta export writes deberta metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-deberta");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"deberta-v3","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":32,"position_buckets":16,"num_labels":3}
@@ -6133,25 +6133,25 @@ test "dense deberta export writes deberta metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "deberta.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
+        .{ .name = "deberta.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "deberta.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.rel_embeddings.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
+        .{ .name = "deberta.encoder.rel_embeddings.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "deberta.encoder.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** (4 * 4)) },
+        .{ .name = "deberta.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([(4 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** (4 * 4)) },
+        .{ .name = "deberta.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([(4 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** (4 * 4)) },
+        .{ .name = "deberta.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([(4 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** (4 * 4)) },
+        .{ .name = "deberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([(4 * 4)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "deberta.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "deberta.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "deberta.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** (8 * 4)) },
-        .{ .name = "deberta.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "deberta.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** (4 * 8)) },
+        .{ .name = "deberta.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([(8 * 4)]f32, @splat(0.0))) },
+        .{ .name = "deberta.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "deberta.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([(4 * 8)]f32, @splat(0.0))) },
         .{ .name = "deberta.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "deberta.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "deberta.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
@@ -6178,13 +6178,13 @@ test "dense bert export writes bert metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-bert");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"bert","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":32,"type_vocab_size":2,"num_labels":3}
@@ -6194,30 +6194,30 @@ test "dense bert export writes bert metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "bert.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "bert.embeddings.position_embeddings.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
-        .{ .name = "bert.embeddings.token_type_embeddings.weight", .shape = &.{ 2, 4 }, .data = &([_]f32{0.0} ** 8) },
+        .{ .name = "bert.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "bert.embeddings.position_embeddings.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
+        .{ .name = "bert.embeddings.token_type_embeddings.weight", .shape = &.{ 2, 4 }, .data = &(@as([8]f32, @splat(0.0))) },
         .{ .name = "bert.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "bert.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "bert.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "bert.encoder.layer.0.attention.self.query.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "bert.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "bert.encoder.layer.0.attention.self.key.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "bert.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "bert.encoder.layer.0.attention.self.value.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "bert.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "bert.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "bert.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "bert.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "bert.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "bert.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "bert.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "bert.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "bert.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "bert.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "bert.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "bert.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "bert.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "bert.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "bert.pooler.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "classifier.weight", .shape = &.{ 3, 4 }, .data = &([_]f32{0.0} ** 12) },
+        .{ .name = "classifier.weight", .shape = &.{ 3, 4 }, .data = &(@as([12]f32, @splat(0.0))) },
         .{ .name = "classifier.bias", .shape = &.{3}, .data = &[_]f32{ 0, 0, 0 } },
     });
 
@@ -6245,13 +6245,13 @@ test "dense t5 export writes t5 metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-t5");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"t5","d_model":8,"d_kv":4,"d_ff":16,"num_heads":2,"num_layers":1,"num_decoder_layers":1,"relative_attention_num_buckets":32,"relative_attention_max_distance":128,"vocab_size":32,"decoder_start_token_id":0,"eos_token_id":1,"pad_token_id":0,"feed_forward_proj":"gated-gelu"}
@@ -6261,13 +6261,13 @@ test "dense t5 export writes t5 metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "shared.weight", .shape = &.{ 32, 8 }, .data = &([_]f32{0.0} ** (32 * 8)) },
-        .{ .name = "encoder.block.0.layer.0.SelfAttention.q.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", .shape = &.{ 32, 2 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "encoder.final_layer_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "decoder.block.0.layer.0.SelfAttention.q.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "decoder.final_layer_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "lm_head.weight", .shape = &.{ 32, 8 }, .data = &([_]f32{0.0} ** (32 * 8)) },
+        .{ .name = "shared.weight", .shape = &.{ 32, 8 }, .data = &(@as([(32 * 8)]f32, @splat(0.0))) },
+        .{ .name = "encoder.block.0.layer.0.SelfAttention.q.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", .shape = &.{ 32, 2 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "encoder.final_layer_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "decoder.block.0.layer.0.SelfAttention.q.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "decoder.final_layer_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 32, 8 }, .data = &(@as([(32 * 8)]f32, @splat(0.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "t5.gguf" });
@@ -6309,13 +6309,13 @@ test "dense layoutlmv3 export writes layoutlmv3 metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-layoutlmv3");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"layoutlmv3","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"type_vocab_size":2,"max_2d_position_embeddings":16,"coordinate_size":4,"shape_size":4,"input_size":16,"patch_size":16,"num_channels":3,"num_labels":3}
@@ -6325,41 +6325,41 @@ test "dense layoutlmv3 export writes layoutlmv3 metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "layoutlmv3.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "layoutlmv3.embeddings.position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "layoutlmv3.embeddings.token_type_embeddings.weight", .shape = &.{ 2, 4 }, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "layoutlmv3.embeddings.x_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "layoutlmv3.embeddings.y_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "layoutlmv3.embeddings.h_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "layoutlmv3.embeddings.w_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
+        .{ .name = "layoutlmv3.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.token_type_embeddings.weight", .shape = &.{ 2, 4 }, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.x_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.y_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.h_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.embeddings.w_position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "layoutlmv3.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.patch_embed.proj.weight", .shape = &.{ 4, 3, 16, 16 }, .data = &([_]f32{0.0} ** (4 * 3 * 16 * 16)) },
+        .{ .name = "layoutlmv3.patch_embed.proj.weight", .shape = &.{ 4, 3, 16, 16 }, .data = &(@as([(4 * 3 * 16 * 16)]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.patch_embed.proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.pos_embed", .shape = &.{ 2, 4 }, .data = &([_]f32{0.0} ** 8) },
+        .{ .name = "layoutlmv3.pos_embed", .shape = &.{ 2, 4 }, .data = &(@as([8]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.cls_token", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "layoutlmv3.norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "layoutlmv3.norm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.encoder.rel_pos_bias.weight", .shape = &.{ 32, 2 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "layoutlmv3.encoder.rel_pos_x_bias.weight", .shape = &.{ 64, 2 }, .data = &([_]f32{0.0} ** 128) },
-        .{ .name = "layoutlmv3.encoder.rel_pos_y_bias.weight", .shape = &.{ 64, 2 }, .data = &([_]f32{0.0} ** 128) },
-        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "layoutlmv3.encoder.rel_pos_bias.weight", .shape = &.{ 32, 2 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.encoder.rel_pos_x_bias.weight", .shape = &.{ 64, 2 }, .data = &(@as([128]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.encoder.rel_pos_y_bias.weight", .shape = &.{ 64, 2 }, .data = &(@as([128]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.self.query.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.self.key.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "layoutlmv3.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.self.value.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "layoutlmv3.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "layoutlmv3.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "layoutlmv3.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "layoutlmv3.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "layoutlmv3.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "layoutlmv3.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "layoutlmv3.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "layoutlmv3.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "layoutlmv3.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "layoutlmv3.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "classifier.weight", .shape = &.{ 3, 4 }, .data = &([_]f32{0.0} ** 12) },
+        .{ .name = "classifier.weight", .shape = &.{ 3, 4 }, .data = &(@as([12]f32, @splat(0.0))) },
         .{ .name = "classifier.bias", .shape = &.{3}, .data = &[_]f32{ 0, 0, 0 } },
     });
 
@@ -6386,13 +6386,13 @@ test "dense clip export writes clip metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-clip");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"clip","projection_dim":4,"text_config":{"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"vocab_size":32},"vision_config":{"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"image_size":16,"patch_size":8}}
@@ -6402,43 +6402,43 @@ test "dense clip export writes clip metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "clip.text_model.embeddings.token_embedding.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
-        .{ .name = "clip.text_model.embeddings.position_embedding.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.text_model.embeddings.token_embedding.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.embeddings.position_embedding.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm1.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm2.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.text_model.final_layer_norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.final_layer_norm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.text_projection.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.text_projection.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clip.vision_model.embeddings.class_embedding", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.vision_model.embeddings.patch_embedding.weight", .shape = &.{ 4, 3, 8, 8 }, .data = &([_]f32{0.0} ** (4 * 3 * 8 * 8)) },
-        .{ .name = "clip.vision_model.embeddings.position_embedding.weight", .shape = &.{ 5, 4 }, .data = &([_]f32{0.0} ** 20) },
+        .{ .name = "clip.vision_model.embeddings.patch_embedding.weight", .shape = &.{ 4, 3, 8, 8 }, .data = &(@as([(4 * 3 * 8 * 8)]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.embeddings.position_embedding.weight", .shape = &.{ 5, 4 }, .data = &(@as([20]f32, @splat(0.0))) },
         .{ .name = "clip.vision_model.pre_layrnorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.vision_model.pre_layrnorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clip.vision_model.encoder.layers.0.layer_norm1.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.vision_model.encoder.layers.0.layer_norm1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "clip.vision_model.encoder.layers.0.mlp.fc2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.vision_model.encoder.layers.0.layer_norm2.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.vision_model.encoder.layers.0.layer_norm2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.vision_model.post_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.vision_model.post_layernorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.visual_projection.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.visual_projection.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clip.logit_scale", .shape = &.{1}, .data = &[_]f32{1.0} },
     });
 
@@ -6467,13 +6467,13 @@ test "dense siglip text export preserves siglip family metadata" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-siglip-text");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"siglip_text_model","projection_dim":4,"text_config":{"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"vocab_size":32}}
@@ -6483,23 +6483,23 @@ test "dense siglip text export preserves siglip family metadata" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "clip.text_model.embeddings.token_embedding.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
-        .{ .name = "clip.text_model.embeddings.position_embedding.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
-        .{ .name = "clip.text_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.text_model.embeddings.token_embedding.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.embeddings.position_embedding.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.self_attn.out_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm1.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "clip.text_model.encoder.layers.0.mlp.fc2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm2.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.encoder.layers.0.layer_norm2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clip.text_model.final_layer_norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clip.text_model.final_layer_norm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clip.text_projection.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clip.text_projection.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "siglip.gguf" });
@@ -6519,13 +6519,13 @@ test "dense whisper export writes whisper metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-whisper");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"whisper","d_model":8,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":2,"decoder_attention_heads":2,"encoder_ffn_dim":16,"decoder_ffn_dim":16,"num_mel_bins":80,"vocab_size":64,"max_source_positions":1500,"max_target_positions":448,"decoder_start_token_id":2}
@@ -6535,16 +6535,16 @@ test "dense whisper export writes whisper metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "model.encoder.conv1.weight", .shape = &.{ 8, 80, 3 }, .data = &([_]f32{0.0} ** (8 * 80 * 3)) },
-        .{ .name = "model.encoder.conv1.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "model.encoder.embed_positions.weight", .shape = &.{ 1500, 8 }, .data = &([_]f32{0.0} ** (1500 * 8)) },
-        .{ .name = "model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "model.encoder.layer_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "model.decoder.embed_tokens.weight", .shape = &.{ 64, 8 }, .data = &([_]f32{0.0} ** (64 * 8)) },
-        .{ .name = "model.decoder.embed_positions.weight", .shape = &.{ 448, 8 }, .data = &([_]f32{0.0} ** (448 * 8)) },
-        .{ .name = "model.decoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "model.decoder.layer_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "proj_out.weight", .shape = &.{ 64, 8 }, .data = &([_]f32{0.0} ** (64 * 8)) },
+        .{ .name = "model.encoder.conv1.weight", .shape = &.{ 8, 80, 3 }, .data = &(@as([(8 * 80 * 3)]f32, @splat(0.0))) },
+        .{ .name = "model.encoder.conv1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "model.encoder.embed_positions.weight", .shape = &.{ 1500, 8 }, .data = &(@as([(1500 * 8)]f32, @splat(0.0))) },
+        .{ .name = "model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "model.encoder.layer_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "model.decoder.embed_tokens.weight", .shape = &.{ 64, 8 }, .data = &(@as([(64 * 8)]f32, @splat(0.0))) },
+        .{ .name = "model.decoder.embed_positions.weight", .shape = &.{ 448, 8 }, .data = &(@as([(448 * 8)]f32, @splat(0.0))) },
+        .{ .name = "model.decoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "model.decoder.layer_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "proj_out.weight", .shape = &.{ 64, 8 }, .data = &(@as([(64 * 8)]f32, @splat(0.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "whisper.gguf" });
@@ -6571,13 +6571,13 @@ test "dense clap export writes clap metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-clap");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":2,"depths":[1,1,1,1],"num_attention_heads":[2,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
@@ -6587,29 +6587,29 @@ test "dense clap export writes clap metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "clap.text_model.embeddings.word_embeddings.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
-        .{ .name = "clap.text_model.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.embeddings.word_embeddings.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clap.text_model.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.pooler.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_projection.linear1.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_projection.linear1.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_projection.linear1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_projection.linear2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.weight", .shape = &.{ 4, 1, 4, 4 }, .data = &([_]f32{0.0} ** (4 * 1 * 4 * 4)) },
+        .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.weight", .shape = &.{ 4, 1, 4, 4 }, .data = &(@as([(4 * 1 * 4 * 4)]f32, @splat(0.0))) },
         .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.audio_model.audio_encoder.layers.0.blocks.0.attention.self.relative_position_bias_table", .shape = &.{ 9, 2 }, .data = &[_]f32{
             0,  1,  2,  3,  4,  5,
             6,  7,  8,  9,  10, 11,
             12, 13, 14, 15, 16, 17,
         } },
-        .{ .name = "clap.audio_model.audio_encoder.batch_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "clap.audio_model.audio_encoder.batch_norm.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_mean", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_var", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "clap.audio_model.audio_encoder.norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "clap.audio_model.audio_encoder.norm.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clap.audio_projection.linear1.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "clap.audio_model.audio_encoder.batch_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "clap.audio_model.audio_encoder.batch_norm.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_mean", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_var", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "clap.audio_model.audio_encoder.norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "clap.audio_model.audio_encoder.norm.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clap.audio_projection.linear1.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "clap.audio_projection.linear1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.audio_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.audio_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.audio_projection.linear2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.logit_scale", .shape = &.{1}, .data = &[_]f32{1.0} },
     });
@@ -6651,10 +6651,10 @@ test "dense clap export writes clap metadata and tensors" {
     // produced by older exporters are repaired without touching tensor data.
     const roundtrip_dir = try std.fs.path.join(allocator, &.{ dir_path, "roundtrip" });
     defer allocator.free(roundtrip_dir);
-    try compat.cwd().createDirPath(compat.io(), roundtrip_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), roundtrip_dir);
     const roundtrip_source = try std.fs.path.join(allocator, &.{ roundtrip_dir, "model.gguf" });
     defer allocator.free(roundtrip_source);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = roundtrip_source, .data = raw });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = roundtrip_source, .data = raw });
     const roundtrip_path = try std.fs.path.join(allocator, &.{ roundtrip_dir, "roundtrip.gguf" });
     defer allocator.free(roundtrip_path);
     try exportModelDirToGguf(allocator, roundtrip_dir, roundtrip_path, .none);
@@ -6675,19 +6675,19 @@ test "exported clap gguf loads and runs through native text path" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-clap-runtime-src");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const export_dir = try testScratchDir(allocator, "native-export-gguf-clap-runtime-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":4,"depths":[1,1,1,1],"num_attention_heads":[1,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
@@ -6697,31 +6697,31 @@ test "exported clap gguf loads and runs through native text path" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "clap.text_model.embeddings.word_embeddings.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0.0} ** (32 * 4)) },
-        .{ .name = "clap.text_model.embeddings.position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0.0} ** (16 * 4)) },
+        .{ .name = "clap.text_model.embeddings.word_embeddings.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
+        .{ .name = "clap.text_model.embeddings.position_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clap.text_model.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.encoder.layer.0.attention.self.query.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.encoder.layer.0.attention.self.query.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.encoder.layer.0.attention.self.key.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.encoder.layer.0.attention.self.key.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.encoder.layer.0.attention.self.value.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.encoder.layer.0.attention.self.value.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.text_model.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clap.text_model.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "clap.text_model.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
-        .{ .name = "clap.text_model.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "clap.text_model.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "clap.text_model.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0.0))) },
+        .{ .name = "clap.text_model.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.text_model.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "clap.text_model.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_model.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_model.pooler.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_model.pooler.dense.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_projection.linear1.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_projection.linear1.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_projection.linear1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "clap.text_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0.0} ** 16) },
+        .{ .name = "clap.text_projection.linear2.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0.0))) },
         .{ .name = "clap.text_projection.linear2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
     });
 
@@ -6759,13 +6759,13 @@ test "dense florence export writes florence metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-florence");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"florence2","text_config":{"d_model":8,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":2,"decoder_attention_heads":2,"encoder_ffn_dim":16,"decoder_ffn_dim":16,"vocab_size":32,"max_position_embeddings":16},"vision_config":{"image_size":32,"hidden_size":8,"patch_size":[7,3,3,3],"patch_stride":[4,2,2,2],"patch_padding":[3,1,1,1],"patch_prenorm":[false,true,true,true],"dim_embed":[8,16,24,32],"num_heads":[1,2,3,4],"num_groups":[1,2,3,4],"depths":[1,1,2,1],"window_size":12,"image_pos_embed":{"max_pos_embeddings":50},"visual_temporal_embedding":{"max_temporal_embeddings":100},"image_feature_source":["spatial_avg_pool","last_frame"]},"projection_dim":8,"image_token_id":31,"bos_token_id":2,"eos_token_id":3,"pad_token_id":1,"decoder_start_token_id":2}
@@ -6784,17 +6784,17 @@ test "dense florence export writes florence metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "vision_tower.convs.0.proj.weight", .shape = &.{ 8, 3, 7, 7 }, .data = &([_]f32{0.0} ** (8 * 3 * 7 * 7)) },
-        .{ .name = "image_projection", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "image_proj_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
-        .{ .name = "image_pos_embed.row_embeddings.weight", .shape = &.{ 50, 4 }, .data = &([_]f32{0.0} ** 200) },
-        .{ .name = "visual_temporal_embed.weight", .shape = &.{ 100, 8 }, .data = &([_]f32{0.0} ** 800) },
-        .{ .name = "language_model.model.encoder.embed_positions.weight", .shape = &.{ 16, 8 }, .data = &([_]f32{0.0} ** 128) },
-        .{ .name = "language_model.model.decoder.embed_positions.weight", .shape = &.{ 16, 8 }, .data = &([_]f32{0.0} ** 128) },
-        .{ .name = "language_model.model.shared.weight", .shape = &.{ 32, 8 }, .data = &([_]f32{0.0} ** 256) },
-        .{ .name = "language_model.model.decoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0.0} ** 64) },
-        .{ .name = "language_model.final_logits_bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 32, 8 }, .data = &([_]f32{0.0} ** 256) },
+        .{ .name = "vision_tower.convs.0.proj.weight", .shape = &.{ 8, 3, 7, 7 }, .data = &(@as([(8 * 3 * 7 * 7)]f32, @splat(0.0))) },
+        .{ .name = "image_projection", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "image_proj_norm.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1.0))) },
+        .{ .name = "image_pos_embed.row_embeddings.weight", .shape = &.{ 50, 4 }, .data = &(@as([200]f32, @splat(0.0))) },
+        .{ .name = "visual_temporal_embed.weight", .shape = &.{ 100, 8 }, .data = &(@as([800]f32, @splat(0.0))) },
+        .{ .name = "language_model.model.encoder.embed_positions.weight", .shape = &.{ 16, 8 }, .data = &(@as([128]f32, @splat(0.0))) },
+        .{ .name = "language_model.model.decoder.embed_positions.weight", .shape = &.{ 16, 8 }, .data = &(@as([128]f32, @splat(0.0))) },
+        .{ .name = "language_model.model.shared.weight", .shape = &.{ 32, 8 }, .data = &(@as([256]f32, @splat(0.0))) },
+        .{ .name = "language_model.model.decoder.layers.0.self_attn.k_proj.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0.0))) },
+        .{ .name = "language_model.final_logits_bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 32, 8 }, .data = &(@as([256]f32, @splat(0.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.gguf" });
@@ -6852,18 +6852,18 @@ test "gliner2 export writes split encoder gguf bundle" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gliner2-wrapper");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const export_dir = try testScratchDir(allocator, "native-export-gguf-gliner2-wrapper-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
@@ -6872,14 +6872,14 @@ test "gliner2 export writes split encoder gguf bundle" {
 
     const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
     defer allocator.free(gliner_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = gliner_config_path,
         .data = "{\"model_type\":\"gliner2\",\"max_width\":4}",
     });
 
     const added_tokens_path = try std.fs.path.join(allocator, &.{ dir_path, "added_tokens.json" });
     defer allocator.free(added_tokens_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = added_tokens_path,
         .data = "{\"[E]\":42}",
     });
@@ -6887,30 +6887,30 @@ test "gliner2 export writes split encoder gguf bundle" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.encoder.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** 64) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.bias", .shape = &.{16}, .data = &([_]f32{0} ** 16) },
+        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 16, 4 }, .data = &(@as([64]f32, @splat(0))) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.bias", .shape = &.{16}, .data = &(@as([16]f32, @splat(0))) },
         .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 1, 4 }, .data = &[_]f32{ 0, 0, 0, 0 } },
     });
 
@@ -6945,18 +6945,18 @@ test "gliner2 export preserves requested encoder basename in bundle marker" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gliner2-wrapper-custom-name");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const export_dir = try testScratchDir(allocator, "native-export-gguf-gliner2-wrapper-custom-name-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
@@ -6965,7 +6965,7 @@ test "gliner2 export preserves requested encoder basename in bundle marker" {
 
     const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
     defer allocator.free(gliner_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = gliner_config_path,
         .data = "{\"model_type\":\"gliner2\",\"max_width\":4}",
     });
@@ -6973,30 +6973,30 @@ test "gliner2 export preserves requested encoder basename in bundle marker" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.encoder.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** 64) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.bias", .shape = &.{16}, .data = &([_]f32{0} ** 16) },
+        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 16, 4 }, .data = &(@as([64]f32, @splat(0))) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.bias", .shape = &.{16}, .data = &(@as([16]f32, @splat(0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ export_dir, "model.gguf" });
@@ -7020,18 +7020,18 @@ test "gliner2 export can quantize gguf head sidecar tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gliner2-quantized-head");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const export_dir = try testScratchDir(allocator, "native-export-gguf-gliner2-quantized-head-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
@@ -7040,7 +7040,7 @@ test "gliner2 export can quantize gguf head sidecar tensors" {
 
     const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
     defer allocator.free(gliner_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = gliner_config_path,
         .data = "{\"model_type\":\"gliner2\",\"max_width\":4,\"capabilities\":[\"extraction\"]}",
     });
@@ -7054,28 +7054,28 @@ test "gliner2 export can quantize gguf head sidecar tensors" {
         24, 25, 26, 27, 28, 29, 30, 31,
     };
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.embeddings.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.embeddings.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{0} ** (16 * 4)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0))) },
         .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "encoder.encoder.LayerNorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.intermediate.dense.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "encoder.encoder.layer.0.output.dense.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "encoder.encoder.layer.0.output.LayerNorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "encoder.encoder.layer.0.output.LayerNorm.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
         .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 1, 32 }, .data = &head_row },
     });
 
@@ -7101,18 +7101,18 @@ test "colqwen bundle export keeps visual weights integrated and preserves sideca
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-colqwen2-wrapper");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const export_dir = try testScratchDir(allocator, "native-export-gguf-colqwen2-wrapper-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"qwen2","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":32,"max_position_embeddings":16,"rms_norm_eps":1e-5,"image_token_index":31,"vision_start_token_id":29,"vision_end_token_id":30,"vision_config":{"hidden_size":8,"embed_dim":8,"num_hidden_layers":1,"num_attention_heads":2,"mlp_ratio":2,"patch_size":14,"spatial_merge_size":2,"temporal_patch_size":2,"image_size":224,"hidden_act":"quick_gelu"}}
@@ -7121,42 +7121,42 @@ test "colqwen bundle export keeps visual weights integrated and preserves sideca
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\",\"multimodal_late_interaction\",\"late_interaction\"],\"inputs\":[\"text\",\"image\"],\"extra\":\"discard-me\"}",
     });
 
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = preprocessor_path,
         .data = "{\"do_resize\":true,\"do_rescale\":true,\"do_normalize\":true,\"do_convert_rgb\":true,\"patch_size\":14,\"temporal_patch_size\":2,\"merge_size\":2,\"min_pixels\":3136,\"max_pixels\":1003520}",
     });
 
     const processor_path = try std.fs.path.join(allocator, &.{ dir_path, "processor_config.json" });
     defer allocator.free(processor_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = processor_path,
         .data = "{\"image_processor_type\":\"Qwen2VLImageProcessor\"}",
     });
 
     const chat_template_path = try std.fs.path.join(allocator, &.{ dir_path, "chat_template.jinja" });
     defer allocator.free(chat_template_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = chat_template_path,
         .data = "{{ messages }}",
     });
 
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_config_path,
         .data = "{\"model_max_length\":16,\"bos_token\":\"<s>\",\"eos_token\":\"</s>\",\"pad_token\":\"<pad>\",\"unk_token\":\"<unk>\"}",
     });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<pad>"},{"id":1,"content":"<unk>"},{"id":2,"content":"<s>"},{"id":3,"content":"</s>"}],"model":{"type":"BPE","vocab":{"<pad>":0,"<unk>":1,"<s>":2,"</s>":3,"Query":4,"image":5},"merges":[]}}
@@ -7166,40 +7166,40 @@ test "colqwen bundle export keeps visual weights integrated and preserves sideca
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "model.embed_tokens.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0} ** (32 * 4)) },
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0))) },
         .{ .name = "model.norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 8, 1176 }, .data = &([_]f32{0} ** (8 * 1176)) },
-        .{ .name = "visual.patch_embed.proj.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.norm1.weight", .shape = &.{8}, .data = &([_]f32{1} ** 8) },
-        .{ .name = "visual.blocks.0.norm1.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.attn.qkv.weight", .shape = &.{ 24, 8 }, .data = &([_]f32{0} ** (24 * 8)) },
-        .{ .name = "visual.blocks.0.attn.qkv.bias", .shape = &.{24}, .data = &([_]f32{0} ** 24) },
-        .{ .name = "visual.blocks.0.attn.proj.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0} ** 64) },
-        .{ .name = "visual.blocks.0.attn.proj.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.norm2.weight", .shape = &.{8}, .data = &([_]f32{1} ** 8) },
-        .{ .name = "visual.blocks.0.norm2.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.mlp.fc1.weight", .shape = &.{ 16, 8 }, .data = &([_]f32{0} ** 128) },
-        .{ .name = "visual.blocks.0.mlp.fc1.bias", .shape = &.{16}, .data = &([_]f32{0} ** 16) },
-        .{ .name = "visual.blocks.0.mlp.fc2.weight", .shape = &.{ 8, 16 }, .data = &([_]f32{0} ** 128) },
-        .{ .name = "visual.blocks.0.mlp.fc2.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.merger.ln_q.weight", .shape = &.{32}, .data = &([_]f32{1} ** 32) },
-        .{ .name = "visual.merger.ln_q.bias", .shape = &.{32}, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.merger.mlp.0.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{0} ** (32 * 32)) },
-        .{ .name = "visual.merger.mlp.0.bias", .shape = &.{32}, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.merger.mlp.2.weight", .shape = &.{ 4, 32 }, .data = &([_]f32{0} ** (4 * 32)) },
-        .{ .name = "visual.merger.mlp.2.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 8, 1176 }, .data = &(@as([(8 * 1176)]f32, @splat(0))) },
+        .{ .name = "visual.patch_embed.proj.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.norm1.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1))) },
+        .{ .name = "visual.blocks.0.norm1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.qkv.weight", .shape = &.{ 24, 8 }, .data = &(@as([(24 * 8)]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.qkv.bias", .shape = &.{24}, .data = &(@as([24]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.proj.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.proj.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.norm2.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1))) },
+        .{ .name = "visual.blocks.0.norm2.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc1.weight", .shape = &.{ 16, 8 }, .data = &(@as([128]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc1.bias", .shape = &.{16}, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc2.weight", .shape = &.{ 8, 16 }, .data = &(@as([128]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc2.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.merger.ln_q.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(1))) },
+        .{ .name = "visual.merger.ln_q.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.0.weight", .shape = &.{ 32, 32 }, .data = &(@as([(32 * 32)]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.0.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.2.weight", .shape = &.{ 4, 32 }, .data = &(@as([(4 * 32)]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.2.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ export_dir, "model.gguf" });
@@ -7249,18 +7249,18 @@ test "exported colqwen bundle loads and prepares multimodal reranker prompts" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-colqwen2-runtime");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const export_dir = try testScratchDir(allocator, "native-export-gguf-colqwen2-runtime-out");
     defer {
-        compat.cwd().deleteTree(compat.io(), export_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), export_dir) catch {};
         allocator.free(export_dir);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"qwen2","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":32,"max_position_embeddings":32,"rms_norm_eps":1e-5,"image_token_index":31,"vision_start_token_id":29,"vision_end_token_id":30,"vision_config":{"hidden_size":8,"embed_dim":8,"num_hidden_layers":1,"num_attention_heads":2,"mlp_ratio":2,"patch_size":14,"spatial_merge_size":2,"temporal_patch_size":2,"image_size":224,"hidden_act":"quick_gelu"}}
@@ -7269,35 +7269,35 @@ test "exported colqwen bundle loads and prepares multimodal reranker prompts" {
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\",\"multimodal_late_interaction\",\"late_interaction\"],\"inputs\":[\"text\",\"image\"]}",
     });
 
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = preprocessor_path,
         .data = "{\"do_resize\":true,\"do_rescale\":true,\"do_normalize\":true,\"do_convert_rgb\":true,\"patch_size\":14,\"temporal_patch_size\":2,\"merge_size\":2,\"min_pixels\":3136,\"max_pixels\":1003520}",
     });
 
     const processor_path = try std.fs.path.join(allocator, &.{ dir_path, "processor_config.json" });
     defer allocator.free(processor_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = processor_path,
         .data = "{\"image_processor_type\":\"Qwen2VLImageProcessor\"}",
     });
 
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_config_path,
         .data = "{\"model_max_length\":32,\"bos_token\":\"<s>\",\"eos_token\":\"</s>\",\"pad_token\":\"<pad>\",\"unk_token\":\"<unk>\"}",
     });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<pad>"},{"id":1,"content":"<unk>"},{"id":2,"content":"<s>"},{"id":3,"content":"</s>"},{"id":29,"content":"<|vision_start|>"},{"id":30,"content":"<|vision_end|>"},{"id":31,"content":"<|image_pad|>"},{"id":32,"content":"<|im_start|>"},{"id":33,"content":"<|im_end|>"},{"id":34,"content":"<|endoftext|>"}],"model":{"type":"BPE","vocab":{"<pad>":0,"<unk>":1,"<s>":2,"</s>":3,"Query":4,"hello":5,"image":6,"Describe":7,"the":8,"document":9,"<|vision_start|>":29,"<|vision_end|>":30,"<|image_pad|>":31,"<|im_start|>":32,"<|im_end|>":33,"<|endoftext|>":34},"merges":[]}}
@@ -7307,40 +7307,40 @@ test "exported colqwen bundle loads and prepares multimodal reranker prompts" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "model.embed_tokens.weight", .shape = &.{ 32, 4 }, .data = &([_]f32{0} ** (32 * 4)) },
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0))) },
         .{ .name = "model.norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
-        .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
-        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(0))) },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 8, 1176 }, .data = &([_]f32{0} ** (8 * 1176)) },
-        .{ .name = "visual.patch_embed.proj.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.norm1.weight", .shape = &.{8}, .data = &([_]f32{1} ** 8) },
-        .{ .name = "visual.blocks.0.norm1.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.attn.qkv.weight", .shape = &.{ 24, 8 }, .data = &([_]f32{0} ** (24 * 8)) },
-        .{ .name = "visual.blocks.0.attn.qkv.bias", .shape = &.{24}, .data = &([_]f32{0} ** 24) },
-        .{ .name = "visual.blocks.0.attn.proj.weight", .shape = &.{ 8, 8 }, .data = &([_]f32{0} ** 64) },
-        .{ .name = "visual.blocks.0.attn.proj.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.norm2.weight", .shape = &.{8}, .data = &([_]f32{1} ** 8) },
-        .{ .name = "visual.blocks.0.norm2.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.blocks.0.mlp.fc1.weight", .shape = &.{ 16, 8 }, .data = &([_]f32{0} ** 128) },
-        .{ .name = "visual.blocks.0.mlp.fc1.bias", .shape = &.{16}, .data = &([_]f32{0} ** 16) },
-        .{ .name = "visual.blocks.0.mlp.fc2.weight", .shape = &.{ 8, 16 }, .data = &([_]f32{0} ** 128) },
-        .{ .name = "visual.blocks.0.mlp.fc2.bias", .shape = &.{8}, .data = &([_]f32{0} ** 8) },
-        .{ .name = "visual.merger.ln_q.weight", .shape = &.{32}, .data = &([_]f32{1} ** 32) },
-        .{ .name = "visual.merger.ln_q.bias", .shape = &.{32}, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.merger.mlp.0.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{0} ** (32 * 32)) },
-        .{ .name = "visual.merger.mlp.0.bias", .shape = &.{32}, .data = &([_]f32{0} ** 32) },
-        .{ .name = "visual.merger.mlp.2.weight", .shape = &.{ 4, 32 }, .data = &([_]f32{0} ** (4 * 32)) },
-        .{ .name = "visual.merger.mlp.2.bias", .shape = &.{4}, .data = &([_]f32{0} ** 4) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 8, 1176 }, .data = &(@as([(8 * 1176)]f32, @splat(0))) },
+        .{ .name = "visual.patch_embed.proj.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.norm1.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1))) },
+        .{ .name = "visual.blocks.0.norm1.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.qkv.weight", .shape = &.{ 24, 8 }, .data = &(@as([(24 * 8)]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.qkv.bias", .shape = &.{24}, .data = &(@as([24]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.proj.weight", .shape = &.{ 8, 8 }, .data = &(@as([64]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.attn.proj.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.norm2.weight", .shape = &.{8}, .data = &(@as([8]f32, @splat(1))) },
+        .{ .name = "visual.blocks.0.norm2.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc1.weight", .shape = &.{ 16, 8 }, .data = &(@as([128]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc1.bias", .shape = &.{16}, .data = &(@as([16]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc2.weight", .shape = &.{ 8, 16 }, .data = &(@as([128]f32, @splat(0))) },
+        .{ .name = "visual.blocks.0.mlp.fc2.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(0))) },
+        .{ .name = "visual.merger.ln_q.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(1))) },
+        .{ .name = "visual.merger.ln_q.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.0.weight", .shape = &.{ 32, 32 }, .data = &(@as([(32 * 32)]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.0.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.2.weight", .shape = &.{ 4, 32 }, .data = &(@as([(4 * 32)]f32, @splat(0))) },
+        .{ .name = "visual.merger.mlp.2.bias", .shape = &.{4}, .data = &(@as([4]f32, @splat(0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ export_dir, "model.gguf" });
@@ -7413,13 +7413,13 @@ test "unsupported dense decoder family fails before tensor mapping" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-unsupported-dense-family");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"falcon","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":6}
@@ -7451,13 +7451,13 @@ test "unsupported dense decoder dry-run reports support status" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-unsupported-dense-family-dry-run");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"falcon","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":6}
@@ -7489,13 +7489,13 @@ test "dense gpt neo export maps transformer names to native gguf names" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gpt-neo");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gpt_neo","n_embd":32,"n_layer":1,"n_head":4,"n_positions":16,"vocab_size":8,"intermediate_size":64}
@@ -7505,23 +7505,23 @@ test "dense gpt neo export maps transformer names to native gguf names" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "transformer.wte.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{1.0} ** 256) },
-        .{ .name = "transformer.wpe.weight", .shape = &.{ 16, 32 }, .data = &([_]f32{2.0} ** 512) },
-        .{ .name = "transformer.h.0.ln_1.weight", .shape = &.{32}, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "transformer.h.0.ln_1.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "transformer.h.0.attn.attention.q_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{3.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.attention.k_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{4.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.attention.v_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{5.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.attention.out_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{6.0} ** 1024) },
-        .{ .name = "transformer.h.0.ln_2.weight", .shape = &.{32}, .data = &([_]f32{7.0} ** 32) },
-        .{ .name = "transformer.h.0.ln_2.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "transformer.h.0.mlp.c_fc.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{8.0} ** 2048) },
-        .{ .name = "transformer.h.0.mlp.c_fc.bias", .shape = &.{64}, .data = &([_]f32{9.0} ** 64) },
-        .{ .name = "transformer.h.0.mlp.c_proj.weight", .shape = &.{ 32, 64 }, .data = &([_]f32{10.0} ** 2048) },
-        .{ .name = "transformer.h.0.mlp.c_proj.bias", .shape = &.{32}, .data = &([_]f32{11.0} ** 32) },
-        .{ .name = "transformer.ln_f.weight", .shape = &.{32}, .data = &([_]f32{12.0} ** 32) },
-        .{ .name = "transformer.ln_f.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{13.0} ** 256) },
+        .{ .name = "transformer.wte.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(1.0))) },
+        .{ .name = "transformer.wpe.weight", .shape = &.{ 16, 32 }, .data = &(@as([512]f32, @splat(2.0))) },
+        .{ .name = "transformer.h.0.ln_1.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "transformer.h.0.ln_1.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "transformer.h.0.attn.attention.q_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(3.0))) },
+        .{ .name = "transformer.h.0.attn.attention.k_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(4.0))) },
+        .{ .name = "transformer.h.0.attn.attention.v_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(5.0))) },
+        .{ .name = "transformer.h.0.attn.attention.out_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(6.0))) },
+        .{ .name = "transformer.h.0.ln_2.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(7.0))) },
+        .{ .name = "transformer.h.0.ln_2.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "transformer.h.0.mlp.c_fc.weight", .shape = &.{ 64, 32 }, .data = &(@as([2048]f32, @splat(8.0))) },
+        .{ .name = "transformer.h.0.mlp.c_fc.bias", .shape = &.{64}, .data = &(@as([64]f32, @splat(9.0))) },
+        .{ .name = "transformer.h.0.mlp.c_proj.weight", .shape = &.{ 32, 64 }, .data = &(@as([2048]f32, @splat(10.0))) },
+        .{ .name = "transformer.h.0.mlp.c_proj.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(11.0))) },
+        .{ .name = "transformer.ln_f.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(12.0))) },
+        .{ .name = "transformer.ln_f.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(13.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "gpt-neo.gguf" });
@@ -7576,13 +7576,13 @@ test "dense gptj export maps transformer names to generic model-layer names" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gptj");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gptj","n_embd":32,"n_layer":1,"n_head":4,"n_positions":16,"vocab_size":8,"n_inner":64}
@@ -7592,23 +7592,23 @@ test "dense gptj export maps transformer names to generic model-layer names" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "transformer.wte.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{1.0} ** 256) },
-        .{ .name = "transformer.wpe.weight", .shape = &.{ 16, 32 }, .data = &([_]f32{2.0} ** 512) },
-        .{ .name = "transformer.h.0.ln_1.weight", .shape = &.{32}, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "transformer.h.0.ln_1.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "transformer.h.0.attn.q_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{3.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.k_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{4.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.v_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{5.0} ** 1024) },
-        .{ .name = "transformer.h.0.attn.out_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{6.0} ** 1024) },
-        .{ .name = "transformer.h.0.ln_2.weight", .shape = &.{32}, .data = &([_]f32{7.0} ** 32) },
-        .{ .name = "transformer.h.0.ln_2.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "transformer.h.0.mlp.fc_in.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{8.0} ** 2048) },
-        .{ .name = "transformer.h.0.mlp.fc_in.bias", .shape = &.{64}, .data = &([_]f32{9.0} ** 64) },
-        .{ .name = "transformer.h.0.mlp.fc_out.weight", .shape = &.{ 32, 64 }, .data = &([_]f32{10.0} ** 2048) },
-        .{ .name = "transformer.h.0.mlp.fc_out.bias", .shape = &.{32}, .data = &([_]f32{11.0} ** 32) },
-        .{ .name = "transformer.ln_f.weight", .shape = &.{32}, .data = &([_]f32{12.0} ** 32) },
-        .{ .name = "transformer.ln_f.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{13.0} ** 256) },
+        .{ .name = "transformer.wte.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(1.0))) },
+        .{ .name = "transformer.wpe.weight", .shape = &.{ 16, 32 }, .data = &(@as([512]f32, @splat(2.0))) },
+        .{ .name = "transformer.h.0.ln_1.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "transformer.h.0.ln_1.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "transformer.h.0.attn.q_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(3.0))) },
+        .{ .name = "transformer.h.0.attn.k_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(4.0))) },
+        .{ .name = "transformer.h.0.attn.v_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(5.0))) },
+        .{ .name = "transformer.h.0.attn.out_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(6.0))) },
+        .{ .name = "transformer.h.0.ln_2.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(7.0))) },
+        .{ .name = "transformer.h.0.ln_2.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "transformer.h.0.mlp.fc_in.weight", .shape = &.{ 64, 32 }, .data = &(@as([2048]f32, @splat(8.0))) },
+        .{ .name = "transformer.h.0.mlp.fc_in.bias", .shape = &.{64}, .data = &(@as([64]f32, @splat(9.0))) },
+        .{ .name = "transformer.h.0.mlp.fc_out.weight", .shape = &.{ 32, 64 }, .data = &(@as([2048]f32, @splat(10.0))) },
+        .{ .name = "transformer.h.0.mlp.fc_out.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(11.0))) },
+        .{ .name = "transformer.ln_f.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(12.0))) },
+        .{ .name = "transformer.ln_f.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(13.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "gptj.gguf" });
@@ -7634,13 +7634,13 @@ test "dense gpt neox export splits fused query key value tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gpt-neox");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gpt_neox","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"intermediate_size":64,"vocab_size":8}
@@ -7653,22 +7653,22 @@ test "dense gpt neox export splits fused query key value tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "gpt_neox.embed_in.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{1.0} ** 256) },
-        .{ .name = "gpt_neox.final_layer_norm.weight", .shape = &.{32}, .data = &([_]f32{2.0} ** 32) },
-        .{ .name = "gpt_neox.final_layer_norm.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "gpt_neox.layers.0.input_layernorm.weight", .shape = &.{32}, .data = &([_]f32{3.0} ** 32) },
-        .{ .name = "gpt_neox.layers.0.input_layernorm.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "gpt_neox.embed_in.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(1.0))) },
+        .{ .name = "gpt_neox.final_layer_norm.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(2.0))) },
+        .{ .name = "gpt_neox.final_layer_norm.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "gpt_neox.layers.0.input_layernorm.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(3.0))) },
+        .{ .name = "gpt_neox.layers.0.input_layernorm.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "gpt_neox.layers.0.attention.query_key_value.weight", .shape = &.{ 96, 32 }, .data = &qkv },
         .{ .name = "gpt_neox.layers.0.attention.query_key_value.bias", .shape = &.{96}, .data = &qkv_bias },
-        .{ .name = "gpt_neox.layers.0.attention.dense.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{4.0} ** 1024) },
-        .{ .name = "gpt_neox.layers.0.attention.dense.bias", .shape = &.{32}, .data = &([_]f32{5.0} ** 32) },
-        .{ .name = "gpt_neox.layers.0.post_attention_layernorm.weight", .shape = &.{32}, .data = &([_]f32{6.0} ** 32) },
-        .{ .name = "gpt_neox.layers.0.post_attention_layernorm.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "gpt_neox.layers.0.mlp.dense_h_to_4h.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{7.0} ** 2048) },
-        .{ .name = "gpt_neox.layers.0.mlp.dense_h_to_4h.bias", .shape = &.{64}, .data = &([_]f32{8.0} ** 64) },
-        .{ .name = "gpt_neox.layers.0.mlp.dense_4h_to_h.weight", .shape = &.{ 32, 64 }, .data = &([_]f32{9.0} ** 2048) },
-        .{ .name = "gpt_neox.layers.0.mlp.dense_4h_to_h.bias", .shape = &.{32}, .data = &([_]f32{10.0} ** 32) },
-        .{ .name = "embed_out.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{11.0} ** 256) },
+        .{ .name = "gpt_neox.layers.0.attention.dense.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(4.0))) },
+        .{ .name = "gpt_neox.layers.0.attention.dense.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(5.0))) },
+        .{ .name = "gpt_neox.layers.0.post_attention_layernorm.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(6.0))) },
+        .{ .name = "gpt_neox.layers.0.post_attention_layernorm.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "gpt_neox.layers.0.mlp.dense_h_to_4h.weight", .shape = &.{ 64, 32 }, .data = &(@as([2048]f32, @splat(7.0))) },
+        .{ .name = "gpt_neox.layers.0.mlp.dense_h_to_4h.bias", .shape = &.{64}, .data = &(@as([64]f32, @splat(8.0))) },
+        .{ .name = "gpt_neox.layers.0.mlp.dense_4h_to_h.weight", .shape = &.{ 32, 64 }, .data = &(@as([2048]f32, @splat(9.0))) },
+        .{ .name = "gpt_neox.layers.0.mlp.dense_4h_to_h.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(10.0))) },
+        .{ .name = "embed_out.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(11.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "gpt-neox.gguf" });
@@ -7696,13 +7696,13 @@ test "dense phi export includes norm and attention bias tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-phi-bias");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"phi","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"layer_norm_epsilon":1e-5}
@@ -7724,18 +7724,18 @@ test "dense phi export includes norm and attention bias tensors" {
         .{ .name = "model.norm.bias", .shape = &.{4}, .data = &[_]f32{ 4, 3, 2, 1 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "model.layers.0.input_layernorm.bias", .shape = &.{4}, .data = &[_]f32{ 0, 1, 0, 1 } },
-        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{1.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(1.0))) },
         .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
-        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{2.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(2.0))) },
         .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &[_]f32{ 4, 3, 2, 1 } },
-        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{3.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(3.0))) },
         .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &[_]f32{ 5, 6, 7, 8 } },
-        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{4.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(4.0))) },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 2, 2, 2, 2 } },
         .{ .name = "model.layers.0.post_attention_layernorm.bias", .shape = &.{4}, .data = &[_]f32{ 1, 0, 1, 0 } },
-        .{ .name = "model.layers.0.mlp.fc1_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "model.layers.0.mlp.fc2_proj.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{3.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &([_]f32{5.0} ** 24) },
+        .{ .name = "model.layers.0.mlp.fc1_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "model.layers.0.mlp.fc2_proj.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(3.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &(@as([24]f32, @splat(5.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "phi.gguf" });
@@ -7763,13 +7763,13 @@ test "dense gpt2 export transposes conv1d weights and stays unquantized when tra
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gpt2");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gpt2","n_embd":4,"n_layer":1,"n_head":2,"n_positions":16,"vocab_size":6,"n_inner":8}
@@ -7784,23 +7784,23 @@ test "dense gpt2 export transposes conv1d weights and stays unquantized when tra
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "wte.weight", .shape = &.{ 6, 4 }, .data = &([_]f32{1.0} ** 24) },
-        .{ .name = "wpe.weight", .shape = &.{ 16, 4 }, .data = &([_]f32{2.0} ** 64) },
+        .{ .name = "wte.weight", .shape = &.{ 6, 4 }, .data = &(@as([24]f32, @splat(1.0))) },
+        .{ .name = "wpe.weight", .shape = &.{ 16, 4 }, .data = &(@as([64]f32, @splat(2.0))) },
         .{ .name = "h.0.ln_1.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
         .{ .name = "h.0.ln_1.bias", .shape = &.{4}, .data = &[_]f32{ 0, 1, 0, 1 } },
         .{ .name = "h.0.attn.c_attn.weight", .shape = &.{ 4, 12 }, .data = &c_attn },
-        .{ .name = "h.0.attn.c_attn.bias", .shape = &.{12}, .data = &([_]f32{3.0} ** 12) },
+        .{ .name = "h.0.attn.c_attn.bias", .shape = &.{12}, .data = &(@as([12]f32, @splat(3.0))) },
         .{ .name = "h.0.attn.c_proj.weight", .shape = &.{ 4, 4 }, .data = &c_proj },
         .{ .name = "h.0.attn.c_proj.bias", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
         .{ .name = "h.0.ln_2.weight", .shape = &.{4}, .data = &[_]f32{ 2, 2, 2, 2 } },
         .{ .name = "h.0.ln_2.bias", .shape = &.{4}, .data = &[_]f32{ 1, 0, 1, 0 } },
         .{ .name = "h.0.mlp.c_fc.weight", .shape = &.{ 4, 8 }, .data = &c_fc },
-        .{ .name = "h.0.mlp.c_fc.bias", .shape = &.{8}, .data = &([_]f32{4.0} ** 8) },
+        .{ .name = "h.0.mlp.c_fc.bias", .shape = &.{8}, .data = &(@as([8]f32, @splat(4.0))) },
         .{ .name = "h.0.mlp.c_proj.weight", .shape = &.{ 8, 4 }, .data = &mlp_proj },
         .{ .name = "h.0.mlp.c_proj.bias", .shape = &.{4}, .data = &[_]f32{ 4, 3, 2, 1 } },
         .{ .name = "ln_f.weight", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
         .{ .name = "ln_f.bias", .shape = &.{4}, .data = &[_]f32{ 4, 3, 2, 1 } },
-        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &([_]f32{5.0} ** 24) },
+        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &(@as([24]f32, @splat(5.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "gpt2.gguf" });
@@ -7841,13 +7841,13 @@ test "dense gpt2 export quantizes conv1d weights after transpose when transforme
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-gpt2-q8");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"gpt2","n_embd":32,"n_layer":1,"n_head":4,"n_positions":16,"vocab_size":8,"n_inner":64}
@@ -7859,23 +7859,23 @@ test "dense gpt2 export quantizes conv1d weights after transpose when transforme
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
-        .{ .name = "wte.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{1.0} ** 256) },
-        .{ .name = "wpe.weight", .shape = &.{ 16, 32 }, .data = &([_]f32{2.0} ** 512) },
-        .{ .name = "h.0.ln_1.weight", .shape = &.{32}, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "h.0.ln_1.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "wte.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(1.0))) },
+        .{ .name = "wpe.weight", .shape = &.{ 16, 32 }, .data = &(@as([512]f32, @splat(2.0))) },
+        .{ .name = "h.0.ln_1.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "h.0.ln_1.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
         .{ .name = "h.0.attn.c_attn.weight", .shape = &.{ 32, 96 }, .data = &c_attn },
-        .{ .name = "h.0.attn.c_attn.bias", .shape = &.{96}, .data = &([_]f32{3.0} ** 96) },
-        .{ .name = "h.0.attn.c_proj.weight", .shape = &.{ 32, 32 }, .data = &([_]f32{4.0} ** 1024) },
-        .{ .name = "h.0.attn.c_proj.bias", .shape = &.{32}, .data = &([_]f32{5.0} ** 32) },
-        .{ .name = "h.0.ln_2.weight", .shape = &.{32}, .data = &([_]f32{6.0} ** 32) },
-        .{ .name = "h.0.ln_2.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "h.0.mlp.c_fc.weight", .shape = &.{ 32, 64 }, .data = &([_]f32{7.0} ** 2048) },
-        .{ .name = "h.0.mlp.c_fc.bias", .shape = &.{64}, .data = &([_]f32{8.0} ** 64) },
-        .{ .name = "h.0.mlp.c_proj.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{9.0} ** 2048) },
-        .{ .name = "h.0.mlp.c_proj.bias", .shape = &.{32}, .data = &([_]f32{10.0} ** 32) },
-        .{ .name = "ln_f.weight", .shape = &.{32}, .data = &([_]f32{11.0} ** 32) },
-        .{ .name = "ln_f.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &([_]f32{12.0} ** 256) },
+        .{ .name = "h.0.attn.c_attn.bias", .shape = &.{96}, .data = &(@as([96]f32, @splat(3.0))) },
+        .{ .name = "h.0.attn.c_proj.weight", .shape = &.{ 32, 32 }, .data = &(@as([1024]f32, @splat(4.0))) },
+        .{ .name = "h.0.attn.c_proj.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(5.0))) },
+        .{ .name = "h.0.ln_2.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(6.0))) },
+        .{ .name = "h.0.ln_2.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "h.0.mlp.c_fc.weight", .shape = &.{ 32, 64 }, .data = &(@as([2048]f32, @splat(7.0))) },
+        .{ .name = "h.0.mlp.c_fc.bias", .shape = &.{64}, .data = &(@as([64]f32, @splat(8.0))) },
+        .{ .name = "h.0.mlp.c_proj.weight", .shape = &.{ 64, 32 }, .data = &(@as([2048]f32, @splat(9.0))) },
+        .{ .name = "h.0.mlp.c_proj.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(10.0))) },
+        .{ .name = "ln_f.weight", .shape = &.{32}, .data = &(@as([32]f32, @splat(11.0))) },
+        .{ .name = "ln_f.bias", .shape = &.{32}, .data = &(@as([32]f32, @splat(0.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 8, 32 }, .data = &(@as([256]f32, @splat(12.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "gpt2-q8.gguf" });
@@ -7897,13 +7897,13 @@ test "dense qwen2 export includes attention bias tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-qwen2-bias");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"qwen2","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -7923,18 +7923,18 @@ test "dense qwen2 export includes attention bias tensors" {
         } },
         .{ .name = "model.norm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
         .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 1, 1, 1, 1 } },
-        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{1.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(1.0))) },
         .{ .name = "model.layers.0.self_attn.q_proj.bias", .shape = &.{4}, .data = &[_]f32{ 1, 2, 3, 4 } },
-        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{2.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(2.0))) },
         .{ .name = "model.layers.0.self_attn.k_proj.bias", .shape = &.{4}, .data = &[_]f32{ 4, 3, 2, 1 } },
-        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{3.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(3.0))) },
         .{ .name = "model.layers.0.self_attn.v_proj.bias", .shape = &.{4}, .data = &[_]f32{ 5, 6, 7, 8 } },
-        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &([_]f32{4.0} ** 16) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 4, 4 }, .data = &(@as([16]f32, @splat(4.0))) },
         .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .data = &[_]f32{ 2, 2, 2, 2 } },
-        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{1.0} ** 32) },
-        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &([_]f32{2.0} ** 32) },
-        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &([_]f32{3.0} ** 32) },
-        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &([_]f32{5.0} ** 24) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(1.0))) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 }, .data = &(@as([32]f32, @splat(2.0))) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 }, .data = &(@as([32]f32, @splat(3.0))) },
+        .{ .name = "lm_head.weight", .shape = &.{ 6, 4 }, .data = &(@as([24]f32, @splat(5.0))) },
     });
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "qwen2.gguf" });
@@ -7962,13 +7962,13 @@ test "dense export can quantize compatible tensors to q8_0" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-q8_0");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":32,"vocab_size":32,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -8083,7 +8083,7 @@ test "quantization include filter limits quantization to matching prefixes" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-q5k-include");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -8105,7 +8105,7 @@ test "quantization exclude filter keeps matching prefixes dense" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-q5k-exclude");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -8259,7 +8259,7 @@ fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tenso
     try writer.writeByte('}');
 
     const io = io_compat();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     var header_size: [8]u8 = undefined;
     std.mem.writeInt(u64, &header_size, json.written().len, .little);
@@ -8273,7 +8273,7 @@ fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tenso
 fn writeGoldenDenseFixture(allocator: std.mem.Allocator, dir_path: []const u8, with_hf_tokenizer: bool) !void {
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"intermediate_size":8,"vocab_size":6,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -8283,7 +8283,7 @@ fn writeGoldenDenseFixture(allocator: std.mem.Allocator, dir_path: []const u8, w
     if (with_hf_tokenizer) {
         const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
         defer allocator.free(tokenizer_path);
-        try compat.cwd().writeFile(compat.io(), .{
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
             .sub_path = tokenizer_path,
             .data =
             \\{
@@ -8379,7 +8379,7 @@ fn writeGoldenDenseFixture(allocator: std.mem.Allocator, dir_path: []const u8, w
 fn writeWideQuantFixture(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":256,"num_hidden_layers":1,"num_attention_heads":8,"num_key_value_heads":8,"intermediate_size":256,"vocab_size":256,"max_position_embeddings":16,"rms_norm_eps":1e-5}
@@ -8398,13 +8398,13 @@ fn writeWideQuantFixture(allocator: std.mem.Allocator, dir_path: []const u8) !vo
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
         .{ .name = "model.embed_tokens.weight", .shape = &.{ 256, 256 }, .data = wide },
-        .{ .name = "model.norm.weight", .shape = &.{256}, .data = &([_]f32{2.0} ** 256) },
-        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{256}, .data = &([_]f32{1.0} ** 256) },
+        .{ .name = "model.norm.weight", .shape = &.{256}, .data = &(@as([256]f32, @splat(2.0))) },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{256}, .data = &(@as([256]f32, @splat(1.0))) },
         .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
-        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{256}, .data = &([_]f32{2.0} ** 256) },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{256}, .data = &(@as([256]f32, @splat(2.0))) },
         .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
@@ -8414,7 +8414,7 @@ fn writeWideQuantFixture(allocator: std.mem.Allocator, dir_path: []const u8) !vo
 fn writeTestFileInDir(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, data: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ dir_path, name });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = data });
 }
 
 fn writeMinimalQuantizedGgufFixture(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -8428,11 +8428,11 @@ fn writeMinimalQuantizedGgufFixture(allocator: std.mem.Allocator, path: []const 
         .dimensions = &dims,
         .tensor_type = .{ .known = .Q8_0 },
     }};
-    const raw = [_]u8{ 0, 60 } ++ ([_]u8{128} ** 32);
+    const raw = [_]u8{ 0, 60 } ++ (@as([32]u8, @splat(128)));
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &tensors);
     defer layout.deinit(allocator);
     const io = io_compat();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     try file.writeStreamingAll(io, layout.header_bytes);
     const data_region_offset = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
@@ -8445,8 +8445,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 
@@ -8491,7 +8491,7 @@ fn writeMinimalProjectorFixture(
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 }
 
 fn makeRangeF32(comptime start: usize, comptime end: usize) [end - start]f32 {
@@ -8521,7 +8521,7 @@ fn expectDenseExportQuantization(
 
     const dir_path = try testScratchDir(allocator, test_name);
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -8531,7 +8531,7 @@ fn expectDenseExportQuantization(
         \\{{"model_type":"llama","hidden_size":{d},"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":{d},"vocab_size":{d},"max_position_embeddings":16,"rms_norm_eps":1e-5}}
     , .{ width, width, width });
     defer allocator.free(config_json);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = config_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = config_json });
 
     const matrix_elem_count = width * width;
     const embed = try allocator.alloc(f32, matrix_elem_count);
@@ -8606,13 +8606,13 @@ fn expectMixedKFamilyExport(
 ) !void {
     const dir_path = try testScratchDir(allocator, test_name);
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"llama","hidden_size":256,"num_hidden_layers":1,"num_attention_heads":8,"num_key_value_heads":8,"intermediate_size":256,"vocab_size":256,"max_position_embeddings":16,"rms_norm_eps":1e-5}

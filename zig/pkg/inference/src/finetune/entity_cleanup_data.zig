@@ -105,7 +105,7 @@ fn loadExamplesFromFile(
     split_filter: ?[]const u8,
     out: *std.ArrayListUnmanaged(Example),
 ) !void {
-    const file_data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, file_data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");

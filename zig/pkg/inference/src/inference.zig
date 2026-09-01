@@ -202,7 +202,7 @@ test "non-device-scalar GQA attention never returns generated decode" {
 
     const env_name = "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE";
     const old_value = std.c.getenv(env_name);
-    const old_value_copy = if (old_value) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_value_copy = if (old_value) |value| try std.testing.allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer {
         if (old_value_copy) |value| {
             _ = setenv(env_name, value.ptr, 1);

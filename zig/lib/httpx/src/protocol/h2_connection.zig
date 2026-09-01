@@ -101,7 +101,7 @@ pub const H2Connection = struct {
     /// Opaque data from the last sent PING. handlePing only signals
     /// ping_ack_event when the ACK payload matches, preventing stale or
     /// server-initiated PING ACKs from falsely satisfying the health check.
-    ping_expected_data: [8]u8 = .{0} ** 8,
+    ping_expected_data: [8]u8 = @splat(0),
 
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
     /// Defaults to half the initial window size. Adjusted when peer SETTINGS
@@ -1437,7 +1437,7 @@ test "GOAWAY handling" {
     // Build a GOAWAY frame (last_stream_id=7, no_error).
     var goaway_payload: [8]u8 = undefined;
     mem.writeInt(u32, goaway_payload[0..4], 7, .big);
-    mem.writeInt(u32, goaway_payload[4..8], @intFromEnum(Http2ErrorCode.no_error), .big);
+    mem.writeInt(u32, goaway_payload[4..8], @backingInt(Http2ErrorCode.no_error), .big);
     try conn.writeFrame(writer, .goaway, 0, 0, &goaway_payload);
 
     var reader = TestReader{ .data = wire.items };
@@ -1460,7 +1460,7 @@ test "successive GOAWAY frames lower the accepted stream boundary" {
 
     var first_payload: [8]u8 = undefined;
     mem.writeInt(u32, first_payload[0..4], 5, .big);
-    mem.writeInt(u32, first_payload[4..8], @intFromEnum(Http2ErrorCode.no_error), .big);
+    mem.writeInt(u32, first_payload[4..8], @backingInt(Http2ErrorCode.no_error), .big);
     var first = Frame{
         .header = .{ .length = 8, .frame_type = .goaway, .flags = 0, .stream_id = 0 },
         .payload = &first_payload,
@@ -1470,7 +1470,7 @@ test "successive GOAWAY frames lower the accepted stream boundary" {
 
     var second_payload: [8]u8 = undefined;
     mem.writeInt(u32, second_payload[0..4], 1, .big);
-    mem.writeInt(u32, second_payload[4..8], @intFromEnum(Http2ErrorCode.no_error), .big);
+    mem.writeInt(u32, second_payload[4..8], @backingInt(Http2ErrorCode.no_error), .big);
     var second = Frame{
         .header = .{ .length = 8, .frame_type = .goaway, .flags = 0, .stream_id = 0 },
         .payload = &second_payload,
@@ -2217,9 +2217,9 @@ test "batched WINDOW_UPDATE: small DATA frames don't trigger immediate updates" 
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     _ = try client.stream_manager.createStream();
-    try client.writeData(c2s_w, 1, "A" ** 100, false);
-    try client.writeData(c2s_w, 1, "B" ** 100, false);
-    try client.writeData(c2s_w, 1, "C" ** 100, false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('A')), false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('B')), false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('C')), false);
 
     // Server processes the frames, writing responses to reply buffer.
     var reply = std.ArrayListUnmanaged(u8).empty;
@@ -2258,9 +2258,9 @@ test "batched WINDOW_UPDATE: threshold triggers flush" {
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     _ = try client.stream_manager.createStream();
-    try client.writeData(c2s_w, 1, "X" ** 16000, false);
-    try client.writeData(c2s_w, 1, "Y" ** 16000, false);
-    try client.writeData(c2s_w, 1, "Z" ** 1000, false);
+    try client.writeData(c2s_w, 1, &@as([16000]u8, @splat('X')), false);
+    try client.writeData(c2s_w, 1, &@as([16000]u8, @splat('Y')), false);
+    try client.writeData(c2s_w, 1, &@as([1000]u8, @splat('Z')), false);
 
     var reply = std.ArrayListUnmanaged(u8).empty;
     defer reply.deinit(allocator);
@@ -2334,7 +2334,7 @@ test "deliverToMailbox lets a per-stream limit lower the connection ceiling" {
     // Deliver a DATA frame within limits.
     var small_frame = Frame{
         .header = .{ .length = 50, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 50)),
+        .payload = @constCast(&(@as([50]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&small_frame);
     try std.testing.expectEqual(@as(usize, 50), stream.data_buf.items.len);
@@ -2343,7 +2343,7 @@ test "deliverToMailbox lets a per-stream limit lower the connection ceiling" {
     // Deliver a DATA frame that exceeds the limit.
     var big_frame = Frame{
         .header = .{ .length = 30, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x42} ** 30)),
+        .payload = @constCast(&(@as([30]u8, @splat(0x42)))),
     };
     try server.deliverToMailbox(&big_frame);
 
@@ -2364,7 +2364,7 @@ test "deliverToMailbox allows unlimited DATA when max_stream_data_size is 0" {
 
     var frame = Frame{
         .header = .{ .length = 200, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 200)),
+        .payload = @constCast(&(@as([200]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&frame);
     try std.testing.expectEqual(@as(usize, 200), stream.data_buf.items.len);
@@ -2653,7 +2653,7 @@ test "receive window decremented on incoming DATA" {
 
     var frame = Frame{
         .header = .{ .length = 100, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 100)),
+        .payload = @constCast(&(@as([100]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&frame);
 
@@ -2704,7 +2704,7 @@ test "adaptive window_update_threshold adjusts with SETTINGS" {
     conn.local_settings.initial_window_size = 8192;
     // Simulate peer sending any SETTINGS to trigger threshold recalculation.
     var payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(http.Http2SettingId.max_concurrent_streams), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(http.Http2SettingId.max_concurrent_streams), .big);
     std.mem.writeInt(u32, payload[2..6], 200, .big);
     try conn.applyPeerSettings(&payload);
 
@@ -2789,7 +2789,7 @@ test "applyPeerSettings signals HPACK encoder table size update" {
 
     // Peer sends SETTINGS with HEADER_TABLE_SIZE = 2048.
     var payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(http.Http2SettingId.header_table_size), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(http.Http2SettingId.header_table_size), .big);
     std.mem.writeInt(u32, payload[2..6], 2048, .big);
     try conn.applyPeerSettings(&payload);
 

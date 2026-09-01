@@ -723,7 +723,10 @@ fn acquireFlatCentroidDirectory(
         var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
         var build_outcome: FlatCentroidBuildOutcome = .retry;
         defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
-        errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
+        // Zig 0.17 no longer exposes the active error payload to errdefer.
+        // Treat an interrupted owner as retryable; callers will preserve and
+        // return the original error while the next waiter may retry the build.
+        errdefer build_outcome = .retry;
 
         var build_reservation: FlatCentroidBuildReservation = .{};
         if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {

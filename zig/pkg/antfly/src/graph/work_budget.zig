@@ -32,8 +32,8 @@ pub const Limits = struct {
     max_distinct_state_bytes: usize = default_max_distinct_state_bytes,
 
     pub fn validate(self: Limits) !void {
-        inline for (std.meta.fields(Limits)) |field| {
-            if (@field(self, field.name) == 0) return error.InvalidGraphExecutionLimits;
+        inline for (@typeInfo(Limits).@"struct".field_names) |field_name| {
+            if (@field(self, field_name) == 0) return error.InvalidGraphExecutionLimits;
         }
     }
 };

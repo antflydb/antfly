@@ -1531,19 +1531,19 @@ const hierarchy_children_rejected_fields = [_][]const u8{
 
 fn auditHierarchyChildrenSearchRequestFields() void {
     @setEvalBranchQuota(10_000);
-    inline for (@typeInfo(SearchRequest).@"struct".fields) |field| {
+    inline for (@typeInfo(SearchRequest).@"struct".field_names) |field_name| {
         comptime var classifications: usize = 0;
         inline for (hierarchy_children_validated_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, field_name, name)) classifications += 1;
         }
         inline for (hierarchy_children_supported_internal_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, field_name, name)) classifications += 1;
         }
         inline for (hierarchy_children_rejected_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, field_name, name)) classifications += 1;
         }
         if (classifications != 1) {
-            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ field.name);
+            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ field_name);
         }
     }
 }
@@ -3539,7 +3539,7 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
     dst.finish_calls += src.finish_calls;
     dst.abort_calls += src.abort_calls;
     dst.active = dst.active or src.active;
-    if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
     dst.current_sequence = @max(dst.current_sequence, src.current_sequence);
     dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
     dst.current_scanned_entries += src.current_scanned_entries;
@@ -3570,7 +3570,7 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
 
 pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatchUpStats) void {
     dst.active = dst.active or src.active;
-    if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
     dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
     dst.wal_retained_segments += src.wal_retained_segments;
     dst.wal_retained_bytes += src.wal_retained_bytes;

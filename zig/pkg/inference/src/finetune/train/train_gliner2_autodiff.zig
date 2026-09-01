@@ -502,7 +502,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 1. Create output directory
     // ------------------------------------------------------------------
-    try compat.cwd().createDirPath(compat.io(), opts.out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.out_dir);
     try syncDirectoryChain(opts.out_dir);
 
     print("train-gliner2-autodiff\n  model_dir={s}\n  train_data={s}\n  out_dir={s}\n", .{
@@ -634,10 +634,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     var config_path_buf: [512]u8 = undefined;
     const encoder_config_path = try std.fmt.bufPrint(&config_path_buf, "{s}/encoder_config/config.json", .{opts.model_dir});
-    const config_bytes = compat.cwd().readFileAlloc(compat.io(), encoder_config_path, allocator, .limited(8 * 1024 * 1024)) catch blk: {
+    const config_bytes = std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), encoder_config_path, allocator, .limited(8 * 1024 * 1024)) catch blk: {
         var fallback_buf: [512]u8 = undefined;
         const fallback_path = try std.fmt.bufPrint(&fallback_buf, "{s}/config.json", .{opts.model_dir});
-        break :blk try compat.cwd().readFileAlloc(compat.io(), fallback_path, allocator, .limited(8 * 1024 * 1024));
+        break :blk try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), fallback_path, allocator, .limited(8 * 1024 * 1024));
     };
     defer allocator.free(config_bytes);
 
@@ -1584,15 +1584,15 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var eval_state = resume_metrics.eval_state;
     var early_stopped = resumeStopsBeforeTraining(opts.resume_checkpoint != null, eval_state, opts.early_stopping_patience);
     var metrics_file = if (opts.resume_checkpoint != null)
-        try compat.cwd().openFile(compat.io(), metrics_path, .{ .mode = .read_write })
+        try std.Io.Dir.cwd().openFile(compat.testingIo(), metrics_path, .{ .mode = .read_write })
     else
-        try compat.cwd().createFile(compat.io(), metrics_path, .{ .truncate = true });
-    defer metrics_file.close(compat.io());
+        try std.Io.Dir.cwd().createFile(compat.testingIo(), metrics_path, .{ .truncate = true });
+    defer metrics_file.close(compat.testingIo());
     if (opts.resume_checkpoint == null) try syncDirectoryChain(opts.out_dir);
     var metrics_buffer: [64 * 1024]u8 = undefined;
-    var metrics_file_writer = metrics_file.writer(compat.io(), &metrics_buffer);
+    var metrics_file_writer = metrics_file.writer(compat.testingIo(), &metrics_buffer);
     if (opts.resume_checkpoint != null) {
-        const metrics_stat = try metrics_file.stat(compat.io());
+        const metrics_stat = try metrics_file.stat(compat.testingIo());
         try metrics_file_writer.seekTo(metrics_stat.size);
     }
     defer metrics_file_writer.end() catch {};
@@ -2009,10 +2009,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         try writeEpochMetric(metrics_writer, epoch_number, avg_epoch_loss, gold_ent_count, epoch_steps, opts.objective, epoch_target_stats, epoch_timing);
         if (new_best) {
             try metrics_writer.flush();
-            try metrics_file.sync(compat.io());
-            const metrics_stat = try metrics_file.stat(compat.io());
+            try metrics_file.sync(compat.testingIo());
+            const metrics_stat = try metrics_file.stat(compat.testingIo());
             const metrics_prefix_sha256 = try sha256FilePrefixDigest(metrics_path, metrics_stat.size);
-            try compat.cwd().createDirPath(compat.io(), checkpoint_dir);
+            try std.Io.Dir.cwd().createDirPath(compat.testingIo(), checkpoint_dir);
             try syncDirectoryChain(checkpoint_dir);
             const best_checkpoint_path = try bestCheckpointPathAlloc(allocator, checkpoint_dir, completed_epochs);
             defer allocator.free(best_checkpoint_path);
@@ -2024,10 +2024,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             completed_epochs % @as(u64, opts.checkpoint_every_epochs) == 0)
         {
             try metrics_writer.flush();
-            try metrics_file.sync(compat.io());
-            const metrics_stat = try metrics_file.stat(compat.io());
+            try metrics_file.sync(compat.testingIo());
+            const metrics_stat = try metrics_file.stat(compat.testingIo());
             const metrics_prefix_sha256 = try sha256FilePrefixDigest(metrics_path, metrics_stat.size);
-            try compat.cwd().createDirPath(compat.io(), checkpoint_dir);
+            try std.Io.Dir.cwd().createDirPath(compat.testingIo(), checkpoint_dir);
             try syncDirectoryChain(checkpoint_dir);
             const checkpoint_path = try std.fmt.allocPrint(allocator, "{s}/epoch-{d}.safetensors", .{ checkpoint_dir, completed_epochs });
             defer allocator.free(checkpoint_path);
@@ -2043,7 +2043,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const graph_cache_stats = trainer.graphCacheStats();
     try writeGraphCacheMetric(metrics_writer, graph_cache_stats);
     try metrics_writer.flush();
-    try metrics_file.sync(compat.io());
+    try metrics_file.sync(compat.testingIo());
 
     // ------------------------------------------------------------------
     // 11. Save adapters
@@ -2694,7 +2694,7 @@ fn writeTrainingManifest(
 }
 
 fn sha256RegularFileAlloc(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind != .file) return null;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -2713,7 +2713,7 @@ fn resumeCheckpointSha256Alloc(allocator: std.mem.Allocator, path: ?[]const u8) 
 }
 
 fn selfExecutableSha256Alloc(allocator: std.mem.Allocator) ![]const u8 {
-    const path = try std.process.executablePathAlloc(compat.io(), allocator);
+    const path = try std.process.executablePathAlloc(compat.testingIo(), allocator);
     defer allocator.free(path);
     return (try sha256RegularFileAlloc(allocator, path)) orelse error.TrainingExecutableNotRegular;
 }
@@ -2825,7 +2825,7 @@ fn updateFingerprintEntry(
 ) !void {
     const path = try std.fs.path.join(allocator, &.{ dir, entry.relative_path });
     defer allocator.free(path);
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             if (!entry.optional) return error.RequiredFingerprintFileMissing;
             // Absent is an identity of its own: it is recorded, not skipped,
@@ -2854,8 +2854,8 @@ fn updateFingerprintEntry(
 }
 
 fn updateSha256FromFile(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8) !void {
-    const io = compat.io();
-    var file = try compat.cwd().openFile(io, path, .{});
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
     var buffer: [64 * 1024]u8 = undefined;
@@ -2870,8 +2870,8 @@ fn updateSha256FromFile(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8) 
 }
 
 fn sha256FilePrefixDigest(path: []const u8, prefix_len: u64) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    const io = compat.io();
-    var file = try compat.cwd().openFile(io, path, .{});
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
     if (prefix_len > stat.size) return error.TrainingMetricsCheckpointMismatch;
@@ -3099,10 +3099,10 @@ fn trainingStateFingerprint(
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
-    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tmp_path, .data = data });
-    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), path, compat.io());
+    std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tmp_path, .data = data });
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, compat.testingIo());
 }
 
 /// Emit one `GLINER2_OPT_PARITY` JSON line per optimizer step with, for every
@@ -3733,7 +3733,7 @@ const BatchTargetStats = struct {
     entity_token_count: u64 = 0,
     ignored_token_count: u64 = 0,
     entity_type_count: usize = 0,
-    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = [_]u64{0} ** gliner2_autodiff.max_span_start_entity_types,
+    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = @as([gliner2_autodiff.max_span_start_entity_types]u64, @splat(0)),
 
     fn entityTokenRate(self: BatchTargetStats) f64 {
         if (self.supervised_token_count == 0) return 0.0;
@@ -3980,8 +3980,8 @@ fn inspectResumeMetrics(
     eval_every_epochs: u32,
     early_stopping_threshold: f64,
 ) !ResumeMetrics {
-    const io = compat.io();
-    var file = try compat.cwd().openFile(io, metrics_path, .{});
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().openFile(io, metrics_path, .{});
     defer file.close(io);
     const reader_buffer = try allocator.alloc(u8, max_resume_metric_line_bytes);
     defer allocator.free(reader_buffer);
@@ -4003,8 +4003,8 @@ fn inspectResumeMetrics(
 }
 
 fn truncateFileToPrefix(path: []const u8, prefix_len: u64) !void {
-    const io = compat.io();
-    var file = try compat.cwd().openFile(io, path, .{ .mode = .read_write });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
     const metrics_len = try file.length(io);
     if (prefix_len > metrics_len) return error.TrainingMetricsCheckpointMismatch;
@@ -4019,10 +4019,10 @@ fn syncDirectoryChain(path: []const u8) !void {
     var current = if (path.len == 0) "." else path;
     while (true) {
         var dir = if (std.fs.path.isAbsolute(current))
-            try std.Io.Dir.openDirAbsolute(compat.io(), current, .{ .iterate = true })
+            try std.Io.Dir.openDirAbsolute(compat.testingIo(), current, .{ .iterate = true })
         else
-            try compat.cwd().openDir(compat.io(), current, .{ .iterate = true });
-        defer dir.close(compat.io());
+            try std.Io.Dir.cwd().openDir(compat.testingIo(), current, .{ .iterate = true });
+        defer dir.close(compat.testingIo());
         while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -4809,10 +4809,10 @@ fn printSpanParityDebug(
     var neg_logits_sum: f64 = 0.0;
     var neg_count: usize = 0;
     const top_k = 5;
-    var top_bce = [_]f64{-1.0} ** top_k;
-    var top_logits = [_]f64{0.0} ** top_k;
-    var top_rows = [_]usize{0} ** top_k;
-    var top_entities = [_]usize{0} ** top_k;
+    var top_bce = @as([top_k]f64, @splat(-1.0));
+    var top_logits = @as([top_k]f64, @splat(0.0));
+    var top_rows = @as([top_k]usize, @splat(0));
+    var top_entities = @as([top_k]usize, @splat(0));
 
     for (0..rows) |row_idx| {
         const target_row = row_idx * width;
@@ -5778,16 +5778,16 @@ fn retainResumeCheckpoint(
 ) !void {
     if (!std.mem.eql(u8, source_path, retained_path)) {
         try std.Io.Dir.copyFile(
-            compat.cwd(),
+            std.Io.Dir.cwd(),
             source_path,
-            compat.cwd(),
+            std.Io.Dir.cwd(),
             retained_path,
-            compat.io(),
+            compat.testingIo(),
             .{ .make_path = true, .replace = true },
         );
-        var retained_file = try compat.cwd().openFile(compat.io(), retained_path, .{});
-        defer retained_file.close(compat.io());
-        try retained_file.sync(compat.io());
+        var retained_file = try std.Io.Dir.cwd().openFile(compat.testingIo(), retained_path, .{});
+        defer retained_file.close(compat.testingIo());
+        try retained_file.sync(compat.testingIo());
         if (std.fs.path.dirname(retained_path)) |dir_path| try syncDirectoryChain(dir_path);
     }
     const retained_sha256 = (try sha256RegularFileAlloc(allocator, retained_path)) orelse
@@ -5811,15 +5811,15 @@ fn pruneEpochCheckpoints(
     current_epoch: u64,
     keep_last: u32,
 ) !void {
-    var dir = compat.cwd().openDir(compat.io(), checkpoint_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(compat.testingIo(), checkpoint_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close(compat.io());
+    defer dir.close(compat.testingIo());
     var epochs = std.ArrayListUnmanaged(u64).empty;
     defer epochs.deinit(allocator);
     var iterator = dir.iterate();
-    while (try iterator.next(compat.io())) |entry| {
+    while (try iterator.next(compat.testingIo())) |entry| {
         if (entry.kind != .file or
             !std.mem.startsWith(u8, entry.name, prefix) or
             !std.mem.endsWith(u8, entry.name, ".safetensors"))
@@ -5839,7 +5839,7 @@ fn pruneEpochCheckpoints(
         const epoch = epochs.items[retained_end - 1];
         const name = try std.fmt.allocPrint(allocator, "{s}{d}.safetensors", .{ prefix, epoch });
         defer allocator.free(name);
-        try dir.deleteFile(compat.io(), name);
+        try dir.deleteFile(compat.testingIo(), name);
     }
     if (keep_last == 0) return;
     const keep: usize = @intCast(keep_last);
@@ -5847,7 +5847,7 @@ fn pruneEpochCheckpoints(
     for (epochs.items[0 .. retained_end - keep]) |epoch| {
         const name = try std.fmt.allocPrint(allocator, "{s}{d}.safetensors", .{ prefix, epoch });
         defer allocator.free(name);
-        try dir.deleteFile(compat.io(), name);
+        try dir.deleteFile(compat.testingIo(), name);
     }
 }
 
@@ -6845,7 +6845,7 @@ test "stochastic negative masking never touches the count-embed active-field blo
 test "packed target stats count only final active schema cells" {
     const E = 3;
     const width = 2 * E;
-    var targets = [_]f32{0.0} ** (2 * width);
+    var targets = @as([(2 * width)]f32, @splat(0.0));
     targets[0] = 1.0;
     targets[E + 0] = 1.0;
     targets[E + 1] = 1.0;
@@ -6940,7 +6940,7 @@ test "training manifest serializes initial adapter provenance and requested max 
     defer allocator.free(out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "initial-adapter.safetensors" });
     defer allocator.free(checkpoint_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = checkpoint_path, .data = "initial adapter" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = checkpoint_path, .data = "initial adapter" });
     const checkpoint_sha256 = (try initialAdapterCheckpointSha256Alloc(allocator, checkpoint_path)).?;
     defer allocator.free(checkpoint_sha256);
 
@@ -7003,7 +7003,7 @@ test "training manifest serializes initial adapter provenance and requested max 
 
     const manifest_path = try std.fs.path.join(allocator, &.{ out_dir, run_validation.manifest_file_name });
     defer allocator.free(manifest_path);
-    const manifest_bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    const manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(1024 * 1024));
     defer allocator.free(manifest_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest_bytes, .{});
     defer parsed.deinit();
@@ -7054,7 +7054,7 @@ test "training manifest serializes initial adapter provenance and requested max 
         .{},
         cache_stats,
     );
-    const clean_manifest_bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    const clean_manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(1024 * 1024));
     defer allocator.free(clean_manifest_bytes);
     var clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean_manifest_bytes, .{});
     defer clean_parsed.deinit();
@@ -7109,7 +7109,7 @@ test "training manifest serializes initial adapter provenance and requested max 
         },
         cache_stats,
     );
-    const resumed_manifest_bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    const resumed_manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(1024 * 1024));
     defer allocator.free(resumed_manifest_bytes);
     var resumed_parsed = try std.json.parseFromSlice(std.json.Value, allocator, resumed_manifest_bytes, .{});
     defer resumed_parsed.deinit();

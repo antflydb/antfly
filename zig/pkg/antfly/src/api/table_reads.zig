@@ -1820,14 +1820,14 @@ pub fn parallelFanoutMetricsSnapshot() ParallelFanoutMetricsSnapshot {
 }
 
 fn ioAsyncLimitWidth(io_impl: *std.Io.Threaded, group_count: usize) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return @max(@as(usize, 1), group_count);
     return @max(@as(usize, 1), @min(group_count, raw));
 }
 
 fn ioAsyncLimitCap(io_impl: *std.Io.Threaded) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return std.math.maxInt(usize);
     return @max(@as(usize, 1), raw);
@@ -20008,8 +20008,10 @@ test "remote canonical graph nodes reject invalid identity and depth domains" {
         .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
     }));
 
-    const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
-        (graph_pattern_mod.max_pattern_hops + 2);
+    const too_many_path_nodes = @as(
+        [graph_pattern_mod.max_pattern_hops + 2]indexes_openapi.GraphPathEndpoint,
+        @splat(.{ .key = "node" }),
+    );
     try std.testing.expectError(
         error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
@@ -20085,7 +20087,7 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
         error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
     );
-    edges[0].type = "x" ** (graph_edge_type.max_bytes + 1);
+    edges[0].type = @as([graph_edge_type.max_bytes + 1]u8, @splat('x'));
     try std.testing.expectError(
         error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
@@ -20799,11 +20801,11 @@ test "provisioned standby read gate permits stale reads and routes non-stale rea
 
     const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
     defer alloc.free(receive_path_raw);
-    const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+    const receive_path = try alloc.dupeSentinel(u8, receive_path_raw, 0);
     defer alloc.free(receive_path);
     const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
     defer alloc.free(progress_path_raw);
-    const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+    const progress_path = try alloc.dupeSentinel(u8, progress_path_raw, 0);
     defer alloc.free(progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
@@ -24287,8 +24289,8 @@ test "internal worker doc identity exchange audit covers every boundary" {
     var validates_generation_projection: usize = 0;
     var fail_closed_before_fanout: usize = 0;
 
-    inline for (std.meta.fields(DocIdentityInternalWorkerBoundary)) |field| {
-        const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
+    inline for (@typeInfo(DocIdentityInternalWorkerBoundary).@"enum".field_names) |field_name| {
+        const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field_name);
         switch (docIdentityInternalWorkerPolicy(boundary)) {
             .carries_shard_doc_set => carries_shard_doc_set += 1,
             .validates_generation_projection => validates_generation_projection += 1,

@@ -337,6 +337,7 @@ pub fn renderRemoteTemplateText(
 }
 
 fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
+    const external_storage = opts.storage != null;
     var resolved: db_mod.OpenOptions = .{
         .open_mode = opts.open_mode,
         .map_size = opts.map_size,
@@ -345,6 +346,9 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         .storage = opts.storage,
         .index_backends = opts.index_backends,
         .ttl_cleanup = opts.ttl_cleanup,
+        .physical_root_mode = if (external_storage) .external_backend else .filesystem_managed,
+        .external_derived_checkpoints = !external_storage,
+        .index_repair_checkpoint_storage = opts.storage,
     };
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };

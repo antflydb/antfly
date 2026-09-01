@@ -40,7 +40,6 @@ const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
 const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
 const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
-const compat = @import("io/compat.zig");
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
@@ -88,9 +87,9 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
-    audio_paths: [8][]const u8 = .{""} ** 8,
+    audio_paths: [8][]const u8 = @splat(""),
     audio_count: usize = 0,
     backend: BackendChoice = .auto,
     max_tokens: i32 = 128,
@@ -149,18 +148,17 @@ const Options = struct {
     kernel_jit_draft_qualified_profile: ?[]const u8 = null,
 };
 
-fn kernelJitProfileOutputPathsAlias(left: []const u8, right: []const u8) !bool {
+fn kernelJitProfileOutputPathsAlias(io: std.Io, left: []const u8, right: []const u8) !bool {
     if (!std.mem.eql(u8, std.fs.path.basename(left), std.fs.path.basename(right))) return false;
 
-    const io = compat.io();
     var left_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const left_parent_len = try compat.cwd().realPathFile(
+    const left_parent_len = try std.Io.Dir.cwd().realPathFile(
         io,
         std.fs.path.dirname(left) orelse ".",
         &left_parent_buffer,
     );
     var right_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const right_parent_len = try compat.cwd().realPathFile(
+    const right_parent_len = try std.Io.Dir.cwd().realPathFile(
         io,
         std.fs.path.dirname(right) orelse ".",
         &right_parent_buffer,
@@ -172,7 +170,7 @@ fn kernelJitProfileOutputPathsAlias(left: []const u8, right: []const u8) !bool {
     );
 }
 
-fn validateKernelJitOptions(opts: Options) !kernel_jit.Config {
+fn validateKernelJitOptions(io: std.Io, opts: Options) !kernel_jit.Config {
     var config = opts.kernel_jit;
     const draft_profile_requested = opts.kernel_jit_draft_profile_out != null or
         opts.kernel_jit_draft_qualified_profile != null;
@@ -183,7 +181,7 @@ fn validateKernelJitOptions(opts: Options) !kernel_jit.Config {
         opts.kernel_jit_draft_profile_out != null;
     if (opts.kernel_jit_profile_out != null and
         opts.kernel_jit_draft_profile_out != null and
-        try kernelJitProfileOutputPathsAlias(opts.kernel_jit_profile_out.?, opts.kernel_jit_draft_profile_out.?))
+        try kernelJitProfileOutputPathsAlias(io, opts.kernel_jit_profile_out.?, opts.kernel_jit_draft_profile_out.?))
     {
         return error.KernelJitTargetDraftProfileOutputConflict;
     }
@@ -285,7 +283,7 @@ fn validateCacheCompactionOption(ratio: ?f32) !void {
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const jit_config = try validateKernelJitOptions(opts);
+    const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
@@ -2825,7 +2823,7 @@ fn writeRawDecodeBenchJson(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn perToken(count: usize, tokens: usize) f64 {
@@ -5838,7 +5836,7 @@ fn writeJsonTiming(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn writeLiveWholeModelJsonTiming(
@@ -5900,7 +5898,7 @@ fn writeLiveWholeModelJsonTiming(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
@@ -6278,6 +6276,7 @@ fn diagnosticGenerateTokenLimit(
 /// silently overwrite earlier records.
 fn dumpGenerateLogits(
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_path: ?[]const u8,
     label: []const u8,
     step: usize,
@@ -6287,7 +6286,7 @@ fn dumpGenerateLogits(
     const path = try std.fmt.allocPrint(allocator, "{s}.{d}.{s}.f32", .{ base, step, label });
     defer allocator.free(path);
     const bytes = std.mem.sliceAsBytes(logits);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
     std.debug.print(
         "generate_logits_dump step={d} label={s} count={d} bytes={d} format=f32-native path={s}\n",
         .{ step, label, logits.len, bytes.len, path },
@@ -6296,8 +6295,8 @@ fn dumpGenerateLogits(
 
 fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) void {
     if (!traceGenerateTopLogitsEnabled()) return;
-    var top_ids = [_]usize{0} ** 8;
-    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    var top_ids = @as([8]usize, @splat(0));
+    var top_vals = @as([8]f32, @splat(-std.math.inf(f32)));
     for (logits, 0..) |logit, idx| {
         var insert_at: ?usize = null;
         for (top_vals, 0..) |current, slot| {
@@ -6682,7 +6681,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             }
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("prefill", generated, output_logits);
-            try dumpGenerateLogits(allocator, dump_generate_logits_path, "prefill", generated, output_logits);
+            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "prefill", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -6710,7 +6709,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         } else blk: {
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("decode", generated, output_logits);
-            try dumpGenerateLogits(allocator, dump_generate_logits_path, "decode", generated, output_logits);
+            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "decode", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -8561,9 +8560,9 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
     snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
     snapshot.provider.active_decode_frame_fallbacks = 7;
     snapshot.provider.prefill_frame_execute_successes = 8;
     snapshot.provider.prefill_frame_execute_attempts = 9;
@@ -8712,8 +8711,8 @@ test "metal stats compact json derives plan counters from runtime generated disp
     // q8_0/none is a promoted production route; q5_k/bias_gelu is still a dev
     // candidate (q5_k/bias was promoted, so it no longer covers the candidate
     // branch of this test).
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);
@@ -8970,9 +8969,9 @@ test "parseArgs accepts kernel JIT profile output" {
     });
     try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit_profile_out.?);
     if (build_options.enable_metal) {
-        try std.testing.expectEqual(kernel_jit.Mode.shadow, (try validateKernelJitOptions(opts)).mode);
+        try std.testing.expectEqual(kernel_jit.Mode.shadow, (try validateKernelJitOptions(std.testing.io, opts)).mode);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitProfileOut, parseArgs(&.{
@@ -9012,9 +9011,9 @@ test "parseArgs accepts native kernel JIT configuration" {
     try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit.qualified_profile_path.?);
     try std.testing.expect(opts.kernel_jit_options_explicit);
     if (build_options.enable_metal) {
-        _ = try validateKernelJitOptions(opts);
+        _ = try validateKernelJitOptions(std.testing.io, opts);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitMode, parseArgs(&.{
@@ -9052,13 +9051,13 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
     try std.testing.expectEqualStrings("/tmp/target-capture.json", capture_opts.kernel_jit_profile_out.?);
     try std.testing.expectEqualStrings("/tmp/draft-capture.json", capture_opts.kernel_jit_draft_profile_out.?);
     if (build_options.enable_metal) {
-        const target_config = try validateKernelJitOptions(capture_opts);
+        const target_config = try validateKernelJitOptions(std.testing.io, capture_opts);
         try std.testing.expectEqual(kernel_jit.Mode.shadow, target_config.mode);
         try std.testing.expect(target_config.profile_capture_only);
         try std.testing.expect((try draftKernelJitConfig(target_config, null, true)).profile_capture_only);
         try std.testing.expect(!(try draftKernelJitConfig(target_config, null, false)).profile_capture_only);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(capture_opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, capture_opts));
     }
 
     const qualified_opts = try parseArgs(&.{
@@ -9076,7 +9075,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
         "/tmp/draft-qualified.json",
     });
     if (build_options.enable_metal) {
-        const target_config = try validateKernelJitOptions(qualified_opts);
+        const target_config = try validateKernelJitOptions(std.testing.io, qualified_opts);
         const draft_config = try draftKernelJitConfig(target_config, qualified_opts.kernel_jit_draft_qualified_profile, false);
         try std.testing.expectEqualStrings("/tmp/target-qualified.json", target_config.qualified_profile_path.?);
         try std.testing.expectEqualStrings("/tmp/draft-qualified.json", draft_config.qualified_profile_path.?);
@@ -9084,7 +9083,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
 
         var draft_only_opts = qualified_opts;
         draft_only_opts.kernel_jit.qualified_profile_path = null;
-        const draft_only_target = try validateKernelJitOptions(draft_only_opts);
+        const draft_only_target = try validateKernelJitOptions(std.testing.io, draft_only_opts);
         try std.testing.expect(draft_only_target.qualified_profile_path == null);
         try std.testing.expectEqualStrings(
             "/tmp/draft-qualified.json",
@@ -9099,7 +9098,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
         const required_draft = try draftKernelJitConfig(required_target, "/tmp/draft-qualified.json", false);
         try std.testing.expectEqual(kernel_jit.Mode.required, required_draft.mode);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(qualified_opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, qualified_opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitDraftProfileOut, parseArgs(&.{
@@ -9129,7 +9128,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
 test "native kernel JIT profile policy is fail closed" {
     try std.testing.expectError(
         error.KernelJitTargetDraftProfileOutputConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -9140,7 +9139,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitTargetDraftProfileOutputConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -9151,7 +9150,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitProfileRequiresMetalBackend,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .native,
@@ -9160,7 +9159,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitProfileRequiresMetalBackend,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .cuda,
@@ -9179,11 +9178,11 @@ test "native kernel JIT profile policy is fail closed" {
     });
     try std.testing.expectError(
         error.KernelJitProfileCaptureRequiresShadow,
-        validateKernelJitOptions(explicit_off),
+        validateKernelJitOptions(std.testing.io, explicit_off),
     );
     try std.testing.expectError(
         error.KernelJitDraftProfileRequiresDraftModel,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -9192,7 +9191,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitDraftProfileRequiresDraftModel,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -9202,7 +9201,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitQualifiedProfileCaptureConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -9552,7 +9551,7 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
         }
     };
     for (names, &saved) |name, *slot| {
-        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeZ(u8, value);
+        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeSentinel(u8, value, 0);
         _ = unsetenv(name.ptr);
     }
 

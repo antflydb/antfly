@@ -92,7 +92,7 @@ fn parseDigits(text: []const u8) ?u64 {
 fn validDate(year: u64, month: u64, day: u64) bool {
     if (year == 0 or month < 1 or month > 12 or day < 1) return false;
     const days_in_month = [_]u8{ 31, if (isLeapYear(year)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    return day <= days_in_month[month - 1];
+    return day <= days_in_month[@intCast(month - 1)];
 }
 
 fn isLeapYear(year: u64) bool {

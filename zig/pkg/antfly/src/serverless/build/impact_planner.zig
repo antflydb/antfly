@@ -214,7 +214,7 @@ fn classifyIndexFamily(value: std.json.Value) ?ArtifactFamily {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,
@@ -260,8 +260,7 @@ test "impact planner flags schema migration as full text rebuild only" {
 test "impact planner flags added dense, sparse, and graph indexes independently" {
     const plan = try planAlloc(std.testing.allocator, .{
         .before_indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
-        .after_indexes_json =
-            "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"graph_idx\":{\"type\":\"graph\"}}",
+        .after_indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"graph_idx\":{\"type\":\"graph\"}}",
     });
     try std.testing.expect(plan.rebuild_dense_vector);
     try std.testing.expect(plan.rebuild_sparse_vector);

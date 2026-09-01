@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ascii_compat = @import("../common/ascii_compat.zig");
 const ant_json = @import("antfly-json");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
@@ -3870,7 +3871,7 @@ fn queryCoverageScore(query: []const u8, text: []const u8) f32 {
     while (it.next()) |token| {
         if (token.len < 4) continue;
         total += 1;
-        if (std.ascii.indexOfIgnoreCase(text, token) != null) matched += 1;
+        if (ascii_compat.indexOfIgnoreCase(text, token) != null) matched += 1;
     }
     return if (total == 0) 0.0 else @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(total));
 }
@@ -5083,7 +5084,7 @@ fn detectSelectedAgenticStrategy(
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
-        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
+        if (ascii_compat.indexOfIgnoreCase(haystack, needle) != null) return true;
     }
     return false;
 }
@@ -5485,14 +5486,15 @@ fn encodeQueryValueForRetrievalQuery(
 
 fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
     var canonical: QueryRequest = .{};
-    inline for (std.meta.fields(QueryRequest)) |field| {
-        if (!@hasField(RetrievalQueryRequest, field.name)) {
-            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field.name);
+    const query_info = @typeInfo(QueryRequest).@"struct";
+    inline for (query_info.field_names, query_info.field_types) |field_name, Field| {
+        if (!@hasField(RetrievalQueryRequest, field_name)) {
+            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field_name);
         }
-        if (@TypeOf(@field(request, field.name)) != field.type) {
-            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field.name);
+        if (@TypeOf(@field(request, field_name)) != Field) {
+            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field_name);
         }
-        @field(canonical, field.name) = @field(request, field.name);
+        @field(canonical, field_name) = @field(request, field_name);
     }
     return canonical;
 }

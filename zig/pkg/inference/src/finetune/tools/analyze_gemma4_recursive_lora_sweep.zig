@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
     out_dir = try resolveCliPath(allocator, invocation_cwd, out_dir);
     defer allocator.free(out_dir);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
     const decision_json = try std.fs.path.join(allocator, &.{ out_dir, "recursive_lora_sweep_decision.json" });
     defer allocator.free(decision_json);
     const decision_md = try std.fs.path.join(allocator, &.{ out_dir, "recursive_lora_sweep_decision.md" });
@@ -164,7 +164,7 @@ fn analyze(
         .evaluated = evaluated.items,
     }, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = decision_json, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = decision_json, .data = out.written() });
 
     try writeMarkdown(allocator, decision_md, criteria, status, recommendation, evaluated.items);
 }
@@ -264,7 +264,7 @@ fn writeMarkdown(
         }
         try writer.writeAll(" |\n");
     }
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = decision_md, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = decision_md, .data = out.written() });
 }
 
 fn writeNamedOptional(writer: anytype, name: []const u8, value: anytype) !void {

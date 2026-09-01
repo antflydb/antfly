@@ -87,24 +87,24 @@ pub const RecordView = Record;
 
 fn decodeRecordKind(raw: u16) !RecordKind {
     return switch (raw) {
-        @intFromEnum(RecordKind.batch_mutation) => .batch_mutation,
-        @intFromEnum(RecordKind.metadata_mutation) => .metadata_mutation,
-        @intFromEnum(RecordKind.derived_effect) => .derived_effect,
-        @intFromEnum(RecordKind.backup_start) => .backup_start,
-        @intFromEnum(RecordKind.backup_end) => .backup_end,
-        @intFromEnum(RecordKind.checkpoint) => .checkpoint,
-        @intFromEnum(RecordKind.manifest) => .manifest,
-        @intFromEnum(RecordKind.truncate) => .truncate,
-        @intFromEnum(RecordKind.timeline_switch) => .timeline_switch,
+        @backingInt(RecordKind.batch_mutation) => .batch_mutation,
+        @backingInt(RecordKind.metadata_mutation) => .metadata_mutation,
+        @backingInt(RecordKind.derived_effect) => .derived_effect,
+        @backingInt(RecordKind.backup_start) => .backup_start,
+        @backingInt(RecordKind.backup_end) => .backup_end,
+        @backingInt(RecordKind.checkpoint) => .checkpoint,
+        @backingInt(RecordKind.manifest) => .manifest,
+        @backingInt(RecordKind.truncate) => .truncate,
+        @backingInt(RecordKind.timeline_switch) => .timeline_switch,
         else => error.UnsupportedRecordKind,
     };
 }
 
 fn decodePayloadCodec(raw: u16) !PayloadCodec {
     return switch (raw) {
-        @intFromEnum(PayloadCodec.raw) => .raw,
-        @intFromEnum(PayloadCodec.json) => .json,
-        @intFromEnum(PayloadCodec.binary) => .binary,
+        @backingInt(PayloadCodec.raw) => .raw,
+        @backingInt(PayloadCodec.json) => .json,
+        @backingInt(PayloadCodec.binary) => .binary,
         else => error.UnsupportedPayloadCodec,
     };
 }
@@ -124,15 +124,15 @@ pub fn encodeAlloc(alloc: Allocator, record: Record) ![]u8 {
 pub fn encodeInto(out: []u8, record: Record) !void {
     const required = try encodedLen(record.payload.len);
     if (out.len != required) return error.InvalidOutputLength;
-    const record_kind = try decodeRecordKind(@intFromEnum(record.kind));
-    const payload_codec = try decodePayloadCodec(@intFromEnum(record.payload_codec));
+    const record_kind = try decodeRecordKind(@backingInt(record.kind));
+    const payload_codec = try decodePayloadCodec(@backingInt(record.payload_codec));
 
     @memset(out[0..header_size], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], format_version, .little);
     std.mem.writeInt(u16, out[header_len_offset..][0..2], header_size, .little);
-    std.mem.writeInt(u16, out[record_kind_offset..][0..2], @intFromEnum(record_kind), .little);
-    std.mem.writeInt(u16, out[payload_codec_offset..][0..2], @intFromEnum(payload_codec), .little);
+    std.mem.writeInt(u16, out[record_kind_offset..][0..2], @backingInt(record_kind), .little);
+    std.mem.writeInt(u16, out[payload_codec_offset..][0..2], @backingInt(payload_codec), .little);
     std.mem.writeInt(u32, out[flags_offset..][0..4], record.flags, .little);
     std.mem.writeInt(u64, out[cluster_id_offset..][0..8], record.cluster_id, .little);
     std.mem.writeInt(u64, out[shard_id_offset..][0..8], record.shard_id, .little);
@@ -313,7 +313,7 @@ test "ha replication record rejects unknown current-version kind and codec" {
     std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
     try std.testing.expectError(error.UnsupportedRecordKind, decode(encoded));
 
-    std.mem.writeInt(u16, encoded[record_kind_offset..][0..2], @intFromEnum(RecordKind.batch_mutation), .little);
+    std.mem.writeInt(u16, encoded[record_kind_offset..][0..2], @backingInt(RecordKind.batch_mutation), .little);
     std.mem.writeInt(u16, encoded[payload_codec_offset..][0..2], 0xffff, .little);
     std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
     try std.testing.expectError(error.UnsupportedPayloadCodec, decode(encoded));
@@ -321,7 +321,7 @@ test "ha replication record rejects unknown current-version kind and codec" {
 
 test "ha replication record refuses to encode unknown current-version kind and codec" {
     try std.testing.expectError(error.UnsupportedRecordKind, encodeAlloc(std.testing.allocator, .{
-        .kind = @enumFromInt(0xffff),
+        .kind = @fromBackingInt(@intCast(0xffff)),
         .payload_codec = .raw,
         .cluster_id = 1,
         .timeline_id = 2,
@@ -332,7 +332,7 @@ test "ha replication record refuses to encode unknown current-version kind and c
 
     try std.testing.expectError(error.UnsupportedPayloadCodec, encodeAlloc(std.testing.allocator, .{
         .kind = .batch_mutation,
-        .payload_codec = @enumFromInt(0xffff),
+        .payload_codec = @fromBackingInt(@intCast(0xffff)),
         .cluster_id = 1,
         .timeline_id = 2,
         .epoch = 3,

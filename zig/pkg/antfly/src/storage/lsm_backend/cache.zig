@@ -149,8 +149,8 @@ pub const Cache = struct {
     const Shard = struct {
         mutex: std.atomic.Mutex = .unlocked,
         entries: EntryMap = .empty,
-        lru_heads: [priority_count]?*Entry = [_]?*Entry{null} ** priority_count,
-        lru_tails: [priority_count]?*Entry = [_]?*Entry{null} ** priority_count,
+        lru_heads: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
+        lru_tails: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
         pending_sync: PendingSync = .{},
         pending_loads: PendingMap = .empty,
     };
@@ -205,24 +205,24 @@ pub const Cache = struct {
             data_block_used_bytes: usize,
             data_block_peak_used_bytes: usize,
             entry_count: usize,
-            kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize,
-            kind_peak_bytes: [@typeInfo(Kind).@"enum".fields.len]usize,
+            kind_bytes: [@typeInfo(Kind).@"enum".field_names.len]usize,
+            kind_peak_bytes: [@typeInfo(Kind).@"enum".field_names.len]usize,
         ) Stats {
             var run_state = self.run_state.snapshot();
             var run_table_raw = self.run_table_raw.snapshot();
             var run_table_index = self.run_table_index.snapshot();
             var run_table_block = self.run_table_block.snapshot();
             var run_table_physical_block = self.run_table_physical_block.snapshot();
-            run_state.used_bytes = kind_bytes[@intFromEnum(Kind.run_state)];
-            run_table_raw.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_raw)];
-            run_table_index.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_index)];
-            run_table_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_block)];
-            run_table_physical_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_physical_block)];
-            run_state.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_state)];
-            run_table_raw.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_raw)];
-            run_table_index.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_index)];
-            run_table_block.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_block)];
-            run_table_physical_block.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_physical_block)];
+            run_state.used_bytes = kind_bytes[@backingInt(Kind.run_state)];
+            run_table_raw.used_bytes = kind_bytes[@backingInt(Kind.run_table_raw)];
+            run_table_index.used_bytes = kind_bytes[@backingInt(Kind.run_table_index)];
+            run_table_block.used_bytes = kind_bytes[@backingInt(Kind.run_table_block)];
+            run_table_physical_block.used_bytes = kind_bytes[@backingInt(Kind.run_table_physical_block)];
+            run_state.peak_used_bytes = kind_peak_bytes[@backingInt(Kind.run_state)];
+            run_table_raw.peak_used_bytes = kind_peak_bytes[@backingInt(Kind.run_table_raw)];
+            run_table_index.peak_used_bytes = kind_peak_bytes[@backingInt(Kind.run_table_index)];
+            run_table_block.peak_used_bytes = kind_peak_bytes[@backingInt(Kind.run_table_block)];
+            run_table_physical_block.peak_used_bytes = kind_peak_bytes[@backingInt(Kind.run_table_physical_block)];
             return .{
                 .used_bytes = used_bytes,
                 .peak_used_bytes = peak_used_bytes,
@@ -246,14 +246,14 @@ pub const Cache = struct {
     data_block_used_bytes: std.atomic.Value(usize) = .init(0),
     data_block_peak_used_bytes: std.atomic.Value(usize) = .init(0),
     entry_count: std.atomic.Value(usize) = .init(0),
-    kind_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+    kind_bytes: [@typeInfo(Kind).@"enum".field_names.len]std.atomic.Value(usize) = .{
         .init(0),
         .init(0),
         .init(0),
         .init(0),
         .init(0),
     },
-    kind_peak_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+    kind_peak_bytes: [@typeInfo(Kind).@"enum".field_names.len]std.atomic.Value(usize) = .{
         .init(0),
         .init(0),
         .init(0),
@@ -357,8 +357,8 @@ pub const Cache = struct {
     }
 
     pub fn snapshotStats(self: *const Cache) Stats {
-        var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
-        var peak_by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
+        var by_kind: [@typeInfo(Kind).@"enum".field_names.len]usize = undefined;
+        var peak_by_kind: [@typeInfo(Kind).@"enum".field_names.len]usize = undefined;
         inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
         inline for (0..peak_by_kind.len) |i| {
             peak_by_kind[i] = @max(by_kind[i], self.kind_peak_bytes[i].load(.monotonic));
@@ -707,7 +707,7 @@ pub const Cache = struct {
         self.linkEntryLocked(shard, entry);
         const used_bytes = self.used_bytes.fetchAdd(byte_cost, .monotonic) + byte_cost;
         updateAtomicMax(&self.peak_used_bytes, used_bytes);
-        const kind_index = @intFromEnum(kind);
+        const kind_index = @backingInt(kind);
         const kind_bytes = self.kind_bytes[kind_index].fetchAdd(byte_cost, .monotonic) + byte_cost;
         updateAtomicMax(&self.kind_peak_bytes[kind_index], kind_bytes);
         if (isDataBlockKind(kind)) {
@@ -806,7 +806,7 @@ pub const Cache = struct {
         std.debug.assert(entry.ref_count == 0);
         self.unlinkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchSub(entry.byte_cost, .monotonic);
-        _ = self.kind_bytes[@intFromEnum(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
+        _ = self.kind_bytes[@backingInt(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
         if (isDataBlockKind(entry.kind)) {
             _ = self.data_block_used_bytes.fetchSub(entry.byte_cost, .monotonic);
         }
@@ -984,7 +984,11 @@ pub const Cache = struct {
     }
 };
 
-const supports_waitable_pending = builtin.os.tag != .freestanding and builtin.link_libc and @hasDecl(std.c, "pthread_cond_wait");
+const supports_waitable_pending = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
+    builtin.link_libc and
+    @hasDecl(std.c, "pthread_cond_wait");
 
 const PendingSync = if (supports_waitable_pending)
     struct {
@@ -1130,7 +1134,7 @@ fn hashKey(path: []const u8, run_id: u64, generation: u64, kind: Kind, block_off
     hasher.update(path);
     hasher.update(std.mem.asBytes(&run_id));
     hasher.update(std.mem.asBytes(&generation));
-    const tag: u8 = @intFromEnum(kind);
+    const tag: u8 = @backingInt(kind);
     hasher.update(&.{tag});
     hasher.update(std.mem.asBytes(&block_offset));
     hasher.update(std.mem.asBytes(&block_len));
@@ -1281,15 +1285,15 @@ test "cache snapshot clamps concurrently sampled peaks to current residency" {
     cache.peak_used_bytes.store(512, .monotonic);
     cache.data_block_used_bytes.store(768, .monotonic);
     cache.data_block_peak_used_bytes.store(256, .monotonic);
-    cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(768, .monotonic);
-    cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(256, .monotonic);
+    cache.kind_bytes[@backingInt(Kind.run_table_block)].store(768, .monotonic);
+    cache.kind_peak_bytes[@backingInt(Kind.run_table_block)].store(256, .monotonic);
     defer {
         cache.used_bytes.store(0, .monotonic);
         cache.peak_used_bytes.store(0, .monotonic);
         cache.data_block_used_bytes.store(0, .monotonic);
         cache.data_block_peak_used_bytes.store(0, .monotonic);
-        cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
-        cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
+        cache.kind_bytes[@backingInt(Kind.run_table_block)].store(0, .monotonic);
+        cache.kind_peak_bytes[@backingInt(Kind.run_table_block)].store(0, .monotonic);
     }
 
     const stats = cache.snapshotStats();
@@ -1368,7 +1372,7 @@ test "cache accounts table index prefix bloom filters" {
 test "cache reports shared byte usage to resource manager" {
     const allocator = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
@@ -1384,19 +1388,19 @@ test "cache reports shared byte usage to resource manager" {
     try std.testing.expect(inserted.isRetained());
 
     var stats = resource_manager.snapshot();
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes > 0);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].soft_limit_events > 0);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes > 0);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)].soft_limit_events > 0);
 
     inserted.release();
     cache.invalidatePath("run-1");
     stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes);
 }
 
 test "cache falls back to a transient handle when retention exceeds the resource envelope" {
     const allocator = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 2,
     };
@@ -1472,7 +1476,7 @@ test "shared LSM cache yields to foreground aggregate admission" {
 test "cache shrinks against resource manager pressure target" {
     const allocator = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };

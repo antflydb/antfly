@@ -950,7 +950,7 @@ fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckRes
     defer allocator.free(actual);
     @memset(actual, 0);
 
-    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    const kernel_name_z = try allocator.dupeSentinel(u8, check.kernel_name, 0);
     defer allocator.free(kernel_name_z);
     var elapsed_nanos: u64 = 0;
     const rc = termite_metal_run_generated_microkernel_check(
@@ -1202,7 +1202,7 @@ fn runAttentionCheck(allocator: std.mem.Allocator, check: AttentionCheckCase) !C
     defer allocator.free(actual);
     @memset(actual, 0);
 
-    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    const kernel_name_z = try allocator.dupeSentinel(u8, check.kernel_name, 0);
     defer allocator.free(kernel_name_z);
     var elapsed_nanos: u64 = 0;
     const rc = termite_metal_run_generated_attention_check(
@@ -1629,7 +1629,7 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
     defer allocator.free(actual);
     @memset(actual, 0);
 
-    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    const kernel_name_z = try allocator.dupeSentinel(u8, check.kernel_name, 0);
     defer allocator.free(kernel_name_z);
     var elapsed_nanos: u64 = 0;
     const rc = termite_metal_run_generated_flash_prefill_check(
@@ -1739,7 +1739,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         var split_count: u32 = 99;
                         var scratch_bytes: usize = 99;
                         const rc = termite_metal_decode_gqa_split_policy_probe(
-                            @intFromEnum(requested),
+                            @backingInt(requested),
                             q_len,
                             kv_tokens,
                             8,
@@ -1757,7 +1757,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         else
                             32;
                         if (kv_tokens < qualified_min_kv) {
-                            if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                            if (rc != 0 or resolved != @backingInt(SplitGqaVariant.auto) or
                                 split_count != 0 or scratch_bytes != 0)
                             {
                                 std.debug.print(
@@ -1770,12 +1770,12 @@ fn runSplitGqaPolicyProbeChecks() !void {
                             const expected_variant = splitGqaResolvedVariant(requested);
                             const expected_splits: usize = @min(splitGqaVariantCap(requested), (kv_tokens + 31) / 32);
                             const expected_scratch = q_len * 8 * expected_splits * (shape.head_dim + 2) * @sizeOf(f32);
-                            if (rc != 1 or resolved != @intFromEnum(expected_variant) or
+                            if (rc != 1 or resolved != @backingInt(expected_variant) or
                                 split_count != @as(u32, @intCast(expected_splits)) or scratch_bytes != expected_scratch)
                             {
                                 std.debug.print(
                                     "split GQA policy mismatch variant={s} q={d} kv={d} hd={d} rc={d} resolved={d}/{d} splits={d}/{d} scratch={d}/{d}\n",
-                                    .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, @intFromEnum(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
+                                    .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, @backingInt(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
                                 );
                                 return error.GeneratedMetalKernelMismatch;
                             }
@@ -1799,7 +1799,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                     var split_count: u32 = 99;
                     var scratch_bytes: usize = 99;
                     const rc = termite_metal_decode_gqa_split_policy_probe(
-                        @intFromEnum(requested),
+                        @backingInt(requested),
                         q_len,
                         kv_tokens,
                         16,
@@ -1812,7 +1812,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                     );
                     const qualified_min_kv: usize = if (q_len == 2) 512 else 32;
                     if (kv_tokens < qualified_min_kv) {
-                        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                        if (rc != 0 or resolved != @backingInt(SplitGqaVariant.auto) or
                             split_count != 0 or scratch_bytes != 0)
                         {
                             return error.GeneratedMetalKernelMismatch;
@@ -1821,12 +1821,12 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         const expected_variant = splitGqaResolvedVariant(requested);
                         const expected_splits: usize = @min(splitGqaVariantCap(requested), (kv_tokens + 31) / 32);
                         const expected_scratch = q_len * 16 * expected_splits * (shape.head_dim + 2) * @sizeOf(f32);
-                        if (rc != 1 or resolved != @intFromEnum(expected_variant) or
+                        if (rc != 1 or resolved != @backingInt(expected_variant) or
                             split_count != @as(u32, @intCast(expected_splits)) or scratch_bytes != expected_scratch)
                         {
                             std.debug.print(
                                 "split GQA A4B policy mismatch variant={s} q={d} kv={d} hd={d} kv_heads={d} rc={d} resolved={d}/{d} splits={d}/{d} scratch={d}/{d}\n",
-                                .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, shape.num_kv_heads, rc, resolved, @intFromEnum(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
+                                .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, shape.num_kv_heads, rc, resolved, @backingInt(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
                             );
                             return error.GeneratedMetalKernelMismatch;
                         }
@@ -1863,7 +1863,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                     var split_count: u32 = 99;
                     var scratch_bytes: usize = 99;
                     const rc = termite_metal_decode_gqa_split_policy_probe_with_min_kv(
-                        @intFromEnum(SplitGqaVariant.auto),
+                        @backingInt(SplitGqaVariant.auto),
                         min_kv,
                         q_len,
                         kv_tokens,
@@ -1876,7 +1876,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         &scratch_bytes,
                     );
                     if (kv_tokens < min_kv) {
-                        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                        if (rc != 0 or resolved != @backingInt(SplitGqaVariant.auto) or
                             split_count != 0 or scratch_bytes != 0)
                         {
                             return error.GeneratedMetalKernelMismatch;
@@ -1885,7 +1885,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         const expected_splits: usize = @min(32, (kv_tokens + 31) / 32);
                         const expected_scratch = q_len * shape.num_heads * expected_splits *
                             (shape.head_dim + 2) * @sizeOf(f32);
-                        if (rc != 1 or resolved != @intFromEnum(SplitGqaVariant.s32_k32_r256) or
+                        if (rc != 1 or resolved != @backingInt(SplitGqaVariant.s32_k32_r256) or
                             split_count != @as(u32, @intCast(expected_splits)) or
                             scratch_bytes != expected_scratch)
                         {
@@ -1902,7 +1902,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
     var zero_min_split_count: u32 = 99;
     var zero_min_scratch_bytes: usize = 99;
     if (termite_metal_decode_gqa_split_policy_probe_with_min_kv(
-        @intFromEnum(SplitGqaVariant.auto),
+        @backingInt(SplitGqaVariant.auto),
         0,
         1,
         23,
@@ -1935,7 +1935,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
         var split_count: u32 = 99;
         var scratch_bytes: usize = 99;
         const rc = termite_metal_decode_gqa_split_policy_probe(
-            @intFromEnum(SplitGqaVariant.auto),
+            @backingInt(SplitGqaVariant.auto),
             shape.q_len,
             512,
             shape.num_heads,
@@ -1946,7 +1946,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
             &split_count,
             &scratch_bytes,
         );
-        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+        if (rc != 0 or resolved != @backingInt(SplitGqaVariant.auto) or
             split_count != 0 or scratch_bytes != 0) return error.GeneratedMetalKernelMismatch;
     }
 
@@ -1965,7 +1965,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
         &invalid_split_count,
         &invalid_scratch_bytes,
     );
-    if (invalid_rc != -2 or invalid_resolved != @intFromEnum(SplitGqaVariant.auto) or
+    if (invalid_rc != -2 or invalid_resolved != @backingInt(SplitGqaVariant.auto) or
         invalid_split_count != 0 or invalid_scratch_bytes != 0) return error.GeneratedMetalKernelMismatch;
 
     std.debug.print(
@@ -2007,7 +2007,7 @@ fn validateSplitGqaScheduleDelta(
     }
     const expected_shape = try splitGqaShapeIndex(check.shape);
     const expected_variant_index: ?usize = if (expected_variant) |variant|
-        @as(usize, @intCast(@intFromEnum(splitGqaResolvedVariant(variant)) - 1))
+        @as(usize, @intCast(@backingInt(splitGqaResolvedVariant(variant)) - 1))
     else
         null;
     var total_delta: u64 = 0;
@@ -2267,17 +2267,17 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     const global_variant_env = "TERMITE_METAL_DECODE_GQA_SPLIT_GLOBAL_VARIANT";
     const min_kv_env = "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV";
     const a4b_enable_env = "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT";
-    const old_enable = if (std.c.getenv(enable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_enable = if (std.c.getenv(enable_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_enable) |value| allocator.free(value);
-    const old_disable = if (std.c.getenv(disable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_disable = if (std.c.getenv(disable_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_disable) |value| allocator.free(value);
-    const old_swa_variant = if (std.c.getenv(swa_variant_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_swa_variant = if (std.c.getenv(swa_variant_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_swa_variant) |value| allocator.free(value);
-    const old_global_variant = if (std.c.getenv(global_variant_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_global_variant = if (std.c.getenv(global_variant_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_global_variant) |value| allocator.free(value);
-    const old_min_kv = if (std.c.getenv(min_kv_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_min_kv = if (std.c.getenv(min_kv_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_min_kv) |value| allocator.free(value);
-    const old_a4b_enable = if (std.c.getenv(a4b_enable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_a4b_enable = if (std.c.getenv(a4b_enable_env)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_a4b_enable) |value| allocator.free(value);
     defer if (old_enable) |value| {
         _ = setenv(enable_env, value.ptr, 1);
@@ -2597,7 +2597,7 @@ test "quant kernel metal runtime RMSNorm CPU oracle matches activations.rmsNorm"
     const weight = [_]f32{ 1.0, 0.5, 2.0, 1.5, 0.25, 1.25, 0.75, 1.75 };
     const eps: f32 = 1e-6;
 
-    var out = [_]f32{0} ** (n * d);
+    var out = @as([(n * d)]f32, @splat(0));
     try referenceRmsNorm(allocator, &input, &weight, n, d, eps, &out);
 
     // Independent scalar reference: out[r,i] = in[r,i] * rsqrt(mean(in^2)+eps) * w[i].
@@ -2942,12 +2942,13 @@ test "quant kernel metal runtime generated counter snapshot order matches C" {
     );
 
     // Every wired counter must map to a unique in-range (format, epilogue) cell.
-    var seen = [_][quant_matmul.generated_quant_epilogue_count]bool{
-        [_]bool{false} ** quant_matmul.generated_quant_epilogue_count,
-    } ** quant_matmul.generated_quant_format_count;
+    var seen = @as(
+        [quant_matmul.generated_quant_format_count][quant_matmul.generated_quant_epilogue_count]bool,
+        @splat(@as([quant_matmul.generated_quant_epilogue_count]bool, @splat(false))),
+    );
     for (quant_matmul.generated_quant_counter_names) |counter| {
-        const format_index: usize = @intFromEnum(counter.format);
-        const epilogue_index: usize = @intFromEnum(counter.epilogue);
+        const format_index: usize = @backingInt(counter.format);
+        const epilogue_index: usize = @backingInt(counter.epilogue);
         try std.testing.expect(format_index < quant_matmul.generated_quant_format_count);
         try std.testing.expect(epilogue_index < quant_matmul.generated_quant_epilogue_count);
         try std.testing.expect(!seen[format_index][epilogue_index]);
@@ -3283,7 +3284,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.evidence_out_path) |path| {
         var collected_provenance: ?CollectedAttestedProvenance = if (cfg.attest_provenance)
-            try collectAttestedProvenance(allocator, compat.io())
+            try collectAttestedProvenance(allocator, init.io)
         else
             null;
         defer if (collected_provenance) |*provenance| provenance.deinit(allocator);
@@ -3319,9 +3320,9 @@ const CheckResult = struct {
     generated_timing_route: GeneratedTimingRoute = .standalone_generated,
     handwritten_elapsed_nanos: ?u64 = null,
     minimum_repeat_speedup: ?f64 = null,
-    repeat_generated_ns: [max_evidence_repeat_runs]u64 = [_]u64{0} ** max_evidence_repeat_runs,
-    repeat_handwritten_ns: [max_evidence_repeat_runs]u64 = [_]u64{0} ** max_evidence_repeat_runs,
-    repeat_speedups: [max_evidence_repeat_runs]f64 = [_]f64{0.0} ** max_evidence_repeat_runs,
+    repeat_generated_ns: [max_evidence_repeat_runs]u64 = @as([max_evidence_repeat_runs]u64, @splat(0)),
+    repeat_handwritten_ns: [max_evidence_repeat_runs]u64 = @as([max_evidence_repeat_runs]u64, @splat(0)),
+    repeat_speedups: [max_evidence_repeat_runs]f64 = @as([max_evidence_repeat_runs]f64, @splat(0.0)),
     repeat_timing_count: u32 = 0,
     repeat_handwritten_count: u32 = 0,
     generated_route_checked: bool = false,
@@ -3689,7 +3690,7 @@ fn runRepeatedCheck(
 
     var max_error: f32 = 0.0;
     var handwritten_count: usize = 0;
-    var repeat_speedups: [max_evidence_repeat_runs]f64 = [_]f64{0.0} ** max_evidence_repeat_runs;
+    var repeat_speedups: [max_evidence_repeat_runs]f64 = @as([max_evidence_repeat_runs]f64, @splat(0.0));
     for (runs, 0..) |*run, i| {
         run.* = try runCheck(allocator, check, route_kernel, promotion_ready_kernel);
         max_error = @max(max_error, run.max_error);
@@ -4008,7 +4009,7 @@ fn writeSweepEvidence(
         try out.appendSlice(allocator, if (emitted == total) "\n" else ",\n");
     }
     try out.appendSlice(allocator, "  ]\n}\n");
-    try writeFileCreatingParent(compat.io(), path, out.items);
+    try writeFileCreatingParent(compat.testingIo(), path, out.items);
 }
 
 fn appendSweepScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), schedule: quant_kernel_compiler.KernelSchedule) !void {
@@ -4427,7 +4428,7 @@ fn runCheckImpl(
     defer allocator.free(actual);
     @memset(actual, 0);
 
-    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    const kernel_name_z = try allocator.dupeSentinel(u8, check.kernel_name, 0);
     defer allocator.free(kernel_name_z);
     const needs_bias = epilogueNeedsBias(check.epilogue);
     const bias_ptr: ?[*]const f32 = if (needs_bias) bias.ptr else null;
@@ -4511,7 +4512,7 @@ fn runHandwrittenBaselineIfSupported(
     if (!handwrittenBaselineSupported(check)) return null;
     const master_disable_env = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
     const old_master_disable = std.c.getenv(master_disable_env);
-    const old_master_disable_copy = if (old_master_disable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_master_disable_copy = if (old_master_disable) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_master_disable_copy) |value| allocator.free(value);
     if (setenv(master_disable_env, "1", 1) != 0) return error.MetalRuntimeUnavailable;
     defer if (old_master_disable_copy) |value| {
@@ -4541,7 +4542,7 @@ fn runQuantBiasSplitBaseline(
 
     const disable_env = disableEnvForSplitBaselineLinearRoute(check);
     const old_disable = if (disable_env) |env_name| std.c.getenv(env_name) else null;
-    const old_disable_copy = if (old_disable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_disable_copy = if (old_disable) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_disable_copy) |value| allocator.free(value);
     if (disable_env) |env_name| {
         if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
@@ -4752,7 +4753,7 @@ fn runProductionRouteIfGenerated(
     };
     if (route_env_name) |env_name| {
         const old_value = std.c.getenv(env_name);
-        old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        old_value_copy = if (old_value) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
         if (gate_override.?.enable) {
             if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
         } else if (unsetenv(env_name) != 0) {
@@ -4773,7 +4774,7 @@ fn runGeneratedRouteForPromotion(
     if (try runProductionRouteIfGenerated(allocator, check, raw_weight, input, bias, expected)) |elapsed| return elapsed;
     const env_name = enableEnvForGeneratedCandidateRoute(check) orelse return null;
     const old_value = std.c.getenv(env_name);
-    const old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_value_copy = if (old_value) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old_value_copy) |value| allocator.free(value);
     if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
     defer {
@@ -4811,7 +4812,7 @@ fn runProviderRouteIfSupported(
     if (use_candidate_route) {
         const env_name = enableEnvForGeneratedCandidateRoute(check) orelse return false;
         const old_value = std.c.getenv(env_name);
-        enabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        enabled_old_value_copy = if (old_value) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
         enabled_env_name = env_name;
         if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
     }
@@ -4827,7 +4828,7 @@ fn runProviderRouteIfSupported(
     };
     if (disableEnvForGeneratedProductionRoute(check)) |env_name| {
         const old_value = std.c.getenv(env_name);
-        disabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        disabled_old_value_copy = if (old_value) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
         disabled_env_name = env_name;
         if (unsetenv(env_name) != 0) return error.MetalRuntimeUnavailable;
     }
@@ -4843,7 +4844,7 @@ fn runProviderRouteIfSupported(
             .bias => termite_metal_provider_linear_q8_0_bias(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
             .bias_gelu => termite_metal_provider_linear_q8_0_bias_gelu(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
             .relu => termite_metal_provider_linear_q8_0_relu(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
-            else => termite_metal_provider_linear_q8_0_planned(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, @intFromEnum(quant_matmul.DispatchKind.small_batch), actual.ptr),
+            else => termite_metal_provider_linear_q8_0_planned(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, @backingInt(quant_matmul.DispatchKind.small_batch), actual.ptr),
         },
         .q8_1 => termite_metal_provider_linear_q8_1(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
         .q8_k => termite_metal_provider_linear_q8_k(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
@@ -5770,7 +5771,7 @@ fn writeEvidence(
         \\}
         \\
     );
-    try writeFileCreatingParent(compat.io(), path, out.items);
+    try writeFileCreatingParent(compat.testingIo(), path, out.items);
     if (promotion_ready_kernel) |kernel| {
         if (emit_promotion_diagnostics and promotion_ready_count != promotion_case_count) {
             std.debug.print(
@@ -6008,14 +6009,14 @@ fn appendF64ArrayField(
 
 fn writeFileCreatingParent(io: std.Io, path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
     }
     if (std.fs.path.isAbsolute(path)) {
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, data);
     } else {
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
     }
 }
 
@@ -6479,14 +6480,14 @@ fn checkEvidenceFileWithSummaryExpected(
     require_kernel: ?[]const u8,
     expected_provenance_override: ?AttestedProvenance,
 ) !EvidenceSummary {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(1024 * 1024));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
     try checkEvidenceJson(allocator, bytes, require_promotion_ready, require_runtime_route_all, require_kernel);
     if (require_promotion_ready) {
         if (expected_provenance_override) |expected_provenance| {
             try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance);
         } else {
-            var expected_provenance = try collectAttestedProvenance(allocator, compat.io());
+            var expected_provenance = try collectAttestedProvenance(allocator, compat.testingIo());
             defer expected_provenance.deinit(allocator);
             try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance.value);
         }
@@ -6589,12 +6590,12 @@ fn checkEvidenceJsonCommandPath(allocator: std.mem.Allocator, bytes: []const u8,
 fn commandEvidenceOutMatches(allocator: std.mem.Allocator, command: []const u8, path: []const u8) !bool {
     const actual = commandArgValue(command, "--evidence-out") orelse return false;
     if (std.mem.eql(u8, actual, path)) return true;
-    const actual_real = compat.cwd().realPathFileAlloc(compat.io(), actual, allocator) catch |err| switch (err) {
+    const actual_real = std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), actual, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
     defer allocator.free(actual_real);
-    const expected_real = compat.cwd().realPathFileAlloc(compat.io(), path, allocator) catch |err| switch (err) {
+    const expected_real = std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -7983,7 +7984,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, copied_path, false, false, null));
     try std.testing.expect(try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/a --repeat-runs 3", "/tmp/a"));
     try std.testing.expect(!try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/abc --repeat-runs 3", "/tmp/a"));
-    const absolute_path = try compat.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
+    const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
     defer std.testing.allocator.free(absolute_path);
     try checkEvidenceJsonCommandPath(std.testing.allocator, actual, absolute_path);
 

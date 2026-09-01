@@ -14,11 +14,11 @@
 
 const std = @import("std");
 
-pub fn io() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+/// Temporary bridge for tests that do not yet receive an I/O implementation
+/// from their fixture. Production code must accept and propagate `std.Io`.
+pub fn testingIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
 }
-
-pub fn cwd() std.Io.Dir {
-    return std.Io.Dir.cwd();
-}
-

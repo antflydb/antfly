@@ -3050,7 +3050,7 @@ test "query merge applies global score ordering and offset" {
 }
 
 test "query merge allocation scales with the selected page" {
-    const large_stored = "x" ** 1024;
+    const large_stored = &@as([1024]u8, @splat('x'));
     var input_hits: [2048]db_mod.types.SearchHit = undefined;
     for (&input_hits) |*hit| {
         hit.* = .{

@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     const count = try std.fmt.parseUnsigned(usize, count_arg, 10);
     if (count == 0) return error.InvalidPilotExampleCount;
 
-    const file = try compat.cwd().createFile(compat.io(), out_path, .{ .truncate = true });
+    const file = try std.Io.Dir.cwd().createFile(init.io, out_path, .{ .truncate = true });
     defer file.close(init.io);
 
     var buf: [4096]u8 = undefined;

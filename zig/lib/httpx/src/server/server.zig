@@ -1030,7 +1030,7 @@ pub const Handler = union(enum) {
             switch (@typeInfo(Instance)) {
                 .pointer => |pointer| {
                     if (pointer.size != .one) @compileError("httpx.Handler.bind requires a single-item pointer");
-                    if (pointer.is_const) @compileError("httpx.Handler.bind currently requires a mutable instance pointer");
+                    if (pointer.attrs.@"const") @compileError("httpx.Handler.bind currently requires a mutable instance pointer");
                 },
                 else => @compileError("httpx.Handler.bind requires an instance pointer"),
             }
@@ -1057,7 +1057,7 @@ pub const Handler = union(enum) {
             switch (@typeInfo(Instance)) {
                 .pointer => |pointer| {
                     if (pointer.size != .one) @compileError("httpx.Handler.wrap requires a single-item pointer");
-                    if (pointer.is_const) @compileError("httpx.Handler.wrap currently requires a mutable instance pointer");
+                    if (pointer.attrs.@"const") @compileError("httpx.Handler.wrap currently requires a mutable instance pointer");
                 },
                 else => @compileError("httpx.Handler.wrap requires an instance pointer"),
             }
@@ -3550,7 +3550,7 @@ test "HTTP/2 oversized body before handler claim writes 413" {
 
     try std.testing.expect(wire.items.len >= 18);
     const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.headers), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
@@ -3563,15 +3563,15 @@ test "HTTP/2 oversized body before handler claim writes 413" {
 
     const data_offset = 9 + headers_len;
     const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.data), wire.items[data_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
     try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
     try std.testing.expectEqualStrings(routeErrorBody(413), wire.items[data_offset + 9 ..][0..data_len]);
 
     const reset_offset = data_offset + 9 + data_len;
     try std.testing.expect(wire.items.len >= reset_offset + 13);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.rst_stream), wire.items[reset_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire.items[reset_offset + 3]);
     try std.testing.expectEqual(
-        @intFromEnum(http.Http2ErrorCode.cancel),
+        @backingInt(http.Http2ErrorCode.cancel),
         std.mem.readInt(u32, wire.items[reset_offset + 9 ..][0..4], .big),
     );
 }
@@ -4023,7 +4023,7 @@ test "H2 body admission exhaustion writes retryable 429 before stream reset" {
 
     try std.testing.expect(wire.items.len >= 18);
     const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.headers), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
     try std.testing.expect(wire.items[4] & H2Connection.FLAG_END_HEADERS != 0);
 
     var client = H2Connection.initClient(allocator, std.testing.io);
@@ -4041,7 +4041,7 @@ test "H2 body admission exhaustion writes retryable 429 before stream reset" {
 
     const data_offset = 9 + headers_len;
     const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.data), wire.items[data_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
     try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
     try std.testing.expectEqualStrings(routeErrorBody(429), wire.items[data_offset + 9 ..][0..data_len]);
     try std.testing.expect(stream.end_stream_sent);
@@ -4238,10 +4238,10 @@ test "H2 request rejection resets an unprocessed stream and unwinds ownership" {
     try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().h2_stream_dispatch_rejections_total);
     try std.testing.expect(h2.stream_manager.getStream(1) == null);
     try std.testing.expectEqual(@as(usize, 13), wire.items.len);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.rst_stream), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire.items[3]);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, wire.items[5..9], .big));
     try std.testing.expectEqual(
-        @as(u32, @intFromEnum(http.Http2ErrorCode.refused_stream)),
+        @as(u32, @backingInt(http.Http2ErrorCode.refused_stream)),
         std.mem.readInt(u32, wire.items[9..13], .big),
     );
 }
@@ -4254,9 +4254,9 @@ test "h2c applyPeerSettings propagates INITIAL_WINDOW_SIZE and HPACK table size"
 
     // Build a SETTINGS payload: INITIAL_WINDOW_SIZE=32768, HEADER_TABLE_SIZE=2048.
     var settings_payload: [12]u8 = undefined;
-    std.mem.writeInt(u16, settings_payload[0..2], @intFromEnum(http.Http2SettingId.initial_window_size), .big);
+    std.mem.writeInt(u16, settings_payload[0..2], @backingInt(http.Http2SettingId.initial_window_size), .big);
     std.mem.writeInt(u32, settings_payload[2..6], 32768, .big);
-    std.mem.writeInt(u16, settings_payload[6..8], @intFromEnum(http.Http2SettingId.header_table_size), .big);
+    std.mem.writeInt(u16, settings_payload[6..8], @backingInt(http.Http2SettingId.header_table_size), .big);
     std.mem.writeInt(u32, settings_payload[8..12], 2048, .big);
 
     // Base64url encode (what the HTTP2-Settings header carries).
@@ -5378,7 +5378,7 @@ test "stream writer preserves small SSE write density and supports oversized eve
 
     capture.bytes.clearRetainingCapacity();
     capture.writes = 0;
-    const large = [_]u8{'x'} ** 9000;
+    const large = @as([9000]u8, @splat('x'));
     try Context.StreamWriter.writeEventTo(&capture, "message", &large);
     try std.testing.expect(capture.writes > 1);
     try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: message\ndata: "));
@@ -5405,7 +5405,7 @@ test "H1 chunked frames coalesce into one write and keep wire format for oversiz
 
     capture.bytes.clearRetainingCapacity();
     capture.writes = 0;
-    const large = [_]u8{'x'} ** 9000;
+    const large = @as([9000]u8, @splat('x'));
     try Context.StreamWriter.writeH1Chunk(&capture, &large);
     try std.testing.expectEqual(@as(usize, 3), capture.writes);
     try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "2328\r\n"));

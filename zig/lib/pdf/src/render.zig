@@ -1070,7 +1070,7 @@ fn softMaskPixel(rgba: []const u8, index: usize, luminosity: bool) u8 {
 }
 
 test "image-backed luminosity soft mask samples normalized coverage" {
-    var image_rgba = [_]u8{ 0, 0, 0, 255 } ** 2;
+    var image_rgba = [_]u8{ 0, 0, 0, 255, 0, 0, 0, 255 };
     var mask = [_]u8{ 0, 0, 0, 255, 255, 255, 255, 255 };
     const run = reader.ImageRun{
         .rgba = &image_rgba,
@@ -2697,7 +2697,7 @@ fn replaceCanvasWhereChangedRectCancelable(canvas: []u8, next: []const u8, backd
 }
 
 test "knockout dirty replacement never scans or mutates outside its bounds" {
-    var backdrop = [_]u8{0} ** (4 * 4 * 4);
+    var backdrop = @as([(4 * 4 * 4)]u8, @splat(0));
     var canvas = backdrop;
     var next = backdrop;
     next[0] = 99;
@@ -2838,7 +2838,7 @@ test "blend pixel mode screen combines source and backdrop" {
 }
 
 test "blend modes preserve source color over a transparent backdrop" {
-    var canvas = [_]u8{0} ** 4;
+    var canvas = @as([4]u8, @splat(0));
     blendPixelMode(&canvas, 0, .{ 0x30, 0x60, 0x90, 0x80 }, .multiply);
     try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x60, 0x90, 0x80 }, &canvas);
 }
@@ -2885,7 +2885,7 @@ test "non-isolated group boundary removes backdrop before applying alpha" {
 
 test "non-isolated coverage rendering consumes the shared bilevel budget" {
     const alloc = std.testing.allocator;
-    var pixels = [_]u8{0} ** (8 * 4);
+    var pixels = @as([8 * 4]u8, @splat(0));
     for (0..8) |index| {
         pixels[index * 4] = 0xff;
         pixels[index * 4 + 3] = if (index == 0 or index == 2 or index == 5 or index == 7) 0xff else 0;
@@ -2910,7 +2910,7 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
         .draw_width = 1,
         .draw_height = 1,
     }};
-    var reference = [_]u8{0} ** 4;
+    var reference = @as([4]u8, @splat(0));
     var reference_budget = BilevelSampleBudget{ .remaining_samples = 4 };
     try drawImageRunCancelable(&reference, 1, 1, 0, 0, 1, images[0], .{}, &reference_budget);
     var expected = [_]u8{ 0, 0, 0xff, 0xff };
@@ -3502,7 +3502,7 @@ test "fallback text raster observes cancellation" {
             return true;
         }
     };
-    var canvas = [_]u8{0xff} ** (32 * 32 * 4);
+    var canvas = @as([(32 * 32 * 4)]u8, @splat(0xff));
     try std.testing.expectError(error.Canceled, drawTextRunCancelable(
         &canvas,
         32,
@@ -3522,8 +3522,8 @@ test "group canvas operations observe cancellation" {
         }
     };
     const cancellation: reader.CancellationProbe = .{ .is_cancelled_fn = Cancelled.check };
-    var canvas = [_]u8{0xff} ** (4 * 4 * 4);
-    var next = [_]u8{0} ** (4 * 4 * 4);
+    var canvas = @as([(4 * 4 * 4)]u8, @splat(0xff));
+    var next = @as([(4 * 4 * 4)]u8, @splat(0));
     try std.testing.expectError(error.Canceled, compositeGroupCanvasCancelable(&canvas, &next, cancellation));
     try std.testing.expectError(error.Canceled, copyCanvasCancelable(&canvas, &next, 4, 4, cancellation));
     try std.testing.expectError(error.Canceled, copyCanvasRectCancelable(&canvas, &next, 4, PixelRect.full(4, 4), cancellation));
@@ -3998,11 +3998,11 @@ test "image minification honors explicit interpolation policy" {
         .draw_height = 1,
     };
 
-    var nearest = [_]u8{0xff} ** 4;
+    var nearest = @as([4]u8, @splat(0xff));
     drawImageRun(&nearest, 1, 1, 0, 0, 1, base);
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, &nearest);
 
-    var filtered = [_]u8{0xff} ** 4;
+    var filtered = @as([4]u8, @splat(0xff));
     var interpolated = base;
     interpolated.interpolate = true;
     drawImageRun(&filtered, 1, 1, 0, 0, 1, interpolated);
@@ -4030,7 +4030,7 @@ test "image mask stencil paints decoded coverage with its occurrence color" {
         .draw_height = 1,
     };
 
-    var canvas = [_]u8{0xff} ** 4;
+    var canvas = @as([4]u8, @splat(0xff));
     drawImageRun(&canvas, 1, 1, 0, 0, 1, run);
     try std.testing.expectEqualSlices(u8, &.{ 51, 102, 153, 255 }, &canvas);
 }
@@ -4057,11 +4057,11 @@ test "OCR bilevel minification preserves source ink coverage" {
         .draw_height = 1,
     };
 
-    var exact_canvas = [_]u8{0xff} ** 4;
+    var exact_canvas = @as([4]u8, @splat(0xff));
     drawImageRun(&exact_canvas, 1, 1, 0, 0, 1, exact);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &exact_canvas);
 
-    var ocr_canvas = [_]u8{0xff} ** 4;
+    var ocr_canvas = @as([4]u8, @splat(0xff));
     var ocr = exact;
     ocr.ocr_coverage_minify = true;
     drawImageRun(&ocr_canvas, 1, 1, 0, 0, 1, ocr);
@@ -4081,7 +4081,7 @@ test "OCR pattern stencil minification preserves sparse mask coverage" {
         .closed = true,
         .points = &tile_points,
     }};
-    var mask_rgba = [_]u8{0} ** (8 * 4);
+    var mask_rgba = @as([8 * 4]u8, @splat(0));
     mask_rgba[0..4].* = .{ 0xff, 0xff, 0xff, 0xff };
     const run: reader.PatternRun = .{
         .kind = .fill,
@@ -4109,7 +4109,7 @@ test "OCR pattern stencil minification preserves sparse mask coverage" {
         .tile_shape_runs = &tile_shapes,
     };
 
-    var canvas = [_]u8{0xff} ** 4;
+    var canvas = @as([4]u8, @splat(0xff));
     try drawPatternRun(alloc, &canvas, 1, 1, 0, 1, run);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[0]);
     try std.testing.expect(canvas[1] >= 222 and canvas[1] <= 224);
@@ -4118,7 +4118,7 @@ test "OCR pattern stencil minification preserves sparse mask coverage" {
 }
 
 test "OCR bilevel area filter retains thin rules beyond four-to-one minification" {
-    var rgba = [_]u8{0xff} ** (8 * 4);
+    var rgba = @as([(8 * 4)]u8, @splat(0xff));
     rgba[0] = 0;
     rgba[1] = 0;
     rgba[2] = 0;
@@ -4140,7 +4140,7 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
         .draw_height = 1,
     };
 
-    var canvas = [_]u8{0xff} ** 4;
+    var canvas = @as([4]u8, @splat(0xff));
     drawImageRun(&canvas, 1, 1, 0, 0, 1, run);
     try std.testing.expect(canvas[0] >= 222 and canvas[0] <= 224);
     try std.testing.expectEqual(canvas[0], canvas[1]);
@@ -4149,7 +4149,7 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
 }
 
 test "OCR bilevel exact integration uses cached full-source summary when unaffordable" {
-    var rgba = [_]u8{0xff} ** (1024 * 4);
+    var rgba = @as([(1024 * 4)]u8, @splat(0xff));
     rgba[511 * 4] = 0;
     rgba[511 * 4 + 1] = 0;
     rgba[511 * 4 + 2] = 0;
@@ -4235,7 +4235,7 @@ test "legacy shape raster path observes cancellation" {
             return true;
         }
     };
-    var canvas = [_]u8{0xff} ** (32 * 32 * 4);
+    var canvas = @as([(32 * 32 * 4)]u8, @splat(0xff));
     const points = [_][2]f64{ .{ 1, 1 }, .{ 31, 31 } };
     try std.testing.expectError(error.Canceled, drawShapeRunAllocCancelable(
         std.testing.allocator,

@@ -101,9 +101,9 @@ pub const Config = struct {
     fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
         const config = value orelse return .{};
         var limits: graph_work_budget.Limits = .{};
-        inline for (std.meta.fields(graph_work_budget.Limits)) |field| {
-            if (@field(config, field.name)) |configured| {
-                @field(limits, field.name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
+        inline for (@typeInfo(graph_work_budget.Limits).@"struct".field_names) |field_name| {
+            if (@field(config, field_name)) |configured| {
+                @field(limits, field_name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
             }
         }
         try limits.validate();
@@ -1113,9 +1113,10 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
 fn deploymentModeFromObject(root: std.json.ObjectMap, expected: ?DeploymentMode) !DeploymentMode {
     if (root.get("deployment_mode")) |value| {
         if (value != .string) return error.InvalidConfig;
-        inline for (std.meta.fields(DeploymentMode)) |field| {
-            if (std.mem.eql(u8, value.string, field.name)) {
-                const configured: DeploymentMode = @enumFromInt(field.value);
+        const info = @typeInfo(DeploymentMode).@"enum";
+        inline for (info.field_names, info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, value.string, field_name)) {
+                const configured: DeploymentMode = @fromBackingInt(@intCast(field_value));
                 if (expected) |required| if (configured != required) return error.DeploymentModeMismatch;
                 return configured;
             }

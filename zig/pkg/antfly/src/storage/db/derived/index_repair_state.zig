@@ -750,9 +750,9 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u128, intent.replica_id);
         try appendInt(alloc, &out, u64, intent.root_generation);
         try appendString(alloc, &out, intent.index_name, max_index_name_bytes);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.kind));
+        try appendInt(alloc, &out, u8, @backingInt(intent.kind));
         try appendInt(alloc, &out, u64, intent.config_hash);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.trigger));
+        try appendInt(alloc, &out, u8, @backingInt(intent.trigger));
         try appendInt(alloc, &out, u64, intent.operator_job_id);
         try appendInt(alloc, &out, u64, intent.operator_job_created_at_ms);
         try appendOptionalString(alloc, &out, intent.candidate_relative_path, max_candidate_path_bytes);
@@ -769,14 +769,14 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         // process-local reservation cannot survive restart.
         try appendInt(alloc, &out, u64, intent.planned_disk_bytes);
         try appendInt(alloc, &out, u64, intent.target_sequence);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.phase));
+        try appendInt(alloc, &out, u8, @backingInt(intent.phase));
         try appendInt(alloc, &out, u32, intent.attempt_count);
         try appendInt(alloc, &out, u32, intent.failure_streak);
         try appendInt(alloc, &out, u64, intent.next_retry_at_ms);
         try appendInt(alloc, &out, u64, intent.started_at_ms);
         try appendInt(alloc, &out, u64, intent.updated_at_ms);
         try appendInt(alloc, &out, u64, intent.owner_epoch);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.automation));
+        try appendInt(alloc, &out, u8, @backingInt(intent.automation));
         try appendOptionalString(alloc, &out, intent.last_error, max_error_bytes);
         try appendInt(alloc, &out, u8, if (entry.pin != null) 1 else 0);
         if (entry.pin) |pin| {
@@ -910,8 +910,8 @@ fn readInt(raw: []const u8, pos: *usize, comptime T: type) !T {
 
 fn readEnum(comptime T: type, raw: []const u8, pos: *usize) !T {
     const value = try readInt(raw, pos, u8);
-    inline for (@typeInfo(T).@"enum".fields) |field| {
-        if (field.value == value) return @enumFromInt(value);
+    inline for (@typeInfo(T).@"enum".field_values) |field_value| {
+        if (field_value == value) return @fromBackingInt(@intCast(value));
     }
     return error.InvalidIndexRepairState;
 }

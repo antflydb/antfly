@@ -13,6 +13,14 @@
 // limitations under the License.
 
 const std = @import("std");
+
+fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
+    var repeated: [bytes.len * count]u8 = undefined;
+    for (0..count) |i| {
+        @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return repeated;
+}
 const syntax = @import("syntax.zig");
 const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
@@ -346,9 +354,9 @@ const CodeSpaceRange = struct {
 const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
-    differences: [256]?[]u8 = [_]?[]u8{null} ** 256,
-    difference_codepoints: [256]?u21 = [_]?u21{null} ** 256,
-    difference_defined: [256]bool = [_]bool{false} ** 256,
+    differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
+    difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
+    difference_defined: [256]bool = @as([256]bool, @splat(false)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
@@ -1096,8 +1104,8 @@ pub const PageRenderDiagnostics = struct {
     vector_text_runs: u32 = 0,
     fallback_text_runs: u32 = 0,
     first_fallback_reason: ?TextFallbackReason = null,
-    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".fields.len]u32 =
-        [_]u32{0} ** @typeInfo(TextFallbackReason).@"enum".fields.len,
+    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".field_names.len]u32 =
+        @as([@typeInfo(TextFallbackReason).@"enum".field_names.len]u32, @splat(0)),
     text_materialization_bytes: u64 = 0,
     peak_operator_materialization_bytes: u64 = 0,
     remaining_edge_tests: u64 = 0,
@@ -1113,7 +1121,7 @@ pub const PageRenderDiagnostics = struct {
     fn recordFallback(self: *PageRenderDiagnostics, reason: TextFallbackReason, run_count: usize) void {
         self.fallback_text_groups +|= 1;
         self.fallback_text_runs +|= @intCast(@min(run_count, std.math.maxInt(u32)));
-        self.fallback_reason_counts[@intFromEnum(reason)] +|= 1;
+        self.fallback_reason_counts[@backingInt(reason)] +|= 1;
         if (self.first_fallback_reason == null) self.first_fallback_reason = reason;
     }
 };
@@ -1368,11 +1376,11 @@ pub const ShadingRun = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
-    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
     color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
     exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
@@ -1983,7 +1991,7 @@ const ImageSampleDecode = struct {
     default_decode: ?[4]ColorComponentRange = null,
     clamp_count: u8 = 0,
     clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
-        [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
+        @as([max_image_color_space_decode_depth][4]ColorComponentRange, @splat(.{ .{}, .{}, .{}, .{} })),
 
     fn encodedValue(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
         const unit = @as(f64, @floatFromInt(sample)) / 255.0;
@@ -2651,11 +2659,11 @@ const PageShading = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
-    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
     color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
     exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
@@ -3915,7 +3923,7 @@ pub const Reader = struct {
         if (revision >= 3) {
             for (0..50) |_| digest = std.crypto.hash.Md5.hashResult(digest[0..file_key_len]);
         }
-        var file_key = [_]u8{0} ** 16;
+        var file_key = @as([16]u8, @splat(0));
         @memcpy(file_key[0..file_key_len], digest[0..file_key_len]);
 
         const user_key = switch ((encrypt.get("U") orelse return error.UnsupportedPdfEncryption).*) {
@@ -7970,8 +7978,8 @@ pub const Reader = struct {
         }
         var discontinuities: [shading_discontinuity_capacity]f64 = undefined;
         var discontinuity_count: usize = 0;
-        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity;
-        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity;
+        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @splat(.{ 0, 0, 0, 0xff });
+        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0);
         var exact_boundary_count: usize = 0;
         try function.appendDiscontinuities(
             &discontinuities,
@@ -8019,8 +8027,8 @@ pub const Reader = struct {
                 sample_points[insert] = sample_points[insert - 1];
             sample_points[insert] = value;
         }
-        var color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity;
-        var color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity;
+        var color_samples: [shading_color_sample_capacity][4]u8 = @splat(.{ 0, 0, 0, 0xff });
+        var color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0);
         for (sample_points[0..sample_count], 0..) |sample, sample_index| {
             var values = [4]f64{ 0, 0, 0, 0 };
             // Clamp explicitly here as well so custom evaluator additions
@@ -10853,7 +10861,7 @@ pub const Reader = struct {
         defer resolved_charprocs.deinit(self.alloc);
         if (resolved_charprocs != .dict) return font;
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
         var resolved_differences: ?syntax.Object = null;
@@ -11162,7 +11170,7 @@ pub const Reader = struct {
             }
         } else {
             var base_encoding = SimpleCffBaseEncoding.embedded;
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
             var resolved_differences: ?syntax.Object = null;
@@ -11637,7 +11645,7 @@ pub const Reader = struct {
         }
         try self.checkCancellation();
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var base_encoding = text_encoding.NamedEncoding.standard;
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
@@ -19272,7 +19280,7 @@ test "content parsing and pixel conversion observe cancellation" {
     defer shapes.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.Canceled,
-        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, "0 " ** 300 ++ "m", &.{}, &.{}, content_cancellation),
+        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, repeatBytesComptime("0 ", 300) ++ "m", &.{}, &.{}, content_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), content_cancel.checks);
 
@@ -19284,7 +19292,7 @@ test "content parsing and pixel conversion observe cancellation" {
     var rgba: [4097 * 4]u8 = undefined;
     try std.testing.expectError(
         error.Canceled,
-        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &([_]u8{0} ** 4097), "DeviceGray", null, pixel_cancellation),
+        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &(@as([4097]u8, @splat(0))), "DeviceGray", null, pixel_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), pixel_cancel.checks);
 }
@@ -20411,7 +20419,7 @@ test "unfiltered terminal read decrypts AES lazily within working limits" {
     const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
     var encrypted: [32]u8 = undefined;
     encrypted[0..16].* = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
-    var padded = [_]u8{13} ** 16;
+    var padded = @as([16]u8, @splat(13));
     @memcpy(padded[0..3], "abc");
     for (&padded, encrypted[0..16]) |*value, iv| value.* ^= iv;
     const aes = std.crypto.core.aes.Aes128.initEnc(key.bytes);
@@ -21362,7 +21370,7 @@ test "Type1 and Type3 spacing follows horizontal scaling in measurement and geom
 
 test "simple TrueType PDF widths fall back to MissingWidth" {
     const alloc = std.testing.allocator;
-    var widths = [_]f64{-1} ** 256;
+    var widths = @as([256]f64, @splat(-1));
     widths['A'] = 600;
     try std.testing.expectEqual(@as(?f64, 600), simpleTrueTypePdfWidth(&widths, 375, 'A'));
     try std.testing.expectEqual(@as(?f64, 375), simpleTrueTypePdfWidth(&widths, 375, 'B'));
@@ -24718,7 +24726,7 @@ test "Indexed palette stream decode reserves retained image working set" {
 
 test "Indexed palette stream metadata is bounded before payload decode" {
     const alloc = std.testing.allocator;
-    const oversized_header_value = "x" ** 4096;
+    const oversized_header_value = @as([4096]u8, @splat('x'));
     const palette_object = try std.fmt.allocPrint(
         alloc,
         "3 0 obj\n<< /Length 3 /Unused ({s}) >>\nstream\nabc\nendstream\nendobj\n",
@@ -24771,7 +24779,7 @@ test "Indexed indirect lookup strings resolve within the aggregate working set" 
     defer palette.deinit(alloc);
     try std.testing.expectEqualStrings("abc", palette.lookup);
 
-    const oversized_lookup = "a" ** 128;
+    const oversized_lookup = @as([128]u8, @splat('a'));
     const oversized_object = try std.fmt.allocPrint(
         alloc,
         "3 0 obj\n({s})\nendobj\n",
@@ -25201,7 +25209,7 @@ test "JBIG2 coverage reduction polling scales with total sampled work" {
         }
     };
 
-    const encoded = [_]u8{0} ** (64 * 64 / 8);
+    const encoded = @as([(64 * 64 / 8)]u8, @splat(0));
     var probe_state = ProbeState{};
     const reduced = try reduceJbig2CoverageAlloc(
         std.testing.allocator,
@@ -25622,7 +25630,7 @@ test "resampled soft mask alpha updates multiple pixels" {
 }
 
 test "interpolated soft mask uses pixel-center bilinear sampling" {
-    var rgba = [_]u8{ 0, 0, 0, 255 } ** 3;
+    var rgba = [_]u8{ 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255 };
     const smask = [_]u8{
         0,   0,   0,   255,
         255, 255, 255, 255,
@@ -25717,7 +25725,7 @@ test "JP2 matrix ICC gray profile converts through PCS" {
             u32be(bytes, offset, @bitCast(signed));
         }
     };
-    var profile = [_]u8{0} ** 190;
+    var profile = @as([190]u8, @splat(0));
     Write.u32be(&profile, 0, profile.len);
     @memcpy(profile[16..20], "GRAY");
     @memcpy(profile[20..24], "XYZ ");
@@ -28047,7 +28055,7 @@ test "type1 RD parsers advance across slash and binary delimiters" {
     try std.testing.expectEqual(@as(usize, 1), subrs.len);
     try std.testing.expectEqualStrings("abc", subrs[0]);
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 375);
     defer {
@@ -28068,7 +28076,7 @@ test "type1 RD parser accepts compact charstrings without dup" {
         "/B 3 RD abc ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "B";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
@@ -28090,7 +28098,7 @@ test "type1 aliases share programs and only seac-reachable helpers survive" {
         "/unreachable 3 RD def ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "A";
     code_to_name[194] = "different";
@@ -28361,7 +28369,7 @@ test "dense low complexity Type1 text remains native within measured budget" {
         .decoder = .{},
         .type1 = .{ .glyphs = &glyphs },
     }};
-    var text = [_]u8{'A'} ** 32;
+    var text = @as([32]u8, @splat('A'));
     var run = TextRun{
         .text = &text,
         .raw_text = &text,
@@ -29140,7 +29148,7 @@ test "type1 font parsing is allocation-failure safe" {
                 if (subrs.len > 0) alloc.free(subrs);
             }
 
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             code_to_name['A'] = "A";
             code_to_name[194] = "different";
             const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);

@@ -518,7 +518,7 @@ pub fn resolveArtifactPaths(allocator: std.mem.Allocator, model_input: []const u
     const encoder_config_path = try std.fs.path.join(allocator, &.{ model_dir, encoder_config_file_name });
     errdefer allocator.free(encoder_config_path);
     const root_config_path = try std.fs.path.join(allocator, &.{ model_dir, config_file_name });
-    const config_path = if (isRegularFilePath(root_config_path)) root_config_path else if (isRegularFilePath(encoder_config_path)) blk: {
+    const config_path = if (isRegularFilePath(compat.testingIo(), root_config_path)) root_config_path else if (isRegularFilePath(compat.testingIo(), encoder_config_path)) blk: {
         allocator.free(root_config_path);
         break :blk try allocator.dupe(u8, encoder_config_path);
     } else {
@@ -527,8 +527,8 @@ pub fn resolveArtifactPaths(allocator: std.mem.Allocator, model_input: []const u
     };
     errdefer allocator.free(config_path);
 
-    if (!isRegularFilePath(checkpoint_path)) return error.MissingModelCheckpoint;
-    if (!isRegularFilePath(encoder_config_path)) return error.MissingEncoderConfig;
+    if (!isRegularFilePath(compat.testingIo(), checkpoint_path)) return error.MissingModelCheckpoint;
+    if (!isRegularFilePath(compat.testingIo(), encoder_config_path)) return error.MissingEncoderConfig;
 
     return .{
         .allocator = allocator,
@@ -546,7 +546,7 @@ pub fn loadBackboneConfig(allocator: std.mem.Allocator, model_input: []const u8)
 }
 
 pub fn resolveLoRACheckpointPath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    if (isRegularFilePath(input)) return try allocator.dupe(u8, input);
+    if (isRegularFilePath(compat.testingIo(), input)) return try allocator.dupe(u8, input);
     const candidates = [_][]const u8{
         "lora_weights.safetensors",
         adapter_checkpoint_file_name,
@@ -554,7 +554,7 @@ pub fn resolveLoRACheckpointPath(allocator: std.mem.Allocator, input: []const u8
     for (candidates) |name| {
         const path = try std.fs.path.join(allocator, &.{ input, name });
         defer allocator.free(path);
-        if (isRegularFilePath(path)) return try allocator.dupe(u8, path);
+        if (isRegularFilePath(compat.testingIo(), path)) return try allocator.dupe(u8, path);
     }
     return error.MissingLoRACheckpoint;
 }
@@ -676,7 +676,7 @@ pub fn bootstrapLoRABundle(
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -831,9 +831,9 @@ pub fn inspectLoRABundle(
         .task_head_passthrough_tensors = task_head_passthrough_tensors,
         .span_rep_passthrough_tensors = span_rep_passthrough_tensors,
         .count_embed_passthrough_tensors = count_embed_passthrough_tensors,
-        .boundary_head_present = isRegularFilePath(boundary_head_path),
-        .boundary_task_head_present = isRegularFilePath(boundary_task_head_path),
-        .cleanup_head_present = isRegularFilePath(cleanup_head_path),
+        .boundary_head_present = isRegularFilePath(compat.testingIo(), boundary_head_path),
+        .boundary_task_head_present = isRegularFilePath(compat.testingIo(), boundary_task_head_path),
+        .cleanup_head_present = isRegularFilePath(compat.testingIo(), cleanup_head_path),
         .use_dora = adapter_config.use_dora,
         .tensors = try tensors.toOwnedSlice(allocator),
     };
@@ -968,7 +968,7 @@ pub fn loadLoRABundle(
 
 pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
     const allocator = bundle.allocator;
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -1043,14 +1043,14 @@ pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !voi
         bundle.target_modules,
         bundleHasDoRA(bundle),
     );
-    try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, config_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, encoder_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.adapter_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.adapter_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.adapter_model_dir, out_dir, special_tokens_map_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.base_model_dir, out_dir, config_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.base_model_dir, out_dir, encoder_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.adapter_model_dir, out_dir, tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.adapter_model_dir, out_dir, tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.adapter_model_dir, out_dir, special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.base_model_dir, out_dir, tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.base_model_dir, out_dir, tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, compat.testingIo(), bundle.base_model_dir, out_dir, special_tokens_map_file_name);
 }
 
 pub fn exportAutodiffAdaptersAsPeftBundle(
@@ -1064,7 +1064,7 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
     params: []const AutodiffAdapterParam,
 ) !AutodiffAdapterExportSummary {
     try validateLoRADropout(dropout);
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -1136,7 +1136,7 @@ pub fn exportAutodiffRegularParamsAsSafetensors(
     out_dir: []const u8,
     params: []const AutodiffAdapterParam,
 ) !AutodiffRegularParamExportSummary {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
     errdefer allocator.free(checkpoint_path);
 
@@ -1198,14 +1198,15 @@ pub fn loadClassifierTaskHead(
 
 pub fn materializeMergedModel(
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_model_dir: []const u8,
     adapter_model_dir: []const u8,
     out_dir: []const u8,
 ) !MaterializeSummary {
-    if (pathExists(out_dir)) return error.OutputDirectoryAlreadyExists;
+    if (pathExists(io, out_dir)) return error.OutputDirectoryAlreadyExists;
     const staging_dir = try materializationStagingPath(allocator, out_dir);
     defer allocator.free(staging_dir);
-    if (pathExists(staging_dir)) return error.MaterializationStagingDirectoryExists;
+    if (pathExists(io, staging_dir)) return error.MaterializationStagingDirectoryExists;
 
     var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
     defer bundle.deinit();
@@ -1263,28 +1264,28 @@ pub fn materializeMergedModel(
     }
     const attached_task_head_tensor_count = try attachTaskHeadCheckpointIfPresent(allocator, adapter_model_dir, &merged);
 
-    try compat.cwd().createDirPath(compat.io(), staging_dir);
+    try std.Io.Dir.cwd().createDirPath(io, staging_dir);
     var staging_published = false;
-    defer if (!staging_published) compat.cwd().deleteTree(compat.io(), staging_dir) catch {};
+    defer if (!staging_published) std.Io.Dir.cwd().deleteTree(io, staging_dir) catch {};
 
     const staged_checkpoint_path = try std.fs.path.join(allocator, &.{ staging_dir, checkpoint_file_name });
     defer allocator.free(staged_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staged_checkpoint_path, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_checkpoint_path, .data = bytes });
 
     const inventory = MaterializationInventory{
-        .config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, config_file_name, true),
-        .encoder_config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, encoder_config_file_name, true),
-        .tokenizer = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_file_name, true),
-        .tokenizer_config = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_config_file_name, true),
-        .special_tokens_map = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, special_tokens_map_file_name, true),
-        .added_tokens = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, added_tokens_file_name, true),
-        .sentencepiece_model = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, sentencepiece_model_file_name, false),
+        .config = try copySupportingArtifactFromPreferredSource(allocator, io, base_model_dir, null, staging_dir, config_file_name, true),
+        .encoder_config = try copySupportingArtifactFromPreferredSource(allocator, io, base_model_dir, null, staging_dir, encoder_config_file_name, true),
+        .tokenizer = try copySupportingArtifactFromPreferredSource(allocator, io, adapter_model_dir, base_model_dir, staging_dir, tokenizer_file_name, true),
+        .tokenizer_config = try copySupportingArtifactFromPreferredSource(allocator, io, adapter_model_dir, base_model_dir, staging_dir, tokenizer_config_file_name, true),
+        .special_tokens_map = try copySupportingArtifactFromPreferredSource(allocator, io, adapter_model_dir, base_model_dir, staging_dir, special_tokens_map_file_name, true),
+        .added_tokens = try copySupportingArtifactFromPreferredSource(allocator, io, adapter_model_dir, base_model_dir, staging_dir, added_tokens_file_name, true),
+        .sentencepiece_model = try copySupportingArtifactFromPreferredSource(allocator, io, adapter_model_dir, base_model_dir, staging_dir, sentencepiece_model_file_name, false),
     };
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_task_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, entity_cleanup_model.head_file_name);
+    try copySupportingArtifactIfPresent(allocator, io, adapter_model_dir, staging_dir, gliner2_boundary.boundary_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, io, adapter_model_dir, staging_dir, gliner2_boundary.boundary_task_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, io, adapter_model_dir, staging_dir, entity_cleanup_model.head_file_name);
 
     var span_rep_passthrough_tensor_count: usize = 0;
     var count_embed_passthrough_tensor_count: usize = 0;
@@ -1295,17 +1296,17 @@ pub fn materializeMergedModel(
     const copied_boundary_head = blk: {
         const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_head_file_name });
         defer allocator.free(path);
-        break :blk isRegularFilePath(path);
+        break :blk isRegularFilePath(io, path);
     };
     const copied_boundary_task_head = blk: {
         const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_task_head_file_name });
         defer allocator.free(path);
-        break :blk isRegularFilePath(path);
+        break :blk isRegularFilePath(io, path);
     };
     const copied_cleanup_head = blk: {
         const path = try std.fs.path.join(allocator, &.{ staging_dir, entity_cleanup_model.head_file_name });
         defer allocator.free(path);
-        break :blk isRegularFilePath(path);
+        break :blk isRegularFilePath(io, path);
     };
 
     var reloaded = try inspectCheckpoint(allocator, staging_dir, null);
@@ -1340,10 +1341,10 @@ pub fn materializeMergedModel(
         .copied_base_tensor_count = base_names.len - bundle.layers.len,
     };
 
-    try syncMaterializationFiles(allocator, staging_dir);
+    try syncMaterializationFiles(allocator, io, staging_dir);
     const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, materialization_manifest_file_name });
     defer allocator.free(manifest_path);
-    try writeSyncedJsonFile(allocator, manifest_path, MaterializationManifest{
+    try writeSyncedJsonFile(allocator, io, manifest_path, MaterializationManifest{
         .artifact_family_version = artifact_family_version,
         .base_model_dir = base_model_dir,
         .adapter_model_dir = adapter_model_dir,
@@ -1356,10 +1357,10 @@ pub fn materializeMergedModel(
         .copied_cleanup_head = summary.copied_cleanup_head,
         .supporting_artifacts = inventory,
     });
-    try syncDirectoryPath(staging_dir);
-    try std.Io.Dir.rename(compat.cwd(), staging_dir, compat.cwd(), out_dir, compat.io());
+    try syncDirectoryPath(io, staging_dir);
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), staging_dir, std.Io.Dir.cwd(), out_dir, io);
     staging_published = true;
-    try syncDirectoryPath(std.fs.path.dirname(out_dir) orelse ".");
+    try syncDirectoryPath(io, std.fs.path.dirname(out_dir) orelse ".");
     return summary;
 }
 
@@ -1687,22 +1688,22 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
-    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    var file = try compat.cwd().createFile(compat.io(), tmp_path, .{ .truncate = true });
+    std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), tmp_path, .{ .truncate = true });
     var closed = false;
-    errdefer if (!closed) file.close(compat.io());
+    errdefer if (!closed) file.close(compat.testingIo());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
-        try file.writeStreamingAll(compat.io(), std.mem.sliceAsBytes(tensor.data));
+        try file.writeStreamingAll(compat.testingIo(), std.mem.sliceAsBytes(tensor.data));
     }
-    file.close(compat.io());
+    file.close(compat.testingIo());
     closed = true;
-    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), path, compat.io());
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, compat.testingIo());
 }
 
 fn buildDeterministicLoraA(allocator: std.mem.Allocator, rows: usize, cols: usize) ![]f32 {
@@ -1793,10 +1794,10 @@ fn writeAdapterConfigJson(
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
-    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tmp_path, .data = data });
-    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), path, compat.io());
+    std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_path) catch {};
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tmp_path, .data = data });
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, compat.testingIo());
 }
 
 fn bundleHasDoRA(bundle: *const LoadedLoRABundle) bool {
@@ -1828,7 +1829,7 @@ fn inspectAdapterConfig(allocator: std.mem.Allocator, input: []const u8) !Adapte
         try allocator.dupe(u8, std.fs.path.dirname(input) orelse ".");
     errdefer allocator.free(model_dir);
 
-    const adapter_checkpoint_path = if (isRegularFilePath(input))
+    const adapter_checkpoint_path = if (isRegularFilePath(compat.testingIo(), input))
         try allocator.dupe(u8, input)
     else
         try resolveLoRACheckpointPath(allocator, input);
@@ -1958,7 +1959,7 @@ fn jsonObjectBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
 fn optionalPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(allocator, &.{ dir_path, basename });
     errdefer allocator.free(path);
-    compat.cwd().access(compat.io(), path, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch {
         allocator.free(path);
         return null;
     };
@@ -2066,6 +2067,7 @@ fn attachTaskHeadCheckpointIfPresent(
 
 fn copySupportingArtifactIfPresent(
     allocator: std.mem.Allocator,
+    io: std.Io,
     source_dir: []const u8,
     out_dir: []const u8,
     file_name: []const u8,
@@ -2078,12 +2080,13 @@ fn copySupportingArtifactIfPresent(
     const dst = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst);
     const parent = std.fs.path.dirname(dst);
-    if (parent) |dir_path| try compat.cwd().createDirPath(compat.io(), dir_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+    if (parent) |dir_path| try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes });
 }
 
 fn copySupportingArtifactFromPreferredSource(
     allocator: std.mem.Allocator,
+    io: std.Io,
     preferred_source_dir: []const u8,
     fallback_source_dir: ?[]const u8,
     out_dir: []const u8,
@@ -2106,8 +2109,8 @@ fn copySupportingArtifactFromPreferredSource(
     defer allocator.free(bytes);
     const dst = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst);
-    if (std.fs.path.dirname(dst)) |parent| try compat.cwd().createDirPath(compat.io(), parent);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+    if (std.fs.path.dirname(dst)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes });
     return true;
 }
 
@@ -2121,8 +2124,8 @@ fn materializationStagingPath(allocator: std.mem.Allocator, out_dir: []const u8)
     return std.fs.path.join(allocator, &.{ std.fs.path.dirname(out_dir) orelse ".", staging_name });
 }
 
-fn pathExists(path: []const u8) bool {
-    _ = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
+fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,
         else => return true,
     };
@@ -2132,9 +2135,9 @@ fn pathExists(path: []const u8) bool {
 fn inspectionArtifactFamilyVersion(allocator: std.mem.Allocator, model_dir: []const u8) ![]const u8 {
     const manifest_path = try std.fs.path.join(allocator, &.{ model_dir, materialization_manifest_file_name });
     defer allocator.free(manifest_path);
-    if (!isRegularFilePath(manifest_path)) return allocator.dupe(u8, artifact_family_version);
+    if (!isRegularFilePath(compat.testingIo(), manifest_path)) return allocator.dupe(u8, artifact_family_version);
 
-    const bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
@@ -2155,7 +2158,7 @@ fn inspectionArtifactFamilyVersion(allocator: std.mem.Allocator, model_dir: []co
     return allocator.dupe(u8, family_value.string);
 }
 
-fn syncMaterializationFiles(allocator: std.mem.Allocator, staging_dir: []const u8) !void {
+fn syncMaterializationFiles(allocator: std.mem.Allocator, io: std.Io, staging_dir: []const u8) !void {
     const file_names = [_][]const u8{
         checkpoint_file_name,
         config_file_name,
@@ -2172,33 +2175,33 @@ fn syncMaterializationFiles(allocator: std.mem.Allocator, staging_dir: []const u
     for (file_names) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ staging_dir, file_name });
         defer allocator.free(path);
-        if (!isRegularFilePath(path)) continue;
-        var file = try compat.cwd().openFile(compat.io(), path, .{});
-        defer file.close(compat.io());
-        try file.sync(compat.io());
+        if (!isRegularFilePath(io, path)) continue;
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        try file.sync(io);
     }
     const encoder_dir = try std.fs.path.join(allocator, &.{ staging_dir, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try syncDirectoryPath(encoder_dir);
-    try syncDirectoryPath(staging_dir);
+    try syncDirectoryPath(io, encoder_dir);
+    try syncDirectoryPath(io, staging_dir);
 }
 
-fn writeSyncedJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
+fn writeSyncedJsonFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, value: anytype) !void {
     const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
-    try file.writeStreamingAll(compat.io(), rendered);
-    try file.sync(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, rendered);
+    try file.sync(io);
 }
 
-fn syncDirectoryPath(path: []const u8) !void {
+fn syncDirectoryPath(io: std.Io, path: []const u8) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
     var dir = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openDirAbsolute(compat.io(), path, .{ .iterate = true })
+        try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
     else
-        try compat.cwd().openDir(compat.io(), path, .{ .iterate = true });
-    defer dir.close(compat.io());
+        try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
     while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
         .SUCCESS => return,
         .INTR => continue,
@@ -2394,12 +2397,12 @@ fn isTaskHeadPassthroughName(name: []const u8) bool {
 }
 
 fn isDirectoryPath(path: []const u8) bool {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return false;
     return stat.kind == .directory;
 }
 
-fn isRegularFilePath(path: []const u8) bool {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return false;
+fn isRegularFilePath(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .file;
 }
 
@@ -2407,23 +2410,23 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_inspect_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, "encoder_config", "config.json" });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_name":"urchade/gliner2","model_type":"gliner2","counting_layer":"count_embed","token_pooling":"first","max_width":12,"count_embed_dim":128,"count_embed_layers":2,"count_embed_heads":4,"count_embed_ffn":256,"max_count_embed":20}
         ,
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data =
         \\{"vocab_size":30522,"hidden_size":128,"num_hidden_layers":2,"num_attention_heads":4,"intermediate_size":256,"max_position_embeddings":512,"type_vocab_size":2,"position_buckets":32,"relative_attention":true,"hidden_dropout_prob":0.1,"attention_probs_dropout_prob":0.1,"layer_norm_eps":1e-7}
@@ -2432,17 +2435,17 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &[_]f32{0} ** (32 * 128) },
-        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &[_]f32{0} ** (8 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &@as([(32 * 128)]f32, @splat(0)) },
+        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &@as([(8 * 128)]f32, @splat(0)) },
     });
 
     var summary = try inspectCheckpoint(allocator, root, null);
@@ -2511,21 +2514,21 @@ test "gliner2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_bootstrap_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, "encoder_config", "config.json" });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_name\":\"urchade/gliner2\",\"model_type\":\"gliner2\",\"counting_layer\":\"count_embed\",\"token_pooling\":\"first\",\"max_width\":12}",
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
@@ -2537,17 +2540,17 @@ test "gliner2 bootstrap and inspect lora bundle" {
     }) |file_name| {
         const tokenizer_artifact_path = try std.fs.path.join(allocator, &.{ root, file_name });
         defer allocator.free(tokenizer_artifact_path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
     }
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "lora" });
@@ -2567,7 +2570,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try saveLoRABundle(&bundle, out_dir);
     const task_head_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
     defer allocator.free(task_head_path);
-    const classifier_weight = [_]f32{0.25} ** (3 * 128);
+    const classifier_weight = @as([(3 * 128)]f32, @splat(0.25));
     const classifier_bias = [_]f32{ 0.5, -0.25, 0.75 };
     try writeHeaderAndTensorsF32(allocator, task_head_path, &.{
         .{ .name = "classifier.weight", .shape = &.{ 3, 128 }, .data = &classifier_weight },
@@ -2589,16 +2592,16 @@ test "gliner2 bootstrap and inspect lora bundle" {
 
     const materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized" });
     defer allocator.free(materialized_dir);
-    var materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
+    var materialize = try materializeMergedModel(allocator, std.testing.io, root, out_dir, materialized_dir);
     defer freeMaterializeSummary(allocator, &materialize);
     try std.testing.expect(materialize.copied_cleanup_head);
     try std.testing.expectEqual(@as(usize, 3), materialize.merged_dora_tensor_count);
     try std.testing.expectEqual(@as(usize, 2), materialize.attached_task_head_tensor_count);
-    try std.testing.expectError(error.OutputDirectoryAlreadyExists, materializeMergedModel(allocator, root, out_dir, materialized_dir));
+    try std.testing.expectError(error.OutputDirectoryAlreadyExists, materializeMergedModel(allocator, std.testing.io, root, out_dir, materialized_dir));
 
     const completion_path = try std.fs.path.join(allocator, &.{ materialized_dir, materialization_manifest_file_name });
     defer allocator.free(completion_path);
-    const completion_bytes = try compat.cwd().readFileAlloc(compat.io(), completion_path, allocator, .limited(64 * 1024));
+    const completion_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), completion_path, allocator, .limited(64 * 1024));
     defer allocator.free(completion_bytes);
     var completion = try std.json.parseFromSlice(std.json.Value, allocator, completion_bytes, .{});
     defer completion.deinit();
@@ -2618,7 +2621,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
         .added_tokens = true,
         .sentencepiece_model = false,
     };
-    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+    try writeSyncedJsonFile(allocator, std.testing.io, completion_path, MaterializationManifest{
         .artifact_family_version = legacy_artifact_family_version,
         .base_model_dir = root,
         .adapter_model_dir = out_dir,
@@ -2635,7 +2638,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     defer freeCheckpointInspection(allocator, &legacy_reload);
     try std.testing.expectEqualStrings(legacy_artifact_family_version, legacy_reload.artifact_family_version);
 
-    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+    try writeSyncedJsonFile(allocator, std.testing.io, completion_path, MaterializationManifest{
         .artifact_family_version = "gliner2_lora/v2",
         .base_model_dir = root,
         .adapter_model_dir = out_dir,
@@ -2670,7 +2673,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try std.testing.expectEqualSlices(f32, adapter_head.weight, materialized_head.weight);
     try std.testing.expectEqualSlices(f32, adapter_head.bias, materialized_head.bias);
 
-    const hidden_rows = [_]f32{0.5} ** (2 * 128);
+    const hidden_rows = @as([(2 * 128)]f32, @splat(0.5));
     const adapter_logits = try adapter_head.scoreRowsAlloc(allocator, &hidden_rows);
     defer allocator.free(adapter_logits);
     const materialized_logits = try materialized_head.scoreRowsAlloc(allocator, &hidden_rows);
@@ -2684,56 +2687,56 @@ test "gliner2 bootstrap and inspect lora bundle" {
     // nor the same-process staging directory behind.
     const added_tokens_path = try std.fs.path.join(allocator, &.{ root, added_tokens_file_name });
     defer allocator.free(added_tokens_path);
-    try compat.cwd().deleteFile(compat.io(), added_tokens_path);
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), added_tokens_path);
     const failed_materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized-missing-inventory" });
     defer allocator.free(failed_materialized_dir);
     const failed_staging_dir = try materializationStagingPath(allocator, failed_materialized_dir);
     defer allocator.free(failed_staging_dir);
     try std.testing.expectError(
         error.RequiredSupportingArtifactMissing,
-        materializeMergedModel(allocator, root, out_dir, failed_materialized_dir),
+        materializeMergedModel(allocator, std.testing.io, root, out_dir, failed_materialized_dir),
     );
-    try std.testing.expect(!pathExists(failed_materialized_dir));
-    try std.testing.expect(!pathExists(failed_staging_dir));
+    try std.testing.expect(!pathExists(std.testing.io, failed_materialized_dir));
+    try std.testing.expect(!pathExists(std.testing.io, failed_staging_dir));
 }
 
 test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_autodiff_export_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, config_file_name });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, encoder_config_file_name });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_name\":\"urchade/gliner2\",\"model_type\":\"gliner2\",\"counting_layer\":\"count_embed\",\"token_pooling\":\"first\",\"max_width\":12}",
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "autodiff_lora" });
     defer allocator.free(out_dir);
-    const a_data = [_]f32{0.01} ** (2 * 128);
-    const b_data = [_]f32{0.02} ** (128 * 2);
+    const a_data = @as([(2 * 128)]f32, @splat(0.01));
+    const b_data = @as([(128 * 2)]f32, @splat(0.02));
     const params = [_]AutodiffAdapterParam{
         .{
             .name = "encoder.layer.0.attention.self.query_proj.weight.lora_A",
@@ -2759,7 +2762,7 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
     defer freeAutodiffAdapterExportSummary(allocator, &exported);
     try std.testing.expectEqual(@as(usize, 2), exported.exported_tensor_count);
 
-    const config_bytes = try compat.cwd().readFileAlloc(compat.io(), exported.adapter_config_path, allocator, .limited(64 * 1024));
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), exported.adapter_config_path, allocator, .limited(64 * 1024));
     defer allocator.free(config_bytes);
     var config = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{});
     defer config.deinit();
@@ -2779,9 +2782,9 @@ test "gliner2 classifier task head reloads and scores golden hidden rows" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_task_head_score_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, task_head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);

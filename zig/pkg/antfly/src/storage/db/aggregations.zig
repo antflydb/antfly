@@ -8659,7 +8659,7 @@ test "significant_terms local background stats use postings without stored index
     defer alloc.free(cwd);
     const path = try std.fs.path.resolve(alloc, &.{ cwd, relative_path });
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -8730,7 +8730,7 @@ test "significant_terms uses the configured field analyzer for foreground and ba
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/configured-analyzer", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();

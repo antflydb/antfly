@@ -138,8 +138,8 @@ fn wrapperBoxAllocator(fallback: Allocator) Allocator {
 
 fn replayHintOrdinalFromSingleMask(mask: u8) ?u8 {
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
-    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
-        if (mask == (@as(u8, 1) << @intCast(field.value))) return @intCast(field.value);
+    inline for (@typeInfo(change_journal_mod.TargetHint).@"enum".field_values) |field_value| {
+        if (mask == (@as(u8, 1) << @intCast(field_value))) return @intCast(field_value);
     }
     return null;
 }

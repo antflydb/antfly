@@ -248,7 +248,7 @@ pub fn freeTableStorageStatuses(alloc: std.mem.Allocator, statuses: []TableStora
 }
 
 fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
-    return counts[@intFromEnum(kind)];
+    return counts[@backingInt(kind)];
 }
 
 pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {

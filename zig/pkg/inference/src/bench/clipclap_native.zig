@@ -178,29 +178,33 @@ fn parseArgs(init: std.process.Init) !BenchConfig {
 }
 
 fn parseTarget(value: []const u8) ?BenchTarget {
-    inline for (@typeInfo(BenchTarget).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(BenchTarget).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
 
 fn parseOutputFormat(value: []const u8) ?OutputFormat {
-    inline for (@typeInfo(OutputFormat).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(OutputFormat).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
 
 fn parseBackendMode(value: []const u8) ?BackendMode {
-    inline for (@typeInfo(BackendMode).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(BackendMode).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
 
 fn parseQuantMode(value: []const u8) ?QuantMode {
-    inline for (@typeInfo(QuantMode).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(QuantMode).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

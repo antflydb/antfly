@@ -158,12 +158,12 @@ pub const LongHeader = struct {
         // First byte: form(1) | fixed_bit(1) | type(2) | type_specific(4)
         out[offset] = (@as(u8, self.form) << 7) |
             (@as(u8, self.fixed_bit) << 6) |
-            (@as(u8, @intFromEnum(self.packet_type)) << 4) |
+            (@as(u8, @backingInt(self.packet_type)) << 4) |
             self.type_specific;
         offset += 1;
 
         // Version (4 bytes, big-endian)
-        const ver = @intFromEnum(self.version);
+        const ver = @backingInt(self.version);
         out[offset] = @intCast((ver >> 24) & 0xFF);
         out[offset + 1] = @intCast((ver >> 16) & 0xFF);
         out[offset + 2] = @intCast((ver >> 8) & 0xFF);
@@ -196,7 +196,7 @@ pub const LongHeader = struct {
         const first = data[offset];
         header.form = @intCast((first >> 7) & 1);
         header.fixed_bit = @intCast((first >> 6) & 1);
-        header.packet_type = @enumFromInt((first >> 4) & 3);
+        header.packet_type = @fromBackingInt(@intCast((first >> 4) & 3));
         header.type_specific = @intCast(first & 0x0F);
         offset += 1;
 
@@ -205,7 +205,7 @@ pub const LongHeader = struct {
             (@as(u32, data[offset + 1]) << 16) |
             (@as(u32, data[offset + 2]) << 8) |
             data[offset + 3];
-        header.version = @enumFromInt(ver);
+        header.version = @fromBackingInt(@intCast(ver));
         offset += 4;
 
         // DCID
@@ -624,11 +624,12 @@ pub const TransportParameters = struct {
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(allocator);
 
-        inline for (@typeInfo(TransportParameters).@"struct".fields) |field| {
-            const param_id = @intFromEnum(@field(TransportParameter, field.name));
-            const value = @field(self, field.name);
+        const info = @typeInfo(TransportParameters).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, Field| {
+            const param_id = @backingInt(@field(TransportParameter, field_name));
+            const value = @field(self, field_name);
 
-            if (field.type == bool) {
+            if (Field == bool) {
                 if (value) {
                     var buf: [16]u8 = undefined;
                     const id_len = try encodeVarInt(param_id, &buf);
@@ -667,7 +668,7 @@ pub const TransportParameters = struct {
             const value = data[offset .. offset + value_len];
             offset += value_len;
 
-            const param: TransportParameter = @enumFromInt(id_result.value);
+            const param: TransportParameter = @fromBackingInt(@intCast(id_result.value));
 
             const parsed_value = if (value.len == 0)
                 null
@@ -715,7 +716,7 @@ pub const StreamType = enum(u2) {
     server_uni = 3,
 
     pub fn fromId(stream_id: u64) StreamType {
-        return @enumFromInt(stream_id & 0x03);
+        return @fromBackingInt(@intCast(stream_id & 0x03));
     }
 
     pub fn isBidirectional(self: StreamType) bool {
@@ -829,8 +830,8 @@ test "ACK frame encode/decode" {
 
 test "CONNECTION_CLOSE encode/decode" {
     const frame = ConnectionCloseFrame{
-        .error_code = @intFromEnum(TransportError.protocol_violation),
-        .frame_type = @intFromEnum(FrameType.stream),
+        .error_code = @backingInt(TransportError.protocol_violation),
+        .frame_type = @backingInt(FrameType.stream),
         .reason_phrase = "bad stream state",
     };
 

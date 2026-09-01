@@ -48,7 +48,7 @@ pub fn writeVarint(alloc: Allocator, buf: *Buf, value: u64) !void {
 }
 
 pub fn writeTag(alloc: Allocator, buf: *Buf, field: u32, wt: WireType) !void {
-    try writeVarint(alloc, buf, @as(u64, field) << 3 | @intFromEnum(wt));
+    try writeVarint(alloc, buf, @as(u64, field) << 3 | @backingInt(wt));
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +172,10 @@ pub fn readTag(bytes: []const u8, pos: *usize) DecodeError!Tag {
     return .{
         .field = @intCast(v >> 3),
         .wire_type = switch (raw_wire_type) {
-            @intFromEnum(WireType.varint) => .varint,
-            @intFromEnum(WireType.fixed64) => .fixed64,
-            @intFromEnum(WireType.length_delimited) => .length_delimited,
-            @intFromEnum(WireType.fixed32) => .fixed32,
+            @backingInt(WireType.varint) => .varint,
+            @backingInt(WireType.fixed64) => .fixed64,
+            @backingInt(WireType.length_delimited) => .length_delimited,
+            @backingInt(WireType.fixed32) => .fixed32,
             else => return error.InvalidWireType,
         },
     };

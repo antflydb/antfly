@@ -16,7 +16,7 @@
     .name = .prometheus,
     .version = "0.1.0",
     .fingerprint = 0x579d3a7b395fb58c,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{},
     .paths = .{
         "build.zig",

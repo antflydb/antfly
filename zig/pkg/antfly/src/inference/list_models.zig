@@ -507,7 +507,12 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    for (0..haystack.len - needle.len + 1) |i| {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 // --- Tests ---

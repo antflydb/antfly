@@ -19,7 +19,7 @@ const current_domain = "antfly-document-unit-fingerprint-v2";
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
-    if (@typeInfo(document_extraction.Unit).@"struct".fields.len != 32) {
+    if (@typeInfo(document_extraction.Unit).@"struct".field_names.len != 32) {
         @compileError("document_extraction.Unit changed; update and version document_unit_fingerprint");
     }
 }
@@ -212,7 +212,7 @@ pub fn stateVersionIsCurrent(value: std.json.Value) bool {
 }
 
 fn hashField(hasher: *Sha256, field: Field) void {
-    hasher.update(&.{@intFromEnum(field)});
+    hasher.update(&.{@backingInt(field)});
 }
 
 fn hashLengthPrefixed(hasher: *Sha256, value: []const u8) void {

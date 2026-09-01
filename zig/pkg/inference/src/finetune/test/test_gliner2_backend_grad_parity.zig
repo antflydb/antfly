@@ -1531,7 +1531,7 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
     defer allocator.free(expected_path);
     const actual_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/cuda_actual.safetensors", .{tmp.sub_path});
     defer allocator.free(actual_path);
-    const fingerprint = [_]u8{0xC7} ** 32;
+    const fingerprint = @as([32]u8, @splat(0xC7));
 
     var uninterrupted_loss: f32 = undefined;
     var uninterrupted_norm: f32 = undefined;
@@ -1639,9 +1639,9 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
         try trainer.saveTrainingState(actual_path, &fingerprint, null);
     }
 
-    const expected = try compat.cwd().readFileAlloc(compat.io(), expected_path, allocator, .unlimited);
+    const expected = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), expected_path, allocator, .unlimited);
     defer allocator.free(expected);
-    const actual = try compat.cwd().readFileAlloc(compat.io(), actual_path, allocator, .unlimited);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), actual_path, allocator, .unlimited);
     defer allocator.free(actual);
     // Byte equality covers every LoRA weight, both Adam moments, per-slot Adam
     // steps, and global micro-batch/optimizer counters in the safetensors file.

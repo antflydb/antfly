@@ -372,7 +372,7 @@ pub const GroupStatusReport = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     transition_pending: bool = false,
     replay_required: bool = false,
@@ -389,7 +389,7 @@ pub const ResolvedVoterSetEvidence = struct {
     voter_count: u16,
     from_leader: bool,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     membership_index: u64 = 0,
 };
 
@@ -476,7 +476,7 @@ pub const VoterSetEvidence = struct {
     fallback_membership_index: u64 = 0,
     ambiguous_fallback_voter_count: bool = false,
     known_voter_count: ?u16 = null,
-    known_voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    known_voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     known_membership_index: u64 = 0,
     has_known_voter_set: bool = false,
     ambiguous_known_voter_set: bool = false,
@@ -585,7 +585,7 @@ test "table manager voter set evidence is order independent when newer reports l
         .group_id = 1,
         .voter_count = 3,
         .voter_set_known = true,
-        .voter_set_fingerprint = [_]u8{0x11} ** voter_set_fingerprint_len,
+        .voter_set_fingerprint = @as([voter_set_fingerprint_len]u8, @splat(0x11)),
         .raft_membership_index = 10,
     };
     const newer_unqualified: GroupStatusReport = .{
@@ -962,11 +962,11 @@ pub const ReplicationSourceStatusRecord = struct {
     /// acknowledgement must match it before provider state may be changed.
     cutover_authority_id: u64 = 0,
     cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Authenticated PostgreSQL cluster, database, and database-incarnation
     /// identity. This deliberately excludes connection credentials.
     cutover_provider_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Provider resources from the authority superseded by the current claim.
     /// They remain durable until inactive cleanup succeeds; a newer claim is
     /// not admitted while this retirement is pending.
@@ -1707,8 +1707,9 @@ fn transitionTableContract(
 }
 
 pub fn parsePlacementClass(role: []const u8) ?PlacementClass {
-    inline for (comptime std.meta.fields(PlacementClass)) |field| {
-        if (std.mem.eql(u8, role, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(PlacementClass).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, role, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

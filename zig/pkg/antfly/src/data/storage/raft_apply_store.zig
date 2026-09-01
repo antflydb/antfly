@@ -99,7 +99,7 @@ pub const RaftApplyStore = struct {
     backend: lsm_backend.BackendHandle,
     shutting_down: std.atomic.Value(bool) = .init(false),
     placement_transition_mutex: std.atomic.Mutex = .unlocked,
-    batch_shards: [batch_shard_count]BatchShard = [_]BatchShard{.{}} ** batch_shard_count,
+    batch_shards: [batch_shard_count]BatchShard = @as([batch_shard_count]BatchShard, @splat(.{})),
 
     const OwnedBatch = AppliedDataBatch;
     const BatchShard = struct {
@@ -289,9 +289,9 @@ pub const RaftApplyStore = struct {
         platform.sync.lockYielding(&self.placement_transition_mutex);
         errdefer self.placement_transition_mutex.unlock();
 
-        var next_exact = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var next_exact = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&next_exact) |*groups| groups.deinit(self.alloc);
-        var admitted_union = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var admitted_union = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&admitted_union) |*groups| groups.deinit(self.alloc);
         for (group_ids) |group_id| {
             const shard_index: usize = @intCast(group_id % batch_shard_count);
@@ -312,7 +312,7 @@ pub const RaftApplyStore = struct {
             shard.mutex.unlock(io);
         }
 
-        var previous = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var previous = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&previous) |*groups| groups.deinit(self.alloc);
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
@@ -327,7 +327,7 @@ pub const RaftApplyStore = struct {
         // union can enter a shard. Build a deduplicated retirement set while
         // holding only that shard's mutex. An allocation failure leaves the
         // safe union admitted, exactly like an aborted host reconciliation.
-        var retire_candidates = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var retire_candidates = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&retire_candidates) |*groups| groups.deinit(self.alloc);
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
@@ -1565,7 +1565,7 @@ pub const RaftApplyStore = struct {
             const owned_value = try self.alloc.alloc(u8, @sizeOf(u64) + 1 + entry.data.len);
             errdefer self.alloc.free(owned_value);
             std.mem.writeInt(u64, owned_value[0..8], entry.term, .little);
-            owned_value[8] = @intFromEnum(entry.entry_type);
+            owned_value[8] = @backingInt(entry.entry_type);
             @memcpy(owned_value[9..], entry.data);
             try writes.append(self.alloc, .{ .key = owned_key, .value = owned_value });
         }
@@ -1669,7 +1669,7 @@ pub const RaftApplyStore = struct {
         const header_len = @sizeOf(u64) + 1;
         if (identity.len < header_len or
             std.mem.readInt(u64, identity[0..8], .little) != replay.term or
-            identity[8] != @intFromEnum(replay.entry_type))
+            identity[8] != @backingInt(replay.entry_type))
         {
             return false;
         }
@@ -2573,7 +2573,7 @@ test "data raft apply store accepts restart replay split below the durable water
         defer std.testing.allocator.free(identity);
         try std.testing.expectEqual(@as(usize, @sizeOf(u64) + 1), identity.len);
         try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, identity[0..8], .little));
-        try std.testing.expectEqual(@intFromEnum(raft_engine.core.types.EntryType.normal), identity[8]);
+        try std.testing.expectEqual(@backingInt(raft_engine.core.types.EntryType.normal), identity[8]);
         var normal_key_buf: [160]u8 = undefined;
         const normal_key = try RaftApplyStore.normalEntryKeyForGroup(&normal_key_buf, 33, 1);
         const normal_data = try group_store.store.get(std.testing.allocator, normal_key);
@@ -2583,7 +2583,7 @@ test "data raft apply store accepts restart replay split below the durable water
         const legacy_payload = "put:b=2";
         var legacy_identity: [@sizeOf(u64) + 1 + legacy_payload.len]u8 = undefined;
         std.mem.writeInt(u64, legacy_identity[0..8], 1, .little);
-        legacy_identity[8] = @intFromEnum(raft_engine.core.types.EntryType.normal);
+        legacy_identity[8] = @backingInt(raft_engine.core.types.EntryType.normal);
         @memcpy(legacy_identity[9..], legacy_payload);
         const legacy_identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 33, 2);
         try group_store.store.put(legacy_identity_key, &legacy_identity);

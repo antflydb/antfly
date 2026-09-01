@@ -412,8 +412,8 @@ fn addBatchProfile(total: *db_mod.BatchProfile, item: db_mod.BatchProfile) void 
 
 fn lsmWriteStatsDelta(after: anytype, before: @TypeOf(after)) @TypeOf(after) {
     var out = after;
-    inline for (std.meta.fields(@TypeOf(after))) |field| {
-        @field(out, field.name) = @field(after, field.name) -| @field(before, field.name);
+    inline for (@typeInfo(@TypeOf(after)).@"struct".field_names) |field_name| {
+        @field(out, field_name) = @field(after, field_name) -| @field(before, field_name);
     }
     return out;
 }

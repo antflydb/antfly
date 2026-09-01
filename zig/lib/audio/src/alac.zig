@@ -63,7 +63,7 @@ const ChannelPredictor = struct {
     prediction_quantization: u8 = 0,
     rice_modifier: u8 = 0,
     predictor_coef_num: u8 = 0,
-    predictor_coef_table: [32]i16 = [_]i16{0} ** 32,
+    predictor_coef_table: [32]i16 = @as([32]i16, @splat(0)),
 };
 
 pub fn parseMagicCookie(bytes: []const u8) !MagicCookie {
@@ -492,7 +492,7 @@ fn predictorDecompressFirAdapt(
         buffer_out[i + 1] = val;
     }
 
-    var coeffs: [32]i16 = [_]i16{0} ** 32;
+    var coeffs: [32]i16 = @as([32]i16, @splat(0));
     @memcpy(coeffs[0..predictor_coef_table.len], predictor_coef_table);
 
     var base_index: usize = 0;

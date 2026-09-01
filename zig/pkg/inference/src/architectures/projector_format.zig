@@ -664,7 +664,7 @@ test "detect termite gemma3 projector" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-gemma3.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
@@ -672,7 +672,7 @@ test "detect termite gemma3 projector" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.antfly_gemma3, try detectPath(allocator, path));
 }
@@ -945,7 +945,7 @@ test "detect clip gemma4 image projector" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-clip-image.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -953,7 +953,7 @@ test "detect clip gemma4 image projector" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.clip_gemma4_image, try detectPath(allocator, path));
 }
@@ -962,7 +962,7 @@ test "detect clip gemma4 unified image audio projector" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-clip-unified.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -971,7 +971,7 @@ test "detect clip gemma4 unified image audio projector" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.clip_gemma4_image_audio, try detectPath(allocator, path));
 }
@@ -980,7 +980,7 @@ test "detect unknown projector metadata" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-unknown.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -988,7 +988,7 @@ test "detect unknown projector metadata" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.unknown, try detectPath(allocator, path));
 }

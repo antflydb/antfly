@@ -502,11 +502,11 @@ pub const CatalogService = struct {
             .head_graph_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.graph_index_actions),
             .head_derived_output_actions = head_actions.derived_output_actions,
             .artifact_actions = .{
-                .document_segment = @enumFromInt(@intFromEnum(plan.artifact_actions.document_segment)),
-                .full_text = @enumFromInt(@intFromEnum(plan.artifact_actions.full_text)),
-                .dense_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.dense_vector)),
-                .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
-                .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
+                .document_segment = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.document_segment))),
+                .full_text = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.full_text))),
+                .dense_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.dense_vector))),
+                .sparse_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.sparse_vector))),
+                .graph = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.graph))),
             },
             .index_config_actions = try cloneIndexConfigPublicationStatusesAlloc(self.alloc, index_config_actions),
             .full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions),
@@ -514,9 +514,9 @@ pub const CatalogService = struct {
             .sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions),
             .graph_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.graph_index_actions),
             .derived_output_actions = .{
-                .chunk_preview = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_preview)),
-                .chunk_embeddings = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_embeddings)),
-                .rerank_terms = @enumFromInt(@intFromEnum(plan.derived_output_actions.rerank_terms)),
+                .chunk_preview = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_preview))),
+                .chunk_embeddings = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_embeddings))),
+                .rerank_terms = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.rerank_terms))),
             },
             .derived_output_resolutions = derived_output_resolutions,
             .max_pending_records = effective_policy.max_pending_records,
@@ -1071,7 +1071,7 @@ fn cloneFullTextIndexActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
             .source_mode = item.source_mode,
             .chunked_source_count = item.chunked_source_count,
         };
@@ -1117,7 +1117,7 @@ fn cloneNamedArtifactActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
         };
         initialized += 1;
     }
@@ -1887,7 +1887,7 @@ fn parseFullTextIndexVersion(index_name: []const u8) ?u32 {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,

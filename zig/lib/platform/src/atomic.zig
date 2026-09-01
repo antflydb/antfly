@@ -59,6 +59,48 @@ pub fn Value(comptime T: type) type {
                 return old;
             }
 
+            pub inline fn fetchMin(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw = @min(old, operand);
+                return old;
+            }
+
+            pub inline fn fetchMax(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw = @max(old, operand);
+                return old;
+            }
+
+            pub inline fn fetchAnd(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw &= operand;
+                return old;
+            }
+
+            pub inline fn fetchNand(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw = ~(old & operand);
+                return old;
+            }
+
+            pub inline fn fetchXor(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw ^= operand;
+                return old;
+            }
+
+            pub inline fn fetchOr(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw |= operand;
+                return old;
+            }
+
             pub inline fn cmpxchgWeak(
                 self: *@This(),
                 expected_value: T,

@@ -16,7 +16,7 @@
     .fingerprint = 0x9257a9236d7cee0e,
     .name = .openapi_zig,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{
         .httpx = .{
             .path = "../httpx",

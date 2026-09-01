@@ -4,7 +4,7 @@
 
 We want an oapi-codegen equivalent for Zig — a tool that reads OpenAPI 3.0.x JSON specs and generates typed Zig client/server code targeting httpx.zig. The antfly2 OpenAPI specs serve as the primary test case, covering complex patterns: `oneOf`/`allOf` with discriminators, cross-file `$ref`, enums, nullable fields, `additionalProperties`, SSE streaming, and multiple auth schemes.
 
-The tool lives at `/Users/ajroetker/go/src/github.com/antflydb/openapi-zig/` and builds with `~/bin/zig` (0.16.0-dev).
+The tool lives at `/Users/ajroetker/go/src/github.com/antflydb/openapi-zig/` and builds with Zig `0.17.0-dev.1936+5a625d5f3`.
 
 ## Project Structure
 
@@ -177,7 +177,7 @@ const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
 codegen.addArgs(&.{ "--spec" });
 codegen.addFileArg(b.path("api.json"));
 codegen.addArgs(&.{ "--package", "my_api", "--output-dir" });
-const gen = codegen.addOutputDirectoryArg("my_api");
+const gen = codegen.addOutputDirectoryArg2("my_api", .{});
 
 const api_mod = b.addModule("my_api", .{ .root_source_file = gen.path(b, "root.zig") });
 api_mod.addImport("httpx", httpx_mod);

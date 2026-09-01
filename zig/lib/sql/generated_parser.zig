@@ -23,13 +23,13 @@ const generated_parse_stack_capacity = 512;
 
 const keyword_terminal_ids = blk: {
     @setEvalBranchQuota(250_000);
-    const keyword_fields = std.meta.fields(token_mod.TokenKeyword);
-    const generated_fields = std.meta.fields(generated.Token);
-    var result: [keyword_fields.len]?u16 = @splat(null);
-    for (keyword_fields, 0..) |keyword_field, keyword_index| {
-        for (generated_fields) |generated_field| {
-            if (std.ascii.eqlIgnoreCase(keyword_field.name, generated_field.name)) {
-                result[keyword_index] = @intCast(generated_field.value + 1);
+    const keyword_info = @typeInfo(token_mod.TokenKeyword).@"enum";
+    const generated_info = @typeInfo(generated.Token).@"enum";
+    var result: [keyword_info.field_names.len]?u16 = @splat(null);
+    for (keyword_info.field_names, 0..) |keyword_name, keyword_index| {
+        for (generated_info.field_names, generated_info.field_values) |generated_name, generated_value| {
+            if (std.ascii.eqlIgnoreCase(keyword_name, generated_name)) {
+                result[keyword_index] = @intCast(generated_value + 1);
                 break;
             }
         }
@@ -978,7 +978,7 @@ fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: 
 
 fn keywordSymbolId(token: token_mod.Token) ?u16 {
     const keyword = token.keyword orelse return null;
-    return keyword_terminal_ids[@intFromEnum(keyword)];
+    return keyword_terminal_ids[@backingInt(keyword)];
 }
 
 fn consumeIfExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {

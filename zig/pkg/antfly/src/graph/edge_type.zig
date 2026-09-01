@@ -28,8 +28,8 @@ pub fn validateStored(value: []const u8) !void {
 
 test "graph edge type policy is byte-bounded UTF-8" {
     try validateStored("cites");
-    try validateStored("x" ** max_bytes);
+    try validateStored(@as([max_bytes]u8, @splat('x')));
     try std.testing.expectError(error.InvalidGraphEdges, validateStored(""));
-    try std.testing.expectError(error.InvalidGraphEdges, validateStored("x" ** (max_bytes + 1)));
+    try std.testing.expectError(error.InvalidGraphEdges, validateStored(@as([max_bytes + 1]u8, @splat('x'))));
     try std.testing.expectError(error.InvalidGraphEdges, validateStored("\xff"));
 }

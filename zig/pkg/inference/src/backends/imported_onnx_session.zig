@@ -451,7 +451,7 @@ test "shared backend context retains exact compute backend identity" {
 }
 
 fn metalShaderValidationEnabledForTest() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = std.c;
     return c_std.getenv("MTL_SHADER_VALIDATION") != null;
 }
 
@@ -2036,7 +2036,7 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     var cast_inputs = [_][]const u8{"mm"};
     var cast_outputs = [_][]const u8{"out"};
     var cast_attrs = [_]proto.AttributeProto{
-        .{ .name = "to", .i = @intFromEnum(proto.DataType.float32), .attr_type = .int },
+        .{ .name = "to", .i = @backingInt(proto.DataType.float32), .attr_type = .int },
     };
     var nodes = [_]proto.NodeProto{
         .{ .op_type = "DynamicQuantizeLinear", .inputs = &dql_inputs, .outputs = &dql_outputs },

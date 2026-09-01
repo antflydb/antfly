@@ -83,7 +83,7 @@ pub fn MetricVec(comptime L: type) type {
         @compileError("Vec type must be a struct, got: " ++ @typeName(L));
     }
 
-    const fields = ti.@"struct".fields;
+    const fields = reflectionFields(L);
     inline for (fields) |f| {
         validateLabel(f.name, f.type);
     }
@@ -398,7 +398,7 @@ fn HashContext(comptime K: type) type {
     return struct {
         const Self = @This();
 
-        const fields = @typeInfo(K).@"struct".fields;
+        const fields = reflectionFields(K);
 
         pub fn hash(_: Self, key: K) u64 {
             var hasher = Wyhash.init(0);
@@ -428,7 +428,7 @@ fn HashContext(comptime K: type) type {
             const V = @TypeOf(value);
             switch (@typeInfo(V)) {
                 .int => |int| switch (int.signedness) {
-                    .signed => hashValue(hasher, @as(std.meta.Int(.unsigned, int.bits), @bitCast(value))),
+                    .signed => hashValue(hasher, @as(@Int(.unsigned, int.bits), @bitCast(value))),
                     .unsigned => {
                         if (std.meta.hasUniqueRepresentation(V)) {
                             hasher.update(std.mem.asBytes(&value));
@@ -438,7 +438,7 @@ fn HashContext(comptime K: type) type {
                         }
                     },
                 },
-                .@"enum" => hashValue(hasher, @intFromEnum(value)),
+                .@"enum" => hashValue(hasher, @backingInt(value)),
                 .error_set => hashValue(hasher, @intFromError(value)),
                 .bool => hasher.update(if (value) &.{1} else &.{0}),
                 .pointer => hasher.update(value), // validateLabelType ensures this was a []u8
@@ -447,6 +447,15 @@ fn HashContext(comptime K: type) type {
             }
         }
     };
+}
+
+const ReflectionField = struct { name: [:0]const u8, type: type };
+
+fn reflectionFields(comptime T: type) [@typeInfo(T).@"struct".field_names.len]ReflectionField {
+    const info = @typeInfo(T).@"struct";
+    var result: [info.field_names.len]ReflectionField = undefined;
+    for (info.field_names, info.field_types, 0..) |name, Field, i| result[i] = .{ .name = name, .type = Field };
+    return result;
 }
 
 // The "preamble" is the optional "# HELP $DESC\n" and "# TYPE $TYPE\n" string

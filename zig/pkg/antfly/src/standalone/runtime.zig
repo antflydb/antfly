@@ -650,7 +650,7 @@ const StandaloneHealthSource = struct {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(self.supervisor.currentState()));
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
@@ -2644,12 +2644,12 @@ pub fn runLite(
     fsync: bool,
     extra_args: []const []const u8,
 ) !void {
-    const path_z = try init.gpa.dupeZ(u8, path);
+    const path_z = try init.gpa.dupeSentinel(u8, path, 0);
     defer init.gpa.free(path_z);
-    const host_z = try init.gpa.dupeZ(u8, host);
+    const host_z = try init.gpa.dupeSentinel(u8, host, 0);
     defer init.gpa.free(host_z);
     var port_buf: [16]u8 = undefined;
-    const port_z = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+    const port_z = try std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0);
     var argv = std.ArrayListUnmanaged([*:0]const u8).empty;
     defer argv.deinit(init.gpa);
     try argv.appendSlice(init.gpa, &.{
@@ -2670,7 +2670,7 @@ pub fn runLite(
         init.gpa.free(owned_extra);
     }
     for (extra_args, 0..) |arg, i| {
-        owned_extra[i] = try init.gpa.dupeZ(u8, arg);
+        owned_extra[i] = try init.gpa.dupeSentinel(u8, arg, 0);
         owned_extra_count += 1;
         try argv.append(init.gpa, owned_extra[i].ptr);
     }
@@ -4091,7 +4091,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -4557,9 +4557,9 @@ fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     try ensureParent(io, log_path);
     try ensureParent(io, slots_path);
 
-    const log_z = try alloc.dupeZ(u8, log_path);
+    const log_z = try alloc.dupeSentinel(u8, log_path, 0);
     defer alloc.free(log_z);
-    const slots_z = try alloc.dupeZ(u8, slots_path);
+    const slots_z = try alloc.dupeSentinel(u8, slots_path, 0);
     defer alloc.free(slots_z);
 
     return try antfly.ha.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
@@ -4584,9 +4584,9 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     try ensureParent(io, log_path);
     try ensureParent(io, progress_path);
 
-    const log_z = try alloc.dupeZ(u8, log_path);
+    const log_z = try alloc.dupeSentinel(u8, log_path, 0);
     defer alloc.free(log_z);
-    const progress_z = try alloc.dupeZ(u8, progress_path);
+    const progress_z = try alloc.dupeSentinel(u8, progress_path, 0);
     defer alloc.free(progress_z);
 
     return try antfly.ha.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
@@ -4633,7 +4633,7 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
 
     try ensureParent(io, fence_wal_path);
 
-    const fence_wal_z = try alloc.dupeZ(u8, fence_wal_path);
+    const fence_wal_z = try alloc.dupeSentinel(u8, fence_wal_path, 0);
     defer alloc.free(fence_wal_z);
 
     return try antfly.ha.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
@@ -4651,7 +4651,7 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
 
     try ensureParent(io, former_primary_log_path);
 
-    const former_primary_log_z = try alloc.dupeZ(u8, former_primary_log_path);
+    const former_primary_log_z = try alloc.dupeSentinel(u8, former_primary_log_path, 0);
     defer alloc.free(former_primary_log_z);
 
     return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
@@ -4663,7 +4663,7 @@ fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]
     if (env_var.len == 0) return error.AdminTokenEnvMissing;
     if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
 
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
 
     const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.AdminTokenMissing;
@@ -4773,7 +4773,7 @@ fn invokeInferenceProvider(
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
-        .operation = @intFromEnum(operation),
+        .operation = @backingInt(operation),
         .request_json = inference_bridge.String.init(request_json),
         .deadline_ns = effective_deadline_ns,
         .has_deadline = 1,
@@ -7561,7 +7561,7 @@ test "inference config falls back to common config" {
 
 test "inference admission bridge charges combined native residency to resource manager" {
     var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+    budgets[@backingInt(antfly.resource_manager.Slice.inference_model_residency)] =
         .{ .hard_limit_bytes = 100 };
     var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
     var owner = InferenceResourceBudgetOwner{
@@ -7686,7 +7686,7 @@ test "inference admission bridge charges combined native residency to resource m
 
 test "standalone tokenizer bridge enforces growth and permits exact teardown" {
     var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
+    budgets[@backingInt(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
         .{ .hard_limit_bytes = 16 };
     var manager = antfly.resource_manager.ResourceManager.init(.{
         .memory_budget = .{ .hard_limit_bytes = 20 },
@@ -8098,7 +8098,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .stable_topology_id = "topology-7",
             .node_id = "primary-a",
             .pod_uid = "primary-pod-uid",
-            .process_boot_id = [_]u8{'a'} ** 64,
+            .process_boot_id = @as([64]u8, @splat('a')),
         };
         platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
         const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);

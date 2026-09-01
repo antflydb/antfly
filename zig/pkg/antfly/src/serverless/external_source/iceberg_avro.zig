@@ -585,8 +585,9 @@ fn primitiveForName(name: []const u8) !AvroPrimitive {
 }
 
 fn knownFieldForName(name: []const u8) KnownField {
-    inline for (@typeInfo(KnownField).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(KnownField).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, name, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return .unknown;
 }
@@ -1425,7 +1426,7 @@ fn appendManifestRecord(
     try appendString(alloc, out, path);
     try appendLong(alloc, out, 111);
     try appendLong(alloc, out, 3);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, sequence_number);
     try appendLong(alloc, out, 1);
@@ -1603,14 +1604,14 @@ fn appendDataManifestRecord(
     record_count: i64,
     file_size_in_bytes: i64,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(DataFileContent.data));
+    try appendLong(alloc, out, @backingInt(DataFileContent.data));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");
@@ -1632,14 +1633,14 @@ fn appendDataManifestRecordWithContentAndEqualityIds(
     file_size_in_bytes: i64,
     equality_ids: []const i32,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");

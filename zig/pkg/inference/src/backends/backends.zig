@@ -123,7 +123,7 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
     }).usesGpuHostedSession());
 }
 
-const backend_order_capacity = std.meta.fields(BackendType).len;
+const backend_order_capacity = @typeInfo(BackendType).@"enum".field_names.len;
 
 const RequiredBackendConfig = struct {
     backend: ?BackendType = null,

@@ -1308,7 +1308,7 @@ fn prepareTestStagingWithBinding(
     });
     defer alloc.free(manifest);
 
-    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = [_]u8{0} ** (Sha256.digest_length * 2);
+    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = @as([(Sha256.digest_length * 2)]u8, @splat(0));
     var capture_receipt_json: ?[]u8 = null;
     defer if (capture_receipt_json) |json| alloc.free(json);
     if (binding) |authority| {

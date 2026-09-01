@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const derived_worker = @import("derived_worker.zig");
@@ -63,12 +64,12 @@ pub const RecoverableRetryStats = struct {
 };
 
 pub const RecoverableRetryCounters = struct {
-    total: std.atomic.Value(u64) = .init(0),
-    writer_locked: std.atomic.Value(u64) = .init(0),
-    resource_budget: std.atomic.Value(u64) = .init(0),
-    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
-    artifact_repair_required: std.atomic.Value(u64) = .init(0),
-    not_found: std.atomic.Value(u64) = .init(0),
+    total: AtomicU64 = .init(0),
+    writer_locked: AtomicU64 = .init(0),
+    resource_budget: AtomicU64 = .init(0),
+    replay_document_not_visible: AtomicU64 = .init(0),
+    artifact_repair_required: AtomicU64 = .init(0),
+    not_found: AtomicU64 = .init(0),
 
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);

@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
             return error.EvalBeforeFailed;
         }
 
-        var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, task, out_dir);
+        var summary = try finetune.materializeMergedModel(allocator, init.io, base_model_dir, adapter_model_dir, task, out_dir);
         defer finetune.freeMaterializeSummary(allocator, &summary);
 
         var eval_after = try peft.runEvalCapture(allocator, init.io, program, "after");
@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, task, out_dir);
+    var summary = try finetune.materializeMergedModel(allocator, init.io, base_model_dir, adapter_model_dir, task, out_dir);
     defer finetune.freeMaterializeSummary(allocator, &summary);
 
     if (report_path) |path| try writeJsonReport(allocator, path, summary);
@@ -102,8 +102,8 @@ const MaterializeEvalFailureReport = struct {
 };
 
 fn writeJsonReport(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);

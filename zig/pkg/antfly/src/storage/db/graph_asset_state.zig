@@ -252,7 +252,7 @@ test "graph asset state v4 round trip preserves generation and keys without payl
 }
 
 test "graph asset state rejects excessive entry counts before allocation" {
-    const raw = version_4_magic ++ [_]u8{0} ** 8 ++ [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    const raw = version_4_magic ++ @as([8]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 0xff, 0xff };
     try std.testing.expectError(error.ResourceLimitExceeded, containsKey(raw, "edge:a"));
 }
 

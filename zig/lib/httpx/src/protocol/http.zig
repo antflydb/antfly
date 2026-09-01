@@ -67,7 +67,7 @@ pub const Http2FrameHeader = struct {
     pub fn serialize(self: Http2FrameHeader) [9]u8 {
         var buf: [9]u8 = undefined;
         std.mem.writeInt(u24, buf[0..3], self.length, .big);
-        buf[3] = @intFromEnum(self.frame_type);
+        buf[3] = @backingInt(self.frame_type);
         buf[4] = self.flags;
         std.mem.writeInt(u32, buf[5..9], self.stream_id, .big);
         return buf;
@@ -77,7 +77,7 @@ pub const Http2FrameHeader = struct {
     pub fn parse(data: [9]u8) Http2FrameHeader {
         return .{
             .length = std.mem.readInt(u24, data[0..3], .big),
-            .frame_type = @enumFromInt(data[3]),
+            .frame_type = @fromBackingInt(@intCast(data[3])),
             .flags = data[4],
             .stream_id = @intCast(std.mem.readInt(u32, data[5..9], .big) & 0x7FFFFFFF),
         };
@@ -130,7 +130,7 @@ pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Alloc
         .{ .id = .max_header_list_size, .val = settings.max_header_list_size },
     };
     for (settings_list) |s| {
-        std.mem.writeInt(u16, buf[0..2], @intFromEnum(s.id), .big);
+        std.mem.writeInt(u16, buf[0..2], @backingInt(s.id), .big);
         std.mem.writeInt(u32, buf[2..6], s.val, .big);
         try out.appendSlice(allocator, &buf);
     }
@@ -150,7 +150,7 @@ pub fn encodeSettingsPayloadBuf(settings: Http2ConnectionSettings, buf: *[6 * 6]
     };
     var offset: usize = 0;
     for (settings_list) |s| {
-        std.mem.writeInt(u16, buf[offset..][0..2], @intFromEnum(s.id), .big);
+        std.mem.writeInt(u16, buf[offset..][0..2], @backingInt(s.id), .big);
         std.mem.writeInt(u32, buf[offset..][2..6], s.val, .big);
         offset += 6;
     }
@@ -187,7 +187,6 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
         }
     }
 }
-
 
 /// HTTP/3 frame types as defined in RFC 9114.
 pub const Http3FrameType = enum(u64) {
@@ -488,7 +487,7 @@ test "applySettingsPayload rejects invalid ENABLE_PUSH" {
     var settings = Http2ConnectionSettings{};
     // ENABLE_PUSH (id=2) with value=2 (must be 0 or 1).
     var payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.enable_push), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(Http2SettingId.enable_push), .big);
     std.mem.writeInt(u32, payload[2..6], 2, .big);
     try std.testing.expectError(error.ProtocolError, applySettingsPayload(&settings, &payload));
 }
@@ -497,7 +496,7 @@ test "applySettingsPayload rejects invalid INITIAL_WINDOW_SIZE" {
     var settings = Http2ConnectionSettings{};
     // INITIAL_WINDOW_SIZE (id=4) with value=0x80000000 (exceeds 2^31-1).
     var payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.initial_window_size), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(Http2SettingId.initial_window_size), .big);
     std.mem.writeInt(u32, payload[2..6], 0x80000000, .big);
     try std.testing.expectError(error.FlowControlError, applySettingsPayload(&settings, &payload));
 }
@@ -506,7 +505,7 @@ test "applySettingsPayload rejects invalid MAX_FRAME_SIZE" {
     var settings = Http2ConnectionSettings{};
     // MAX_FRAME_SIZE (id=5) with value=0 (below 16384 minimum).
     var payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.max_frame_size), .big);
+    std.mem.writeInt(u16, payload[0..2], @backingInt(Http2SettingId.max_frame_size), .big);
     std.mem.writeInt(u32, payload[2..6], 0, .big);
     try std.testing.expectError(error.ProtocolError, applySettingsPayload(&settings, &payload));
 

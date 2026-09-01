@@ -21,7 +21,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.16.0
 
 jobs:
   package:
@@ -29,6 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Resolve version
         id: version
@@ -76,11 +78,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xz-utils
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
           curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
+            "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$zig_archive"
+          echo "$ZIG_X86_64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          tar -xJf "$zig_archive" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Test Antfly C ABI packaging

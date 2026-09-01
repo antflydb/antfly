@@ -927,7 +927,7 @@ test "sfnt reader parses head maxp hhea and glyph range" {
 }
 
 test "sfnt reader rejects invalid scaler type" {
-    const bytes = [_]u8{ 0, 0, 0, 0 } ++ [_]u8{0} ** 8;
+    const bytes = [_]u8{ 0, 0, 0, 0 } ++ @as([8]u8, @splat(0));
     try std.testing.expectError(error.InvalidSfnt, Font.init(std.testing.allocator, &bytes));
 }
 
@@ -1012,7 +1012,7 @@ test "exact cmap lookup continues across matching encoding records" {
     try appendU16(alloc, &bytes, 0);
     try appendU16(alloc, &bytes, format0_len);
     try appendU16(alloc, &bytes, 0);
-    var glyphs = [_]u8{0} ** 256;
+    var glyphs = @as([256]u8, @splat(0));
     glyphs['A'] = 7;
     try bytes.appendSlice(alloc, &glyphs);
 

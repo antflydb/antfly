@@ -453,11 +453,11 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
     try appendInt(out, alloc, u32, @intCast(batch.documents.len));
     for (batch.documents) |doc| {
         try writeBytes(out, alloc, doc.key);
-        try out.append(alloc, @intFromEnum(doc.action));
+        try out.append(alloc, @backingInt(doc.action));
         try writeOptionalBytes(out, alloc, doc.cleaned_value);
         try appendInt(out, alloc, u32, @intCast(doc.targets.len));
         for (doc.targets) |target| {
-            try out.append(alloc, @intFromEnum(target.kind));
+            try out.append(alloc, @backingInt(target.kind));
             try writeBytes(out, alloc, target.index_name);
         }
     }
@@ -494,7 +494,7 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
 
     try appendInt(out, alloc, u32, @intCast(batch.generated_enrichment_refs.len));
     for (batch.generated_enrichment_refs) |request| {
-        try out.append(alloc, @intFromEnum(request.kind));
+        try out.append(alloc, @backingInt(request.kind));
         try writeBytes(out, alloc, request.index_name);
         try writeBytes(out, alloc, request.artifact_name);
         try writeBytes(out, alloc, request.embedding_name);
@@ -673,7 +673,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     for (documents) |*doc| {
         const key = try reader.readBytesAlloc(alloc);
         errdefer alloc.free(key);
-        const action: DerivedAction = @enumFromInt(try reader.readByte());
+        const action: DerivedAction = @fromBackingInt(@intCast(try reader.readByte()));
         const cleaned_value = try reader.readMaybeBytesAlloc(alloc);
         errdefer if (cleaned_value) |value| alloc.free(value);
         const target_count = try reader.readInt(u32);
@@ -685,7 +685,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
         }
         for (targets) |*target| {
             target.* = .{
-                .kind = @enumFromInt(try reader.readByte()),
+                .kind = @fromBackingInt(@intCast(try reader.readByte())),
                 .index_name = try reader.readBytesAlloc(alloc),
             };
             initialized_targets += 1;
@@ -784,7 +784,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     }
     for (generated_enrichment_refs) |*request| {
         request.* = .{
-            .kind = @enumFromInt(try reader.readByte()),
+            .kind = @fromBackingInt(@intCast(try reader.readByte())),
             .index_name = try reader.readBytesAlloc(alloc),
             .artifact_name = try reader.readBytesOrEmpty(alloc),
             .embedding_name = try reader.readBytesOrEmpty(alloc),

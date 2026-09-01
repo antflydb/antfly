@@ -913,21 +913,21 @@ test "lake explain reports object range cache lane accounting" {
         .evicted_bytes = 128,
         .rejected_bytes = 64,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.metadata)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.metadata)] = .{
         .hits = 2,
         .misses = 1,
         .stored_bytes = 512,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.compressed_range)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.compressed_range)] = .{
         .misses = 5,
         .stored_bytes = 1024,
         .evicted_bytes = 128,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.serving_sidecar)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.serving_sidecar)] = .{
         .hits = 2,
         .stored_bytes = 512,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.broad_scan_scratch)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.broad_scan_scratch)] = .{
         .misses = 1,
         .rejected_bytes = 64,
     };

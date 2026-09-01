@@ -109,8 +109,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (report_path) |path| {
-        const io = compat.io();
-        var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+        const io = init.io;
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close(io);
         const rendered = try std.json.Stringify.valueAlloc(allocator, report, .{ .whitespace = .indent_2 });
         defer allocator.free(rendered);
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("saved_report: {s}\n", .{path});
     }
 
-    const io = compat.io();
+    const io = init.io;
     const stdout = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
     var writer = stdout.writer(io, &buf);

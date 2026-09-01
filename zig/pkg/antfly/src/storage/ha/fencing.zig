@@ -428,7 +428,7 @@ fn encodeReceipt(alloc: Allocator, event_type: EventType, receipt: Receipt) ![]u
     @memset(out[0..header_len], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], version, .little);
-    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event_type), .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @backingInt(event_type), .little);
     var flags: u32 = 0;
     if (receipt.forced) flags |= 1 << 0;
     std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
@@ -469,7 +469,7 @@ fn decodeReceipt(alloc: Allocator, bytes: []const u8) !OwnedReceipt {
     if (!std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidMagic;
     const decoded_version = std.mem.readInt(u16, bytes[version_offset..][0..2], .little);
     if (decoded_version == 0 or decoded_version > version) return error.UnsupportedVersion;
-    const event_type: EventType = @enumFromInt(std.mem.readInt(u16, bytes[event_type_offset..][0..2], .little));
+    const event_type: EventType = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[event_type_offset..][0..2], .little)));
     if (event_type != .promotion_fence) return error.UnsupportedFenceEvent;
     const stored_header_crc = std.mem.readInt(u32, bytes[header_crc_offset..][0..4], .little);
     if (stored_header_crc != Crc32.hash(bytes[0..header_crc_offset])) return error.HeaderCrcMismatch;
@@ -536,7 +536,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
-    return try alloc.dupeZ(u8, raw);
+    return try alloc.dupeSentinel(u8, raw, 0);
 }
 
 const StandbyPaths = struct {
@@ -579,9 +579,9 @@ fn standbyPaths(alloc: Allocator, comptime name: []const u8) !StandbyPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_raw) catch {};
 
     return .{
-        .receive_log = try alloc.dupeZ(u8, receive_raw),
-        .progress_wal = try alloc.dupeZ(u8, progress_raw),
-        .fence_wal = try alloc.dupeZ(u8, fence_raw),
+        .receive_log = try alloc.dupeSentinel(u8, receive_raw, 0),
+        .progress_wal = try alloc.dupeSentinel(u8, progress_raw, 0),
+        .fence_wal = try alloc.dupeSentinel(u8, fence_raw, 0),
     };
 }
 

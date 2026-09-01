@@ -375,14 +375,14 @@ pub fn looksLikeBinaryRecord(raw: []const u8) bool {
 fn hintMask(hints: []const TargetHint) u8 {
     var mask: u8 = 0;
     for (hints) |hint| {
-        const bit: u3 = @intCast(@intFromEnum(hint));
+        const bit: u3 = @intCast(@backingInt(hint));
         mask |= (@as(u8, 1) << bit);
     }
     return mask;
 }
 
 pub fn singleHintMask(hint: TargetHint) u8 {
-    const bit: u3 = @intCast(@intFromEnum(hint));
+    const bit: u3 = @intCast(@backingInt(hint));
     return (@as(u8, 1) << bit);
 }
 
@@ -404,47 +404,47 @@ pub fn encodedRecordHintMask(raw: []const u8) !u8 {
 
 fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
     var count: usize = 0;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.enrichment))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.full_text))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.dense_vector))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.sparse_vector))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.enrichment))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.full_text))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.dense_vector))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.sparse_vector))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.graph))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.algebraic))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.resolution))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.promotion))) != 0) count += 1;
     if (count == 0) return &.{};
 
     const hints = try alloc.alloc(TargetHint, count);
     var index: usize = 0;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.enrichment))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.enrichment))) != 0) {
         hints[index] = .enrichment;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.full_text))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.full_text))) != 0) {
         hints[index] = .full_text;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.dense_vector))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.dense_vector))) != 0) {
         hints[index] = .dense_vector;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.sparse_vector))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.sparse_vector))) != 0) {
         hints[index] = .sparse_vector;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.graph))) != 0) {
         hints[index] = .graph;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.algebraic))) != 0) {
         hints[index] = .algebraic;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.resolution))) != 0) {
         hints[index] = .resolution;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.promotion))) != 0) {
         hints[index] = .promotion;
         index += 1;
     }

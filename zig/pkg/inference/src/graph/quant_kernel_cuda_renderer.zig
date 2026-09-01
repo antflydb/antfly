@@ -505,7 +505,7 @@ pub const AttentionSplitVariant = enum(u8) {
     split8 = 8,
 
     pub fn kvSplits(self: AttentionSplitVariant) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn sourceTag(self: AttentionSplitVariant) []const u8 {

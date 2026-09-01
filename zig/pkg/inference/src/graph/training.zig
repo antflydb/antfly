@@ -1952,7 +1952,7 @@ fn dumpGraphOutputValuesJsonl(
         }
         try appendGraphOutputDump("],\"abs_sum\":{d}}}\n", .{abs_sum});
     }
-    try io_compat.cwd().writeFile(io_compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(io_compat.testingIo(), .{
         .sub_path = path,
         .data = graph_output_dump_buffer.items,
     });

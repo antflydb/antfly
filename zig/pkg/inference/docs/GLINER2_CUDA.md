@@ -272,7 +272,7 @@ fault-path qualification result, not a throughput target.
 From `zig/pkg/inference`:
 
 ```sh
-ZIG=../../../.tools/zig-x86_64-linux-0.16.0/zig
+ZIG=../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig
 MODEL=/absolute/path/to/fp16-gliner2-gguf-directory
 
 $ZIG build -Dcuda=true -Dcuda-artifacts=sm89 -Dcuda-libs=auto \

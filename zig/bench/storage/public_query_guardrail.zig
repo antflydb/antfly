@@ -2063,7 +2063,7 @@ fn enforcePublicExactSortBudgetRejection(
         extern fn unsetenv(name: [*:0]const u8) c_int;
     };
     const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
-    const previous = if (Env.getenv(budget_env)) |value| try alloc.dupeZ(u8, std.mem.span(value)) else null;
+    const previous = if (Env.getenv(budget_env)) |value| try alloc.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (previous) |value| alloc.free(value);
     if (Env.setenv(budget_env, "1", 1) != 0) return error.EnvironmentVariableSetFailed;
     defer {
@@ -5013,7 +5013,7 @@ fn parseNextU64(args: *std.process.Args.Iterator, flag: []const u8) !u64 {
 }
 
 fn tempPath(buf: []u8) [:0]u8 {
-    return std.fmt.bufPrintZ(buf, "/tmp/antfly-public-query-{d}", .{platform_time.monotonicNs()}) catch unreachable;
+    return std.fmt.bufPrintSentinel(buf, "/tmp/antfly-public-query-{d}", .{platform_time.monotonicNs()}, 0) catch unreachable;
 }
 
 fn reserveEphemeralPort(io: std.Io) !u16 {

@@ -199,7 +199,7 @@ pub fn initHeadFromModelDir(allocator: std.mem.Allocator, model_dir: []const u8)
 }
 
 pub fn saveHead(allocator: std.mem.Allocator, head: *const RerankerHead, out_dir: []const u8) !void {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, head_config_file_name });
@@ -211,10 +211,10 @@ pub fn saveHead(allocator: std.mem.Allocator, head: *const RerankerHead, out_dir
         .{ .name = "legacy_reranker.classifier.bias", .shape = &.{1}, .data = &bias },
     });
 
-    var file = try compat.cwd().createFile(compat.io(), config_path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), config_path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
     var buf: [256]u8 = undefined;
-    var writer = file.writerStreaming(compat.io(), &buf);
+    var writer = file.writerStreaming(compat.testingIo(), &buf);
     try std.json.Stringify.value(.{
         .task = "reranker_regression",
         .hidden_size = head.hidden_size,
@@ -225,7 +225,7 @@ pub fn saveHead(allocator: std.mem.Allocator, head: *const RerankerHead, out_dir
 }
 
 pub fn materializeMergedHead(allocator: std.mem.Allocator, head: *const RerankerHead, out_dir: []const u8) !void {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, merged_head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
 
@@ -239,7 +239,7 @@ pub fn materializeMergedHead(allocator: std.mem.Allocator, head: *const Reranker
 pub fn loadHeadIfPresent(allocator: std.mem.Allocator, model_dir: []const u8, hidden_size: usize) !?RerankerHead {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ model_dir, head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
-    _ = compat.cwd().statFile(compat.io(), checkpoint_path, .{}) catch return null;
+    _ = std.Io.Dir.cwd().statFile(compat.testingIo(), checkpoint_path, .{}) catch return null;
 
     var access = try openTensorAccessForFile(allocator, checkpoint_path);
     defer access.deinit();
@@ -259,7 +259,7 @@ pub fn loadHeadIfPresent(allocator: std.mem.Allocator, model_dir: []const u8, hi
 }
 
 pub fn loadHeadFromInput(allocator: std.mem.Allocator, input_path: []const u8, hidden_size: usize) !?RerankerHead {
-    const stat = compat.cwd().statFile(compat.io(), input_path, .{}) catch |err| switch (err) {
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), input_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -468,7 +468,7 @@ pub fn saveCachedPooledSummary(allocator: std.mem.Allocator, path: []const u8, s
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn prepareCachedTopLayerSummary(
@@ -540,7 +540,7 @@ pub fn saveCachedTopLayerSummary(allocator: std.mem.Allocator, path: []const u8,
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn replayTopLayersFromBoundary(
@@ -1144,8 +1144,8 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
 
     var len_buf: [8]u8 = undefined;
@@ -1166,9 +1166,9 @@ test "reranker head save and load round trip" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_reranker_head_roundtrip_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     var head = RerankerHead{
         .allocator = allocator,

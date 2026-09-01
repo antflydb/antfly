@@ -15,11 +15,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const host_template = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps) struct {} else @import("../../template.zig");
+const host_template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps) struct {} else @import("../../template.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ContentPart = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps) union(enum) {
+pub const ContentPart = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps) union(enum) {
     text: []const u8,
     media_url: []const u8,
     binary: BinaryContent,
@@ -35,7 +35,7 @@ pub fn renderDocument(
     template_source: []const u8,
     doc_json: []const u8,
 ) ![]const u8 {
-    if (builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         return try host_template.renderDocument(alloc, template_source, doc_json);
     }
 
@@ -77,7 +77,7 @@ pub fn renderDocumentWithHelpers(
     doc_json: []const u8,
     extra_helpers: anytype,
 ) ![]const u8 {
-    if (builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         return try host_template.renderDocumentWithHelpers(alloc, template_source, doc_json, extra_helpers);
     }
 
@@ -85,7 +85,7 @@ pub fn renderDocumentWithHelpers(
 }
 
 pub fn textToParts(alloc: Allocator, text: []const u8) ![]ContentPart {
-    if (builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         return try host_template.textToParts(alloc, text);
     }
 
@@ -141,7 +141,7 @@ pub fn textToParts(alloc: Allocator, text: []const u8) ![]ContentPart {
 }
 
 pub fn freeContentParts(alloc: Allocator, parts: []const ContentPart) void {
-    if (builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         host_template.freeContentParts(alloc, parts);
         return;
     }
@@ -285,7 +285,7 @@ pub const ErrorDirective = struct {
 };
 
 pub fn formatErrorDirective(alloc: Allocator, status: u16, message: []const u8) ![]const u8 {
-    if (builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         return try host_template.formatErrorDirective(alloc, status, message);
     }
 

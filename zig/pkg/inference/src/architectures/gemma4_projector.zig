@@ -1811,7 +1811,7 @@ test "gemma4 12b real mmproj optional projector smoke" {
     var cb = compute.computeBackend();
 
     if (image_path) |path| {
-        const image_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        const image_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(image_bytes);
         var projected = try encodeProjectedImagesFromStore(&cb, allocator, store, &.{image_bytes});
         defer projected.deinit();
@@ -1822,7 +1822,7 @@ test "gemma4 12b real mmproj optional projector smoke" {
     }
 
     if (audio_path) |path| {
-        const audio_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(128 * 1024 * 1024));
+        const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(128 * 1024 * 1024));
         defer allocator.free(audio_bytes);
         var projected = try encodeProjectedAudioFromStore(&cb, allocator, store, &.{audio_bytes});
         defer projected.deinit();

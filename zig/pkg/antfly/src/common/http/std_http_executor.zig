@@ -575,7 +575,7 @@ pub const StdHttpExecutor = struct {
         const connection_closing = if (request.connection) |connection| connection.closing else true;
         self.recordCompletedRequest(request_keep_alive, connection_closing);
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .content_type = content_type,
             .headers = headers,
             .body = body,

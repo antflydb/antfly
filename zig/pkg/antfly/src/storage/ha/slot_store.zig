@@ -516,7 +516,7 @@ fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     @memset(out[0..header_len], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], version, .little);
-    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event.event_type), .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @backingInt(event.event_type), .little);
     std.mem.writeInt(u32, out[name_len_offset..][0..4], @intCast(event.state.name.len), .little);
     std.mem.writeInt(u64, out[timeline_id_offset..][0..8], event.state.timeline_id, .little);
     std.mem.writeInt(u64, out[restart_lsn_offset..][0..8], event.state.restart_lsn, .little);
@@ -554,7 +554,7 @@ fn decodeEvent(bytes: []const u8) !EventView {
 
     const flags = std.mem.readInt(u32, bytes[flags_offset..][0..4], .little);
     return .{
-        .event_type = @enumFromInt(std.mem.readInt(u16, bytes[event_type_offset..][0..2], .little)),
+        .event_type = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[event_type_offset..][0..2], .little))),
         .state = .{
             .name = body.name,
             .timeline_id = std.mem.readInt(u64, bytes[timeline_id_offset..][0..8], .little),
@@ -635,7 +635,7 @@ fn encodeV1TestEvent(alloc: Allocator, event: EventView) ![]u8 {
     @memset(out[0..header_len], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], 1, .little);
-    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event.event_type), .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @backingInt(event.event_type), .little);
     std.mem.writeInt(u32, out[name_len_offset..][0..4], @intCast(event.state.name.len), .little);
     std.mem.writeInt(u64, out[timeline_id_offset..][0..8], event.state.timeline_id, .little);
     std.mem.writeInt(u64, out[restart_lsn_offset..][0..8], event.state.restart_lsn, .little);
@@ -663,7 +663,7 @@ fn encodeV2TestEvent(alloc: Allocator, event: EventView) ![]u8 {
     @memset(out[0..header_len], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], 2, .little);
-    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event.event_type), .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @backingInt(event.event_type), .little);
     std.mem.writeInt(u32, out[name_len_offset..][0..4], @intCast(event.state.name.len), .little);
     std.mem.writeInt(u64, out[timeline_id_offset..][0..8], event.state.timeline_id, .little);
     std.mem.writeInt(u64, out[restart_lsn_offset..][0..8], event.state.restart_lsn, .little);
@@ -701,7 +701,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
-    return try alloc.dupeZ(u8, raw);
+    return try alloc.dupeSentinel(u8, raw, 0);
 }
 
 test "storage.ha slot store persists slot progress across reopen" {

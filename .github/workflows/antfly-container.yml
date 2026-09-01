@@ -32,10 +32,6 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.16.0
-  # Keep the glibc-linked host compiler reproducible while continuing to emit
-  # static musl release artifacts for both architectures.
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
 
 jobs:
   build-artifact:
@@ -67,6 +63,9 @@ jobs:
         with:
           submodules: true
 
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
+
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v3
@@ -95,19 +94,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
-
-      - name: Install glibc-linked Zig
+      # Nixpkgs only packages stable Zig 0.16 here; use the checksum-pinned
+      # 0.17 nightly required by the source tree.
+      - name: Install Zig
         run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          case "${{ matrix.zig_arch }}" in
+            x86_64) zig_sha256="$ZIG_X86_64_LINUX_SHA256" ;;
+            aarch64) zig_sha256="$ZIG_AARCH64_LINUX_SHA256" ;;
+            *) echo "unsupported Zig architecture: ${{ matrix.zig_arch }}" >&2; exit 1 ;;
+          esac
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/builds/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$zig_archive"
+          echo "$zig_sha256  $zig_archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$zig_archive" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Build runtime artifact
         run: |

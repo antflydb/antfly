@@ -773,11 +773,11 @@ pub const GraphIndex = struct {
         const root = std.mem.span(reverse_path);
         const outgoing_raw = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
         defer alloc.free(outgoing_raw);
-        const outgoing_path = try alloc.dupeZ(u8, outgoing_raw);
+        const outgoing_path = try alloc.dupeSentinel(u8, outgoing_raw, 0);
         defer alloc.free(outgoing_path);
         const reverse_raw = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
         defer alloc.free(reverse_raw);
-        const private_reverse_path = try alloc.dupeZ(u8, reverse_raw);
+        const private_reverse_path = try alloc.dupeSentinel(u8, reverse_raw, 0);
         defer alloc.free(private_reverse_path);
         return try openWithPrivateStores(alloc, outgoing_path, private_reverse_path, index_name, opts);
     }
@@ -2024,7 +2024,7 @@ test "graph durable writes reject invalid edge types before mutation" {
     );
     try std.testing.expectError(
         error.InvalidGraphEdges,
-        graph.addEdge("a", "b", "x" ** (edge_type_mod.max_bytes + 1), 1, 0, 0, ""),
+        graph.addEdge("a", "b", @as([edge_type_mod.max_bytes + 1]u8, @splat('x')), 1, 0, 0, ""),
     );
     const edges = try graph.getEdges(alloc, "a", "", .out);
     defer GraphIndex.freeEdges(alloc, edges);

@@ -22,29 +22,96 @@ const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
-const supports_native_storage = builtin.os.tag != .freestanding;
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
+const supports_native_storage = !is_hostless;
 const supports_posix_fd_cache = supports_native_storage and
     builtin.os.tag != .windows and
     builtin.os.tag != .wasi and
     (builtin.os.tag == .linux or builtin.link_libc) and
     @hasDecl(std.posix.system, "pread");
-// TODO: Re-enable Linux evented storage once std.Io.Evented/std.Io.Uring is
-// stable enough for this code path. In Zig 0.16, instantiating std.Io.Uring
-// trips stdlib error-set mismatches: std/Io/Uring.zig's dirOpenDir and
-// dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
-// error sets that do not include it.
-const supports_evented_runtime = false;
+const supports_evented_runtime = builtin.os.tag == .linux;
 // Standalone NativeStorage values used by focused tools/tests have no
 // BackendRuntime handle, so keep their local cache conservative. Production
 // runtimes inject handles to the single RLIMIT-derived process pool.
 const fallback_cached_native_fds: usize = 64;
 const unlimited_fd_admission_capacity: usize = 1024;
-const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
+const fd_cache_shard_count: usize = if (is_hostless) 1 else 16;
 const max_posix_io_chunk: usize = 64 * 1024 * 1024;
 
 pub const RuntimeKind = enum {
     threaded,
     evented,
+};
+
+/// A process-scoped Evented executor shared by all NativeStorage instances.
+/// Native storage states retain this handle, so leases, descriptor permits,
+/// futures, and atomic writers may safely outlive their owning NativeStorage.
+/// The process owner must deinitialize it only after all stores and retained
+/// child operations have drained, and from the thread that called init.
+pub const EventedRuntime = if (supports_evented_runtime) struct {
+    evented: std.Io.Evented,
+    refs: std.atomic.Value(usize) = .init(1),
+    closing: std.atomic.Value(bool) = .init(false),
+
+    pub fn init(allocator: Allocator) !@This() {
+        var evented: std.Io.Evented = undefined;
+        try std.Io.Evented.init(&evented, allocator, .{});
+        return .{ .evented = evented };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.closing.store(true, .release);
+        // Atomically consume the process owner's reference. This closes the
+        // retain race: a concurrent store creation either retained first (and
+        // makes teardown fail loudly) or observes zero/closing and fails.
+        std.debug.assert(self.refs.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null);
+        std.Io.Evented.deinit(&self.evented);
+        self.* = undefined;
+    }
+
+    fn retain(self: *@This()) !void {
+        if (self.closing.load(.acquire)) return error.EventedRuntimeClosed;
+        while (true) {
+            const current = self.refs.load(.acquire);
+            if (current == 0) return error.EventedRuntimeClosed;
+            if (self.refs.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |_| continue;
+            if (self.closing.load(.acquire)) {
+                self.release();
+                return error.EventedRuntimeClosed;
+            }
+            return;
+        }
+    }
+
+    fn release(self: *@This()) void {
+        const previous = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 1);
+    }
+
+    fn io(self: *@This()) std.Io {
+        return self.evented.io();
+    }
+} else struct {
+    pub fn init(_: Allocator) !@This() {
+        return error.UnsupportedEventedIoRuntime;
+    }
+
+    pub fn deinit(_: *@This()) void {}
+    fn retain(_: *@This()) !void {
+        return error.UnsupportedEventedIoRuntime;
+    }
+    fn release(_: *@This()) void {}
+    fn io(_: *@This()) std.Io {
+        unreachable;
+    }
+};
+
+/// Threaded runtimes are owned by each retained NativeStorageState. Evented
+/// runtimes are process-scoped because std.Io.Evented owns the calling thread's
+/// fiber executor and cannot be initialized or destroyed once per store.
+pub const Runtime = union(RuntimeKind) {
+    threaded: void,
+    evented: *EventedRuntime,
 };
 
 pub const NativeStorageStats = struct {
@@ -156,7 +223,7 @@ pub const RangeReadFuture = struct {
     }
 };
 
-pub const ReadRuntime = if (builtin.os.tag == .freestanding)
+pub const ReadRuntime = if (is_hostless)
     struct {
         pub fn init(_: anytype) ReadRuntime {
             return .{};
@@ -1015,7 +1082,7 @@ else
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
-            const owned_path = try self.allocator.dupeZ(u8, path);
+            const owned_path = try self.allocator.dupeSentinel(u8, path, 0);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
 
@@ -1392,7 +1459,7 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-var native_storage_cache_namespace: std.atomic.Value(u64) = .init(1);
+var native_storage_cache_namespace: CounterU64 = .init(1);
 
 fn processNativeFdCache() *FdCache {
     const locked = lockAtomic(&process_native_storage_pool_mutex);
@@ -1469,22 +1536,32 @@ const NativeStorageState = struct {
     allocator: Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
-    threaded: std.Io.Threaded,
+    runtime: union(RuntimeKind) {
+        threaded: std.Io.Threaded,
+        evented: *EventedRuntime,
+    },
     fd_cache: *FdCache,
     cache_namespace: u64,
 
-    fn create(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !*NativeStorageState {
-        if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
+    fn create(allocator: Allocator, runtime: Runtime, pool: ?*NativeStoragePool) !*NativeStorageState {
         const state = try allocator.create(NativeStorageState);
         errdefer allocator.destroy(state);
         state.* = undefined;
         state.allocator = allocator;
         state.refs = .init(1);
         state.closing = .init(false);
-        // Native storage state may outlive its owning DB while range futures
-        // drain. Prevent that retained runtime from growing without a bound.
-        state.threaded = threaded_io_limits.initService(allocator);
-        errdefer state.threaded.deinit();
+        // Native storage state may outlive its owning DB while leases, permits,
+        // futures, and atomic writers drain. It therefore owns Threaded or
+        // retains the process-scoped Evented executor for the same lifetime.
+        switch (runtime) {
+            .threaded => state.runtime = .{ .threaded = threaded_io_limits.initService(allocator) },
+            .evented => |evented| {
+                if (comptime !supports_evented_runtime) return error.UnsupportedEventedIoRuntime;
+                try evented.retain();
+                state.runtime = .{ .evented = evented };
+            },
+        }
+        errdefer state.deinitRuntime();
         // NativeStorage.init is used by repository, recovery, and status
         // helpers as well as BackendRuntime-owned stores. All production
         // handles must join the same process admission domain; isolated caches
@@ -1492,6 +1569,27 @@ const NativeStorageState = struct {
         state.fd_cache = if (pool) |shared| shared.fd_cache else processNativeFdCache();
         state.cache_namespace = native_storage_cache_namespace.fetchAdd(1, .monotonic);
         return state;
+    }
+
+    fn io(self: *NativeStorageState) std.Io {
+        return switch (self.runtime) {
+            .threaded => |*threaded| threaded.io(),
+            .evented => |evented| evented.io(),
+        };
+    }
+
+    fn deinitRuntime(self: *NativeStorageState) void {
+        switch (self.runtime) {
+            .threaded => |*threaded| threaded.deinit(),
+            .evented => |evented| evented.release(),
+        }
+    }
+
+    fn threadedConcurrentLimit(self: *NativeStorageState) ?std.Io.Limit {
+        return switch (self.runtime) {
+            .threaded => |*threaded| threaded.concurrent_limit,
+            .evented => null,
+        };
     }
 
     fn fdCache(self: *NativeStorageState) *FdCache {
@@ -1505,13 +1603,13 @@ const NativeStorageState = struct {
     fn acquireFdPermit(self: *NativeStorageState) !NativeFdPermit {
         const retained = try self.retain();
         errdefer retained.release();
-        const io = retained.threaded.io();
+        const runtime_io = retained.io();
         const cache = retained.fdCache();
-        try cache.reserveDescriptors(io, 1);
+        try cache.reserveDescriptors(runtime_io, 1);
         return .{
             .state = retained,
             .cache = cache,
-            .io = io,
+            .io = runtime_io,
             .count = 1,
         };
     }
@@ -1519,13 +1617,13 @@ const NativeStorageState = struct {
     fn acquireFdPermits(self: *NativeStorageState, count: usize) !NativeFdPermit {
         const retained = try self.retain();
         errdefer retained.release();
-        const io = retained.threaded.io();
+        const runtime_io = retained.io();
         const cache = retained.fdCache();
-        try cache.reserveDescriptors(io, count);
+        try cache.reserveDescriptors(runtime_io, count);
         return .{
             .state = retained,
             .cache = cache,
-            .io = io,
+            .io = runtime_io,
             .count = count,
         };
     }
@@ -1563,8 +1661,8 @@ const NativeStorageState = struct {
         // namespace before destroying the I/O runtime so a restore or reopen
         // at the same pathname can never observe the old inode.
         self.fd_cache.invalidateNamespace(self.cache_namespace);
-        self.fd_cache.signalAdmissionChanged(self.threaded.io());
-        self.threaded.deinit();
+        self.fd_cache.signalAdmissionChanged(self.io());
+        self.deinitRuntime();
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1575,17 +1673,17 @@ const NativeStorageState = struct {
     /// window but had not inserted it yet.
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
         self.fdCache().invalidatePath(self.cache_namespace, path);
-        self.fdCache().signalAdmissionChanged(self.threaded.io());
+        self.fdCache().signalAdmissionChanged(self.io());
     }
 
     fn invalidateRename(self: *NativeStorageState, old_path: []const u8, new_path: []const u8) void {
         self.fdCache().invalidateRename(self.cache_namespace, old_path, new_path);
-        self.fdCache().signalAdmissionChanged(self.threaded.io());
+        self.fdCache().signalAdmissionChanged(self.io());
     }
 
     fn invalidateTree(self: *NativeStorageState, path: []const u8) void {
         self.fdCache().invalidateTree(self.cache_namespace, path);
-        self.fdCache().signalAdmissionChanged(self.threaded.io());
+        self.fdCache().signalAdmissionChanged(self.io());
     }
 };
 
@@ -1627,7 +1725,7 @@ pub const NativeFdPermit = struct {
     }
 };
 
-const NativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
+const NativeRangeReadFuture = if (!supports_native_storage)
     struct {}
 else
     struct {
@@ -1720,11 +1818,11 @@ pub const NativeStorage = if (!supports_native_storage)
             }
         };
 
-        pub fn init(_: Allocator, _: RuntimeKind) !NativeStorage {
+        pub fn init(_: Allocator, _: Runtime) !NativeStorage {
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn initWithPool(_: Allocator, _: RuntimeKind, _: ?*NativeStoragePool) !NativeStorage {
+        pub fn initWithPool(_: Allocator, _: Runtime, _: ?*NativeStoragePool) !NativeStorage {
             return error.UnsupportedNativeStorageRuntime;
         }
 
@@ -1759,262 +1857,6 @@ pub const NativeStorage = if (!supports_native_storage)
         }
     }
 else blk: {
-    if (supports_evented_runtime) {
-        break :blk struct {
-            runtime: union(RuntimeKind) {
-                threaded: std.Io.Threaded,
-                evented: std.Io.Evented,
-            },
-            state: *NativeStorageState,
-
-            const native_vtable: Storage.VTable = .{
-                .create_dir_path = createDirPath,
-                .read_file_alloc = readFileAlloc,
-                .read_file_range_alloc = readFileRangeAlloc,
-                .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
-                .read_file_range_into = readFileRangeInto,
-                .read_file_range_at_most_into = readFileRangeAtMostInto,
-                .file_size = fileSize,
-                .read_file_trailer_alloc = readFileTrailerAlloc,
-                .write_file_absolute = writeFileAbsolute,
-                .append_file_absolute = appendFileAbsolute,
-                .begin_atomic_write = beginAtomicWrite,
-                .sync_contents_absolute = syncFileContentsAbsolute,
-                .sync_parent_absolute = syncParentAbsolute,
-                .rename_absolute = renameAbsolute,
-                .delete_file_absolute = deleteFileAbsolute,
-                .delete_tree = deleteTree,
-                .now_ns = nowNs,
-                .root_identity_alloc = nativeRootIdentityAlloc,
-                .rename_is_atomic = true,
-                .supports_host_path_generation_publication = true,
-                .supports_native_path_locks = true,
-            };
-
-            pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
-                return try initWithPool(allocator, kind, null);
-            }
-
-            pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
-                var runtime = switch (kind) {
-                    .threaded => .{ .threaded = threaded_io_limits.initService(allocator) },
-                    .evented => blk2: {
-                        var evented: std.Io.Evented = undefined;
-                        try std.Io.Evented.init(&evented, allocator, .{});
-                        break :blk2 .{ .evented = evented };
-                    },
-                };
-                errdefer switch (runtime) {
-                    .threaded => |*threaded| threaded.deinit(),
-                    .evented => |*evented| std.Io.Evented.deinit(evented),
-                };
-                return .{
-                    .runtime = runtime,
-                    .state = try NativeStorageState.create(allocator, kind, pool),
-                };
-            }
-
-            pub fn deinit(self: *NativeStorage) void {
-                self.state.closeStorageRef();
-                switch (self.runtime) {
-                    .threaded => |*threaded| threaded.deinit(),
-                    .evented => |*evented| std.Io.Evented.deinit(evented),
-                }
-                self.* = undefined;
-            }
-
-            pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
-                return self.state.fdCacheConst().snapshotStats();
-            }
-
-            pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
-                return try self.state.acquireFdPermit();
-            }
-
-            pub fn storage(self: *NativeStorage) Storage {
-                return .{
-                    .ptr = self,
-                    .vtable = &native_vtable,
-                };
-            }
-
-            fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try createDirPathPortable(threaded.io(), path),
-                    .evented => |*evented| try createDirPathPortable(evented.io(), path),
-                }
-            }
-
-            fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(max_bytes)),
-                    .evented => |*evented| try std.Io.Dir.cwd().readFileAlloc(evented.io(), path, allocator, .limited(max_bytes)),
-                };
-            }
-
-            fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeAlloc(state.cache_namespace, state.threaded.io(), allocator, path, offset, len);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
-                    .evented => |*evented| try readFileRangeWithIo(evented.io(), allocator, path, offset, len),
-                };
-            }
-
-            fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                const runtime = read_runtime orelse {
-                    const sync_storage: Storage = .{ .ptr = ptr, .vtable = &native_vtable };
-                    return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
-                };
-                return try NativeRangeReadFuture.create(runtime, self.state, allocator, path, offset, len);
-            }
-
-            fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeInto(state.cache_namespace, state.threaded.io(), path, offset, out);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
-                    .evented => |*evented| try readFileRangeWithIoInto(evented.io(), path, offset, out),
-                };
-            }
-
-            fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeAtMostInto(state.cache_namespace, state.threaded.io(), path, offset, out);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIoAtMostInto(threaded.io(), path, offset, out),
-                    .evented => |*evented| try readFileRangeWithIoAtMostInto(evented.io(), path, offset, out),
-                };
-            }
-
-            fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().fileSize(state.cache_namespace, state.threaded.io(), path);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try fileSizeWithIo(threaded.io(), path),
-                    .evented => |*evented| try fileSizeWithIo(evented.io(), path),
-                };
-            }
-
-            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readTrailerAlloc(state.cache_namespace, state.threaded.io(), allocator, path, len);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileTrailerWithIo(threaded.io(), allocator, path, len),
-                    .evented => |*evented| try readFileTrailerWithIo(evented.io(), allocator, path, len),
-                };
-            }
-
-            fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try writeFileAbsoluteWithIo(threaded.io(), path, contents),
-                    .evented => |*evented| try writeFileAbsoluteWithIo(evented.io(), path, contents),
-                }
-            }
-
-            fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync),
-                    .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync),
-                }
-            }
-
-            fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return try NativeAtomicWriteSink.create(allocator, path, self.state);
-            }
-
-            fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try syncFileContentsPathWithIo(threaded.io(), path),
-                    .evented => |*evented| try syncFileContentsPathWithIo(evented.io(), path),
-                }
-            }
-
-            fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try syncParentPathWithIo(threaded.io(), path),
-                    .evented => |*evented| try syncParentPathWithIo(evented.io(), path),
-                }
-            }
-
-            fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidateRename(old_path, new_path);
-                defer self.state.invalidateRename(old_path, new_path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try renamePathWithIo(threaded.io(), old_path, new_path),
-                    .evented => |*evented| try renamePathWithIo(evented.io(), old_path, new_path),
-                }
-            }
-
-            fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try deleteFilePathWithIo(threaded.io(), path),
-                    .evented => |*evented| try deleteFilePathWithIo(evented.io(), path),
-                }
-            }
-
-            fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidateTree(path);
-                defer self.state.invalidateTree(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try std.Io.Dir.cwd().deleteTree(threaded.io(), path),
-                    .evented => |*evented| try std.Io.Dir.cwd().deleteTree(evented.io(), path),
-                }
-            }
-
-            fn nowNs(ptr: *anyopaque) u64 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return switch (self.runtime) {
-                    .threaded => |*threaded| blk2: {
-                        const now = std.Io.Timestamp.now(threaded.io(), .awake);
-                        break :blk2 @intCast(now.toNanoseconds());
-                    },
-                    .evented => |*evented| blk2: {
-                        const now = std.Io.Timestamp.now(evented.io(), .awake);
-                        break :blk2 @intCast(now.toNanoseconds());
-                    },
-                };
-            }
-        };
-    }
-
     break :blk struct {
         state: *NativeStorageState,
 
@@ -2027,7 +1869,7 @@ else blk: {
                 std.debug.assert(self.active);
                 return .{
                     .ptr = self.state,
-                    .vtable = &threaded_only_vtable,
+                    .vtable = &native_vtable,
                 };
             }
 
@@ -2039,7 +1881,7 @@ else blk: {
             }
         };
 
-        const threaded_only_vtable: Storage.VTable = .{
+        const native_vtable: Storage.VTable = .{
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
             .read_file_range_alloc = readFileRangeAlloc,
@@ -2063,12 +1905,12 @@ else blk: {
             .supports_native_path_locks = true,
         };
 
-        pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
-            return try initWithPool(allocator, kind, null);
+        pub fn init(allocator: Allocator, runtime: Runtime) !NativeStorage {
+            return try initWithPool(allocator, runtime, null);
         }
 
-        pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
-            return .{ .state = try NativeStorageState.create(allocator, kind, pool) };
+        pub fn initWithPool(allocator: Allocator, runtime: Runtime, pool: ?*NativeStoragePool) !NativeStorage {
+            return .{ .state = try NativeStorageState.create(allocator, runtime, pool) };
         }
 
         pub fn deinit(self: *NativeStorage) void {
@@ -2089,7 +1931,7 @@ else blk: {
             return try self.state.acquireFdPermits(count);
         }
 
-        /// Keeps the native state and its threaded I/O runtime alive after the
+        /// Keeps the native state and its selected I/O runtime alive after the
         /// owning NativeStorage begins shutdown. No new lease may be acquired
         /// once shutdown has started.
         pub fn acquireLease(self: *NativeStorage) !Lease {
@@ -2115,7 +1957,7 @@ else blk: {
             // keep the state alive independently until their own deinit.
             return .{
                 .ptr = self.state,
-                .vtable = &threaded_only_vtable,
+                .vtable = &native_vtable,
             };
         }
 
@@ -2140,15 +1982,15 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, offset, len);
+                return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.io(), allocator, path, offset, len);
             }
-            return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
+            return try readFileRangeWithIo(retained.io(), allocator, path, offset, len);
         }
 
         fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const runtime = read_runtime orelse {
-                const sync_storage: Storage = .{ .ptr = ptr, .vtable = &threaded_only_vtable };
+                const sync_storage: Storage = .{ .ptr = ptr, .vtable = &native_vtable };
                 return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
             };
             return try NativeRangeReadFuture.create(runtime, state, allocator, path, offset, len);
@@ -2159,9 +2001,9 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
+                return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.io(), path, offset, out);
             }
-            return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
+            return try readFileRangeWithIoInto(retained.io(), path, offset, out);
         }
 
         fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2169,9 +2011,9 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAtMostInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
+                return try retained.fdCache().readRangeAtMostInto(retained.cache_namespace, retained.io(), path, offset, out);
             }
-            return try readFileRangeWithIoAtMostInto(retained.threaded.io(), path, offset, out);
+            return try readFileRangeWithIoAtMostInto(retained.io(), path, offset, out);
         }
 
         fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
@@ -2179,9 +2021,9 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
+                return try retained.fdCache().fileSize(retained.cache_namespace, retained.io(), path);
             }
-            return try fileSizeWithIo(retained.threaded.io(), path);
+            return try fileSizeWithIo(retained.io(), path);
         }
 
         fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -2189,9 +2031,9 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readTrailerAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, len);
+                return try retained.fdCache().readTrailerAlloc(retained.cache_namespace, retained.io(), allocator, path, len);
             }
-            return try readFileTrailerWithIo(retained.threaded.io(), allocator, path, len);
+            return try readFileTrailerWithIo(retained.io(), allocator, path, len);
         }
 
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -2237,7 +2079,7 @@ else blk: {
             defer retained.release();
             retained.invalidateRename(old_path, new_path);
             defer retained.invalidateRename(old_path, new_path);
-            try renamePathWithIo(retained.threaded.io(), old_path, new_path);
+            try renamePathWithIo(retained.io(), old_path, new_path);
         }
 
         fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -2252,7 +2094,7 @@ else blk: {
                 // can be removed even while the FD budget is saturated.
                 try deleteFilePathPosix(path);
             } else {
-                try deleteFilePathWithIo(retained.threaded.io(), path);
+                try deleteFilePathWithIo(retained.io(), path);
             }
         }
 
@@ -2278,7 +2120,7 @@ else blk: {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = state.retain() catch return 0;
             defer retained.release();
-            const now = std.Io.Timestamp.now(retained.threaded.io(), .awake);
+            const now = std.Io.Timestamp.now(retained.io(), .awake);
             return @intCast(now.toNanoseconds());
         }
     };
@@ -2463,9 +2305,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
     defer closeFd(new_parent_fd);
 
     const allocator = std.heap.page_allocator;
-    const old_base_name_z = try allocator.dupeZ(u8, old_base_name);
+    const old_base_name_z = try allocator.dupeSentinel(u8, old_base_name, 0);
     defer allocator.free(old_base_name_z);
-    const new_base_name_z = try allocator.dupeZ(u8, new_base_name);
+    const new_base_name_z = try allocator.dupeSentinel(u8, new_base_name, 0);
     defer allocator.free(new_base_name_z);
 
     while (true) {
@@ -2494,9 +2336,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
 
 fn renameAbsoluteDirectPosix(old_path: []const u8, new_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
+    const old_path_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
+    const new_path_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_path_z);
 
     while (true) {
@@ -2550,7 +2392,7 @@ fn createAtomicWriteFdPosix(path: []const u8) !std.posix.fd_t {
 
 fn deleteFilePathPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -2784,7 +2626,7 @@ const NativeBufferedAtomicWriteSink = struct {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
-        const io = self.state.threaded.io();
+        const io = self.state.io();
         self.state.invalidatePath(self.tmp_path);
         writeFileAbsoluteWithIo(io, self.tmp_path, self.out.items) catch |err| {
             deleteFilePathWithIo(io, self.tmp_path) catch {};
@@ -2808,7 +2650,7 @@ const NativeBufferedAtomicWriteSink = struct {
     fn abort(ptr: *anyopaque) void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         self.state.invalidatePath(self.tmp_path);
-        deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
+        deleteFilePathWithIo(self.state.io(), self.tmp_path) catch {};
         self.state.invalidatePath(self.tmp_path);
         self.deinit();
     }
@@ -3024,7 +2866,7 @@ pub const MemoryStorage = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    if (is_hostless) return false;
     platform_sync.lockYielding(mutex);
     return true;
 }
@@ -3467,9 +3309,65 @@ test "native storage retained runtime has a finite worker ceiling" {
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     defer native.deinit();
     try std.testing.expectEqual(
-        std.Io.Limit.limited(threaded_io_limits.service),
-        native.state.threaded.concurrent_limit,
+        @as(?std.Io.Limit, std.Io.Limit.limited(threaded_io_limits.service)),
+        native.state.threadedConcurrentLimit(),
     );
+}
+
+test "evented native storage retained children outlive their owner" {
+    if (!supports_evented_runtime) return error.SkipZigTest;
+
+    var evented = try EventedRuntime.init(std.testing.allocator);
+    defer evented.deinit();
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
+    defer pool.deinit();
+
+    var first = try NativeStorage.initWithPool(
+        std.testing.allocator,
+        .{ .evented = &evented },
+        &pool,
+    );
+    var second = try NativeStorage.initWithPool(
+        std.testing.allocator,
+        .{ .evented = &evented },
+        &pool,
+    );
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 3), evented.refs.load(.acquire));
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/antfly-evented-storage-retained-{d}",
+        .{atomic_write_nonce.fetchAdd(1, .monotonic)},
+    );
+
+    var lease = try first.acquireLease();
+    var lease_active = true;
+    defer if (lease_active) lease.deinit();
+    var permit = try first.acquireFdPermit();
+    var permit_active = true;
+    defer if (permit_active) permit.release();
+    var writer = try first.storage().beginAtomicWrite(std.testing.allocator, path);
+    var writer_active = true;
+    defer if (writer_active) writer.abort();
+    try writer.appendSlice("evented-retained");
+
+    first.deinit();
+    writer_active = false;
+    try writer.finish();
+
+    const retained_storage = lease.storage();
+    const written = try retained_storage.readFileAlloc(std.testing.allocator, path, 64);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("evented-retained", written);
+    try retained_storage.deleteFileAbsolute(path);
+
+    permit.release();
+    permit_active = false;
+    lease.deinit();
+    lease_active = false;
+    try std.testing.expectEqual(@as(usize, 2), evented.refs.load(.acquire));
 }
 
 test "native fd cache retries an open that straddles a mutation fence" {
@@ -3604,7 +3502,7 @@ test "native atomic write finish retains admission through parent sync" {
     // Fill the persistent class to the point where relinquishing the writer's
     // transient slot would make reacquisition fail. The closed data file and
     // parent-directory fsync are sequential users of that same admitted slot.
-    const io = native.state.threaded.io();
+    const io = native.state.io();
     try pool.fd_cache.reservePersistentDescriptors(io, 2);
     var persistent_held = true;
     defer if (persistent_held) pool.fd_cache.releasePersistentDescriptors(io, 2);

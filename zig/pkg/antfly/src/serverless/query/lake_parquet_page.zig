@@ -2674,7 +2674,7 @@ const Reader = struct {
 
     fn readFieldHeader(self: *Reader, previous_field_id: *i16) !?Field {
         const raw = try self.readByte();
-        const field_type: CompactType = @enumFromInt(raw & 0x0f);
+        const field_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
         if (field_type == .stop) return null;
         const delta: i16 = @intCast(raw >> 4);
         const field_id = if (delta == 0) try self.readI16() else previous_field_id.* + delta;
@@ -2757,8 +2757,8 @@ const Reader = struct {
                 const count = try self.readVarintUsize();
                 if (count == 0) return;
                 const types = try self.readByte();
-                const key_type: CompactType = @enumFromInt(types >> 4);
-                const value_type: CompactType = @enumFromInt(types & 0x0f);
+                const key_type: CompactType = @fromBackingInt(@intCast(types >> 4));
+                const value_type: CompactType = @fromBackingInt(@intCast(types & 0x0f));
                 for (0..count) |_| {
                     try self.skip(key_type);
                     try self.skip(value_type);
@@ -2777,7 +2777,7 @@ const Reader = struct {
 
     fn readListHeader(self: *Reader) !struct { elem_type: CompactType, len: usize } {
         const raw = try self.readByte();
-        const elem_type: CompactType = @enumFromInt(raw & 0x0f);
+        const elem_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
         const inline_len = raw >> 4;
         const len = if (inline_len == 15) try self.readVarintUsize() else inline_len;
         return .{ .elem_type = elem_type, .len = len };
@@ -2881,9 +2881,9 @@ fn zigzagDecode(raw: u64) i64 {
 fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i16, id: i16, field_type: CompactType) !void {
     const delta = id - previous.*;
     if (delta > 0 and delta <= 15) {
-        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @intFromEnum(field_type)));
+        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @backingInt(field_type)));
     } else {
-        try out.append(alloc, @intFromEnum(field_type));
+        try out.append(alloc, @backingInt(field_type));
         try appendI16(out, alloc, id);
     }
     previous.* = id;
@@ -3993,6 +3993,6 @@ test "parquet page parser rejects unsupported pages and truncated payloads" {
 
     var unsupported = parsed.header;
     unsupported.encoding = .rle_dictionary;
-    const payload = [_]u8{0} ** 16;
+    const payload = @as([16]u8, @splat(0));
     try std.testing.expectError(error.UnsupportedParquetPage, decodePlainI64Alloc(alloc, unsupported, &payload));
 }

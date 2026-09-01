@@ -30,7 +30,7 @@ fn openNamespaceDbi(
     create: bool,
 ) !lmdb.Dbi {
     const db_name = namespace.name orelse return try raw.openDb(null, .{ .create = create });
-    const db_name_z = try allocator.dupeZ(u8, db_name);
+    const db_name_z = try allocator.dupeSentinel(u8, db_name, 0);
     defer allocator.free(db_name_z);
     return try raw.openDb(db_name_z, .{ .create = create });
 }
@@ -42,7 +42,7 @@ fn openNamespaceDbiBatch(
     create: bool,
 ) !lmdb.Dbi {
     const db_name = namespace.name orelse return try raw.openDb(null, .{ .create = create });
-    const db_name_z = try allocator.dupeZ(u8, db_name);
+    const db_name_z = try allocator.dupeSentinel(u8, db_name, 0);
     defer allocator.free(db_name_z);
     return try raw.openDb(db_name_z, .{ .create = create });
 }

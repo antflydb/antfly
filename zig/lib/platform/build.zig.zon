@@ -16,7 +16,7 @@
     .name = .antfly_platform,
     .version = "0.0.1",
     .fingerprint = 0x777bb317e35826e7,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{},
     .paths = .{
         "build.zig",

@@ -26,6 +26,56 @@ const SpecialTokens = @import("tokenizer.zig").SpecialTokens;
 const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 const unicode_classes = @import("unicode_classes.zig");
 
+/// Zig/WebAssembly supports atomics only up to the target's pointer width.
+/// The browser build is explicitly single-threaded, so keep 64-bit profiling
+/// counters non-atomic there while preserving native atomic behavior.
+const AtomicU64 = if (builtin.cpu.arch == .wasm32 and builtin.single_threaded)
+    SingleThreadedU64
+else
+    std.atomic.Value(u64);
+
+const SingleThreadedU64 = extern struct {
+    raw: u64,
+
+    const Self = @This();
+
+    fn init(value: u64) Self {
+        return .{ .raw = value };
+    }
+
+    fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+
+    fn store(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) void {
+        self.raw = value;
+    }
+
+    fn swap(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw = value;
+        return previous;
+    }
+
+    fn fetchAdd(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw +%= value;
+        return previous;
+    }
+
+    fn fetchSub(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw -%= value;
+        return previous;
+    }
+
+    fn fetchOr(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw |= value;
+        return previous;
+    }
+};
+
 const ModelType = enum { word_piece, bpe, unigram };
 
 const PreTokenizerType = enum {
@@ -329,7 +379,7 @@ pub const HfTokenizer = struct {
         // Two independent bits materially reduce false second-hit admission.
         // Two rotating generations keep a one-shot scan from saturating the
         // filter forever.
-        generations: [2][bpe_doorkeeper_words]std.atomic.Value(u64) =
+        generations: [2][bpe_doorkeeper_words]AtomicU64 =
             @splat(@splat(.{ .raw = 0 })),
         active_generation: std.atomic.Value(u8) = .init(0),
         observations: std.atomic.Value(usize) = .init(0),
@@ -339,14 +389,14 @@ pub const HfTokenizer = struct {
     const BpeCache = struct {
         owner: *HfTokenizer,
         shards: [bpe_cache_shard_count]BpeCacheShard =
-            [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
+            @as([bpe_cache_shard_count]BpeCacheShard, @splat(.{})),
         max_bytes: usize = default_bpe_cache_max_bytes,
         bulk_slots: ?[]std.atomic.Value(usize) = null,
         bulk_slots_per_shard: usize = 0,
         used_bytes: std.atomic.Value(usize) = .init(0),
-        rejected_reservations: std.atomic.Value(u64) = .init(0),
-        rejected_admissions: std.atomic.Value(u64) = .init(0),
-        evictions: std.atomic.Value(u64) = .init(0),
+        rejected_reservations: AtomicU64 = .init(0),
+        rejected_admissions: AtomicU64 = .init(0),
+        evictions: AtomicU64 = .init(0),
         resource_budget: ?BpeCacheResourceBudget = null,
         doorkeeper: BpeDoorkeeper = .{},
         reader_gate: std.atomic.Value(bool) = .init(false),
@@ -465,18 +515,18 @@ pub const HfTokenizer = struct {
     };
 
     const BpeProfileCounters = struct {
-        pretokens: std.atomic.Value(u64) = .init(0),
-        direct_hits: std.atomic.Value(u64) = .init(0),
-        hits: std.atomic.Value(u64) = .init(0),
-        misses: std.atomic.Value(u64) = .init(0),
-        probes: std.atomic.Value(u64) = .init(0),
-        key_bytes: std.atomic.Value(u64) = .init(0),
-        token_ids: std.atomic.Value(u64) = .init(0),
-        key_len_histogram: [33]std.atomic.Value(u64) =
+        pretokens: AtomicU64 = .init(0),
+        direct_hits: AtomicU64 = .init(0),
+        hits: AtomicU64 = .init(0),
+        misses: AtomicU64 = .init(0),
+        probes: AtomicU64 = .init(0),
+        key_bytes: AtomicU64 = .init(0),
+        token_ids: AtomicU64 = .init(0),
+        key_len_histogram: [33]AtomicU64 =
             @splat(.{ .raw = 0 }),
-        id_count_histogram: [9]std.atomic.Value(u64) =
+        id_count_histogram: [9]AtomicU64 =
             @splat(.{ .raw = 0 }),
-        probe_histogram: [17]std.atomic.Value(u64) =
+        probe_histogram: [17]AtomicU64 =
             @splat(.{ .raw = 0 }),
     };
 
@@ -799,7 +849,7 @@ pub const HfTokenizer = struct {
             .parallel_workspace_free_count = 0,
             .parallel_workspace_free_bytes = 0,
             .parallel_bpe_config = .{},
-            .worker_bpe_caches = [_]WorkerBpeCacheLease{.{}} ** max_worker_bpe_caches,
+            .worker_bpe_caches = @as([max_worker_bpe_caches]WorkerBpeCacheLease, @splat(.{})),
             .cache_resource_budget_mutex = .unlocked,
             .cache_resource_budget_observer_id = acquireCacheResourceBudgetObserverId(),
             .cache_resource_budget_bytes = 0,
@@ -1937,7 +1987,7 @@ pub const HfTokenizer = struct {
         published_stable_boundary_words: std.atomic.Value(usize) = .init(0),
         published_stable_boundary_bytes: std.atomic.Value(usize) = .init(0),
         published_text_bytes: std.atomic.Value(usize) = .init(0),
-        published_elapsed_ns: std.atomic.Value(u64) = .init(0),
+        published_elapsed_ns: AtomicU64 = .init(0),
         published_cache_owner: std.atomic.Value(usize) =
             .init(invalid_worker_cache_owner),
 
@@ -2345,7 +2395,7 @@ pub const HfTokenizer = struct {
         stable_offset_learns: std.atomic.Value(usize) = .init(0),
         stable_offset_replays: std.atomic.Value(usize) = .init(0),
         workers: [max_parallel_bpe_chunks]ParallelBpeWorker =
-            [_]ParallelBpeWorker{.{}} ** max_parallel_bpe_chunks,
+            @as([max_parallel_bpe_chunks]ParallelBpeWorker, @splat(.{})),
 
         fn retainedBytes(self: *const ParallelBpeWorkspace) usize {
             var total: usize = @sizeOf(ParallelBpeWorkspace);

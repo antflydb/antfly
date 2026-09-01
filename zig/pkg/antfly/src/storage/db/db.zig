@@ -186,11 +186,11 @@ fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resour
         @min(@max(@as(u64, 8 * 1024 * 1024), raw_lsm), 8 * gib)
     else
         std.math.clamp(raw_lsm, 64 * 1024 * 1024, 8 * gib);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = lsm_hard * 7 / 8,
         .hard_limit_bytes = lsm_hard,
     };
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = hbc_hard * 7 / 8,
         .hard_limit_bytes = hbc_hard,
     };
@@ -204,8 +204,8 @@ fn standaloneResourceManagerOptions(alloc: Allocator) resource_manager_mod.Optio
 test "standalone resource manager derives elastic storage cache envelopes" {
     const gib: u64 = 1024 * 1024 * 1024;
     const options = standaloneResourceManagerOptionsForTotal(std.testing.allocator, 12 * gib);
-    const lsm = options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-    const hbc = options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+    const lsm = options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+    const hbc = options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
     try std.testing.expectEqual(@as(u64, 6 * gib), options.memory_budget.hard_limit_bytes);
     try std.testing.expectEqual(@as(u64, 3 * gib), lsm.hard_limit_bytes);
     try std.testing.expectEqual(lsm.hard_limit_bytes * 7 / 8, lsm.soft_limit_bytes);
@@ -217,15 +217,15 @@ const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const lease_mod = @import("lease.zig");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_stub.zig")
 else
     @import("../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_remote_stub.zig")
 else
     @import("../../template_remote.zig");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
@@ -588,16 +588,16 @@ pub const HAAsyncEffectMirror = struct {
     /// every acknowledged write is wholly before or wholly after the frozen
     /// former-primary boundary.
     transition_mutex: ?*std.atomic.Mutex = null,
-    last_lsn: ?*std.atomic.Value(u64) = null,
-    failure_count: ?*std.atomic.Value(u64) = null,
+    last_lsn: ?*AtomicU64 = null,
+    failure_count: ?*AtomicU64 = null,
     sync_policy: ha_primary_mod.SyncPolicy = .{},
     sync_wait_ctx: ?*anyopaque = null,
     sync_wait_fn: ?HASyncWaitFn = null,
-    last_gate_lsn: ?*std.atomic.Value(u64) = null,
+    last_gate_lsn: ?*AtomicU64 = null,
     last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*std.atomic.Value(u64) = null,
-    sync_wait_count: ?*std.atomic.Value(u64) = null,
-    sync_degraded_count: ?*std.atomic.Value(u64) = null,
+    sync_reject_count: ?*AtomicU64 = null,
+    sync_wait_count: ?*AtomicU64 = null,
+    sync_degraded_count: ?*AtomicU64 = null,
 };
 
 pub const HASyncWaitFn = *const fn (
@@ -1324,7 +1324,7 @@ const AsyncContext = struct {
     /// Avoid taking the scheduler mutex on the common derived-watermark path
     /// when no repair is waiting for index progress.
     index_repair_progress_wait_pending: std.atomic.Value(bool) = .init(false),
-    index_repair_scheduler_revision: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_repair_scheduler_revision: AtomicU64 = AtomicU64.init(0),
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -1523,8 +1523,8 @@ const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
-var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
-var test_graph_repair_stream_scans: std.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_flushes: AtomicU64 = .init(0);
+var test_graph_repair_stream_scans: AtomicU64 = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
@@ -1656,7 +1656,7 @@ const DenseCatchUpContentionStats = struct {
     finish_calls: AtomicU64 = .init(0),
     abort_calls: AtomicU64 = .init(0),
     active: AtomicU64 = .init(0),
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(types.DenseCatchUpStats.Phase.idle)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(types.DenseCatchUpStats.Phase.idle)),
     current_sequence: AtomicU64 = .init(0),
     current_target_sequence: AtomicU64 = .init(0),
     current_scanned_entries: AtomicU64 = .init(0),
@@ -1690,7 +1690,7 @@ const DenseCatchUpContentionStats = struct {
             .finish_calls = self.finish_calls.load(.monotonic),
             .abort_calls = self.abort_calls.load(.monotonic),
             .active = self.active.load(.monotonic) != 0,
-            .phase = @enumFromInt(self.phase.load(.monotonic)),
+            .phase = @fromBackingInt(@intCast(self.phase.load(.monotonic))),
             .current_sequence = self.current_sequence.load(.monotonic),
             .current_target_sequence = self.current_target_sequence.load(.monotonic),
             .current_scanned_entries = self.current_scanned_entries.load(.monotonic),
@@ -3301,7 +3301,7 @@ fn atomicMaxU64(value: *AtomicU64, candidate: u64) void {
 
 fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
     ctx.stats.dense_catch_up.active.store(if (progress.active) 1 else 0, .monotonic);
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(if (progress.active) types.DenseCatchUpStats.Phase.replay else types.DenseCatchUpStats.Phase.idle), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(if (progress.active) types.DenseCatchUpStats.Phase.replay else types.DenseCatchUpStats.Phase.idle), .monotonic);
     ctx.stats.dense_catch_up.current_sequence.store(progress.sequence, .monotonic);
     ctx.stats.dense_catch_up.current_target_sequence.store(progress.target_sequence, .monotonic);
     ctx.stats.dense_catch_up.current_scanned_entries.store(progress.scanned_entries, .monotonic);
@@ -3312,7 +3312,7 @@ fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
 }
 
 fn setDenseCatchUpPhase(ctx: *AsyncContext, phase: types.DenseCatchUpStats.Phase) void {
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(phase), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(phase), .monotonic);
     _ = ctx.stats.dense_catch_up.progress_updates.fetchAdd(1, .monotonic);
 }
 
@@ -3324,7 +3324,7 @@ fn noteDenseBulkFinishProgress(ctx_ptr: *anyopaque, progress: backend_types.Bulk
         .publish => .bulk_publish,
         .complete => .bulk_finish,
     };
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(phase), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(phase), .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_current_window.store(progress.publish_window, .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(progress.split_steps, .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(progress.deferred_leaf_splits, .monotonic);
@@ -3634,9 +3634,10 @@ fn denseLsmWriteStatsSnapshot(ctx: *AsyncContext, index_name: []const u8) ?hbc_m
 
 fn denseLsmWriteStatsDelta(after: hbc_mod.LsmWriteStats, before: hbc_mod.LsmWriteStats) hbc_mod.LsmWriteStats {
     var delta = after;
-    inline for (std.meta.fields(hbc_mod.LsmWriteStats)) |field| {
-        if (field.type == u64) {
-            @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name);
+    const info = @typeInfo(hbc_mod.LsmWriteStats).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        if (Field == u64) {
+            @field(delta, field_name) = @field(after, field_name) -| @field(before, field_name);
         }
     }
     return delta;
@@ -3765,7 +3766,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
         };
     }
 
-    const zpath = try alloc.dupeZ(u8, path);
+    const zpath = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(zpath);
 
     return switch (primaryStoreOpenPlan(opts)) {
@@ -3935,8 +3936,8 @@ pub const DB = struct {
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
-    managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
-    managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_requested: AtomicU64 = .init(0),
+    managed_admission_materialization_completed: AtomicU64 = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -20795,7 +20796,7 @@ pub const DB = struct {
         std.mem.writeInt(u64, out[16..24], marker.source_doc_count, .little);
         std.mem.writeInt(u64, out[24..32], marker.identity_generation, .little);
         std.mem.writeInt(u64, out[32..40], marker.replay_target_sequence, .little);
-        std.mem.writeInt(u64, out[40..48], @intFromEnum(marker.disposition), .little);
+        std.mem.writeInt(u64, out[40..48], @backingInt(marker.disposition), .little);
         return out;
     }
 
@@ -25663,7 +25664,7 @@ pub const DB = struct {
         var offset: usize = 0;
         inline for (.{
             index_status_magic,
-            @as(u64, @intFromEnum(status_snapshot.kind)),
+            @as(u64, @backingInt(status_snapshot.kind)),
             status_snapshot.doc_count,
             status_snapshot.term_count,
             status_snapshot.edge_count,
@@ -25685,11 +25686,11 @@ pub const DB = struct {
         const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const kind: types.IndexKind = switch (kind_raw) {
-            @intFromEnum(types.IndexKind.full_text) => .full_text,
-            @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-            @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-            @intFromEnum(types.IndexKind.graph) => .graph,
-            @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+            @backingInt(types.IndexKind.full_text) => .full_text,
+            @backingInt(types.IndexKind.dense_vector) => .dense_vector,
+            @backingInt(types.IndexKind.sparse_vector) => .sparse_vector,
+            @backingInt(types.IndexKind.graph) => .graph,
+            @backingInt(types.IndexKind.algebraic) => .algebraic,
             else => return error.InvalidIndexStatusSnapshot,
         };
         return .{
@@ -40565,7 +40566,7 @@ fn haMirrorSyncEnabled(mirror: HAAsyncEffectMirror) bool {
 
 fn recordHAMirrorGate(mirror: HAAsyncEffectMirror, gate: ha_commit_gate_mod.GateResult) void {
     if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
-    if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
+    if (mirror.last_gate_action) |last_action| last_action.store(@backingInt(gate.action), .release);
     switch (gate.action) {
         .acknowledge => {},
         .acknowledge_degraded => {
@@ -40923,7 +40924,7 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
         return error.ReplayDocumentNotVisible;
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(types.DenseCatchUpStats.Phase.replay), .monotonic);
     _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
     if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
@@ -40938,7 +40939,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
     if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
     if (active == 1) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
-        ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
+        ctx.stats.dense_catch_up.phase.store(@backingInt(types.DenseCatchUpStats.Phase.idle), .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_current_window.store(0, .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(0, .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(0, .monotonic);
@@ -42945,8 +42946,8 @@ fn replayPendingDerivedBatches(
             const resource_snapshot = if (manager) |value| value.snapshot() else null;
             const hbc_policy: resource_manager_mod.HbcCachePolicy = if (manager) |value| value.hbcCachePolicy() else .{};
             const retry_stats: resource_manager_mod.DerivedRecoverableRetryStats = if (manager) |value| value.derivedRecoverableRetryStats() else .{};
-            const hbc_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] else .{ .name = "hbc_node_metadata_cache" };
-            const dense_apply_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] else .{ .name = "dense_apply_working_set" };
+            const hbc_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] else .{ .name = "hbc_node_metadata_cache" };
+            const dense_apply_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] else .{ .name = "dense_apply_working_set" };
 
             std.log.warn(
                 "dense catch-up watchdog progress index={s} sequence={} target={} scanned={} applied={} delta_applied={} local_cache_gates={{nodes={},vectors={}}} shared_hbc={{target={},used={},peak={},soft={},hard={},node_protected={},quantized_protected={},vector_protected={},metadata_protected={},reclaim_requests={},reclaimed_bytes={}}}",
@@ -42984,13 +42985,13 @@ fn replayPendingDerivedBatches(
                     hbc_cache.vector.peak_bytes,
                     hbc_cache.vector.evictions,
                     hbc_cache.metadata.used_bytes,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].used_bytes else 0,
                     dense_apply_slice.used_bytes,
                     dense_apply_slice.peak_bytes,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
                     retry_stats.total,
                     retry_stats.not_found,
                     profile.insert_find_leaf_ns,
@@ -43252,7 +43253,7 @@ fn setDerivedCoverageOutcomes(
     for (outcomes) |transition| {
         if (seen.contains(transition.doc_key)) continue;
         try seen.put(alloc, transition.doc_key, {});
-        const target_index = @intFromEnum(transition.outcome);
+        const target_index = @backingInt(transition.outcome);
         const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, transition.doc_key);
         owned_marker_keys.append(alloc, marker_key) catch |err| {
             alloc.free(marker_key);
@@ -43268,7 +43269,7 @@ fn setDerivedCoverageOutcomes(
         } else null;
         if (existing_outcome == null or existing_outcome.? != transition.outcome) {
             if (existing_outcome) |previous| {
-                const previous_index = @intFromEnum(previous);
+                const previous_index = @backingInt(previous);
                 if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
                 counter_counts[previous_index] -= 1;
             }
@@ -43412,7 +43413,7 @@ fn deleteDerivedCoverageForDocKeys(
     defer unique_deletes.deinit(alloc);
 
     const outcomes = std.meta.tags(DerivedCoverageOutcome);
-    var removed_counts = [_]u64{0} ** outcomes.len;
+    var removed_counts = @as([outcomes.len]u64, @splat(0));
     for (doc_keys) |doc_key| {
         const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
         errdefer alloc.free(marker_key);
@@ -43427,7 +43428,7 @@ fn deleteDerivedCoverageForDocKeys(
         if (existing) |value| {
             defer alloc.free(value);
             const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
-            removed_counts[@intFromEnum(outcome)] +|= 1;
+            removed_counts[@backingInt(outcome)] +|= 1;
         }
         try deletes.append(alloc, marker_key);
         errdefer _ = deletes.pop();
@@ -43442,7 +43443,7 @@ fn deleteDerivedCoverageForDocKeys(
         return;
     }
 
-    var counter_keys: [outcomes.len]?[]u8 = .{null} ** outcomes.len;
+    var counter_keys: [outcomes.len]?[]u8 = @splat(null);
     defer for (counter_keys) |key| if (key) |value| alloc.free(value);
     var counter_values: [outcomes.len][8]u8 = undefined;
     var counter_writes: [outcomes.len]docstore_mod.KVPair = undefined;
@@ -48657,7 +48658,7 @@ const OpenedSplitDestinationStore = struct {
 };
 
 fn openSplitDestinationStore(self: *DB, dest_dir: []const u8) !OpenedSplitDestinationStore {
-    const dest_path_z = try self.alloc.dupeZ(u8, dest_dir);
+    const dest_path_z = try self.alloc.dupeSentinel(u8, dest_dir, 0);
     defer self.alloc.free(dest_path_z);
 
     return switch (splitDestinationStorePlan(self)) {
@@ -48847,7 +48848,7 @@ fn rebaseRangeCoverageMetadata(
                 generation: u64,
                 byte_range: types.ByteRange,
                 counts: [std.meta.tags(DerivedCoverageOutcome).len]u64 =
-                    [_]u64{0} ** std.meta.tags(DerivedCoverageOutcome).len,
+                    @as([std.meta.tags(DerivedCoverageOutcome).len]u64, @splat(0)),
 
                 fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                     const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
@@ -48861,7 +48862,7 @@ fn rebaseRangeCoverageMetadata(
                     if (!state.byte_range.contains(doc_key)) return .@"continue";
                     const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
                         return error.InvalidDerivedCoverageOutcome;
-                    const outcome_index = @intFromEnum(outcome);
+                    const outcome_index = @backingInt(outcome);
                     state.counts[outcome_index] = std.math.add(u64, state.counts[outcome_index], 1) catch
                         return error.InvalidDerivedCoverageCounter;
                     return .@"continue";
@@ -50289,7 +50290,7 @@ fn storeHasReplayRecordForHintAfter(
 
     var ctx = Context{};
     const stats = store.forEachReplayLaneFrom(
-        @intCast(@intFromEnum(hint)),
+        @intCast(@backingInt(hint)),
         from_sequence + 1,
         1,
         &ctx,
@@ -50335,7 +50336,7 @@ fn replayRangeHasManagedIndexApplicableRecord(
         .target_sequence = target_sequence,
     };
     _ = ctx.store.forEachReplayLaneFrom(
-        @intCast(@intFromEnum(managedIndexReplayHint(index_ref.kind))),
+        @intCast(@backingInt(managedIndexReplayHint(index_ref.kind))),
         from_sequence + 1,
         0,
         &scan_ctx,
@@ -52888,7 +52889,7 @@ fn reportReducedDbSplitSchedule(
 }
 
 fn randomDbSplitWriteSpec(random: std.Random) DbSplitSimDocSpec {
-    return @enumFromInt(random.uintLessThan(u8, 4));
+    return @fromBackingInt(@intCast(random.uintLessThan(u8, 4)));
 }
 
 fn buildDbSplitReplayActions(
@@ -63106,7 +63107,7 @@ test "db async document extraction accounts resource manager working set" {
     defer alloc.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)];
     try std.testing.expect(stats.peak_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
 }
@@ -74964,7 +74965,7 @@ test "storage.ha db waits for remote apply before completing derived enrichment"
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -75444,7 +75445,7 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
 }
 
@@ -75515,7 +75516,7 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
@@ -75605,7 +75606,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -75834,7 +75835,7 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), apply_failure.calls);
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
@@ -75921,7 +75922,7 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
     try std.testing.expectEqual(@as(usize, 2), remote_ack.calls);
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -76029,7 +76030,7 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
@@ -76228,7 +76229,7 @@ test "storage.ha db primary progress sync wait survives primary restart before a
         target_lsn = primary.lastLsn();
         try std.testing.expectEqual(@as(u64, 1), target_lsn);
         try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-        try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+        try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 
         const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
@@ -76319,7 +76320,7 @@ test "storage.ha db block sync policy surfaces wait provider errors" {
     try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 }
 
 test "storage.ha db fail-closed sync policy rejects before local batch commit" {
@@ -76371,7 +76372,7 @@ test "storage.ha db fail-closed sync policy rejects before local batch commit" {
     }));
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
     try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
 }
@@ -77401,7 +77402,7 @@ test "db catch-up advances vacuous derived replay target gap" {
         try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
         var batch = try db.core.store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(latest_key[0..], latest_raw[0..]);
@@ -77461,7 +77462,7 @@ test "db stats report projection checkpoint replay tail per index hint" {
         try db.core.store.ensureReplayNextSequenceAtLeast(dense_target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, dense_target_sequence, .little);
-        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
         var batch = try db.core.store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(latest_key[0..], latest_raw[0..]);
@@ -77633,7 +77634,7 @@ test "db catch-up defers artifact dense target advance without durable counter" 
     try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
     var latest_raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
     var batch = try db.core.store.beginWriteBatch();
     errdefer batch.abort();
     try batch.put(latest_key[0..], latest_raw[0..]);
@@ -81423,7 +81424,7 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -81494,7 +81495,7 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ std.mem.span(path), cfg.name });
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -81662,7 +81663,7 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
 
     const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_index_path);
-    const dense_index_path_z = try alloc.dupeZ(u8, dense_index_path);
+    const dense_index_path_z = try alloc.dupeSentinel(u8, dense_index_path, 0);
     defer alloc.free(dense_index_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_index_path_z, .{
@@ -81851,7 +81852,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -81963,7 +81964,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -82149,7 +82150,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -82290,7 +82291,7 @@ test "db durable root incarnation follows the physical root rather than visibili
     defer transition.deinit();
     var staged = try transition.beginStaging();
     defer staged.deinit();
-    const retired_path = try alloc.dupeZ(u8, staged.path());
+    const retired_path = try alloc.dupeSentinel(u8, staged.path(), 0);
     defer {
         cleanupTempDir(retired_path);
         alloc.free(retired_path);
@@ -82412,7 +82413,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -82538,7 +82539,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
 
     const active_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ std.mem.span(path), cfg.name });
     defer alloc.free(active_path);
-    const active_path_z = try alloc.dupeZ(u8, active_path);
+    const active_path_z = try alloc.dupeSentinel(u8, active_path, 0);
     defer alloc.free(active_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, active_path_z, .{
@@ -82606,7 +82607,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
 
     // A yielded building candidate has no incomplete-publication marker and is
     // independently reopenable before the next process resumes its cursor.
-    const candidate_path_z = try alloc.dupeZ(u8, candidate_path);
+    const candidate_path_z = try alloc.dupeSentinel(u8, candidate_path, 0);
     defer alloc.free(candidate_path_z);
     {
         var candidate = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, candidate_path_z, .{
@@ -82853,7 +82854,7 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
 
 test "index repair inspection window is bounded and rotates fairly" {
     const candidate_count = 257;
-    var seen = [_]bool{false} ** candidate_count;
+    var seen = @as([candidate_count]bool, @splat(false));
     var cursor: u64 = 0;
     var pass: usize = 0;
     while (pass < 33) : (pass += 1) {
@@ -84823,7 +84824,7 @@ test "db dense repair defers before candidate creation when node admission is ex
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -84835,7 +84836,7 @@ test "db dense repair defers before candidate creation when node admission is ex
     }
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 2 * 1024 * 1024,
         .hard_limit_bytes = 4 * 1024 * 1024,
     };
@@ -85371,7 +85372,7 @@ test "db repair replay pin applies hard-pressure write backpressure" {
     defer cleanupTempDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
@@ -86205,7 +86206,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     // can therefore exercise the rollback/retry ownership handoff.
     const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(path), candidate_relative_path.? });
     defer alloc.free(candidate_path);
-    const candidate_path_z = try alloc.dupeZ(u8, candidate_path);
+    const candidate_path_z = try alloc.dupeSentinel(u8, candidate_path, 0);
     defer alloc.free(candidate_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, candidate_path_z, .{
@@ -87619,7 +87620,7 @@ test "db malformed quarantined dense config does not block healthy artifact coun
 test "db dense repair working set scales batch to resource budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 12 * 1024 * 1024,
         .hard_limit_bytes = 16 * 1024 * 1024,
     };
@@ -87642,7 +87643,7 @@ test "db dense repair working set scales batch to resource budget" {
 test "db dense counter bootstrap admission respects soft background budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 12 * 1024 * 1024,
         .hard_limit_bytes = 16 * 1024 * 1024,
     };
@@ -92797,12 +92798,12 @@ test "db best effort force compact leaves text merge debt under pressure" {
     const table_schema_api = @import("../../schema/mod.zig");
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -92889,12 +92890,12 @@ test "db runUntilIdle defers full text merge pressure without failing" {
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .reject_work,
     };
@@ -96879,7 +96880,7 @@ fn printDenseStreamingQualificationDiagnostics(db: *DB, docs_written: usize, mem
             );
             for (stats.active_readers_by_kind, 0..) |count, kind_index| {
                 if (count == 0) continue;
-                const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(kind_index);
+                const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(kind_index));
                 std.debug.print(
                     "dense_streaming_qualification_lsm_reader owner={s} kind={s} count={d}\n",
                     .{ label, lsm_backend_mod.readerPinKindName(kind), count },
@@ -97629,7 +97630,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x5a} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x5a);
     const participant = "table:receipts:group:7";
     const begin_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 11 };
     const prepare_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 12 };
@@ -97708,7 +97709,7 @@ test "db raced replicated transaction completion persists receipt and participan
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x6b);
     const participant = "table:receipts:group:8";
     _ = try db.beginReplicatedTransactionAtRaftEntry(
         txn_id,
@@ -98088,7 +98089,7 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
             break :blk_key key;
         };
         var record_value: [33]u8 = undefined;
-        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        record_value[0] = @backingInt(transactions_mod.TxnStatus.committed);
         std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
         std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
         std.mem.writeInt(u64, record_value[17..25], 1_000, .little);

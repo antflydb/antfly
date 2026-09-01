@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         // setup itself terminates the process, CI still identifies the test
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (trace_cleanup) std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
         testing.io_instance.deinit();
         if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
-        if (testing.allocator_instance.deinit() == .leak) {
+        if (testing.allocator_instance.deinit() != 0) {
             leak_count += 1;
         }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
@@ -286,7 +286,7 @@ pub fn log(
     args: anytype,
 ) void {
     @disableInstrumentation();
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         _ = log_err_count.fetchAdd(1, .monotonic);
     }
     std.debug.print("[{s}] ({s}): ", .{

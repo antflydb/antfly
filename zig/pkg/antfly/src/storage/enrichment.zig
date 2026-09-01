@@ -332,7 +332,7 @@ pub const EnrichmentStatus = enum(u8) {
 pub fn writeEnrichmentStatus(store: *DocStore, key: []const u8, suffix: []const u8, status: EnrichmentStatus) !void {
     var buf: [1024]u8 = undefined;
     const full_key = makeFullKey(&buf, key, suffix);
-    const val = [_]u8{@intFromEnum(status)};
+    const val = [_]u8{@backingInt(status)};
     try store.put(full_key, &val);
 }
 
@@ -346,7 +346,7 @@ pub fn readEnrichmentStatus(store: *DocStore, alloc: Allocator, key: []const u8,
     };
     defer alloc.free(val);
     if (val.len < 1) return null;
-    return @enumFromInt(val[0]);
+    return @fromBackingInt(@intCast(val[0]));
 }
 
 /// Mark a key as permanently unenrichable (dud).

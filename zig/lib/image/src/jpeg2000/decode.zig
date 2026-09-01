@@ -130,7 +130,7 @@ pub const Jp2ColorMetadata = struct {
     /// Indexed by codestream component. Five is the maximum component count
     /// accepted by the U8 decoder, so metadata remains allocation-free after
     /// the JP2 box parser returns.
-    channel_definitions: [5]?box.ChannelDefinition = .{null} ** 5,
+    channel_definitions: [5]?box.ChannelDefinition = @splat(null),
 
     pub const AlphaLayout = struct {
         color_count: u8,
@@ -189,7 +189,7 @@ pub const Jp2ColorMetadata = struct {
         }
         const alpha_index = alpha orelse return null;
 
-        var used = [_]bool{false} ** 5;
+        var used = @as([5]bool, @splat(false));
         used[alpha_index] = true;
         for (color_indexes[0..color_count]) |maybe_index| {
             if (maybe_index) |index| {

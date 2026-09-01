@@ -2922,7 +2922,7 @@ test "embedAudioPcm falls back under the execution gate without re-entry" {
         .audio_session = fake.session(),
     };
 
-    const samples = [_]f32{0.0} ** 1024;
+    const samples = @as([1024]f32, @splat(0.0));
     const clips = [_]audio.PcmAudio{
         .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
         .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },

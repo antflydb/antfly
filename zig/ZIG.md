@@ -1,8 +1,53 @@
 # Zig Notes
 
-## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
+## 2026-08-29: Zig 0.17 nightly migration
 
-This repo's embedded Antfly inference wasm build currently targets `wasm32-freestanding`.
+The repository's canonical Zig version and archive checksums live in
+[`toolchain.env`](toolchain.env). Nightly archives
+come from `https://ziglang.org/builds/`, rather than the stable-release download
+directory.
+
+The migration includes the Zig 0.17 build-system argument API, parallel-array
+type reflection, splat-based array initialization, sentinel allocation and
+formatting APIs, the current `std.Io` networking operation interface, and
+build-system `translate-c` modules replacing the removed `@cImport` builtin.
+
+Use that exact compiler for repository builds so local results match CI and the
+container/release toolchains.
+
+### WASM on Zig 0.17
+
+The unified embedded database and inference target now builds with the stock
+toolchain and is covered by the root build:
+
+```sh
+cd zig
+zig build wasm
+```
+
+It targets `wasm32-wasi` and ships a browser-safe WASI Preview 1 import shim.
+The shim supplies clocks, entropy, and diagnostics but deliberately does not
+emulate a host filesystem. Embedded databases use their configured storage
+backend, and WASI follows the same hostless/manual-runtime paths as the former
+freestanding build. No local Zig stdlib patch is required.
+
+The standalone inference artifact uses the same supported wasm32 target:
+
+```sh
+cd zig/pkg/inference
+zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm
+```
+
+The experimental wasm64 target remains freestanding because Zig 0.17 does not
+ship a wasm64 WASI libc; it still requires the historical local stdlib
+workaround described below.
+
+## Historical: freestanding wasm stdlib breakage in Zig 0.16
+
+The remainder of this section records the obsolete Zig 0.16 investigation. It
+is retained as upstream context; it does not describe the current build.
+
+The embedded Antfly inference wasm build targeted `wasm32-freestanding`.
 While working on the `go/pkg/termite` wasm32/wasm64 split, the build hit a set of
 upstream Zig stdlib issues before repo codegen/typechecking could complete.
 

@@ -63,7 +63,7 @@ pub const ConfChange = struct {
 
     pub fn encode(self: ConfChange, alloc: Allocator) ![]u8 {
         const out = try alloc.alloc(u8, 9);
-        out[0] = @intFromEnum(self.change_type);
+        out[0] = @backingInt(self.change_type);
         std.mem.writeInt(u64, out[1..9], self.node_id, .little);
         return out;
     }
@@ -71,9 +71,9 @@ pub const ConfChange = struct {
     pub fn decode(data: []const u8) !ConfChange {
         if (data.len != 9) return error.InvalidConfChangeEncoding;
         const change_tag = switch (data[0]) {
-            @intFromEnum(ConfChangeType.add_node) => ConfChangeType.add_node,
-            @intFromEnum(ConfChangeType.remove_node) => ConfChangeType.remove_node,
-            @intFromEnum(ConfChangeType.add_learner_node) => ConfChangeType.add_learner_node,
+            @backingInt(ConfChangeType.add_node) => ConfChangeType.add_node,
+            @backingInt(ConfChangeType.remove_node) => ConfChangeType.remove_node,
+            @backingInt(ConfChangeType.add_learner_node) => ConfChangeType.add_learner_node,
             else => return error.InvalidConfChangeEncoding,
         };
         return .{
@@ -114,12 +114,12 @@ pub const ConfChangeV2 = struct {
         const out = try alloc.alloc(u8, header_len + changes_len + context_len);
 
         out[0] = 2;
-        out[1] = @intFromEnum(self.transition);
+        out[1] = @backingInt(self.transition);
         std.mem.writeInt(u32, out[2..6], @intCast(self.changes.len), .little);
 
         var cursor: usize = 6;
         for (self.changes) |change| {
-            out[cursor] = @intFromEnum(change.change_type);
+            out[cursor] = @backingInt(change.change_type);
             cursor += 1;
             writeIntAt(u64, out, cursor, change.node_id);
             cursor += 8;
@@ -136,9 +136,9 @@ pub const ConfChangeV2 = struct {
         if (data[0] != 2) return error.InvalidConfChangeEncoding;
 
         const transition = switch (data[1]) {
-            @intFromEnum(ConfChangeTransition.auto) => ConfChangeTransition.auto,
-            @intFromEnum(ConfChangeTransition.joint_explicit) => ConfChangeTransition.joint_explicit,
-            @intFromEnum(ConfChangeTransition.joint_implicit) => ConfChangeTransition.joint_implicit,
+            @backingInt(ConfChangeTransition.auto) => ConfChangeTransition.auto,
+            @backingInt(ConfChangeTransition.joint_explicit) => ConfChangeTransition.joint_explicit,
+            @backingInt(ConfChangeTransition.joint_implicit) => ConfChangeTransition.joint_implicit,
             else => return error.InvalidConfChangeEncoding,
         };
 
@@ -152,9 +152,9 @@ pub const ConfChangeV2 = struct {
         for (changes, 0..) |*change, i| {
             _ = i;
             change.change_type = switch (data[cursor]) {
-                @intFromEnum(ConfChangeType.add_node) => .add_node,
-                @intFromEnum(ConfChangeType.remove_node) => .remove_node,
-                @intFromEnum(ConfChangeType.add_learner_node) => .add_learner_node,
+                @backingInt(ConfChangeType.add_node) => .add_node,
+                @backingInt(ConfChangeType.remove_node) => .remove_node,
+                @backingInt(ConfChangeType.add_learner_node) => .add_learner_node,
                 else => return error.InvalidConfChangeEncoding,
             };
             cursor += 1;

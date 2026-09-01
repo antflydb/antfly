@@ -1,19 +1,22 @@
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS zig
 
-ARG ZIG_VERSION=0.16.0
 ARG BUILDARCH
 
 RUN apk add --no-cache curl xz
+COPY zig/toolchain.env /tmp/zig-toolchain.env
 
-RUN case "${BUILDARCH}" in \
-        amd64) zig_arch="x86_64" ;; \
-        arm64) zig_arch="aarch64" ;; \
+RUN . /tmp/zig-toolchain.env && \
+    case "${BUILDARCH}" in \
+        amd64) zig_arch="x86_64"; zig_sha256="${ZIG_X86_64_LINUX_SHA256}" ;; \
+        arm64) zig_arch="aarch64"; zig_sha256="${ZIG_AARCH64_LINUX_SHA256}" ;; \
         *) echo "unsupported BUILDARCH=${BUILDARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    curl --fail --location --retry 3 "https://ziglang.org/builds/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    echo "${zig_sha256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     mkdir -p /opt && \
     tar -xJf /tmp/zig.tar.xz -C /opt && \
-    mv /opt/zig-${zig_arch}-linux-${ZIG_VERSION} /opt/zig
+    mv /opt/zig-${zig_arch}-linux-${ZIG_VERSION} /opt/zig && \
+    rm /tmp/zig.tar.xz /tmp/zig-toolchain.env
 
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 

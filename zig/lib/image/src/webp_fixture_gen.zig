@@ -41,8 +41,8 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(vp8l);
     try writeAndDescribe(alloc, io, out_root, "lossless/literal-rgba-2x3.webp", vp8l);
 
-    const first_partition = [_]u8{0} ** 200;
-    const token_partition = [_]u8{0} ** 64;
+    const first_partition = @as([200]u8, @splat(0));
+    const token_partition = @as([64]u8, @splat(0));
     const vp8 = try buildVp8Webp(alloc, 1, 1, &first_partition, &.{&token_partition});
     defer alloc.free(vp8);
     try writeAndDescribe(alloc, io, out_root, "lossy/minimal-vp8-1x1.webp", vp8);

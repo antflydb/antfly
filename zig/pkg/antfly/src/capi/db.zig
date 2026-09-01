@@ -54,7 +54,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
@@ -62,7 +62,7 @@ fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
     defer alloc.free(base);
     const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 const Handle = struct {
@@ -394,7 +394,7 @@ const JsonSplitState = struct {
 
     fn init(alloc: Allocator, state: db_mod.types.SplitState) !JsonSplitState {
         return .{
-            .phase = @intFromEnum(state.phase),
+            .phase = @backingInt(state.phase),
             .split_key_b64 = try dupBase64(alloc, state.split_key),
             .new_shard_id = state.new_shard_id,
             .started_at = state.started_at,
@@ -1700,8 +1700,8 @@ fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type
 }
 
 fn optionHasField(comptime Options: type, comptime field_name: []const u8) bool {
-    inline for (std.meta.fields(Options)) |field| {
-        if (std.mem.eql(u8, field.name, field_name)) return true;
+    inline for (@typeInfo(Options).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, name, field_name)) return true;
     }
     return false;
 }
@@ -2725,7 +2725,7 @@ fn encodeResolvedDenseWireResponse(
     cursor += 4;
     std.mem.writeInt(u16, out[cursor..][0..2], search_wire.version, .little);
     cursor += 2;
-    std.mem.writeInt(u16, out[cursor..][0..2], @intFromEnum(search_wire.Op.dense_search), .little);
+    std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(search_wire.Op.dense_search), .little);
     cursor += 2;
     std.mem.writeInt(u32, out[cursor..][0..4], resolved.total_hits, .little);
     cursor += 4;
@@ -3293,7 +3293,7 @@ pub export fn antfly_db_get_transaction_status(
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
-    out.* = @intFromEnum(status);
+    out.* = @backingInt(status);
     return .ok;
 }
 
@@ -6619,7 +6619,7 @@ test "capi transaction lifecycle" {
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_begin_transaction_with_id(handle_ptr, null, 1_000, null, 0));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_write_transaction(handle_ptr, null, null, 0, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, &txn_id, null));
     var reset_status: u8 = 99;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, null, &reset_status));
@@ -6639,11 +6639,11 @@ test "capi transaction lifecycle" {
         },
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(handle_ptr, &txn_id, &writes, writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
 
     var status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(handle_ptr, &txn_id, &status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), status);
 
     var commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(handle_ptr, &txn_id, &commit_version));
@@ -6785,10 +6785,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_file_path);
 
     try std.testing.expectEqual(@as(u32, 1), antfly_abi_version());
-    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
-    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.ok))));
+    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.invalid_argument))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@backingInt(capi.ErrorCode.busy))), "writer") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
     try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
@@ -7141,10 +7141,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .is_delete = false,
     }};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(src_handle, &lite_txn_id, &txn_writes, txn_writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 4_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @backingInt(transactions_mod.TxnStatus.committed), 4_000));
     var lite_txn_status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(src_handle, &lite_txn_id, &lite_txn_status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), lite_txn_status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), lite_txn_status);
     var lite_txn_commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(src_handle, &lite_txn_id, &lite_txn_commit_version));
     try std.testing.expectEqual(@as(u64, 4_000), lite_txn_commit_version);
@@ -7366,7 +7366,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -7615,7 +7615,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .profile = 99,
         .flags = std.math.maxInt(u32),
         .reserved0 = 1,
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
@@ -7633,7 +7633,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .flags = std.math.maxInt(u32),
         .map_size = std.math.maxInt(u64),
         .ttl_cleanup_enabled = true,
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_options_init(&defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.LiteOpenOptions)), defaults.abi_size);
@@ -7659,7 +7659,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .open_mode = capi.lite_open_mode_readonly,
         .profile = capi.lite_profile_native,
         .flags = std.math.maxInt(u32),
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
@@ -8079,7 +8079,7 @@ test "capi request paths trigger readable lease hook" {
     cleanupTestDir(path);
 
     const Recorder = struct {
-        contexts: [9][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 9,
+        contexts: [9][32]u8 = @as([9][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         group_ids: [9]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         count: usize = 0,

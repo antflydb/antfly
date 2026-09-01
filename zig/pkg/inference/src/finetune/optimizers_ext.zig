@@ -587,10 +587,10 @@ test "Muon NS singular values land in Keller-Jordan stability basin" {
     // Well-conditioned starting point (near-orthogonal) so the test isn't
     // dominated by initial-condition variance.
     var x: [16]f32 = .{
-        1.0,  0.05, -0.02, 0.03,
-        0.04, 1.0,  0.06,  -0.01,
-        -0.03, 0.02, 1.0,  0.05,
-        0.01, -0.04, 0.03, 1.0,
+        1.0,   0.05,  -0.02, 0.03,
+        0.04,  1.0,   0.06,  -0.01,
+        -0.03, 0.02,  1.0,   0.05,
+        0.01,  -0.04, 0.03,  1.0,
     };
 
     try newtonSchulz(allocator, &x, n, n, 5);
@@ -661,8 +661,8 @@ test "8-bit AdamW approximates fp32 AdamW" {
     defer state8.deinit();
 
     // Reference fp32 Adam state.
-    var m32: [64]f32 = [_]f32{0} ** 64;
-    var v32: [64]f32 = [_]f32{0} ** 64;
+    var m32: [64]f32 = @as([64]f32, @splat(0));
+    var v32: [64]f32 = @as([64]f32, @splat(0));
 
     const lr: f32 = 0.001;
     const steps: u32 = 10;

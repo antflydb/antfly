@@ -66,6 +66,8 @@ pub const WalCheckpointRetryReason = enum(u8) {
 };
 
 const supports_waitable_immutable_flush = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
@@ -277,7 +279,7 @@ pub const ReaderPinKind = enum(u8) {
     other,
 };
 
-pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".fields.len;
+pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".field_names.len;
 
 pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
     return switch (kind) {
@@ -292,7 +294,7 @@ pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
 }
 
 fn readerPinKindIndex(kind: ReaderPinKind) usize {
-    return @intFromEnum(kind);
+    return @backingInt(kind);
 }
 
 pub const MutableSnapshotCloneReasonStats = background_runtime_mod.LsmMutableSnapshotCloneReasonStats;
@@ -322,11 +324,11 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
 }
 
 fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
-    return @intFromEnum(reason);
+    return @backingInt(reason);
 }
 
 fn activeReaderKindStats(active_readers_by_kind: [reader_pin_kind_count]usize) [reader_pin_kind_count]u64 {
-    var stats: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count;
+    var stats: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0));
     for (active_readers_by_kind, 0..) |active, i| stats[i] = @intCast(active);
     return stats;
 }
@@ -400,7 +402,7 @@ pub const Options = struct {
     recovery_scratch_retained_cap_bytes: usize = wal_mod.default_replay_scratch_retained_cap_bytes,
     cursor_scratch_retained_cap_bytes: usize = 1 * 1024 * 1024,
     compaction_scratch_retained_cap_bytes: usize = 4 * 1024 * 1024,
-    io_runtime: storage_io.RuntimeKind = .threaded,
+    io_runtime: storage_io.Runtime = .threaded,
     read_runtime: ?storage_io.ReadRuntime = null,
     native_storage_pool: ?*storage_io.NativeStoragePool = null,
     storage: ?storage_io.Storage = null,
@@ -458,7 +460,7 @@ fn writePressureDuringBulkIngestEnvEnabled() bool {
     return true;
 }
 
-pub const IoRuntime = storage_io.RuntimeKind;
+pub const IoRuntime = storage_io.Runtime;
 pub const Storage = storage_io.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const NativeStorageStats = storage_io.NativeStorageStats;
@@ -649,7 +651,7 @@ pub const Backend = struct {
     };
 
     pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
-        if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+        if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
         dst.started +|= src.started;
         dst.completed +|= src.completed;
         dst.failed +|= src.failed;
@@ -779,7 +781,7 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
-        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
         bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -826,8 +828,8 @@ pub const Backend = struct {
         obsolete_delete_failures: u64 = 0,
         obsolete_delete_retries: u64 = 0,
         active_readers: u64 = 0,
-        active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
-        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
+        active_readers_by_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
+        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
@@ -965,7 +967,7 @@ pub const Backend = struct {
             (!dst_wal_checkpoint_pending or
                 src.wal_checkpoint_retry_delay_ns < dst.wal_checkpoint_retry_delay_ns or
                 (src.wal_checkpoint_retry_delay_ns == dst.wal_checkpoint_retry_delay_ns and
-                    (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason) or
+                    (@backingInt(src.wal_checkpoint_retry_reason) > @backingInt(dst.wal_checkpoint_retry_reason) or
                         (src.wal_checkpoint_retry_reason == dst.wal_checkpoint_retry_reason and
                             src.wal_checkpoint_retry_attempts > dst.wal_checkpoint_retry_attempts))));
         if (src_retry_precedes) {
@@ -1008,11 +1010,11 @@ pub const Backend = struct {
     }
 
     pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
-        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
-                @field(dst, field.name) |= @field(src, field.name);
+        inline for (@typeInfo(WriteStats).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "table_file_compression_codec_mask")) {
+                @field(dst, field_name) |= @field(src, field_name);
             } else {
-                @field(dst, field.name) +|= @field(src, field.name);
+                @field(dst, field_name) +|= @field(src, field_name);
             }
         }
     }
@@ -1458,7 +1460,7 @@ pub const Backend = struct {
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
-    active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
+    active_readers_by_kind: [reader_pin_kind_count]usize = @as([reader_pin_kind_count]usize, @splat(0)),
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
     obsolete_manifest_dirty: bool = false,
@@ -1505,7 +1507,7 @@ pub const Backend = struct {
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
-    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
     bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -4048,7 +4050,7 @@ pub const Backend = struct {
         self.obsolete_manifest_dirty = false;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !u64 {
         try validateRunLayoutForManifest(runs);
         const bytes = try repository_mod.persistManifestWithStorageCount(
             self.storage.?,
@@ -5223,7 +5225,7 @@ pub const Backend = struct {
                     self.wal_checkpoint_retry_deadline_ns,
                     candidate_deadline_ns,
                 );
-                if (@intFromEnum(reason) > @intFromEnum(self.wal_checkpoint_retry_reason)) {
+                if (@backingInt(reason) > @backingInt(self.wal_checkpoint_retry_reason)) {
                     self.wal_checkpoint_retry_reason = reason;
                 }
             }
@@ -7480,7 +7482,7 @@ test "lsm backend resource manager throttles projected immutable state" {
     try std.testing.expect(one_memtable_bytes > 0);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
         .hard_limit_bytes = one_memtable_bytes * 3,
     };
@@ -7525,7 +7527,7 @@ test "lsm backend does not wait on aggregate soft pressure owned elsewhere" {
     try std.testing.expect(incoming_bytes > 0);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = incoming_bytes + incoming_bytes / 2,
         .hard_limit_bytes = incoming_bytes * 4,
     };
@@ -7561,7 +7563,7 @@ test "lsm backend rejects aggregate hard throttle without waiting" {
     try std.testing.expect(incoming_bytes > 0);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = incoming_bytes,
         .hard_limit_bytes = incoming_bytes + incoming_bytes / 2,
     };
@@ -7595,12 +7597,12 @@ test "lsm backend resource manager rejects before wal apply" {
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = one_memtable_bytes,
         .hard_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
+    policies[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .policies = policies });
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -9835,7 +9837,7 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     var txn = try backend.beginWrite();
     try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
     try txn.commit();
@@ -9873,7 +9875,7 @@ test "lsm backend preserves logical flush sizing with an actual memory guard" {
     var mutable: ActiveMemTable = .{};
     defer mutable.deinit(std.testing.allocator);
 
-    const value = [_]u8{'x'} ** (256 * 1024);
+    const value = @as([(256 * 1024)]u8, @splat('x'));
     for (0..8) |i| {
         // Replacements leave the superseded value in the arena until the
         // memtable is released, while the logical state remains one entry.
@@ -9901,7 +9903,7 @@ test "lsm backend probe owns immutable point values without retaining generation
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -9943,7 +9945,7 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     });
     defer backend.close();
 
-    const value_a = [_]u8{'a'} ** 300;
+    const value_a = @as([300]u8, @splat('a'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:a", value_a[0..]);
@@ -9963,7 +9965,7 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     try std.testing.expectEqual(retired_bytes, retired_stats.retired_immutable_bytes);
     try std.testing.expectEqual(@as(u64, 1), retired_stats.immutable_pinned_generations);
 
-    const value_b = [_]u8{'b'} ** 300;
+    const value_b = @as([300]u8, @splat('b'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:b", value_b[0..]);
@@ -10221,7 +10223,7 @@ test "lsm backend read snapshot keeps immutable data visible after flush" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -10254,7 +10256,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -10716,7 +10718,7 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -10794,7 +10796,7 @@ test "lsm backend background io budget defers scheduled compaction" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -10833,7 +10835,7 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -10869,7 +10871,7 @@ test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -10890,7 +10892,7 @@ test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
 
 test "lsm backend compaction scheduler reserves resource-manager work budget" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
@@ -13883,7 +13885,7 @@ test "lsm backend replay scan serves run data blocks transiently" {
     defer runtime.deinit();
 
     const lane: u8 = 7;
-    const payload = "x" ** 1024;
+    const payload = &@as([1024]u8, @splat('x'));
     {
         var write = try runtime.beginWrite();
         for (1..97) |sequence| {
@@ -17534,7 +17536,7 @@ test "lsm backend shard rewrites preserve the configured physical run cap" {
         defer runtime.deinit();
         var txn = try runtime.beginRead();
         defer txn.abort();
-        try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:079"));
+        try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:079"));
         try std.testing.expectError(error.NotFound, txn.get("doc:000"));
     }
 
@@ -17547,7 +17549,7 @@ test "lsm backend shard rewrites preserve the configured physical run cap" {
     defer runtime.deinit();
     var txn = try runtime.beginRead();
     defer txn.abort();
-    try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:000"));
+    try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:000"));
     try std.testing.expectError(error.NotFound, txn.get("doc:079"));
 }
 

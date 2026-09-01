@@ -1044,13 +1044,13 @@ fn sourcePlanDigest(sources: []const Source) [Sha256.digest_length]u8 {
             hash.update("file\x00");
             hashFramed(&hash, file.source_path);
             hashFramed(&hash, file.artifact_path);
-            hashInt(&hash, @intFromEnum(file.kind));
+            hashInt(&hash, @backingInt(file.kind));
         },
         .tree => |tree| {
             hash.update("tree\x00");
             hashFramed(&hash, tree.source_root);
             hashFramed(&hash, tree.artifact_prefix);
-            hashInt(&hash, @intFromEnum(tree.kind));
+            hashInt(&hash, @backingInt(tree.kind));
         },
     };
     var out: [Sha256.digest_length]u8 = undefined;
@@ -1286,8 +1286,8 @@ fn testPrimaryPaths(alloc: Allocator, root: []const u8, label: []const u8) !Test
     const slots_raw = try std.fmt.allocPrint(alloc, "{s}/{s}.slots", .{ root, label });
     defer alloc.free(slots_raw);
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
     };
 }
 

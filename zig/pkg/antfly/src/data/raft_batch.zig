@@ -221,7 +221,7 @@ test "raft batch round trips internal split replication identity" {
 }
 
 test "raft batch round trips deterministic transaction begin" {
-    const txn_id: db_mod.types.TxnId = .{1} ** 16;
+    const txn_id: db_mod.types.TxnId = @splat(1);
     const encoded = try encode(std.testing.allocator, "docs", .{
         .transaction = .{ .begin = .{
             .txn_id = txn_id,

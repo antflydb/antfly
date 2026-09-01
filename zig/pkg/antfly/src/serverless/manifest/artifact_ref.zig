@@ -39,6 +39,6 @@ pub const ArtifactRef = struct {
 };
 
 test "manifest artifact kinds include lake-native artifacts" {
-    try @import("std").testing.expectEqual(@as(u8, 9), @intFromEnum(ArtifactKind.row_fragment));
-    try @import("std").testing.expectEqual(@as(u8, 11), @intFromEnum(ArtifactKind.algebraic_segment));
+    try @import("std").testing.expectEqual(@as(u8, 9), @backingInt(ArtifactKind.row_fragment));
+    try @import("std").testing.expectEqual(@as(u8, 11), @backingInt(ArtifactKind.algebraic_segment));
 }

@@ -1373,7 +1373,7 @@ fn ensureNodeAsDType(
     errdefer alloc.free(attrs);
     attrs[0] = .{
         .name = "to",
-        .i = @intCast(@intFromEnum(termiteDTypeToOnnx(target_dtype))),
+        .i = @intCast(@backingInt(termiteDTypeToOnnx(target_dtype))),
         .attr_type = .int,
     };
     const node_inputs = try alloc.alloc([]const u8, inps.len);
@@ -2198,13 +2198,13 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
             alloc,
             "Cast",
             "to",
-            @as(i64, @intCast(@intFromEnum(termiteDTypeToOnnx(n.output_shape.dtype)))),
+            @as(i64, @intCast(@backingInt(termiteDTypeToOnnx(n.output_shape.dtype)))),
         ),
         .fused_to_float32 => try intAttrOp(
             alloc,
             "Cast",
             "to",
-            @as(i64, @intCast(@intFromEnum(DataType.float32))),
+            @as(i64, @intCast(@backingInt(DataType.float32))),
         ),
 
         // Fused attention
@@ -2322,7 +2322,7 @@ fn convOp(alloc: Allocator, a: ml.graph.node.ConvAttrs) !OpMapping {
 
 fn castOp(alloc: Allocator, a: ml.graph.node.ConvertDTypeAttrs) !OpMapping {
     const onnx_dt = termiteDTypeToOnnx(a.target);
-    return intAttrOp(alloc, "Cast", "to", @as(i64, @intCast(@intFromEnum(onnx_dt))));
+    return intAttrOp(alloc, "Cast", "to", @as(i64, @intCast(@backingInt(onnx_dt))));
 }
 
 fn normOp(alloc: Allocator, op_type: []const u8, a: ml.graph.node.NormAttrs) !OpMapping {
@@ -3146,7 +3146,7 @@ test "exportGraphWithExternalData emits q8_0 block parameter via DequantizeLinea
     const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 2, 32 }));
     try graph.markOutput(weight);
 
-    const values = [_]u8{128} ** 64;
+    const values = @as([64]u8, @splat(128));
     const scales = [_]f32{ 0.25, 0.5 };
     const init = ParameterInitializer{
         .name = "weight",
@@ -3211,7 +3211,7 @@ test "exportGraph rejects inline q8_0 block parameter initializers" {
     const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 1, 32 }));
     try graph.markOutput(weight);
 
-    const values = [_]u8{128} ** 32;
+    const values = @as([32]u8, @splat(128));
     const scales = [_]f32{0.25};
     const init = ParameterInitializer{
         .name = "weight",

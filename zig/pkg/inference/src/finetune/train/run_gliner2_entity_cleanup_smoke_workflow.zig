@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     const train_split = if (std.mem.eql(u8, train_split_arg, "none")) null else train_split_arg;
     const eval_split = if (std.mem.eql(u8, eval_split_arg, "none")) null else eval_split_arg;
 
-    try compat.cwd().createDirPath(compat.io(), output_root);
+    try std.Io.Dir.cwd().createDirPath(init.io, output_root);
     const train_cache_path = try std.fs.path.join(allocator, &.{ output_root, "train_cleanup_cache.json" });
     defer allocator.free(train_cache_path);
     const eval_cache_path = try std.fs.path.join(allocator, &.{ output_root, "eval_cleanup_cache.json" });
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     const run_status_path = try std.fs.path.join(allocator, &.{ output_root, "run_status.json" });
     defer allocator.free(run_status_path);
 
-    try artifact_writer.writeJsonFile(allocator, training_config_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, training_config_path, .{
         .contract_version = run_contract.training_config_version,
         .artifact_family_version = gliner2.artifact_family_version,
         .task = "gliner2_entity_cleanup_smoke_workflow",
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .output_root = output_root,
     });
-    try artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "running",
         .task = "gliner2_entity_cleanup_smoke_workflow",
@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
             .final = materialized_dir,
         },
     });
-    errdefer artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    errdefer artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "failed",
         .task = "gliner2_entity_cleanup_smoke_workflow",
@@ -228,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
     var trained_inspect = try gliner2.inspectLoRABundle(allocator, model_dir, trained_dir);
     defer gliner2.freeLoRABundleInspectionSummary(allocator, &trained_inspect);
 
-    var materialize = try gliner2.materializeMergedModel(allocator, model_dir, trained_dir, materialized_dir);
+    var materialize = try gliner2.materializeMergedModel(allocator, init.io, model_dir, trained_dir, materialized_dir);
     defer freeMaterializeSummary(allocator, &materialize);
 
     var summary = WorkflowSummary{
@@ -262,8 +262,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer freeWorkflowSummary(allocator, &summary);
 
-    try artifact_writer.writeJsonFile(allocator, workflow_report_path, summary);
-    try artifact_writer.writeJsonFile(allocator, training_report_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, workflow_report_path, summary);
+    try artifact_writer.writeJsonFile(allocator, init.io, training_report_path, .{
         .contract_version = run_contract.training_report_version,
         .artifact_family_version = gliner2.artifact_family_version,
         .task = "gliner2_entity_cleanup_smoke_workflow",
@@ -273,7 +273,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .summary = summary,
     });
-    try artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "completed",
         .task = "gliner2_entity_cleanup_smoke_workflow",

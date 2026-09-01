@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub const adapter_a_tensor_name = "adapter.a";
 pub const adapter_b_tensor_name = "adapter.b";
@@ -102,7 +103,7 @@ pub fn applyInPlace(hidden: []f32, adapter_a: Matrix, adapter_b: Matrix, alpha: 
     const scale = effectiveScale(alpha, rank);
     if (scale == 0) return;
 
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
+    var low_rank = compat.stackFallback(4096, std.heap.page_allocator);
     const alloc = low_rank.get();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
@@ -173,7 +174,7 @@ pub fn accumulateLinearLoRAGrads(
     const scale = effectiveScale(alpha, rank);
     if (scale == 0) return;
 
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
+    var low_rank = compat.stackFallback(4096, std.heap.page_allocator);
     const alloc = low_rank.get();
     const tmp_rank = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp_rank);
@@ -254,7 +255,7 @@ pub fn accumulateLinearLoRAGradsBackend(
         if (scale == 0) break :gpu_path;
 
         // Allocate transposed weight buffers and temporary gradient buffers.
-        var sf = std.heap.stackFallback(8192, std.heap.page_allocator);
+        var sf = compat.stackFallback(8192, std.heap.page_allocator);
         const alloc = sf.get();
 
         const lora_a_t = alloc.alloc(f32, rank * in_features) catch break :gpu_path;
@@ -422,7 +423,7 @@ pub fn doraMergeInto(view: DoRAView, out: []f32) void {
     std.debug.assert(out.len == in_features * out_features);
     std.debug.assert(view.magnitude.len == out_features);
 
-    var norms_buf = std.heap.stackFallback(4096, std.heap.page_allocator);
+    var norms_buf = compat.stackFallback(4096, std.heap.page_allocator);
     const alloc = norms_buf.get();
     const col_norms = alloc.alloc(f32, out_features) catch return;
     defer alloc.free(col_norms);
@@ -492,7 +493,7 @@ pub fn accumulateDoRAGrads(
     if (rank == 0) return;
     const scale = effectiveScaleMode(view.alpha, rank, view.scaling);
 
-    var stack = std.heap.stackFallback(16 * 1024, std.heap.page_allocator);
+    var stack = compat.stackFallback(16 * 1024, std.heap.page_allocator);
     const alloc = stack.get();
     const v_col = alloc.alloc(f32, in_features) catch return;
     defer alloc.free(v_col);

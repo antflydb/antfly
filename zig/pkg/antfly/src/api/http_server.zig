@@ -2093,7 +2093,7 @@ pub const ApiHttpServer = struct {
     restore_retry_wakeup_generation: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_event: std.Io.Event = .unset,
     restore_backoff_waiters: [max_concurrent_restore_jobs]?*std.Io.Event =
-        .{null} ** max_concurrent_restore_jobs,
+        @splat(null),
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
@@ -4024,8 +4024,8 @@ pub const ApiHttpServer = struct {
         report: metadata_table_manager.RuntimeEnrichmentStatusReport,
     ) db_mod.types.EnrichmentStats {
         var stats: db_mod.types.EnrichmentStats = .{};
-        inline for (std.meta.fields(metadata_table_manager.RuntimeEnrichmentStatusReport)) |field| {
-            @field(stats, field.name) = @field(report, field.name);
+        inline for (@typeInfo(metadata_table_manager.RuntimeEnrichmentStatusReport).@"struct".field_names) |field_name| {
+            @field(stats, field_name) = @field(report, field_name);
         }
         return stats;
     }
@@ -4086,8 +4086,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn parseRemoteRuntimeFreshness(freshness: []const u8) runtime_status.RuntimeStatusFreshness {
-        inline for (@typeInfo(runtime_status.RuntimeStatusFreshness).@"enum".fields) |field| {
-            if (std.mem.eql(u8, freshness, field.name)) return @enumFromInt(field.value);
+        const info = @typeInfo(runtime_status.RuntimeStatusFreshness).@"enum";
+        inline for (info.field_names, info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, freshness, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return .remote_unknown;
     }
@@ -11107,7 +11108,7 @@ pub const ApiHttpServer = struct {
         defer if (fallback_io) |*owned| owned.deinit();
         const backup_io = self.sharedApiIo() orelse fallback_io.?.io();
         var trace: ClusterBackupExecutionTrace = .{};
-        errdefer |err| trace.logFailure(err);
+        errdefer if (trace.cause != null) trace.logFailure(error.InternalFailure);
 
         var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
             if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
@@ -30491,7 +30492,7 @@ test "api http server enforces session adoption timeout when configured" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
 
-    const session_path_z = try alloc.dupeZ(u8, session_path);
+    const session_path_z = try alloc.dupeSentinel(u8, session_path, 0);
     defer alloc.free(session_path_z);
     var session_store = try docstore_mod.DocStore.open(alloc, session_path_z, .{});
     defer session_store.close();
@@ -37016,9 +37017,9 @@ test "table backup retry preserves the retained ambiguous generation" {
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
     try backups_api.reserveTableBackupAttemptAtLocation(
         alloc,
@@ -37158,9 +37159,9 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = table.table_id,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
 
     try server.backupOwnedTableWithArtifactId(
@@ -42491,7 +42492,10 @@ test "api http server executes foreign right join query through registry" {
 
 test "api http server executes direct foreign table query through registry" {
     const alloc = std.testing.allocator;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
     try std.testing.expectEqual(@as(c_int, 0), c.setenv("PG_DSN", "postgres://resolved", 1));
     defer _ = c.unsetenv("PG_DSN");
 

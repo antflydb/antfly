@@ -6101,7 +6101,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         .{ .name = "group_id", .value = "7" },
         .{ .name = "table_name", .value = "docs" },
     };
-    const txn_id = [_]u8{0x42} ** 16;
+    const txn_id = @as([16]u8, @splat(0x42));
 
     const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
         .txn_id = txn_id,
@@ -7802,7 +7802,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
-    var clients = [_]?httpx.Socket{null} ** 128;
+    var clients = @as([128]?httpx.Socket, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close();
         slot.* = null;
@@ -7892,12 +7892,16 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     for (&clients) |*slot| {
         if (slot.*) |*client| {
             var linger = std.posix.linger{ .onoff = 1, .linger = 0 };
-            std.posix.setsockopt(
+            // This is best-effort test cleanup: the peer may have already
+            // invalidated the socket, and Zig 0.17 treats EINVAL as
+            // unreachable in the checked wrapper.
+            _ = std.posix.system.setsockopt(
                 client.handle,
                 std.posix.SOL.SOCKET,
                 std.posix.SO.LINGER,
-                std.mem.asBytes(&linger),
-            ) catch {};
+                std.mem.asBytes(&linger).ptr,
+                @sizeOf(std.posix.linger),
+            );
             client.close();
         }
         slot.* = null;

@@ -193,7 +193,7 @@ pub fn saveCachedSummary(allocator: std.mem.Allocator, path: []const u8, summary
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn loadCachedSummary(allocator: std.mem.Allocator, path: []const u8) !CachedSummary {
@@ -217,14 +217,14 @@ pub fn freeCachedSummary(allocator: std.mem.Allocator, summary: *CachedSummary) 
 }
 
 pub fn saveHead(allocator: std.mem.Allocator, head: *const CleanupHead, out_dir: []const u8) !void {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const path = try std.fs.path.join(allocator, &.{ out_dir, head_file_name });
     defer allocator.free(path);
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
     var buf: [8192]u8 = undefined;
-    var writer = file.writerStreaming(compat.io(), &buf);
+    var writer = file.writerStreaming(compat.testingIo(), &buf);
     try std.json.Stringify.value(.{
         .artifact_family_version = artifact_family_version,
         .feature_dim = head.feature_dim,
@@ -245,7 +245,7 @@ pub fn saveHead(allocator: std.mem.Allocator, head: *const CleanupHead, out_dir:
 pub fn loadHeadIfPresent(allocator: std.mem.Allocator, model_dir: []const u8) !?CleanupHead {
     const path = try std.fs.path.join(allocator, &.{ model_dir, head_file_name });
     defer allocator.free(path);
-    _ = compat.cwd().statFile(compat.io(), path, .{}) catch return null;
+    _ = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return null;
     return try loadHead(allocator, path);
 }
 

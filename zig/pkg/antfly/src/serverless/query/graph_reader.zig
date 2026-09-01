@@ -763,8 +763,8 @@ fn findAdjacency(segment: graph_segment_mod.Segment, doc_id: []const u8) ?graph_
 }
 
 fn neighborOrder(lhs: BorrowedNeighbor, rhs: BorrowedNeighbor) std.math.Order {
-    if (@intFromEnum(lhs.direction) != @intFromEnum(rhs.direction)) {
-        return std.math.order(@intFromEnum(lhs.direction), @intFromEnum(rhs.direction));
+    if (@backingInt(lhs.direction) != @backingInt(rhs.direction)) {
+        return std.math.order(@backingInt(lhs.direction), @backingInt(rhs.direction));
     }
     const edge_type_order = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
     if (edge_type_order != .eq) return edge_type_order;
@@ -861,7 +861,7 @@ test "serverless graph neighbor selection admits scans and observes cancellation
         .edge_type = @constCast("cites"),
         .weight = 1.0,
     };
-    const edges = [_]graph_segment_mod.Edge{edge} ** 64;
+    const edges = @as([64]graph_segment_mod.Edge, @splat(edge));
     const adjacency = graph_segment_mod.Adjacency{
         .node_id = @constCast("root"),
         .out_edges = @constCast(edges[0..]),
@@ -933,7 +933,7 @@ test "serverless graph traversal bounds edge scans, visited nodes, results, and 
     );
     try std.testing.expectEqual(@as(usize, 1), node_seen.count());
 
-    const repeated = [_]graph_segment_mod.Edge{edges[0]} ** 64;
+    const repeated = @as([64]graph_segment_mod.Edge, @splat(edges[0]));
     var cancelled = std.atomic.Value(bool).init(true);
     var cancel_budget = try GraphTraversalBudget.init(.{}, CancellationToken.fromAtomic(&cancelled));
     try std.testing.expectError(

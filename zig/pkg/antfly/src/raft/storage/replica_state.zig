@@ -558,7 +558,7 @@ pub const PersistentReplicaState = struct {
         try appendInt(u64, alloc, out, entry.term);
         try appendInt(u64, alloc, out, entry.index);
         try ensureStateBodyCapacity(out, 1);
-        try out.append(alloc, @intFromEnum(entry.entry_type));
+        try out.append(alloc, @backingInt(entry.entry_type));
         try appendBytes(alloc, out, entry.data);
     }
 
@@ -568,9 +568,9 @@ pub const PersistentReplicaState = struct {
         const entry_type_tag = if (cursor.* < bytes.len) bytes[cursor.*] else return error.InvalidReplicaState;
         cursor.* += 1;
         const entry_type: raft_engine.core.types.EntryType = switch (entry_type_tag) {
-            @intFromEnum(raft_engine.core.types.EntryType.normal) => .normal,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change) => .conf_change,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
+            @backingInt(raft_engine.core.types.EntryType.normal) => .normal,
+            @backingInt(raft_engine.core.types.EntryType.conf_change) => .conf_change,
+            @backingInt(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
             else => return error.InvalidReplicaState,
         };
         return .{

@@ -727,7 +727,7 @@ fn takeLoadOptionValue(args: *std.process.Args.Iterator, flag: []const u8) union
 fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult {
     var args = iterator;
     var values: LoadOptionValues = .{};
-    var seen = std.EnumSet(LoadOption).initEmpty();
+    var seen = std.EnumSet(LoadOption).empty;
 
     while (args.next()) |arg| {
         const option = loadOption(arg) orelse return .{ .issue = .{ .unknown = arg } };

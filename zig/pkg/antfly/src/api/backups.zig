@@ -322,7 +322,7 @@ pub fn parseTableBackupFenceHeaderValuesWithDeadline(
             std.fmt.parseInt(u64, value, 10) catch return error.InvalidBackupFence
         else
             0,
-        .metadata_incarnation = if (metadata_incarnation_value) |value| value[0..32].* else [_]u8{0} ** 32,
+        .metadata_incarnation = if (metadata_incarnation_value) |value| value[0..32].* else @as([32]u8, @splat(0)),
         .table_id = std.fmt.parseInt(u64, table_id_value.?, 10) catch return error.InvalidBackupFence,
         .definition_digest = definition_digest,
         .topology_range_count = std.fmt.parseInt(u64, topology_count_value.?, 10) catch return error.InvalidBackupFence,
@@ -393,7 +393,7 @@ pub fn tableBackupFenceWithTopology(
 ) TableBackupFence {
     return .{
         .metadata_group_id = snapshot.status.metadata_group_id,
-        .metadata_incarnation = snapshot.status.metadata_incarnation orelse [_]u8{0} ** 32,
+        .metadata_incarnation = snapshot.status.metadata_incarnation orelse @as([32]u8, @splat(0)),
         .table_id = table.table_id,
         .definition_digest = backup_contract.tableDefinitionDigest(
             table.table_id,
@@ -3978,8 +3978,8 @@ const ClusterAttemptCleanupProgress = struct {
 };
 
 fn cleanupProgressLessThan(a: ClusterAttemptCleanupProgress, b: ClusterAttemptCleanupProgress) bool {
-    const a_phase = @intFromEnum(a.phase);
-    const b_phase = @intFromEnum(b.phase);
+    const a_phase = @backingInt(a.phase);
+    const b_phase = @backingInt(b.phase);
     return a_phase < b_phase or (a_phase == b_phase and a.next_table_index < b.next_table_index);
 }
 
@@ -5833,8 +5833,8 @@ fn currentGoAttemptTimestampOrder(
     lhs: CurrentGoAttemptTimestamp,
     rhs: CurrentGoAttemptTimestamp,
 ) std.math.Order {
-    inline for (std.meta.fields(CurrentGoAttemptTimestamp)) |field| {
-        const order = std.math.order(@field(lhs, field.name), @field(rhs, field.name));
+    inline for (@typeInfo(CurrentGoAttemptTimestamp).@"struct".field_names) |field_name| {
+        const order = std.math.order(@field(lhs, field_name), @field(rhs, field_name));
         if (order != .eq) return order;
     }
     return .eq;
@@ -9799,7 +9799,7 @@ fn artifactVerificationCacheKeyHasher(
 ) std.crypto.hash.sha2.Sha256 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-artifact-verification-receipt-v1");
-    hasher.update(&.{@intFromEnum(format)});
+    hasher.update(&.{@backingInt(format)});
     hashArtifactBytes(&hasher, shard.snapshot_path);
     hashArtifactU64(&hasher, shard.artifact_size_bytes);
     hashArtifactBytes(&hasher, shard.artifact_sha256);
@@ -12488,7 +12488,7 @@ test "native artifact copy observes cancellation between io chunks" {
     defer file.close(std.testing.io);
     var writer_buffer: [4096]u8 = undefined;
     var writer = file.writer(std.testing.io, &writer_buffer);
-    const zeros = [_]u8{0} ** (256 * 1024);
+    const zeros = @as([(256 * 1024)]u8, @splat(0));
     for (0..4) |_| try writer.interface.writeAll(&zeros);
     try writer.end();
 
@@ -14476,9 +14476,9 @@ test "table backup reservation durably binds logical and artifact ids" {
             .metadata_group_id = 3,
             .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
             .table_id = 7,
-            .definition_digest = [_]u8{0x11} ** 32,
+            .definition_digest = @as([32]u8, @splat(0x11)),
             .topology_range_count = 1,
-            .topology_digest = [_]u8{0x22} ** 32,
+            .topology_digest = @as([32]u8, @splat(0x22)),
         },
     );
     var reservation = (try readTableBackupAttemptReservation(alloc, io, &location, "logical")).?;
@@ -14502,9 +14502,9 @@ test "table backup reservation durably binds logical and artifact ids" {
                 .metadata_group_id = 3,
                 .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                 .table_id = 7,
-                .definition_digest = [_]u8{0x11} ** 32,
+                .definition_digest = @as([32]u8, @splat(0x11)),
                 .topology_range_count = 1,
-                .topology_digest = [_]u8{0x22} ** 32,
+                .topology_digest = @as([32]u8, @splat(0x22)),
             },
         ),
     );
@@ -14530,9 +14530,9 @@ test "table backup reservation durably binds logical and artifact ids" {
             .metadata_group_id = 3,
             .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
             .table_id = 7,
-            .definition_digest = [_]u8{0x11} ** 32,
+            .definition_digest = @as([32]u8, @splat(0x11)),
             .topology_range_count = 1,
-            .topology_digest = [_]u8{0x22} ** 32,
+            .topology_digest = @as([32]u8, @splat(0x22)),
         },
     );
     try std.testing.expect(!try deleteTableBackupReservationIfArtifactOwnedAtLocation(
@@ -14636,9 +14636,9 @@ test "standalone table backup stale reclamation fences delayed writers" {
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
     try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", 1);
@@ -14679,9 +14679,9 @@ test "deadline-fenced stale table cleanup retires its generation tombstone" {
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
         .writer_not_after_unix_ns = 2,
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
@@ -14723,9 +14723,9 @@ test "standalone stale reclaim bounds foreground native artifact deletion" {
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
         .writer_not_after_unix_ns = 2,
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .native, fence);
@@ -14790,9 +14790,9 @@ test "standalone table backup stale reclamation preserves committed manifests an
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "committed", "committed-artifact", .portable, fence);
     try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "committed-artifact", 1);
@@ -14832,9 +14832,9 @@ test "committed table reconciliation retires writer state but preserves forwarde
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
         .writer_not_after_unix_ns = 2,
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
@@ -15083,9 +15083,9 @@ test "remote cluster artifact cleanup advances within a strict operation budget"
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
     try reserveClusterBackupAttemptLeaseAtLocation(
@@ -15191,9 +15191,9 @@ test "table backup cleanup removes the forwarded artifact envelope before payloa
         .metadata_group_id = 3,
         .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
         .table_id = 7,
-        .definition_digest = [_]u8{0x11} ** 32,
+        .definition_digest = @as([32]u8, @splat(0x11)),
         .topology_range_count = 1,
-        .topology_digest = [_]u8{0x22} ** 32,
+        .topology_digest = @as([32]u8, @splat(0x22)),
     };
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
     try reserveTableBackupAttemptAtLocation(alloc, io, &location, "artifact", "artifact", .portable, fence);
@@ -15643,7 +15643,7 @@ test "filesystem cluster backup lease supports the maximum owner identity" {
     );
     defer alloc.free(root);
     var location: BackupLocation = .{ .file = root };
-    const attempt_id = [_]u8{'a'} ** 128;
+    const attempt_id = @as([128]u8, @splat('a'));
 
     try reserveClusterBackupAttemptLeaseAtLocation(
         alloc,
@@ -15681,7 +15681,7 @@ test "cluster cleanup lease supports the maximum public attempt identity" {
         .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
     };
     defer location.deinit(alloc);
-    const attempt_id = [_]u8{'a'} ** 128;
+    const attempt_id = @as([128]u8, @splat('a'));
     const tables = [_]ClusterBackupAttemptTable{.{
         .name = "docs",
         .table_backup_id = "table-snap",

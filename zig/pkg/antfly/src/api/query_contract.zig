@@ -6910,7 +6910,7 @@ test "canonical graph path edges enforce durable type policy" {
     const edges: []const graph_query_mod.PathEdgeInfo = &.{.{
         .source = "a",
         .target = "b",
-        .edge_type = "x" ** (graph_edge_type.max_bytes + 1),
+        .edge_type = @as([graph_edge_type.max_bytes + 1]u8, @splat('x')),
         .weight = 1,
     }};
     try std.testing.expectError(

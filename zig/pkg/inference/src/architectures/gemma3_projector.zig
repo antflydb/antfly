@@ -493,7 +493,7 @@ test "supports termite gemma3 projector metadata" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "termite-gemma3-projector-classify.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
@@ -509,7 +509,7 @@ test "supports termite gemma3 projector metadata" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expect(try isSupportedProjectorPath(allocator, path));
 }
@@ -518,7 +518,7 @@ test "rejects clip projector metadata" {
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ "/tmp", "termite-gemma3-projector-reject.gguf" });
     defer allocator.free(path);
-    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(compat.testingIo(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -526,7 +526,7 @@ test "rejects clip projector metadata" {
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expect(!(try isSupportedProjectorPath(allocator, path)));
 }

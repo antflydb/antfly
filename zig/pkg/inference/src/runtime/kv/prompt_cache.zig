@@ -111,7 +111,7 @@ const RadixNode = struct {
     blocks: []block.KvBlockId = &.{},
     storage_blocks: []block.KvBlockId = &.{},
     children: std.ArrayListUnmanaged(RadixNodeId) = .empty,
-    edge_hash: Hash = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    edge_hash: Hash = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     estimated_bytes: usize = 0,
     expires_at_ms: i64 = 0,
     last_used: u64 = 0,
@@ -1284,14 +1284,14 @@ fn nowMs() i64 {
 }
 
 fn zeroHash() Hash {
-    return [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    return @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
 }
 
 fn blockHash(config: pool_mod.KvPoolConfig, namespace: []const u8, previous_hash: Hash, tokens: []const i64) Hash {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(&previous_hash);
-    updateHashU64(&hasher, @intFromEnum(config.backend));
-    updateHashU64(&hasher, @intFromEnum(config.dtype));
+    updateHashU64(&hasher, @backingInt(config.backend));
+    updateHashU64(&hasher, @backingInt(config.dtype));
     updateHashU64(&hasher, config.page_size_tokens);
     updateHashU64(&hasher, config.num_layers_packed);
     updateHashU64(&hasher, config.num_kv_heads);
@@ -1313,8 +1313,8 @@ fn radixEdgeHash(config: pool_mod.KvPoolConfig, namespace: []const u8, parent: ?
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-radix-edge-v1");
     updateHashU64(&hasher, if (parent) |id| @as(u64, id) else std.math.maxInt(u64));
-    updateHashU64(&hasher, @intFromEnum(config.backend));
-    updateHashU64(&hasher, @intFromEnum(config.dtype));
+    updateHashU64(&hasher, @backingInt(config.backend));
+    updateHashU64(&hasher, @backingInt(config.dtype));
     updateHashU64(&hasher, config.page_size_tokens);
     updateHashU64(&hasher, config.num_layers_packed);
     updateHashU64(&hasher, config.num_kv_heads);

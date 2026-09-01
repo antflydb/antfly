@@ -84,12 +84,8 @@ pub fn chainLabeledFilteredTests(
 }
 
 pub fn selectTestFilters(
-    b: *std.Build,
+    test_filters: []const []const u8,
     default_filters: []const []const u8,
 ) []const []const u8 {
-    return build_test_filters.select(
-        b.allocator,
-        b.args orelse &.{},
-        default_filters,
-    );
+    return if (test_filters.len == 0) default_filters else test_filters;
 }

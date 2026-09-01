@@ -171,7 +171,7 @@ const AttentionFunctions = struct {
 
 fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: []const u8) !cuda_driver.CUfunction {
     var name_buffer: [128]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&name_buffer, "{s}", .{name}, 0);
     var function: cuda_driver.CUfunction = null;
     try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name_z));
     return function orelse error.CudaKernelUnavailable;
@@ -296,7 +296,7 @@ fn nextSignedUnit(state: *u64) f32 {
 }
 
 fn fillInputs(q: []f32, k: []f32, v: []f32, head_dim: usize, kv_len: usize, num_heads: usize, num_kv_heads: usize, pattern: Pattern, seed: u64) void {
-    var state = seed ^ (@as(u64, @intFromEnum(pattern)) *% 0x9e37_79b9_7f4a_7c15);
+    var state = seed ^ (@as(u64, @backingInt(pattern)) *% 0x9e37_79b9_7f4a_7c15);
     switch (pattern) {
         .random => {
             for (q) |*value| value.* = nextSignedUnit(&state) * 0.125;

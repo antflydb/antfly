@@ -4139,7 +4139,7 @@ test "conjunctive validation rejects disconnected and unused aliases" {
         .optional = &optional,
     }));
 
-    const oversized_alias = "a" ** (max_identifier_bytes + 1);
+    const oversized_alias = @as([max_identifier_bytes + 1]u8, @splat('a'));
     const oversized_nodes = [_]MatchNode{.{ .alias = oversized_alias }};
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
         .anchor_alias = oversized_alias,
@@ -4151,7 +4151,7 @@ test "conjunctive validation rejects disconnected and unused aliases" {
 test "conjunctive validation bounds total recursive pattern shape" {
     const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
     const edge = MatchEdge{ .from = "a", .to = "b" };
-    const too_many_edges = [_]MatchEdge{edge} ** (max_conjunctive_edges + 1);
+    const too_many_edges = @as([max_conjunctive_edges + 1]MatchEdge, @splat(edge));
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
         .nodes = &nodes,
         .edges = &too_many_edges,
@@ -4161,7 +4161,7 @@ test "conjunctive validation bounds total recursive pattern shape" {
     const optional_node = [_]MatchNode{.{ .alias = "child" }};
     const optional_edge = [_]MatchEdge{.{ .from = "root", .to = "child" }};
     const optional_group = OptionalPattern{ .nodes = &optional_node, .edges = &optional_edge };
-    const too_many_optional = [_]OptionalPattern{optional_group} ** (max_optional_patterns + 1);
+    const too_many_optional = @as([max_optional_patterns + 1]OptionalPattern, @splat(optional_group));
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
         .nodes = &base_nodes,
         .edges = &.{},
@@ -4214,7 +4214,7 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
     }
     try std.testing.expectEqual(@as(u128, targets.len), aggregates[0].value);
 
-    const too_many_specs = [_]CountAggregateSpec{.{}} ** (max_count_aggregates + 1);
+    const too_many_specs = @as([max_count_aggregates + 1]CountAggregateSpec, @splat(.{}));
     try std.testing.expectError(error.InvalidArgument, aggregateConjunctivePatternWithEdgeReader(
         alloc,
         Reader{ .targets = &targets },
@@ -5385,14 +5385,14 @@ test "pattern match supports linear alias bindings and cycles" {
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern", .{tmp.sub_path});
     defer alloc.free(dir_path);
-    const dir = try alloc.dupeZ(u8, dir_path);
+    const dir = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir);
     var doc_store = try @import("../storage/docstore.zig").DocStore.open(arena.allocator(), dir, .{});
     defer doc_store.close();
 
     const reverse_dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern-rev", .{tmp.sub_path});
     defer alloc.free(reverse_dir_path);
-    const reverse_dir = try alloc.dupeZ(u8, reverse_dir_path);
+    const reverse_dir = try alloc.dupeSentinel(u8, reverse_dir_path, 0);
     defer alloc.free(reverse_dir);
     var graph_index = try graph_mod.GraphIndex.open(alloc, &doc_store, reverse_dir, "g", .{});
     defer graph_index.close();

@@ -125,7 +125,7 @@ pub const FusedOp = enum(u8) {
 // ── Op Attributes ──────────────────────────────────────────────────────
 
 pub const ReduceAttrs = struct {
-    axes: [max_rank]u8 = .{0} ** max_rank,
+    axes: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
@@ -144,25 +144,25 @@ pub const ReshapeAttrs = struct {
 };
 
 pub const TransposeAttrs = struct {
-    perm: [max_rank]u8 = .{0} ** max_rank,
+    perm: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
 pub const BroadcastAttrs = struct {
     target_shape: Shape,
-    broadcast_axes: [max_rank]u8 = .{0} ** max_rank,
+    broadcast_axes: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
 pub const SliceAttrs = struct {
-    starts: [max_rank]i64 = .{0} ** max_rank,
-    limits: [max_rank]i64 = .{0} ** max_rank,
-    strides: [max_rank]i64 = .{1} ** max_rank,
+    starts: [max_rank]i64 = @splat(0),
+    limits: [max_rank]i64 = @splat(0),
+    strides: [max_rank]i64 = @splat(1),
     num_axes: u8 = 0,
     /// ONNX Slice can derive starts/limits from runtime shape subgraphs.
     /// When either flag is set, node inputs are [data, starts, limits] and
     /// bound_axes maps those compact input tensors onto the full-rank attrs.
-    bound_axes: [max_rank]u8 = .{0} ** max_rank,
+    bound_axes: [max_rank]u8 = @splat(0),
     num_bound_axes: u8 = 0,
     runtime_starts: bool = false,
     runtime_limits: bool = false,
@@ -191,17 +191,17 @@ pub const ScatterAddAttrs = struct {
 };
 
 pub const DotGeneralAttrs = struct {
-    lhs_contracting: [max_rank]u8 = .{0} ** max_rank,
-    rhs_contracting: [max_rank]u8 = .{0} ** max_rank,
-    lhs_batch: [max_rank]u8 = .{0} ** max_rank,
-    rhs_batch: [max_rank]u8 = .{0} ** max_rank,
+    lhs_contracting: [max_rank]u8 = @splat(0),
+    rhs_contracting: [max_rank]u8 = @splat(0),
+    lhs_batch: [max_rank]u8 = @splat(0),
+    rhs_batch: [max_rank]u8 = @splat(0),
     num_contracting: u8 = 0,
     num_batch: u8 = 0,
 };
 
 pub const ConvAttrs = struct {
-    strides: [4]u32 = .{1} ** 4,
-    padding: [4][2]i32 = .{.{0} ** 2} ** 4,
+    strides: [4]u32 = @splat(1),
+    padding: [4][2]i32 = @splat(@splat(0)),
     num_spatial: u8 = 0,
     groups: u32 = 1,
 };
@@ -234,7 +234,7 @@ pub const LinearAttrs = struct {
     /// concatenated weight. Backends that don't dispatch a grouped
     /// kernel can ignore these — the op semantics are unchanged
     /// (still a regular matmul of `(input × combined_weight)`).
-    projection_out_dims: [4]u32 = .{0} ** 4,
+    projection_out_dims: [4]u32 = @splat(0),
     num_projections: u8 = 0,
 };
 
@@ -485,7 +485,7 @@ pub const Node = struct {
     output_shape: Shape,
 
     /// Up to 4 inputs stored inline. Most ML ops take 1-3 inputs.
-    inputs: [4]NodeId = .{null_node} ** 4,
+    inputs: [4]NodeId = @splat(null_node),
     num_inputs: u8 = 0,
 
     /// Points to the root of a decomposed primitive subgraph that computes

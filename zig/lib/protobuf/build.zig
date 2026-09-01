@@ -91,7 +91,7 @@ pub fn build(b: *std.Build) void {
     gen_run.addArg("--desc");
     gen_run.addFileArg(b.path("src/testdata/quantize.desc"));
     gen_run.addArg("--output");
-    const gen_dir = gen_run.addOutputDirectoryArg("generated");
+    const gen_dir = gen_run.addOutputDirectoryArg2("generated", .{ .make_absolute = true });
 
     const generated_mod = b.createModule(.{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -135,7 +135,7 @@ pub fn addProtoModule(
     codegen.addArg("--desc");
     codegen.addFileArg(desc_file);
     codegen.addArg("--output");
-    const gen_dir = codegen.addOutputDirectoryArg(module_name);
+    const gen_dir = codegen.addOutputDirectoryArg2(module_name, .{ .make_absolute = true });
     for (extra_args) |arg| codegen.addArg(arg);
 
     const mod = b.addModule(module_name, .{

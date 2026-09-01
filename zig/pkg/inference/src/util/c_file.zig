@@ -135,7 +135,7 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const fd = try openReadOnlyZ(path_z);
@@ -243,7 +243,7 @@ pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []c
         .{ prefix, std.posix.system.getpid(), nonce },
     );
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = c.open(path_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
@@ -272,7 +272,7 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Read an entire file with a custom max size limit.
 pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -297,7 +297,7 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 /// Return the byte size of a file.
 pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -341,7 +341,7 @@ test "file identity sampling spans interior ranges" {
 /// hashing a multi-gigabyte checkpoint on every process start.
 pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = try openReadOnlyZ(path_z);
     defer closeFd(fd);
@@ -396,7 +396,7 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
 
 /// Read a byte range from a file using pread.
 pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -415,7 +415,7 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
 
 /// Read a byte range from a file into an existing buffer using pread.
 pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u64, buf: []u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -443,7 +443,7 @@ pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, 
 
 pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
     if (comptime !supports_posix_file_advice) return;
-    const path_z = allocator.dupeZ(u8, path) catch return;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(path_z);
     const fd = openReadOnlyZ(path_z) catch return;
     defer closeFd(fd);
@@ -474,7 +474,7 @@ pub fn prefetchFile(
 ) !FilePrefetchResult {
     if (comptime !supports_posix_file_advice) return error.UnsupportedPlatform;
     const workers: usize = std.math.clamp(@as(usize, requested_workers), 1, 8);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = try openReadOnlyZ(path_z);
     defer closeFd(fd);
@@ -552,7 +552,7 @@ pub fn prefetchFile(
 
 /// Check if a file exists at the given path.
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
     defer allocator.free(path_z);
     return fileExistsZ(path_z);
 }
@@ -569,9 +569,9 @@ pub fn fileExistsZ(path_z: [:0]const u8) bool {
 /// temporary directory, so concurrent creators cannot clobber each other.
 pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_path: []const u8) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    const old_z = try allocator.dupeZ(u8, old_path);
+    const old_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_z);
-    const new_z = try allocator.dupeZ(u8, new_path);
+    const new_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_z);
     const linux = std.os.linux;
     switch (linux.errno(linux.renameat2(

@@ -25,7 +25,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const compat = @import("../../io/compat.zig");
 const c_file = @import("../../util/c_file.zig");
 
 pub const schema = "antfly_gemma4_a4b_cuda_prepared_pack/v2";
@@ -169,7 +168,7 @@ fn digestHex(bytes: []const u8) [64]u8 {
 fn syncDirectoryPath(io: std.Io, path: []const u8) !void {
     switch (builtin.os.tag) {
         .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => {
-            var dir = try compat.cwd().openDir(io, path, .{ .iterate = true });
+            var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
             defer dir.close(io);
             const file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
             try file.sync(io);
@@ -223,9 +222,9 @@ pub fn write(
         .{ output_path, std.posix.system.getpid(), temp_sequence.fetchAdd(1, .monotonic) },
     );
     defer allocator.free(tmp_path);
-    try compat.cwd().createDir(io, tmp_path, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, tmp_path, .default_dir);
     var committed = false;
-    defer if (!committed) compat.cwd().deleteTree(io, tmp_path) catch {};
+    defer if (!committed) std.Io.Dir.cwd().deleteTree(io, tmp_path) catch {};
 
     const shard_manifest = try allocator.alloc(ManifestShard, shard_count);
     defer allocator.free(shard_manifest);
@@ -258,7 +257,7 @@ pub fn write(
         shard_name_lengths[shard_index] = name.len;
         const path = try std.fs.path.join(allocator, &.{ tmp_path, name });
         defer allocator.free(path);
-        var file = try compat.cwd().createFile(io, path, .{ .exclusive = true, .truncate = false });
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .truncate = false });
         var open = true;
         defer if (open) file.close(io);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -293,7 +292,7 @@ pub fn write(
     defer allocator.free(rendered);
     const manifest_path = try std.fs.path.join(allocator, &.{ tmp_path, manifest_name });
     defer allocator.free(manifest_path);
-    var manifest_file = try compat.cwd().createFile(io, manifest_path, .{ .exclusive = true, .truncate = false });
+    var manifest_file = try std.Io.Dir.cwd().createFile(io, manifest_path, .{ .exclusive = true, .truncate = false });
     var manifest_open = true;
     defer if (manifest_open) manifest_file.close(io);
     try manifest_file.writeStreamingAll(io, rendered);
@@ -563,7 +562,7 @@ test "prepared pack validates source identity geometry bounds and shards" {
     defer allocator.free(root);
     const source_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" });
     defer allocator.free(source_path);
-    try compat.cwd().writeFile(std.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
     const output_path = try std.fs.path.join(allocator, &.{ root, default_directory_name });
     defer allocator.free(output_path);
     const geometry = GeometryIdentity{

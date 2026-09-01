@@ -1056,7 +1056,7 @@ const replay_hints = [_]change_journal_mod.TargetHint{
 };
 
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
-    return @intCast(@intFromEnum(hint));
+    return @intCast(@backingInt(hint));
 }
 
 fn encodeReplaySequence(sequence: u64) [8]u8 {

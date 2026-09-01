@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
@@ -63,6 +64,9 @@ pub fn chunkBinary(alloc: Allocator, cfg: chunking_types.Config, mime_type: []co
 }
 
 pub fn chunkInput(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
+        return try chunkInputDirect(alloc, cfg, input);
+    }
     if (cfg.api_url.len == 0) return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
 

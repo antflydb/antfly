@@ -192,9 +192,9 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};
 
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
-        .progress = try alloc.dupeZ(u8, progress_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
+        .progress = try alloc.dupeSentinel(u8, progress_raw, 0),
     };
 }
 

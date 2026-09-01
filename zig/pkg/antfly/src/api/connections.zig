@@ -426,7 +426,7 @@ pub const Cache = struct {
     const key_lock_count = 64;
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    key_locks: [key_lock_count]std.Io.Mutex = [_]std.Io.Mutex{.init} ** key_lock_count,
+    key_locks: [key_lock_count]std.Io.Mutex = @as([key_lock_count]std.Io.Mutex, @splat(.init)),
     entries: std.StringArrayHashMapUnmanaged(Entry) = .{},
 
     pub const Entry = struct {
@@ -539,7 +539,7 @@ const Instance = struct {
     key: []const u8 = "",
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     sources: std.ArrayListUnmanaged([]const u8) = .empty,
-    model_types: std.EnumSet(ConfiguredModelType) = std.EnumSet(ConfiguredModelType).initEmpty(),
+    model_types: std.EnumSet(ConfiguredModelType) = std.EnumSet(ConfiguredModelType).empty,
     configured_models: std.StringArrayHashMapUnmanaged(void) = .{},
 };
 
@@ -621,7 +621,7 @@ pub fn buildConnectionsResponse(
     cache: ?*Cache,
     opts: BuildOptions,
 ) !ConnectionsResponse {
-    var kinds = std.EnumSet(ConnectionKind).initFull();
+    var kinds: std.EnumSet(ConnectionKind) = .full;
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
     const effective_opts = opts;
 
@@ -685,7 +685,7 @@ fn appendLocalInferenceConnection(
 }
 
 fn parseKindFilter(filter: []const u8) std.EnumSet(ConnectionKind) {
-    var kinds = std.EnumSet(ConnectionKind).initEmpty();
+    var kinds = std.EnumSet(ConnectionKind).empty;
     var it = std.mem.splitScalar(u8, filter, ',');
     while (it.next()) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t");
@@ -958,7 +958,7 @@ fn externalIoProtocolFromConfig(protocol: common_config.Config.ExternalIoProtoco
 }
 
 fn configuredModelTypeSet(values: []const []const u8) !std.EnumSet(ConfiguredModelType) {
-    var set = std.EnumSet(ConfiguredModelType).initEmpty();
+    var set = std.EnumSet(ConfiguredModelType).empty;
     for (values) |value| {
         const model_type = std.meta.stringToEnum(ConfiguredModelType, value) orelse return error.InvalidConfig;
         set.insert(model_type);

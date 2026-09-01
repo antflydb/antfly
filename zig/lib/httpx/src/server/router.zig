@@ -51,16 +51,16 @@ const Segment = union(enum) {
 };
 
 /// Number of method variants used for per-method route partitioning.
-const method_count = @typeInfo(types.Method).@"enum".fields.len;
+const method_count = @typeInfo(types.Method).@"enum".field_names.len;
 
 /// HTTP Router with path parameter support.
 /// Routes are partitioned by HTTP method for O(R/M) lookup instead of O(R).
 pub const Router = struct {
     allocator: Allocator,
-    /// Per-method route lists indexed by @intFromEnum(method).
-    method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
+    /// Per-method route lists indexed by @backingInt(method).
+    method_routes: [method_count]std.ArrayListUnmanaged(Route) = @as([method_count]std.ArrayListUnmanaged(Route), @splat(.empty)),
     body_limited_route_count: usize = 0,
-    body_limited_route_counts: [method_count]usize = [_]usize{0} ** method_count,
+    body_limited_route_counts: [method_count]usize = @as([method_count]usize, @splat(0)),
     const Self = @This();
 
     /// Creates a new router.
@@ -82,11 +82,11 @@ pub const Router = struct {
     }
 
     fn routesFor(self: *Self, method: types.Method) *std.ArrayListUnmanaged(Route) {
-        return &self.method_routes[@intFromEnum(method)];
+        return &self.method_routes[@backingInt(method)];
     }
 
     fn routesForConst(self: *const Self, method: types.Method) []const Route {
-        return self.method_routes[@intFromEnum(method)].items;
+        return self.method_routes[@backingInt(method)].items;
     }
 
     /// Adds a route to the router.
@@ -119,7 +119,7 @@ pub const Router = struct {
         });
         if (max_body_size != null) {
             self.body_limited_route_count += 1;
-            self.body_limited_route_counts[@intFromEnum(method)] += 1;
+            self.body_limited_route_counts[@backingInt(method)] += 1;
         }
     }
 
@@ -224,7 +224,7 @@ pub const Router = struct {
     }
 
     pub fn hasBodyLimitsForMethod(self: *const Self, method: types.Method) bool {
-        return self.body_limited_route_counts[@intFromEnum(method)] != 0;
+        return self.body_limited_route_counts[@backingInt(method)] != 0;
     }
 
     /// Returns the list of allowed methods for a given path.

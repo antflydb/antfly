@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         if (args.next() != null) return error.InvalidArguments;
         var bundle = try profile_output.loadQualifiedProfileBundle(allocator, init.io, bundle_path);
         defer bundle.deinit();
-        var loaded_profiles: [@typeInfo(profile_output.BundleComponent).@"enum".fields.len]?profile_output.CanonicalQualifiedProfile = @splat(null);
+        var loaded_profiles: [@typeInfo(profile_output.BundleComponent).@"enum".field_names.len]?profile_output.CanonicalQualifiedProfile = @splat(null);
         defer for (&loaded_profiles) |*loaded| if (loaded.*) |*profile| profile.deinit();
         var package_profiles: [loaded_profiles.len]kernel_jit.QualificationPackageProfileInput = undefined;
         var profile_count: usize = 0;

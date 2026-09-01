@@ -195,6 +195,9 @@ jobs:
             echo "release_tooling=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify Zig toolchain pins
+        run: python3 scripts/ci/verify_zig_toolchain.py
+
   release-tooling:
     name: release-tooling
     needs: changes
@@ -230,10 +233,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Run backup listing against MinIO
         run: scripts/test-backup-s3-integration.sh
@@ -257,11 +257,13 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.16.0"
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@v6
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -275,11 +277,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl xz-utils
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
           curl -fsSL \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
+            "https://ziglang.org/builds/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$zig_archive"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
+          tar -xJf "$zig_archive" \
             -C "$RUNNER_TEMP/zig" \
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
@@ -319,10 +323,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -337,6 +338,14 @@ jobs:
 
       - name: Check generated sources
         run: make zig-generated-check
+
+      - name: Build and smoke-test browser WASM
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: |
+          zig build wasm --cache-poison=disallowed
+          cd pkg/inference
+          zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm --cache-poison=disallowed
 
       - name: Test bounded-build tooling
         working-directory: zig
@@ -502,7 +511,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--cache-poison=disallowed --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -597,10 +606,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -646,7 +652,7 @@ jobs:
       - name: Run full Zig unit tests
         run: |
           set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--cache-poison=disallowed --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
           status="$?"
           if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
             echo "::group::unit failure cgroup memory"
@@ -792,10 +798,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -850,10 +853,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC cache dirs
         run: |
@@ -960,10 +960,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC cache dirs
         run: |

@@ -70,12 +70,12 @@ pub fn IteratorType(
                 .descending => std.math.maxInt(Key),
             };
 
-            var pending = BitSet.initEmpty();
+            var pending = BitSet.empty;
             var probe_key: Key = key_min;
 
-            var probing = BitSet.initFull();
+            var probing = BitSet.full;
             while (probing.count() > 0) {
-                probing = BitSet.initEmpty();
+                probing = BitSet.empty;
                 for (0..self.streams_count) |stream_index| {
                     if (pending.isSet(stream_index)) continue;
 

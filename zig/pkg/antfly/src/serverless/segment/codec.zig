@@ -43,7 +43,7 @@ pub fn encodeAlloc(alloc: Allocator, entries: []const segment_types.Entry) ![]u8
     for (entries) |entry| {
         try appendU64(alloc, &out, entry.lsn);
         try appendU64(alloc, &out, entry.timestamp_ns);
-        try out.append(alloc, @intFromEnum(entry.kind));
+        try out.append(alloc, @backingInt(entry.kind));
         try appendU32(alloc, &out, @intCast(entry.doc_id.len));
         try appendU32(alloc, &out, @intCast(if (entry.body) |body| body.len else 0));
         try out.appendSlice(alloc, entry.doc_id);
@@ -76,8 +76,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) ![]segment_types.Entry {
         if (cursor + doc_id_len + body_len > bytes.len) return error.InvalidSegment;
 
         const kind: api_types.MutationKind = switch (kind_raw) {
-            @intFromEnum(api_types.MutationKind.upsert) => .upsert,
-            @intFromEnum(api_types.MutationKind.delete) => .delete,
+            @backingInt(api_types.MutationKind.upsert) => .upsert,
+            @backingInt(api_types.MutationKind.delete) => .delete,
             else => return error.InvalidSegment,
         };
         entries[idx] = .{

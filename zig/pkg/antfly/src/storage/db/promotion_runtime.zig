@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -290,9 +291,9 @@ pub const PromotionRuntime = struct {
     sink_available: std.atomic.Value(bool),
     missing_sink_blocked: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
-    error_count: std.atomic.Value(u64),
+    applied_sequence: AtomicU64,
+    target_sequence: AtomicU64,
+    error_count: AtomicU64,
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool) = .init(false),

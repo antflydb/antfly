@@ -91,14 +91,14 @@ pub const generated_quant_epilogue_count = std.enums.values(GeneratedQuantEpilog
 pub const GeneratedQuantDispatchCounts = [generated_quant_format_count][generated_quant_epilogue_count]u64;
 
 pub const generated_quant_dispatch_counts_zero: GeneratedQuantDispatchCounts =
-    [_][generated_quant_epilogue_count]u64{[_]u64{0} ** generated_quant_epilogue_count} ** generated_quant_format_count;
+    @as([generated_quant_format_count][generated_quant_epilogue_count]u64, @splat(@as([generated_quant_epilogue_count]u64, @splat(0))));
 
 pub fn generatedQuantDispatchCount(
     counts: *const GeneratedQuantDispatchCounts,
     format: GeneratedQuantFormatIndex,
     epilogue: GeneratedQuantEpilogueIndex,
 ) u64 {
-    return counts[@intFromEnum(format)][@intFromEnum(epilogue)];
+    return counts[@backingInt(format)][@backingInt(epilogue)];
 }
 
 pub const GeneratedQuantCounterName = struct {

@@ -86,10 +86,10 @@ const owned_peak_snapshot_label_len: usize = 96;
 const OwnedAllocationRecord = struct {
     handle: ?*anyopaque = null,
     bytes: usize = 0,
-    dims: [max_dims]i32 = [_]i32{0} ** max_dims,
+    dims: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     rank: u8 = 0,
     seq: u64 = 0,
-    label: [owned_peak_snapshot_label_len]u8 = [_]u8{0} ** owned_peak_snapshot_label_len,
+    label: [owned_peak_snapshot_label_len]u8 = @as([owned_peak_snapshot_label_len]u8, @splat(0)),
     label_len: u8 = 0,
     active: bool = false,
 
@@ -98,7 +98,7 @@ const OwnedAllocationRecord = struct {
     }
 };
 
-var owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+var owned_allocation_records = @as([owned_peak_snapshot_capacity]OwnedAllocationRecord, @splat(.{}));
 var owned_allocation_next_slot: usize = 0;
 var owned_allocation_sequence: u64 = 0;
 var owned_allocation_live_record_count: usize = 0;
@@ -108,7 +108,7 @@ var owned_alloc_context: []const u8 = "";
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = std.c;
     const value = c.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;
@@ -196,11 +196,11 @@ fn noteOwnedAllocationRecord(handle: *anyopaque, byte_len: usize, dims: []const 
         owned_allocation_lost_record_count += 1;
         return;
     };
-    var dims_buf = [_]i32{0} ** max_dims;
+    var dims_buf = @as([max_dims]i32, @splat(0));
     const rank = @min(dims.len, max_dims);
     for (dims[0..rank], 0..) |dim, axis| dims_buf[axis] = dim;
     owned_allocation_sequence += 1;
-    var label_buf = [_]u8{0} ** owned_peak_snapshot_label_len;
+    var label_buf = @as([owned_peak_snapshot_label_len]u8, @splat(0));
     const label_len = copyLabel(&label_buf, owned_alloc_context);
     owned_allocation_records[idx] = .{
         .handle = handle,
@@ -245,7 +245,7 @@ fn printOwnedPeakSnapshot() void {
     if (owned_peak_snapshot_print_count >= ownedPeakSnapshotLimit()) return;
     owned_peak_snapshot_print_count += 1;
 
-    var top = [_]OwnedAllocationRecord{.{}} ** 32;
+    var top = @as([32]OwnedAllocationRecord, @splat(.{}));
     var used: usize = 0;
     var live_bytes: u64 = 0;
     for (owned_allocation_records) |record| {
@@ -371,7 +371,7 @@ pub fn resetMemoryStats() void {
     owned_allocation_lost_record_count = 0;
     owned_alloc_context = "";
     owned_allocation_recording_enabled_cache = null;
-    owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+    owned_allocation_records = @as([owned_peak_snapshot_capacity]OwnedAllocationRecord, @splat(.{}));
 }
 
 pub const DeviceStorage = struct {
@@ -425,7 +425,7 @@ extern fn termite_metal_buffer_copy(
 ) c_int;
 
 pub const MetalTensor = struct {
-    shape_buf: [max_dims]i32 = [_]i32{0} ** max_dims,
+    shape_buf: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     shape_len: u8 = 0,
     dtype: DType = .f32,
 
@@ -597,9 +597,9 @@ pub const MetalTensor = struct {
         fresh: bool,
     ) !MetalTensor {
         const handle = (if (fresh)
-            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+            termite_metal_buffer_alloc_fresh(runtime, byte_len, @backingInt(mode))
         else
-            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse
+            termite_metal_buffer_alloc(runtime, byte_len, @backingInt(mode))) orelse
             return error.MetalBufferAllocFailed;
         var tensor = deviceOwned(runtime, handle, 0, byte_len, dims);
         errdefer tensor.deinit();
@@ -673,7 +673,7 @@ pub const MetalTensor = struct {
     ) !MetalTensor {
         if (self.device) |d| {
             if (byte_offset_delta + byte_len > d.byte_len) return error.InvalidTensorShape;
-            const copied = termite_metal_buffer_alloc(d.ref.runtime, byte_len, @intFromEnum(StorageMode.private)) orelse
+            const copied = termite_metal_buffer_alloc(d.ref.runtime, byte_len, @backingInt(StorageMode.private)) orelse
                 return error.MetalBufferAllocFailed;
             errdefer termite_metal_buffer_release(copied);
             if (termite_metal_buffer_copy(d.ref.runtime, d.ref.handle, d.byte_offset + byte_offset_delta, copied, 0, byte_len) != 0) {

@@ -1311,7 +1311,7 @@ def strict_environment_provenance(
     git = release_provenance.git_provenance(pathlib.Path(__file__).resolve().parents[5])
     toolchains = release_provenance.toolchain_provenance()
     repo = pathlib.Path(__file__).resolve().parents[5]
-    pinned_zig = repo / ".tools/zig-x86_64-linux-0.16.0/zig"
+    pinned_zig = repo / ".tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig"
     if pinned_zig.is_file():
         # This is the exact compiler selected by run_controlled_release_build;
         # hash it even though the reproducible tool bundle is gitignored.
@@ -1412,8 +1412,8 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
         ):
             errors.append(f"strict qualification requires {name} path, hash, and version provenance")
     zig_version = (toolchains.get("zig") or {}).get("version")
-    if zig_version and str(zig_version).strip() != "0.16.0":
-        errors.append(f"strict qualification requires Zig 0.16.0, observed {zig_version!r}")
+    if zig_version and str(zig_version).strip() != "0.17.0-dev.1936+5a625d5f3":
+        errors.append(f"strict qualification requires Zig 0.17.0-dev.1936+5a625d5f3, observed {zig_version!r}")
     nvcc_version = (toolchains.get("nvcc") or {}).get("version")
     if nvcc_version and "release 13.2" not in str(nvcc_version):
         errors.append("strict qualification requires the CUDA 13.2 NVCC toolchain")
@@ -1679,7 +1679,7 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
     repo = pathlib.Path(__file__).resolve().parents[5]
     canonical_binary = (inference / "zig-out/bin/antfly-inference").resolve()
     configured_binary = pathlib.Path(args.binary).resolve()
-    pinned_zig = repo / ".tools/zig-x86_64-linux-0.16.0/zig"
+    pinned_zig = repo / ".tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig"
     zig = pinned_zig if pinned_zig.is_file() else pathlib.Path("zig")
     command = [
         str(zig),

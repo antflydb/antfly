@@ -543,7 +543,7 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
         return error.InvalidSeedArtifactAction };
     var protected_generations = std.ArrayListUnmanaged([]const u8).empty;
     errdefer protected_generations.deinit(alloc);
-    var seen_flags = std.EnumSet(ArtifactFlag).initEmpty();
+    var seen_flags = std.EnumSet(ArtifactFlag).empty;
     var idx: usize = 1;
     while (idx < argv.len) {
         const raw_flag = argv[idx];
@@ -1090,7 +1090,7 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
         const apply_lag_lsn = try u64FromI64(slot.apply_lag_lsn);
         const safe_read_lag_lsn = try u64FromI64(slot.safe_read_lag_lsn);
         const retention_lag_lsn = try u64FromI64(slot.retention_lag_lsn);
-        const status_code = @intFromEnum(try slotStatusCodeFromAdmin(slot.status));
+        const status_code = @backingInt(try slotStatusCodeFromAdmin(slot.status));
 
         if (slot.active) active_slots += 1;
         if (slot.reseed_required) reseed_required_slots += 1;
@@ -1119,9 +1119,9 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
 
     const durability = snapshot.durability;
     const durability_status_code = if (durability) |decision|
-        @intFromEnum(try durabilityStatusCodeFromAdmin(decision.status))
+        @backingInt(try durabilityStatusCodeFromAdmin(decision.status))
     else
-        @intFromEnum(ha.metrics.DurabilityStatusCode.not_configured);
+        @backingInt(ha.metrics.DurabilityStatusCode.not_configured);
     const durability_satisfied = if (durability) |decision|
         boolGauge(std.mem.eql(u8, decision.status, "satisfied"))
     else
@@ -1382,7 +1382,7 @@ fn i64FromU64(raw: u64) !i64 {
 }
 
 fn zPath(alloc: std.mem.Allocator, path: []const u8) ![:0]u8 {
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
@@ -1473,7 +1473,7 @@ fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
 fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[]u8 {
     const env_var = try validateHAAdminTokenEnvName(options.remote_token_env orelse return null);
 
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
 
     const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.HAAdminTokenMissing;
@@ -2669,12 +2669,12 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
-        .fence_wal = try alloc.dupeZ(u8, fence_wal),
-        .backup_root = try alloc.dupeZ(u8, backup_root),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
+        .fence_wal = try alloc.dupeSentinel(u8, fence_wal, 0),
+        .backup_root = try alloc.dupeSentinel(u8, backup_root, 0),
     };
 }
 

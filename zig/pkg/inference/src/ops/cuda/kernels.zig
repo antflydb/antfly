@@ -241,7 +241,7 @@ fn noteGeneratedGqaScorePreworkConsumerConfigured(
     mode: GeneratedGqaScorePreworkConsumerMode,
     source: []const u8,
 ) void {
-    const bit = @as(u8, 1) << @intCast(@intFromEnum(mode));
+    const bit = @as(u8, 1) << @intCast(@backingInt(mode));
     if (generated_gqa_score_prework_consumer_config_log_mask.fetchOr(bit, .monotonic) & bit != 0) return;
     std.log.info(
         "cuda_gqa_score_prework_consumer: event=configured configured={s} consumer=none route=none head_dim=0 fallback_reason=none source={s}",
@@ -334,7 +334,7 @@ fn generatedGqaScorePreworkConsumerLogBit(
         512 => 1,
         else => return null,
     };
-    const bit_index = @as(usize, @intFromEnum(event)) * 6 + consumer_slot * 2 + head_dim_slot;
+    const bit_index = @as(usize, @backingInt(event)) * 6 + consumer_slot * 2 + head_dim_slot;
     return @as(u64, 1) << @intCast(bit_index);
 }
 
@@ -604,7 +604,7 @@ pub fn generatedGqaScorePreworkScheduleTag(
     compute_minor: i32,
 ) u8 {
     const selection = generatedGqaScorePreworkSelection(request, compute_major, compute_minor) orelse return 0;
-    return @intFromEnum(selection.route);
+    return @backingInt(selection.route);
 }
 
 fn generatedGqaDecodeSplitKvMinTokens() u32 {
@@ -671,7 +671,7 @@ fn generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len: usize) GeneratedGqaDecodeSc
 }
 
 pub fn generatedGqaDecodeScheduleTag(kv_seq_len: usize) u8 {
-    return @intFromEnum(generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len));
+    return @backingInt(generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len));
 }
 
 fn generatedGqaDecodeWorkspaceBytes() usize {
@@ -688,7 +688,7 @@ fn allocGqaSplitkOnlineDecodeWorkspace(
     const layout = cuda_kernel_renderer.generatedSplitkOnlineDecodeWorkspaceLayout();
     var workspace = try buffer_mod.DeviceBuffer.alloc(ctx, layout.total_bytes);
     errdefer workspace.free(ctx);
-    const zero_counters = [_]u32{0} ** cuda_kernel_renderer.generated_splitk_online_decode_query_heads;
+    const zero_counters = @as([cuda_kernel_renderer.generated_splitk_online_decode_query_heads]u32, @splat(0));
     const counters = buffer_mod.DeviceBuffer{
         .ptr = workspace.ptr + layout.completion_counters_offset,
         .len = zero_counters.len * @sizeOf(u32),
@@ -1151,7 +1151,7 @@ fn claimGqaSplitkOnlineDecodeTelemetry(
     head_dim: usize,
 ) bool {
     const head_slot: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
-    const bit_index = @as(usize, @intFromEnum(event)) * 3 + head_slot;
+    const bit_index = @as(usize, @backingInt(event)) * 3 + head_slot;
     const bit = @as(u64, 1) << @intCast(bit_index);
     return word.fetchOr(bit, .monotonic) & bit == 0;
 }
@@ -1462,7 +1462,7 @@ fn gqaFlashPrefillTelemetryBit(
 ) u64 {
     const head_bucket: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
     const query_bucket: usize = if (q_seq_len == 512) 0 else if (q_seq_len == 3) 1 else 2;
-    const bit_index = @as(usize, @intFromEnum(event)) * 9 + head_bucket * 3 + query_bucket;
+    const bit_index = @as(usize, @backingInt(event)) * 9 + head_bucket * 3 + query_bucket;
     return @as(u64, 1) << @intCast(bit_index);
 }
 
@@ -1597,11 +1597,11 @@ pub const JitRouteScope = struct {
     // Deterministically sorted distinct [out_dim, in_dim] Q4_0 shapes that can
     // reach generated dispatch for this model. They define the live
     // conformance domain and are part of the exact qualification cache key.
-    observed_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    observed_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     observed_shape_count: usize = 0,
-    prefill_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    prefill_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     prefill_shape_count: usize = 0,
-    pair_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    pair_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     pair_shape_count: usize = 0,
     conformance_complete: bool = true,
 
@@ -1894,9 +1894,9 @@ const max_runtime_jit_functions_per_artifact = 3;
 
 const RuntimeJitFunctionMapping = struct {
     slots: [max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction =
-        [_]?*driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+        @as([max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction, @splat(null)),
     names: [max_runtime_jit_functions_per_artifact][]const u8 =
-        [_][]const u8{""} ** max_runtime_jit_functions_per_artifact,
+        @as([max_runtime_jit_functions_per_artifact][]const u8, @splat("")),
     count: usize = 0,
 
     fn one(slot: *driver_mod.CUfunction, name: []const u8) RuntimeJitFunctionMapping {
@@ -1958,7 +1958,7 @@ pub const RuntimeJitCancellation = struct {
 };
 
 fn runtimeJitMonotonicNowNs() u64 {
-    const value = std.Io.Clock.awake.now(io_compat.io()).nanoseconds;
+    const value = std.Io.Clock.awake.now(io_compat.testingIo()).nanoseconds;
     if (value <= 0) return 0;
     return @intCast(@min(value, std.math.maxInt(u64)));
 }
@@ -2031,12 +2031,12 @@ const runtime_jit_rejection_capacity: usize = 256;
 
 const RuntimeJitRejectionMemo = struct {
     const Entry = struct {
-        key: kernel_jit.ArtifactKey = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey),
+        key: kernel_jit.ArtifactKey = @as([@sizeOf(kernel_jit.ArtifactKey)]u8, @splat(0)),
         rejected_at_ns: u64 = 0,
         valid: bool = false,
     };
 
-    entries: [runtime_jit_rejection_capacity]Entry = [_]Entry{.{}} ** runtime_jit_rejection_capacity,
+    entries: [runtime_jit_rejection_capacity]Entry = @as([runtime_jit_rejection_capacity]Entry, @splat(.{})),
     next_evict: usize = 0,
 
     fn activeAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) bool {
@@ -2130,7 +2130,7 @@ pub const RuntimeJitStats = struct {
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
-        [_]driver_mod.CUmodule{null} ** quant_kernel_compiler.first_generated_artifacts.len,
+        @as([quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule, @splat(null)),
     runtime_jit_module_count: usize = 0,
     runtime_jit_routes: JitProductionRoutes = .{},
     runtime_jit_pending_routes: JitProductionRoutes = .{},
@@ -2861,7 +2861,7 @@ pub const KernelModule = struct {
         if (cache_path) |path| {
             cache = kernel_jit.ArtifactCache.initPath(
                 allocator,
-                io_compat.io(),
+                io_compat.testingIo(),
                 path,
                 try config.maxCacheBytes(),
             ) catch |err| blk: {
@@ -2942,7 +2942,7 @@ pub const KernelModule = struct {
                 }
             }
 
-            const kernel_name = allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+            const kernel_name = allocator.dupeSentinel(u8, artifact.kernel_id, 0) catch |err| {
                 try handleRuntimeJitFailure(mode, required_route, artifact, "kernel name allocation", @errorName(err), "");
                 continue;
             };
@@ -2987,10 +2987,10 @@ pub const KernelModule = struct {
                 try handleRuntimeJitFailure(mode, required_route, artifact, "PTX module load", @errorName(err), "");
                 continue;
             };
-            var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+            var functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
             var all_symbols_resolved = true;
             for (0..mapping.count) |index| {
-                const symbol_name = allocator.dupeZ(u8, mapping.names[index]) catch |err| {
+                const symbol_name = allocator.dupeSentinel(u8, mapping.names[index], 0) catch |err| {
                     _ = ctx.driver.fns.cuModuleUnload(module);
                     try handleRuntimeJitFailure(mode, required_route, artifact, "symbol name allocation", @errorName(err), "");
                     all_symbols_resolved = false;
@@ -5037,7 +5037,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var scalar_ptr = scalar.ptr;
         var count_u32 = try toU32(count);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var scalar_on_left_u32: u32 = @intFromBool(scalar_on_left);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
@@ -7170,7 +7170,7 @@ pub const KernelModule = struct {
         var a_ptr = a.ptr;
         var b_ptr = b.ptr;
         var count_u32 = try toU32(count);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&a_ptr),
@@ -7213,7 +7213,7 @@ pub const KernelModule = struct {
         var a_rank_u32 = try toU32(a_rank);
         var b_rank_u32 = try toU32(b_rank);
         var output_rank_u32 = try toU32(output_rank);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var a_dims_mut = a_dims;
         var b_dims_mut = b_dims;
         var output_dims_mut = output_dims;
@@ -17554,7 +17554,7 @@ const generated_q4_0_q8_e2b_pair_threads: usize = 384;
 const generated_q4_0_q8_e2b_down_small_threads: usize = 128;
 const generated_q4_0_q8_e2b_down_large_threads: usize = 256;
 const generated_q4_0_ggml_q8_1_down_threads: usize = 128;
-const generated_q4_0_q8_e2b_max_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
+const generated_q4_0_q8_e2b_max_activation: u8 = @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
 const generated_q4_0_exact_ffn_pair_threads: usize = 128;
 const generated_q4_0_exact_ffn_down_threads: usize = 256;
 
@@ -17945,7 +17945,7 @@ const LiveRuntimeJitConformance = struct {
     fn identity(self: LiveRuntimeJitConformance, route: LiveRuntimeJitRoute) kernel_jit.ArtifactKey {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update(live_runtime_jit_conformance_policy_identity);
-        hasher.update(&.{@intFromEnum(route)});
+        hasher.update(&.{@backingInt(route)});
         var budget_encoded: [@sizeOf(u64)]u8 = undefined;
         std.mem.writeInt(u64, &budget_encoded, live_runtime_jit_max_fixture_bytes, .little);
         hasher.update(&budget_encoded);
@@ -18086,7 +18086,7 @@ fn liveRuntimeJitScopeWithinFixtureBudget(scope: JitRouteScope) bool {
 
 const RuntimeJitQualificationScopes = struct {
     scopes: [JitRouteScope.max_observed_shapes]JitRouteScope =
-        [_]JitRouteScope{.{}} ** JitRouteScope.max_observed_shapes,
+        @as([JitRouteScope.max_observed_shapes]JitRouteScope, @splat(.{})),
     count: usize = 0,
     complete: bool = true,
 
@@ -19481,7 +19481,7 @@ test "CUDA runtime JIT qualification scopes retain bounded body and omit oversiz
 
 test "CUDA runtime JIT negative qualification memo is exact bounded and expiring" {
     var memo = RuntimeJitRejectionMemo{};
-    var key = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey);
+    var key = @as([@sizeOf(kernel_jit.ArtifactKey)]u8, @splat(0));
     key[0] = 1;
     var other = key;
     other[0] = 2;
@@ -19531,7 +19531,7 @@ test "CUDA runtime JIT live qualifier is prepublication-sync and injectable" {
         .ctx = @ptrFromInt(4096),
         .module = &module,
         .artifact = artifact,
-        .candidate_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+        .candidate_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null)),
     };
 
     const cached = try resolveRuntimeJitQualification(.on, true, qualified, qualifier, request);
@@ -19680,7 +19680,7 @@ test "CUDA runtime JIT activation requires exact qualification and publishes bun
     };
     var module = KernelModule{};
     const mapping = module.generatedFunctionMapping(production).?;
-    var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
     for (0..mapping.count) |index| functions[index] = @ptrFromInt(index + 1);
 
     try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .shadow, true));
@@ -19705,8 +19705,8 @@ test "CUDA runtime JIT activation requires exact qualification and publishes bun
     promoted_attention.production_enabled = true;
     var attention_module = KernelModule{};
     const attention_mapping = attention_module.generatedFunctionMapping(promoted_attention).?;
-    var old_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
-    var new_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var old_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
+    var new_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
     for (0..attention_mapping.count) |index| {
         old_functions[index] = @ptrFromInt(index + 11);
         new_functions[index] = @ptrFromInt(index + 21);
@@ -19888,8 +19888,8 @@ fn loadPtxModuleWithJitLog(
     ptx: []const u8,
     label: []const u8,
 ) driver_mod.Error!void {
-    var info_log: [4096]u8 = .{0} ** 4096;
-    var error_log: [4096]u8 = .{0} ** 4096;
+    var info_log: [4096]u8 = @splat(0);
+    var error_log: [4096]u8 = @splat(0);
     var options = [_]driver_mod.CUjit_option{
         driver_mod.CU_JIT_INFO_LOG_BUFFER,
         driver_mod.CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
@@ -20027,9 +20027,9 @@ fn smokeGemma4A4BResidentQ4_0(
     const max_routes = rows * experts;
     const expert_stride = intermediate * q4_0_block_bytes;
 
-    const input_host = [_]f32{1.0 / 32.0} ** (rows * hidden);
+    const input_host = @as([rows * hidden]f32, @splat(1.0 / 32.0));
     const logits_host = [_]f32{ 0.0, 2.0, 3.0, -1.0 };
-    var weight_host = [_]u8{0} ** (experts * expert_stride);
+    var weight_host = @as([experts * expert_stride]u8, @splat(0));
     for (0..experts) |expert| {
         const value: i4 = if (expert == 0) 2 else 1;
         for (0..intermediate) |out| {
@@ -20243,7 +20243,7 @@ fn smokeGemma4A4BExactDown(
         const offset = block * q4_0_block_bytes;
         writeQ4_0SmokeRow(weight_host[offset .. offset + q4_0_block_bytes], 0.125, value);
     }
-    const route_ids_host = [_]u32{0} ** routes;
+    const route_ids_host = @as([routes]u32, @splat(0));
 
     var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
     defer input.free(ctx);
@@ -20309,7 +20309,7 @@ fn smokeGemma4A4BExactLmHead(
     const q8_row_blocks = in_dim / q8_1_values_per_block;
     const col_tiles = out_dim / q6_k_col_tile8;
 
-    const input_host = [_]f32{0.25} ** in_dim;
+    const input_host = @as([in_dim]f32, @splat(0.25));
     const weight_host = try allocator.alloc(u8, out_dim * q6_row_blocks * q6_k_block_bytes);
     defer allocator.free(weight_host);
     for (0..out_dim) |col| {
@@ -21761,7 +21761,7 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q8_0_block_bytes);
+    var weight_raw = @as([(out_dim * q8_0_block_bytes)]u8, @splat(0));
     writeQ8_0SmokeRow(weight_raw[0..34], 1.0, 1);
     writeQ8_0SmokeRow(weight_raw[34..68], 0.5, 2);
     writeQ8_0SmokeRow(weight_raw[68..102], 2.0, -1);
@@ -21839,11 +21839,11 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q4_0_block_bytes);
+    var weight_raw = @as([(out_dim * q4_0_block_bytes)]u8, @splat(0));
     writeQ4_0SmokeRow(weight_raw[0..18], 1.0, 1);
     writeQ4_0SmokeRow(weight_raw[18..36], 0.5, 2);
     writeQ4_0SmokeRow(weight_raw[36..54], 2.0, -1);
-    var patterned_row = [_]i4{0} ** q4_0_values_per_block;
+    var patterned_row = @as([q4_0_values_per_block]i4, @splat(0));
     patterned_row[0] = 1;
     patterned_row[16] = -1;
     writeQ4_0SmokeRowValues(weight_raw[54..72], 1.0, &patterned_row);
@@ -21909,10 +21909,10 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         const ripple: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 9)) - 4)) / 43.0;
         value.* = centered + ripple;
     }
-    var large_weight_raw = [_]u8{0} ** (large_out_dim * large_row_blocks * q4_0_block_bytes);
+    var large_weight_raw = @as([(large_out_dim * large_row_blocks * q4_0_block_bytes)]u8, @splat(0));
     for (0..large_out_dim) |col| {
         for (0..large_row_blocks) |block| {
-            var values = [_]i4{0} ** q4_0_values_per_block;
+            var values = @as([q4_0_values_per_block]i4, @splat(0));
             for (&values, 0..) |*value, lane_index| {
                 const raw: i32 = @intCast((col * 31 + block * 13 + lane_index * 5) % 15);
                 value.* = @intCast(raw - 7);
@@ -22045,7 +22045,7 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     try expectApproxSlice(out, expected[0..], 4.0);
 
-    const gate_data = [_]f32{1.0} ** (rows * in_dim);
+    const gate_data = @as([(rows * in_dim)]f32, @splat(1.0));
     var gate = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_data.len * @sizeOf(f32));
     defer gate.free(&ctx);
     try gate.copyFromHost(&ctx, std.mem.sliceAsBytes(&gate_data));
@@ -22140,8 +22140,8 @@ pub fn smokeQ4_0E4BPairActivationQ8_1Rows(allocator: std.mem.Allocator) !void {
     defer allocator.free(up_weight_raw);
     for (0..out_dim) |col| {
         for (0..input_row_blocks) |block| {
-            var gate_values = [_]i4{0} ** q4_0_values_per_block;
-            var up_values = [_]i4{0} ** q4_0_values_per_block;
+            var gate_values = @as([q4_0_values_per_block]i4, @splat(0));
+            var up_values = @as([q4_0_values_per_block]i4, @splat(0));
             for (0..q4_0_values_per_block) |lane| {
                 const gate_raw: i32 = @intCast((col * 31 + block * 13 + lane * 5) % 15);
                 const up_raw: i32 = @intCast((col * 19 + block * 23 + lane * 7 + 3) % 15);
@@ -22180,7 +22180,7 @@ pub fn smokeQ4_0E4BPairActivationQ8_1Rows(allocator: std.mem.Allocator) !void {
         rows,
         in_dim,
         out_dim,
-        @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.gelu),
+        @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.gelu),
     );
     try ctx.synchronize();
 
@@ -22210,7 +22210,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
         input_data[i] = @floatFromInt(i + 1);
         input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
     }
-    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
     const bias_data = [_]f32{ 0.25, -1.0 };
@@ -22319,7 +22319,7 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
 
     const rows: usize = 2;
     const dim: usize = q6_k_values_per_block;
-    var weight_raw = [_]u8{0} ** (rows * q6_k_block_bytes);
+    var weight_raw = @as([(rows * q6_k_block_bytes)]u8, @splat(0));
     writeQ6_KSmokeRow(weight_raw[0..q6_k_block_bytes], 1.0, -3);
     writeQ6_KSmokeRow(weight_raw[q6_k_block_bytes .. 2 * q6_k_block_bytes], 0.5, 4);
 
@@ -22360,8 +22360,8 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     try expectApproxSlice(actual, expected, 0.0001);
 
-    const gate_data = [_]f32{1.0} ** q6_k_values_per_block;
-    const up_data = [_]f32{1.0} ** q6_k_values_per_block;
+    const gate_data = @as([q6_k_values_per_block]f32, @splat(1.0));
+    const up_data = @as([q6_k_values_per_block]f32, @splat(1.0));
     var gate = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_data.len * @sizeOf(f32));
     defer gate.free(&ctx);
     var up = try buffer_mod.DeviceBuffer.alloc(&ctx, up_data.len * @sizeOf(f32));
@@ -22374,13 +22374,13 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
 
     try module.launchLinearQ6KTile4F32(&ctx, down_out, gate, weight, 1, q6_k_values_per_block, rows);
     try ctx.synchronize();
-    var down_actual = [_]f32{0} ** rows;
+    var down_actual = @as([rows]f32, @splat(0));
     try down_out.copyToHost(&ctx, std.mem.sliceAsBytes(&down_actual));
     try ctx.synchronize();
     try expectApproxSlice(&down_actual, &down_expected, 0.01);
 
     @memset(&down_actual, 0);
-    try module.launchLinearQ6KGatedDownTile4F32(&ctx, down_out, gate, up, weight, 1, q6_k_values_per_block, rows, @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu));
+    try module.launchLinearQ6KGatedDownTile4F32(&ctx, down_out, gate, up, weight, 1, q6_k_values_per_block, rows, @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu));
     try ctx.synchronize();
     try down_out.copyToHost(&ctx, std.mem.sliceAsBytes(&down_actual));
     try ctx.synchronize();
@@ -22400,15 +22400,15 @@ fn smokeFlorence2TripleQ4KTcHmmaF32(
         input_data[i] = @floatFromInt(i + 1);
         input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
     }
-    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
-    var weight_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    var weight_tc_raw = @as([(out_dim * q4_k_tc_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeTensorCore(&weight_tc_raw, &weight_raw, in_dim, out_dim);
-    var weight_b_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_b_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_b_raw[0..144], 0.25, 3);
     writeQ4_KSmokeRow(weight_b_raw[144..288], 2.0, 1);
-    var weight_b_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    var weight_b_tc_raw = @as([(out_dim * q4_k_tc_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeTensorCore(&weight_b_tc_raw, &weight_b_raw, in_dim, out_dim);
     const bias_data = [_]f32{ 0.25, -1.0 };
     const bias_b_data = [_]f32{ 1.5, -2.25 };
@@ -23704,7 +23704,7 @@ test "generated CUDA Q6_K Q8_1 argmax launch contracts are exact" {
 }
 
 test "generated CUDA Q4_0 Q8_1 E2B launch contracts are exact" {
-    const silu_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.silu);
+    const silu_activation: u8 = @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.silu);
     try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 6144, silu_activation));
     try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 12288, silu_activation));
     try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 6144, 1536));
@@ -23875,7 +23875,7 @@ test "cuda kernel launch helper bounds" {
 }
 
 test "cuda q8_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q8_0_block_bytes;
+    var raw = @as([q8_0_block_bytes]u8, @splat(0));
     writeQ8_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);
@@ -23883,7 +23883,7 @@ test "cuda q8_0 smoke row writer uses gguf block layout" {
 }
 
 test "cuda q4_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q4_0_block_bytes;
+    var raw = @as([q4_0_block_bytes]u8, @splat(0));
     writeQ4_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);

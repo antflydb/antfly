@@ -690,7 +690,7 @@ fn writeRunOutputs(
 ) !void {
     const training_config_path = try std.fs.path.join(allocator, &.{ out_dir, "training_config.json" });
     defer allocator.free(training_config_path);
-    try artifact_writer.writeJsonFile(allocator, training_config_path, .{
+    try artifact_writer.writeJsonFile(allocator, io, training_config_path, .{
         .contract_version = run_contract.training_config_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "gemma4_lora_train_eval",
@@ -726,11 +726,11 @@ fn writeRunOutputs(
 
     const report_path = try std.fs.path.join(allocator, &.{ out_dir, "train_eval_report.json" });
     defer allocator.free(report_path);
-    try artifact_writer.writeJsonFile(allocator, report_path, report_payload);
+    try artifact_writer.writeJsonFile(allocator, io, report_path, report_payload);
 
     const training_report_path = try std.fs.path.join(allocator, &.{ out_dir, "training_report.json" });
     defer allocator.free(training_report_path);
-    try artifact_writer.writeJsonFile(allocator, training_report_path, .{
+    try artifact_writer.writeJsonFile(allocator, io, training_report_path, .{
         .contract_version = run_contract.training_report_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "gemma4_lora_train_eval",

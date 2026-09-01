@@ -16,7 +16,7 @@
     .fingerprint = 0x455a9f271e83b54a,
     .name = .pjrt,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{
         .protobuf = .{
             .path = "../protobuf",

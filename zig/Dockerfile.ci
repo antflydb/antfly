@@ -1,6 +1,5 @@
 FROM ubuntu:24.04
 
-ARG ZIG_VERSION=0.16.0
 ARG WASMTIME_VERSION=v45.0.2
 ARG TARGETARCH
 
@@ -25,16 +24,20 @@ RUN apt-get update && \
       xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
-RUN case "${TARGETARCH}" in \
-      amd64) zig_arch="x86_64" ;; \
-      arm64) zig_arch="aarch64" ;; \
+COPY zig/toolchain.env /tmp/zig-toolchain.env
+
+RUN . /tmp/zig-toolchain.env && \
+    case "${TARGETARCH}" in \
+      amd64) zig_arch="x86_64"; zig_sha256="${ZIG_X86_64_LINUX_SHA256}" ;; \
+      arm64) zig_arch="aarch64"; zig_sha256="${ZIG_AARCH64_LINUX_SHA256}" ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    curl --fail --location --retry 3 "https://ziglang.org/builds/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    echo "${zig_sha256}  /tmp/zig.tar.xz" | sha256sum --check --strict && \
     mkdir -p /opt && \
     tar -xJf /tmp/zig.tar.xz -C /opt && \
     mv "/opt/zig-${zig_arch}-linux-${ZIG_VERSION}" /opt/zig && \
-    rm /tmp/zig.tar.xz
+    rm /tmp/zig.tar.xz /tmp/zig-toolchain.env
 
 RUN case "${TARGETARCH}" in \
       amd64) wasmtime_arch="x86_64" ;; \

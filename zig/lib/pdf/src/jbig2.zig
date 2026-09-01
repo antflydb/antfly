@@ -1212,7 +1212,7 @@ test "arithmetic decoder matches Annex E context transitions" {
     // MPS and LPS exchange paths without relying on a PDF container.
     const encoded = [_]u8{ 0x84, 0xc7, 0x3b, 0xfc, 0xe1, 0xa1, 0x43, 0x04, 0x02, 0x20, 0x00, 0x00 };
     var decoder = try ArithmeticDecoder.init(&encoded);
-    var contexts = [_]u8{0} ** 2;
+    var contexts = @as([2]u8, @splat(0));
     var bits: u16 = 0;
     for (0..16) |_| bits = (bits << 1) | try decoder.decode(&contexts, 0);
     try std.testing.expectEqual(@as(u16, 2), bits);

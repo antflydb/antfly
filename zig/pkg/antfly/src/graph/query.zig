@@ -290,14 +290,14 @@ test "graph public operation names and edge filters stay unambiguous and bounded
     try std.testing.expect(!isValidIdentifier("author\u{202e}name"));
     try std.testing.expect(!isValidIdentifier("*"));
     try std.testing.expect(!isValidIdentifier("$query_results"));
-    try std.testing.expect(!isValidIdentifier("a" ** (max_identifier_bytes + 1)));
+    try std.testing.expect(!isValidIdentifier(@as([max_identifier_bytes + 1]u8, @splat('a'))));
 
     try validateEdgeTypes(&.{ "cites", "related" });
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{""}));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{ "cites", "cites" }));
-    const too_many = [_][]const u8{"edge"} ** (max_edge_types + 1);
+    const too_many = @as([max_edge_types + 1][]const u8, @splat("edge"));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_many));
-    const too_large = [_][]const u8{"x" ** (max_edge_type_bytes + 1)};
+    const too_large = [_][]const u8{@as([max_edge_type_bytes + 1]u8, @splat('x'))};
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_large));
 
     try std.testing.expectEqual(@as(usize, 101), resultCollectionLimit(100));

@@ -1586,7 +1586,7 @@ test "iceberg snapshot reader rejects corrupted cached metadata range lengths" {
     const corrupt_bytes = try alloc.dupe(u8, "{}");
     cache.entries.put(alloc, cache_key, .{
         .bytes = corrupt_bytes,
-        .checksum = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .checksum = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     }) catch |err| {
         alloc.free(cache_key);
         alloc.free(corrupt_bytes);
@@ -2346,7 +2346,7 @@ fn appendManifestListRecord(
     try appendString(alloc, out, manifest_path);
     try appendLong(alloc, out, @intCast(manifest_length));
     try appendLong(alloc, out, 0);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendLong(alloc, out, 42);
     try appendLong(alloc, out, summary.added_files);
     try appendLong(alloc, out, summary.existing_files);
@@ -2476,14 +2476,14 @@ fn appendDataManifestRecord(
     record_count: i64,
     file_size_in_bytes: i64,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 12);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 42);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 43);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, "PARQUET");
     try appendLong(alloc, out, record_count);
@@ -2499,14 +2499,14 @@ fn appendDataManifestRecordWithEqualityIds(
     file_size_in_bytes: i64,
     equality_ids: []const i32,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 12);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 42);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 43);
-    try appendLong(alloc, out, @intFromEnum(iceberg_avro.DataFileContent.equality_deletes));
+    try appendLong(alloc, out, @backingInt(iceberg_avro.DataFileContent.equality_deletes));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, "PARQUET");
     try appendLong(alloc, out, record_count);

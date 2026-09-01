@@ -418,9 +418,9 @@ pub fn computeLossAndGrads(
 /// via a deeper surrogate or switch to full autodiff.
 const candidate_lora_modules = [_][]const u8{
     // Qwen2 HF naming
-    "q_proj",     "k_proj",     "v_proj",   "o_proj",
+    "q_proj",     "k_proj",   "v_proj",     "o_proj",
     // Fused-chunker naming (in case the caller reused the reranker defaults)
-    "query_proj", "key_proj",   "value_proj", "out_proj",
+    "query_proj", "key_proj", "value_proj", "out_proj",
 };
 
 const lora_grad_helpers = @import("lora_grad_helpers.zig");
@@ -529,7 +529,7 @@ pub fn trainStep(
     // Pin every last-layer target module's grad block while the backward is
     // in flight. This prevents a concurrent spill-to-fit from evicting a
     // block mid-accumulation. Unpin them at the end of the step.
-    var pinned_blocks: [candidate_lora_modules.len]?residency_mod.GradBlockId = .{null} ** candidate_lora_modules.len;
+    var pinned_blocks: [candidate_lora_modules.len]?residency_mod.GradBlockId = @splat(null);
     defer if (coord) |c| {
         for (pinned_blocks) |maybe_id| {
             if (maybe_id) |id| c.unpinGradBlock(id) catch {};

@@ -4315,7 +4315,7 @@ test "wal read-only lsm backend does not create missing root" {
 
     const path_raw = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-readonly-lsm-missing", .{tmp.sub_path});
     defer std.testing.allocator.free(path_raw);
-    const path = try std.testing.allocator.dupeZ(u8, path_raw);
+    const path = try std.testing.allocator.dupeSentinel(u8, path_raw, 0);
     defer std.testing.allocator.free(path);
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});

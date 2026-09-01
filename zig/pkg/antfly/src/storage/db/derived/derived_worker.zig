@@ -825,11 +825,11 @@ test "catchUpIndex batches dense replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-batched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-batched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -955,7 +955,7 @@ test "catchUpIndex window hooks fire once per replay window" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-hooks-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1010,7 +1010,7 @@ test "catchUpIndex refuses to open an apply window after its deadline" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-expired-deadline-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
     defer journal.close();
@@ -1036,7 +1036,7 @@ test "catchUpIndex can stop after bounded replay windows" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-limit-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1093,7 +1093,7 @@ test "catchUpIndex catch-up hooks fire once per replay run" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-catch-up-hooks-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1148,7 +1148,7 @@ test "catchUpIndex persists replay progress after finishing replay window" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-persist-order-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1192,11 +1192,11 @@ test "catchUpIndex removes pending chunk dense vectors by parent document" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-parent-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-parent-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1247,7 +1247,7 @@ test "catchUpIndex chunks large replay windows" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1295,7 +1295,7 @@ test "catchUpIndex chunks replay by byte budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-byte-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1345,7 +1345,7 @@ test "catchUpIndex chunks dense replay by item budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-item-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1395,7 +1395,7 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-item-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1432,7 +1432,7 @@ test "catchUpIndex chunks dense replay by estimated vector byte budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-byte-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1486,11 +1486,11 @@ test "catchUpIndex batches full-text replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-unbatched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-unbatched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1544,11 +1544,11 @@ test "catchUpIndex batches sparse replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-sparse-batched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-sparse-batched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1601,11 +1601,11 @@ test "catchUpIndex batches graph artifact journal records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-graph-journal-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-graph-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1651,7 +1651,7 @@ test "catchUpIndex batches resolution artifact graph journal records before appl
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-resolution-graph-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());

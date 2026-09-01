@@ -40,13 +40,12 @@ pub fn initializeNoop(comptime T: type) T {
     switch (@typeInfo(T)) {
         .@"struct" => |struct_info| {
             var m: T = undefined;
-            inline for (struct_info.fields) |field| {
-                switch (@typeInfo(field.type)) {
-                    .@"union" => @field(m, field.name) = .{ .noop = {} },
+            inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs) |field_name, Field, attrs| {
+                switch (@typeInfo(Field)) {
+                    .@"union" => @field(m, field_name) = .{ .noop = {} },
                     else => {
-                        if (field.default_value_ptr) |default_value_ptr| {
-                            const default_value = @as(*align(1) const field.type, @ptrCast(default_value_ptr)).*;
-                            @field(m, field.name) = default_value;
+                        if (attrs.defaultValue(Field)) |default_value| {
+                            @field(m, field_name) = default_value;
                         }
                     },
                 }
@@ -59,11 +58,11 @@ pub fn initializeNoop(comptime T: type) T {
 
 pub fn write(metrics: anytype, writer: *std.Io.Writer) !void {
     const S = @typeInfo(@TypeOf(metrics)).pointer.child;
-    const fields = @typeInfo(S).@"struct".fields;
+    const info = @typeInfo(S).@"struct";
 
-    inline for (fields) |f| {
-        switch (@typeInfo(f.type)) {
-            .@"union" => try @constCast(&@field(metrics, f.name)).write(writer),
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        switch (@typeInfo(Field)) {
+            .@"union" => try @constCast(&@field(metrics, field_name)).write(writer),
             else => {},
         }
     }

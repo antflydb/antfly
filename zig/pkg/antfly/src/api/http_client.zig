@@ -4189,9 +4189,9 @@ test "fenced backup forwarding treats post-send transport failure as ambiguous" 
             .metadata_group_id = 3,
             .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
             .table_id = 7,
-            .definition_digest = [_]u8{0x11} ** 32,
+            .definition_digest = @as([32]u8, @splat(0x11)),
             .topology_range_count = 1,
-            .topology_digest = [_]u8{0x22} ** 32,
+            .topology_digest = @as([32]u8, @splat(0x22)),
             .writer_not_after_unix_ns = 123,
         },
     ));

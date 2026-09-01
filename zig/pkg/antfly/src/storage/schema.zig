@@ -46,7 +46,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================
@@ -243,12 +243,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendOptStr(&buf, alloc, tmpl.path_match);
         try appendOptStr(&buf, alloc, tmpl.path_unmatch);
         try appendOptStr(&buf, alloc, tmpl.match_mapping_type);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.field_type));
+        try buf.append(alloc, @backingInt(tmpl.mapping.field_type));
         try buf.append(alloc, if (tmpl.mapping.do_index) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
+        try buf.append(alloc, @backingInt(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -259,12 +259,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
         for (schema.declared_fields) |field| {
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -276,12 +276,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         for (schema.exact_fields) |field| {
             try appendStr(&buf, alloc, field.source_field);
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -390,7 +390,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         const match_mapping_type: ?[]const u8 = if (has_match_mapping_type) try alloc.dupe(u8, readStr(data, &pos)) else null;
         errdefer if (match_mapping_type) |p| alloc.free(p);
 
-        const field_type: AntflyType = @enumFromInt(data[pos]);
+        const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
         const do_index = data[pos] == 1;
         pos += 1;
@@ -450,7 +450,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         for (fields) |*field| {
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;
@@ -509,7 +509,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(source_field);
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;

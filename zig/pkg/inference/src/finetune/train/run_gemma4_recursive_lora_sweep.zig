@@ -100,7 +100,7 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     const teacher_temperatures = try parseCsv(allocator, opts.teacher_temperatures_csv);
     defer allocator.free(teacher_temperatures);
 
-    try compat.cwd().createDirPath(compat.io(), opts.output_root);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.output_root);
 
     var baseline_dirs = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -250,7 +250,7 @@ fn writeComparison(
         .smallest_trained_adapter = smallest_trained_adapter,
     }, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = comparison_path, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = comparison_path, .data = out.written() });
 }
 
 fn baselineRow(allocator: std.mem.Allocator, backend: []const u8, path: []const u8) !Row {
@@ -384,10 +384,10 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, argv0: []con
     var vector = try allocator.alloc([*:0]const u8, args.len + 1);
     defer allocator.free(vector);
 
-    owned[0] = try allocator.dupeZ(u8, argv0);
+    owned[0] = try allocator.dupeSentinel(u8, argv0, 0);
     vector[0] = owned[0].ptr;
     for (args, 0..) |arg, idx| {
-        owned[idx + 1] = try allocator.dupeZ(u8, arg);
+        owned[idx + 1] = try allocator.dupeSentinel(u8, arg, 0);
         vector[idx + 1] = owned[idx + 1].ptr;
     }
 

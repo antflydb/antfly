@@ -510,7 +510,7 @@ pub const SegmentWriter = struct {
             try appendU16BE(self.alloc, out, @intCast(field.sections.items.len));
 
             for (field.sections.items) |*section| {
-                try appendU16BE(self.alloc, out, @intFromEnum(section.section_type));
+                try appendU16BE(self.alloc, out, @backingInt(section.section_type));
                 try appendU64BE(self.alloc, out, @intCast(section.offset));
                 try appendU64BE(self.alloc, out, @intCast(section.length));
                 try appendU32BE(self.alloc, out, section.checksum);
@@ -526,7 +526,7 @@ pub const SegmentWriter = struct {
             try sinkAppendU16BE(sink, @intCast(field.sections.items.len));
 
             for (field.sections.items) |*section| {
-                try sinkAppendU16BE(sink, @intFromEnum(section.section_type));
+                try sinkAppendU16BE(sink, @backingInt(section.section_type));
                 try sinkAppendU64BE(sink, @intCast(section.offset));
                 try sinkAppendU64BE(sink, @intCast(section.length));
                 try sinkAppendU32BE(sink, section.checksum);
@@ -2019,7 +2019,7 @@ fn writeMergedSectionIndex(alloc: Allocator, sink: *SegmentSink, fields: []const
         try sink.appendSlice(field.name);
         try sinkAppendU16BE(sink, @intCast(field.sections.items.len));
         for (field.sections.items) |section| {
-            try sinkAppendU16BE(sink, @intFromEnum(section.section_type));
+            try sinkAppendU16BE(sink, @backingInt(section.section_type));
             try sinkAppendU64BE(sink, section.offset);
             try sinkAppendU64BE(sink, section.length);
             try sinkAppendU32BE(sink, section.checksum);
@@ -2995,7 +2995,7 @@ test "segment layout stats ignores invalid inverted section slice" {
         .name = "content",
         .sections = sections[0..],
     }};
-    const data = [_]u8{0} ** 64;
+    const data = @as([64]u8, @splat(0));
     const reader = SegmentReader{
         .alloc = std.testing.allocator,
         .data = &data,
@@ -3603,7 +3603,7 @@ fn buildLegacyF64DocValuesSectionAlloc(alloc: Allocator, doc_id: u32, value: f64
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try out.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
     try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
     const offset_pos = out.items.len;
     try out.appendNTimes(alloc, 0, 8);

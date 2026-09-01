@@ -104,7 +104,7 @@ pub const Eval = struct {
     pub fn init(arena: std.mem.Allocator, context: *ValueMap) Eval {
         var e = Eval{
             .arena = arena,
-            .scopes = .{null} ** 16,
+            .scopes = @splat(null),
             .scope_depth = 1,
             .output = std.ArrayListUnmanaged(u8).empty,
             .strip_next = false,

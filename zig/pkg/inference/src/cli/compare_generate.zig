@@ -45,7 +45,7 @@ const Options = struct {
     native_model_dir: []const u8,
     reference_model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
     backend: BackendChoice = .auto,
     native_backend: ?BackendChoice = null,
@@ -249,7 +249,7 @@ const WeightBindingSlotStat = struct {
     rms: f64 = 0,
     mean_abs: f64 = 0,
     max_abs: f32 = 0,
-    first: [weight_binding_sample_count]f32 = [_]f32{0} ** weight_binding_sample_count,
+    first: [weight_binding_sample_count]f32 = @as([weight_binding_sample_count]f32, @splat(0)),
     first_count: usize = 0,
 
     fn deinit(self: *WeightBindingSlotStat, allocator: std.mem.Allocator) void {
@@ -1195,7 +1195,7 @@ fn writeQualityEvalJson(
         try out.appendSlice(allocator, row);
     }
     try out.appendSlice(allocator, "\n]}\n");
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 fn runActivationTraceCompare(allocator: std.mem.Allocator, opts: Options) !void {

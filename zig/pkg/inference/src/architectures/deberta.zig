@@ -289,11 +289,11 @@ const DebertaLayerNormSlotKind = enum(usize) {
 };
 
 fn debertaLinearSlot(layer: usize, kind: DebertaLinearSlotKind) usize {
-    return layer * 6 + @intFromEnum(kind);
+    return layer * 6 + @backingInt(kind);
 }
 
 fn debertaLayerNormSlot(layer: usize, kind: DebertaLayerNormSlotKind) usize {
-    return layer * 2 + @intFromEnum(kind);
+    return layer * 2 + @backingInt(kind);
 }
 
 fn allAttentionMaskOnes(mask: []const i64, total: usize) bool {

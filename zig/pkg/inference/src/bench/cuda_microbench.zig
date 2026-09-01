@@ -139,7 +139,7 @@ const q4_0_tc_q_bytes: usize = 16;
 const activation_multiply_strided_symbol = "termite_activation_multiply_fused_gate_up_f32";
 const activation_multiply_strided_row_counts = [_]usize{ 64, 512 };
 const activation_multiply_strided_f_dims = [_]usize{ 8960, 12288 };
-const activation_multiply_strided_activation: u32 = @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
+const activation_multiply_strided_activation: u32 = @backingInt(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
 
 const q6_k_values_per_block: usize = 256;
 const q6_k_block_bytes: usize = 210;
@@ -180,7 +180,7 @@ const q6_k_q8_1_lm_argmax_variants = [_]Q6KQ8_1LmArgmaxVariant{
 
 const q4_0_q8_1_e2b_ffn_rows: usize = 1;
 const q4_0_q8_1_e2b_ffn_hidden_dim: usize = 1536;
-const q4_0_q8_1_e2b_ffn_activation: u32 = @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
+const q4_0_q8_1_e2b_ffn_activation: u32 = @backingInt(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
 const q4_0_q8_1_e2b_ffn_pair_threads: usize = 384;
 const q4_0_q8_1_e2b_ffn_ggml_down_threads: usize = 128;
 const q4_0_q8_1_e2b_ffn_production_down_threads: usize = 256;
@@ -892,7 +892,7 @@ test "cuda microbench E2B FFN SM89 mode defaults and gate are exact" {
     try validateQ4_0Q8_1E2BFfnSm89Gate(false, 8, 0);
     try validateQ4_0Q8_1E2BFfnSm89Gate(true, 8, 9);
     try std.testing.expectError(error.CudaComputeCapabilityMismatch, validateQ4_0Q8_1E2BFfnSm89Gate(true, 9, 0));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new)), q4_0_q8_1_e2b_ffn_activation);
+    try std.testing.expectEqual(@as(u32, @backingInt(backend_contracts.DecoderRuntimeActivationKind.gelu_new)), q4_0_q8_1_e2b_ffn_activation);
     try std.testing.expectEqual(@as(usize, 256), q4_0_q8_1_e2b_ffn_production_down_threads);
     try std.testing.expectEqual(@as(usize, 128), q4_0_q8_1_e2b_ffn_ggml_down_threads);
 
@@ -931,7 +931,7 @@ test "cuda microbench exact byte comparison preserves f32 bit patterns" {
 }
 
 test "cuda microbench llama Q8_1 differential ignores only typed raw-sum field" {
-    const legacy = [_]u8{0} ** q8_1_block_bytes;
+    const legacy = @as([q8_1_block_bytes]u8, @splat(0));
     var ggml = legacy;
     ggml[2] = 0x34;
     ggml[3] = 0x12;
@@ -940,7 +940,7 @@ test "cuda microbench llama Q8_1 differential ignores only typed raw-sum field" 
     ggml[4] = 1;
     try std.testing.expectEqual(@as(?usize, 4), try firstQ8PayloadMismatchIgnoringGgmlSum(&legacy, &ggml));
 
-    const values = [_]f32{1.0} ** q8_1_values_per_block;
+    const values = @as([q8_1_values_per_block]f32, @splat(1.0));
     const sum_half: f16 = 32.0;
     const sum_bits: u16 = @bitCast(sum_half);
     ggml[2] = @truncate(sum_bits);
@@ -2382,7 +2382,7 @@ const GeneratedCandidateModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
         errdefer _ = ctx.driver.fns.cuModuleUnload(module);
 
-        const kernel_name = try allocator.dupeZ(u8, kernel_id);
+        const kernel_name = try allocator.dupeSentinel(u8, kernel_id, 0);
         defer allocator.free(kernel_name);
         var function: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, kernel_name));
@@ -4453,14 +4453,14 @@ fn checkQuantCompilerEvidenceJsonPath(allocator: std.mem.Allocator, bytes: []con
 
 fn writeFileCreatingParent(io: std.Io, path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
     }
     if (std.fs.path.isAbsolute(path)) {
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, data);
     } else {
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
     }
 }
 
@@ -4643,8 +4643,8 @@ fn replaceOnce(allocator: std.mem.Allocator, input: []const u8, needle: []const 
 test "cuda microbench evidence writer creates absolute parent directories" {
     const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/antfly_quant_evidence_test_{d}", .{std.posix.system.getpid()});
     defer std.testing.allocator.free(root);
-    compat.cwd().deleteTree(std.testing.io, root) catch {};
-    defer compat.cwd().deleteTree(std.testing.io, root) catch {};
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
     const evidence_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/q4.json", .{root});
     defer std.testing.allocator.free(evidence_path);
@@ -4795,7 +4795,7 @@ fn runGemma4KernelBench(
             \\}
             \\
         );
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json_out.items });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_out.items });
     }
 }
 

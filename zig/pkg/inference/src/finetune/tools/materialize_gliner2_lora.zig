@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
             return error.EvalBeforeFailed;
         }
 
-        const summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
+        const summary = try finetune.materializeMergedModel(allocator, init.io, base_model_dir, adapter_model_dir, out_dir);
         defer freeMaterializeSummary(allocator, summary);
 
         var eval_after = try peft.runEvalCapture(allocator, init.io, program, "after");
@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
+    const summary = try finetune.materializeMergedModel(allocator, init.io, base_model_dir, adapter_model_dir, out_dir);
     defer freeMaterializeSummary(allocator, summary);
 
     try printJson(init, summary);

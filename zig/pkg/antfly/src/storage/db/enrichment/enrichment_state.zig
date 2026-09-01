@@ -141,10 +141,10 @@ fn decodeProjectionCheckpoint(raw: []const u8) !ProjectionCheckpoint {
     const generation = readCheckpointInt(raw, &pos, u64);
     const config_hash = readCheckpointInt(raw, &pos, u64);
     const status: ProjectionStatus = switch (status_raw) {
-        @intFromEnum(ProjectionStatus.clean) => .clean,
-        @intFromEnum(ProjectionStatus.rebuilding) => .rebuilding,
-        @intFromEnum(ProjectionStatus.degraded) => .degraded,
-        @intFromEnum(ProjectionStatus.repair_required) => .repair_required,
+        @backingInt(ProjectionStatus.clean) => .clean,
+        @backingInt(ProjectionStatus.rebuilding) => .rebuilding,
+        @backingInt(ProjectionStatus.degraded) => .degraded,
+        @backingInt(ProjectionStatus.repair_required) => .repair_required,
         else => return error.InvalidEnrichmentState,
     };
     return .{
@@ -161,7 +161,7 @@ fn encodeProjectionCheckpoint(checkpoint: ProjectionCheckpoint) [37]u8 {
     var pos: usize = checkpoint_magic.len;
     writeCheckpointInt(&out, &pos, u32, checkpoint_format_version);
     writeCheckpointInt(&out, &pos, u64, checkpoint.applied_sequence);
-    writeCheckpointInt(&out, &pos, u8, @intFromEnum(checkpoint.status));
+    writeCheckpointInt(&out, &pos, u8, @backingInt(checkpoint.status));
     writeCheckpointInt(&out, &pos, u64, checkpoint.generation);
     writeCheckpointInt(&out, &pos, u64, checkpoint.config_hash);
     return out;
@@ -459,7 +459,7 @@ test "enrichment runtime status persists source target sequence" {
 }
 
 test "enrichment runtime status upgrades legacy shared retry count" {
-    var raw = [_]u8{0} ** runtime_status_len;
+    var raw = @as([runtime_status_len]u8, @splat(0));
     std.mem.writeInt(u32, raw[40..44], 4, .little);
     std.mem.writeInt(u64, raw[52..60], 91, .little);
     raw[60] = 1;
@@ -519,7 +519,7 @@ test "enrichment runtime status sidecar preserves rollback-readable primary" {
 }
 
 test "enrichment runtime status reads transient extended development record" {
-    var raw = [_]u8{0} ** runtime_status_extended_len;
+    var raw = @as([runtime_status_extended_len]u8, @splat(0));
     std.mem.writeInt(u32, raw[40..44], 5, .little);
     std.mem.writeInt(u64, raw[52..60], 91, .little);
     std.mem.writeInt(u32, raw[62..66], 2, .little);

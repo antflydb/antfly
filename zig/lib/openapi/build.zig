@@ -43,9 +43,7 @@ pub fn build(b: *std.Build) void {
 
     const run_exe = b.addRunArtifact(exe);
     run_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_exe.addArgs(args);
-    }
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the openapi-zig code generator");
     run_step.dependOn(&run_exe.step);
 
@@ -62,7 +60,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // E2E test for modular code generation
-    const e2e_modular = b.addSystemCommand(&.{ "bash", "test/e2e_modular.sh" });
+    const e2e_modular = b.addSystemCommand(&.{"bash"});
+    e2e_modular.addFileArg(b.path("test/e2e_modular.sh"));
     e2e_modular.step.dependOn(b.getInstallStep());
     const e2e_step = b.step("e2e", "Run end-to-end tests");
     e2e_step.dependOn(&e2e_modular.step);
@@ -167,7 +166,7 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     }
 
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(opts.package_name);
+    const gen_dir = codegen.addOutputDirectoryArg2(opts.package_name, .{ .make_absolute = true });
 
     const module = b.addModule(opts.package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),

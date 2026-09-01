@@ -247,7 +247,7 @@ pub fn saveCachedBoundarySummary(allocator: std.mem.Allocator, path: []const u8,
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn loadCachedBoundarySummary(allocator: std.mem.Allocator, path: []const u8) !CachedBoundarySummary {
@@ -392,7 +392,7 @@ pub fn trainEvalBoundaryHead(
     head.weight = linear_head.weight[0];
     head.bias = linear_head.bias[0];
 
-    try std.Io.Dir.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     try saveBoundaryHead(allocator, out_dir, &head);
 
     var train_after = try buildEvalSummaryFromBatch(allocator, model_dir, train_summary, backend, &train_batch, &head);
@@ -514,7 +514,7 @@ pub fn trainEvalBoundaryTaskHead(
     }
     head.global_bias = linear_head.bias[0];
 
-    try std.Io.Dir.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     try saveBoundaryTaskHead(allocator, out_dir, &head);
 
     var train_after = try buildEvalSummaryFromTaskBatch(allocator, model_dir, train_summary, backend, &train_batch, &head);
@@ -543,7 +543,7 @@ pub fn saveBoundaryHead(allocator: std.mem.Allocator, out_dir: []const u8, head:
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .head = head.* }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn saveBoundaryTaskHead(allocator: std.mem.Allocator, out_dir: []const u8, head: *const BoundaryTaskHead) !void {
@@ -552,7 +552,7 @@ pub fn saveBoundaryTaskHead(allocator: std.mem.Allocator, out_dir: []const u8, h
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .head = head.* }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn resolveBoundaryHeadPath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -812,7 +812,7 @@ fn freeCachedBoundaryExampleSummary(allocator: std.mem.Allocator, entry: *Cached
 fn resolveHiddenSize(allocator: std.mem.Allocator, model_dir: []const u8) !usize {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "encoder_config", "config.json" });
     defer allocator.free(config_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), config_path, allocator, .limited(8 * 1024 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), config_path, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -1021,7 +1021,7 @@ fn dupeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]
 }
 
 fn isRegularFilePath(path: []const u8) bool {
-    const cwd = compat.cwd();
-    cwd.access(compat.io(), path, .{}) catch return false;
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(compat.testingIo(), path, .{}) catch return false;
     return true;
 }

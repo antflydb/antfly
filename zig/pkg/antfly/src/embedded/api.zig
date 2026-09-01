@@ -1204,7 +1204,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
             .format_version = backup_codec.format_version,
             .flags = 0,
             .created_at_ns = 0,
-            .backup_id = [_]u8{0} ** 16,
+            .backup_id = @as([16]u8, @splat(0)),
             .table_count = 1,
             .shard_count = 1,
         });

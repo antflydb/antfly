@@ -132,7 +132,7 @@ fn appendUniquePhysicalFieldValidation(
     source_field: []const u8,
     field_type: storage_schema.AntflyType,
 ) !void {
-    const type_mask = @as(u16, 1) << @intCast(@intFromEnum(field_type));
+    const type_mask = @as(u16, 1) << @intCast(@backingInt(field_type));
     if (seen_types.getPtr(source_field)) |mask| {
         if (mask.* & type_mask != 0) return;
         const owned_source = try alloc.dupe(u8, source_field);
@@ -164,7 +164,7 @@ fn appendUniquePhysicalFieldValidation(
 fn physicalFieldValidationLessThan(_: void, a: impl.PhysicalFieldValidation, b: impl.PhysicalFieldValidation) bool {
     const order = std.mem.order(u8, a.source_field, b.source_field);
     if (order != .eq) return order == .lt;
-    return @intFromEnum(a.field_type) < @intFromEnum(b.field_type);
+    return @backingInt(a.field_type) < @backingInt(b.field_type);
 }
 
 fn freePhysicalFieldValidations(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
@@ -513,14 +513,14 @@ fn declaredFieldLessThan(_: void, a: storage_schema.DeclaredField, b: storage_sc
     const field_order = std.mem.order(u8, a.field, b.field);
     if (field_order != .eq) return field_order == .lt;
     if (a.mapping.field_type != b.mapping.field_type) {
-        return @intFromEnum(a.mapping.field_type) < @intFromEnum(b.mapping.field_type);
+        return @backingInt(a.mapping.field_type) < @backingInt(b.mapping.field_type);
     }
     if (a.mapping.do_index != b.mapping.do_index) return !a.mapping.do_index;
     if (a.mapping.store != b.mapping.store) return !a.mapping.store;
     if (a.mapping.doc_values != b.mapping.doc_values) return !a.mapping.doc_values;
     if (a.mapping.sortable != b.mapping.sortable) return !a.mapping.sortable;
     if (a.mapping.missing_null_policy != b.mapping.missing_null_policy) {
-        return @intFromEnum(a.mapping.missing_null_policy) < @intFromEnum(b.mapping.missing_null_policy);
+        return @backingInt(a.mapping.missing_null_policy) < @backingInt(b.mapping.missing_null_policy);
     }
     if (a.mapping.include_in_all != b.mapping.include_in_all) return !a.mapping.include_in_all;
     return std.mem.order(u8, a.mapping.analyzer, b.mapping.analyzer) == .lt;

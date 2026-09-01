@@ -5607,7 +5607,11 @@ const PublicGraphRequestCache = struct {
         var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
         defer application_lease.deinit();
 
-        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){
+            .items = base,
+            .capacity = base.len,
+            .pointer_stability = .{},
+        };
         base = &.{};
         defer {
             for (slots.items) |*slot| slot.deinit(self.handler.alloc);

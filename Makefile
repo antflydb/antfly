@@ -40,6 +40,7 @@ help:
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
 	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
+	@echo "  zig-toolchain-check  Verify all Zig pins and archive checksums agree"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
 	@echo "  download-omni-deps Download ONNX Runtime and PJRT archives"
@@ -69,7 +70,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main
-.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-toolchain-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -134,6 +135,9 @@ zig-openapi-check:
 
 zig-snowball-check:
 	$(ZIG_MAKE) snowball-check
+
+zig-toolchain-check:
+	python3 scripts/ci/verify_zig_toolchain.py
 
 zig-license-headers:
 	$(ZIG_MAKE) license-headers

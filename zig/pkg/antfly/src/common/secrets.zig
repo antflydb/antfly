@@ -250,7 +250,7 @@ pub const FileStore = struct {
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
     generation_snapshot: std.atomic.Value(u64) = .init(0),
-    content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     last_reload_failed: bool = false,
     reload_success_count: u64 = 0,
@@ -998,14 +998,14 @@ fn secretKeyForEnvVar(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
 
 fn hasEnvVar(env_var: []const u8) bool {
     if (!builtin.link_libc) return false;
-    const env_var_z = std.heap.smp_allocator.dupeZ(u8, env_var) catch return false;
+    const env_var_z = std.heap.smp_allocator.dupeSentinel(u8, env_var, 0) catch return false;
     defer std.heap.smp_allocator.free(env_var_z);
     return std.c.getenv(env_var_z.ptr) != null;
 }
 
 pub fn envValueOwned(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
     if (!builtin.link_libc) return null;
-    const env_var_z = alloc.dupeZ(u8, env_var) catch return null;
+    const env_var_z = alloc.dupeSentinel(u8, env_var, 0) catch return null;
     defer alloc.free(env_var_z);
     const raw = std.c.getenv(env_var_z.ptr) orelse return null;
     return alloc.dupe(u8, std.mem.span(raw)) catch null;
@@ -1078,7 +1078,7 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
         tmp_exists = true;
         defer file.close(io);
         if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
-            try file.setPermissions(io, @enumFromInt(0o600));
+            try file.setPermissions(io, @fromBackingInt(@intCast(0o600)));
         }
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
@@ -1262,7 +1262,7 @@ test "file secret store detects projected volume symlink target replacement" {
     try std.testing.expectEqualStrings("other", reloaded.?);
     try std.testing.expectEqual(initial_generation + 1, store.generation());
     const health = store.healthSnapshot();
-    const expected_source_generation = [_]u8{0xbb} ** 32;
+    const expected_source_generation = @as([32]u8, @splat(0xbb));
     try std.testing.expect(health.supports_source_generation);
     try std.testing.expectEqualSlices(u8, &expected_source_generation, &health.source_generation.?);
 }

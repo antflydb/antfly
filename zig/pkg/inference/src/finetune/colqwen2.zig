@@ -469,7 +469,7 @@ const EvalOptions = struct {
 };
 
 pub fn resolveArtifactPaths(allocator: std.mem.Allocator, input: []const u8) !ArtifactPaths {
-    const stat = compat.cwd().statFile(compat.io(), input, .{}) catch return error.InputNotFound;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), input, .{}) catch return error.InputNotFound;
     const model_dir = if (stat.kind == .directory)
         try allocator.dupe(u8, input)
     else
@@ -634,7 +634,7 @@ pub fn bootstrapLoRABundle(
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -877,7 +877,7 @@ pub fn loadLoRABundle(
 
 pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
     const allocator = bundle.allocator;
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
@@ -1018,12 +1018,12 @@ pub fn materializeMergedModel(
         try merged.put(allocator, try allocator.dupe(u8, layer.base_tensor_name), tensor);
     }
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
     errdefer allocator.free(output_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = output_checkpoint_path, .data = bytes });
 
     try copySupportingArtifactIfPresent(allocator, base_paths.config_path, out_dir, hf_config_file_name);
     try copySupportingArtifactIfPresent(allocator, base_paths.preprocessor_config_path, out_dir, preprocessor_config_file_name);
@@ -1691,7 +1691,7 @@ pub fn savePreparedInputsSummary(allocator: std.mem.Allocator, path: []const u8,
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn freeInspectionSummary(allocator: std.mem.Allocator, summary: *InspectionSummary) void {
@@ -1926,19 +1926,19 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
         for (tensor.data) |item| {
             const bits: u32 = @bitCast(item);
             var bits_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
+            try file.writeStreamingAll(compat.testingIo(), &bits_buf);
         }
     }
 }
@@ -1963,7 +1963,7 @@ fn writeAdapterConfigJson(
         .target_modules = target_modules,
         .use_dora = use_dora,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn bundleHasDoRA(bundle: *const LoadedLoRABundle) bool {
@@ -1984,13 +1984,13 @@ fn copySupportingArtifactIfPresent(
     defer allocator.free(contents);
     const dst_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = contents });
 }
 
 fn optionalPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(allocator, &.{ dir_path, basename });
     errdefer allocator.free(path);
-    compat.cwd().access(compat.io(), path, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch {
         allocator.free(path);
         return null;
     };
@@ -2080,7 +2080,7 @@ fn doraMagnitudeTensorName(allocator: std.mem.Allocator, base_tensor_name: []con
 }
 
 fn isRegularFilePath(path: []const u8) bool {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return false;
     return stat.kind == .file;
 }
 
@@ -2557,8 +2557,8 @@ pub fn freePreparedInputsSummary(allocator: std.mem.Allocator, summary: *const P
 fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     const dir_path = try std.fmt.allocPrint(allocator, "/tmp/termite_colqwen2_{s}_{d}", .{ name, std.posix.system.getpid() });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 
@@ -2566,16 +2566,16 @@ test "colqwen2 inspect adapter directory reads config" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "adapter_inspect_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const adapter_config_path = try std.fs.path.join(allocator, &.{ root, adapter_config_file_name });
     defer allocator.free(adapter_config_path);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ root, adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = adapter_config_path,
         .data = "{\"base_model_name_or_path\":\"vidore/colqwen2-v1.0\",\"peft_type\":\"LORA\",\"task_type\":\"FEATURE_EXTRACTION\",\"r\":16,\"lora_alpha\":32.0,\"target_modules\":[\"q_proj\",\"v_proj\"]}",
     });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = adapter_checkpoint_path, .data = "stub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = adapter_checkpoint_path, .data = "stub" });
 
     var summary = try inspectCheckpoint(allocator, root);
     defer freeInspectionSummary(allocator, &summary);
@@ -2589,19 +2589,19 @@ test "colqwen2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "bootstrap_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const config_path = try std.fs.path.join(allocator, &.{ root, hf_config_file_name });
     defer allocator.free(config_path);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":128}",
     });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.v_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 128, 1536 }, .data = &[_]f32{0} ** (128 * 1536) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.v_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 128, 1536 }, .data = &@as([(128 * 1536)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "lora" });
@@ -2624,7 +2624,7 @@ test "colqwen2 lora bundle load and save round-trip" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "roundtrip_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, hf_config_file_name });
     defer allocator.free(config_path);
@@ -2639,14 +2639,14 @@ test "colqwen2 lora bundle load and save round-trip" {
     const special_tokens_path = try std.fs.path.join(allocator, &.{ root, special_tokens_map_file_name });
     defer allocator.free(special_tokens_path);
 
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":128}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"processor_class\":\"ColQwen2Processor\"}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{\"tokenizer_class\":\"Qwen2TokenizerFast\"}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = special_tokens_path, .data = "{\"image_token\":\"<|image_pad|>\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":128}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"processor_class\":\"ColQwen2Processor\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{\"tokenizer_class\":\"Qwen2TokenizerFast\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = special_tokens_path, .data = "{\"image_token\":\"<|image_pad|>\"}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
-        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 8, 16 }, .data = &[_]f32{0} ** (8 * 16) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
+        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 8, 16 }, .data = &@as([(8 * 16)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
@@ -2727,7 +2727,7 @@ test "colqwen2 prepare inputs against examples" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "prepare_inputs_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, hf_config_file_name });
     defer allocator.free(config_path);
@@ -2740,16 +2740,16 @@ test "colqwen2 prepare inputs against examples" {
     const image_path = try std.fs.path.join(allocator, &.{ root, "sample.png" });
     defer allocator.free(image_path);
 
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\"}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{\"tokenizer_class\":\"Qwen2TokenizerFast\",\"model_max_length\":128}" });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{\"tokenizer_class\":\"Qwen2TokenizerFast\",\"model_max_length\":128}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":0,"content":"<pad>","special":true},{"id":1,"content":"<unk>","special":true},{"id":2,"content":"<bos>","special":true}],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordPiece","unk_token":"<unk>","continuing_subword_prefix":"##","max_input_chars_per_word":100,"vocab":{"<pad>":0,"<unk>":1,"<bos>":2,"Query":3,"--":4,"invoice":5,"Describe":6,"the":7,"image":8,".":9,"<|im_start|>user":10,"<|vision_start|><|image_pad|><|vision_end|>Describe":11,"image.<|im_end|><|endoftext|>":12},"special_tokens":{"<pad>":0,"<unk>":1,"<bos>":2}}}
         ,
     });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"processor_class\":\"ColQwen2Processor\",\"patch_size\":14,\"merge_size\":2,\"min_pixels\":3136,\"max_pixels\":50176}" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = image_path, .data = &red_png_2x2 });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"processor_class\":\"ColQwen2Processor\",\"patch_size\":14,\"merge_size\":2,\"min_pixels\":3136,\"max_pixels\":50176}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = image_path, .data = &red_png_2x2 });
 
     const examples = [_]Example{
         .{ .query = "invoice", .image_path = "sample.png", .score = 1.0 },
@@ -2766,15 +2766,15 @@ test "colqwen2 one step train and eval" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "train_one_step_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, hf_config_file_name });
     defer allocator.free(config_path);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
+        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
@@ -2826,15 +2826,15 @@ test "colqwen2 train prepared examples epoch updates bundle" {
     const allocator = std.testing.allocator;
     const root = try testScratchDir(allocator, "train_epoch_test");
     defer allocator.free(root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, hf_config_file_name });
     defer allocator.free(config_path);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
+        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });

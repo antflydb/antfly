@@ -435,7 +435,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 1. Create output directory
     // ------------------------------------------------------------------
-    try compat.cwd().createDirPath(compat.io(), opts.output_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.output_dir);
 
     print("train-fused-chunker data={s} output={s} epochs={d} batch_size={d} lr={d} hidden={d} max_seq_len={d} seed={d}\n", .{
         opts.data_path,
@@ -501,7 +501,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         var path_buf: [512]u8 = undefined;
         const st_path = std.fmt.bufPrint(&path_buf, "{s}/model.safetensors", .{mdir}) catch null;
         if (st_path) |p| {
-            const exists = compat.cwd().statFile(compat.io(), p, .{}) catch null;
+            const exists = std.Io.Dir.cwd().statFile(compat.testingIo(), p, .{}) catch null;
             if (exists != null) {
                 if (SafetensorsSource.initAbsolute(allocator, p)) |src| {
                     var source_ptr = src;
@@ -731,7 +731,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             break :blk std.fmt.bufPrint(&opt_state_path_buf, "{s}_optimizer.safetensors", .{base}) catch null;
         };
         if (opt_state_path) |p| {
-            const exists = compat.cwd().statFile(compat.io(), p, .{}) catch null;
+            const exists = std.Io.Dir.cwd().statFile(compat.testingIo(), p, .{}) catch null;
             if (exists != null) {
                 print("restoring optimizer state from {s}\n", .{p});
                 trainer.loadOptimizerState(allocator, p) catch |err| {

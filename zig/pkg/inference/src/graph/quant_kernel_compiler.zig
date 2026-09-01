@@ -226,7 +226,7 @@ const catalog_fingerprint_seed: u64 = 0x414e_5446_4c59_414f; // "ANTFLYAO"
 pub fn targetFingerprint(target: Target) u64 {
     var hasher = std.hash.Wyhash.init(catalog_fingerprint_seed ^ 0x5441_5247_4554_0001);
     catalogHashU8(&hasher, 1);
-    catalogHashU8(&hasher, @intFromEnum(target.backend));
+    catalogHashU8(&hasher, @backingInt(target.backend));
     catalogHashBytes(&hasher, target.architecture);
     catalogHashU64(&hasher, target.required_features);
     return hasher.final();
@@ -6181,8 +6181,8 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         registry_records[index] = artifactRegistryManifestRecord(artifact);
     }
     var records: [first_generated_matmul_artifacts.len]ArtifactManifestRecord = undefined;
-    var owned_route_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
-    var owned_blocker_check_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
+    var owned_route_commands = @as([first_generated_matmul_artifacts.len][]const u8, @splat(""));
+    var owned_blocker_check_commands = @as([first_generated_matmul_artifacts.len][]const u8, @splat(""));
     defer for (owned_route_commands) |command| {
         if (command.len != 0) allocator.free(command);
     };
@@ -7400,12 +7400,12 @@ fn plannedCountersKey(
     epilogue: Epilogue,
     dispatch: quant_matmul.DispatchKind,
 ) u64 {
-    var key: u64 = @intFromEnum(backend);
+    var key: u64 = @backingInt(backend);
     // Format is enum(u16) with an explicit tag at 254, so give it 16 bits.
-    key = (key << 16) | @intFromEnum(format);
-    key = (key << 8) | @intFromEnum(row_bucket);
-    key = (key << 8) | @intFromEnum(epilogue);
-    key = (key << 8) | @intFromEnum(dispatch);
+    key = (key << 16) | @backingInt(format);
+    key = (key << 8) | @backingInt(row_bucket);
+    key = (key << 8) | @backingInt(epilogue);
+    key = (key << 8) | @backingInt(dispatch);
     return key;
 }
 
@@ -7511,8 +7511,8 @@ pub fn countersForLowering(lowering: QuantKernelLowering) PlanCounters {
 }
 
 pub fn addCountersToStats(stats: anytype, counters: PlanCounters) void {
-    inline for (@typeInfo(PlanCounters).@"struct".fields) |field| {
-        @field(stats.*, field.name) += @intCast(@field(counters, field.name));
+    inline for (@typeInfo(PlanCounters).@"struct".field_names) |field_name| {
+        @field(stats.*, field_name) += @intCast(@field(counters, field_name));
     }
 }
 
@@ -10485,11 +10485,11 @@ test "quant kernel compiler registry route summary is golden" {
     var by_backend = [_]PlanCounters{ .{}, .{} };
     for (first_registry.entries) |entry| {
         const counters = countersForLowering(entry);
-        const index = @intFromEnum(entry.backend);
+        const index = @backingInt(entry.backend);
         addCountersToStats(&by_backend[index], counters);
     }
 
-    const cuda = by_backend[@intFromEnum(@as(Backend, .cuda))];
+    const cuda = by_backend[@backingInt(@as(Backend, .cuda))];
     try std.testing.expectEqual(@as(usize, 1232), cuda.quant_kernel_planned_ops);
     try std.testing.expectEqual(@as(usize, 59), cuda.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 5), cuda.quant_kernel_generated_production);
@@ -10504,7 +10504,7 @@ test "quant kernel compiler registry route summary is golden" {
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_tensor_core_repack_required);
     try std.testing.expectEqual(@as(usize, 1168), cuda.quant_kernel_fallback_unsupported);
 
-    const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
+    const metal = by_backend[@backingInt(@as(Backend, .metal))];
     try std.testing.expectEqual(@as(usize, 1232), metal.quant_kernel_planned_ops);
     try std.testing.expectEqual(@as(usize, 105), metal.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 7), metal.quant_kernel_generated_production);
@@ -13152,7 +13152,7 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     const macos_gate = std.mem.indexOf(u8, contents, "if (target.result.os.tag == .macos) {\n        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);") orelse return error.MissingMetalBuildMacosGate;
     const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }\n\n    const quant_kernel_metal_runtime_check_step") orelse return error.MissingMetalBuildNonMacosFailClosed;
     try std.testing.expect(macos_gate < non_macos_fail_closed);
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return build_test_filters.select("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return if (test_filters.len == 0) default_filters else test_filters;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, test_filter_contents, 1, "else if (std.mem.startsWith(u8, arg, \"-\")) {"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, ".target = b.graph.host"));
@@ -13172,14 +13172,14 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "\"500\",\n            \"--production-regression-check\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--production-regression-check"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "run_quant_kernel_metal_production_regression.has_side_effects = true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-runtime-route-all-evidence-{x}.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-runtime-route-all-evidence.json"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(route_all_evidence_name)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-production-regression-evidence-{x}.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-production-regression-evidence.json"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(production_regression_evidence_name)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-blocker-evidence-refresh"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--refresh-blocker-evidence"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "refresh_quant_kernel_metal_blocker_evidence.has_side_effects = true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-blocker-evidence-{x}"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-blocker-evidence"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputDirectoryArg(blocker_evidence_dir_name)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "--blocker-evidence-dir"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "addDirectoryArg(blocker_evidence_dir)"));
@@ -13418,8 +13418,8 @@ test "quant kernel compiler adds every plan counter to runtime stats" {
     };
 
     var counters = PlanCounters{};
-    inline for (@typeInfo(PlanCounters).@"struct".fields, 1..) |field, value| {
-        @field(counters, field.name) = value;
+    inline for (@typeInfo(PlanCounters).@"struct".field_names, 1..) |field_name, value| {
+        @field(counters, field_name) = value;
     }
 
     var stats64 = Stats64{};
@@ -13427,9 +13427,9 @@ test "quant kernel compiler adds every plan counter to runtime stats" {
     var stats_usize = StatsUsize{};
     addCountersToStats(&stats_usize, counters);
 
-    inline for (@typeInfo(PlanCounters).@"struct".fields) |field| {
-        try std.testing.expectEqual(@as(u64, @intCast(@field(counters, field.name))), @field(stats64, field.name));
-        try std.testing.expectEqual(@field(counters, field.name), @field(stats_usize, field.name));
+    inline for (@typeInfo(PlanCounters).@"struct".field_names) |field_name| {
+        try std.testing.expectEqual(@as(u64, @intCast(@field(counters, field_name))), @field(stats64, field_name));
+        try std.testing.expectEqual(@field(counters, field_name), @field(stats_usize, field_name));
     }
 }
 

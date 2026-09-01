@@ -320,13 +320,13 @@ pub const Detail = enum(c_int) {
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
     // rejected without constructing an invalid exhaustive Zig enum.
-    code: c_int = @intFromEnum(Code.ok),
-    detail: c_int = @intFromEnum(Detail.none),
+    code: c_int = @backingInt(Code.ok),
+    detail: c_int = @backingInt(Detail.none),
 
     pub const ok: Status = .{};
 
     pub fn isOk(self: Status) bool {
-        return self.code == @intFromEnum(Code.ok);
+        return self.code == @backingInt(Code.ok);
     }
 };
 
@@ -626,18 +626,18 @@ pub fn statusFromError(err: anyerror) Status {
 /// not an arbitrary error string across the stable ABI.
 pub fn statusFromErrorWithFallback(err: anyerror, fallback: anyerror) Status {
     const value = statusFromError(err);
-    if (value.detail != @intFromEnum(Detail.none)) return value;
+    if (value.detail != @backingInt(Detail.none)) return value;
     const fallback_value = statusFromError(fallback);
-    std.debug.assert(fallback_value.detail != @intFromEnum(Detail.none));
+    std.debug.assert(fallback_value.detail != @backingInt(Detail.none));
     return fallback_value;
 }
 
 pub fn errorHasStableDetail(err: anyerror) bool {
-    return statusFromError(err).detail != @intFromEnum(Detail.none);
+    return statusFromError(err).detail != @backingInt(Detail.none);
 }
 
 fn status(code: Code, detail: Detail) Status {
-    return .{ .code = @intFromEnum(code), .detail = @intFromEnum(detail) };
+    return .{ .code = @backingInt(code), .detail = @backingInt(detail) };
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
@@ -1004,9 +1004,9 @@ test "stable status has a C layout" {
 
 test "unknown wire values fail closed" {
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = 999, .detail = 999 }));
-    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @intFromEnum(Code.internal), .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = 999 }));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{
-        .code = @intFromEnum(Code.invalid_argument),
-        .detail = @intFromEnum(Detail.table_not_found),
+        .code = @backingInt(Code.invalid_argument),
+        .detail = @backingInt(Detail.table_not_found),
     }));
 }

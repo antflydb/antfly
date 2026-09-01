@@ -286,7 +286,7 @@ const Registry = struct {
     fn mapZeroTable(alloc: Allocator, n: usize) ![]RegistryCell {
         if (n == 0) return &[_]RegistryCell{};
         const byte_count = std.math.mul(usize, n, @sizeOf(RegistryCell)) catch return error.RegistryTooLarge;
-        if (comptime builtin.os.tag == .freestanding) {
+        if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
             const table = try alloc.alloc(RegistryCell, n);
             @memset(std.mem.sliceAsBytes(table), 0);
             return table;
@@ -303,7 +303,7 @@ const Registry = struct {
 
     fn unmapZeroTable(alloc: Allocator, table: []RegistryCell) void {
         if (table.len == 0) return;
-        if (comptime builtin.os.tag == .freestanding) {
+        if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
             alloc.free(table);
             return;
         }

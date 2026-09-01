@@ -263,7 +263,7 @@ pub const Environment = struct {
         if (use_zig_backend and opts.map_async and !opts.write_map) return Error.Incompatible;
 
         const alloc = heapAllocator();
-        const path_owned = alloc.dupeZ(u8, std.mem.span(path)) catch return Error.LmdbUnexpected;
+        const path_owned = alloc.dupeSentinel(u8, std.mem.span(path), 0) catch return Error.LmdbUnexpected;
         errdefer alloc.free(path_owned);
 
         var zig_env: ?zig_lmdb.env.Environment = null;
@@ -793,7 +793,7 @@ pub const Cursor = struct {
     pub fn getEntry(self: *Cursor, op: CursorOp) Error!Entry {
         switch (self.backend) {
             .c => |cursor| {
-                const entry = try c_backend.cursorGet(cursor, @intFromEnum(op), check);
+                const entry = try c_backend.cursorGet(cursor, @backingInt(op), check);
                 return .{ .key = entry.key, .value = entry.value };
             },
             .zig => |*cursor| {
@@ -851,7 +851,7 @@ pub const Cursor = struct {
     pub fn set(self: *Cursor, key: []const u8) Error!Entry {
         switch (self.backend) {
             .c => |cursor| {
-                const entry = try c_backend.cursorGetWithKey(cursor, key, @intFromEnum(CursorOp.set_key), check);
+                const entry = try c_backend.cursorGetWithKey(cursor, key, @backingInt(CursorOp.set_key), check);
                 return .{ .key = entry.key, .value = entry.value };
             },
             .zig => |*cursor| {

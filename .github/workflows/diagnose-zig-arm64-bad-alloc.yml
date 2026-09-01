@@ -13,8 +13,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.16.0
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
   MACOS_SDK_VERSION: "15.5"
   MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
@@ -35,6 +33,9 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           submodules: true
 
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
+
       - name: Verify x86_64 host
         run: test "$(uname -m)" = x86_64
 
@@ -50,19 +51,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
-
-      - name: Install glibc-linked Zig
+      # Nixpkgs only packages stable Zig 0.16 here; use the checksum-pinned
+      # 0.17 nightly required by the source tree.
+      - name: Install Zig
         run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$zig_archive"
+          echo "$ZIG_X86_64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$zig_archive" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Install pinned macOS cross-compilation SDK
         run: |

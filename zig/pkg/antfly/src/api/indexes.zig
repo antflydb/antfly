@@ -2025,7 +2025,7 @@ const AggregatedIndexStatus = struct {
     coverage_config_mismatch_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
-    source_replay: [64]db_mod.types.IndexSourceReplayStatus = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64,
+    source_replay: [64]db_mod.types.IndexSourceReplayStatus = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" })),
     source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -2077,7 +2077,7 @@ const AggregatedIndexStatus = struct {
 };
 
 fn canonicalizeConfiguredSourceReplay(aggregate: *AggregatedIndexStatus, configured_sources: []const []const u8) void {
-    var ordered = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64;
+    var ordered = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" }));
     var ordered_count: usize = 0;
     for (configured_sources) |artifact_name| {
         if (ordered_count == ordered.len) break;
@@ -2440,7 +2440,7 @@ fn aggregateIndexStatusIndexed(
         aggregate.catch_up_applied_sequence += public_item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += public_item.catch_up_target_sequence;
         if (public_item.catch_up_active) aggregate.catch_up_active = true;
-        if (@intFromEnum(public_item.catch_up_phase) > @intFromEnum(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
+        if (@backingInt(public_item.catch_up_phase) > @backingInt(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
         aggregateTextMergeStats(&aggregate.text_merge, item.text_merge);
         aggregateHbcCacheStats(&aggregate.hbc_cache, item.hbc_cache);
         aggregateHbcPostingStats(&aggregate.hbc_posting, item.hbc_posting);
@@ -4470,7 +4470,7 @@ fn appendCoverageIncompleteReasons(
         expected_config_hash,
     );
     const observation_current = authority.coverage_authoritative;
-    var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
+    var reasons = std.EnumSet(CoverageIncompleteReason).empty;
 
     if (!runtime_present) reasons.insert(.runtime_unavailable);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
@@ -6089,8 +6089,8 @@ fn expectCreatedObjectAllowlistCovers(
     comptime T: type,
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field.name));
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field_name));
     }
 }
 
@@ -6113,11 +6113,11 @@ test "created nested response allowlists cover generated schemas" {
     try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
-    inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field.name));
+    inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field_name));
     }
-    inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field.name));
+    inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field_name));
     }
 
     inline for (.{

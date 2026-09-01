@@ -21,7 +21,7 @@ const reader_config = @import("antfly_reader_config");
 // large Antfly unit-test root prevents the Zig compiler and test process from
 // approaching the 15 GiB CI runner limit. Production builds and the PDF/OCR
 // E2E binary still use the full implementation.
-const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
             pub const DecodeLimits = struct {
@@ -169,21 +169,21 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
     }
 else
     @import("antfly_pdf");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const pdf_runtime_available = builtin.os.tag != .freestanding and !builtin.is_test and !build_options.bench_minimal_deps;
+pub const pdf_runtime_available = builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !builtin.is_test and !build_options.bench_minimal_deps;
 
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
             var snapshot = remote.acquire();
             defer snapshot.deinit();
@@ -2413,7 +2413,7 @@ fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
         if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &std.zip.central_file_header_sig)) return error.ZipBadCdOffset;
         const flags = std.mem.readInt(u16, bytes[cursor + 8 ..][0..2], .little);
         if ((flags & 0x0001) != 0) return error.ZipEncryptionUnsupported;
-        const compression_method: std.zip.CompressionMethod = @enumFromInt(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little));
+        const compression_method: std.zip.CompressionMethod = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little)));
         const compressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 20 ..][0..4], .little);
         const uncompressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 24 ..][0..4], .little);
         const name_len = std.mem.readInt(u16, bytes[cursor + 28 ..][0..2], .little);
@@ -3324,7 +3324,7 @@ fn buildStoredZipAlloc(alloc: Allocator, entries: []const TestZipEntry) ![]u8 {
 
     for (entries) |entry| {
         const offset = out.items.len;
-        const crc = std.hash.crc.Crc32.hash(entry.data);
+        const crc = std.hash.crc.@"CRC-32/ISO-HDLC".hash(entry.data);
         try appendZipLe32(alloc, &out, 0x04034b50);
         try appendZipLe16(alloc, &out, 20);
         try appendZipLe16(alloc, &out, 0);

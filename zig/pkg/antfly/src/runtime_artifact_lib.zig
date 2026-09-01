@@ -137,10 +137,10 @@ const RuntimeProcess = struct {
         errdefer alloc.free(argument_storage);
         var initialized_arguments: usize = 0;
         errdefer for (argument_storage[0..initialized_arguments]) |argument| alloc.free(argument);
-        argument_storage[0] = try alloc.dupeZ(u8, "antfly-runtime");
+        argument_storage[0] = try alloc.dupeSentinel(u8, "antfly-runtime", 0);
         initialized_arguments = 1;
         for (input_arguments, 1..) |argument, index| {
-            argument_storage[index] = try alloc.dupeZ(u8, argument.slice());
+            argument_storage[index] = try alloc.dupeSentinel(u8, argument.slice(), 0);
             initialized_arguments += 1;
         }
         const argument_ptrs = try alloc.alloc([*:0]const u8, argument_storage.len);
@@ -331,14 +331,14 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
 }
 
 const inference_provider_operation_slots = 13;
-var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
+var inference_private_failure_counts = @as([inference_provider_operation_slots]std.atomic.Value(u64), @splat(std.atomic.Value(u64).init(0)));
 
 // Private inference errors are normalized at this archive boundary, so this is
 // the only place their original identity is available. Keep a fixed-size set
 // of per-operation/error/model counters: one noisy model must not consume the
 // first diagnostic for a different model, while model names supplied by a
 // client must never grow process memory or produce unbounded first-error logs.
-var inference_private_failure_diagnostics = [_]private_error_diagnostics.Diagnostic{.{}} ** private_error_diagnostics.slots_count;
+var inference_private_failure_diagnostics = @as([private_error_diagnostics.slots_count]private_error_diagnostics.Diagnostic, @splat(.{}));
 
 fn shouldLogInferencePrivateFailure(count: u64) bool {
     // Keep the first few failures for diagnosis, then retain logarithmic

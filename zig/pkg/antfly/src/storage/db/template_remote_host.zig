@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-pub const impl = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+pub const impl = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("template_remote_stub.zig")
 else
     struct {

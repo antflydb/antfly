@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const build_options = @import("build_options");
 
 const grpo = @import("grpo.zig");
@@ -905,7 +906,7 @@ fn copySmokeArtifactFromQwenTokenizerBundle(
     if (c_file.fileExists(allocator, src_path)) {
         const contents = try c_file.readFile(allocator, src_path);
         defer allocator.free(contents);
-        try compat.cwd().writeFile(io, .{ .sub_path = dst_path, .data = contents });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = contents });
         return;
     }
 
@@ -1063,8 +1064,8 @@ fn writeOwnedTextFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8
 }
 
 fn writeTextFile(io: std.Io, path: []const u8, contents: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir_name| try compat.cwd().createDirPath(io, dir_name);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    if (std.fs.path.dirname(path)) |dir_name| try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
 fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tensors: []const WriteTensorF32) !void {
@@ -1090,14 +1091,14 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
-    for (tensors) |tensor| try file.writeStreamingAll(compat.io(), std.mem.sliceAsBytes(tensor.data));
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
+    for (tensors) |tensor| try file.writeStreamingAll(compat.testingIo(), std.mem.sliceAsBytes(tensor.data));
 }
 
 fn makeFilledF32(allocator: std.mem.Allocator, len: usize, value: f32) ![]f32 {
@@ -2664,7 +2665,6 @@ fn parseCsvBorrowed(allocator: std.mem.Allocator, value: []const u8) ![]const []
 }
 
 fn runDirectBootstrapLayoutlmv3Lora(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
-    _ = io;
     if (argv_in.len < 3) return error.InvalidArguments;
     const model_dir = argv_in[1];
     const out_dir = argv_in[2];
@@ -2696,7 +2696,7 @@ fn runDirectBootstrapLayoutlmv3Lora(allocator: std.mem.Allocator, io: std.Io, ar
         }
     }
 
-    var summary = try layoutlmv3.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
+    var summary = try layoutlmv3.bootstrapLoRABundle(allocator, io, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,
@@ -2720,7 +2720,7 @@ fn runDirectTrainEvalLayoutlmv3LoraToken(allocator: std.mem.Allocator, io: std.I
 
 fn runDirectMaterializeLayoutlmv3Checkpoint(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
     if (argv_in.len < 5) return error.InvalidArguments;
-    var summary = try layoutlmv3.materializeMergedModel(allocator, argv_in[1], argv_in[2], argv_in[3], argv_in[4]);
+    var summary = try layoutlmv3.materializeMergedModel(allocator, io, argv_in[1], argv_in[2], argv_in[3], argv_in[4]);
     defer layoutlmv3.freeMaterializeSummary(allocator, &summary);
     if (argv_in.len >= 6) {
         try writeJsonFile(allocator, io, argv_in[5], summary);
@@ -3458,7 +3458,7 @@ fn runOptimizerBackedQwen2Sft(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .lora_sft),
             .alpha = adapterAlpha(adapter),
@@ -3677,7 +3677,7 @@ fn runOptimizerBackedGemmaDpo(
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     try validateGemmaAdapterOptions(adapter);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .dpo),
             .alpha = adapterAlpha(adapter),
@@ -3862,7 +3862,7 @@ fn runOptimizerBackedQwen2Dpo(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .dpo),
             .alpha = adapterAlpha(adapter),
@@ -4098,7 +4098,7 @@ fn runOptimizerBackedGemmaGrpo(
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
     try validateGemmaAdapterOptions(adapter);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .grpo),
             .alpha = adapterAlpha(adapter),
@@ -4351,7 +4351,7 @@ fn runOptimizerBackedQwen2Grpo(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .grpo),
             .alpha = adapterAlpha(adapter),
@@ -5528,7 +5528,7 @@ fn isQwen35Family(family: []const u8) bool {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return std_compat.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 fn containsQwen35Signal(path: []const u8) bool {

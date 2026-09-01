@@ -381,7 +381,7 @@ pub fn saveTrainableTokenAdapter(
     if (deltas.len != token_indices.len * embedding_dim) return error.InvalidAdapterTensorShape;
     try validateUniqueTokenIndices(token_indices);
 
-    try compat.cwd().createDirPath(io, out_dir);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, trainable_token_adapter_config_file_name });
     errdefer allocator.free(config_path);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, trainable_token_adapter_checkpoint_file_name });
@@ -685,7 +685,7 @@ fn writeFileAtomic(allocator: std.mem.Allocator, io: std.Io, path: []const u8, d
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
     std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-    try compat.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = data });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = data });
     try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
 }
 
@@ -734,7 +734,7 @@ pub fn runEvalCapture(
         .signal => |sig| .{
             .phase = phase,
             .term = "signal",
-            .signal = @intFromEnum(sig),
+            .signal = @backingInt(sig),
             .stdout = result.stdout,
             .stderr = result.stderr,
             .success = false,
@@ -742,7 +742,7 @@ pub fn runEvalCapture(
         .stopped => |sig| .{
             .phase = phase,
             .term = "stopped",
-            .signal = @intFromEnum(sig),
+            .signal = @backingInt(sig),
             .stdout = result.stdout,
             .stderr = result.stderr,
             .success = false,
@@ -803,9 +803,9 @@ test "runtime adapter registry selects disables and weighted-combines adapters" 
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_peft_runtime_registry_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const adapter_a_path = try std.fs.path.join(allocator, &.{ root, "adapter_a.safetensors" });
     defer allocator.free(adapter_a_path);
@@ -819,7 +819,7 @@ test "runtime adapter registry selects disables and weighted-combines adapters" 
         .{ .name = "layer.lora_A.weight", .shape = a_shape[0..], .data = a_lora_a[0..] },
         .{ .name = "layer.lora_B.weight", .shape = a_shape[0..], .data = a_lora_b[0..] },
     };
-    try saveF32Safetensors(allocator, compat.io(), adapter_a_path, &adapter_a_tensors);
+    try saveF32Safetensors(allocator, compat.testingIo(), adapter_a_path, &adapter_a_tensors);
 
     var b_shape = [_]usize{2};
     var b_lora_a = [_]f32{ 10.0, 20.0 };
@@ -828,7 +828,7 @@ test "runtime adapter registry selects disables and weighted-combines adapters" 
         .{ .name = "layer.lora_A.weight", .shape = b_shape[0..], .data = b_lora_a[0..] },
         .{ .name = "other.lora_A.weight", .shape = b_shape[0..], .data = b_extra[0..] },
     };
-    try saveF32Safetensors(allocator, compat.io(), adapter_b_path, &adapter_b_tensors);
+    try saveF32Safetensors(allocator, compat.testingIo(), adapter_b_path, &adapter_b_tensors);
 
     var registry = RuntimeAdapterRegistry.init(allocator);
     defer registry.deinit();
@@ -869,8 +869,8 @@ test "trainable token adapter saves loads inspects and applies embedding deltas"
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_trainable_token_adapter_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const token_indices = [_]u32{ 1, 3 };
     const deltas = [_]f32{
@@ -879,7 +879,7 @@ test "trainable token adapter saves loads inspects and applies embedding deltas"
     };
     var summary = try saveTrainableTokenAdapter(
         allocator,
-        compat.io(),
+        compat.testingIo(),
         root,
         "model.embed_tokens.weight",
         &token_indices,
@@ -922,14 +922,14 @@ test "trainable token adapter rejects out-of-range token indices" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_trainable_token_adapter_oob_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const token_indices = [_]u32{4};
     const deltas = [_]f32{ 1.0, 2.0 };
     var summary = try saveTrainableTokenAdapter(
         allocator,
-        compat.io(),
+        compat.testingIo(),
         root,
         "model.embed_tokens.weight",
         &token_indices,
@@ -951,8 +951,8 @@ test "trainable token adapter rejects duplicate token indices" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_trainable_token_adapter_duplicate_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const token_indices = [_]u32{ 1, 1 };
     const deltas = [_]f32{
@@ -961,7 +961,7 @@ test "trainable token adapter rejects duplicate token indices" {
     };
     try std.testing.expectError(error.DuplicateTokenIndex, saveTrainableTokenAdapter(
         allocator,
-        compat.io(),
+        compat.testingIo(),
         root,
         "model.embed_tokens.weight",
         &token_indices,

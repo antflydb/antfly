@@ -994,15 +994,17 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
-    inline for (@typeInfo(BackendChoice).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(BackendChoice).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
 
 fn parseOutputFormat(value: []const u8) ?OutputFormat {
-    inline for (@typeInfo(OutputFormat).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(OutputFormat).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

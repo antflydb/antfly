@@ -1458,12 +1458,12 @@ pub const MetadataHttpServer = struct {
                     "tables",
                     "ranges",
                 };
-                const actual_fields = std.meta.fields(metadata_api.CatalogRoutingSnapshot);
+                const actual_fields = @typeInfo(metadata_api.CatalogRoutingSnapshot).@"struct".field_names;
                 if (actual_fields.len != expected_fields.len) {
                     @compileError("update budgeted routing snapshot serialization for the new wire field");
                 }
                 for (expected_fields, actual_fields) |expected, actual| {
-                    if (!std.mem.eql(u8, expected, actual.name)) {
+                    if (!std.mem.eql(u8, expected, actual)) {
                         @compileError("budgeted routing snapshot serialization is out of sync with the wire type");
                     }
                 }
@@ -2954,7 +2954,7 @@ fn cloneParsedGroupStatuses(
             .local_voter = parsed.local_voter orelse false,
             .voter_count = parsed.voter_count orelse 0,
             .voter_set_known = parsed.voter_set_known orelse false,
-            .voter_set_fingerprint = parsed.voter_set_fingerprint orelse [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+            .voter_set_fingerprint = parsed.voter_set_fingerprint orelse @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0)),
             .joint_consensus = parsed.joint_consensus orelse false,
             .transition_pending = parsed.transition_pending orelse false,
             .replay_required = parsed.replay_required orelse false,
@@ -3670,9 +3670,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
             return self.checks >= 3;
         }
     };
-    var projection_tables = [_]metadata_table_manager.TableRecord{
-        .{ .table_id = 7, .name = "docs" },
-    } ** 65;
+    var projection_tables = @as([65]metadata_table_manager.TableRecord, @splat(.{ .table_id = 7, .name = "docs" }));
     const large_snapshot = metadata_api.CatalogRoutingSnapshot{
         .metadata_group_id = 91,
         .catalog_revision = 12,

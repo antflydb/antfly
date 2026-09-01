@@ -43,15 +43,15 @@ pub fn supportsType(comptime T: type) bool {
         .@"enum" => return true,
         .@"union" => |info| {
             if (info.tag_type == null) return false;
-            inline for (info.fields) |field| {
-                if (field.type != void and !supportsType(field.type)) return false;
+            inline for (info.field_types) |Field| {
+                if (Field != void and !supportsType(Field)) return false;
             }
             return true;
         },
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                if (field.is_comptime) return false;
-                if (!supportsType(field.type)) return false;
+            inline for (info.field_types, info.field_attrs) |Field, attrs| {
+                if (attrs.@"comptime") return false;
+                if (!supportsType(Field)) return false;
             }
             return true;
         },
@@ -74,14 +74,14 @@ pub fn containsCustomJsonParseType(comptime T: type) bool {
     switch (@typeInfo(T)) {
         .optional => |info| return containsCustomJsonParseType(info.child),
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                if (containsCustomJsonParseType(field.type)) return true;
+            inline for (info.field_types) |Field| {
+                if (containsCustomJsonParseType(Field)) return true;
             }
             return false;
         },
         .@"union" => |info| {
-            inline for (info.fields) |field| {
-                if (containsCustomJsonParseType(field.type)) return true;
+            inline for (info.field_types) |Field| {
+                if (containsCustomJsonParseType(Field)) return true;
             }
             return false;
         },
@@ -273,7 +273,7 @@ const Parser = struct {
         self.skipWhitespace();
 
         var result: T = undefined;
-        var seen = [_]bool{false} ** info.fields.len;
+        var seen = @as([info.field_names.len]bool, @splat(false));
 
         if (!self.atEnd() and self.input[self.pos] == '}') {
             self.pos += 1;
@@ -298,17 +298,17 @@ const Parser = struct {
             if (self.cachedStructFieldIndex(T, field_name.slice())) |i| {
                 try self.parseStructFieldAtIndex(T, info, &result, &seen, i);
                 matched = true;
-            } else inline for (info.fields, 0..) |field, i| {
-                const json_field_name = comptime structFieldJsonName(T, field.name, i);
+            } else inline for (info.field_names, info.field_types, 0..) |field_name_zig, Field, i| {
+                const json_field_name = comptime structFieldJsonName(T, field_name_zig, i);
                 if (std.mem.eql(u8, json_field_name, field_name.slice())) {
                     self.rememberStructField(T, json_field_name, i);
-                    if (comptime structFieldRejectsNull(T, field.name, i)) {
+                    if (comptime structFieldRejectsNull(T, field_name_zig, i)) {
                         if (self.startsWith("null")) return error.UnexpectedToken;
                     }
                     if (seen[i]) {
                         switch (self.options.duplicate_field_behavior) {
                             .use_first => {
-                                _ = try self.parseType(field.type);
+                                _ = try self.parseType(Field);
                                 matched = true;
                                 break;
                             },
@@ -316,7 +316,7 @@ const Parser = struct {
                             .use_last => {},
                         }
                     }
-                    @field(result, field.name) = try self.parseType(field.type);
+                    @field(result, field_name_zig) = try self.parseType(Field);
                     seen[i] = true;
                     matched = true;
                     break;
@@ -356,22 +356,22 @@ const Parser = struct {
         seen: []bool,
         field_index: usize,
     ) json.ParseError(json.Scanner)!void {
-        inline for (info.fields, 0..) |field, i| {
+        inline for (info.field_names, info.field_types, 0..) |field_name_zig, Field, i| {
             if (field_index == i) {
-                if (comptime structFieldRejectsNull(T, field.name, i)) {
+                if (comptime structFieldRejectsNull(T, field_name_zig, i)) {
                     if (self.startsWith("null")) return error.UnexpectedToken;
                 }
                 if (seen[i]) {
                     switch (self.options.duplicate_field_behavior) {
                         .use_first => {
-                            _ = try self.parseType(field.type);
+                            _ = try self.parseType(Field);
                             return;
                         },
                         .@"error" => return error.DuplicateField,
                         .use_last => {},
                     }
                 }
-                @field(result.*, field.name) = try self.parseType(field.type);
+                @field(result.*, field_name_zig) = try self.parseType(Field);
                 seen[i] = true;
                 return;
             }
@@ -382,8 +382,8 @@ const Parser = struct {
     fn structFieldJsonName(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) []const u8 {
         if (!hasOpenApiFieldMetadata(T)) return zig_name;
         const metadata = T.openApiFieldMetadata;
-        const fields = @typeInfo(T).@"struct".fields;
-        if (metadata.len != fields.len)
+        const field_names = @typeInfo(T).@"struct".field_names;
+        if (metadata.len != field_names.len)
             @compileError("OpenAPI field metadata must match the generated struct");
         if (!std.mem.eql(u8, zig_name, metadata[field_index][1]))
             @compileError("OpenAPI field metadata order does not match the generated struct");
@@ -433,14 +433,14 @@ const Parser = struct {
 
         var result: T = undefined;
 
-        inline for (info.fields, 0..) |field, i| {
+        inline for (info.field_types, 0..) |Field, i| {
             if (self.atEnd()) return error.UnexpectedEndOfInput;
             if (i > 0) {
                 if (self.input[self.pos] != ',') return error.UnexpectedToken;
                 self.pos += 1;
                 self.skipWhitespace();
             }
-            result[i] = try self.parseType(field.type);
+            result[i] = try self.parseType(Field);
             self.skipWhitespace();
         }
 
@@ -478,12 +478,12 @@ const Parser = struct {
         self.pos += 1;
         self.skipWhitespace();
 
-        inline for (info.fields) |field| {
-            if (std.mem.eql(u8, field.name, field_name.slice())) {
-                const result = if (field.type == void)
-                    try self.parseVoidPayloadUnion(T, field.name)
+        inline for (info.field_names, info.field_types) |field_name_zig, Field| {
+            if (std.mem.eql(u8, field_name_zig, field_name.slice())) {
+                const result = if (Field == void)
+                    try self.parseVoidPayloadUnion(T, field_name_zig)
                 else
-                    @unionInit(T, field.name, try self.parseType(field.type));
+                    @unionInit(T, field_name_zig, try self.parseType(Field));
 
                 self.skipWhitespace();
                 if (self.atEnd()) return error.UnexpectedEndOfInput;
@@ -763,7 +763,7 @@ const Parser = struct {
         const closing_quote = try self.currentStringClosingQuote();
         const direct_content = self.input[self.pos + 1 .. closing_quote];
 
-        if (ptr_info.is_const and ptr_info.sentinel() == null and self.allocate_strings == .alloc_if_needed and self.canDirectCopyString(direct_content)) {
+        if (ptr_info.attrs.@"const" and ptr_info.sentinel() == null and self.allocate_strings == .alloc_if_needed and self.canDirectCopyString(direct_content)) {
             if (direct_content.len > self.max_value_len) return error.ValueTooLong;
             self.pos = closing_quote + 1;
             self.quote_cursor += 2;
@@ -1057,17 +1057,17 @@ fn validateNumberLikeSlice(slice: []const u8) json.ParseError(json.Scanner)!void
 
 fn fillDefaults(comptime T: type, result: *T, seen: []bool) json.ParseFromValueError!void {
     const info = @typeInfo(T).@"struct";
-    inline for (info.fields, 0..) |field, i| {
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, Field, attrs, i| {
         if (!seen[i]) {
-            if (field.default_value_ptr) |ptr| {
-                const typed_ptr: *align(@alignOf(field.type)) const field.type = @ptrCast(@alignCast(ptr));
-                @field(result.*, field.name) = typed_ptr.*;
-            } else if (!hasOpenApiFieldMetadata(T) and @typeInfo(field.type) == .optional) {
+            if (attrs.default_value_ptr) |ptr| {
+                const typed_ptr: *align(@alignOf(Field)) const Field = @ptrCast(@alignCast(ptr));
+                @field(result.*, field_name) = typed_ptr.*;
+            } else if (!hasOpenApiFieldMetadata(T) and @typeInfo(Field) == .optional) {
                 // Preserve std.json's ordinary Zig-struct behavior. Generated
                 // OpenAPI structs encode property presence in the field
                 // default: an optional-typed field without a default is a
                 // required nullable property and must remain missing here.
-                @field(result.*, field.name) = null;
+                @field(result.*, field_name) = null;
             } else {
                 return error.MissingField;
             }

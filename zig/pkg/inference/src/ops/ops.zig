@@ -626,7 +626,7 @@ pub const DecoderRuntimeComputeRegion = enum(u8) {
 
 pub const DecoderRuntimeComputeRegionScope = struct {
     backend: ?*const ComputeBackend = null,
-    previous: usize = @intFromEnum(DecoderRuntimeComputeRegion.other),
+    previous: usize = @backingInt(DecoderRuntimeComputeRegion.other),
     active: bool = false,
 
     pub fn deinit(self: *DecoderRuntimeComputeRegionScope) void {
@@ -700,17 +700,17 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_slot_upload_bytes: u64 = 0,
     a4b_moe_projected_enabled: u64 = 0,
     a4b_moe_projected_layer_attempts: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_route_hits: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_route_misses: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_all_hit_layers: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_token_attempts: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_all_hit_tokens: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_packed_q4_0_linear_attempts: u64 = 0,
     a4b_packed_q4_0_linear_successes: u64 = 0,
     a4b_packed_q4_0_linear_fallbacks: u64 = 0,
@@ -897,9 +897,9 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_last_frame_compute_region_layer_count: u64 = 0,
     metal_runtime_last_frame_compute_region_other_count: u64 = 0,
     metal_runtime_last_frame_planned_command_op_count: u64 = 0,
-    metal_runtime_last_frame_planned_command_op_kind_counts: [32]u64 = [_]u64{0} ** 32,
-    metal_runtime_last_frame_planned_command_operator_counts: [16]u64 = [_]u64{0} ** 16,
-    metal_runtime_last_frame_planned_command_quant_dispatch_counts: [4]u64 = [_]u64{0} ** 4,
+    metal_runtime_last_frame_planned_command_op_kind_counts: [32]u64 = @as([32]u64, @splat(0)),
+    metal_runtime_last_frame_planned_command_operator_counts: [16]u64 = @as([16]u64, @splat(0)),
+    metal_runtime_last_frame_planned_command_quant_dispatch_counts: [4]u64 = @as([4]u64, @splat(0)),
     metal_runtime_last_frame_blit_buffer_upload_count: u64 = 0,
     metal_runtime_last_frame_blit_buffer_copy_count: u64 = 0,
     metal_runtime_last_frame_blit_buffer_slice_count: u64 = 0,
@@ -919,7 +919,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_linear_mm_f16_input: u64 = 0,
     metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
-    metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = @as([12][4]u64, @splat(@as([4]u64, @splat(0)))),
     metal_runtime_q4_0_linear_reduce: u64 = 0,
     metal_runtime_q4_0_linear_reduce_rows_1: u64 = 0,
     metal_runtime_q4_0_linear_reduce_rows_2_8: u64 = 0,

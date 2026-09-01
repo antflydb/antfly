@@ -585,7 +585,7 @@ fn metalBroadcastHasResidentShape(query: CapabilityQuery) bool {
     const output_elems = shapeElementCount(output_shape) orelse return false;
     if (input_elems > std.math.maxInt(u32) or output_elems > std.math.maxInt(u32)) return false;
 
-    var mapped_output_axes = [_]bool{false} ** ml.graph.shape.max_rank;
+    var mapped_output_axes = @as([ml.graph.shape.max_rank]bool, @splat(false));
     for (0..rank) |input_axis| {
         const output_axis: usize = attrs.broadcast_axes[input_axis];
         if (output_axis >= output_rank or mapped_output_axes[output_axis]) return false;
