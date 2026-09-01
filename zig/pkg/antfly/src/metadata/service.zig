@@ -899,6 +899,7 @@ fn storesHaveDenseNativeAuthority(stores: []const metadata_table_manager.StoreRe
 
 fn validateDenseNativeStoreAdmission(
     stores: []const metadata_table_manager.StoreRecord,
+    activated_version: u16,
     record: metadata_table_manager.StoreRecord,
 ) !void {
     if (!metadata_table_manager.storeServesTableData(record.role)) return;
@@ -916,7 +917,8 @@ fn validateDenseNativeStoreAdmission(
             store.dense_native_storage_protocol_version,
         )) all_table_stores_capable = false;
     }
-    if (!storesHaveDenseNativeAuthority(stores) and
+    if (activated_version < metadata_table_manager.dense_native_storage_protocol_version and
+        !storesHaveDenseNativeAuthority(stores) and
         !(saw_table_store and all_table_stores_capable)) return;
     if (!metadata_table_manager.denseNativeStorageProtocolSupported(
         record.reporter_incarnation,
@@ -946,16 +948,24 @@ test "native authority rejects legacy table-store admission but permits metadata
     };
     try std.testing.expectError(
         error.DenseNativeStorageProtocolUnavailable,
-        validateDenseNativeStoreAdmission(&stores, legacy_data),
+        validateDenseNativeStoreAdmission(&stores, 0, legacy_data),
     );
     var metadata_only = legacy_data;
     metadata_only.role = "metadata";
-    try validateDenseNativeStoreAdmission(&stores, metadata_only);
+    try validateDenseNativeStoreAdmission(&stores, 0, metadata_only);
 
     var capable_data = legacy_data;
     capable_data.reporter_incarnation = 11;
     capable_data.dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version;
-    try validateDenseNativeStoreAdmission(&stores, capable_data);
+    try validateDenseNativeStoreAdmission(&stores, 0, capable_data);
+    try std.testing.expectError(
+        error.DenseNativeStorageProtocolUnavailable,
+        validateDenseNativeStoreAdmission(
+            &.{},
+            metadata_table_manager.dense_native_storage_protocol_version,
+            legacy_data,
+        ),
+    );
 }
 
 fn storesHaveRuntimeReporterFence(stores: []const metadata_table_manager.StoreRecord) bool {
@@ -2638,7 +2648,11 @@ pub const MetadataService = struct {
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
         const stores = try self.listProjectedStores(self.alloc);
         defer self.freeProjectedStores(self.alloc, stores);
-        try validateDenseNativeStoreAdmission(stores, record);
+        const activated_version = if (self.projectedStore()) |store|
+            try store.getDenseNativeStorageProtocolActivationVersion(self.metadata_group_id)
+        else
+            0;
+        try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
@@ -4921,7 +4935,11 @@ pub const MetadataHttpService = struct {
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
         const stores = try self.listProjectedStores(self.alloc);
         defer self.freeProjectedStores(self.alloc, stores);
-        try validateDenseNativeStoreAdmission(stores, record);
+        const activated_version = if (self.projectedStore()) |store|
+            try store.getDenseNativeStorageProtocolActivationVersion(self.metadata_group_id)
+        else
+            0;
+        try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
