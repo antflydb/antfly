@@ -74202,6 +74202,10 @@ test "db full_text sync level does not precompute template chunk full text routi
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        // Keep the asynchronous enrichment worker from racing the assertion
+        // that .full_text returns before template-derived chunks are routed.
+        // Drain the same work explicitly below once that boundary is proven.
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
@@ -74239,7 +74243,7 @@ test "db full_text sync level does not precompute template chunk full text routi
 
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runEnrichmentUntil(1);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_template_chunked_idx_chunks");
     defer alloc.free(chunk_prefix);
