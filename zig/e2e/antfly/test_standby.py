@@ -50,8 +50,15 @@ HA_BACKUP_HEADER_SIZE = 96
 HA_BACKUP_ENTRY_HEADER_SIZE = 28
 HA_BACKUP_FORMAT_VERSION = 1
 HA_BACKUP_FILE_KIND_METADATA = 3
+HA_TRANSITION_BUSY_BODY = b"HAStateTransitionBusy"
+HA_TRANSITION_RETRY_TIMEOUT_S = 20.0
+HA_TRANSITION_RETRY_INTERVAL_S = 0.1
 
 pytestmark = pytest.mark.ha_standby
+
+
+def _is_ha_transition_busy(response: requests.Response) -> bool:
+    return response.status_code == 503 and response.content == HA_TRANSITION_BUSY_BODY
 
 
 class HAStandaloneNode:
@@ -268,21 +275,30 @@ class HAStandaloneNode:
         )
 
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
         while True:
             response = self.admin_get_response(path, **params)
-            if response.status_code != 503 or response.text != "HAStateTransitionBusy":
+            if not _is_ha_transition_busy(response):
                 return self._check(response)
             if time.monotonic() >= deadline:
                 return self._check(response)
             # HA GETs are observations. The runtime deliberately sheds them
             # while a role transition owns the state mutex, so retry the exact
             # transient response without weakening any other failure signal.
-            time.sleep(0.1)
+            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.admin_post_response(path, payload)
-        return self._check(response)
+        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+        while True:
+            response = self.admin_post_response(path, payload)
+            if not _is_ha_transition_busy(response):
+                return self._check(response)
+            if time.monotonic() >= deadline:
+                return self._check(response)
+            # This exact response is emitted before route dispatch when the HA
+            # state mutex is owned, so no mutation has occurred and retrying is
+            # safe. Do not retry arbitrary 503 responses from route handlers.
+            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
         response = self._request(
@@ -323,6 +339,58 @@ class HAStandaloneNode:
                 response=response,
             )
         return response.json()
+
+
+def _test_response(status_code: int, body: bytes) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = body
+    response.request = requests.Request(
+        "POST", f"http://127.0.0.1{HA_ADMIN_ROOT}/test"
+    ).prepare()
+    response.url = response.request.url
+    return response
+
+
+def test_admin_post_retries_exact_pre_dispatch_transition_busy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    responses = iter(
+        [
+            _test_response(503, HA_TRANSITION_BUSY_BODY),
+            _test_response(200, b'{"result":"ok"}'),
+        ]
+    )
+    attempts = 0
+
+    def next_response(_path: str, _payload: dict[str, Any]) -> requests.Response:
+        nonlocal attempts
+        attempts += 1
+        return next(responses)
+
+    node.admin_post_response = next_response
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert node.admin_post("/test", {}) == {"result": "ok"}
+    assert attempts == 2
+
+
+def test_admin_post_does_not_retry_ambiguous_service_unavailable():
+    node = object.__new__(HAStandaloneNode)
+    attempts = 0
+
+    def unavailable(_path: str, _payload: dict[str, Any]) -> requests.Response:
+        nonlocal attempts
+        attempts += 1
+        return _test_response(503, b"upstream unavailable")
+
+    node.admin_post_response = unavailable
+    node.debug_logs = lambda: "test logs"
+
+    with pytest.raises(requests.HTTPError, match="upstream unavailable"):
+        node.admin_post("/test", {})
+    assert attempts == 1
 
 
 class HACluster:
@@ -1210,9 +1278,25 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert missing_promoted_primary_doc.status_code == 404
 
-    ha_cluster.standby.batch_write(table_name, {"doc:promoted": {"title": "promoted"}})
-    promoted_doc = ha_cluster.standby.lookup_key(table_name, "doc:promoted")
-    assert promoted_doc["title"] == "promoted"
+    # Promotion changes authority, but this in-process standby has not been
+    # restarted as a primary with a replacement synchronous replica. Keep the
+    # public mutation surface fail-closed until continuous replication exists.
+    rejected_promoted_write = ha_cluster.standby.batch_write_response(
+        table_name,
+        {"doc:promoted": {"title": "must not commit without replication"}},
+    )
+    assert rejected_promoted_write.status_code == 503
+    assert rejected_promoted_write.json() == {
+        "error": "mutation is not continuously replicated while HA is active",
+        "code": "ha_mutation_not_replicated",
+        "surface": "document_batch",
+    }
+    missing_promoted_copy = _wait_for_promoted_primary_missing_lookup(
+        ha_cluster,
+        table_name,
+        "doc:promoted",
+    )
+    assert missing_promoted_copy.status_code == 404
     with pytest.raises(requests.HTTPError) as missing_former_primary_copy:
         ha_cluster.primary.lookup_key(table_name, "doc:promoted", consistency="stale")
     assert missing_former_primary_copy.value.response is not None
