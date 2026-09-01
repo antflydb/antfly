@@ -34,7 +34,13 @@ package_cli_release = load_module(
 )
 
 
-def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> Path:
+def write_release_archive(
+    root: Path,
+    version: str,
+    os_name: str,
+    arch: str,
+    variant: str | None = None,
+) -> Path:
     stage = root / f"{os_name}-{arch}"
     (stage / "include").mkdir(parents=True)
     (stage / "lib").mkdir()
@@ -52,14 +58,15 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
     for shell in ("bash", "zsh", "fish"):
         (stage / "completions" / f"antfly.{shell}").write_text(f"{shell} completion\n")
 
-    archive = root / f"antfly_{version}_{os_name}_{arch}.tar.gz"
+    suffix = f"_{variant}" if variant else ""
+    archive = root / f"antfly_{version}_{os_name}_{arch}{suffix}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         for child in stage.iterdir():
             tar.add(child, arcname=child.name)
     return archive
 
 
-class CAbiPackagingTests(unittest.TestCase):
+class CompletionPackagingTests(unittest.TestCase):
     def test_generated_completions_include_nested_commands(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             output_dir = Path(raw) / "completions"
@@ -80,6 +87,17 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn('compgen -W "bash zsh fish"', bash)
             self.assertIn("__fish_seen_subcommand_from completion", fish)
 
+
+class CAbiPackagingTests(unittest.TestCase):
+    def test_cli_platforms_select_gnu_linux_archives(self) -> None:
+        names = {
+            platform.key: package_cli_release.archive_name("1.2.3", platform)
+            for platform in package_cli_release.PLATFORMS
+        }
+        self.assertEqual(names["darwin-arm64"], "antfly_1.2.3_Darwin_arm64.tar.gz")
+        self.assertEqual(names["linux-arm64"], "antfly_1.2.3_Linux_arm64_gnu.tar.gz")
+        self.assertEqual(names["linux-x64"], "antfly_1.2.3_Linux_x86_64_gnu.tar.gz")
+
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -89,12 +107,18 @@ class CAbiPackagingTests(unittest.TestCase):
             archive_dir = root / "archives"
             archive_dir.mkdir()
 
-            platform = package_cli_release.PLATFORMS[0]
-            write_release_archive(archive_dir, "1.2.3", platform.release_os, platform.release_arch)
+            platform = package_cli_release.PLATFORMS[1]
+            write_release_archive(
+                archive_dir,
+                "1.2.3",
+                platform.release_os,
+                platform.release_arch,
+                platform.release_variant,
+            )
 
-            (repo / "ts" / "packages" / "cli-darwin-arm64").mkdir(parents=True)
-            (repo / "ts" / "packages" / "cli-darwin-arm64" / "package.json").write_text(
-                '{"name":"@antfly/cli-darwin-arm64","version":"0.0.0","files":["bin","include","lib","share","README.md"]}\n'
+            (repo / "ts" / "packages" / "cli-linux-arm64").mkdir(parents=True)
+            (repo / "ts" / "packages" / "cli-linux-arm64" / "package.json").write_text(
+                '{"name":"@antfly/cli-linux-arm64","version":"0.0.0","files":["bin","include","lib","share","README.md"]}\n'
             )
             (repo / "zig" / "pkg" / "antfly" / "antfarm").mkdir(parents=True)
             (repo / "zig" / "pkg" / "antfly" / "antfarm" / "index.html").write_text("antfarm\n")
@@ -102,29 +126,35 @@ class CAbiPackagingTests(unittest.TestCase):
             (repo / "py" / "packages" / "cli" / "src" / "antfly_cli" / "__init__.py").write_text(
                 "def main(): return 0\n"
             )
+            (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
+                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.10"\n'
+            )
 
             package_cli_release.extract_archive(archive_dir, "1.2.3", platform, extracted)
             package_cli_release.copy_antfarm(repo, extracted)
             package_cli_release.populate_npm_package(repo, platform, extracted)
 
-            npm_package = repo / "ts" / "packages" / "cli-darwin-arm64"
+            npm_package = repo / "ts" / "packages" / "cli-linux-arm64"
             self.assertEqual((npm_package / "include" / "antfly.h").read_text(), "/* antfly header */\n")
-            self.assertEqual((npm_package / "lib" / "libantfly.dylib").read_text(), "antfly library\n")
+            self.assertEqual((npm_package / "lib" / "libantfly.so").read_text(), "antfly library\n")
 
             wheel = package_cli_release.package_python_wheel(repo, out, "1.2.3", platform, extracted)
             with zipfile.ZipFile(wheel) as zf:
                 names = set(zf.namelist())
+                metadata = zf.read("antfly_cli-1.2.3.dist-info/METADATA").decode()
             self.assertIn("antfly_cli/include/antfly.h", names)
-            self.assertIn("antfly_cli/lib/libantfly.dylib", names)
+            self.assertIn("antfly_cli/lib/libantfly.so", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
+            self.assertIn("Requires-Python: >=3.10", metadata)
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             archive_dir = root / "archives"
             archive_dir.mkdir()
-            for os_name, arch in (("Darwin", "arm64"), ("Linux", "arm64"), ("Linux", "x86_64")):
-                write_release_archive(archive_dir, "1.2.3", os_name, arch)
+            write_release_archive(archive_dir, "1.2.3", "Darwin", "arm64")
+            write_release_archive(archive_dir, "1.2.3", "Linux", "arm64", "gnu")
+            write_release_archive(archive_dir, "1.2.3", "Linux", "x86_64", "gnu")
 
             formula = root / "Formula" / "antfly.rb"
             subprocess.run(
@@ -145,6 +175,9 @@ class CAbiPackagingTests(unittest.TestCase):
             )
 
             rendered = formula.read_text()
+            self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
+            self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)
+            self.assertIn("antfly_1.2.3_Linux_x86_64_gnu.tar.gz", rendered)
             self.assertIn('include.install Dir["include/*"] if Dir.exist?("include")', rendered)
             self.assertIn('lib.install Dir["lib/*"] if Dir.exist?("lib")', rendered)
             self.assertIn('(share/"antfly").install Dir["share/antfly/*"] if Dir.exist?("share/antfly")', rendered)

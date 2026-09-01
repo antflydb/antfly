@@ -26,12 +26,17 @@ class Platform:
     release_os: str
     release_arch: str
     wheel_platform: str
+    release_variant: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.wheel_platform.startswith("manylinux_") and self.release_variant != "gnu":
+            raise ValueError(f"manylinux platform {self.key} must use a GNU release archive")
 
 
 PLATFORMS = (
     Platform("darwin-arm64", "Darwin", "arm64", "macosx_11_0_arm64"),
-    Platform("linux-arm64", "Linux", "arm64", "manylinux_2_28_aarch64"),
-    Platform("linux-x64", "Linux", "x86_64", "manylinux_2_28_x86_64"),
+    Platform("linux-arm64", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu"),
+    Platform("linux-x64", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu"),
 )
 
 
@@ -74,7 +79,24 @@ def python_version_from_release(version: str) -> str:
 
 
 def archive_name(version: str, platform: Platform) -> str:
-    return f"antfly_{version}_{platform.release_os}_{platform.release_arch}.tar.gz"
+    variant = f"_{platform.release_variant}" if platform.release_variant else ""
+    return f"antfly_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
+
+
+def project_requires_python(pyproject: Path) -> str:
+    """Read project.requires-python without duplicating release metadata."""
+    in_project = False
+    for line in pyproject.read_text().splitlines():
+        section = re.fullmatch(r"\s*\[([^]]+)]\s*", line)
+        if section:
+            in_project = section.group(1) == "project"
+            continue
+        if not in_project:
+            continue
+        match = re.fullmatch(r'\s*requires-python\s*=\s*"([^"]+)"\s*', line)
+        if match:
+            return match.group(1)
+    raise SystemExit(f"missing project.requires-python in {pyproject}")
 
 
 def lite_library_name(platform: Platform) -> str:
@@ -200,7 +222,9 @@ def package_python_wheel(
     metadata["Summary"] = "Native Antfly CLI installer package"
     metadata["Author-email"] = "Antfly, Inc. <ajroetker@antfly.io>"
     metadata["License"] = "Elastic-2.0"
-    metadata["Requires-Python"] = ">=3.9"
+    metadata["Requires-Python"] = project_requires_python(
+        repo_root / "py" / "packages" / "cli" / "pyproject.toml"
+    )
     metadata["Project-URL"] = "Homepage, https://antfly.io"
     metadata["Project-URL"] = "Documentation, https://docs.antfly.io"
     metadata["Project-URL"] = "Repository, https://github.com/antflydb/antfly"

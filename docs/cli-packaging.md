@@ -47,20 +47,44 @@ The CLI workflow also supports manual runs with a version input and `cli/v*`
 tags for republishing or recovery. Trusted publishing for the normal release
 path should be configured against `.github/workflows/antfly-release.yml`.
 
-The packaging script expects these release archives:
+Linux releases have two libc variants. The unsuffixed archive is the portable,
+CPU-only musl build retained for the direct download installer. The `_gnu`
+archive is the glibc build used anywhere the distribution includes a loadable
+shared library or runtime-loaded integration:
+
+| Consumer | Linux archive | Reason |
+| --- | --- | --- |
+| `scripts/install.sh` | auto-detected | `_gnu` on glibc; musl on musl or unknown Linux |
+| Direct portable archive downloads | musl (unsuffixed) | Portable standalone CLI |
+| Python `manylinux` wheels | `_gnu` | glibc-compatible executable and C ABI library |
+| npm Linux platform packages | `_gnu` | Generic Linux package with a usable C ABI library |
+| Homebrew on Linux | `_gnu` | Linuxbrew runs on glibc and installs `libantfly.so` |
+| Container images | `_gnu` | CUDA, PJRT/XLA, and other host plugins use the glibc ABI |
+
+The release workflow publishes these native archives:
 
 ```text
 antfly_0.2.0_Darwin_arm64.tar.gz
 antfly_0.2.0_Linux_arm64.tar.gz
+antfly_0.2.0_Linux_arm64_gnu.tar.gz
 antfly_0.2.0_Linux_x86_64.tar.gz
+antfly_0.2.0_Linux_x86_64_gnu.tar.gz
 ```
 
-Those archives must include `include/antfly.h` and the platform library
-under `lib/`; `scripts/packaging/build_zig_release_archive.sh` builds the normal
-runtime and then the `capi` target into the same archive prefix. Linux archives
-compile in the CUDA and PJRT/XLA backends; both discover their driver or plugin
-at runtime, so the same archives also run on CPU-only Linux hosts. PJRT/XLA use
-still requires a compatible plugin supplied by the runtime environment.
+The Python/npm packaging script consumes the Darwin archive and both `_gnu`
+Linux archives. The GNU targets pin glibc 2.28 to match the wheel platform tag
+and keep that compatibility floor stable across Zig upgrades. All archives
+include `include/antfly.h` and the platform library under `lib/`;
+`scripts/packaging/build_zig_release_archive.sh` builds the runtime and then the
+`capi` target into the same archive prefix. GNU Linux archives compile in the
+CUDA and PJRT/XLA backends, which discover their driver or plugin at runtime and
+remain usable on CPU-only glibc hosts. PJRT/XLA use still requires a compatible
+plugin supplied by the runtime environment.
+
+The shell installer detects glibc with `getconf` and otherwise checks for musl.
+Set `ANTFLY_LIBC=gnu` or `ANTFLY_LIBC=musl` to override detection, for example
+when preparing an installation for a different host. In automatic mode it
+falls back to musl when an older release does not provide a GNU archive.
 
 For prerelease tags, npm uses the release version directly. Python wheels use
 PEP 440 equivalents, for example `v0.2.0-dev10` becomes `0.2.0.dev10`.

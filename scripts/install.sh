@@ -188,6 +188,26 @@ detect_platform() {
     echo "$OS $ARCH"
 }
 
+detect_linux_libc() {
+    case "${ANTFLY_LIBC:-auto}" in
+        gnu|musl) echo "$ANTFLY_LIBC"; return ;;
+        auto|'') ;;
+        *) error "ANTFLY_LIBC must be auto, gnu, or musl" ;;
+    esac
+
+    if available getconf && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        echo "gnu"
+        return
+    fi
+    if available ldd && ldd --version 2>&1 | grep -qi musl; then
+        echo "musl"
+        return
+    fi
+
+    warning "Could not detect the Linux libc; using the portable musl build"
+    echo "musl"
+}
+
 # Download and install antfly
 install_antfly() {
     require curl tar
@@ -221,13 +241,30 @@ EOF
 
     status "Installing Antfly $TAG..."
 
-    ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+    ARCHIVE_SUFFIX=""
+    if [ "$OS" = "Linux" ]; then
+        LIBC=$(detect_linux_libc)
+        status "Detected Linux libc: $LIBC"
+        if [ "$LIBC" = "gnu" ]; then
+            ARCHIVE_SUFFIX="_gnu"
+        fi
+    fi
+    ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}${ARCHIVE_SUFFIX}.tar.gz"
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
     CHECKSUMS_URL="https://releases.antfly.io/antfly/${TAG}/antfly_zig_checksums.txt"
 
     status "Downloading from $DOWNLOAD_URL..."
     if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
-        error "Failed to download Antfly. Please check your internet connection and the version number."
+        if [ "$OS" = "Linux" ] && [ "${LIBC:-}" = "gnu" ] && [ "${ANTFLY_LIBC:-auto}" = "auto" ]; then
+            warning "GNU archive is unavailable; falling back to the portable musl build"
+            ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+            DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
+            status "Downloading from $DOWNLOAD_URL..."
+            download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME" || \
+                error "Failed to download Antfly. Please check your internet connection and the version number."
+        else
+            error "Failed to download Antfly. Please check your internet connection and the version number."
+        fi
     fi
 
     status "Downloading release checksums..."
@@ -346,6 +383,9 @@ Options:
 Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
+
+  ANTFLY_LIBC overrides Linux libc detection. Supported values are auto
+  (default), gnu, and musl.
 
   ANTFLY_DOWNLOAD_CLASS supplies a best-effort analytics label for archive
   requests. Set it to employee for staff downloads or ci for automated jobs;

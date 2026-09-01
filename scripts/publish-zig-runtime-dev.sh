@@ -65,8 +65,8 @@ fi
 
 host_arch="$(uname -m)"
 case "$host_arch" in
-  x86_64) native_arch=amd64; zig_target=x86_64-linux-gnu ;;
-  arm64|aarch64) native_arch=arm64; zig_target=aarch64-linux-gnu ;;
+  x86_64) native_arch=amd64; zig_target=x86_64-linux-gnu.2.28 ;;
+  arm64|aarch64) native_arch=arm64; zig_target=aarch64-linux-gnu.2.28 ;;
   *) echo "unsupported host architecture: $host_arch" >&2; exit 2 ;;
 esac
 

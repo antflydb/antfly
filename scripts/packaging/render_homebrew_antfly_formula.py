@@ -9,14 +9,15 @@ from pathlib import Path
 
 
 ARCHIVES = {
-    "darwin_arm64": ("Darwin", "arm64"),
-    "linux_arm64": ("Linux", "arm64"),
-    "linux_x86_64": ("Linux", "x86_64"),
+    "darwin_arm64": ("Darwin", "arm64", None),
+    "linux_arm64": ("Linux", "arm64", "gnu"),
+    "linux_x86_64": ("Linux", "x86_64", "gnu"),
 }
 
 
-def archive_name(version: str, os_name: str, arch: str) -> str:
-    return f"antfly_{version}_{os_name}_{arch}.tar.gz"
+def archive_name(version: str, os_name: str, arch: str, variant: str | None) -> str:
+    suffix = f"_{variant}" if variant else ""
+    return f"antfly_{version}_{os_name}_{arch}{suffix}.tar.gz"
 
 
 def sha256(path: Path) -> str:
@@ -36,8 +37,8 @@ def main() -> int:
     args = parser.parse_args()
 
     values: dict[str, str] = {}
-    for key, (os_name, arch) in ARCHIVES.items():
-        name = archive_name(args.version, os_name, arch)
+    for key, (os_name, arch, variant) in ARCHIVES.items():
+        name = archive_name(args.version, os_name, arch, variant)
         path = args.archive_dir / name
         if not path.exists():
             raise SystemExit(f"missing archive for Homebrew formula: {path}")

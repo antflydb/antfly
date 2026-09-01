@@ -62,11 +62,27 @@ done
 case "$url" in
   */antfly_zig_checksums.txt)
     printf '%s  antfly_1.2.3_Linux_x86_64.tar.gz\n' "$TEST_CHECKSUM" >"$output"
+    printf '%s  antfly_1.2.3_Linux_x86_64_gnu.tar.gz\n' "$TEST_CHECKSUM" >>"$output"
+    ;;
+  *_gnu.tar.gz)
+    if [ "${TEST_FAIL_GNU_DOWNLOAD:-}" = "1" ]; then
+      exit 22
+    fi
+    : >"$output"
     ;;
   *)
     : >"$output"
     ;;
 esac
+EOF
+
+cat >"$test_root/bin/getconf" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "GNU_LIBC_VERSION" ]; then
+  printf 'glibc 2.28\n'
+  exit 0
+fi
+exit 1
 EOF
 
 cat >"$test_root/bin/sha256sum" <<'EOF'
@@ -97,11 +113,14 @@ run_installer() {
   local class="$1"
   local arguments_file="$2"
   local stderr_file="$3"
+  local libc="${4:-auto}"
   CURL_ARGUMENTS_FILE="$arguments_file" \
     TEST_CHECKSUM="$checksum" \
     TEST_ACTUAL_CHECKSUM="${TEST_ACTUAL_CHECKSUM:-$checksum}" \
     TEST_FAIL_ACTIVATION="${TEST_FAIL_ACTIVATION:-}" \
+    TEST_FAIL_GNU_DOWNLOAD="${TEST_FAIL_GNU_DOWNLOAD:-}" \
     ANTFLY_DOWNLOAD_CLASS="$class" \
+    ANTFLY_LIBC="$libc" \
     HOME="$test_root/home" \
     PATH="$test_root/bin:/usr/bin:/bin" \
     sh "$repo_root/scripts/install.sh" v1.2.3 >/dev/null 2>"$stderr_file"
@@ -109,9 +128,10 @@ run_installer() {
 
 run_case() {
   local class="$1"
-  local arguments_file="$test_root/curl-${class:-missing}.txt"
-  local stderr_file="$test_root/stderr-${class:-missing}.txt"
-  run_installer "$class" "$arguments_file" "$stderr_file"
+  local libc="${2:-auto}"
+  local arguments_file="$test_root/curl-${class:-missing}-${libc}.txt"
+  local stderr_file="$test_root/stderr-${class:-missing}-${libc}.txt"
+  run_installer "$class" "$arguments_file" "$stderr_file" "$libc"
   printf '%s\n' "$arguments_file" "$stderr_file"
 }
 
@@ -191,6 +211,18 @@ external_files="$(run_case external)"
 external_arguments="$(printf '%s\n' "$external_files" | sed -n '1p')"
 assert_line "antfly-installer/1" "$external_arguments"
 assert_no_audience_header "$external_arguments"
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64_gnu.tar.gz" "$external_arguments"
+
+musl_files="$(run_case external musl)"
+musl_arguments="$(printf '%s\n' "$musl_files" | sed -n '1p')"
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64.tar.gz" "$musl_arguments"
+
+fallback_arguments="$test_root/curl-fallback.txt"
+fallback_stderr="$test_root/stderr-fallback.txt"
+TEST_FAIL_GNU_DOWNLOAD=1 run_installer external "$fallback_arguments" "$fallback_stderr"
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64_gnu.tar.gz" "$fallback_arguments"
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64.tar.gz" "$fallback_arguments"
+grep -Fq "falling back to the portable musl build" "$fallback_stderr"
 
 invalid_files="$(run_case not-valid)"
 invalid_arguments="$(printf '%s\n' "$invalid_files" | sed -n '1p')"

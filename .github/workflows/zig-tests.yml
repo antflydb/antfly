@@ -186,7 +186,14 @@ jobs:
             scripts/install.sh \
             scripts/test_install_download_markers.sh \
             scripts/test_quickstart_docs.py \
+            scripts/packaging/package_cli_release.py \
+            scripts/packaging/render_homebrew_antfly_formula.py \
+            scripts/packaging/test_cabi_packaging.py \
+            scripts/packaging/build_zig_release_archive.sh \
+            py/packages/cli/pyproject.toml \
+            docs/cli-packaging.md \
             docs/guides/quickstart.mdx \
+            .github/workflows/antfly-release.yml \
             .github/workflows/cli-publish.yml \
             .github/workflows/zig-tests.yml
           then
@@ -210,6 +217,7 @@ jobs:
         run: |
           scripts/test_install_download_markers.sh
           scripts/test_quickstart_docs.py
+          python3 scripts/packaging/test_cabi_packaging.py CAbiPackagingTests
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 
