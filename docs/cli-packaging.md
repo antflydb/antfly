@@ -48,16 +48,16 @@ tags for republishing or recovery. Trusted publishing for the normal release
 path should be configured against `.github/workflows/antfly-release.yml`.
 
 Linux releases have two libc variants. The unsuffixed archive is the portable,
-CPU-only musl build retained for the direct download installer. The `_gnu`
-archive is the glibc build used anywhere the distribution includes a loadable
-shared library or runtime-loaded integration:
+CPU-only musl build used by musl hosts and direct portable downloads. The
+`_gnu` archive is the glibc build used for glibc hosts and runtime-loaded
+integrations:
 
 | Consumer | Linux archive | Reason |
 | --- | --- | --- |
 | `scripts/install.sh` | auto-detected | `_gnu` on glibc; musl on musl or unknown Linux |
 | Direct portable archive downloads | musl (unsuffixed) | Portable standalone CLI |
 | Python `manylinux` wheels | `_gnu` | glibc-compatible executable and C ABI library |
-| npm Linux platform packages | `_gnu` | Generic Linux package with a usable C ABI library |
+| npm Linux platform packages | libc-specific | GNU and musl packages preserve both supported Linux ABIs |
 | Homebrew on Linux | `_gnu` | Linuxbrew runs on glibc and installs `libantfly.so` |
 | Container images | `_gnu` | CUDA, PJRT/XLA, and other host plugins use the glibc ABI |
 
@@ -71,10 +71,12 @@ antfly_0.2.0_Linux_x86_64.tar.gz
 antfly_0.2.0_Linux_x86_64_gnu.tar.gz
 ```
 
-The Python/npm packaging script consumes the Darwin archive and both `_gnu`
-Linux archives. The GNU targets pin glibc 2.28 to match the wheel platform tag
-and keep that compatibility floor stable across Zig upgrades. All archives
-include `include/antfly.h` and the platform library under `lib/`;
+The packaging script consumes the Darwin archive and both variants for each
+Linux architecture. Python wheels use only the GNU archives. npm publishes GNU
+and musl platform packages and selects between them at runtime. The GNU targets
+pin glibc 2.28 to match the wheel platform tag and keep that compatibility floor
+stable across Zig upgrades. All archives include `include/antfly.h` and the
+platform library under `lib/`;
 `scripts/packaging/build_zig_release_archive.sh` builds the runtime and then the
 `capi` target into the same archive prefix. GNU Linux archives compile in the
 CUDA and PJRT/XLA backends, which discover their driver or plugin at runtime and
@@ -106,8 +108,16 @@ and populates npm platform packages:
 ```text
 @antfly/cli-darwin-arm64
 @antfly/cli-linux-arm64
+@antfly/cli-linux-arm64-gnu
 @antfly/cli-linux-x64
+@antfly/cli-linux-x64-gnu
 ```
 
-The top-level `@antfly/cli` package exposes the `antfly` bin and delegates to
-the right platform package at runtime.
+The existing unsuffixed npm Linux packages remain musl packages for backwards
+compatibility. The `-gnu` packages declare `libc: glibc`; the unsuffixed Linux
+packages declare `libc: musl`. The top-level `@antfly/cli` package exposes the
+`antfly` bin and selects the package matching the host OS, CPU, and libc.
+
+Before the first automated release, bootstrap `@antfly/cli-linux-arm64-gnu` and
+`@antfly/cli-linux-x64-gnu`, then configure npm trusted publishing against the
+same release workflows as the existing platform packages.

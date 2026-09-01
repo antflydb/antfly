@@ -1,12 +1,12 @@
 {
-  "name": "@antfly/cli-linux-arm64",
+  "name": "@antfly/cli-linux-arm64-gnu",
   "version": "0.0.0",
-  "description": "Native Antfly CLI binary for Linux arm64 with musl",
+  "description": "Native Antfly CLI binary for Linux arm64 with glibc",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/antflydb/antfly.git",
-    "directory": "ts/packages/cli-linux-arm64"
+    "directory": "ts/packages/cli-linux-arm64-gnu"
   },
   "files": [
     "bin",
@@ -22,6 +22,6 @@
     "arm64"
   ],
   "libc": [
-    "musl"
+    "glibc"
   ]
 }

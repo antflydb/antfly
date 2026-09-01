@@ -1,6 +1,7 @@
 {
   "name": "@antfly/cli",
   "version": "0.0.0",
+  "type": "module",
   "description": "Native Antfly CLI installer package",
   "license": "Elastic-2.0",
   "repository": {
@@ -20,12 +21,14 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --check ./bin/antfly.js"
+    "test": "node --test ./test/*.test.js && node --check ./bin/antfly.js"
   },
   "optionalDependencies": {
     "@antfly/cli-darwin-arm64": "workspace:*",
     "@antfly/cli-linux-arm64": "workspace:*",
-    "@antfly/cli-linux-x64": "workspace:*"
+    "@antfly/cli-linux-arm64-gnu": "workspace:*",
+    "@antfly/cli-linux-x64": "workspace:*",
+    "@antfly/cli-linux-x64-gnu": "workspace:*"
   },
   "engines": {
     "node": ">=24.0"

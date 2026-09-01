@@ -291,6 +291,7 @@ jobs:
       - name: Smoke check package wrappers
         run: |
           python -m compileall -q py/packages/cli/src/antfly_cli
+          node --test ts/packages/cli/test/*.test.js
           node --check ts/packages/cli/bin/antfly.js
 
       - name: Pack npm packages
@@ -299,7 +300,9 @@ jobs:
           mkdir -p dist/cli-packages/npm
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64-gnu
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64-gnu
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
 
       - name: Upload Python wheels
@@ -364,8 +367,10 @@ jobs:
           esac
           echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
           npm publish ./dist/antfly-cli-darwin-arm64-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-arm64-*.tgz --access public --provenance --tag "$npm_tag"
-          npm publish ./dist/antfly-cli-linux-x64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish ./dist/antfly-cli-linux-arm64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish ./dist/antfly-cli-linux-arm64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish ./dist/antfly-cli-linux-x64-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish ./dist/antfly-cli-linux-x64-gnu-*.tgz --access public --provenance --tag "$npm_tag"
           npm publish ./dist/antfly-cli-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
 
   publish-zig-homebrew:

@@ -23,20 +23,28 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Platform:
     key: str
+    npm_package_dir: str
     release_os: str
     release_arch: str
-    wheel_platform: str
+    wheel_platform: str | None
     release_variant: str | None = None
+    npm_libc: str | None = None
 
     def __post_init__(self) -> None:
-        if self.wheel_platform.startswith("manylinux_") and self.release_variant != "gnu":
+        if self.wheel_platform and self.wheel_platform.startswith("manylinux_") and self.release_variant != "gnu":
             raise ValueError(f"manylinux platform {self.key} must use a GNU release archive")
+        if self.release_os == "Linux":
+            expected_libc = "glibc" if self.release_variant == "gnu" else "musl"
+            if self.npm_libc != expected_libc:
+                raise ValueError(f"Linux platform {self.key} must declare npm libc {expected_libc}")
 
 
 PLATFORMS = (
-    Platform("darwin-arm64", "Darwin", "arm64", "macosx_11_0_arm64"),
-    Platform("linux-arm64", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu"),
-    Platform("linux-x64", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu"),
+    Platform("darwin-arm64", "cli-darwin-arm64", "Darwin", "arm64", "macosx_11_0_arm64"),
+    Platform("linux-arm64-gnu", "cli-linux-arm64-gnu", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu", "glibc"),
+    Platform("linux-x64-gnu", "cli-linux-x64-gnu", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu", "glibc"),
+    Platform("linux-arm64-musl", "cli-linux-arm64", "Linux", "arm64", None, None, "musl"),
+    Platform("linux-x64-musl", "cli-linux-x64", "Linux", "x86_64", None, None, "musl"),
 )
 
 
@@ -174,8 +182,19 @@ def update_pyproject_version(path: Path, version: str) -> None:
     path.write_text(text)
 
 
+def validate_npm_package(repo_root: Path, platform: Platform) -> None:
+    package_json = repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json"
+    data = json.loads(package_json.read_text())
+    expected_name = f"@antfly/{platform.npm_package_dir}"
+    if data.get("name") != expected_name:
+        raise SystemExit(f"{package_json} must declare package name {expected_name}")
+    expected_libc = [platform.npm_libc] if platform.npm_libc else None
+    if data.get("libc") != expected_libc:
+        raise SystemExit(f"{package_json} must declare libc {expected_libc}")
+
+
 def populate_npm_package(repo_root: Path, platform: Platform, extracted: Path) -> None:
-    package_dir = repo_root / "ts" / "packages" / platform.key.replace("darwin", "cli-darwin").replace("linux", "cli-linux")
+    package_dir = repo_root / "ts" / "packages" / platform.npm_package_dir
     clean_path(package_dir / "bin")
     clean_path(package_dir / "include")
     clean_path(package_dir / "lib")
@@ -194,6 +213,8 @@ def package_python_wheel(
     platform: Platform,
     extracted: Path,
 ) -> Path:
+    if platform.wheel_platform is None:
+        raise ValueError(f"platform {platform.key} does not produce a Python wheel")
     dist_name = "antfly_cli"
     package_name = "antfly_cli"
     tag = f"py3-none-{platform.wheel_platform}"
@@ -282,8 +303,8 @@ def main() -> int:
     update_pyproject_version(repo_root / "py" / "packages" / "cli" / "pyproject.toml", python_version)
     update_json_version(repo_root / "ts" / "packages" / "cli" / "package.json", version, optional_deps=True)
     for platform in PLATFORMS:
-        package_dir_name = platform.key.replace("darwin", "cli-darwin").replace("linux", "cli-linux")
-        update_json_version(repo_root / "ts" / "packages" / package_dir_name / "package.json", version)
+        validate_npm_package(repo_root, platform)
+        update_json_version(repo_root / "ts" / "packages" / platform.npm_package_dir / "package.json", version)
 
     clean_path(py_out)
     for platform in PLATFORMS:
@@ -292,8 +313,9 @@ def main() -> int:
             extract_archive(archive_dir, version, platform, extracted)
             copy_antfarm(repo_root, extracted)
             populate_npm_package(repo_root, platform, extracted)
-            wheel = package_python_wheel(repo_root, py_out, python_version, platform, extracted)
-            print(f"wrote {wheel}")
+            if platform.wheel_platform:
+                wheel = package_python_wheel(repo_root, py_out, python_version, platform, extracted)
+                print(f"wrote {wheel}")
 
     print("npm package directories populated under ts/packages/cli-*")
     return 0

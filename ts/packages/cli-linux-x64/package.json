@@ -1,7 +1,7 @@
 {
   "name": "@antfly/cli-linux-x64",
   "version": "0.0.0",
-  "description": "Native Antfly CLI binary for Linux x64",
+  "description": "Native Antfly CLI binary for Linux x64 with musl",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",
@@ -20,5 +20,8 @@
   ],
   "cpu": [
     "x64"
+  ],
+  "libc": [
+    "musl"
   ]
 }

@@ -5,16 +5,12 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
+import { resolvePlatformPackage } from "./platform.js";
+
 const require = createRequire(import.meta.url);
 
-const packageByPlatform = {
-  "darwin-arm64": "@antfly/cli-darwin-arm64",
-  "linux-arm64": "@antfly/cli-linux-arm64",
-  "linux-x64": "@antfly/cli-linux-x64"
-};
-
 const platformKey = `${process.platform}-${process.arch}`;
-const packageName = packageByPlatform[platformKey];
+const packageName = resolvePlatformPackage(process.platform, process.arch);
 
 if (!packageName) {
   console.error(`Unsupported Antfly CLI platform: ${platformKey}`);
@@ -30,7 +26,12 @@ try {
   process.exit(1);
 }
 
-const executable = join(packageJsonPath, "..", "bin", process.platform === "win32" ? "antfly.exe" : "antfly");
+const executable = join(
+  packageJsonPath,
+  "..",
+  "bin",
+  process.platform === "win32" ? "antfly.exe" : "antfly"
+);
 if (!existsSync(executable)) {
   console.error(`Antfly CLI executable is missing: ${executable}`);
   process.exit(1);

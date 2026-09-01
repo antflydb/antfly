@@ -191,6 +191,7 @@ jobs:
             scripts/packaging/test_cabi_packaging.py \
             scripts/packaging/build_zig_release_archive.sh \
             py/packages/cli/pyproject.toml \
+            ':(glob)ts/packages/cli*/**' \
             docs/cli-packaging.md \
             docs/guides/quickstart.mdx \
             .github/workflows/antfly-release.yml \

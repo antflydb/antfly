@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import stat
 import subprocess
 import sys
@@ -12,7 +13,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGING_DIR = Path(__file__).resolve().parent
@@ -89,14 +89,25 @@ class CompletionPackagingTests(unittest.TestCase):
 
 
 class CAbiPackagingTests(unittest.TestCase):
-    def test_cli_platforms_select_gnu_linux_archives(self) -> None:
+    def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {
             platform.key: package_cli_release.archive_name("1.2.3", platform)
             for platform in package_cli_release.PLATFORMS
         }
         self.assertEqual(names["darwin-arm64"], "antfly_1.2.3_Darwin_arm64.tar.gz")
-        self.assertEqual(names["linux-arm64"], "antfly_1.2.3_Linux_arm64_gnu.tar.gz")
-        self.assertEqual(names["linux-x64"], "antfly_1.2.3_Linux_x86_64_gnu.tar.gz")
+        self.assertEqual(names["linux-arm64-gnu"], "antfly_1.2.3_Linux_arm64_gnu.tar.gz")
+        self.assertEqual(names["linux-x64-gnu"], "antfly_1.2.3_Linux_x86_64_gnu.tar.gz")
+        self.assertEqual(names["linux-arm64-musl"], "antfly_1.2.3_Linux_arm64.tar.gz")
+        self.assertEqual(names["linux-x64-musl"], "antfly_1.2.3_Linux_x86_64.tar.gz")
+
+    def test_npm_platform_manifests_declare_the_expected_libc(self) -> None:
+        expected_dependencies = set()
+        for platform in package_cli_release.PLATFORMS:
+            package_cli_release.validate_npm_package(REPO_ROOT, platform)
+            expected_dependencies.add(f"@antfly/{platform.npm_package_dir}")
+
+        top_level = json.loads((REPO_ROOT / "ts" / "packages" / "cli" / "package.json").read_text())
+        self.assertEqual(set(top_level["optionalDependencies"]), expected_dependencies)
 
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -116,9 +127,18 @@ class CAbiPackagingTests(unittest.TestCase):
                 platform.release_variant,
             )
 
-            (repo / "ts" / "packages" / "cli-linux-arm64").mkdir(parents=True)
-            (repo / "ts" / "packages" / "cli-linux-arm64" / "package.json").write_text(
-                '{"name":"@antfly/cli-linux-arm64","version":"0.0.0","files":["bin","include","lib","share","README.md"]}\n'
+            package_dir = repo / "ts" / "packages" / platform.npm_package_dir
+            package_dir.mkdir(parents=True)
+            (package_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": f"@antfly/{platform.npm_package_dir}",
+                        "version": "0.0.0",
+                        "files": ["bin", "include", "lib", "share", "README.md"],
+                        "libc": [platform.npm_libc],
+                    }
+                )
+                + "\n"
             )
             (repo / "zig" / "pkg" / "antfly" / "antfarm").mkdir(parents=True)
             (repo / "zig" / "pkg" / "antfly" / "antfarm" / "index.html").write_text("antfarm\n")
@@ -134,7 +154,7 @@ class CAbiPackagingTests(unittest.TestCase):
             package_cli_release.copy_antfarm(repo, extracted)
             package_cli_release.populate_npm_package(repo, platform, extracted)
 
-            npm_package = repo / "ts" / "packages" / "cli-linux-arm64"
+            npm_package = repo / "ts" / "packages" / platform.npm_package_dir
             self.assertEqual((npm_package / "include" / "antfly.h").read_text(), "/* antfly header */\n")
             self.assertEqual((npm_package / "lib" / "libantfly.so").read_text(), "antfly library\n")
 
