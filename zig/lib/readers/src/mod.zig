@@ -131,6 +131,18 @@ pub const BatchExecution = struct {
     serial_items: usize = 0,
     fallback_items: usize = 0,
     fallback_reason: ?[]const u8 = null,
+
+    pub fn validate(self: @This(), item_count: usize) !void {
+        const executed = std.math.add(usize, self.native_items, self.serial_items) catch
+            return error.InvalidReadExecutionReport;
+        if (self.requested_items != item_count or executed != item_count)
+            return error.InvalidReadExecutionReport;
+        if (self.fallback_items > self.serial_items) return error.InvalidReadExecutionReport;
+        if (self.native_items > 0 and self.native_batches == 0) return error.InvalidReadExecutionReport;
+        if (self.native_batches > self.native_items) return error.InvalidReadExecutionReport;
+        if (self.fallback_items == 0 and self.fallback_reason != null)
+            return error.InvalidReadExecutionReport;
+    }
 };
 
 pub const BatchResult = struct {
@@ -446,25 +458,16 @@ const AntflyReaderState = struct {
 
 fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count: usize) !BatchExecution {
     const report = wire orelse return .{ .requested_items = item_count, .serial_items = item_count };
-    const requested = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport;
-    const native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport;
-    const native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport;
-    const serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport;
-    const fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport;
-    const executed_items = std.math.add(usize, native_items, serial_items) catch
-        return error.InvalidReadExecutionReport;
-    if (requested != item_count or executed_items != requested or fallback_items > serial_items)
-        return error.InvalidReadExecutionReport;
-    if (native_items > 0 and native_batches == 0) return error.InvalidReadExecutionReport;
-    if (native_batches > native_items) return error.InvalidReadExecutionReport;
-    return .{
-        .requested_items = requested,
-        .native_batches = native_batches,
-        .native_items = native_items,
-        .serial_items = serial_items,
-        .fallback_items = fallback_items,
-        .fallback_reason = if (fallback_items > 0) "remote_reader_fallback" else null,
+    const execution = BatchExecution{
+        .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
+        .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
+        .native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport,
+        .serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport,
+        .fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport,
+        .fallback_reason = if (report.fallback_items > 0) "remote_reader_fallback" else null,
     };
+    try execution.validate(item_count);
+    return execution;
 }
 
 test "reader wire execution is observed, validated, and backward compatible" {
@@ -490,6 +493,15 @@ test "reader wire execution is observed, validated, and backward compatible" {
     }, 2);
     try std.testing.expectEqual(@as(usize, 1), mixed.native_items);
     try std.testing.expectEqual(@as(usize, 1), mixed.serial_items);
+
+    try std.testing.expectError(
+        error.InvalidReadExecutionReport,
+        (BatchExecution{ .requested_items = 1, .serial_items = 1 }).validate(2),
+    );
+    try std.testing.expectError(
+        error.InvalidReadExecutionReport,
+        (BatchExecution{ .requested_items = 2, .serial_items = 2, .fallback_reason = "impossible" }).validate(2),
+    );
 }
 
 const OpenAiReaderState = CloudReaderState(.openai);

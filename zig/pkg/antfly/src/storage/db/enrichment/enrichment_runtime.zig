@@ -13574,9 +13574,19 @@ fn deleteStalePageEmbeddingArtifactsWithLimit(
             if (try derivedEmbeddingBelongsToDesiredChunkSet(state.alloc, key, state.desired_page_key_set))
                 return .@"continue";
             if (try internal_keys.derivedEmbeddingBaseKeyAlloc(state.alloc, key)) |base_key| {
-                try appendUniqueOwnedKey(state.alloc, state.stale_vector_keys, base_key);
+                // A store scan visits each canonical artifact key exactly once,
+                // and the selected embedding name has one key per page. Avoid
+                // quadratic list de-duplication at the admitted page ceiling.
+                state.stale_vector_keys.append(state.alloc, base_key) catch |err| {
+                    state.alloc.free(base_key);
+                    return err;
+                };
             }
-            try appendUniqueDupeKey(state.alloc, state.artifact_delete_keys, key);
+            const owned_artifact_key = try state.alloc.dupe(u8, key);
+            state.artifact_delete_keys.append(state.alloc, owned_artifact_key) catch |err| {
+                state.alloc.free(owned_artifact_key);
+                return err;
+            };
             return .@"continue";
         }
     };

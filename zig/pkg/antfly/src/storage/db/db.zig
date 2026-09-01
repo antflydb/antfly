@@ -42716,39 +42716,91 @@ fn appendGeneratedBatchFromEnrichment(
         &owned_counter_keys,
         &owned_counter_values,
     );
-    const append_split_delta = shouldAppendSplitDeltaForContext(&batch_ctx);
-    var split_delta_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-    defer split_delta_writes.deinit(batch_ctx.alloc);
-    var split_promotion_values = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (split_promotion_values.items) |value| batch_ctx.alloc.free(value);
-        split_promotion_values.deinit(batch_ctx.alloc);
-    }
-    if (append_split_delta) {
-        try split_delta_writes.appendSlice(batch_ctx.alloc, store_writes.items);
-        for (artifact_promotions) |promotion| {
-            const value = batch_ctx.store.get(batch_ctx.alloc, promotion.staged_key) catch |err| switch (err) {
-                error.NotFound => return error.InvalidGeneratedArtifactPromotion,
+    const SplitDeltaBuilder = struct {
+        timestamp: u64,
+        writes: []const docstore_mod.KVPair,
+        deletes: []const []const u8,
+        promotions: []const docstore_mod.DocStore.KeyPromotion,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
+        reservation: *?resource_manager_mod.Reservation,
+
+        fn build(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const encoded_size = shard_mod.splitDeltaWithPromotionsEncodedSize(
+                self.writes,
+                self.deletes,
+                self.promotions,
+                txn,
+            ) catch |err| switch (err) {
+                error.NotFound => return error.InvalidKeyPromotion,
+                error.SplitDeltaTooLarge => return error.ResourceLimitExceeded,
                 else => return err,
             };
-            split_promotion_values.append(batch_ctx.alloc, value) catch |err| {
-                batch_ctx.alloc.free(value);
-                return err;
+            if (self.resource_manager) |manager| {
+                const reservation_bytes = std.math.cast(u64, encoded_size) orelse
+                    return error.ResourceLimitExceeded;
+                if (self.reservation.* == null) {
+                    self.reservation.* = manager.reserve(
+                        .shard_transition_working_set,
+                        reservation_bytes,
+                    ) catch return error.ResourceLimitExceeded;
+                } else if (self.reservation.*.?.reservedBytes() != reservation_bytes) {
+                    return error.ResourceLimitExceeded;
+                }
+            }
+            return shard_mod.encodeSplitDeltaWithPromotionsAlloc(
+                alloc,
+                self.timestamp,
+                self.writes,
+                self.deletes,
+                self.promotions,
+                txn,
+            ) catch |err| switch (err) {
+                error.NotFound => error.InvalidKeyPromotion,
+                error.SplitDeltaTooLarge => error.ResourceLimitExceeded,
+                else => err,
             };
-            try split_delta_writes.append(batch_ctx.alloc, .{ .key = promotion.final_key, .value = value });
         }
+    };
+    var split_delta_key_buf: [19]u8 = undefined;
+    var split_delta_reservation: ?resource_manager_mod.Reservation = null;
+    defer if (split_delta_reservation) |*reservation| reservation.release();
+    var split_delta_builder: SplitDeltaBuilder = undefined;
+    var transactional_split_delta: ?docstore_mod.DocStore.TransactionalWriteBuilder = null;
+    if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+        const split_delta_key = batch_ctx.shard_manager.reserveSplitDeltaKey(&split_delta_key_buf) catch |err| switch (err) {
+            error.SplitDeltaSequenceOverflow => return error.ResourceLimitExceeded,
+            else => return err,
+        };
+        split_delta_builder = .{
+            .timestamp = currentTimeNs(),
+            .writes = store_writes.items,
+            .deletes = store_delete_keys.items,
+            .promotions = store_promotions,
+            .resource_manager = batch_ctx.index_manager.resource_manager,
+            .reservation = &split_delta_reservation,
+        };
+        transactional_split_delta = .{
+            .ptr = &split_delta_builder,
+            .key = split_delta_key,
+            .build = SplitDeltaBuilder.build,
+        };
     }
-    const promoted_artifact_bytes = batch_ctx.store.putBatchWithPromotionsAndReplay(batch_ctx.io, store_writes.items, store_delete_keys.items, store_promotions, .{
-        .sequence = sequence,
-        .payload = payload,
-    }) catch |err| switch (err) {
+    const promoted_artifact_bytes = batch_ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(
+        batch_ctx.io,
+        store_writes.items,
+        store_delete_keys.items,
+        store_promotions,
+        .{
+            .sequence = sequence,
+            .payload = payload,
+        },
+        transactional_split_delta,
+    ) catch |err| switch (err) {
         error.InvalidKeyPromotion => return error.InvalidGeneratedArtifactPromotion,
         error.KeyPromotionBytesOverflow => return error.GeneratedArtifactPromotionBytesOverflow,
         else => return err,
     };
-    if (append_split_delta) {
-        try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), split_delta_writes.items, store_delete_keys.items);
-    }
     var deferred_ha_gates = HADeferredCommitGates.begin(&batch_ctx);
     defer deferred_ha_gates.releaseTransition();
     deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&batch_ctx, payload));
@@ -79630,6 +79682,11 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         .{ .key = final_key, .value = "old-vector" },
         .{ .key = stale_key, .value = "stale-vector" },
     }, &.{});
+    try db.core.shard_manager.prepareSplit("m");
+    try db.core.shard_manager.split(99, "m");
+    const transition_bytes_before = db.core.index_manager.resource_manager.?.sliceStats(
+        .shard_transition_working_set,
+    ).used_bytes;
 
     _ = try appendGeneratedBatchFromEnrichment(
         append_ctx,
@@ -79637,11 +79694,26 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         &.{.{ .staged_key = stage_key, .final_key = final_key }},
         &.{stale_key},
     );
+    try std.testing.expectEqual(
+        transition_bytes_before,
+        db.core.index_manager.resource_manager.?.sliceStats(.shard_transition_working_set).used_bytes,
+    );
     const promoted = try db.core.store.get(alloc, final_key);
     defer alloc.free(promoted);
     try std.testing.expectEqualStrings("new-vector", promoted);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+    const split_deltas = try db.core.shard_manager.listDeltasAfter(alloc, 0);
+    defer shard_mod.freeDeltas(alloc, split_deltas);
+    try std.testing.expectEqual(@as(usize, 1), split_deltas.len);
+    var saw_promoted_split_value = false;
+    for (split_deltas[0].writes) |write| {
+        if (std.mem.eql(u8, write.key, final_key)) {
+            try std.testing.expectEqualStrings("new-vector", write.value);
+            saw_promoted_split_value = true;
+        }
+    }
+    try std.testing.expect(saw_promoted_split_value);
 
     const missing_stage = "private:pdf-stage:missing";
     try db.core.store.putBatch(&.{
@@ -79663,6 +79735,9 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
     defer alloc.free(stable_stale);
     try std.testing.expectEqualStrings("stable-vector", stable_final);
     try std.testing.expectEqualStrings("stable-stale-vector", stable_stale);
+    const deltas_after_failed_promotion = try db.core.shard_manager.listDeltasAfter(alloc, 0);
+    defer shard_mod.freeDeltas(alloc, deltas_after_failed_promotion);
+    try std.testing.expectEqual(@as(usize, 1), deltas_after_failed_promotion.len);
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {

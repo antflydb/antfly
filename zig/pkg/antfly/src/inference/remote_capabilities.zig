@@ -40,6 +40,7 @@ const CapabilityFlight = struct {
     value: ?work.InferenceCapabilities = null,
     err: ?anyerror = null,
     ready: std.Io.Event = .unset,
+    refs_changed: std.Io.Event = .unset,
 };
 
 pub const WaitContext = struct {
@@ -76,9 +77,12 @@ pub const Cache = struct {
             var flights = self.flights.iterator();
             const flight = flights.next().?.value_ptr.*;
             flight.refs += 1;
-            self.mutex.unlock(self.io);
-            flight.ready.waitUncancelable(self.io);
-            self.mutex.lockUncancelable(self.io);
+            while (flight.refs != 1) {
+                flight.refs_changed.reset();
+                self.mutex.unlock(self.io);
+                flight.refs_changed.waitUncancelable(self.io);
+                self.mutex.lockUncancelable(self.io);
+            }
             self.releaseFlightLocked(flight);
         }
         var entries = self.entries.iterator();
@@ -111,93 +115,119 @@ pub const Cache = struct {
         headers: []const [2][]const u8,
         wait_context: WaitContext,
     ) !?work.InferenceCapabilities {
-        try wait_context.check(monotonicNowNs(self.io));
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
         defer self.alloc.free(key);
-        const now_ns = monotonicNowNs(self.io);
+        while (true) {
+            try wait_context.check(monotonicNowNs(self.io));
+            const now_ns = monotonicNowNs(self.io);
 
-        self.mutex.lockUncancelable(self.io);
-        if (self.closing) {
-            self.mutex.unlock(self.io);
-            return error.CapabilityCacheClosed;
-        }
-        if (self.entries.get(key)) |entry| {
-            if (now_ns < entry.expires_at_ns) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.closing) {
                 self.mutex.unlock(self.io);
-                return entry.value;
+                return error.CapabilityCacheClosed;
             }
-        }
-        if (self.flights.get(key)) |flight| {
-            flight.refs += 1;
-            self.mutex.unlock(self.io);
-            waitForFlight(self.io, flight, wait_context) catch |err| {
+            if (self.entries.get(key)) |entry| {
+                if (now_ns < entry.expires_at_ns) {
+                    self.mutex.unlock(self.io);
+                    return entry.value;
+                }
+            }
+            if (self.flights.get(key)) |flight| {
+                if (flight.done and (if (flight.err) |err|
+                    err == error.CapabilityDiscoveryOwnerAbandoned
+                else
+                    false))
+                {
+                    // Keep the retired flight tracked for teardown until its
+                    // original waiters release it, but never let a retry add a
+                    // new reference and prolong that retirement.
+                    self.mutex.unlock(self.io);
+                    try wait_context.check(monotonicNowNs(self.io));
+                    self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                    };
+                    continue;
+                }
+                flight.refs += 1;
+                self.mutex.unlock(self.io);
+                waitForFlight(self.io, flight, wait_context) catch |err| {
+                    self.mutex.lockUncancelable(self.io);
+                    self.releaseFlightLocked(flight);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
                 self.mutex.lockUncancelable(self.io);
+                const value = flight.value;
+                const flight_err = flight.err;
                 self.releaseFlightLocked(flight);
+                self.mutex.unlock(self.io);
+                if (flight_err) |err| {
+                    if (err == error.CapabilityDiscoveryOwnerAbandoned) continue;
+                    return err;
+                }
+                return value;
+            }
+
+            const flight = self.alloc.create(CapabilityFlight) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
             };
-            self.mutex.lockUncancelable(self.io);
-            const value = flight.value;
-            const flight_err = flight.err;
-            self.releaseFlightLocked(flight);
-            self.mutex.unlock(self.io);
-            if (flight_err) |err| return err;
-            return value;
-        }
-
-        const flight = self.alloc.create(CapabilityFlight) catch |err| {
-            self.mutex.unlock(self.io);
-            return err;
-        };
-        flight.* = .{ .key = self.alloc.dupe(u8, key) catch |err| {
-            self.alloc.destroy(flight);
-            self.mutex.unlock(self.io);
-            return err;
-        } };
-        self.flights.put(self.alloc, flight.key, flight) catch |err| {
-            self.alloc.free(flight.key);
-            self.alloc.destroy(flight);
-            self.mutex.unlock(self.io);
-            return err;
-        };
-        self.mutex.unlock(self.io);
-
-        const discovered = discoverWithDeadline(self.alloc, self.io, http, inference_url, model, task, headers, wait_context.deadline_ns);
-        if (discovered) |value| {
-            const owner_context_error: ?anyerror = blk: {
-                wait_context.check(monotonicNowNs(self.io)) catch |err| break :blk err;
-                break :blk null;
+            flight.* = .{ .key = self.alloc.dupe(u8, key) catch |err| {
+                self.alloc.destroy(flight);
+                self.mutex.unlock(self.io);
+                return err;
+            } };
+            self.flights.put(self.alloc, flight.key, flight) catch |err| {
+                self.alloc.free(flight.key);
+                self.alloc.destroy(flight);
+                self.mutex.unlock(self.io);
+                return err;
             };
-            self.mutex.lockUncancelable(self.io);
-            self.admitLocked(key, value, monotonicNowNs(self.io)) catch {};
-            flight.value = value;
-            flight.done = true;
-            flight.ready.set(self.io);
-            self.releaseFlightLocked(flight);
             self.mutex.unlock(self.io);
-            if (owner_context_error) |err| return err;
-            return value;
-        } else |err| {
-            const owner_context_error: ?anyerror = blk: {
-                wait_context.check(monotonicNowNs(self.io)) catch |context_err| break :blk context_err;
-                break :blk null;
-            };
-            self.mutex.lockUncancelable(self.io);
-            const stale = self.entries.get(key);
-            if (stale != null and monotonicNowNs(self.io) < stale.?.stale_until_ns) {
-                flight.value = stale.?.value;
-            } else {
-                flight.err = err;
+
+            const discovered = discoverWithContext(self.alloc, self.io, http, inference_url, model, task, headers, wait_context);
+            if (discovered) |value| {
+                const owner_context_error: ?anyerror = blk: {
+                    wait_context.check(monotonicNowNs(self.io)) catch |err| break :blk err;
+                    break :blk null;
+                };
+                self.mutex.lockUncancelable(self.io);
+                self.admitLocked(key, value, monotonicNowNs(self.io)) catch {};
+                flight.value = value;
+                flight.done = true;
+                flight.ready.set(self.io);
+                self.releaseFlightLocked(flight);
+                self.mutex.unlock(self.io);
+                if (owner_context_error) |err| return err;
+                return value;
+            } else |err| {
+                const owner_context_error: ?anyerror = blk: {
+                    wait_context.check(monotonicNowNs(self.io)) catch |context_err| break :blk context_err;
+                    break :blk null;
+                };
+                self.mutex.lockUncancelable(self.io);
+                const stale = self.entries.get(key);
+                if (stale != null and monotonicNowNs(self.io) < stale.?.stale_until_ns) {
+                    flight.value = stale.?.value;
+                } else {
+                    // The transport is canceled by its owning caller. Do
+                    // not poison unrelated waiters; one of them retries as
+                    // the next owner under its own context.
+                    flight.err = if (owner_context_error != null)
+                        error.CapabilityDiscoveryOwnerAbandoned
+                    else
+                        err;
+                }
+                flight.done = true;
+                flight.ready.set(self.io);
+                const value = flight.value;
+                const flight_err = flight.err;
+                self.releaseFlightLocked(flight);
+                self.mutex.unlock(self.io);
+                if (owner_context_error) |context_err| return context_err;
+                if (flight_err) |flight_error| return flight_error;
+                return value;
             }
-            flight.done = true;
-            flight.ready.set(self.io);
-            const value = flight.value;
-            const flight_err = flight.err;
-            self.releaseFlightLocked(flight);
-            self.mutex.unlock(self.io);
-            if (owner_context_error) |context_err| return context_err;
-            if (flight_err) |flight_error| return flight_error;
-            return value;
         }
     }
 
@@ -236,6 +266,7 @@ pub const Cache = struct {
     fn releaseFlightLocked(self: *Cache, flight: *CapabilityFlight) void {
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
+        flight.refs_changed.set(self.io);
         if (flight.refs != 0) return;
         std.debug.assert(flight.done);
         _ = self.flights.remove(flight.key);
@@ -432,7 +463,7 @@ pub fn discover(
     return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
 }
 
-fn discoverWithDeadline(
+fn discoverWithContext(
     alloc: std.mem.Allocator,
     io: std.Io,
     http: *httpx.Client,
@@ -440,11 +471,12 @@ fn discoverWithDeadline(
     model: []const u8,
     task: work.Task,
     headers: []const [2][]const u8,
-    deadline_ns: ?u64,
+    context: WaitContext,
 ) !?work.InferenceCapabilities {
     const now_ns = monotonicNowNs(io);
+    try context.check(now_ns);
     const effective_deadline = @min(
-        deadline_ns orelse now_ns +| capability_discovery_timeout_ns,
+        context.deadline_ns orelse now_ns +| capability_discovery_timeout_ns,
         now_ns +| capability_discovery_timeout_ns,
     );
     if (now_ns >= effective_deadline) return error.Timeout;
@@ -455,7 +487,14 @@ fn discoverWithDeadline(
     ));
     const url = try modelsUrlAlloc(alloc, inference_url);
     defer alloc.free(url);
-    var response = try http.get(url, .{ .headers = headers, .timeout_ms = timeout_ms });
+    var response = try http.get(url, .{
+        .headers = headers,
+        .timeout_ms = timeout_ms,
+        .cancellation = httpx.CancellationToken.fromCallback(
+            context.cancellation.ptr,
+            context.cancellation.is_cancelled_fn,
+        ),
+    });
     defer response.deinit();
     if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
     return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
@@ -493,4 +532,25 @@ test "remote Antfly capability single-flight wait observes deadline and cancella
     try std.testing.expectError(error.Canceled, waitForFlight(io, &flight, .{
         .cancellation = CancellationToken.fromAtomic(&canceled),
     }));
+}
+
+test "remote Antfly completed capability flight remains tracked until all waiters release" {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc, std.Options.debug_io);
+    defer cache.deinit();
+
+    const flight = try alloc.create(CapabilityFlight);
+    flight.* = .{
+        .key = try alloc.dupe(u8, "endpoint:model:task"),
+        .refs = 2,
+        .done = true,
+    };
+    try cache.flights.put(alloc, flight.key, flight);
+
+    cache.releaseFlightLocked(flight);
+    try std.testing.expectEqual(@as(usize, 1), cache.flights.count());
+    try std.testing.expectEqual(@as(usize, 1), flight.refs);
+
+    cache.releaseFlightLocked(flight);
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
 }

@@ -120,6 +120,64 @@ native-batch flags. Manifests may lower the server defaults with
 values for window formation and every executor validates the concrete
 invocation again, so a caller cannot bypass the limits by skipping the planner.
 
+### Distributed Antfly inference boundary
+
+The same design applies when storage/enrichment and inference run on different
+Antfly nodes. Direct execution against a configured dedicated inference-node
+URL is supported by the reader, generator, and embedder clients. The node that
+owns enrichment prepares the document, performs bounded PDF parsing and page
+rendering, and retains each rendered window only until its consumers finish. A
+remote executor then sends that already-bounded window to the inference node.
+The PDF container and an unbounded set of page images are never forwarded as
+implicit remote state.
+
+Capability discovery is scoped to the resolved inference endpoint, model,
+task, and authentication identity. Thus admission uses the limits of the node
+that will execute the request, rather than assuming that all inference nodes
+have the same loaded model or backend. Work and result envelopes retain item,
+source-fingerprint, and page identities across the HTTP boundary, and the
+client validates cardinality and observed execution before publication.
+
+Admission has two owners in a distributed deployment:
+
+- the enrichment node admits source bytes, renderer scratch space, retained
+  encoded images, decoded pixels, staging, and an optional prefetch window;
+- the inference node independently admits request bytes, media items, decoded
+  model inputs, accelerator memory, and model concurrency.
+
+The client-side reservation is released only after the remote invocation no
+longer borrows the page buffers. Cancellation and deadlines cover capability
+lookup, single-flight waits, and inference transport; retry or failover must
+reuse stable work identities so durable publication stays idempotent.
+
+Batch formation is currently per resolved endpoint and model invocation. A
+load balancer may route one complete bounded request to an eligible inference
+node, but the coordinator does not split one native model batch across several
+nodes and then describe it as one native batch. Future cross-node fan-out, if
+needed for throughput, belongs above the executor: partition into independent
+bounded requests, preserve per-item identity and failure, and aggregate their
+observed execution reports without assuming completion order.
+
+The current Go inference proxy is not yet a complete endpoint for this path. It
+routes `/ai/v1/embed` but does not expose the capability catalog, read, or
+generation-batch routes required here (`GET /ai/v1/models`,
+`POST /ai/v1/read`, and `POST /ai/v1/generate/batch`). Until those routes are
+added, distributed deployments must use a dedicated inference-node/service URL
+for PDF readers and multimodal generators; ClipClap embedding can use the proxy
+only within its existing embed contract.
+
+The long-term proxy contract is model-aware rather than a transparent
+round-robin surface:
+
+- expose a cluster capability catalog for every routable model/task;
+- advertise the conservative intersection of eligible nodes' limits, or return
+  a resolution/affinity token that binds discovery and execution to one node;
+- route each bounded native batch intact to one capable node;
+- preserve cancellation, item identities, per-item failures, response
+  cardinality, and observed execution reports; and
+- retry or fail over only at an independent request boundary, without merging
+  several node executions into one claimed native batch.
+
 ### Generic bounded scheduler
 
 The scheduler groups work only when task, resolved model identity, backend,
@@ -350,8 +408,11 @@ The hardening above follows four long-term rules:
   document-store commit. The replay record is the public generation boundary,
   so no promoted artifact set can exist without its durable vector replacement.
   Stage payloads are borrowed from the write transaction during promotion; the
-  commit does not retain a second document-sized heap copy. An active split
-  still materializes the exact promoted writes required by its durable handoff.
+  commit does not retain a second document-sized heap copy. During an active
+  split, the exact handoff delta is encoded directly from those borrowed values
+  and committed by the same transaction; only the durable encoded delta buffer
+  is materialized, after exact byte admission against the shard-transition
+  working-set budget.
   Coverage counters remain idempotent post-append metadata: failure prevents
   the enrichment source watermark from advancing, so retry reconciles them
   from the already durable generation.
@@ -446,7 +507,9 @@ The hardening above follows four long-term rules:
 15. **Implemented after review:** remote read and generation responses carry
     optional observed execution reports. Clients validate and preserve mixed
     execution counters, preserve backward compatibility as serial execution,
-    and never upgrade telemetry from a capability prediction.
+    and never upgrade telemetry from a capability prediction. Reader reports
+    are validated against every physical image chunk before aggregation, so
+    malformed local reports cannot cancel each other out.
 16. **Implemented after review:** reader URI admission measures decoded base64
     data URIs and validates MIME before local callback or remote adaptation.
     Generator admission recognizes PDF as the
@@ -454,9 +517,15 @@ The hardening above follows four long-term rules:
 17. **Implemented after review:** capability single-flight waiters observe
     cancellation/deadlines, catalog fetches have a finite timeout, and cache
     teardown drains in-flight owners instead of asserting they do not exist.
-    Owners recheck context after discovery, cancellation/timeout propagate
-    through managed embedders, and every absolute deadline shares one monotonic
-    clock domain on Darwin and other platforms.
+    Owner cancellation is wired into the catalog HTTP request itself and is
+    rechecked after discovery; an abandoned owner releases unrelated waiters to
+    retry under their own contexts. Cancellation/timeout propagate through
+    managed embedders, and every absolute deadline shares one monotonic clock
+    domain on Darwin and other platforms.
+18. **Implemented after review:** stale page-artifact discovery remains bounded
+    by both total scan work and selected-model fanout, uses a hash set for desired
+    pages, and appends canonical scan keys in linear time rather than performing
+    quadratic list de-duplication at the page ceiling.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

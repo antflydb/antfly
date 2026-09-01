@@ -1081,6 +1081,15 @@ pub const DocStore = struct {
         destination_key: []const u8,
     };
 
+    /// Builds one value from the same write transaction used for key
+    /// promotions. This lets callers serialize promotion source values while
+    /// they are still borrowed and commit the derived write atomically.
+    pub const TransactionalWriteBuilder = struct {
+        ptr: *anyopaque,
+        key: []const u8,
+        build: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror![]u8,
+    };
+
     fn putBatchWithReplayOnceWithOptions(
         self: *DocStore,
         writes: []const KVPair,
@@ -1161,10 +1170,17 @@ pub const DocStore = struct {
         deletes: []const []const u8,
         promotions: []const KeyPromotion,
         replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
     ) !usize {
         var batch = try self.beginWriteBatchWithOptions(.{});
         errdefer batch.abort();
         var txn = batch.asTxn();
+        const built_value = if (transactional_write) |builder|
+            try builder.build(builder.ptr, self.alloc, &txn)
+        else
+            null;
+        defer if (built_value) |value| self.alloc.free(value);
+        if (transactional_write) |builder| try txn.put(builder.key, built_value.?);
         var promoted_bytes: usize = 0;
         for (promotions) |promotion| {
             const value = txn.get(promotion.source_key) catch |err| switch (err) {
@@ -1200,9 +1216,27 @@ pub const DocStore = struct {
         promotions: []const KeyPromotion,
         replay: ?ReplayAppend,
     ) !usize {
+        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null);
+    }
+
+    pub fn putBatchWithPromotionsReplayAndBuiltWrite(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+    ) !usize {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            const promoted_bytes = self.putBatchWithPromotionsAndReplayOnce(writes, deletes, promotions, replay) catch |err| switch (err) {
+            const promoted_bytes = self.putBatchWithPromotionsAndReplayOnce(
+                writes,
+                deletes,
+                promotions,
+                replay,
+                transactional_write,
+            ) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);

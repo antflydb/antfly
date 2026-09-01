@@ -903,6 +903,11 @@ pub const Runtime = struct {
                 alloc.free(chunk_results);
                 return error.InvalidReaderResponse;
             }
+            chunk_batch.execution.validate(chunk_results.len) catch {
+                for (chunk_results) |*result| readers.deinitResult(alloc, result);
+                alloc.free(chunk_results);
+                return error.InvalidReadExecutionReport;
+            };
             mergeReaderExecution(&reader_execution, chunk_batch.execution) catch |err| {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
                 alloc.free(chunk_results);
