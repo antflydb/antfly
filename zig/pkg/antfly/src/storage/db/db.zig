@@ -33228,6 +33228,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     const artifact_name = requestArtifactName(request);
     var config = try document_extraction_mod.parseConfig(alloc, config_json);
     defer config.deinit(alloc);
+    enrichment_runtime_mod.applyDocumentExtractionRuntimePolicy(&config);
     try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
 
     const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
@@ -33294,14 +33295,25 @@ fn computeDocumentExtractionAssetRequestDerived(
         }
     }
 
+    const extraction_resource_manager = if (db.enrichment_runtime) |runtime|
+        runtime.config.resource_manager orelse runtime.index_manager.resource_manager
+    else
+        db.core.index_manager.resource_manager;
+    var extraction_budgeted: ?resource_manager_mod.BudgetedAllocator = if (extraction_resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, alloc, 1)
+    else
+        null;
+    defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
+    const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
+
     const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
-        alloc,
+        extraction_alloc,
         db.remote_content,
         db.secret_store,
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return error.DocumentExtractionWorkingSetTooLarge else return err,
         else => {
             if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
             try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
@@ -33320,51 +33332,80 @@ fn computeDocumentExtractionAssetRequestDerived(
         },
     };
     var downloaded_mut = downloaded;
-    defer downloaded_mut.deinit(alloc);
+    defer downloaded_mut.deinit(extraction_alloc);
 
-    // This direct precompute path allocates the downloaded source, decoded
-    // extraction result, and retained materialization state from `alloc`
-    // rather than an independently observed BudgetedAllocator. Keep its
-    // conservative operation reservation until those owners are destroyed at
-    // function exit. The streaming runtime can stage-release decoder credit
-    // because it accounts retained owners separately; this path cannot safely
-    // report that capacity free while its allocations remain live.
-    var pdf_decode_reservation: ?resource_manager_mod.Reservation = null;
-    defer if (pdf_decode_reservation) |*reservation| reservation.release();
-    if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
-        if (db.core.index_manager.resource_manager) |manager| {
-            const stats = manager.sliceStats(.document_extraction_working_set);
-            const downloaded_bytes: u64 = @intCast(downloaded_mut.data.len);
-            const decode_budget = if (stats.hard_limit_bytes == 0)
-                @as(u64, @intCast(config.pdf_decode_limits.max_working_set_bytes))
-            else
-                @min(@as(u64, @intCast(config.pdf_decode_limits.max_working_set_bytes)), stats.hard_limit_bytes -| downloaded_bytes);
-            if (decode_budget == 0) return error.DocumentExtractionWorkingSetTooLarge;
-            const reservation_bytes = std.math.add(u64, downloaded_bytes, decode_budget) catch return error.DocumentExtractionWorkingSetTooLarge;
-            pdf_decode_reservation = try manager.reserve(.document_extraction_working_set, reservation_bytes);
-            config.pdf_decode_limits.max_working_set_bytes = @intCast(decode_budget);
+    // Downloaded bytes and the decoded extraction result are admitted before
+    // allocation by extraction_alloc. Native render forks and transient OCR
+    // buffers use the inspection, render, and output credits below, so no
+    // owner relies on unclaimed "headroom" or duplicates a ResourceManager
+    // charge.
+    var pdf_operation_reservation: ?resource_manager_mod.OwnedSplitReservation = null;
+    defer if (pdf_operation_reservation) |*reservation| reservation.release();
+    const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+    var pdf_inspection_bytes: usize = if (source_is_pdf) config.pdf_decode_limits.max_working_set_bytes else 0;
+    if (source_is_pdf) {
+        if (extraction_resource_manager) |manager| {
+            const requested_inspection_bytes = config.pdf_decode_limits.max_working_set_bytes;
+            const requested_render_bytes = config.pdf_render_max_inflight_bytes;
+            const requested_native_bytes = std.math.add(usize, requested_inspection_bytes, requested_render_bytes) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            const requested_native_bytes_u64: u64 = @intCast(requested_native_bytes);
+            const tracked_headroom: u64 = @intCast(enrichment_runtime_mod.documentExtractionPdfTrackedHeadroomBytes(alloc, request));
+            pdf_operation_reservation = manager.reserveOwnedSplitAtMost(
+                .document_extraction_working_set,
+                requested_native_bytes_u64,
+                tracked_headroom,
+            ) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+                else => return err,
+            };
+            const native_budget = std.math.cast(usize, pdf_operation_reservation.?.primary_bytes) orelse
+                return error.DocumentExtractionWorkingSetTooLarge;
+            const partition = try enrichment_runtime_mod.partitionPdfNativeBudget(
+                native_budget,
+                requested_inspection_bytes,
+                requested_render_bytes,
+            );
+            pdf_inspection_bytes = partition.inspection_bytes;
+            try pdf_operation_reservation.?.transferSecondaryTo(&extraction_budgeted.?);
+            config.pdf_render_max_inflight_bytes = partition.render_bytes;
+            config.pdf_decode_limits.max_working_set_bytes = @min(config.pdf_decode_limits.max_working_set_bytes, config.pdf_render_max_inflight_bytes);
             config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, config.pdf_decode_limits.max_working_set_bytes);
         }
     }
 
-    var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+    var pdf_inspection_reservation = enrichment_runtime_mod.ReservedWorkingSetAllocator.init(alloc, pdf_inspection_bytes);
+    const document_extraction_alloc = if (source_is_pdf)
+        pdf_inspection_reservation.allocator()
+    else
+        extraction_alloc;
+    var extraction_config = config;
+    if (source_is_pdf) {
+        extraction_config.pdf_decode_limits.max_working_set_bytes = pdf_inspection_bytes;
+        extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
+    }
+    var extraction = document_extraction_mod.extractDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config) catch |err| switch (err) {
+        error.OutOfMemory => if ((extraction_budgeted != null and extraction_budgeted.?.denied()) or pdf_inspection_reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge else return err,
         else => {
             try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "document extraction failed", document_extraction_mod.failureStage(err, "document_extraction"), artifact_writes);
             return;
         },
     };
-    defer extraction.deinit(alloc);
+    defer extraction.deinit(document_extraction_alloc);
     if (db.enrichment_runtime) |runtime| {
-        try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequest(
+        try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
             runtime,
-            alloc,
+            document_extraction_alloc,
             request,
             config,
             source_url,
             downloaded_mut.data,
             extraction.content_type,
             &extraction,
+            .{
+                .native_backing_alloc = alloc,
+                .working_alloc = if (extraction_budgeted != null) extraction_alloc else null,
+            },
         );
     } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
         return error.MissingAssetProducer;

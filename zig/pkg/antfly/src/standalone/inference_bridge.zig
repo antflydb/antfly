@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 17;
+pub const abi_version: u32 = 20;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -157,6 +157,39 @@ pub const ProviderOperation = enum(c_int) {
     transcribe_audio = 10,
     extract = 11,
     list_models_json = 12,
+    read_encoded_images = 13,
+    generate_messages_with_attachments = 14,
+    model_capabilities = 15,
+    read_encoded_images_reported = 16,
+};
+
+pub const ProviderBinaryPayload = extern struct {
+    bytes: String,
+    content_type: String,
+};
+
+/// Logical work identity is independent of attachment storage order. Multiple
+/// attachments may belong to one item and one item index need not equal the
+/// payload ordinal.
+pub const ProviderAttachmentRef = extern struct {
+    attachment_index: usize,
+    item_index: usize = 0,
+    item_id: OptionalString = .{},
+    source_fingerprint: OptionalString = .{},
+    page_number: u32 = 0,
+    has_page_number: u8 = 0,
+};
+
+/// JSON metadata paired with ProviderInvokeContext.binary_payloads for
+/// read_encoded_images. Binary payloads are operation-neutral; the operation
+/// JSON defines their interpretation. `image_count` deliberately appears in
+/// both channels so the host rejects a torn call before borrowing memory.
+pub const ReadEncodedImagesRequest = struct {
+    model: []const u8,
+    image_count: usize,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const ProviderInvokeContext = extern struct {
@@ -169,6 +202,10 @@ pub const ProviderInvokeContext = extern struct {
     has_deadline: u8,
     out_response_handle: *?*anyopaque,
     out_response_json: *String,
+    binary_payloads: ?[*]const ProviderBinaryPayload = null,
+    binary_payloads_len: usize = 0,
+    attachment_refs: ?[*]const ProviderAttachmentRef = null,
+    attachment_refs_len: usize = 0,
 };
 
 pub const RouteManifestEntry = extern struct {

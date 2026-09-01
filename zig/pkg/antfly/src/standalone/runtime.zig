@@ -4783,7 +4783,11 @@ fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedd
         .rerank_texts = inferenceProviderRerankTexts,
         .generate_text = inferenceProviderGenerateText,
         .generate_messages = inferenceProviderGenerateMessages,
+        .generate_messages_with_attachments = inferenceProviderGenerateMessagesWithAttachments,
+        .model_capabilities = inferenceProviderModelCapabilities,
         .read_images = inferenceProviderReadImages,
+        .read_encoded_images = inferenceProviderReadEncodedImages,
+        .read_encoded_images_reported = inferenceProviderReadEncodedImagesReported,
         .transcribe_audio = inferenceProviderTranscribeAudio,
         .extract = inferenceProviderExtract,
         .list_models_json = inferenceProviderListModelsJson,
@@ -4797,6 +4801,19 @@ fn invokeInferenceProvider(
     operation: inference_bridge.ProviderOperation,
     request: anytype,
     deadline_ns: ?u64,
+) !Result {
+    return try invokeInferenceProviderWithBinary(Result, alloc, handle, operation, request, deadline_ns, &.{}, &.{});
+}
+
+fn invokeInferenceProviderWithBinary(
+    comptime Result: type,
+    alloc: std.mem.Allocator,
+    handle: *anyopaque,
+    operation: inference_bridge.ProviderOperation,
+    request: anytype,
+    deadline_ns: ?u64,
+    binary_payloads: []const inference_bridge.ProviderBinaryPayload,
+    attachment_refs: []const inference_bridge.ProviderAttachmentRef,
 ) !Result {
     const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
     defer alloc.free(request_json);
@@ -4812,6 +4829,10 @@ fn invokeInferenceProvider(
         .has_deadline = 1,
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
+        .binary_payloads = if (binary_payloads.len > 0) binary_payloads.ptr else null,
+        .binary_payloads_len = binary_payloads.len,
+        .attachment_refs = if (attachment_refs.len > 0) attachment_refs.ptr else null,
+        .attachment_refs_len = attachment_refs.len,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceInvokeProvider(&context);
@@ -5099,10 +5120,7 @@ fn inferenceProviderEmbedDenseParts(
     model: []const u8,
     parts: []const antfly.template.ContentPart,
 ) anyerror![][]f32 {
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts, .{
-        .model = model,
-        .parts = parts,
-    }, null);
+    return try inferenceProviderEmbedDensePartsBorrowed(handle, alloc, model, parts, .embed_dense_parts, null);
 }
 
 fn inferenceProviderEmbedDensePartsWithContext(
@@ -5113,10 +5131,46 @@ fn inferenceProviderEmbedDensePartsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     try context.check();
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
-        .model = model,
-        .parts = parts,
-    }, context.deadline_ns);
+    return try inferenceProviderEmbedDensePartsBorrowed(handle, alloc, model, parts, .embed_dense_parts_with_context, context.deadline_ns);
+}
+
+fn inferenceProviderEmbedDensePartsBorrowed(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    operation: inference_bridge.ProviderOperation,
+    deadline_ns: ?u64,
+) ![][]f32 {
+    const wire_parts = try alloc.alloc(antfly.template.ContentPart, parts.len);
+    defer alloc.free(wire_parts);
+    const payload_storage = try alloc.alloc(inference_bridge.ProviderBinaryPayload, parts.len);
+    defer alloc.free(payload_storage);
+    const ref_storage = try alloc.alloc(inference_bridge.ProviderAttachmentRef, parts.len);
+    defer alloc.free(ref_storage);
+    var payload_count: usize = 0;
+    for (parts, wire_parts, 0..) |part, *wire_part, item_index| switch (part) {
+        .binary => |binary| {
+            payload_storage[payload_count] = .{
+                .bytes = inference_bridge.String.init(binary.data),
+                .content_type = inference_bridge.String.init(binary.mime_type),
+            };
+            ref_storage[payload_count] = .{ .attachment_index = payload_count, .item_index = item_index };
+            payload_count += 1;
+            wire_part.* = .{ .binary = .{ .mime_type = binary.mime_type, .data = &.{} } };
+        },
+        else => wire_part.* = part,
+    };
+    return try invokeInferenceProviderWithBinary(
+        [][]f32,
+        alloc,
+        handle,
+        operation,
+        .{ .model = model, .parts = wire_parts, .attachment_count = payload_count },
+        deadline_ns,
+        payload_storage[0..payload_count],
+        ref_storage[0..payload_count],
+    );
 }
 
 fn inferenceProviderRerankTexts(
@@ -5159,6 +5213,60 @@ fn inferenceProviderGenerateMessages(
     }, null);
 }
 
+fn inferenceProviderGenerateMessagesWithAttachments(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+    attachments: []const antfly.inference.work.Attachment,
+) anyerror![]u8 {
+    const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, attachments.len);
+    defer alloc.free(payloads);
+    const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, attachments.len);
+    defer alloc.free(refs);
+    for (attachments, 0..) |attachment, i| {
+        try attachment.validate();
+        payloads[i] = .{
+            .bytes = inference_bridge.String.init(attachment.bytes),
+            .content_type = inference_bridge.String.init(attachment.content_type),
+        };
+        refs[i] = .{
+            .attachment_index = i,
+            .item_index = 0,
+            .item_id = inference_bridge.OptionalString.init(if (attachment.identity.item_id.len > 0) attachment.identity.item_id else null),
+            .source_fingerprint = inference_bridge.OptionalString.init(attachment.identity.source_fingerprint),
+            .page_number = attachment.identity.page_number orelse 0,
+            .has_page_number = @intFromBool(attachment.identity.page_number != null),
+        };
+    }
+    return try invokeInferenceProviderWithBinary(
+        []u8,
+        alloc,
+        handle,
+        .generate_messages_with_attachments,
+        .{ .model = model, .messages = messages, .attachment_count = attachments.len },
+        null,
+        payloads,
+        refs,
+    );
+}
+
+fn inferenceProviderModelCapabilities(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+) anyerror!antfly.inference.work.InferenceCapabilities {
+    return try invokeInferenceProvider(
+        antfly.inference.work.InferenceCapabilities,
+        alloc,
+        handle,
+        .model_capabilities,
+        .{ .model = model, .task = task },
+        null,
+    );
+}
+
 fn inferenceProviderReadImages(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -5169,6 +5277,99 @@ fn inferenceProviderReadImages(
         .model = model,
         .request = request,
     }, null);
+}
+
+fn inferenceProviderReadEncodedImages(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.EncodedRequest,
+) anyerror![]antfly.readers.Result {
+    if (request.images.len == 0) return try alloc.alloc(antfly.readers.Result, 0);
+    var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
+    defer encoded.deinit(alloc);
+    return try invokeInferenceProviderWithBinary(
+        []antfly.readers.Result,
+        alloc,
+        handle,
+        .read_encoded_images,
+        encodedImageProviderMetadata(model, request),
+        null,
+        encoded.payloads,
+        encoded.refs,
+    );
+}
+
+fn inferenceProviderReadEncodedImagesReported(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.EncodedRequest,
+) anyerror!antfly.readers.BatchResult {
+    if (request.images.len == 0) return .{
+        .items = try alloc.alloc(antfly.readers.Result, 0),
+        .execution = .{ .mode = .serial, .requested_items = 0 },
+    };
+    var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
+    defer encoded.deinit(alloc);
+    return try invokeInferenceProviderWithBinary(
+        antfly.readers.BatchResult,
+        alloc,
+        handle,
+        .read_encoded_images_reported,
+        encodedImageProviderMetadata(model, request),
+        null,
+        encoded.payloads,
+        encoded.refs,
+    );
+}
+
+fn encodedImageProviderMetadata(
+    model: []const u8,
+    request: antfly.readers.EncodedRequest,
+) inference_bridge.ReadEncodedImagesRequest {
+    return .{
+        .model = model,
+        .image_count = request.images.len,
+        .prompt = request.prompt,
+        .max_tokens = request.max_tokens,
+        .source_fingerprint = request.source_fingerprint,
+    };
+}
+
+const EncodedImageProviderPayloads = struct {
+    payloads: []inference_bridge.ProviderBinaryPayload,
+    refs: []inference_bridge.ProviderAttachmentRef,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.payloads);
+        alloc.free(self.refs);
+        self.* = undefined;
+    }
+};
+
+fn encodedImageProviderPayloadsAlloc(
+    alloc: std.mem.Allocator,
+    images: []const antfly.readers.EncodedImage,
+) !EncodedImageProviderPayloads {
+    const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, images.len);
+    errdefer alloc.free(payloads);
+    const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, images.len);
+    for (images, 0..) |image, i| {
+        payloads[i] = .{
+            .bytes = inference_bridge.String.init(image.bytes),
+            .content_type = inference_bridge.String.init(image.mime_type),
+        };
+        refs[i] = .{
+            .attachment_index = i,
+            .item_index = i,
+            .item_id = inference_bridge.OptionalString.init(if (image.item_id.len > 0) image.item_id else null),
+            .source_fingerprint = inference_bridge.OptionalString.init(image.source_fingerprint),
+            .page_number = image.page_number orelse 0,
+            .has_page_number = @intFromBool(image.page_number != null),
+        };
+    }
+    return .{ .payloads = payloads, .refs = refs };
 }
 
 fn inferenceProviderTranscribeAudio(
@@ -5876,6 +6077,109 @@ test "standalone runtime local dense embed preserves borrowed binary media" {
     try std.testing.expectEqualStrings("image/png", direct[2].media.mime_type);
     try std.testing.expectEqual(@intFromPtr(raw[0..].ptr), @intFromPtr(direct[2].media.data.ptr));
     try std.testing.expectEqualSlices(u8, &raw, direct[2].media.data);
+}
+
+test "standalone encoded reader ABI round trips borrowed payloads" {
+    const alloc = std.testing.allocator;
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 1 };
+    const jpeg = [_]u8{ 0xff, 0xd8, 0xff, 2 };
+    const images = [_]antfly.readers.EncodedImage{
+        .{ .bytes = &png, .mime_type = "image/png" },
+        .{ .bytes = &jpeg, .mime_type = "image/jpeg" },
+    };
+    const request = antfly.readers.EncodedRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "mixed-deadbeef",
+    };
+
+    const FakeReader = struct {
+        first_ptr: [*]const u8,
+        second_ptr: [*]const u8,
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            encoded: antfly.readers.EncodedRequest,
+        ) ![]antfly.readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", encoded.prompt.?);
+            try std.testing.expectEqual(@as(i64, 128), encoded.max_tokens.?);
+            try std.testing.expectEqualStrings("mixed-deadbeef", encoded.source_fingerprint.?);
+            try std.testing.expectEqual(@as(usize, 2), encoded.images.len);
+            try std.testing.expectEqualStrings("image/png", encoded.images[0].mime_type);
+            try std.testing.expectEqualStrings("image/jpeg", encoded.images[1].mime_type);
+            try std.testing.expectEqual(@intFromPtr(self.first_ptr), @intFromPtr(encoded.images[0].bytes.ptr));
+            try std.testing.expectEqual(@intFromPtr(self.second_ptr), @intFromPtr(encoded.images[1].bytes.ptr));
+
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            out[0] = .{ .text = try result_alloc.dupe(u8, "first") };
+            out[1] = .{ .text = try result_alloc.dupe(u8, "second") };
+            return out;
+        }
+    };
+    var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
+    var state: inference_host.LinkedInferenceState = undefined;
+    state.alloc = alloc;
+    state.read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read };
+
+    // Traverse the production caller, ProviderInvokeContext construction,
+    // host operation dispatch, borrowed-payload decode, JSON response, and
+    // response destruction without loading a model.
+    const results = try inferenceProviderReadEncodedImages(&state, alloc, "florence2", request);
+    defer {
+        for (results) |*result| antfly.readers.deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("first", results[0].text);
+    try std.testing.expectEqualStrings("second", results[1].text);
+
+    // Keep malformed-context coverage at the codec boundary, where a corrupt
+    // pointer/count pair can be represented without dereferencing it.
+    var payloads = try encodedImageProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = encodedImageProviderMetadata("florence2", request);
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, request_json, null, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+    var bad_metadata = metadata;
+    bad_metadata.image_count += 1;
+    const bad_json = try std.json.Stringify.valueAlloc(alloc, bad_metadata, .{});
+    defer alloc.free(bad_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, bad_json, payloads.payloads.ptr, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+
+    const invalid_mime_images = [_]antfly.readers.EncodedImage{.{ .bytes = &png, .mime_type = "" }};
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inferenceProviderReadEncodedImages(&state, alloc, "florence2", .{ .images = &invalid_mime_images }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const empty_request = antfly.readers.EncodedRequest{ .images = &.{} };
+    const empty_metadata = encodedImageProviderMetadata("florence2", empty_request);
+    const empty_json = try std.json.Stringify.valueAlloc(alloc, empty_metadata, .{});
+    defer alloc.free(empty_json);
+    var empty_decoded = try inference_host.decodeReadEncodedImagesProviderRequest(alloc, empty_json, null, 0, null, 0);
+    defer empty_decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_decoded.images.len);
+
+    const unused_handle: *anyopaque = @ptrFromInt(1);
+    const empty_results = try inferenceProviderReadEncodedImages(unused_handle, alloc, "florence2", empty_request);
+    defer alloc.free(empty_results);
+    try std.testing.expectEqual(@as(usize, 0), empty_results.len);
 }
 
 test "standalone runtime local generator preflights mixed resident media exactly" {

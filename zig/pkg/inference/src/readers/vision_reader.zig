@@ -197,6 +197,11 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.readBatch(image_datas);
     }
 
+    pub fn readRawBatchReported(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBatchReported(image_datas);
+    }
+
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
         var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readDecoded(img);

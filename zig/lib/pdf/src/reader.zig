@@ -3818,6 +3818,13 @@ pub const Reader = struct {
         return reader;
     }
 
+    /// Update task-local decode ceilings between render operations. Callers
+    /// must not mutate limits while a fork or decode is active.
+    pub fn setDecodeLimits(self: *Reader, decode_limits: DecodeLimits) !void {
+        try decode_limits.validate();
+        self.decode_limits = decode_limits;
+    }
+
     pub fn deinit(self: *Reader) void {
         if (self.page_index) |pages| {
             for (pages) |*page| page.deinit(self.alloc);
@@ -3836,6 +3843,73 @@ pub const Reader = struct {
         self.alloc.free(self.xref_entries);
         self.trailer.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Create an independently owned render view of this parsed document.
+    ///
+    /// The source byte slice remains borrowed from the original document and
+    /// must outlive the returned Reader. Parsed document metadata is cloned,
+    /// while every mutable cache and render diagnostic is task-local. A fork
+    /// may therefore be moved to another thread as long as its allocator is
+    /// also safe to use exclusively from that thread.
+    ///
+    /// Callers must create all forks before starting render threads. This
+    /// serializes lazy page-tree discovery and makes the shared source Reader
+    /// immutable for the lifetime of the render group.
+    pub fn forkForRendering(self: *Reader, alloc: Allocator, cancellation: CancellationProbe) !Reader {
+        try cancellation.check();
+        try self.ensurePageIndex();
+
+        const xref_entries = try alloc.dupe(XrefEntry, self.xref_entries);
+        errdefer alloc.free(xref_entries);
+
+        var trailer = try self.trailer.clone(alloc);
+        errdefer trailer.deinit(alloc);
+
+        const source_pages = self.page_index.?;
+        const page_index = try alloc.alloc(syntax.Object, source_pages.len);
+        var initialized_pages: usize = 0;
+        errdefer {
+            for (page_index[0..initialized_pages]) |*page| page.deinit(alloc);
+            alloc.free(page_index);
+        }
+        for (source_pages, 0..) |page, i| {
+            page_index[i] = try page.clone(alloc);
+            initialized_pages += 1;
+        }
+
+        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
+        errdefer alloc.destroy(font_cache);
+        font_cache.* = .empty;
+
+        const image_cache = try alloc.create(DecodedImageCache);
+        errdefer alloc.destroy(image_cache);
+        image_cache.* = .{};
+
+        const encrypted_streams = try alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef));
+        errdefer alloc.destroy(encrypted_streams);
+        encrypted_streams.* = .empty;
+        errdefer encrypted_streams.deinit(alloc);
+        var encrypted_stream_iter = self.encrypted_streams.iterator();
+        while (encrypted_stream_iter.next()) |entry| {
+            try encrypted_streams.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        return .{
+            .alloc = alloc,
+            .bytes = self.bytes,
+            .decode_limits = self.decode_limits,
+            .version_minor = self.version_minor,
+            .startxref_offset = self.startxref_offset,
+            .xref_entries = xref_entries,
+            .trailer = trailer,
+            .page_index = page_index,
+            .font_cache = font_cache,
+            .image_cache = image_cache,
+            .encryption = self.encryption,
+            .encrypted_streams = encrypted_streams,
+            .cancellation = cancellation,
+        };
     }
 
     pub fn trailerGet(self: *const Reader, key: []const u8) ?*const syntax.Object {

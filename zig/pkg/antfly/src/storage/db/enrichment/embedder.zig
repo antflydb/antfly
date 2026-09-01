@@ -21,11 +21,17 @@ const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or b
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
+const inference_work = @import("../../../inference/work.zig");
 
 pub const DenseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32;
 pub const DenseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) anyerror![]const []const f32;
 pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, parts: []const template_mod.ContentPart, dims: u32) anyerror![]f32;
+/// Embeds each content part as an independently addressable work item. This is
+/// the document-page path: a window of page images produces one vector per
+/// page rather than an implicit document-level pool.
+pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
+pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
@@ -47,7 +53,9 @@ pub const DenseEmbedder = struct {
     dense_embed_fn: DenseEmbedFn,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
+    dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
+    capabilities_fn: ?DenseCapabilitiesFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
@@ -79,9 +87,21 @@ pub const DenseEmbedder = struct {
         return self.dense_embed_parts_fn != null;
     }
 
+    pub fn supportsPartItems(self: DenseEmbedder) bool {
+        return self.dense_embed_part_items_fn != null;
+    }
+
     pub fn mediaPartLimit(self: DenseEmbedder, embedding_name: []const u8) ?usize {
         const media_part_limit_fn = self.media_part_limit_fn orelse return null;
         return media_part_limit_fn(self.ptr, embedding_name);
+    }
+
+    pub fn capabilities(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
+        const capabilities_fn = self.capabilities_fn orelse return error.EmbeddingCapabilitiesUnavailable;
+        const result = try capabilities_fn(self.ptr, alloc, embedding_name);
+        try result.validate();
+        if (result.task != .embed) return error.InvalidInferenceCapabilities;
+        return result;
     }
 
     pub fn embedDenseParts(
@@ -95,6 +115,24 @@ pub const DenseEmbedder = struct {
         var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
         defer sanitized.deinit(alloc);
         return try dense_embed_parts_fn(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims);
+    }
+
+    pub fn embedDensePartItems(
+        self: DenseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        items: []const template_mod.ContentPart,
+        dims: u32,
+    ) ![]const []const f32 {
+        const embed_items = self.dense_embed_part_items_fn orelse return error.UnsupportedEmbeddingProvider;
+        var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, items);
+        defer sanitized.deinit(alloc);
+        const vectors = try embed_items(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims);
+        if (vectors.len != items.len) {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        }
+        return vectors;
     }
 
     pub fn deinit(self: DenseEmbedder, alloc: Allocator) void {

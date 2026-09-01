@@ -8078,6 +8078,7 @@ pub const IndexManager = struct {
                         .index_name = try alloc.dupe(u8, entry.config.name),
                         .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
                         .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .embedding_input = chunk_cfg.embedding_input,
                         .doc_key = try alloc.dupe(u8, doc_key),
                         .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                         .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -8124,6 +8125,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .embedding_input = embedding_cfg.embedding_input,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -8143,6 +8145,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = "",
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .embedding_input = embedding_cfg.embedding_input,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13623,6 +13626,7 @@ pub const IndexManager = struct {
                         .source_field = chunk_cfg.source_field,
                         .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
+                        .embedding_input = chunk_cfg.embedding_input,
                         .expected_dims = dense_cfg.dims,
                         .producer_json = semantic_producer orelse "",
                         .chunk_size = chunk_cfg.chunk_size,
@@ -13656,6 +13660,7 @@ pub const IndexManager = struct {
                         .source_field = chunk_cfg.source_field,
                         .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
+                        .embedding_input = chunk_cfg.embedding_input,
                         .producer_json = semantic_producer orelse "",
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
@@ -13711,6 +13716,7 @@ pub const IndexManager = struct {
                 (cfg.source_template.len > 0 or std.mem.eql(u8, existing.source_field, cfg.source_field));
             if (!source_selector_matches or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
+                existing.embedding_input != cfg.embedding_input or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
@@ -13754,6 +13760,11 @@ pub const IndexManager = struct {
                 }
             },
             .embedding => {
+                if (cfg.embedding_input == .pdf_page_images and
+                    (cfg.source_template.len > 0 or cfg.chunk_size > 0 or cfg.chunker_json.len > 0))
+                {
+                    return error.InvalidEnrichmentConfig;
+                }
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
@@ -20685,6 +20696,7 @@ const GeneratorConfig = struct {
     chunking_execution_json: []u8 = &.{},
     embedding_execution_json: []u8 = &.{},
     full_text_index: bool = false,
+    embedding_input: enrichment_types.EmbeddingInput = .text,
 
     fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
         alloc.free(self.source_field);
@@ -20835,6 +20847,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .source_field = if (cfg.template.len == 0 and cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
         .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
+        .embedding_input = cfg.embedding_input,
         .expected_dims = cfg.expected_dims,
         .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
@@ -20853,6 +20866,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         std.mem.eql(u8, a.source_field, b.source_field) and
         std.mem.eql(u8, a.source_template, b.source_template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.embedding_input == b.embedding_input and
         a.expected_dims == b.expected_dims and
         std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
@@ -20883,6 +20897,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .field = if (cfg.source_field.len > 0) try alloc.dupe(u8, cfg.source_field) else "",
         .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
+        .embedding_input = cfg.embedding_input,
         .expected_dims = cfg.expected_dims,
         .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
@@ -21665,6 +21680,12 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
         .chunking_execution_json = chunking_execution_json,
         .embedding_execution_json = embedding_execution_json,
         .full_text_index = full_text_index,
+        .embedding_input = if (generator.object.get("input")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "text")) break :blk .text;
+            if (std.mem.eql(u8, value.string, "pdf_page_images")) break :blk .pdf_page_images;
+            return error.InvalidIndexConfig;
+        } else .text,
     };
 }
 
@@ -24915,6 +24936,18 @@ test "parseDenseGeneratorConfig parses source_template" {
     try std.testing.expectEqualStrings("body_chunks", generator.artifact_name);
     try std.testing.expectEqual(@as(u32, 512), generator.chunk_size);
     try std.testing.expectEqual(@as(u32, 64), generator.chunk_overlap);
+}
+
+test "parseDenseGeneratorConfig selects durable PDF page images" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"generator":{"kind":"dense_embedding","source_field":"document_url","artifact_name":"pdf_pages_v1","embedding_name":"pdf_visual_v1","input":"pdf_page_images"}}
+    ;
+    const generator = try parseDenseGeneratorConfig(alloc, json) orelse return error.TestUnexpectedResult;
+    defer generator.deinit(alloc);
+    try std.testing.expectEqual(enrichment_types.EmbeddingInput.pdf_page_images, generator.embedding_input);
+    try std.testing.expectEqualStrings("pdf_pages_v1", generator.artifact_name);
+    try std.testing.expectEqualStrings("pdf_visual_v1", generator.embedding_name.?);
 }
 
 test "parseDenseGeneratorConfig without source_template" {

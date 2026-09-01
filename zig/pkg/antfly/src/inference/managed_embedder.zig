@@ -48,6 +48,8 @@ const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const inference_work = @import("work.zig");
+const remote_capabilities = @import("remote_capabilities.zig");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -128,6 +130,23 @@ pub const AntflyProvider = struct {
         model: []const u8,
         messages: []const inference_types.ChatMessage,
     ) anyerror![]u8 = null,
+    /// Binary media remains borrowed for the synchronous call. Message media
+    /// parts with empty data are matched to attachments in encounter order.
+    generate_messages_with_attachments: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        attachments: []const inference_work.Attachment,
+    ) anyerror![]u8 = null,
+    /// Capabilities are resolved by model and backend. Callers must not infer
+    /// native batching from provider identity.
+    model_capabilities: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        task: inference_work.Task,
+    ) anyerror!inference_work.InferenceCapabilities = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -147,6 +166,18 @@ pub const AntflyProvider = struct {
         model: []const u8,
         request: readers.Request,
     ) anyerror![]readers.Result = null,
+    read_encoded_images: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.EncodedRequest,
+    ) anyerror![]readers.Result = null,
+    read_encoded_images_reported: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.EncodedRequest,
+    ) anyerror!readers.BatchResult = null,
     extract: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -794,7 +825,9 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
+            .dense_embed_part_items_fn = embedDensePartItems,
             .media_part_limit_fn = denseMediaPartLimit,
+            .capabilities_fn = denseCapabilities,
             .deinit_fn = deinitDenseEmbedder,
             .foreground_bounded = self.denseForegroundBounded(),
         };
@@ -1057,10 +1090,78 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryParts(alloc, entry, parts, dims);
     }
 
+    fn embedDensePartItems(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const template_mod.ContentPart,
+        dims: u32,
+    ) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
+        const capabilities = try denseCapabilities(ptr, alloc, embedding_name);
+        try validateDensePartItemInvocation(capabilities, items);
+        return try embedPartItemsWithEntry(alloc, entry, items, dims);
+    }
+
     fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return null;
-        return if (isAntflyProvider(entry.provider)) 1 else null;
+        // The local multimodal embedding ABI treats every part as one
+        // independently addressable input. The limit is a model/task semantic,
+        // not a blanket property of the Antfly provider.
+        return if (entry.multimodal and isAntflyProvider(entry.provider)) 1 else null;
+    }
+
+    fn denseCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.sparse) return error.UnsupportedEmbeddingProvider;
+        if (entry.antfly_provider) |local| {
+            if (local.model_capabilities) |resolve| {
+                const result = try resolve(local.ptr, alloc, entry.model, .embed);
+                try result.validate();
+                if (result.task != .embed) return error.InvalidInferenceCapabilities;
+                return result;
+            }
+        }
+        if (entry.provider == .antfly and entry.base_url.len > 0) {
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+            defer http.deinit();
+            var auth_header: ?[]u8 = null;
+            defer if (auth_header) |value| alloc.free(value);
+            var header_storage: [1][2][]const u8 = undefined;
+            const headers: []const [2][]const u8 = if (entry.api_key) |*api_key_ref| blk: {
+                auth_header = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref);
+                if (auth_header == null) break :blk &.{};
+                header_storage[0] = .{ "Authorization", auth_header.? };
+                break :blk &header_storage;
+            } else &.{};
+            if (remote_capabilities.discover(
+                alloc,
+                &http,
+                entry.base_url,
+                entry.model,
+                .embed,
+                headers,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            }) |result| return result;
+        }
+        // Unknown remote capability is deliberately conservative. It remains
+        // usable, but the document planner cannot assume fused batching or a
+        // provider-specific memory ceiling.
+        return .{
+            .task = .embed,
+            .input_modalities = .{ .text = true, .image = entry.multimodal },
+            .accepted_mime_types = .{ .text_plain = true, .image_png = entry.multimodal, .image_jpeg = entry.multimodal },
+            .input_granularity = if (entry.multimodal) .page else .chunk,
+            .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1, .max_media_parts_per_item = 1 },
+            .output = .embedding,
+            .borrowed_attachments = entry.multimodal,
+        };
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -3922,6 +4023,100 @@ fn embedWithEntryParts(
     return try embedWithEntry(alloc, entry, flattened, dims);
 }
 
+fn modalityForContentType(content_type: []const u8) !inference_work.Modalities {
+    if (std.mem.startsWith(u8, content_type, "image/")) return .{ .image = true };
+    if (std.mem.startsWith(u8, content_type, "audio/")) return .{ .audio = true };
+    if (std.ascii.eqlIgnoreCase(content_type, "application/pdf")) return .{ .document = true };
+    if (std.ascii.eqlIgnoreCase(content_type, "text/plain")) return .{ .text = true };
+    return error.UnsupportedInferenceMimeType;
+}
+
+fn mergeModalities(target: *inference_work.Modalities, value: inference_work.Modalities) void {
+    const target_bits: u8 = @bitCast(target.*);
+    const value_bits: u8 = @bitCast(value);
+    target.* = @bitCast(target_bits | value_bits);
+}
+
+fn validateDensePartItemInvocation(
+    capabilities: inference_work.InferenceCapabilities,
+    items: []const template_mod.ContentPart,
+) !void {
+    var shape = inference_work.InvocationShape{ .item_count = items.len };
+    for (items) |item| switch (item) {
+        .text => |text| {
+            mergeModalities(&shape.modalities, .{ .text = true });
+            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, text.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            try capabilities.validateMimeType("text/plain");
+        },
+        .media_url => {
+            // The embedding transport currently defines media_url as an image
+            // URL. Its concrete MIME and byte/pixel shape are revalidated after
+            // download by the provider-owned request admission path.
+            mergeModalities(&shape.modalities, .{ .image = true });
+            shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
+        },
+        .binary => |media| {
+            mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
+            try capabilities.validateMimeType(media.mime_type);
+            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, media.data.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
+        },
+    };
+    try capabilities.validateInvocation(.embed, shape);
+}
+
+/// Embed a bounded window of independently addressable document assets. Each
+/// part is one input and must produce exactly one vector; callers retain page
+/// identity by position and never receive an implicit document-level pool.
+fn embedPartItemsWithEntry(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    items: []const template_mod.ContentPart,
+    dims: u32,
+) ![]const []const f32 {
+    if (items.len == 0) return try alloc.alloc([]const f32, 0);
+    if (!isAntflyProvider(entry.provider)) return error.UnsupportedEmbeddingProvider;
+
+    if (entry.antfly_provider) |local| {
+        const embed_parts = local.embed_dense_parts orelse return error.UnsupportedEmbeddingProvider;
+        try waitForEntryPacer(entry);
+        const context = embeddingRequestContext(entry);
+        try context.check();
+        const vectors = (if (local.embed_dense_parts_with_context) |with_context|
+            AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, with_context, .{ local.ptr, alloc, entry.model, items, context })
+        else
+            AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, embed_parts, .{ local.ptr, alloc, entry.model, items })) catch |err|
+            return normalizeLocalEmbeddingError(err);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try context.check();
+        try validateDenseBatch(vectors, items.len, dims);
+        return vectors;
+    }
+
+    try waitForEntryPacer(entry);
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer http.deinit();
+    var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
+    defer provider.deinit();
+    provider.setRequestCancellation(entry.cancellation);
+    if (entry.api_key) |*api_key_ref| {
+        if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
+            defer alloc.free(auth_header);
+            try provider.setAuthorizationHeader(auth_header);
+        }
+    }
+
+    var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
+        error.EmptyResponse => return error.EmptyEmbeddingResponse,
+        else => return err,
+    };
+    errdefer result.deinit();
+    try validateDenseBatch(result.vectors, items.len, dims);
+    return try adoptDenseBatchResult(alloc, &result);
+}
+
 fn embedSparseWithEntry(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -6398,6 +6593,14 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
     try std.testing.expect(local.saw_parts);
+
+    local.response_count = parts.len;
+    const page_vectors = try dense_interface.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3);
+    defer db_embedder.freeDenseEmbeddingBatch(std.testing.allocator, page_vectors);
+    try std.testing.expectEqual(@as(usize, 3), page_vectors.len);
+    for (page_vectors) |page_vector| {
+        try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, page_vector);
+    }
 
     local.response_count = 0;
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));

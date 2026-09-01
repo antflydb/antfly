@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const inference_work = @import("../../../inference/work.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -79,6 +80,30 @@ pub const Request = struct {
     inline_media_trusted: bool = false,
     /// Stable source fingerprint for opt-in producer/inference profiling.
     source_fingerprint: ?[]const u8 = null,
+    /// Stable per-item identity used when compatible requests from different
+    /// documents share one provider batch.
+    item_id: []const u8 = "",
+    page_number: ?u32 = null,
+    /// Trusted, borrowed encoded media generated inside Antfly. Providers that
+    /// cannot consume binary media directly adapt this to their wire format at
+    /// the final transport boundary.
+    media: []const EncodedMedia = &.{},
+};
+
+pub const EncodedMedia = struct {
+    bytes: []const u8,
+    mime_type: []const u8,
+};
+
+pub const ProducedBatch = struct {
+    items: [][]u8,
+    execution: inference_work.ExecutionReport,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.items) |item| alloc.free(item);
+        alloc.free(self.items);
+        self.* = undefined;
+    }
 };
 
 pub const Producer = struct {
@@ -88,7 +113,10 @@ pub const Producer = struct {
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
+        produce_batch_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch = null,
+        batch_mode: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!inference_work.BatchMode = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
+        capabilities_for_requests: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!?inference_work.InferenceCapabilities = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         /// See embedder.DenseEmbedder.foreground_bounded. This is deliberately
         /// opt-in so a custom callback cannot silently defeat the write
@@ -116,6 +144,8 @@ pub const Producer = struct {
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
+        if (self.vtable.produce_batch_reported) |reported|
+            return (try reported(self.ptr, alloc, requests)).items;
         if (self.vtable.produce_batch) |produce_batch| return try produce_batch(self.ptr, alloc, requests);
 
         const out = try alloc.alloc([]u8, requests.len);
@@ -132,15 +162,47 @@ pub const Producer = struct {
         return out;
     }
 
-    /// Reports whether produceBatch can execute the request set as one native
-    /// operation. A missing hook preserves the existing producer contract: a
-    /// provided batch function is assumed native, while the generic fallback is
-    /// explicitly sequential.
-    pub fn canProduceBatch(self: Producer, alloc: Allocator, requests: []const Request) !bool {
-        if (self.vtable.produce_batch == null) return false;
+    /// Returns the execution path that actually completed. Legacy callbacks
+    /// are conservatively classified as compatibility execution; capability
+    /// prediction is never presented as observed telemetry.
+    pub fn produceBatchReported(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
+        if (self.vtable.produce_batch_reported) |reported| {
+            const batch = try reported(self.ptr, alloc, requests);
+            try batch.execution.validate();
+            if (batch.items.len != requests.len) {
+                var owned = batch;
+                owned.deinit(alloc);
+                return error.InvalidProducedBatchCardinality;
+            }
+            return batch;
+        }
+        const items = try self.produceBatch(alloc, requests);
+        return .{ .items = items, .execution = inference_work.ExecutionReport.compatibility(requests.len) };
+    }
+
+    /// Describes how the request set will execute. This preserves the important
+    /// distinction between a fused/native model batch and an API-compatible
+    /// serial loop.
+    pub fn batchMode(self: Producer, alloc: Allocator, requests: []const Request) !inference_work.BatchMode {
+        if (self.vtable.produce_batch == null and self.vtable.produce_batch_reported == null) return .none;
+        if (self.vtable.batch_mode) |batch_mode|
+            return try batch_mode(self.ptr, alloc, requests);
         if (self.vtable.can_produce_batch) |can_produce_batch|
-            return try can_produce_batch(self.ptr, alloc, requests);
-        return true;
+            return if (try can_produce_batch(self.ptr, alloc, requests)) .native else .none;
+        return .serial_compatibility;
+    }
+
+    /// Compatibility wrapper for callers that only need to choose between the
+    /// batch entry point and singleton execution.
+    pub fn canProduceBatch(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        return try self.batchMode(alloc, requests) != .none;
+    }
+
+    pub fn capabilitiesForRequests(self: Producer, alloc: Allocator, requests: []const Request) !?inference_work.InferenceCapabilities {
+        const resolve = self.vtable.capabilities_for_requests orelse return null;
+        const result = try resolve(self.ptr, alloc, requests);
+        if (result) |capabilities| try capabilities.validate();
+        return result;
     }
 
     pub fn deinit(self: Producer, alloc: Allocator) void {

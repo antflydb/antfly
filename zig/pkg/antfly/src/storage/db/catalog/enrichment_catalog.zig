@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const enrichment_types = @import("../enrichment/enrichment_types.zig");
 
 pub const EnrichmentType = enum {
     chunk,
@@ -30,6 +31,7 @@ pub const EnrichmentConfig = struct {
     /// instead of extracting a single source_field.
     source_template: []const u8 = "",
     source_artifact_name: []const u8 = "",
+    embedding_input: enrichment_types.EmbeddingInput = .text,
     expected_dims: u32 = 0,
     vector_space: []const u8 = "",
     chunk_size: u32 = 0,
@@ -47,6 +49,7 @@ pub const EnrichmentConfig = struct {
             .source_field = try alloc.dupe(u8, cfg.source_field),
             .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
+            .embedding_input = cfg.embedding_input,
             .expected_dims = cfg.expected_dims,
             .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
             .chunk_size = cfg.chunk_size,

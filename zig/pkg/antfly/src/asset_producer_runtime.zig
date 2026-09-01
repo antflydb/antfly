@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const generating_runtime = @import("generating/mod.zig");
 const managed_embedder = @import("inference/managed_embedder.zig");
@@ -21,10 +22,65 @@ const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
+const inference_work = @import("inference/work.zig");
+const remote_capabilities = @import("inference/remote_capabilities.zig");
 
 const Allocator = std.mem.Allocator;
-const local_reader_batch_max_images: usize = 64;
+const local_reader_batch_ceiling: usize = 64;
+const default_local_reader_batch_images: usize = 8;
 const max_asset_provider_timeout_ms: u64 = 300_000;
+const ReaderItemExecution = enum { native, serial, fallback };
+
+fn summarizeReaderExecution(
+    image_counts: []const usize,
+    execution_by_image: []const ReaderItemExecution,
+    native_batches: usize,
+    fallback_reason: ?[]const u8,
+) inference_work.ExecutionReport {
+    var report = inference_work.ExecutionReport{
+        .requested_items = image_counts.len,
+        .native_batches = native_batches,
+    };
+    var offset: usize = 0;
+    for (image_counts) |count| {
+        var request_execution: ReaderItemExecution = .native;
+        for (execution_by_image[offset .. offset + count]) |item_execution| {
+            if (item_execution == .fallback) {
+                request_execution = .fallback;
+                break;
+            }
+            if (item_execution == .serial) request_execution = .serial;
+        }
+        switch (request_execution) {
+            .native => report.native_items += 1,
+            .serial => report.serial_items += 1,
+            .fallback => {
+                report.serial_items += 1;
+                report.fallback_items += 1;
+            },
+        }
+        offset += count;
+    }
+    std.debug.assert(offset == execution_by_image.len);
+    if (report.fallback_items > 0) report.fallback_reason = fallback_reason orelse "reader_fallback";
+    return report;
+}
+
+test "reader execution report preserves mixed native and fallback completion" {
+    const report = summarizeReaderExecution(
+        &.{ 2, 1, 1 },
+        &.{ .native, .fallback, .serial, .native },
+        2,
+        "native_batch_failed",
+    );
+    try report.validate();
+    try std.testing.expectEqual(@as(usize, 3), report.requested_items);
+    try std.testing.expectEqual(@as(usize, 1), report.native_items);
+    try std.testing.expectEqual(@as(usize, 2), report.serial_items);
+    try std.testing.expectEqual(@as(usize, 1), report.fallback_items);
+    try std.testing.expectEqual(@as(usize, 2), report.native_batches);
+    try std.testing.expectEqualStrings("native_batch_failed", report.fallback_reason.?);
+}
 
 pub const Runtime = struct {
     alloc: Allocator,
@@ -83,7 +139,7 @@ pub const Runtime = struct {
             // A caller-owned HTTP client may not have a finite request timeout,
             // so this borrowed interface cannot advertise the foreground
             // liveness contract.
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .produce_batch_reported = produceBatchReported, .batch_mode = batchMode, .can_produce_batch = canProduceBatch, .capabilities_for_requests = capabilitiesForRequests },
         };
     }
 
@@ -93,7 +149,10 @@ pub const Runtime = struct {
             .vtable = &.{
                 .produce = produce,
                 .produce_batch = produceBatch,
+                .produce_batch_reported = produceBatchReported,
+                .batch_mode = batchMode,
                 .can_produce_batch = canProduceBatch,
+                .capabilities_for_requests = capabilitiesForRequests,
                 .deinit = deinitProducer,
                 .foreground_bounded = true,
                 .foreground_bounded_for_requests = foregroundBoundedForRequests,
@@ -138,7 +197,7 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const local = self.antfly_provider orelse break :blk true;
                 break :blk !(isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
-                    local.read_images != null);
+                    (local.read_images != null or local.read_encoded_images != null));
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
@@ -172,22 +231,106 @@ pub const Runtime = struct {
     }
 
     fn canProduceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        return try batchMode(ptr, alloc, requests) != .none;
+    }
+
+    fn capabilitiesForRequests(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        if (requests.len == 0) return true;
+        if (requests.len == 0 or !requestsShareConfig(requests)) return null;
+        return switch (requests[0].producer_type) {
+            .reader => blk: {
+                var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer cfg.deinit();
+                break :blk try self.readerCapabilities(alloc, cfg.value);
+            },
+            .generator => blk: {
+                var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+                defer parsed.deinit(alloc);
+                if (parsed.generator.provider == .antfly and parsed.generator.url.len == 0) {
+                    const local = self.antfly_provider orelse break :blk null;
+                    const resolve = local.model_capabilities orelse break :blk null;
+                    break :blk try resolve(local.ptr, alloc, parsed.generator.model, .generate);
+                }
+                if (parsed.generator.provider == .antfly and parsed.generator.url.len > 0) {
+                    var secret = try common_secrets.SecretValue.initConfigOrEnv(
+                        alloc,
+                        parsed.generator.api_key,
+                        "ANTFLY_INFERENCE_API_KEY",
+                    );
+                    defer secret.deinit(alloc);
+                    const token = secret.resolveOwned(alloc, self.secret_store) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => break :blk null,
+                    };
+                    defer if (token) |value| alloc.free(value);
+                    var auth_value: ?[]u8 = null;
+                    defer if (auth_value) |value| alloc.free(value);
+                    var header_storage: [1][2][]const u8 = undefined;
+                    const headers: []const [2][]const u8 = if (token) |value| auth: {
+                        auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+                        header_storage[0] = .{ "Authorization", auth_value.? };
+                        break :auth &header_storage;
+                    } else &.{};
+                    break :blk remote_capabilities.discover(
+                        alloc,
+                        self.http,
+                        parsed.generator.url,
+                        parsed.generator.model,
+                        .generate,
+                        headers,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn batchMode(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !inference_work.BatchMode {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0) return .native;
         const first = requests[0];
         for (requests) |request| {
-            if (request.producer_type != first.producer_type) return false;
+            if (request.producer_type != first.producer_type) return .none;
         }
         return switch (first.producer_type) {
-            .copy => true,
-            .document_extraction => false,
-            .reader => try self.canReadBatch(alloc, requests),
-            .generator => try self.canGenerateBatch(alloc, requests),
+            .copy => .native,
+            .document_extraction => .none,
+            .reader => blk: {
+                if (!try self.canReadBatch(alloc, requests)) break :blk .none;
+                var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer cfg.deinit();
+                const capabilities = (try self.readerCapabilities(alloc, cfg.value)) orelse break :blk .none;
+                break :blk capabilities.batch.mode;
+            },
+            // The HTTP endpoint and embedded boundary accept independent
+            // multimodal requests but currently serialize projector/session
+            // use for thread safety. Report that honestly until the resolved
+            // model advertises a native multimodal generation batch.
+            .generator => blk: {
+                if (!try self.canGenerateBatch(alloc, requests)) break :blk .none;
+                var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+                defer parsed.deinit(alloc);
+                // The embedded callback is one invocation per item today.
+                if (parsed.generator.url.len == 0) break :blk .serial_compatibility;
+                const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse
+                    break :blk .serial_compatibility;
+                break :blk capabilities.batch.mode;
+            },
             // The transcriber interface accepts one audio input per call. Its
             // produceBatch implementation is therefore a compatibility loop,
             // not an atomic provider batch, and must be isolated by callers.
-            .transcriber => false,
-            .extractor => try self.canExtractBatch(alloc, requests),
+            .transcriber => .none,
+            .extractor => if (try self.canExtractBatch(alloc, requests)) .native else .none,
         };
     }
 
@@ -199,26 +342,45 @@ pub const Runtime = struct {
     }
 
     fn canReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        _ = self;
         if (!requestsShareConfig(requests)) return false;
+        const uses_encoded_media = requests[0].media.len > 0;
+        if (uses_encoded_media and !requests[0].inline_media_trusted) return false;
         for (requests[1..]) |request| {
             if (request.inline_media_trusted != requests[0].inline_media_trusted) return false;
+            if ((request.media.len > 0) != uses_encoded_media) return false;
         }
         var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
         defer cfg.deinit();
-        if (!readerSupportsPerImageBatch(cfg.value.provider)) return false;
+        const capabilities = try self.readerCapabilities(alloc, cfg.value);
+        if (capabilities == null or capabilities.?.batch.mode == .none or
+            capabilities.?.result_cardinality != .one_per_item or
+            !capabilities.?.supports(.{ .image = true })) return false;
 
+        var owned_shared_prompt: ?[]u8 = null;
+        defer if (owned_shared_prompt) |prompt| alloc.free(prompt);
         var shared_prompt: ?[]const u8 = cfg.value.prompt;
         for (requests, 0..) |request, i| {
-            var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+            var source = try parseReaderSourceWithMetadataOnly(
+                alloc,
+                request.source_text,
+                request.source_parts_json,
+                request.media.len > 0,
+            );
             defer source.deinit(alloc);
-            if (source.images.len == 0) return false;
+            if (uses_encoded_media) {
+                if (request.media.len == 0) return false;
+            } else if (source.images.len == 0) return false;
             const effective_prompt = source.prompt orelse cfg.value.prompt;
             if (i == 0) {
-                shared_prompt = effective_prompt;
+                if (source.prompt) |prompt| {
+                    owned_shared_prompt = try alloc.dupe(u8, prompt);
+                    shared_prompt = owned_shared_prompt;
+                } else {
+                    shared_prompt = cfg.value.prompt;
+                }
             } else if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
                 return false;
             }
@@ -226,18 +388,58 @@ pub const Runtime = struct {
         return true;
     }
 
+    fn readerCapabilities(
+        self: *Runtime,
+        alloc: Allocator,
+        cfg: readers.Config,
+    ) !?inference_work.InferenceCapabilities {
+        if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
+            if (cfg.provider != .antfly) return null;
+            const endpoint = cfg.resolvedUrl() orelse return null;
+            var auth_value: ?[]u8 = null;
+            defer if (auth_value) |value| alloc.free(value);
+            var header_storage: [1][2][]const u8 = undefined;
+            const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+                auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+                header_storage[0] = .{ "Authorization", auth_value.? };
+                break :blk &header_storage;
+            } else &.{};
+            return remote_capabilities.discover(
+                alloc,
+                self.http,
+                endpoint,
+                cfg.model orelse "",
+                .read,
+                headers,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+        }
+        const local = self.antfly_provider orelse return null;
+        const resolve = local.model_capabilities orelse return null;
+        const capabilities = try resolve(local.ptr, alloc, cfg.model orelse "", .read);
+        try capabilities.validate();
+        if (capabilities.task != .read) return error.InvalidInferenceCapabilities;
+        return capabilities;
+    }
+
     fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        _ = self;
         if (!requestsShareConfig(requests)) return false;
+        var all_have_media = true;
         for (requests) |request| {
-            if (request.source_parts_json) |parts| if (parts.len > 0) return false;
+            if (request.media.len > 0 and !request.inline_media_trusted) return false;
+            all_have_media = all_have_media and request.media.len > 0;
         }
         var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
         defer parsed.deinit(alloc);
         const cfg = parsed.generator;
-        return cfg.provider == .antfly and
-            cfg.url.len > 0 and
-            cfg.api_key == null and
+        const local_serial = all_have_media and cfg.provider == .antfly and cfg.url.len == 0 and
+            self.antfly_provider != null and
+            self.antfly_provider.?.generate_messages_with_attachments != null;
+        const remote_batch = cfg.provider == .antfly and cfg.url.len > 0;
+        return (local_serial or remote_batch) and
+            (remote_batch or cfg.api_key == null) and
             cfg.project_id == null and
             cfg.location == null and
             cfg.credentials_path == null and
@@ -290,6 +492,38 @@ pub const Runtime = struct {
             else => return err,
         }
         return try self.produceBatchSequential(alloc, requests);
+    }
+
+    fn produceBatchReported(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0) return .{
+            .items = try alloc.alloc([]u8, 0),
+            .execution = inference_work.ExecutionReport.serial(0),
+        };
+        const first_type = requests[0].producer_type;
+        for (requests) |request| if (request.producer_type != first_type) {
+            return .{
+                .items = try self.produceBatchSequential(alloc, requests),
+                .execution = inference_work.ExecutionReport.fallback(requests.len, "mixed_producer_types"),
+            };
+        };
+        if (first_type == .reader) return self.tryReadBatchReported(alloc, requests) catch |err| switch (err) {
+            error.BatchIncompatible => .{
+                .items = try self.produceBatchSequential(alloc, requests),
+                .execution = inference_work.ExecutionReport.fallback(requests.len, "batch_incompatible"),
+            },
+            else => return err,
+        };
+
+        const mode = try batchMode(ptr, alloc, requests);
+        const items = try produceBatch(self, alloc, requests);
+        return .{
+            .items = items,
+            .execution = switch (mode) {
+                .native => inference_work.ExecutionReport.native(requests.len),
+                .serial_compatibility, .none => inference_work.ExecutionReport.serial(requests.len),
+            },
+        };
     }
 
     fn produceCopyBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -379,24 +613,43 @@ pub const Runtime = struct {
         for (requests) |request| {
             if (request.producer_type != .generator) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
-            if (request.source_parts_json) |raw_parts| {
-                if (raw_parts.len > 0) return error.BatchIncompatible;
-            }
+            if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         }
 
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
         defer parsed_cfg.deinit(alloc);
         const cfg = parsed_cfg.generator;
-        if (cfg.provider != .antfly or cfg.url.len == 0) return error.BatchIncompatible;
-        if (cfg.api_key != null or cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
+        if (cfg.provider != .antfly) return error.BatchIncompatible;
+        if (cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
         if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
+        if (cfg.url.len == 0) {
+            const local = self.antfly_provider orelse return error.BatchIncompatible;
+            if (local.generate_messages_with_attachments == null) return error.BatchIncompatible;
+            return try self.produceBatchSequential(alloc, requests);
+        }
 
         const batch_url = try antflyGenerateBatchUrlAlloc(alloc, cfg.url);
         defer alloc.free(batch_url);
         const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, requests);
         defer alloc.free(body);
 
-        var resp = try self.http.post(batch_url, .{ .json = body, .timeout_ms = 300_000 });
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(
+            alloc,
+            cfg.api_key,
+            "ANTFLY_INFERENCE_API_KEY",
+        );
+        defer secret.deinit(alloc);
+        const token = try secret.resolveOwned(alloc, self.secret_store);
+        defer if (token) |value| alloc.free(value);
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (token) |value| auth: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :auth &header_storage;
+        } else &.{};
+        var resp = try self.http.post(batch_url, .{ .json = body, .headers = headers, .timeout_ms = 300_000 });
         defer resp.deinit();
         if (!resp.ok()) return mapAntflyGenerateBatchStatus(resp.status.code);
         const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
@@ -449,13 +702,20 @@ pub const Runtime = struct {
     }
 
     fn tryReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        return (try self.tryReadBatchReported(alloc, requests)).items;
+    }
+
+    fn tryReadBatchReported(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
+        const uses_encoded_media = requests[0].media.len > 0;
         for (requests) |request| {
             if (request.producer_type != .reader) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
             // Never collapse external and internally generated media into one
             // request: trust is intentionally carried at the request boundary.
             if (request.inline_media_trusted != requests[0].inline_media_trusted) return error.BatchIncompatible;
+            if ((request.media.len > 0) != uses_encoded_media) return error.BatchIncompatible;
         }
+        if (uses_encoded_media and !requests[0].inline_media_trusted) return error.UntrustedInlineMedia;
 
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
             .allocate = .alloc_always,
@@ -467,7 +727,10 @@ pub const Runtime = struct {
         // one prompt, but produce one response for the prompt as a whole, so
         // flattening requests across those providers loses the request/result
         // boundary. Let the generic batch path execute them sequentially.
-        if (!readerSupportsPerImageBatch(cfg_parsed.value.provider)) return error.BatchIncompatible;
+        const capabilities = (try self.readerCapabilities(alloc, cfg_parsed.value)) orelse
+            return error.BatchIncompatible;
+        if (capabilities.batch.mode == .none or capabilities.result_cardinality != .one_per_item or
+            !capabilities.supports(.{ .image = true })) return error.BatchIncompatible;
         const sources = try alloc.alloc(ReaderSource, requests.len);
         var sources_filled: usize = 0;
         defer {
@@ -478,44 +741,123 @@ pub const Runtime = struct {
         defer alloc.free(image_counts);
         var flat_images = std.ArrayListUnmanaged([]const u8).empty;
         defer flat_images.deinit(alloc);
+        var flat_encoded = std.ArrayListUnmanaged(readers.EncodedImage).empty;
+        defer flat_encoded.deinit(alloc);
+        var flat_source_fingerprints = std.ArrayListUnmanaged(?[]const u8).empty;
+        defer flat_source_fingerprints.deinit(alloc);
 
         var shared_prompt: ?[]const u8 = cfg_parsed.value.prompt;
         for (requests, 0..) |request, i| {
-            sources[i] = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+            sources[i] = try parseReaderSourceWithMetadataOnly(
+                alloc,
+                request.source_text,
+                request.source_parts_json,
+                request.media.len > 0,
+            );
             sources_filled += 1;
             const effective_prompt = sources[i].prompt orelse cfg_parsed.value.prompt;
             if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
                 if (i == 0) shared_prompt = effective_prompt else return error.BatchIncompatible;
             }
-            image_counts[i] = sources[i].images.len;
-            try flat_images.appendSlice(alloc, sources[i].images);
+            if (uses_encoded_media) {
+                image_counts[i] = request.media.len;
+                for (request.media) |media| {
+                    try flat_encoded.append(alloc, .{
+                        .bytes = media.bytes,
+                        .mime_type = media.mime_type,
+                        .item_id = request.item_id,
+                        .source_fingerprint = request.source_fingerprint,
+                        .page_number = request.page_number,
+                    });
+                    try flat_source_fingerprints.append(alloc, request.source_fingerprint);
+                }
+            } else {
+                image_counts[i] = sources[i].images.len;
+                try flat_images.appendSlice(alloc, sources[i].images);
+                for (sources[i].images) |_| try flat_source_fingerprints.append(alloc, request.source_fingerprint);
+            }
+            if (image_counts[i] == 0) return error.BatchIncompatible;
         }
-        if (flat_images.items.len == 0) return error.BatchIncompatible;
+        const total_images = if (uses_encoded_media) flat_encoded.items.len else flat_images.items.len;
+        if (total_images == 0) return error.BatchIncompatible;
+        std.debug.assert(flat_source_fingerprints.items.len == total_images);
 
-        const results = try alloc.alloc(readers.Result, flat_images.items.len);
+        const results = try alloc.alloc(readers.Result, total_images);
+        const execution_by_image = try alloc.alloc(ReaderItemExecution, total_images);
+        defer alloc.free(execution_by_image);
         var results_filled: usize = 0;
+        var native_batches: usize = 0;
+        var fallback_reason: ?[]const u8 = null;
         var results_errdefer_active = true;
         errdefer if (results_errdefer_active) {
             for (results[0..results_filled]) |*result| readers.deinitResult(alloc, result);
             alloc.free(results);
         };
         var image_offset: usize = 0;
-        while (image_offset < flat_images.items.len) {
-            const image_end = @min(image_offset + local_reader_batch_max_images, flat_images.items.len);
-            const chunk_images = flat_images.items[image_offset..image_end];
-            const chunk_results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
-                .images = chunk_images,
-                .prompt = shared_prompt,
-                .max_tokens = cfg_parsed.value.max_tokens,
-                .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
-                .source_fingerprint = requests[0].source_fingerprint,
-            });
-            if (chunk_results.len != chunk_images.len) {
+        const local_reader = isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl());
+        const reader_chunk_max_images = if (local_reader)
+            @min(localReaderBatchMaxImages(), capabilities.batch.max_items)
+        else
+            local_reader_batch_ceiling;
+        while (image_offset < total_images) {
+            // Encoded images carry identity per item, so compatible pages from
+            // different documents may share a model batch without losing
+            // attribution. URL-only inputs retain the conservative legacy
+            // source boundary until their transport also carries per-item
+            // identity.
+            const image_end = if (local_reader and !uses_encoded_media)
+                readerBatchEnd(flat_source_fingerprints.items, image_offset, reader_chunk_max_images)
+            else
+                @min(image_offset +| reader_chunk_max_images, total_images);
+            var chunk_fingerprint_buffer: [32]u8 = undefined;
+            const chunk_source_fingerprint = readerBatchSourceFingerprint(
+                flat_source_fingerprints.items[image_offset..image_end],
+                &chunk_fingerprint_buffer,
+            );
+            const chunk_batch = if (uses_encoded_media)
+                try self.readEncodedImagesWithConfigReported(alloc, cfg_parsed.value, .{
+                    .images = flat_encoded.items[image_offset..image_end],
+                    .prompt = shared_prompt,
+                    .max_tokens = cfg_parsed.value.max_tokens,
+                    .source_fingerprint = chunk_source_fingerprint,
+                })
+            else blk: {
+                const items = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
+                    .images = flat_images.items[image_offset..image_end],
+                    .prompt = shared_prompt,
+                    .max_tokens = cfg_parsed.value.max_tokens,
+                    .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
+                    .source_fingerprint = chunk_source_fingerprint,
+                });
+                break :blk readers.BatchResult{
+                    .items = items,
+                    .execution = .{ .mode = .serial, .requested_items = items.len },
+                };
+            };
+            const chunk_results = chunk_batch.items;
+            const chunk_execution: ReaderItemExecution = switch (chunk_batch.execution.mode) {
+                .native => blk: {
+                    native_batches += chunk_batch.execution.native_batches;
+                    break :blk .native;
+                },
+                .serial => .serial,
+                .fallback => blk: {
+                    fallback_reason = chunk_batch.execution.fallback_reason;
+                    break :blk .fallback;
+                },
+            };
+            @memset(execution_by_image[image_offset..image_end], chunk_execution);
+            if (chunk_results.len != image_end - image_offset) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
                 alloc.free(chunk_results);
                 return error.InvalidReaderResponse;
             }
             for (chunk_results, 0..) |result, j| {
+                if (uses_encoded_media and !readerResultMatchesImageIdentity(result, flat_encoded.items[image_offset + j])) {
+                    for (chunk_results) |*item| readers.deinitResult(alloc, item);
+                    alloc.free(chunk_results);
+                    return error.InvalidReaderResponseIdentity;
+                }
                 results[image_offset + j] = result;
             }
             results_filled += chunk_results.len;
@@ -541,27 +883,77 @@ pub const Runtime = struct {
             out[i] = try encodeReaderResults(alloc, request.content_type, results[offset .. offset + count]);
             offset += count;
         }
-        return out;
+        const report = summarizeReaderExecution(image_counts, execution_by_image, native_batches, fallback_reason);
+        return .{
+            .items = out,
+            .execution = report,
+        };
     }
 
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
         const cfg = parsed_cfg.generator;
+        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
+            self.antfly_provider != null and
+            self.antfly_provider.?.generate_messages_with_attachments != null and
+            request.media.len > 0;
         var parts: ?[]generating_runtime.ContentPart = null;
         defer if (parts) |items| freeGeneratorContentParts(alloc, items);
-        const content: generating_runtime.ChatMessageContent = if (request.source_parts_json) |raw_parts| blk: {
-            if (raw_parts.len == 0) break :blk .{ .text = request.source_text };
-            parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts);
+        const content: generating_runtime.ChatMessageContent = if (request.source_parts_json != null or request.media.len > 0) blk: {
+            const raw_parts = request.source_parts_json orelse "[]";
+            parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts, request.media, !local_attachments);
             break :blk .{ .parts = parts.? };
         } else .{ .text = request.source_text };
+        const messages = [_]generating_runtime.ChatMessage{.{ .role = .user, .content = content }};
+        if (local_attachments) {
+            const local = self.antfly_provider.?;
+            const resolve_capabilities = local.model_capabilities orelse return error.InvalidInferenceCapabilities;
+            const capabilities = try resolve_capabilities(local.ptr, alloc, cfg.model, .generate);
+            var encoded_bytes: usize = 0;
+            var modalities = inference_work.Modalities{ .text = true };
+            for (request.media) |media| {
+                try capabilities.validateMimeType(media.mime_type);
+                encoded_bytes = std.math.add(usize, encoded_bytes, media.bytes.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+                if (std.mem.startsWith(u8, media.mime_type, "image/")) {
+                    modalities.image = true;
+                } else if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
+                    modalities.audio = true;
+                } else return error.UnsupportedInferenceMimeType;
+            }
+            try capabilities.validateInvocation(.generate, .{
+                .item_count = 1,
+                .modalities = modalities,
+                .encoded_bytes = encoded_bytes,
+                .max_media_parts_per_item = request.media.len,
+            });
+            const attachments = try alloc.alloc(inference_work.Attachment, request.media.len);
+            defer alloc.free(attachments);
+            for (request.media, 0..) |media, i| attachments[i] = .{
+                .bytes = media.bytes,
+                .content_type = media.mime_type,
+                .identity = .{
+                    .item_id = request.item_id,
+                    .source_fingerprint = request.source_fingerprint,
+                    .page_number = request.page_number,
+                },
+            };
+            const result = try self.antfly_provider.?.generate_messages_with_attachments.?(
+                self.antfly_provider.?.ptr,
+                alloc,
+                cfg.model,
+                &messages,
+                attachments,
+            );
+            return result;
+        }
         const link = generating_runtime.ChainLink{ .generator = cfg };
         var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
-        }, &.{
-            .{ .role = .user, .content = content },
-        });
+        }, &messages);
         defer result.deinit();
         if (parsed_cfg.tool_output == .arguments) {
             return try toolCallArgumentsOutputAlloc(alloc, result.tool_calls, parsed_cfg.tool_name);
@@ -576,10 +968,32 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
 
-        var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        var source = try parseReaderSourceWithMetadataOnly(
+            alloc,
+            request.source_text,
+            request.source_parts_json,
+            request.media.len > 0,
+        );
         defer source.deinit(alloc);
 
-        const results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
+        const results = if (request.media.len > 0) blk: {
+            const encoded = try alloc.alloc(readers.EncodedImage, request.media.len);
+            defer alloc.free(encoded);
+            for (request.media, 0..) |media, i| encoded[i] = .{
+                .bytes = media.bytes,
+                .mime_type = media.mime_type,
+                .item_id = request.item_id,
+                .source_fingerprint = request.source_fingerprint,
+                .page_number = request.page_number,
+            };
+            break :blk try self.readEncodedImagesWithConfig(alloc, cfg_parsed.value, .{
+                .images = encoded,
+                .prompt = source.prompt orelse cfg_parsed.value.prompt,
+                .max_tokens = cfg_parsed.value.max_tokens,
+                .source_fingerprint = request.source_fingerprint,
+            });
+        } else try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
             .images = source.images,
             .prompt = source.prompt orelse cfg_parsed.value.prompt,
             .max_tokens = cfg_parsed.value.max_tokens,
@@ -595,6 +1009,13 @@ pub const Runtime = struct {
 
     fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
         if (isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
+            const capabilities = (try self.readerCapabilities(alloc, cfg)) orelse
+                return error.InvalidInferenceCapabilities;
+            try capabilities.validateInvocation(.read, .{
+                .item_count = request.images.len,
+                .modalities = .{ .image = true },
+                .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
+            });
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             return try read_images(local.ptr, alloc, cfg.model orelse "", request);
@@ -610,6 +1031,82 @@ pub const Runtime = struct {
 
         const provider = try runtime.get("asset");
         return try provider.read(alloc, request);
+    }
+
+    fn readEncodedImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) ![]readers.Result {
+        return (try self.readEncodedImagesWithConfigReported(alloc, cfg, request)).items;
+    }
+
+    fn readEncodedImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) !readers.BatchResult {
+        try readers.validateEncodedRequest(request);
+        if (isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
+            const capabilities = (try self.readerCapabilities(alloc, cfg)) orelse
+                return error.InvalidInferenceCapabilities;
+            var encoded_bytes: usize = 0;
+            for (request.images) |image| {
+                try capabilities.validateMimeType(image.mime_type);
+                encoded_bytes = std.math.add(usize, encoded_bytes, image.bytes.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+            }
+            try capabilities.validateInvocation(.read, .{
+                .item_count = request.images.len,
+                .modalities = .{ .image = true },
+                .encoded_bytes = encoded_bytes,
+                .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
+            });
+            const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (local.read_encoded_images_reported) |read_reported|
+                return try read_reported(local.ptr, alloc, cfg.model orelse "", request);
+            if (local.read_encoded_images) |read_encoded_images| {
+                const items = try read_encoded_images(local.ptr, alloc, cfg.model orelse "", request);
+                errdefer {
+                    for (items) |*item| readers.deinitResult(alloc, item);
+                    alloc.free(items);
+                }
+                if (items.len != request.images.len) return error.InvalidReaderResponse;
+                for (items, request.images) |*item, image| {
+                    if (item.item_id.len == 0 and image.item_id.len > 0) item.item_id = try alloc.dupe(u8, image.item_id);
+                    if (item.source_fingerprint == null) item.source_fingerprint = if (image.source_fingerprint) |value| try alloc.dupe(u8, value) else null;
+                    if (item.page_number == null) item.page_number = image.page_number;
+                }
+                return .{
+                    .items = items,
+                    .execution = .{ .mode = .serial, .requested_items = request.images.len },
+                };
+            }
+        }
+
+        // Remote providers and older embedded runtimes retain compatibility by
+        // adapting at the transport boundary. The PDF/enrichment path itself
+        // never materializes base64 when the local binary callback exists.
+        const urls = try alloc.alloc([]const u8, request.images.len);
+        var initialized: usize = 0;
+        defer {
+            for (urls[0..initialized]) |url| alloc.free(@constCast(url));
+            alloc.free(urls);
+        }
+        for (request.images, 0..) |image, i| {
+            const encoded_len = std.base64.standard.Encoder.calcSize(image.bytes.len);
+            const prefix_len = "data:;base64,".len + image.mime_type.len;
+            const url = try alloc.alloc(u8, prefix_len + encoded_len);
+            errdefer alloc.free(url);
+            const prefix = try std.fmt.bufPrint(url[0..prefix_len], "data:{s};base64,", .{image.mime_type});
+            std.debug.assert(prefix.len == prefix_len);
+            _ = std.base64.standard.Encoder.encode(url[prefix_len..], image.bytes);
+            urls[i] = url;
+            initialized += 1;
+        }
+        const items = try self.readImagesWithConfig(alloc, cfg, .{
+            .images = urls,
+            .prompt = request.prompt,
+            .max_tokens = request.max_tokens,
+            .inline_content_trust = .trusted_internal,
+            .source_fingerprint = request.source_fingerprint,
+        });
+        return .{
+            .items = items,
+            .execution = .{ .mode = .serial, .requested_items = request.images.len },
+        };
     }
 
     fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -820,10 +1317,6 @@ fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
 }
 
-fn readerSupportsPerImageBatch(provider: readers.Provider) bool {
-    return provider == .antfly;
-}
-
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
 }
@@ -836,6 +1329,86 @@ fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn readerResultMatchesImageIdentity(result: readers.Result, image: readers.EncodedImage) bool {
+    return std.mem.eql(u8, result.item_id, image.item_id) and
+        optionalStringsEqual(result.source_fingerprint, image.source_fingerprint) and
+        result.page_number == image.page_number;
+}
+
+/// Mirrors the native Florence chunk policy at the caller boundary. Keeping
+/// the exact environment contract here prevents an outer 64-image invocation
+/// from being silently repartitioned into differently attributed inner
+/// chunks. The server retains the same hard ceiling independently.
+fn localReaderBatchMaxImages() usize {
+    const configured = platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse
+        return default_local_reader_batch_images;
+    return std.math.clamp(configured, 1, local_reader_batch_ceiling);
+}
+
+fn readerBatchEnd(fingerprints: []const ?[]const u8, start: usize, max_images: usize) usize {
+    std.debug.assert(start < fingerprints.len);
+    std.debug.assert(max_images > 0);
+    const limit = @min(start +| max_images, fingerprints.len);
+    var end = start + 1;
+    while (end < limit and optionalStringsEqual(fingerprints[start], fingerprints[end])) : (end += 1) {}
+    return end;
+}
+
+test "asset producer runtime local reader chunks stop at source boundaries before the Florence cap" {
+    const fingerprints = [_]?[]const u8{ "pdf-a", "pdf-a", "pdf-b", "pdf-b" };
+    try std.testing.expectEqual(@as(usize, 2), readerBatchEnd(&fingerprints, 0, 8));
+    try std.testing.expectEqual(@as(usize, 4), readerBatchEnd(&fingerprints, 2, 8));
+    try std.testing.expectEqual(@as(usize, 1), readerBatchEnd(&fingerprints, 0, 1));
+}
+
+/// Preserve an exact source label for same-document batches. Mixed-document
+/// batches receive a stable aggregate label so profiling cannot accidentally
+/// attribute the entire model invocation to the first request.
+fn readerBatchSourceFingerprint(
+    fingerprints: []const ?[]const u8,
+    mixed_buffer: *[32]u8,
+) ?[]const u8 {
+    if (fingerprints.len == 0) return null;
+    const first = fingerprints[0];
+    var all_equal = true;
+    for (fingerprints[1..]) |fingerprint| {
+        if (!optionalStringsEqual(first, fingerprint)) {
+            all_equal = false;
+            break;
+        }
+    }
+    if (all_equal) return first;
+
+    var hasher = std.hash.Wyhash.init(0x616e_7466_6c79_6f63);
+    var length_bytes: [8]u8 = undefined;
+    for (fingerprints) |maybe_fingerprint| {
+        if (maybe_fingerprint) |fingerprint| {
+            hasher.update(&.{1});
+            std.mem.writeInt(u64, &length_bytes, @intCast(fingerprint.len), .big);
+            hasher.update(&length_bytes);
+            hasher.update(fingerprint);
+        } else {
+            hasher.update(&.{0});
+        }
+    }
+    return std.fmt.bufPrint(mixed_buffer, "mixed-{x}", .{hasher.final()}) catch unreachable;
+}
+
+test "asset producer runtime preserves or aggregates reader batch source fingerprints" {
+    const same = [_]?[]const u8{ "same", "same" };
+    var same_buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("same", readerBatchSourceFingerprint(&same, &same_buffer).?);
+
+    const mixed = [_]?[]const u8{ "first", "second" };
+    var first_buffer: [32]u8 = undefined;
+    var second_buffer: [32]u8 = undefined;
+    const first = readerBatchSourceFingerprint(&mixed, &first_buffer).?;
+    const second = readerBatchSourceFingerprint(&mixed, &second_buffer).?;
+    try std.testing.expect(std.mem.startsWith(u8, first, "mixed-"));
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(!std.mem.eql(u8, first, "first"));
 }
 
 const ReaderSource = struct {
@@ -851,6 +1424,15 @@ const ReaderSource = struct {
 };
 
 fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_json: ?[]const u8) !ReaderSource {
+    return try parseReaderSourceWithMetadataOnly(alloc, source_text, source_parts_json, false);
+}
+
+fn parseReaderSourceWithMetadataOnly(
+    alloc: Allocator,
+    source_text: []const u8,
+    source_parts_json: ?[]const u8,
+    allow_metadata_only: bool,
+) !ReaderSource {
     if (source_parts_json) |raw_parts| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
         defer parsed.deinit();
@@ -884,14 +1466,24 @@ fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_jso
                 }
             }
 
-            if (images.items.len > 0) {
+            if (images.items.len > 0 or allow_metadata_only) {
+                const owned_images = try images.toOwnedSlice(alloc);
+                errdefer {
+                    for (owned_images) |image| alloc.free(@constCast(image));
+                    alloc.free(owned_images);
+                }
                 return .{
-                    .images = try images.toOwnedSlice(alloc),
+                    .images = owned_images,
                     .prompt = if (prompt.items.len > 0) try prompt.toOwnedSlice(alloc) else null,
                 };
             }
+            // Preserve the established source_text fallback for ordinary URL
+            // readers. Reset both lists after deinit so their errdefers remain
+            // harmless if parsing source_text subsequently fails.
             prompt.deinit(alloc);
+            prompt = .empty;
             images.deinit(alloc);
+            images = .empty;
         }
     }
 
@@ -998,13 +1590,15 @@ fn antflyGenerateBatchRequestJsonAlloc(
     try out.appendSlice(alloc, "{\"mode\":\"sync\",\"requests\":[");
     for (requests, 0..) |request, i| {
         if (i > 0) try out.append(alloc, ',');
+        const content_json = try generatorRequestContentJsonAlloc(alloc, request);
+        defer alloc.free(content_json);
         const item = try std.fmt.allocPrint(
             alloc,
-            "{{\"custom_id\":\"{d}\",\"body\":{{\"model\":{f},\"messages\":[{{\"role\":\"user\",\"content\":{f}}}],\"mode\":\"eager\"",
+            "{{\"custom_id\":\"{d}\",\"body\":{{\"model\":{f},\"messages\":[{{\"role\":\"user\",\"content\":{s}}}],\"mode\":\"eager\"",
             .{
                 i,
                 std.json.fmt(cfg.model, .{}),
-                std.json.fmt(request.source_text, .{}),
+                content_json,
             },
         );
         defer alloc.free(item);
@@ -1018,6 +1612,55 @@ fn antflyGenerateBatchRequestJsonAlloc(
         try out.appendSlice(alloc, "}}");
     }
     try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Materialize provider JSON only at the remote HTTP boundary. The durable PDF
+/// path and embedded provider path keep renderer bytes borrowed.
+fn generatorRequestContentJsonAlloc(alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    if (request.source_parts_json == null and request.media.len == 0)
+        return try std.json.Stringify.valueAlloc(alloc, request.source_text, .{});
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var emitted = false;
+    if (request.source_parts_json) |raw_parts| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.InvalidGeneratorContentParts;
+        for (parsed.value.array.items) |part| {
+            if (part != .object) continue;
+            const type_value = part.object.get("type") orelse continue;
+            if (type_value != .string or std.mem.eql(u8, type_value.string, "metadata")) continue;
+            if (emitted) try out.append(alloc, ',');
+            const encoded = try std.json.Stringify.valueAlloc(alloc, part, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            emitted = true;
+        }
+    }
+    for (request.media) |media| {
+        if (emitted) try out.append(alloc, ',');
+        const encoded_len = std.base64.standard.Encoder.calcSize(media.bytes.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, media.bytes);
+        const part = try std.fmt.allocPrint(
+            alloc,
+            "{{\"type\":\"media\",\"mime_type\":{f},\"data\":{f}}}",
+            .{ std.json.fmt(media.mime_type, .{}), std.json.fmt(encoded, .{}) },
+        );
+        defer alloc.free(part);
+        try out.appendSlice(alloc, part);
+        emitted = true;
+    }
+    if (!emitted and request.source_text.len > 0) {
+        const part = try std.fmt.allocPrint(alloc, "{{\"type\":\"text\",\"text\":{f}}}", .{std.json.fmt(request.source_text, .{})});
+        defer alloc.free(part);
+        try out.appendSlice(alloc, part);
+    }
+    try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1090,7 +1733,13 @@ fn generateResponseContentAlloc(alloc: Allocator, response: std.json.Value) ![]u
     };
 }
 
-fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_parts: []const u8) ![]generating_runtime.ContentPart {
+fn parseGeneratorContentParts(
+    alloc: Allocator,
+    source_text: []const u8,
+    raw_parts: []const u8,
+    media_attachments: []const asset_producer.EncodedMedia,
+    encode_attachments: bool,
+) ![]generating_runtime.ContentPart {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
     defer parsed.deinit();
     if (parsed.value != .array) {
@@ -1137,6 +1786,26 @@ fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_par
                 }
             }
         }
+    }
+
+    for (media_attachments) |attachment| {
+        const data = if (encode_attachments) blk: {
+            const encoded_len = std.base64.standard.Encoder.calcSize(attachment.bytes.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            _ = std.base64.standard.Encoder.encode(encoded, attachment.bytes);
+            break :blk encoded;
+        } else "";
+        var data_owned = data.len > 0;
+        errdefer if (data_owned) alloc.free(@constCast(data));
+        const mime_type = try alloc.dupe(u8, attachment.mime_type);
+        var mime_owned = true;
+        errdefer if (mime_owned) alloc.free(mime_type);
+        try parts.append(alloc, .{ .media = .{
+            .data = data,
+            .mime_type = mime_type,
+        } });
+        data_owned = false;
+        mime_owned = false;
     }
 
     if (parts.items.len == 0) {
@@ -1246,6 +1915,128 @@ test "asset producer runtime passes rendered media parts to generators" {
     if (run_err) |err| return err;
     defer alloc.free(result.?);
     try std.testing.expectEqualStrings("vision result", result.?);
+}
+
+test "asset producer runtime passes rendered bytes to embedded generators without base64" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .generate_messages_with_attachments = generate,
+                .model_capabilities = capabilities,
+            };
+        }
+
+        fn capabilities(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            task: inference_work.Task,
+        ) !inference_work.InferenceCapabilities {
+            if (task != .generate) return error.TestUnexpectedResult;
+            return .{
+                .task = .generate,
+                .input_modalities = .{ .text = true, .image = true },
+                .accepted_mime_types = .{ .text_plain = true, .image_png = true },
+                .input_granularity = .page,
+                .batch = .{
+                    .mode = .serial_compatibility,
+                    .preferred_items = 8,
+                    .max_items = 128,
+                    .max_encoded_bytes = 64 * 1024 * 1024,
+                    .max_decoded_pixels = 50_000_000,
+                    .max_media_parts_per_item = 8,
+                },
+                .output = .generated_text,
+                .borrowed_attachments = true,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn generate(
+            ptr: *anyopaque,
+            a: Allocator,
+            model: []const u8,
+            messages: []const generating_runtime.ChatMessage,
+            attachments: []const inference_work.Attachment,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("google/gemma-4-mm", model);
+            try std.testing.expectEqual(@as(usize, 1), messages.len);
+            const parts = switch (messages[0].content orelse return error.TestUnexpectedResult) {
+                .parts => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            try std.testing.expectEqualStrings("Transcribe exactly", parts[0].text);
+            try std.testing.expectEqual(@as(usize, 0), parts[1].media.data.len);
+            try std.testing.expectEqual(@as(usize, 1), attachments.len);
+            try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x50, 0x4e, 0x47 }, attachments[0].bytes);
+            try std.testing.expectEqualStrings("image/png", attachments[0].content_type);
+            try std.testing.expectEqualStrings(if (self.calls == 1) "page:3" else "page:4", attachments[0].identity.item_id);
+            try std.testing.expectEqualStrings("doc-a", attachments[0].identity.source_fingerprint.?);
+            try std.testing.expectEqual(@as(?u32, @intCast(self.calls + 2)), attachments[0].identity.page_number);
+            return try a.dupe(u8, "borrowed vision result");
+        }
+    };
+
+    const png = [_]u8{ 0x89, 0x50, 0x4e, 0x47 };
+    var local = Local{};
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    const requests = [_]asset_producer.Request{
+        .{
+            .producer_type = .generator,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"google/gemma-4-mm\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"Transcribe exactly\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "doc-a",
+            .item_id = "page:3",
+            .page_number = 3,
+            .media = &.{.{ .bytes = &png, .mime_type = "image/png" }},
+        },
+        .{
+            .producer_type = .generator,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"google/gemma-4-mm\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"Transcribe exactly\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "doc-a",
+            .item_id = "page:4",
+            .page_number = 4,
+            .media = &.{.{ .bytes = &png, .mime_type = "image/png" }},
+        },
+    };
+    const producer = runtime.producer();
+    try std.testing.expectEqual(inference_work.BatchMode.serial_compatibility, try producer.batchMode(alloc, &requests));
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |result| try std.testing.expectEqualStrings("borrowed vision result", result);
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
 }
 
 fn expectOpenAiToolGeneratorRequest(req: httpx.testing_mod.RequestInfo) !void {
@@ -1371,6 +2162,7 @@ test "asset producer runtime stores forced tool arguments from plain json conten
 
 fn expectAntflyGenerateBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse "");
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mode\":\"sync\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"custom_id\":\"0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"custom_id\":\"1\"") != null);
@@ -1413,6 +2205,31 @@ fn expectJsonF32Field(value: std.json.Value, field: []const u8, expected: f32) !
     try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
 }
 
+fn testNativeReaderCapabilities(
+    _: *anyopaque,
+    _: Allocator,
+    _: []const u8,
+    task: inference_work.Task,
+) !inference_work.InferenceCapabilities {
+    if (task != .read) return error.TestUnexpectedResult;
+    return .{
+        .task = .read,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true, .image_jpeg = true, .image_webp = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 8,
+            .max_items = local_reader_batch_ceiling,
+            .max_encoded_bytes = 64 * 1024 * 1024,
+            .max_decoded_pixels = 50_000_000,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .read_result,
+        .borrowed_attachments = true,
+    };
+}
+
 test "owned asset producer foreground contract follows the selected route" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -1425,6 +2242,7 @@ test "owned asset producer foreground contract follows the selected route" {
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
+                .model_capabilities = testNativeReaderCapabilities,
             };
         }
 
@@ -1470,6 +2288,9 @@ test "asset producer runtime batches compatible antfly generator requests" {
     const io = io_impl.io();
 
     var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
+            .body = "{\"generators\":{\"local-generator\":{\"inputs\":[\"text\",\"image\"],\"capabilities\":[\"native_batch_generate_multimodal\"]}}}",
+        } },
         .{ .method = .POST, .path = "/generate/batch", .assert_request = expectAntflyGenerateBatchRequest, .respond = .{
             .body =
             \\{"object":"generate.batch","data":[
@@ -1486,7 +2307,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
     var runtime = Runtime.init(alloc, &client);
     const producer = runtime.producer();
 
-    const cfg_json = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"url\":\"{s}\",\"max_tokens\":24,\"temperature\":0.25,\"top_p\":0.9,\"top_k\":40,\"frequency_penalty\":0.1,\"presence_penalty\":0.2}}", .{server.baseUrl()});
+    const cfg_json = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"url\":\"{s}\",\"api_key\":\"test-token\",\"max_tokens\":24,\"temperature\":0.25,\"top_p\":0.9,\"top_k\":40,\"frequency_penalty\":0.1,\"presence_penalty\":0.2}}", .{server.baseUrl()});
     defer alloc.free(cfg_json);
 
     var results: ?[][]u8 = null;
@@ -1523,6 +2344,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
 
     try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
     try server.handleOne();
+    try server.handleOne();
     try group.await(io);
     if (run_err) |err| return err;
     defer {
@@ -1549,6 +2371,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
+                .model_capabilities = testNativeReaderCapabilities,
             };
         }
 
@@ -1609,6 +2432,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
+                .model_capabilities = testNativeReaderCapabilities,
             };
         }
 
@@ -1643,7 +2467,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
-    const results = try producer.produceBatch(alloc, &.{
+    const requests = [_]asset_producer.Request{
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
@@ -1658,13 +2482,111 @@ test "asset producer runtime batches compatible antfly reader requests" {
             .content_type = "text/plain",
             .inline_media_trusted = true,
         },
-    });
+    };
+    try std.testing.expect(try producer.canProduceBatch(alloc, &requests));
+    const results = try producer.produceBatch(alloc, &requests);
     defer {
         for (results) |result| alloc.free(result);
         alloc.free(results);
     }
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("first", results[0]);
+    try std.testing.expectEqualStrings("second", results[1]);
+    try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+}
+
+test "asset producer runtime batches local encoded media without base64 adaptation" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        read_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .read_images = readImages,
+                .read_encoded_images = readEncodedImages,
+                .model_capabilities = testNativeReaderCapabilities,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
+            return error.TestUnexpectedResult;
+        }
+
+        fn readEncodedImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.EncodedRequest) ![]readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("local-reader", model);
+            try std.testing.expectEqual(@as(usize, 2), request.images.len);
+            for (request.images, 0..) |image, i| {
+                const expected_suffix: u8 = @intCast(i + 1);
+                try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x50, 0x4e, 0x47, expected_suffix }, image.bytes);
+                try std.testing.expectEqualStrings("image/png", image.mime_type);
+                try std.testing.expectEqualStrings(if (i == 0) "first-source" else "second-source", image.source_fingerprint.?);
+            }
+            try std.testing.expectEqualStrings("<OCR>", request.prompt.?);
+            try std.testing.expect(request.source_fingerprint != null);
+
+            const out = try a.alloc(readers.Result, 2);
+            out[0] = .{ .text = try a.dupe(u8, "first") };
+            out[1] = .{ .text = try a.dupe(u8, "second") };
+            self.read_calls += 1;
+            return out;
+        }
+    };
+
+    const first_png = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 1 };
+    const second_png = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 2 };
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const requests = [_]asset_producer.Request{
+        .{
+            .producer_type = .reader,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "first-source",
+            .media = &.{.{ .bytes = &first_png, .mime_type = "image/png" }},
+        },
+        .{
+            .producer_type = .reader,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "second-source",
+            .media = &.{.{ .bytes = &second_png, .mime_type = "image/png" }},
+        },
+    };
+    try std.testing.expect(try producer.canProduceBatch(alloc, &requests));
+    try std.testing.expectEqual(inference_work.BatchMode.native, try producer.batchMode(alloc, &requests));
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
     try std.testing.expectEqualStrings("first", results[0]);
     try std.testing.expectEqualStrings("second", results[1]);
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
@@ -1756,6 +2678,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
+                .model_capabilities = testNativeReaderCapabilities,
             };
         }
 
@@ -1771,9 +2694,13 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expect(request.images.len > 0);
-            try std.testing.expect(request.images.len <= local_reader_batch_max_images);
+            try std.testing.expect(request.images.len <= localReaderBatchMaxImages());
             try std.testing.expect(request.prompt == null);
             if (self.read_calls >= self.batch_lengths.len) return error.TestUnexpectedResult;
+            if (self.read_calls == 0)
+                try std.testing.expectEqualStrings("head-source", request.source_fingerprint.?)
+            else
+                try std.testing.expectEqualStrings("tail-source", request.source_fingerprint.?);
             self.batch_lengths[self.read_calls] = request.images.len;
             self.read_calls += 1;
 
@@ -1797,13 +2724,16 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
-    const request_count = local_reader_batch_max_images + 1;
-    var urls: [request_count][]u8 = undefined;
+    const expected_batch_images = localReaderBatchMaxImages();
+    const request_count = expected_batch_images + 1;
+    const urls = try alloc.alloc([]u8, request_count);
+    defer alloc.free(urls);
     var urls_filled: usize = 0;
     defer {
         for (urls[0..urls_filled]) |url| alloc.free(url);
     }
-    var requests: [request_count]asset_producer.Request = undefined;
+    const requests = try alloc.alloc(asset_producer.Request, request_count);
+    defer alloc.free(requests);
     for (0..request_count) |i| {
         urls[i] = try std.fmt.allocPrint(alloc, "data:image/png;base64,{d}", .{i});
         urls_filled += 1;
@@ -1812,10 +2742,11 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
             .source_text = urls[i],
             .content_type = "text/plain",
+            .source_fingerprint = if (i < expected_batch_images) "head-source" else "tail-source",
         };
     }
 
-    const results = try producer.produceBatch(alloc, &requests);
+    const results = try producer.produceBatch(alloc, requests);
     defer {
         for (results) |result| alloc.free(result);
         alloc.free(results);
@@ -1823,7 +2754,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
 
     try std.testing.expectEqual(@as(usize, request_count), results.len);
     try std.testing.expectEqual(@as(usize, 2), local.read_calls);
-    try std.testing.expectEqual(@as(usize, local_reader_batch_max_images), local.batch_lengths[0]);
+    try std.testing.expectEqual(expected_batch_images, local.batch_lengths[0]);
     try std.testing.expectEqual(@as(usize, 1), local.batch_lengths[1]);
     for (results, urls) |result, url| {
         try std.testing.expectEqualStrings(url, result);

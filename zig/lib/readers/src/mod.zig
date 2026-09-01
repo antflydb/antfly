@@ -54,18 +54,99 @@ pub const Request = struct {
     source_fingerprint: ?[]const u8 = null,
 };
 
+/// Borrowed encoded image bytes for trusted in-process producers. This avoids
+/// converting renderer output to a data URI only to parse and decode it again.
+pub const EncodedImage = struct {
+    bytes: []const u8,
+    mime_type: []const u8,
+    /// Per-item provenance survives cross-document provider batches. These
+    /// fields are diagnostic identity, not model input.
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
+};
+
+pub const EncodedRequest = struct {
+    images: []const EncodedImage,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+};
+
+/// Validate the shared in-process encoded-image contract before execution
+/// mode selection. Keeping this here prevents embedded and standalone readers
+/// from accepting different requests.
+pub fn validateEncodedRequest(request: EncodedRequest) !void {
+    for (request.images) |image| {
+        if (image.bytes.len == 0) return error.InvalidImageInput;
+        const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
+        if (mime_type.len != image.mime_type.len or mime_type.len <= "image/".len or
+            !std.ascii.startsWithIgnoreCase(mime_type, "image/"))
+        {
+            return error.InvalidArguments;
+        }
+    }
+}
+
+test "encoded reader validation is execution-mode independent" {
+    const bytes = [_]u8{1};
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} });
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "IMAGE/PNG" }} });
+    try std.testing.expectError(
+        error.InvalidImageInput,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &.{}, .mime_type = "image/png" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "application/octet-stream" }} }),
+    );
+}
+
 pub const Result = struct {
     text: []const u8,
     fields_json: ?[]const u8 = null,
     regions_json: ?[]const u8 = null,
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
 };
 
 pub fn deinitResult(alloc: Allocator, result: *Result) void {
     alloc.free(@constCast(result.text));
     if (result.fields_json) |value| alloc.free(@constCast(value));
     if (result.regions_json) |value| alloc.free(@constCast(value));
+    if (result.item_id.len > 0) alloc.free(@constCast(result.item_id));
+    if (result.source_fingerprint) |value| alloc.free(@constCast(value));
     result.* = undefined;
 }
+
+pub const BatchExecutionMode = enum {
+    native,
+    serial,
+    fallback,
+};
+
+pub const BatchExecution = struct {
+    mode: BatchExecutionMode,
+    requested_items: usize,
+    native_batches: usize = 0,
+    fallback_reason: ?[]const u8 = null,
+};
+
+pub const BatchResult = struct {
+    items: []Result,
+    execution: BatchExecution,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.items) |*item| deinitResult(alloc, item);
+        alloc.free(self.items);
+        self.* = undefined;
+    }
+};
 
 pub const Reader = struct {
     ptr: *anyopaque,

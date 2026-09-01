@@ -83,11 +83,17 @@ pub const GeneratedEnrichmentKind = enum {
     asset,
 };
 
+pub const EmbeddingInput = enum {
+    text,
+    pdf_page_images,
+};
+
 pub const GeneratedEnrichmentRequest = struct {
     kind: GeneratedEnrichmentKind,
     index_name: []const u8,
     artifact_name: []const u8 = "",
     embedding_name: []const u8 = "",
+    embedding_input: EmbeddingInput = .text,
     doc_key: []const u8,
     source_field: []const u8,
     /// Handlebars template to render document fields for embedding.
@@ -164,6 +170,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .index_name = index_name,
         .artifact_name = artifact_name,
         .embedding_name = embedding_name,
+        .embedding_input = request.embedding_input,
         .doc_key = doc_key,
         .source_field = source_field,
         .source_template = source_template,

@@ -2119,6 +2119,39 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_mod, false, link_libc);
 
+    // A production-mode executable (builtin.is_test == false) keeps the large
+    // unit-test graph on its lightweight PDF stub while still exercising the
+    // native document-extraction coordinator against a real PDF fixture.
+    const pdf_ocr_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pdf_ocr_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pdf_integration_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("lib/pdf/integration_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_ocr_integration_mod.addImport("pdf_integration_fixture", pdf_integration_fixture_mod);
+    production_antfly_imports.configure(b, pdf_ocr_integration_mod, false, link_libc);
+    const pdf_ocr_integration = b.addExecutable(.{
+        .name = "pdf-ocr-integration",
+        .root_module = pdf_ocr_integration_mod,
+    });
+    const run_pdf_ocr_integration = b.addRunArtifact(pdf_ocr_integration);
+    const pdf_ocr_integration_step = b.step(
+        "pdf-ocr-integration-test",
+        "Run native PDF rendering and encoded reader batching through the OCR coordinator",
+    );
+    pdf_ocr_integration_step.dependOn(&run_pdf_ocr_integration.step);
+    const run_pdf_model_qualification = b.addRunArtifact(pdf_ocr_integration);
+    run_pdf_model_qualification.addArg("--qualify-real");
+    const pdf_model_qualification_step = b.step(
+        "pdf-model-qualification-test",
+        "Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL",
+    );
+    pdf_model_qualification_step.dependOn(&run_pdf_model_qualification.step);
+
     const lib_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
@@ -3148,6 +3181,7 @@ pub fn build(b: *std.Build) void {
     const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
     const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_pdf_test_step.dependOn(&run_pdf_ocr_integration.step);
 
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
@@ -3433,7 +3467,13 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{
+            "generating backend factory executes fallback chain across providers",
+            "asset producer runtime",
+            "inference capabilities",
+            "batch capabilities",
+            "remote Antfly",
+        },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -4877,6 +4917,8 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
             "document extraction reserves PDF decoder peak memory atomically",
+            "PDF native grant partitions concurrent inspection and render ownership",
+            "PDF operation reservation owns OCR allocation headroom",
             "PDF decoder reservation composes with every live slice owner",
             "PDF decoder credit and OCR transient allocations compose without double charging",
             "reserved PDF working set is bounded without duplicate resource charges",
@@ -7126,6 +7168,9 @@ pub fn build(b: *std.Build) void {
         "classified batch reservation distinguishes size from contention",
         "aggregate host memory admission is atomic across slices",
         "bounded observer growth grants aggregate slice and host capacity atomically",
+        "owned split reservations prevent concurrent headroom theft",
+        "owned split reservations reclaim before partial fallback",
+        "owned split secondary credit transfers into a budgeted allocator",
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
@@ -7512,6 +7557,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime module compiles",
             "standalone runtime local generator accepts media url data uris",
             "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone encoded reader ABI round trips borrowed payloads",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
             "standalone inference middleware reuses public API authentication",
@@ -7655,6 +7701,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
+    unit_test_step.dependOn(&run_pdf_ocr_integration.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
@@ -10871,6 +10918,31 @@ pub fn build(b: *std.Build) void {
             setStripRecursively(role_mod, &visited);
         }
     }
+
+    // Exercise the real production archive boundary for encoded-image reads.
+    // The probe resolves only the exported C function table, so it cannot
+    // accidentally pass by importing inference_host.zig into the test root.
+    const linked_inference_abi_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/inference_abi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linked_inference_abi_integration_mod.link_libc = link_libc;
+    addMacosSdkPaths(b, linked_inference_abi_integration_mod, target);
+    const linked_inference_abi_integration = b.addExecutable(.{
+        .name = "linked-inference-abi-integration",
+        .root_module = linked_inference_abi_integration_mod,
+    });
+    linked_inference_abi_integration.root_module.linkLibrary(
+        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+    );
+    const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
+    const linked_inference_abi_integration_step = b.step(
+        "linked-inference-abi-integration-test",
+        "Run the production-linked inference function-table and binary-payload ABI probe",
+    );
+    linked_inference_abi_integration_step.dependOn(&run_linked_inference_abi_integration.step);
+    lib_standalone_runtime_test_step.dependOn(&run_linked_inference_abi_integration.step);
 
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);

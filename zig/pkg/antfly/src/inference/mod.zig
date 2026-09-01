@@ -27,6 +27,8 @@ pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
+pub const work = @import("work.zig");
+pub const remote_capabilities = @import("remote_capabilities.zig");
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -48,6 +50,7 @@ test "inference module compiles" {
     _ = managed_embedder;
     _ = list_models;
     _ = query_embedding_cache;
+    _ = work;
 }
 
 test "bedrock provider request helpers" {

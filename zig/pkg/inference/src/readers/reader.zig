@@ -36,6 +36,15 @@ pub const Result = reader_types.Result;
 pub const ReadOptions = reader_types.ReadOptions;
 pub const StructuredValue = reader_types.StructuredValue;
 
+pub const BatchExecutionMode = enum { native, serial, fallback };
+
+pub const BatchResult = struct {
+    results: []Result,
+    mode: BatchExecutionMode,
+    native_batches: usize = 0,
+    fallback_reason: ?[]const u8 = null,
+};
+
 const ParserKind = enum {
     default,
     donut,
@@ -80,13 +89,18 @@ const VisionLoadedReader = struct {
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return (try self.readBatchReported(image_datas, options)).results;
+    }
+
+    pub fn readBatchReported(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) !BatchResult {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
-        const raw_results = try self.core.readRawBatch(image_datas, .{
+        const raw_batch = try self.core.readRawBatchReported(image_datas, .{
             .prompt = normalized_prompt,
             .max_tokens = options.max_tokens,
             .source_fingerprint = options.source_fingerprint,
         });
+        const raw_results = raw_batch.results;
         defer {
             for (raw_results) |raw| {
                 var tmp = raw;
@@ -106,7 +120,16 @@ const VisionLoadedReader = struct {
             out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
             filled += 1;
         }
-        return out;
+        return .{
+            .results = out,
+            .mode = switch (raw_batch.mode) {
+                .native => .native,
+                .serial => .serial,
+                .fallback => .fallback,
+            },
+            .native_batches = raw_batch.native_batches,
+            .fallback_reason = raw_batch.fallback_reason,
+        };
     }
 };
 
@@ -294,20 +317,24 @@ pub const LoadedReader = union(enum) {
     }
 
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return (try self.readBatchReported(image_datas, options)).results;
+    }
+
+    pub fn readBatchReported(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) !BatchResult {
         try validateReadOptions(options);
         const allocator = self.resultAllocator();
-        const results = try switch (self.*) {
-            .vision => |*reader| reader.readBatch(image_datas, options),
-            .genai => |*reader| reader.readBatch(image_datas, options),
-            .vlm => |*reader| reader.readBatch(image_datas, options),
-            .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
+        const batch = try switch (self.*) {
+            .vision => |*reader| reader.readBatchReported(image_datas, options),
+            .genai => |*reader| BatchResult{ .results = try reader.readBatch(image_datas, options), .mode = .serial },
+            .vlm => |*reader| BatchResult{ .results = try reader.readBatch(image_datas, options), .mode = .serial },
+            .multistage => |*reader| BatchResult{ .results = try readBatchSerial(@TypeOf(reader.*), reader, image_datas, options), .mode = .serial },
         };
         errdefer {
-            for (results) |*result| result.deinit();
-            allocator.free(results);
+            for (batch.results) |*result| result.deinit();
+            allocator.free(batch.results);
         }
-        for (results) |*result| try sanitizeResultUtf8(result);
-        return results;
+        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        return batch;
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {

@@ -1,0 +1,1269 @@
+# Bounded document preparation and multimodal inference
+
+Status: bounded document preparation, indexed reader execution, multimodal
+generation transport, and durable page-image embedding implemented
+
+This document describes how Antfly turns documents into bounded inference work.
+PDF extraction, page rendering, OCR, generation, and embedding share document
+preparation, media transport, scheduling, admission, identity, and failure
+semantics. Reader, generator, and embedder outputs remain deliberately distinct.
+
+Florence 2 is the first natively batched reader implementation, not the
+architecture boundary. Gemma4 multimodal is a generator: PDF OCR with Gemma4 is
+a batch of independent generation requests containing page images and an OCR
+prompt. ClipClap is a multimodal embedder: it embeds PDF-derived page images,
+extracted text, or chunks, but does not interpret a multi-page PDF container.
+Antfly must prepare those inputs first.
+
+The durable document pipeline must not be confused with template-time PDF
+helpers. `remotePDF` is a deprecated compatibility helper that extracts text.
+`remoteMedia mode="render"` renders only the first PDF page. Those helpers
+prepare one inference request and do not provide durable, bounded, multi-page
+orchestration.
+
+## Long-term architecture
+
+```text
+DocumentSource
+      |
+      v
+PreparedDocument
+  identity, MIME, page metadata, immutable parsed state
+      |
+      v
+bounded transformation stream
+  PageText | ChunkText | PageImage | other media
+      |
+      +--> ReaderExecutor    -> structured read/OCR results
+      |
+      +--> GeneratorExecutor -> generated text or tool output
+      |
+      +--> EmbedderExecutor  -> vectors
+```
+
+The reusable abstraction is document preparation plus typed work scheduling,
+not a universal reader. The three executor classes may share attachments,
+admission, batching, provenance, cancellation, and per-item result envelopes;
+they must not share task semantics merely because all three can consume images.
+
+### Task-neutral document preparation
+
+A `PreparedDocument` owns source identity, MIME type, stable page metadata, and
+the lifetime of immutable parsed state. It exposes lazy transformations rather
+than eagerly retaining every representation:
+
+- embedded page text and layout metadata;
+- chunked text;
+- rendered page images;
+- stable document, page, and transformation identities; and
+- source fingerprint plus render/extraction parameters.
+
+Consumers declare the assets they require. The planner renders only the next
+admitted window, shares an immutable parse and safe window-local results when
+multiple consumers have compatible requirements, and releases rendered bytes
+after all consumers of that window finish. A future transform cache is keyed by
+source fingerprint, page, renderer version, DPI, pixel/dimension limits, and
+render profile; it must never be keyed by URL alone.
+
+### Task-specific executors
+
+| Task | Example | Input | Output |
+| --- | --- | --- | --- |
+| Read/OCR | Florence 2 | page image plus read prompt | structured page text |
+| Generate | Gemma4 multimodal | independent message containing a page image | generated text/tool output |
+| Embed | ClipClap | page image, text chunk, or audio | vector |
+
+A generator used for OCR is still a generator. It keeps generator sampling,
+chat-template, output-schema, tool, and result semantics. A reader keeps its
+structured reading result. An embedder produces vectors and never passes
+through text-quality selection.
+
+### Resolved model capabilities
+
+Batching decisions belong to the resolved model and backend, not merely the
+provider enum or a model-name substring. The model resolver exposes an
+`InferenceCapabilities` value containing at least:
+
+```zig
+const InferenceCapabilities = struct {
+    task: Task,
+    input_modalities: Modalities,
+    accepted_mime_types: MimeTypes,
+    input_granularity: enum { document, page, chunk },
+    batch: struct {
+        mode: enum { none, serial_compatibility, native },
+        preferred_items: usize,
+        max_items: usize,
+        max_encoded_bytes: usize,
+        max_decoded_pixels: u64,
+        max_media_parts_per_item: usize,
+        per_item_failures: bool,
+    },
+    output: enum { read_result, generated_text, embedding },
+    result_cardinality: enum { one_per_item, one_per_request },
+    prompt_policy: enum { explicit, model_default, structured_schema },
+    borrowed_attachments: bool,
+};
+```
+
+Capabilities are discovered after model resolution and may differ by backend.
+Configuration may restrict a capability but must not assert support the loaded
+model does not have. Compatibility serialization is reported as
+`serial_compatibility`; it is never described in telemetry as a native batch.
+The local resolver and remote `/ai/v1/models` catalog use the same normalized
+native-batch flags. Manifests may lower the server defaults with
+`inference.batch.preferred_items=`, `inference.batch.max_items=`,
+`inference.batch.max_encoded_bytes=`,
+`inference.batch.max_decoded_pixels=`, and
+`inference.batch.max_media_parts_per_item=` capabilities. Planning uses these
+values for window formation and every executor validates the concrete
+invocation again, so a caller cannot bypass the limits by skipping the planner.
+
+### Generic bounded scheduler
+
+The scheduler groups work only when task, resolved model identity, backend,
+prompt/schema, transformation parameters, and output cardinality are
+compatible. Each window is bounded simultaneously by:
+
+- item count and serialized bytes;
+- retained encoded bytes and decoded pixels;
+- PDF decoder and renderer scratch memory;
+- renderer worker count and thread-safety mode;
+- model admission and provider request limits; and
+- cancellation and deadline.
+
+One render window is the default. Optional render/inference overlap uses one
+prefetch window and is enabled only after admission reserves the combined peak
+of both windows. Estimates guide scheduling; hard bounded allocators, decoder
+limits, and model admission remain the enforcement boundary.
+
+### Generic borrowed attachment ABI
+
+Reader, generator, and embedder invocations use one versioned borrowed
+attachment representation:
+
+```zig
+const Attachment = extern struct {
+    bytes: String,
+    content_type: String,
+};
+
+const AttachmentRef = struct {
+    attachment_index: usize,
+    item_index: usize,
+    source_fingerprint: ?[]const u8,
+    page_number: ?u32,
+};
+```
+
+Operation JSON contains attachment references; bytes are borrowed for the
+duration of the synchronous invocation. The host validates ABI version,
+pointer/count consistency, indexes, MIME types, byte limits, and per-item
+cardinality before borrowing memory. Unsupported remote transports perform
+base64 or multipart adaptation only at their final provider boundary.
+
+Per-item identity removes the current need to split otherwise compatible local
+batches at document boundaries solely for profiling. Cross-document batching
+is then permitted without losing provenance.
+
+### Typed per-item results and honest execution reports
+
+All executors return an indexed envelope while retaining task-specific values:
+
+```zig
+const WorkItemResult = struct {
+    item_id: []const u8,
+    source_fingerprint: ?[]const u8,
+    page_number: ?u32,
+    value: union(Task) {
+        read: ReadResult,
+        generate: GenerateResult,
+        embed: []const f32,
+    },
+    failure: ?ItemFailure,
+};
+
+const ExecutionReport = struct {
+    requested_items: usize,
+    native_batches: usize,
+    native_items: usize,
+    serial_items: usize,
+    fallback_items: usize,
+    fallback_reason: ?[]const u8,
+};
+```
+
+Envelope failures fail the invocation. Deterministic item failures remain
+attached to the failed item so valid siblings continue. Telemetry distinguishes
+requested batching, native execution, serial compatibility, and fallback.
+
+### PDF embedding semantics
+
+"Embed this PDF" is not one implicit operation. Configuration selects one or
+more durable artifacts:
+
+- one vector per extracted-text chunk;
+- one visual vector per rendered page;
+- both text and visual vectors in named embedding spaces; or
+- an explicit document-level reduction with a named, versioned reducer.
+
+Page vectors retain page identity. Text and visual spaces are never silently
+mixed, and page vectors are never implicitly pooled into one document vector.
+This preserves incremental updates, selective reprocessing, and explainable
+retrieval.
+
+## Review findings and required fixes
+
+The following findings apply to the implementation described later in this
+document. They are architectural requirements, not Florence-specific cleanup:
+
+1. **OCR was coupled to readers.** The durable configuration and planner must
+   select a task-specific reader or generator executor. Gemma4 must not be
+   wrapped in `LoadedReader` merely to reuse page rendering.
+2. **Batch support was inferred from provider identity.** Replace
+   `provider == antfly` checks with resolved model/backend capabilities.
+3. **An accepted outer batch could execute serially inside the reader.** Return
+   an execution report and label non-native families as serial compatibility.
+4. **The local binary ABI was operation-specific.** Generalize binary payloads
+   and per-item attachment references across read, generate, and embed.
+5. **One source fingerprint described an entire model call.** Carry identity
+   per item so cross-document native batches retain exact provenance.
+6. **Prompt behavior was inferred from model-name text.** Prompt family and
+   output schema come from resolved capabilities or explicit configuration.
+   Model-name detection remains compatibility-only and emits a diagnostic.
+7. **Embedding templates were mistaken for durable PDF processing.** Durable
+   page/chunk artifacts use enrichment replay and the bounded document
+   renderer; template helpers remain request-local compatibility conveniences.
+8. **Local embedders were capped at one media part at the provider level.**
+   Apply model cardinality limits and expose a true per-page embedding batch
+   rather than sending an ambiguous multi-page content list as one vector.
+9. **The generation batch endpoint rejected multimodal requests.** Accept
+   bounded independent multimodal items when the resolved model supports them;
+   report serial execution honestly until a native multimodal batch path is
+   available.
+10. **Production integration coverage was Florence-shaped.** Add the same
+    bounded render fixture through generic fake reader, generator, and embedder
+    executors, plus real-model opt-in tests for Florence, Gemma4, and ClipClap.
+
+## Migration sequence and implementation status
+
+1. **Implemented:** shared task, work identity, borrowed attachment,
+   capability, batch-mode, and execution-report contracts were added without
+   changing durable artifact keys.
+2. **Implemented:** local reader batching is selected from resolved model
+   capabilities. Native and serial-compatibility modes are distinct, and OCR
+   profiling no longer labels an accepted serial batch as native.
+3. **Implemented:** provider ABI v20 separates borrowed binary payload storage
+   from logical attachment references. One generator item may own several
+   attachments, while read and embedding batches retain independent item,
+   source, and page identity. Reader, generator, and embedder host paths borrow
+   the same representation; remote transports encode only at the HTTP
+   boundary.
+4. **Implemented:** document OCR selects `reader` or `generator` explicitly.
+   The generation batch endpoint accepts bounded multimodal requests and uses
+   controlled serial execution for projector/session safety until a resolved
+   model advertises native multimodal generation batching. Embedded local
+   generators use the same bounded batch boundary and report
+   `serial_compatibility` while invoking page messages synchronously.
+5. **Implemented:** dense multimodal embedders expose a true
+   `embedDensePartItems` operation with strict one-vector-per-item cardinality.
+   A bounded page window can therefore enter ClipClap as one item per rendered
+   page. `embedRenderedPdfPageBatch` performs that connector while retaining
+   page numbers and render failures. The durable `pdf_page_images` input plans
+   one admitted render/inference window at a time, persists one vector artifact
+   per stable page key, publishes it to each consuming index, and removes stale
+   vectors when the document loses pages. Each page artifact fingerprints the
+   exact rendered image plus semantic model configuration, never only the
+   source URL. Page outputs are written to a private staging namespace. A retry
+   clears that request's prior staging records, all page failures are checked,
+   and only a complete attempt promotes artifacts and performs stale-page
+   cleanup. A partial attempt therefore cannot overwrite or delete the last
+   complete public page-vector set; the normal durable retry supervisor either
+   retries it or records terminal repair debt.
+6. **Implemented:** capability lookup participates in reader, generator, and
+   dense-embedder planning. MIME acceptance, item count, encoded bytes, decoded
+   pixels, media cardinality, and result cardinality are validated at executor
+   boundaries. Unknown remote capabilities remain conservative.
+7. **Implemented:** observed reader execution propagates from the native
+   pipeline through the standalone boundary. OCR telemetry distinguishes
+   native completion, compatibility serialization, and native-to-serial
+   fallback instead of logging the preflight prediction. Mixed completion
+   retains native batch counts and classifies only the affected logical items
+   as serial/fallback.
+8. **Implemented locally:** prompt policy is resolved during configuration
+   parsing, and execution no longer guesses prompt semantics from a model name.
+   Model-name detection is confined to backward-compatible config migration.
+   Remote Antfly execution discovers resolved inputs, normalized native-batch
+   support, and model-owned limits from `/ai/v1/models`; discovery failure uses
+   conservative serial/single-item behavior instead of guessing.
+9. **Deliberately deferred:** fused inspection/render preparation and a single
+   prefetched window require profiling and combined admission. One-window
+   execution remains the safe default.
+10. **Implemented for deterministic CI:** the production-mode two-page PDF
+    fixture traverses reader, generator, and embedder contracts and verifies
+    native reader batching, honest serial generator reporting, and one visual
+    vector per page. `zig build pdf-model-qualification-test` is the opt-in
+    real Florence, Gemma4, and ClipClap release gate; it requires the endpoint,
+    three resolved model names, and embedding dimensions listed under Testing.
+    Model bundles and accelerator backends remain outside hermetic CI.
+
+The detailed PDF renderer design below remains normative for the
+`PreparedDocument -> PageImage` transformation. References to Florence describe
+the initial `ReaderExecutor`, not a restriction on the shared pipeline.
+
+### Durable visual embedding configuration
+
+A dense index opts into page-image semantics explicitly; existing text and
+chunk configurations do not change behavior:
+
+```json
+{
+  "generator": {
+    "kind": "dense_embedding",
+    "source_field": "document_url",
+    "artifact_name": "pdf_pages_v1",
+    "embedding_name": "pdf_visual_v1",
+    "input": "pdf_page_images"
+  },
+  "execution": {
+    "embedding": {
+      "batch_items": 8,
+      "batch_bytes": 67108864
+    }
+  }
+}
+```
+
+`artifact_name` is the stable page-unit namespace. Vector keys derive from
+`(document, artifact_name, page:NNNNNN, embedding_name)`. Resolved model
+capabilities can only reduce the configured item, byte, and pixel windows;
+document data and index configuration cannot raise them.
+
+Renderer scratch and retained PNGs are two ceilings over the same
+operation-owned allocator grant. The planner splits that grant before each
+window and requires `scratch_bytes + retained_bytes <= available_bytes`; it
+also refreshes the cancellation deadline at each window boundary. This avoids
+depending on allocator failure to enforce the combined peak.
+
+The central idea is a document-scoped streaming microbatcher:
+
+```text
+parse and inspect embedded text
+           |
+           v
+select pages that need OCR
+           |
+           v
+prepare one document-scoped render session
+           |
+           v
+render a bounded page window
+  (controlled CPU parallelism)
+           |
+           v
+run one Florence batch
+           |
+           v
+merge by page number, persist, release memory
+           |
+           +---------- repeat ----------+
+```
+
+## Goals
+
+- Amortize PDF parsing and resource discovery across all OCR pages in a
+  document.
+- Fill native Florence batches rather than invoking the model once per page.
+- Permit controlled parallel page rendering without assuming that the current
+  PDF reader is thread-safe.
+- Bound live compressed bytes, decoded pixels, renderer scratch memory, OCR
+  request bytes, model memory, and the result reorder buffer.
+- Preserve request order, page identity, embedded-text quality comparison,
+  durable retry behavior, and per-page failure isolation.
+- Apply backpressure so a large PDF cannot render arbitrarily far ahead of OCR
+  or persistence.
+- Keep unsupported reader families and remote providers correct through a
+  deliberate serial fallback.
+
+## Non-goals
+
+- This proposal does not make every reader model natively batched. Florence 2
+  is the initial optimized model family.
+- This proposal does not require concurrent rendering in the first milestone.
+  A document-scoped serial renderer behind the batch contract is already a
+  useful improvement.
+- This proposal does not initially share mutable PDF renderer caches between
+  threads.
+- This proposal does not change page or chunk artifact keys.
+
+## Current implementation
+
+Antfly now has a bounded document-scoped render and OCR pipeline:
+
+- Document extraction identifies PDF pages with missing or low-quality
+  embedded text and marks them `pending_ocr`.
+- Generated OCR work is collected using an item and byte policy. The defaults
+  are eight items, an operator maximum of eight items, and 64 MiB of request
+  bytes.
+- One stable, heap-owned PDF OCR coordinator is retained for the entire
+  document operation, including across streaming OCR microbatch flushes. Its
+  `PdfRenderSession` discovers the page tree once, and each admitted render
+  worker receives a private
+  `Reader.forkForRendering` snapshot with its own allocator, caches,
+  cancellation probe, render targets, and diagnostics.
+- `renderParsedPagesBatchAlloc` accepts an explicit page window, preserves
+  request order and page identity, isolates deterministic page failures, and
+  enforces batch-page, parallelism, pixel, in-flight byte, retained PNG, and
+  per-worker allocator limits.
+- One atomic operation reservation owns three disjoint subcredits: PDF text
+  inspection, PDF render coordination/workers, and retained/transient OCR
+  output. Inspection and rendering use separate hard bounded allocators because
+  the inspection reader remains alive while a streaming callback renders a
+  window; they can never spend the same logical native bytes. The synchronous
+  path uses the inspection subcredit for its initial extraction rather than
+  transferring only output credit and leaving native capacity idle.
+  The combined native side is partially grantable and the output side is
+  required.
+  Concurrent documents cannot steal the output credit after admission, and a
+  full request gets normal cache reclamation before partial native fallback.
+  The output credit is atomically transferred into the `BudgetedAllocator`
+  that owns streaming retained state and transient provider buffers (and the
+  synchronous path's downloaded source and provider buffers). Native credit
+  is partitioned after admission into non-overlapping inspection and render
+  ceilings. After the render session is prepared, its remaining credit must
+  still fit a minimum raster; otherwise the operation fails before launching a
+  worker. Decode limits and render geometry shrink to a smaller partial grant
+  instead of admitting a mathematically impossible worker. The available worker
+  allowance is recomputed from live coordinator allocations before every
+  window. Both the byte-derived pixel allowance and the explicit in-flight
+  pixel cap participate in adaptive geometry, so a tighter operator pixel
+  limit reduces DPI instead of rejecting an otherwise renderable page.
+- Render workers use freeing, task-local bounded allocators rather than arenas,
+  so their limits measure peak live memory instead of cumulative allocations.
+  Multi-worker waves rendezvous after thread creation and are released from a
+  start gate together. Telemetry reports `peak_launched_workers` for the
+  deterministic wave width and `peak_parallelism` separately for workers
+  actually inside rendering; waiting workers are never counted as renderers.
+  Cancellation
+  releases the gate immediately, so a late worker cannot extend the operation
+  past its render deadline.
+  Each worker downsizes an oversized PNG to its request byte ceiling before
+  the result is copied into retained batch storage.
+- The enrichment runtime renders only the next OCR microbatch. It holds no
+  prefetched window, transfers each rendered PNG into the matching producer
+  request, flushes OCR, and releases the bytes before preparing another
+  window.
+- The local Antfly reader producer flattens compatible page requests into one
+  image list while retaining original request boundaries. Borrowed encoded
+  pages carry item, source, and page identity independently, so compatible
+  pages from different documents may now share a native batch. Legacy URL-only
+  reader inputs remain source-bounded until that transport carries the same
+  per-item identity.
+- Rendered PNGs cross the asset producer and standalone inference ABI as
+  generic borrowed attachments. Reader, generator, and embedding operations
+  share payload validation and provenance. Providers without a binary callback
+  adapt to data URIs only at their final transport boundary. JSON metadata
+  repeats payload count, and the inference host rejects cardinality mismatches,
+  invalid item indexes, and missing pointers before borrowing bytes.
+- The read endpoint and direct read interface accept up to 64 images and apply
+  aggregate encoded-byte and decoded-pixel admission. Direct encoded-image
+  calls charge their already-resident bytes once; only URL/data-URI paths
+  reserve prospective download storage.
+- Native Florence chunks image inputs by
+  `ANTFLY_INFERENCE_READ_BATCH_SIZE`, which defaults to eight. Each chunk uses
+  a batched encoder and, where supported, a batched incremental KV decoder.
+- Page render latency is captured inside each worker and returned with its
+  indexed page result. Window scheduling, start-gate wait, and later OCR work
+  are not mislabeled as page render time.
+- Results are returned in input order. Unsupported providers and malformed
+  native batch responses fall back to isolated serial work.
+- Generator-backed OCR uses independent page messages and generic OCR prompt
+  semantics; it is not routed through `LoadedReader`. Multimodal generation
+  batches are admitted but currently reported as `serial_compatibility` while
+  shared projector/session state is serialized.
+- Multimodal embedding exposes one-vector-per-part batch semantics for page
+  images and text chunks. It never silently pools a document. The integration
+  fixture exercises the same bounded two-page render window through fake
+  Florence reader, Gemma generator, and ClipClap embedder boundaries.
+- Mixed-EOS Florence batch decoding uses the same row update helper for the KV
+  and full-decoder paths and has a regression test proving that finished rows
+  remain padded while active rows retain independent lengths.
+
+The implementation intentionally does not prefetch a second render window.
+That keeps memory and backpressure simple: render, infer, merge, release, then
+advance. Decoded-pixel handoff and sharing the extraction parse with the render
+session remain measurement-driven follow-ups.
+
+## Required invariants
+
+The implementation must preserve the following invariants:
+
+1. Page identity is explicit. Results are joined by `page_number`, never by
+   completion order alone.
+2. At most one admitted render window is retained per document unless an
+   explicitly admitted prefetch window is enabled.
+3. Every concurrent renderer owns all mutable state it touches.
+4. The parsed document outlives every page render task and is destroyed only
+   after all tasks have joined.
+5. A page cannot be persisted as successfully OCRed until its output has passed
+   OCR validation and embedded-text quality comparison.
+6. A permanent page failure does not fail valid sibling pages.
+7. A systemic failure such as shutdown, allocator failure, or unavailable
+   capacity cancels and joins the whole render group.
+8. Item and byte limits are supplemented by aggregate pixel and working-set
+   limits.
+9. Provider fallbacks are observable; a batch must never silently become
+   serial work.
+10. Admission estimates improve scheduling, while hard allocators and decoder
+    limits enforce safety when estimates are low.
+11. Native decoder reservation must leave explicit capacity for every
+    allocator-backed owner charged to the same resource slice.
+12. Reported peak render concurrency is measured from workers actually
+    executing, not from the planned wave width.
+
+## Target pipeline
+
+### 1. Inspect the document and select OCR candidates
+
+Embedded PDF text extraction continues to produce stable page units. OCR
+candidate selection remains based on `ocr_mode` and `OcrQuality`.
+
+The candidate list contains stable page metadata rather than rendered bytes:
+
+```zig
+const PdfOcrCandidate = struct {
+    unit_index: usize,
+    page_number: u32,
+    embedded_quality: OcrQuality,
+    force_ocr: bool,
+};
+```
+
+Born-digital pages that pass quality checks do not enter the render scheduler.
+Sparse candidate lists such as pages 1, 5, and 19 remain valid and preserve
+their original unit positions.
+
+### 2. Parse once and separate immutable from mutable render state
+
+The coordinator's `PdfRenderSession` is deliberately treated as
+non-thread-safe. Parallel rendering is implemented by preparing the base parse
+and giving every worker a private `Reader.forkForRendering` snapshot with its
+own allocator and mutable caches. Conceptually, that is the following split:
+
+```zig
+const ParsedPdfDocument = struct {
+    source: []const u8,
+    object_index: ImmutableObjectIndex,
+    page_tree: ImmutablePageTree,
+    resources: ImmutableResourceMetadata,
+
+    fn createRenderContext(
+        self: *const ParsedPdfDocument,
+        allocator: Allocator,
+    ) !PdfPageRenderContext;
+};
+
+const PdfPageRenderContext = struct {
+    allocator: Allocator,
+    graphics_state: GraphicsState,
+    decoded_streams: TaskLocalDecodeCache,
+    font_state: TaskLocalFontState,
+    compositing_scratch: TaskLocalCompositingScratch,
+};
+```
+
+The names above are illustrative; the important ownership boundary is not.
+Object tables, page-tree structure, source bytes, and immutable resource
+descriptions may be shared. Decoded streams, graphics stacks, font mutation,
+image buffers, transparency buffers, and encoder state must initially be
+task-local.
+
+Any existing lazy cache must be handled in one of three ways:
+
+1. Populate and freeze it before starting render tasks.
+2. Move it into `PdfPageRenderContext`.
+3. Protect it with narrowly scoped synchronization and document why contention
+   is acceptable.
+
+The implemented choice is task-local state. A future renderer may use a mutex
+around a narrowly scoped shared cache, but a mutex around a whole session would
+be serialized and must be reported as such.
+
+The first batch-render milestone may parse once for the render operation in
+addition to the earlier embedded-text extraction parse. A later fused PDF
+preparation operation can share one parsed document across embedded-text
+analysis and rendering, reducing the document to one total parse. Avoid an
+opaque cross-ABI session handle unless measurements show that the fused or
+coarse streaming operation cannot meet backpressure requirements; handles add
+lifetime and runtime-artifact compatibility risk.
+
+### 3. Use a bounded multi-page render boundary
+
+`zig/lib/pdf` exposes a coarse in-process document operation. Origin main no
+longer has the older enrichment-compute render ABI, so reintroducing an opaque
+cross-artifact session handle would add lifecycle risk without helping the
+current call graph. The implemented public shape is:
+
+```zig
+pub const PageRenderRequest = struct {
+    page_number: usize,
+    requested_dpi: u16 = 150,
+    max_pixels: u64 = 40_000_000,
+    max_dimension: u32 = 4096,
+};
+
+pub const PageRenderBatchOptions = struct {
+    max_batch_pages: usize = 8,
+    max_parallel_pages: usize = 1,
+    max_inflight_pixels: u64 = 50_000_000,
+    max_inflight_bytes: usize = 512 * 1024 * 1024,
+    max_retained_png_bytes: usize = 64 * 1024 * 1024,
+    bytes_per_pixel_reserve: usize = 12,
+    cancellation: reader.CancellationProbe = .{},
+};
+```
+
+The returned `RenderedPageBatch.results` array is in request order. Each result
+contains the explicit page number and exactly one of a rendered PNG or a page
+failure. `RenderedPageBatch.deinit` releases every unclaimed result. The
+enrichment coordinator may take a result by clearing its optional rendered
+value, after which it owns and eventually releases that PNG.
+
+The provider performs these steps inside one call:
+
+1. Validate all limits and page numbers.
+2. Reuse the document-scoped parsed reader.
+3. Create a bounded render group.
+4. Render admitted pages using private contexts.
+5. Copy completed PNGs to the caller allocator in coordinator order.
+6. Cancel and join workers on a systemic failure.
+7. Destroy the parsed document after the final worker joins.
+
+The existing single-page functions remain available for compatibility. New
+document OCR work performs adaptive encoded-size retries inside the batch
+worker, before retained-output admission.
+
+### 4. Use controlled parallel rendering
+
+Parallel rendering uses two levels of admission in the current runtime:
+
+- Global resource-manager byte admission and bounded enrichment execution lanes
+  prevent concurrent PDFs from multiplying memory without limit.
+- A per-document worker cap prevents one large PDF from creating an unbounded
+  thread group.
+
+The resource-manager admission is one owned split reservation. With the
+defaults, the operation must own the 64 MiB OCR transient-output credit and may
+own the requested inspection-plus-render native capacity. A partial native
+grant is divided proportionally into non-overlapping inspection and render
+ceilings; both must remain nonzero when both phases are requested. Another
+operation cannot consume the already-owned output side. An unusable native
+partition or unavailable required output credit fails before parsing starts.
+
+A separate process-wide CPU permit pool remains an optional follow-up if
+operational measurements show that the bounded enrichment lanes are too coarse.
+
+Page count is not a sufficient weight. Before scheduling a page, derive its
+target dimensions after DPI and dimension clamping, then estimate:
+
+```text
+RGBA output bytes
++ resampling scratch
++ drawing and compositing scratch
++ bounded PDF stream decode reservation
++ encoded PNG estimate
++ retained OCR request bytes
+```
+
+The scheduler acquires a weighted reservation:
+
+```zig
+const PdfRenderAdmission = struct {
+    workers: usize = 1,
+    pixels: u64,
+    working_bytes: usize,
+};
+```
+
+Estimates are intentionally conservative. Every task also uses a hard
+`BudgetedAllocator`, and PDF stream decoding retains its existing decoded
+stream and peak working-set limits. An underestimate therefore causes an
+identified resource failure rather than unbounded growth.
+
+Effective per-document concurrency is:
+
+```text
+min(requested concurrency,
+    operator concurrency cap,
+    memory-budget-derived concurrency,
+    pages remaining in the active OCR window)
+```
+
+Start with a default concurrency of one, not the machine CPU count.
+Concurrency greater than one must remain disabled until the immutable document
+and task-local context split is complete.
+
+The renderer should initially schedule pages in document order. More complex
+size-aware scheduling is possible later, but it increases reorder-buffer
+pressure and makes latency harder to reason about. Page-number-keyed results
+still make completion order irrelevant to correctness.
+
+### 5. Fill one bounded render/OCR window
+
+Rendering must not run across the whole document before inference. The
+enrichment runtime fills one microbatch subject to all limits:
+
+```text
+candidate count       <= OCR batch item cap
+serialized/encoded    <= OCR batch byte cap
+rendered pixels       <= render window pixel cap
+working-set estimate  <= render window memory cap
+```
+
+Pseudocode:
+
+```zig
+while (next_candidate < candidates.len) {
+    const window = try scheduler.renderNextWindow(candidates[next_candidate..]);
+    defer window.deinit();
+
+    const readable_pages = collectSuccessfulPagesByPageNumber(window.results);
+    const ocr_results = try reader.readBatch(readable_pages);
+    try applyPageResults(units, readable_pages, ocr_results);
+    try recordRenderFailures(units, window.results);
+
+    next_candidate += window.consumed_candidates;
+}
+```
+
+The tail batch is allowed to be smaller. A page whose individual request is
+larger than the operation cap is recorded as a permanent request-size failure
+without preventing later pages from progressing.
+
+The initial unified default should be eight OCR pages, matching the native
+Florence default. The byte and pixel caps may produce smaller batches for large
+pages.
+
+### 6. Remove the local base64 and JSON round trip
+
+Add an internal binary media representation to `asset_producer.Request`:
+
+```zig
+pub const MediaInput = struct {
+    bytes: []const u8,
+    mime_type: []const u8,
+    trusted_internal: bool,
+};
+
+pub const Request = struct {
+    // Existing fields...
+    media: []const MediaInput = &.{},
+};
+```
+
+The local Antfly reader producer can pass trusted rendered PNG bytes directly
+to the direct reader interface. Remote providers may serialize media according
+to their transport requirements, but that serialization should not be imposed
+on the local path.
+
+This removes:
+
+- PNG-to-base64 expansion.
+- JSON escaping and parsing.
+- Data-URI parsing.
+- Base64 decoding into a second encoded-image allocation.
+
+A later optimization may pass decoded RGB images or preprocessed Florence
+pixel tensors directly to the reader. That should be a separate milestone:
+crossing the enrichment/inference boundary with decoded images increases ABI
+surface area and makes pixel-buffer admission and format compatibility more
+important. The encoded binary handoff captures most of the avoidable overhead
+with substantially less coupling.
+
+### 7. Execute the native OCR batch
+
+Compatible local Antfly reader requests are flattened into an image list and
+submitted to `LoadedReader.readBatch`. Preserve these behaviors:
+
+- The original request-to-image ranges are retained so results can be
+  reassembled correctly.
+- Native Florence chunks by its effective model batch cap.
+- Florence encoder execution is batched.
+- CUDA and Metal use the batched incremental KV path where supported.
+- Rows that reach EOS stop accumulating output text while unfinished rows
+  continue.
+- Unsupported shapes fall back to the full batched decoder, then to the serial
+  reader only for documented compatibility errors.
+- The batch result count must equal the submitted image count.
+
+The document batch cap and Florence batch cap should share a common effective
+value or, at minimum, be exposed together in status and profiling. A document
+batch larger than the Florence cap is still correct, but it creates an extra
+hidden chunk boundary.
+
+### 8. Merge and persist page results
+
+Every render and OCR result is keyed by page number and mapped back to its
+stable unit index:
+
+```zig
+const PageOcrResult = union(enum) {
+    success: struct {
+        page_number: u32,
+        output: ReaderResult,
+    },
+    failure: struct {
+        page_number: u32,
+        stage: enum { render, preprocess, inference, validation },
+        retryable: bool,
+        identity: FailureIdentity,
+    },
+};
+```
+
+For successful OCR, retain the existing comparison between embedded and OCR
+quality. OCR must not erase substantial embedded text with a trivial or worse
+response. Update method, status, confidence, regions, render metadata, and
+failure provenance before generating the final unit and chunk artifacts.
+
+Rendered buffers are released immediately after their OCR result is applied.
+The pipeline must not retain completed PNGs through later artifact writes.
+
+## Backpressure and optional overlap
+
+The initial implementation should render one window, OCR it, release it, and
+then render the next. This is simple and has a clear peak-memory bound.
+
+An optional double-buffered mode can overlap CPU rendering of window N+1 with
+GPU OCR of window N:
+
+```text
+CPU render:  [ window N ] [ window N+1 ] [ window N+2 ]
+GPU OCR:                  [ window N   ] [ window N+1 ]
+```
+
+Enable this only with `prefetch_batches = 1`, and admit the combined memory of
+the active OCR window and the prefetched render window. Values greater than one
+are unnecessary initially and risk recreating whole-document buffering.
+
+If the inference queue is saturated, rendering must stop at the admitted
+window. Likewise, a render scheduler with no permits must not reserve an
+inference slot while waiting if doing so can create a resource-order deadlock.
+Define and test one global acquisition order, for example:
+
+1. Document extraction working-set lease.
+2. Render-window lease.
+3. Inference queue units only after the window is ready.
+
+Release in reverse order where practical. Do not hold inference units while
+waiting for render workers.
+
+## Configuration and operator caps
+
+The public execution policy should express desired batching while operator
+settings impose hard ceilings. A possible configuration shape is:
+
+```yaml
+execution:
+  batch_items: 8
+  batch_bytes: 67108864
+
+ocr:
+  render:
+    concurrency: 2
+    max_inflight_pages: 8
+    max_inflight_pixels: 50000000
+    max_inflight_bytes: 268435456
+    prefetch_batches: 0
+```
+
+Suggested operator controls:
+
+```text
+ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS
+ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS
+ANTFLY_ENRICHMENT_OCR_BATCH_BYTES
+ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES
+ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS
+ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES
+```
+
+Empty, zero, overflowing, and malformed values need explicit semantics. In
+general, requested values are clamped to at least one where zero would disable
+progress. Parallel pages are hard-clamped to eight. Parallel rendering defaults
+to one; operators can opt into higher CPU concurrency only after assigning an
+aggregate byte budget that admits it. Prefetch is not implemented and is
+therefore effectively zero.
+
+Status output should report requested and effective values so operators can
+tell when admission or a hard cap reduced concurrency or batch size.
+
+## Failure semantics
+
+Failures fall into three categories.
+
+### Per-page permanent failures
+
+Examples include an unsupported page resource, a malformed page content
+stream, a page exceeding a hard dimension limit, trivial OCR output, or prompt
+echo. Record the page failure and continue with valid siblings.
+
+Reader/generator OCR results may preserve successful siblings because their
+page text is independently attributable. Durable page-image embedding has a
+stronger publication rule: one failed or missing vector fails that document
+attempt before coverage or stale cleanup. Successful sibling vectors remain
+private staging records and are discarded at retry start. This prevents a
+short or partially failed provider response from silently shrinking the
+searchable document.
+
+### Batch/provider failures
+
+Examples include a response-count mismatch or a backend operator unsupported
+for the batch shape. For a permanent batch-compatibility failure, retry only
+that microbatch serially and record the fallback reason. Do not restart already
+completed windows.
+
+If one item poisons an otherwise valid provider batch, preprocessing should
+identify it before model execution where possible. Otherwise, serial isolation
+is limited to the failed microbatch.
+
+### Systemic retryable failures
+
+Examples include inference capacity, model availability, transient transport,
+shutdown, and global resource pressure. These yield to the durable enrichment
+worker according to the existing retry budget. Do not convert a capacity
+failure into permanent page coverage merely because it occurred during a
+batch.
+
+All outstanding render tasks must be cancelled and joined before returning a
+systemic error. No callback may access the parsed document after the provider
+returns. Each render wave composes the caller's deadline with a wave-local
+atomic stop flag. A worker that observes cancellation or a systemic allocator
+failure stops sibling work cooperatively; the coordinator still joins every
+spawned thread before propagating the error. Peak concurrency telemetry counts
+workers between their actual enter/leave transitions, including inline
+thread-spawn fallbacks.
+
+## Observability
+
+The opt-in `ANTFLY_INFERENCE_READ_PROFILE` stream now reports per-page render
+events, render-window page ranges, requested and peak concurrency, peak
+admitted pixels and bytes, thread-spawn fallbacks, OCR batch mode, fallback
+reason, request bytes, source fingerprint, and elapsed time. Long-lived status
+counters can be added if these events prove useful operationally. The full
+desired inventory is:
+
+- PDFs parsed for text and PDFs parsed for rendering.
+- Render-session reuse count and pages per session.
+- Requested and effective render concurrency.
+- Active render workers, pixels, estimated bytes, and actual peak bytes.
+- Render windows started/completed and pages per window.
+- Page render latency and window fill latency.
+- OCR batches started/completed, pages, encoded bytes, and rendered pixels.
+- Native Florence batch size and internal chunk count.
+- Batch, full-decoder fallback, and serial fallback counts with reasons.
+- Per-stage page failures and retryability.
+- Time waiting for render permits and inference queue units.
+- GPU OCR utilization relative to CPU render time.
+
+Existing source fingerprints are included in profile logs without logging
+document content or rendered image bytes. Borrowed attachments carry item,
+source, and page identity independently, so compatible local work may batch
+across documents while every inner chunk and serial fallback retains exact
+provenance.
+
+## Test plan
+
+### Functional batching
+
+- An eight-page scanned PDF produces one render window and one Florence batch.
+- A ten-page scanned PDF produces windows and OCR batches of eight and two.
+- A mixed PDF batches only selected pages while retaining original unit order.
+- Sparse candidate pages map back to the correct units.
+- Batch output is byte-for-byte equivalent to serial output for deterministic
+  fixtures.
+- Florence rows with different EOS lengths match serial decoding.
+
+### Rendering and thread safety
+
+- Instrumentation proves one render parse/session per document operation.
+- Concurrency one uses the same batch ABI and output as the legacy path.
+- Concurrency two or greater produces identical page images under repeated
+  stress.
+- A wave-start rendezvous makes launched-worker concurrency deterministic even
+  for fixtures whose individual pages render faster than thread scheduling.
+- Task-local decode, font, graphics, and compositing state does not leak across
+  pages.
+- The parsed document remains alive until all workers join.
+- Cancellation during every render stage joins workers and frees buffers.
+- Cancellation while workers are still arriving at the wave-start gate
+  releases both arrived and late workers without waiting for the missing
+  arrival.
+- Allocation-failure injection at every ownership transfer is leak-free.
+- Thread-sanitizer or equivalent stress coverage is used where supported.
+- `zig build pdf-ocr-integration-test` runs as a production-mode executable
+  (`builtin.is_test == false`) and renders both pages of a real fixture through
+  one document-scoped coordinator. It carries both PNGs through the
+  asset-producer encoded-media path and verifies one local reader callback with
+  two ordered images. It asserts two launched workers and separately validates
+  the honest active-renderer range of one through two, preventing
+  the normal Antfly unit-test PDF stub or a start-gate wait count from making
+  native integration coverage pass vacuously. The same executable is a
+  dependency of `lib-pdf-test` and the aggregate `unit-test`, so CI runs the
+  production path rather than leaving it as an opt-in check.
+- Durable enrichment tests seed an existing public page vector, stage one
+  successful sibling beside a failed page, and verify that retry startup keeps
+  the old vector while clearing private partial output. A complete retry then
+  promotes both vectors and removes both staging records.
+- Capability tests verify local executor rejection and remote catalog parsing
+  for modalities, MIME, item, byte, pixel, and media-part limits.
+
+### Real-model qualification
+
+The non-hermetic release gate renders the same two-page fixture and sends its
+pages through actual remote Antfly reader, generator, and embedder contracts:
+
+```sh
+ANTFLY_PDF_QUALIFICATION_URL=http://127.0.0.1:8082/ai/v1 \
+ANTFLY_PDF_QUALIFICATION_READER_MODEL=florence2 \
+ANTFLY_PDF_QUALIFICATION_GENERATOR_MODEL=gemma4 \
+ANTFLY_PDF_QUALIFICATION_EMBEDDER_MODEL=clipclap \
+ANTFLY_PDF_QUALIFICATION_EMBED_DIMS=768 \
+zig build pdf-model-qualification-test
+```
+
+The gate requires two non-empty reader results, two non-empty generator
+results, and two vectors with the configured dimensions. It intentionally
+fails when the environment is absent, so a release job cannot accidentally
+report model qualification after running only the fake providers.
+
+### Admission and memory
+
+- Item, encoded-byte, pixel, and working-set thresholds each split windows at
+  the correct boundary.
+- A single oversized page fails individually without blocking later pages.
+- Actual live memory remains below the combined declared caps.
+- The native reservation preserves the configured tracked-output headroom
+  as an owned credit under competing slice owners.
+- The owned output credit transfers atomically into the allocator that owns
+  both retained OCR state and transient provider buffers; manager usage does
+  not change during the transfer and exact live-byte accounting resumes as
+  buffers are released.
+- Partial native grants reserve a viable minimum raster after persistent parse
+  state and a bounded decode workspace. Page geometry is derived from the
+  remaining byte grant before worker admission.
+- A per-page pixel cap below the requested geometry adaptively lowers DPI and
+  succeeds when the minimum supported render geometry still fits.
+- The synchronous precompute path downloads and materializes its temporary
+  extraction and OCR state through a BudgetedAllocator before allocation; it
+  uses the same atomic inspection/render/output partition as streaming
+  extraction. Its extracted units remain under inspection ownership until they
+  are destroyed, so the native reservation is not released early.
+- Streaming text inspection, its borrowed callback unit, the persistent render
+  coordinator, and render forks are simultaneously covered by distinct hard
+  ceilings whose sum is the one native reservation.
+- In the streaming path, provider request construction, returned transient
+  buffers, and persistent OCR text use the same tracked allocator, so a full
+  split reservation cannot starve the retained-state copy it was intended to
+  protect. The synchronous path keeps extracted and replacement unit state
+  under its inspection ceiling until teardown while its output allocator owns
+  provider buffers.
+- Source-session cache growth between windows reduces the next window's
+  computed worker allowance.
+- Underestimated pages are stopped by the budgeted allocator.
+- Many concurrent documents obey the global weighted-byte cap and bounded
+  enrichment execution lanes.
+- Prefetch mode admits both buffers and never retains more than the configured
+  number of windows.
+- Queue saturation applies backpressure instead of accumulating rendered
+  pages.
+- Resource acquisition order cannot deadlock render and inference workers.
+
+### Failure isolation and replay
+
+- One render failure does not poison sibling pages.
+- One trivial OCR result does not poison sibling pages.
+- A malformed native batch response falls back only for that window.
+- A transient inference failure yields without persisting false terminal
+  coverage.
+- Retry resumes deterministically without duplicating or skipping page
+  artifacts.
+- A crash after rendering but before persistence does not require rendered
+  images to be durable; replay safely rerenders the pages.
+- Existing embedded text survives an inferior OCR response.
+
+### Boundary compatibility
+
+- Existing single-page render functions remain available.
+- Invalid batch limits and page numbers return explicit failures.
+- Batch-owned buffers are destroyed exactly once, including partial failure.
+- The standalone inference ABI version is bumped when borrowed binary payload
+  segments are added, and prefix validation rejects mismatched artifacts.
+- The standalone encoded-image codec round-trips multiple borrowed payloads
+  with ordered MIME types and metadata, accepts empty input without invoking a
+  model, and rejects missing pointers or JSON/binary count mismatches. The
+  unit conformance test traverses request construction, dispatch, response
+  serialization, and destruction through a model-free handler seam.
+- `zig build linked-inference-abi-integration-test` links the separately
+  generated production inference archive, resolves only
+  `antfly_standalone_inference_get_function_table`, and verifies function-table
+  prefix validation, wrapper-owned version rejection, stable `Status` mapping,
+  and borrowed binary MIME rejection without importing `inference_host.zig`.
+  The focused standalone runtime test depends on this executable.
+
+## Implementation status and follow-ups
+
+### Phase 0: Baseline and parity coverage
+
+Status: production plumbing and the opt-in real-model gate are complete;
+release environments still own model parity and performance baselines.
+
+- Add end-to-end metrics for parse, render, handoff, and Florence execution.
+- Add native Florence batch-versus-serial parity tests.
+- Add a representative scanned PDF benchmark with 1, 4, 8, and 16 pages.
+- Record current parse count, peak memory, render time, OCR time, and total
+  throughput.
+
+### Phase 1: Unify OCR batching policy
+
+Status: complete.
+
+- Change the document OCR default from four to eight where resource defaults
+  permit it.
+- Keep the document and Florence caps independently operator-controlled and
+  profile actual batch and internal chunk behavior.
+- Retain item and byte caps and add an aggregate rendered-pixel cap.
+- Preserve current serial provider fallback behavior.
+
+### Phase 2: Batch-render ABI with serial execution
+
+Status: complete as an in-process `zig/lib/pdf` boundary; the obsolete
+enrichment-compute ABI is not reintroduced.
+
+- Add the streaming multi-page render ABI and indexed page results.
+- Parse once per batch-render document operation.
+- Implement it with `max_parallel_pages = 1` using the current renderer.
+- Migrate enrichment runtime callers.
+- Keep the existing single-page API alongside the batch API for compatibility.
+
+This phase removes repeated per-page parsing without making thread-safety
+claims.
+
+### Phase 3: Immutable document and controlled concurrency
+
+Status: complete for document-local concurrency plus global resource-manager
+byte admission. Parallelism defaults to one and is operator-capped at eight.
+
+- Split parsed immutable PDF state from mutable page render contexts.
+- Move lazy mutable caches to task-local state or freeze them before workers
+  start.
+- Use global resource-manager byte admission plus a per-document worker cap.
+- Add private freeing budgeted allocators per task.
+- Enable operator-capped concurrency, defaulting to one.
+- Add cancellation, join, and concurrency stress tests.
+- Keep one stable coordinator across streaming OCR flushes, compose
+  wave-local cancellation with the external deadline, and report measured
+  rather than planned concurrency.
+- Reserve native and transient output memory as one owned split, reclaim before
+  partial fallback, atomically transfer output credit to the live allocator,
+  partition partial native grants into persistent/decode/raster budgets, and
+  recompute available render bytes before each window.
+- Downsize encoded output within each worker before retaining a completed page.
+
+### Phase 4: Binary local media handoff
+
+Status: complete, including operation-neutral borrowed binary segments across
+reader, generator, and embedder standalone runtime calls, with data-URI
+fallback at unsupported provider boundaries.
+
+- Extend the internal asset producer request with trusted binary media.
+- Add a direct encoded-image batch reader entry point.
+- Reconstruct generator media placeholders and embedding binary parts from the
+  same borrowed attachment array with strict redundant-count validation.
+- Treat direct encoded media as already resident so admission does not add a
+  fictitious second download allocation.
+- Remove base64/data-URI serialization from local PDF OCR.
+- Keep serialization adapters for remote providers.
+
+### Phase 5: Render/OCR pipeline overlap
+
+Status: optional follow-up. The implemented pipeline intentionally keeps
+prefetch at zero.
+
+- Add optional one-window prefetch.
+- Admit active OCR and prefetched render memory together.
+- Stop rendering when inference backpressure prevents the current window from
+  advancing.
+- Compare end-to-end throughput and peak memory against the non-overlapped
+  implementation.
+
+### Phase 6: Optional decoded-image handoff
+
+Status: measurement-driven follow-up.
+
+- Measure whether PNG encode/decode remains material after Phase 4.
+- If justified, define a stable decoded pixel format at the local boundary.
+- Feed decoded image batches directly into Florence preprocessing.
+- Preserve encoded-image fallback for other reader families.
+
+### Phase 7: Fuse PDF inspection and render preparation if needed
+
+Status: measurement-driven follow-up.
+
+- Measure the remaining cost of parsing once for embedded text and once for the
+  render operation.
+- If material, add a coarse PDF preparation operation that shares one parsed
+  document across text analysis and candidate rendering.
+- Prefer a single bounded streaming operation over a long-lived opaque ABI
+  handle.
+
+## Acceptance criteria
+
+The implemented baseline satisfies these criteria:
+
+- Compatible multi-page PDF OCR requests use the native Florence batch path by
+  default, with an eight-item document default.
+- A document is parsed once for its render operation, independent of the
+  number of OCR pages.
+- Render concurrency is explicitly capped and never derived from CPU count.
+- Aggregate pixels and working bytes are admitted before concurrent work, and
+  every worker also has a hard live-allocation ceiling.
+- Page order and artifact identity are stable across concurrency levels.
+- A permanent page failure does not prevent valid siblings from completing.
+- A systemic cancellation or allocator failure joins the render wave and
+  retains durable retry semantics.
+- Profile events identify batched, serialized, chunked, and fallback work.
+- The production-mode native integration target submits both pages of a real
+  two-page PDF through one document-scoped coordinator, then exercises a
+  bounded rendered-page window through reader, generator, and embedder task
+  contracts.
+- That integration launches a two-worker render wave, reports the independently
+  observed active-renderer range, and makes one ordered two-image encoded reader
+  callback through the production asset producer runtime. The generic portion
+  additionally verifies borrowed Gemma-style generation attachments and one
+  ClipClap-style vector per page in one embedding invocation.
+
+The following remain qualification work rather than architectural blockers:
+
+- Run `pdf-model-qualification-test` in the accelerator-backed release lane
+  for the exact Florence, Gemma4, and ClipClap artifacts being shipped.
+- Run serial-versus-batch Florence output parity against the production model
+  fixture in CI; the mixed-EOS state transition already has hermetic coverage.
+- Add a corpus benchmark for 1, 4, 8, and 16 pages and publish peak RSS and
+  pages-per-second thresholds.
+- Promote selected profile fields to long-lived runtime status counters after
+  operational use establishes which counters are actionable.
+
+## Open decisions
+
+- Whether immutable font program parsing should eventually be frozen and
+  shared. The safe implementation keeps font and image caches task-local.
+- Whether the conservative source-size, decode-working-set, and
+  bytes-per-pixel reservation can be tightened with measured high-water data.
+- Whether a process-wide CPU permit pool materially improves control beyond
+  the existing per-document cap, bounded enrichment execution lanes, and
+  global resource-manager byte reservation.
+- Whether the long-term pipeline should retain PNG as the local interchange
+  format or move directly to RGB pixels after measuring Phase 4.
+- Whether extraction and render preparation should share one parse after
+  measuring the remaining second document parse.

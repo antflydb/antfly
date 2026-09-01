@@ -90,6 +90,15 @@ pub const ReadResult = struct {
     }
 };
 
+pub const BatchExecutionMode = enum { native, serial, fallback };
+
+pub const ReadBatchResult = struct {
+    results: []ReadResult,
+    mode: BatchExecutionMode,
+    native_batches: usize = 0,
+    fallback_reason: ?[]const u8 = null,
+};
+
 pub const ReadingPipeline = struct {
     allocator: std.mem.Allocator,
     vision_encoder: backends.Session,
@@ -157,39 +166,59 @@ pub const ReadingPipeline = struct {
     /// back to the existing serial path; native Florence uses a batched encoder
     /// and KV-decoder path where the selected backend supports it.
     pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        return (try self.readBatchReported(image_datas)).results;
+    }
+
+    /// Execute a read batch and report the path that actually completed. This
+    /// deliberately reports after fallback, rather than repeating capability
+    /// prediction at the caller.
+    pub fn readBatchReported(self: *ReadingPipeline, image_datas: []const []const u8) !ReadBatchResult {
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
         const allocator = self.allocator;
-        if (image_datas.len == 0) return try allocator.alloc(ReadResult, 0);
+        if (image_datas.len == 0) return .{ .results = try allocator.alloc(ReadResult, 0), .mode = .serial };
         if (image_datas.len == 1) {
             logReadBatchMode("single", image_datas, null);
             const out = try allocator.alloc(ReadResult, 1);
             errdefer allocator.free(out);
             out[0] = try self.read(image_datas[0]);
-            return out;
+            return .{ .results = out, .mode = .serial };
         }
         if (expectsFlattenedPatches(self.vision_encoder)) {
             logReadBatchMode("serial", image_datas, "flattened_patches_model");
-            return self.readBatchSerial(image_datas);
+            return .{ .results = try self.readBatchSerial(image_datas), .mode = .serial };
         }
 
         if (session_factory.getFlorenceConfig(self.vision_encoder) != null) {
-            logReadBatchMode("native_florence", image_datas, null);
-            return self.readBatchNativeFlorenceChunked(image_datas) catch |err| switch (err) {
+            const max_batch = nativeFlorenceReadBatchSize();
+            if (max_batch <= 1) {
+                logReadBatchMode("serial", image_datas, "configured_batch_size_one");
+                return .{ .results = try self.readBatchSerial(image_datas), .mode = .serial };
+            }
+            const results = self.readBatchNativeFlorenceChunked(image_datas) catch |err| switch (err) {
                 error.UnsupportedShape,
                 error.UnsupportedOperation,
                 error.UnsupportedFlorence2ResidentMetal,
                 => {
                     logReadBatchMode("serial_fallback", image_datas, @errorName(err));
-                    return self.readBatchSerial(image_datas);
+                    return .{
+                        .results = try self.readBatchSerial(image_datas),
+                        .mode = .fallback,
+                        .fallback_reason = @errorName(err),
+                    };
                 },
                 else => return err,
+            };
+            return .{
+                .results = results,
+                .mode = .native,
+                .native_batches = std.math.divCeil(usize, image_datas.len, max_batch) catch unreachable,
             };
         }
 
         logReadBatchMode("serial", image_datas, "non_florence_model");
-        return self.readBatchSerial(image_datas);
+        return .{ .results = try self.readBatchSerial(image_datas), .mode = .serial };
     }
 
     fn readBatchSerial(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
@@ -215,6 +244,7 @@ pub const ReadingPipeline = struct {
             logReadBatchMode("serial", image_datas, "configured_batch_size_one");
             return self.readBatchSerial(image_datas);
         }
+        logReadBatchMode(if (image_datas.len > max_batch) "native_florence_chunked" else "native_florence", image_datas, null);
 
         const out = try allocator.alloc(ReadResult, image_datas.len);
         var filled: usize = 0;
@@ -366,7 +396,7 @@ pub const ReadingPipeline = struct {
 
         var lengths = try allocator.alloc(usize, batch);
         defer allocator.free(lengths);
-        var finished = try allocator.alloc(bool, batch);
+        const finished = try allocator.alloc(bool, batch);
         defer allocator.free(finished);
         @memset(finished, false);
 
@@ -434,28 +464,22 @@ pub const ReadingPipeline = struct {
                 const logits = try cb.toFloat32(logits_tensor, allocator);
                 defer allocator.free(logits);
 
-                const vocab_size = florence_cfg.vocab_size;
-                for (0..batch) |b| {
-                    if (finished[b]) {
-                        step_tokens[b] = @as(i64, self.config.pad_token_id);
-                        continue;
-                    }
-                    const row = dec_ids[b * max_len ..][0..max_len];
-                    const logits_offset = std.math.mul(usize, b, vocab_size) catch return error.InvalidInputShape;
-                    const last_logits = logits[logits_offset..][0..vocab_size];
-                    const best_id = selectGreedyToken(last_logits, row[0..dec_len], self.config.no_repeat_ngram_size);
-                    if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) {
-                        finished[b] = true;
-                        finished_count += 1;
-                        lengths[b] = dec_len;
-                        step_tokens[b] = @as(i64, self.config.pad_token_id);
-                    } else {
-                        const token: i64 = @intCast(best_id);
-                        row[dec_len] = token;
-                        step_tokens[b] = token;
-                        lengths[b] = dec_len + 1;
-                    }
-                }
+                finished_count += try applyFlorenceBatchGreedyStep(
+                    dec_ids,
+                    batch,
+                    max_len,
+                    dec_len,
+                    finished,
+                    lengths,
+                    logits,
+                    florence_cfg.vocab_size,
+                    0,
+                    florence_cfg.vocab_size,
+                    self.config.eos_token_id,
+                    self.config.pad_token_id,
+                    self.config.no_repeat_ngram_size,
+                    step_tokens,
+                );
             }
 
             dec_len += 1;
@@ -521,7 +545,7 @@ pub const ReadingPipeline = struct {
 
         var lengths = try allocator.alloc(usize, batch);
         defer allocator.free(lengths);
-        var finished = try allocator.alloc(bool, batch);
+        const finished = try allocator.alloc(bool, batch);
         defer allocator.free(finished);
         @memset(finished, false);
 
@@ -565,28 +589,24 @@ pub const ReadingPipeline = struct {
                 logReadProfileStep("batch_decoder_run", decoder_steps, dec_len, decoder_run_ns);
                 defer allocator.free(logits);
 
-                const vocab_size = florence_cfg.vocab_size;
-                for (0..batch) |b| {
-                    if (finished[b]) {
-                        dec_ids[b * max_len + dec_len] = @as(i64, self.config.pad_token_id);
-                        continue;
-                    }
-                    const row = dec_ids[b * max_len ..][0..max_len];
-                    const batch_decode_offset = std.math.mul(usize, b, dec_len) catch return error.InvalidInputShape;
-                    const token_offset = std.math.add(usize, batch_decode_offset, dec_len - 1) catch return error.InvalidInputShape;
-                    const logits_offset = std.math.mul(usize, token_offset, vocab_size) catch return error.InvalidInputShape;
-                    const last_logits = logits[logits_offset..][0..vocab_size];
-                    const best_id = selectGreedyToken(last_logits, row[0..dec_len], self.config.no_repeat_ngram_size);
-                    if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) {
-                        finished[b] = true;
-                        finished_count += 1;
-                        lengths[b] = dec_len;
-                        dec_ids[b * max_len + dec_len] = @as(i64, self.config.pad_token_id);
-                    } else {
-                        dec_ids[b * max_len + dec_len] = @intCast(best_id);
-                        lengths[b] = dec_len + 1;
-                    }
-                }
+                const logits_row_stride = std.math.mul(usize, dec_len, florence_cfg.vocab_size) catch return error.InvalidInputShape;
+                const logits_tail_offset = std.math.mul(usize, dec_len - 1, florence_cfg.vocab_size) catch return error.InvalidInputShape;
+                finished_count += try applyFlorenceBatchGreedyStep(
+                    dec_ids,
+                    batch,
+                    max_len,
+                    dec_len,
+                    finished,
+                    lengths,
+                    logits,
+                    logits_row_stride,
+                    logits_tail_offset,
+                    florence_cfg.vocab_size,
+                    self.config.eos_token_id,
+                    self.config.pad_token_id,
+                    self.config.no_repeat_ngram_size,
+                    null,
+                );
             }
             dec_len += 1;
         }
@@ -1379,8 +1399,7 @@ fn compactDecoderInputIds(
 }
 
 fn nativeFlorenceReadBatchSize() usize {
-    const raw = platform.env.getenv("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse return 8;
-    const parsed = std.fmt.parseInt(usize, raw, 10) catch return 8;
+    const parsed = platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse return 8;
     return std.math.clamp(parsed, 1, 64);
 }
 
@@ -1610,6 +1629,122 @@ fn cleanupPureText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     }
 
     return allocator.dupe(u8, std.mem.trim(u8, cleaned.items, " \t\r\n"));
+}
+
+fn applyFlorenceBatchGreedyStep(
+    decoder_ids: []i64,
+    batch: usize,
+    max_len: usize,
+    decoder_len: usize,
+    finished: []bool,
+    lengths: []usize,
+    logits: []const f32,
+    logits_row_stride: usize,
+    logits_tail_offset: usize,
+    vocab_size: usize,
+    eos_token_id: i32,
+    pad_token_id: i32,
+    no_repeat_ngram_size: usize,
+    step_tokens: ?[]i64,
+) !usize {
+    if (decoder_len >= max_len or finished.len != batch or lengths.len != batch or vocab_size == 0)
+        return error.InvalidInputShape;
+    if (step_tokens) |tokens| if (tokens.len != batch) return error.InvalidInputShape;
+
+    var newly_finished: usize = 0;
+    for (0..batch) |b| {
+        const row_offset = std.math.mul(usize, b, max_len) catch return error.InvalidInputShape;
+        if (row_offset > decoder_ids.len or max_len > decoder_ids.len - row_offset) return error.InvalidInputShape;
+        const row = decoder_ids[row_offset..][0..max_len];
+        if (finished[b]) {
+            row[decoder_len] = @as(i64, pad_token_id);
+            if (step_tokens) |tokens| tokens[b] = @as(i64, pad_token_id);
+            continue;
+        }
+
+        const batch_logits_offset = std.math.mul(usize, b, logits_row_stride) catch return error.InvalidInputShape;
+        const logits_offset = std.math.add(usize, batch_logits_offset, logits_tail_offset) catch return error.InvalidInputShape;
+        if (logits_offset > logits.len or vocab_size > logits.len - logits_offset) return error.InvalidInputShape;
+        const best_id = selectGreedyToken(logits[logits_offset..][0..vocab_size], row[0..decoder_len], no_repeat_ngram_size);
+        if (@as(i32, @intCast(best_id)) == eos_token_id) {
+            finished[b] = true;
+            newly_finished += 1;
+            lengths[b] = decoder_len;
+            row[decoder_len] = @as(i64, pad_token_id);
+            if (step_tokens) |tokens| tokens[b] = @as(i64, pad_token_id);
+        } else {
+            const token: i64 = @intCast(best_id);
+            row[decoder_len] = token;
+            lengths[b] = decoder_len + 1;
+            if (step_tokens) |tokens| tokens[b] = token;
+        }
+    }
+    return newly_finished;
+}
+
+test "Florence batch decode preserves row lengths across mixed EOS" {
+    const batch: usize = 2;
+    const max_len: usize = 4;
+    const vocab_size: usize = 4;
+    const eos_token_id: i32 = 2;
+    const pad_token_id: i32 = 0;
+    var decoder_ids = [_]i64{ 1, 0, 0, 0, 1, 0, 0, 0 };
+    var finished = [_]bool{ false, false };
+    var lengths = [_]usize{ 1, 1 };
+    var step_tokens = [_]i64{ 0, 0 };
+
+    // Row zero reaches EOS immediately while row one emits token 3.
+    const first_logits = [_]f32{
+        0, 1, 9, 2,
+        0, 1, 2, 9,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try applyFlorenceBatchGreedyStep(
+        &decoder_ids,
+        batch,
+        max_len,
+        1,
+        &finished,
+        &lengths,
+        &first_logits,
+        vocab_size,
+        0,
+        vocab_size,
+        eos_token_id,
+        pad_token_id,
+        0,
+        &step_tokens,
+    ));
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &finished);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, &lengths);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 3 }, &step_tokens);
+
+    // The finished row stays padded and length-stable while row one reaches
+    // EOS on its own next step.
+    const second_logits = [_]f32{
+        9, 0, 0, 0,
+        0, 1, 9, 2,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try applyFlorenceBatchGreedyStep(
+        &decoder_ids,
+        batch,
+        max_len,
+        2,
+        &finished,
+        &lengths,
+        &second_logits,
+        vocab_size,
+        0,
+        vocab_size,
+        eos_token_id,
+        pad_token_id,
+        0,
+        &step_tokens,
+    ));
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, &finished);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, &lengths);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 0 }, &step_tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 0, 0, 0 }, decoder_ids[0..max_len]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3, 0, 0 }, decoder_ids[max_len..]);
 }
 
 fn selectGreedyToken(logits: []const f32, prefix: []const i64, no_repeat_ngram_size: usize) usize {

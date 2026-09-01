@@ -4736,21 +4736,128 @@ pub const Node = struct {
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
 
+        return try self.runReadImageBatchDirect(allocator, model_path, image_datas, request.prompt, max_tokens, request.source_fingerprint);
+    }
+
+    pub fn readEncodedImagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+    ) ![]readers_api.Result {
+        return (try self.readEncodedImagesReportedDirect(allocator, model_name, request)).items;
+    }
+
+    pub fn readEncodedImagesReportedDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+    ) !readers_api.BatchResult {
+        if (request.images.len == 0) return .{
+            .items = try allocator.alloc(readers_api.Result, 0),
+            .execution = .{ .mode = .serial, .requested_items = 0 },
+        };
+        if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
+        try readers_api.validateEncodedRequest(request);
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        const security = effectiveRequestContentSecurity(self);
+        const per_image_byte_cap = std.math.cast(
+            usize,
+            security.max_download_size_bytes orelse default_max_request_media_bytes,
+        ) orelse std.math.maxInt(usize);
+        const encoded_byte_cap = readInlineSourceByteCap(self);
+        var encoded_bytes: usize = 0;
+        for (request.images) |image| {
+            if (image.bytes.len > per_image_byte_cap) return error.ReadBatchTooLarge;
+            encoded_bytes = std.math.add(usize, encoded_bytes, image.bytes.len) catch return error.ReadBatchTooLarge;
+            if (encoded_bytes > encoded_byte_cap) return error.ReadBatchTooLarge;
+        }
+
+        var admission = readResidentEncodedAdmissionForLimits(
+            request.images.len,
+            encoded_bytes,
+            self.inference_admission.capacity,
+            security.max_image_dimension,
+        );
+        admission.units = @max(admission.units, estimateReadAdmissionUnits(request.images.len, max_tokens));
+        try self.acquireAdmissionUnits(admission.units);
+        var reserved_units = admission.units;
+        defer self.releaseAdmissionUnits(reserved_units);
+        self.metrics.incRequest("read.local.encoded");
+        defer self.metrics.decActive();
+
+        var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        for (request.images) |image| try decoded_budget.addImage(image.bytes);
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        try self.growAdmissionUnits(reserved_units, required_units);
+        reserved_units = required_units;
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        defer self.allocator.free(model_path);
+
+        const image_datas = try allocator.alloc([]const u8, request.images.len);
+        defer allocator.free(image_datas);
+        for (request.images, 0..) |image, i| image_datas[i] = image.bytes;
+        return try self.runReadImageBatchReportedDirect(
+            allocator,
+            model_path,
+            image_datas,
+            request.images,
+            request.prompt,
+            max_tokens,
+            request.source_fingerprint,
+        );
+    }
+
+    fn runReadImageBatchDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        prompt: ?[]const u8,
+        max_tokens: ?usize,
+        source_fingerprint: ?[]const u8,
+    ) ![]readers_api.Result {
+        return (try self.runReadImageBatchReportedDirect(
+            allocator,
+            model_path,
+            image_datas,
+            null,
+            prompt,
+            max_tokens,
+            source_fingerprint,
+        )).items;
+    }
+
+    fn runReadImageBatchReportedDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        encoded_images: ?[]const readers_api.EncodedImage,
+        prompt: ?[]const u8,
+        max_tokens: ?usize,
+        source_fingerprint: ?[]const u8,
+    ) !readers_api.BatchResult {
         var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
         defer reader.deinit();
 
-        const out = try allocator.alloc(readers_api.Result, request.images.len);
+        const out = try allocator.alloc(readers_api.Result, image_datas.len);
         var initialized: usize = 0;
         errdefer {
             for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
             allocator.free(out);
         }
 
-        const results = try reader.readBatch(image_datas, .{
-            .prompt = normalizeReadPrompt(request.prompt),
+        const batch = try reader.readBatchReported(image_datas, .{
+            .prompt = normalizeReadPrompt(prompt),
             .max_tokens = max_tokens,
-            .source_fingerprint = request.source_fingerprint,
+            .source_fingerprint = source_fingerprint,
         });
+        const results = batch.results;
         defer {
             for (results) |result| {
                 var tmp = result;
@@ -4758,7 +4865,7 @@ pub const Node = struct {
             }
             allocator.free(results);
         }
-        if (results.len != request.images.len) return error.InvalidReadResultCount;
+        if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
         for (results, 0..) |result, i| {
             var item: readers_api.Result = .{
@@ -4767,10 +4874,27 @@ pub const Node = struct {
             errdefer readers_api.deinitResult(allocator, &item);
             item.fields_json = try readerFieldsJsonAlloc(allocator, result.fields);
             item.regions_json = try readerRegionsJsonAlloc(allocator, result.regions);
+            if (encoded_images) |images| {
+                item.item_id = if (images[i].item_id.len > 0) try allocator.dupe(u8, images[i].item_id) else "";
+                item.source_fingerprint = if (images[i].source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+                item.page_number = images[i].page_number;
+            }
             out[i] = item;
             initialized += 1;
         }
-        return out;
+        return .{
+            .items = out,
+            .execution = .{
+                .mode = switch (batch.mode) {
+                    .native => .native,
+                    .serial => .serial,
+                    .fallback => .fallback,
+                },
+                .requested_items = image_datas.len,
+                .native_batches = batch.native_batches,
+                .fallback_reason = batch.fallback_reason,
+            },
+        };
     }
 
     pub fn transcribeAudioDirect(
@@ -8048,9 +8172,6 @@ pub const Node = struct {
             .auto, .native, .metal, .cuda => {},
             .onnx, .xla, .webgpu, .wasm => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
         };
-        if (generateRequestHasNonTextContentParts(body)) {
-            return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
-        }
         return null;
     }
 
@@ -8094,9 +8215,7 @@ pub const Node = struct {
 
     fn generateBatchUnsupportedReason(body: api.GenerateRequest, messages: []const generation.Message) ?api.GenerateBatchError {
         if (generateBatchUnsupportedReasonPreflight(body)) |reason| return reason;
-        if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
-            return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
-        }
+        _ = messages;
         return null;
     }
 
@@ -8597,7 +8716,24 @@ pub const Node = struct {
                         continue;
                     },
                 };
-                const execution_mode = batchExecutionMode(backend_kind);
+                // Multimodal projector/session state is not yet proven safe
+                // for parallel use. Accept independent multimodal batch items,
+                // but serialize them under the model lock until a resolved
+                // model capability advertises native multimodal batching.
+                var group_has_media = false;
+                for (group_indices.items) |idx| {
+                    if (!pending[idx]) continue;
+                    if (generation.messagesHaveImages(owned_messages[idx].messages) or
+                        generation.messagesHaveAudio(owned_messages[idx].messages))
+                    {
+                        group_has_media = true;
+                        break;
+                    }
+                }
+                const execution_mode = if (group_has_media)
+                    BatchExecutionMode.shared_serial
+                else
+                    batchExecutionMode(backend_kind);
                 const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
                     backend_kind,
                     gpt_config,
@@ -11595,6 +11731,7 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&listing.manifest),
                     has_visual,
                     has_audio,
+                    listing.manifest.native_arch_hint == .florence,
                     chat_template_failed,
                     listing.compatibility_level,
                 );
@@ -11652,6 +11789,7 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&model.manifest),
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                    model.manifest.native_arch_hint == .florence,
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                 );
@@ -13366,6 +13504,9 @@ fn appendModelInfo(
     zero_shot_classification: bool,
     has_visual: bool,
     has_audio: bool,
+    /// Normalized executor capability inferred from the resolved architecture.
+    /// Publishing this keeps remote planners from guessing from model names.
+    native_batch_read: bool,
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
@@ -13377,11 +13518,12 @@ fn appendModelInfo(
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
+    const inferred_native_batch_read = native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
-    if (capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !has_known_inputs) {
+    if (capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !inferred_native_batch_read and !has_known_inputs) {
         if (!chat_template_failed and compatibility_level.len == 0) {
             try buf.appendSlice(allocator, "{}");
             return;
@@ -13429,6 +13571,11 @@ fn appendModelInfo(
         try jsonEncodeString(buf, allocator, "extraction");
         cap_index += 1;
     }
+    if (inferred_native_batch_read) {
+        if (cap_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, "native_batch_read");
+        cap_index += 1;
+    }
     try buf.appendSlice(allocator, "],\"inputs\":[");
     var input_index: usize = 0;
     for ([_][]const u8{ "text", "image", "audio" }) |input| {
@@ -13444,6 +13591,35 @@ fn appendModelInfo(
         try jsonEncodeString(buf, allocator, compatibility_level);
     }
     try buf.append(allocator, '}');
+}
+
+test "standalone inference model catalog publishes resolved native reader batching" {
+    const alloc = std.testing.allocator;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    try appendModelInfo(
+        &body,
+        alloc,
+        "read",
+        "",
+        &.{},
+        &.{"image"},
+        false,
+        false,
+        false,
+        true,
+        false,
+        "compatible",
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
+    defer parsed.deinit();
+    const capabilities = parsed.value.object.get("capabilities") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(capabilities == .array);
+    var found = false;
+    for (capabilities.array.items) |capability| {
+        if (capability == .string and std.mem.eql(u8, capability.string, "native_batch_read")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 const InferenceHttpRouteAdmission = enum { none, inference };
@@ -14205,15 +14381,14 @@ test "generate batch rejects cache compaction clearly" {
     try std.testing.expectEqualStrings("INVALID_CACHE_COMPACTION_RATIO", invalid_reason.code);
 }
 
-test "generate batch preflight rejects image content without parsing media" {
+test "generate batch preflight accepts bounded multimodal content for per-item parsing" {
     const request_json =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]}]}
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
+    try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(parsed.value) == null);
 }
 
 test "generate batch isolates native execution and serializes stateful GPU backends" {
@@ -14559,6 +14734,24 @@ test "read admission reserves default batch bytes and image pressure without ove
     try boundary_budget.addPixels(boundary.decoded_pixel_cap);
     try std.testing.expectEqual(@as(usize, 4), boundary_budget.requiredUnits());
     try std.testing.expectError(error.ImageBatchTooLarge, boundary_budget.addPixels(1));
+}
+
+test "resident encoded image admission does not reserve a second download copy" {
+    const encoded_bytes = 8 * 1024 * 1024;
+    const resident = readResidentEncodedAdmissionForLimits(2, encoded_bytes, 8, null);
+    const url_shaped = readRequestAdmissionForLimits(
+        2,
+        default_max_read_batch_bytes,
+        default_max_request_media_bytes,
+        8,
+        null,
+        encoded_bytes,
+    );
+
+    try std.testing.expectEqual(encoded_bytes, resident.byte_cap);
+    try std.testing.expectEqual(encoded_bytes, resident.resident_byte_cap);
+    try std.testing.expect(url_shaped.resident_byte_cap > resident.resident_byte_cap);
+    try std.testing.expect(resident.decoded_pixel_cap > url_shaped.decoded_pixel_cap);
 }
 
 test "remote and inline media reserve distinct resident peaks before download" {
@@ -20104,6 +20297,30 @@ fn readRequestAdmissionForLimits(
             max_concurrent_units,
             max_image_dimension,
             resident_byte_cap,
+        ),
+    };
+}
+
+/// Admission for bytes that are already resident in the caller's encoded
+/// media buffers. Unlike URL/data-URI admission, there is no prospective
+/// download allocation to add a second time.
+fn readResidentEncodedAdmissionForLimits(
+    image_count: usize,
+    encoded_bytes: usize,
+    max_concurrent_units: usize,
+    max_image_dimension: ?u32,
+) ReadRequestAdmission {
+    const byte_units = admissionUnitsFor(encoded_bytes, read_admission_bytes_per_unit);
+    const image_units = admissionUnitsFor(image_count, read_admission_images_per_unit);
+    return .{
+        .units = @max(@as(usize, 1), @max(byte_units, image_units)),
+        .byte_cap = encoded_bytes,
+        .resident_byte_cap = encoded_bytes,
+        .decoded_pixel_cap = readDecodedPixelCapForLimits(
+            image_count,
+            max_concurrent_units,
+            max_image_dimension,
+            encoded_bytes,
         ),
     };
 }

@@ -22,6 +22,7 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
+
 const minimum_direct_render_dpi: u16 = 1;
 const minimum_requested_render_dpi: u16 = 72;
 
@@ -60,6 +61,66 @@ pub const RenderProfile = enum {
     exact,
     /// Preserve bilevel ink coverage during minification for OCR inputs.
     ocr,
+};
+
+pub const PageRenderRequest = struct {
+    page_number: usize,
+    requested_dpi: u16 = 150,
+    max_pixels: u64 = 40_000_000,
+    max_dimension: u32 = 4096,
+    /// When set, retry this page at smaller raster dimensions before exposing
+    /// it to the batch's retained-output allocator.
+    max_output_bytes: ?usize = null,
+    min_output_dimension: u32 = 1,
+    max_output_attempts: u8 = 8,
+};
+
+/// Admission policy for one render microbatch. The caller deliberately owns
+/// document-level windowing: requests.len must not exceed max_batch_pages, so
+/// this API cannot accidentally retain a whole large document in memory.
+pub const PageRenderBatchOptions = struct {
+    max_batch_pages: usize = 8,
+    max_parallel_pages: usize = 1,
+    max_inflight_pixels: u64 = 50_000_000,
+    max_inflight_bytes: usize = 512 * 1024 * 1024,
+    max_retained_png_bytes: usize = 64 * 1024 * 1024,
+    bytes_per_pixel_reserve: usize = 12,
+    profile: RenderProfile = .ocr,
+    cancellation: reader.CancellationProbe = .{},
+};
+
+pub const PageRenderResult = struct {
+    page_number: usize,
+    rendered: ?RenderedPagePng = null,
+    failure: ?anyerror = null,
+    /// Wall-clock time spent inside the page worker's render operation. This
+    /// excludes wave preparation, admission, and start-gate wait time.
+    render_elapsed_ns: u64 = 0,
+
+    pub fn deinit(self: *PageRenderResult, alloc: Allocator) void {
+        if (self.rendered) |*page| page.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RenderedPageBatch = struct {
+    results: []PageRenderResult,
+    requested_parallelism: usize,
+    /// Maximum number of successfully launched worker threads in a wave.
+    /// This is distinct from peak_parallelism: launched workers may still be
+    /// waiting at the coordinated start gate.
+    peak_launched_workers: usize,
+    /// Maximum number of workers executing their render operation at once.
+    peak_parallelism: usize,
+    peak_admitted_pixels: u64,
+    peak_admitted_bytes: usize,
+    thread_spawn_fallbacks: usize,
+
+    pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
+        for (self.results) |*result| result.deinit(alloc);
+        alloc.free(self.results);
+        self.* = undefined;
+    }
 };
 
 pub const Backend = struct {
@@ -249,18 +310,48 @@ pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
     max_dimension: u32,
     profile: RenderProfile,
 ) !RenderedPagePng {
-    if (page_number == 0) return error.InvalidPageNumber;
-    if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
-    if (max_pixels == 0 or max_dimension == 0) return error.RenderedPageTooLarge;
+    const geometry = try adaptiveRenderGeometry(parsed, .{
+        .page_number = page_number,
+        .requested_dpi = requested_dpi,
+        .max_pixels = max_pixels,
+        .max_dimension = max_dimension,
+    });
+
+    parsed.clearRenderDiagnostics();
+    var used_compatibility_backend = false;
+    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, geometry.effective_dpi, max_pixels, geometry.rotation, profile, &used_compatibility_backend);
+    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
+    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
+    return .{
+        .png = png,
+        .requested_dpi = requested_dpi,
+        .effective_dpi = geometry.effective_dpi,
+        .width = geometry.width,
+        .height = geometry.height,
+        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
+        .diagnostics = diagnostics,
+    };
+}
+
+const AdaptiveRenderGeometry = struct {
+    effective_dpi: u16,
+    width: u32,
+    height: u32,
+    pixels: u64,
+    rotation: render.PageRotation,
+};
+
+fn adaptiveRenderGeometry(parsed: *reader.Reader, request: PageRenderRequest) !AdaptiveRenderGeometry {
+    if (request.page_number == 0) return error.InvalidPageNumber;
+    if (request.requested_dpi < 72 or request.requested_dpi > 600) return error.InvalidRenderDpi;
+    if (request.max_pixels == 0 or request.max_dimension == 0) return error.RenderedPageTooLarge;
     const page_count = try parsed.pageCount();
-    if (page_number > page_count) return error.InvalidPageNumber;
-    const box = try parsed.extractPageBox(page_number);
-    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
+    if (request.page_number > page_count) return error.InvalidPageNumber;
+    const box = try parsed.extractPageBox(request.page_number);
+    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(request.page_number));
     const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
 
-    var effective_dpi = requested_dpi;
-    var width: u32 = 0;
-    var height: u32 = 0;
+    var effective_dpi = request.requested_dpi;
     while (true) {
         const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
         const unrotated_width = rasterAxisExtent(box.min_x, box.max_x, scale);
@@ -270,28 +361,465 @@ pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
         const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
             height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
         if (fits_integer) {
-            width = @intFromFloat(width_f);
-            height = @intFromFloat(height_f);
+            const width: u32 = @intFromFloat(width_f);
+            const height: u32 = @intFromFloat(height_f);
             const pixels = @as(u64, width) * @as(u64, height);
-            if (width <= max_dimension and height <= max_dimension and pixels <= max_pixels) break;
+            if (width <= request.max_dimension and height <= request.max_dimension and pixels <= request.max_pixels) {
+                return .{
+                    .effective_dpi = effective_dpi,
+                    .width = width,
+                    .height = height,
+                    .pixels = pixels,
+                    .rotation = rotation,
+                };
+            }
         }
         if (effective_dpi == minimum_direct_render_dpi) return error.RenderedPageTooLarge;
         effective_dpi -= 1;
     }
+}
 
-    parsed.clearRenderDiagnostics();
-    var used_compatibility_backend = false;
-    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation, profile, &used_compatibility_backend);
-    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
-    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
+const RenderWorkerBudgetAllocator = struct {
+    backing: Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn allocator(self: *RenderWorkerBudgetAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *RenderWorkerBudgetAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.max_live_bytes -| self.live_bytes) {
+            self.limit_exceeded = true;
+            return null;
+        }
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *RenderWorkerBudgetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > self.max_live_bytes -| self.live_bytes) {
+            self.limit_exceeded = true;
+            return false;
+        }
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *RenderWorkerBudgetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > self.max_live_bytes -| self.live_bytes) {
+            self.limit_exceeded = true;
+            return null;
+        }
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *RenderWorkerBudgetAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
+
+const PreparedRenderPage = struct {
+    request_index: usize,
+    request: PageRenderRequest,
+    pixels: u64,
+    admitted_bytes: usize,
+};
+
+const RenderWaveControl = struct {
+    external: reader.CancellationProbe,
+    stopped: std.atomic.Value(bool) = .init(false),
+    start_released: std.atomic.Value(bool) = .init(false),
+    arrived: std.atomic.Value(usize) = .init(0),
+    active: std.atomic.Value(usize) = .init(0),
+    peak_active: std.atomic.Value(usize) = .init(0),
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        if (self.stopped.load(.acquire)) return true;
+        if (self.external.is_cancelled_fn) |check| return check(self.external.context);
+        return false;
+    }
+
+    fn probe(self: *const @This()) reader.CancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn stop(self: *@This()) void {
+        self.stopped.store(true, .release);
+    }
+
+    fn enterRender(self: *@This()) void {
+        const current = self.active.fetchAdd(1, .acq_rel) + 1;
+        var peak = self.peak_active.load(.acquire);
+        while (current > peak) {
+            peak = self.peak_active.cmpxchgWeak(peak, current, .acq_rel, .acquire) orelse break;
+        }
+    }
+
+    fn leaveRender(self: *@This()) void {
+        _ = self.active.fetchSub(1, .acq_rel);
+    }
+
+    /// Count every successfully launched worker before allowing the wave to
+    /// render. Besides avoiding first-spawn scheduling bias in diagnostics,
+    /// this makes a render wave begin from one immutable, fully prepared set
+    /// of task-local readers.
+    fn arriveAndWaitForStart(self: *@This()) void {
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        while (!self.start_released.load(.acquire)) {
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn releaseStartWhenReady(self: *@This(), expected: usize) void {
+        while (self.arrived.load(.acquire) < expected) {
+            self.external.check() catch {
+                // A deadline must release workers that already reached the
+                // gate. Late workers observe the released gate, then fail the
+                // composed cancellation probe before rendering.
+                self.stop();
+                break;
+            };
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+        self.start_released.store(true, .release);
+    }
+};
+
+const PageRenderWorker = struct {
+    request: PageRenderRequest,
+    profile: RenderProfile,
+    budget: RenderWorkerBudgetAllocator,
+    parsed: ?reader.Reader = null,
+    rendered: ?RenderedPagePng = null,
+    failure: ?anyerror = null,
+    render_elapsed_ns: u64 = 0,
+    thread: ?std.Thread = null,
+    wave_control: *RenderWaveControl,
+
+    fn init(self: *PageRenderWorker, source: *reader.Reader, request: PageRenderRequest, profile: RenderProfile, wave_control: *RenderWaveControl, admitted_bytes: usize) !void {
+        self.* = .{
+            .request = request,
+            .profile = profile,
+            .budget = .{
+                .backing = std.heap.page_allocator,
+                .max_live_bytes = admitted_bytes,
+            },
+            .wave_control = wave_control,
+        };
+        errdefer self.deinit();
+        self.parsed = try source.forkForRendering(self.budget.allocator(), wave_control.probe());
+    }
+
+    fn deinit(self: *PageRenderWorker) void {
+        if (self.rendered) |*rendered| rendered.deinit(self.budget.allocator());
+        if (self.parsed) |*parsed| parsed.deinit();
+        self.* = undefined;
+    }
+
+    fn run(self: *PageRenderWorker) void {
+        self.wave_control.arriveAndWaitForStart();
+        self.wave_control.probe().check() catch {
+            self.failure = error.Canceled;
+            return;
+        };
+        const render_started_ns = monotonicNowNs();
+        self.wave_control.enterRender();
+        defer {
+            self.wave_control.leaveRender();
+            const finished_ns = monotonicNowNs();
+            self.render_elapsed_ns = finished_ns -| render_started_ns;
+        }
+        var request = self.request;
+        var attempts: u8 = 0;
+        while (true) {
+            attempts +|= 1;
+            var rendered = renderParsedPagePngAdaptiveWithProfileAlloc(
+                self.budget.allocator(),
+                &self.parsed.?,
+                request.page_number,
+                request.requested_dpi,
+                request.max_pixels,
+                request.max_dimension,
+                self.profile,
+            ) catch |err| {
+                self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
+                    error.RenderWorkerMemoryLimitExceeded
+                else
+                    err;
+                if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
+                    self.wave_control.stop();
+                return;
+            };
+            const output_limit = request.max_output_bytes orelse {
+                self.rendered = rendered;
+                return;
+            };
+            if (rendered.png.len <= output_limit) {
+                self.rendered = rendered;
+                return;
+            }
+            const minimum = @max(@as(u32, 1), request.min_output_dimension);
+            if (attempts >= request.max_output_attempts or request.max_dimension <= minimum) {
+                rendered.deinit(self.budget.allocator());
+                self.failure = error.RenderedPageOutputTooLarge;
+                return;
+            }
+            const next_dimension = nextBoundedRenderDimension(request.max_dimension, rendered.png.len, output_limit, minimum);
+            rendered.deinit(self.budget.allocator());
+            request.max_dimension = next_dimension;
+            const dimension_pixels = @as(u64, next_dimension) * @as(u64, next_dimension);
+            request.max_pixels = @min(request.max_pixels, dimension_pixels);
+        }
+    }
+};
+
+fn monotonicNowNs() u64 {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows) return 0;
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => {},
+        else => return 0,
+    }
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn nextBoundedRenderDimension(current: u32, encoded_bytes: usize, byte_budget: usize, minimum: u32) u32 {
+    if (current <= minimum) return current;
+    if (encoded_bytes == 0 or byte_budget >= encoded_bytes)
+        return @max(minimum, current - @max(@as(u32, 1), current / 4));
+    const ratio = @as(f64, @floatFromInt(byte_budget)) / @as(f64, @floatFromInt(encoded_bytes));
+    const scale = @min(0.75, @sqrt(ratio) * 0.90);
+    const estimated: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(current)) * scale));
+    return @max(minimum, @min(current - 1, estimated));
+}
+
+fn renderPageAdmissionBytes(parsed: *const reader.Reader, pixels: u64, options: PageRenderBatchOptions) !usize {
+    const raster_bytes_u64 = std.math.mul(u64, pixels, std.math.cast(u64, options.bytes_per_pixel_reserve) orelse return error.RenderBatchAdmissionExceeded) catch return error.RenderBatchAdmissionExceeded;
+    const raster_bytes = std.math.cast(usize, raster_bytes_u64) orelse return error.RenderBatchAdmissionExceeded;
+    // Forks borrow source bytes, but their cloned page/xref metadata can grow
+    // with document size. Charging the complete source length is deliberately
+    // conservative and gives the task-local allocator a hard upper bound.
+    const with_metadata = std.math.add(usize, raster_bytes, parsed.sourceBytes().len) catch return error.RenderBatchAdmissionExceeded;
+    return std.math.add(usize, with_metadata, parsed.decode_limits.max_working_set_bytes) catch return error.RenderBatchAdmissionExceeded;
+}
+
+fn prepareRenderPageForAdmission(
+    parsed: *reader.Reader,
+    request: PageRenderRequest,
+    options: PageRenderBatchOptions,
+    request_index: usize,
+) !PreparedRenderPage {
+    const fixed_bytes = std.math.add(
+        usize,
+        parsed.sourceBytes().len,
+        parsed.decode_limits.max_working_set_bytes,
+    ) catch return error.RenderBatchAdmissionExceeded;
+    if (fixed_bytes >= options.max_inflight_bytes) return error.RenderBatchAdmissionExceeded;
+    const raster_budget = options.max_inflight_bytes - fixed_bytes;
+    const memory_pixels = raster_budget / options.bytes_per_pixel_reserve;
+    if (memory_pixels == 0) return error.RenderBatchAdmissionExceeded;
+
+    var adjusted = request;
+    adjusted.max_pixels = @min(
+        adjusted.max_pixels,
+        @min(
+            options.max_inflight_pixels,
+            std.math.cast(u64, memory_pixels) orelse std.math.maxInt(u64),
+        ),
+    );
+    const geometry = try adaptiveRenderGeometry(parsed, adjusted);
+    const admitted_bytes = try renderPageAdmissionBytes(parsed, geometry.pixels, options);
+    if (geometry.pixels > options.max_inflight_pixels or admitted_bytes > options.max_inflight_bytes)
+        return error.RenderBatchAdmissionExceeded;
     return .{
-        .png = png,
-        .requested_dpi = requested_dpi,
-        .effective_dpi = effective_dpi,
-        .width = width,
-        .height = height,
-        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
-        .diagnostics = diagnostics,
+        .request_index = request_index,
+        .request = adjusted,
+        .pixels = geometry.pixels,
+        .admitted_bytes = admitted_bytes,
+    };
+}
+
+/// Render one bounded page window while preserving request order.
+///
+/// Page parse/render failures are returned in the corresponding result.
+/// Allocator failure, invalid batch policy, and retained-output exhaustion are
+/// systemic errors. The source Reader is used only while workers are prepared;
+/// all concurrent work happens on independently allocated render forks.
+pub fn renderParsedPagesBatchAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    requests: []const PageRenderRequest,
+    options: PageRenderBatchOptions,
+) !RenderedPageBatch {
+    if (options.max_batch_pages == 0 or options.max_parallel_pages == 0 or
+        options.max_inflight_pixels == 0 or options.max_inflight_bytes == 0 or
+        options.max_retained_png_bytes == 0 or options.bytes_per_pixel_reserve < 4)
+    {
+        return error.InvalidRenderBatchOptions;
+    }
+    if (requests.len > options.max_batch_pages) return error.RenderBatchTooLarge;
+    const source_cancellation = parsed.cancellationProbe();
+    const cancellation = if (options.cancellation.is_cancelled_fn != null)
+        options.cancellation
+    else
+        source_cancellation;
+    try cancellation.check();
+    // Preflight reads the source Reader serially before private render forks
+    // exist. Install the operation probe for that phase, then restore the
+    // caller's session state before returning.
+    parsed.setCancellationProbe(cancellation);
+    defer parsed.setCancellationProbe(source_cancellation);
+
+    const results = try alloc.alloc(PageRenderResult, requests.len);
+    var initialized_results: usize = 0;
+    errdefer {
+        for (results[0..initialized_results]) |*result| result.deinit(alloc);
+        alloc.free(results);
+    }
+    for (requests, 0..) |request, i| {
+        results[i] = .{ .page_number = request.page_number };
+        initialized_results += 1;
+    }
+
+    const prepared = try alloc.alloc(?PreparedRenderPage, requests.len);
+    defer alloc.free(prepared);
+    @memset(prepared, null);
+    for (requests, 0..) |request, i| {
+        prepared[i] = prepareRenderPageForAdmission(parsed, request, options, i) catch |err| {
+            results[i].failure = err;
+            continue;
+        };
+    }
+
+    const worker_capacity = @min(options.max_parallel_pages, requests.len);
+    const workers = try alloc.alloc(PageRenderWorker, worker_capacity);
+    defer alloc.free(workers);
+    const wave = try alloc.alloc(PreparedRenderPage, worker_capacity);
+    defer alloc.free(wave);
+
+    var next_request: usize = 0;
+    var retained_png_bytes: usize = 0;
+    var peak_launched_workers: usize = 0;
+    var peak_parallelism: usize = 0;
+    var peak_admitted_pixels: u64 = 0;
+    var peak_admitted_bytes: usize = 0;
+    var thread_spawn_fallbacks: usize = 0;
+    while (next_request < requests.len) {
+        try cancellation.check();
+        var wave_len: usize = 0;
+        var wave_pixels: u64 = 0;
+        var wave_bytes: usize = 0;
+        while (next_request < requests.len and wave_len < worker_capacity) : (next_request += 1) {
+            const candidate = prepared[next_request] orelse continue;
+            const next_pixels = std.math.add(u64, wave_pixels, candidate.pixels) catch break;
+            const next_bytes = std.math.add(usize, wave_bytes, candidate.admitted_bytes) catch break;
+            if (wave_len > 0 and (next_pixels > options.max_inflight_pixels or next_bytes > options.max_inflight_bytes)) break;
+            wave[wave_len] = candidate;
+            wave_len += 1;
+            wave_pixels = next_pixels;
+            wave_bytes = next_bytes;
+        }
+        if (wave_len == 0) continue;
+        peak_admitted_pixels = @max(peak_admitted_pixels, wave_pixels);
+        peak_admitted_bytes = @max(peak_admitted_bytes, wave_bytes);
+
+        var wave_control = RenderWaveControl{ .external = cancellation };
+        var initialized_workers: usize = 0;
+        defer {
+            for (workers[0..initialized_workers]) |*worker| worker.deinit();
+        }
+        for (wave[0..wave_len], 0..) |candidate, i| {
+            try workers[i].init(
+                parsed,
+                candidate.request,
+                options.profile,
+                &wave_control,
+                candidate.admitted_bytes,
+            );
+            initialized_workers += 1;
+        }
+
+        if (wave_len == 1) {
+            // The conservative default does not need a helper thread. Keeping
+            // the serial case inline avoids thread setup cost while exercising
+            // the exact same batch ownership and admission path.
+            wave_control.releaseStartWhenReady(0);
+            workers[0].run();
+        } else {
+            var spawned_workers: usize = 0;
+            for (workers[0..wave_len]) |*worker| {
+                worker.thread = std.Thread.spawn(.{}, PageRenderWorker.run, .{worker}) catch blk: {
+                    thread_spawn_fallbacks += 1;
+                    break :blk null;
+                };
+                if (worker.thread != null) spawned_workers += 1;
+            }
+            peak_launched_workers = @max(peak_launched_workers, spawned_workers);
+            wave_control.releaseStartWhenReady(spawned_workers);
+            for (workers[0..wave_len]) |*worker| if (worker.thread == null) worker.run();
+            for (workers[0..wave_len]) |*worker| {
+                if (worker.thread) |thread| thread.join();
+            }
+        }
+
+        peak_parallelism = @max(peak_parallelism, wave_control.peak_active.load(.acquire));
+
+        for (wave[0..wave_len], workers[0..wave_len]) |candidate, *worker| {
+            results[candidate.request_index].render_elapsed_ns = worker.render_elapsed_ns;
+            if (worker.failure) |err| {
+                if (err == error.OutOfMemory or err == error.Canceled) return err;
+                results[candidate.request_index].failure = err;
+                continue;
+            }
+            const rendered = worker.rendered.?;
+            const next_retained = std.math.add(usize, retained_png_bytes, rendered.png.len) catch return error.RenderBatchRetainedBytesExceeded;
+            if (next_retained > options.max_retained_png_bytes) return error.RenderBatchRetainedBytesExceeded;
+            const owned_png = try alloc.dupe(u8, rendered.png);
+            results[candidate.request_index].rendered = .{
+                .png = owned_png,
+                .requested_dpi = rendered.requested_dpi,
+                .effective_dpi = rendered.effective_dpi,
+                .width = rendered.width,
+                .height = rendered.height,
+                .quality = rendered.quality,
+                .diagnostics = rendered.diagnostics,
+            };
+            retained_png_bytes = next_retained;
+        }
+    }
+
+    return .{
+        .results = results,
+        .requested_parallelism = options.max_parallel_pages,
+        .peak_launched_workers = peak_launched_workers,
+        .peak_parallelism = peak_parallelism,
+        .peak_admitted_pixels = peak_admitted_pixels,
+        .peak_admitted_bytes = peak_admitted_bytes,
+        .thread_spawn_fallbacks = thread_spawn_fallbacks,
     };
 }
 
@@ -2804,6 +3332,342 @@ test "native page renderer renders the requested one-based PDF page" {
     try std.testing.expectEqual(first.width, second.width);
     try std.testing.expectEqual(first.height, second.height);
     try std.testing.expect(!std.mem.eql(u8, first.rgba, second.rgba));
+}
+
+test "render forks isolate mutable state across concurrent pages" {
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(std.testing.allocator, fixture);
+    defer parsed.deinit();
+
+    // Fork construction is intentionally serial. Each worker receives an
+    // allocator that no other render thread touches.
+    var first_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer first_arena.deinit();
+    var second_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer second_arena.deinit();
+    var first_fork = try parsed.forkForRendering(first_arena.allocator(), .{});
+    defer first_fork.deinit();
+    var second_fork = try parsed.forkForRendering(second_arena.allocator(), .{});
+    defer second_fork.deinit();
+
+    const Worker = struct {
+        alloc: Allocator,
+        parsed: *reader.Reader,
+        page_number: usize,
+        rendered: ?RenderedPagePng = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.rendered = renderParsedPagePngAdaptiveWithProfileAlloc(
+                self.alloc,
+                self.parsed,
+                self.page_number,
+                150,
+                40_000_000,
+                2048,
+                .ocr,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    var first_worker: Worker = .{
+        .alloc = first_arena.allocator(),
+        .parsed = &first_fork,
+        .page_number = 1,
+    };
+    var second_worker: Worker = .{
+        .alloc = second_arena.allocator(),
+        .parsed = &second_fork,
+        .page_number = 2,
+    };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first_worker});
+    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second_worker});
+    first_thread.join();
+    second_thread.join();
+
+    if (first_worker.failure) |err| return err;
+    if (second_worker.failure) |err| return err;
+    const first = first_worker.rendered.?;
+    const second = second_worker.rendered.?;
+    try std.testing.expectEqual(first.width, second.width);
+    try std.testing.expectEqual(first.height, second.height);
+    try std.testing.expect(!std.mem.eql(u8, first.png, second.png));
+
+    // Concurrent fork work must not consume or mutate the source Reader's
+    // task-local cancellation and diagnostics state.
+    try std.testing.expect(parsed.lastRenderDiagnostics() == null);
+    const source_text = try parsed.extractPageTextAlloc(1);
+    defer std.testing.allocator.free(source_text);
+    try std.testing.expect(std.mem.indexOf(u8, source_text, "FIRST PAGE") != null);
+}
+
+test "bounded render batch preserves order and isolates page failures" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{
+        .{ .page_number = 2 },
+        .{ .page_number = 99 },
+        .{ .page_number = 1 },
+    }, .{
+        .max_batch_pages = 3,
+        .max_parallel_pages = 2,
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), batch.results.len);
+    try std.testing.expectEqual(@as(usize, 2), batch.results[0].page_number);
+    try std.testing.expect(batch.results[0].rendered != null);
+    try std.testing.expect(batch.results[0].failure == null);
+    try std.testing.expectEqual(@as(usize, 99), batch.results[1].page_number);
+    try std.testing.expect(batch.results[1].rendered == null);
+    try std.testing.expect(batch.results[1].failure.? == error.InvalidPageNumber);
+    try std.testing.expectEqual(@as(usize, 1), batch.results[2].page_number);
+    try std.testing.expect(batch.results[2].rendered != null);
+    try std.testing.expect(batch.results[2].failure == null);
+    try std.testing.expectEqual(@as(usize, 2), batch.peak_launched_workers);
+    try std.testing.expect(batch.peak_parallelism >= 1);
+    try std.testing.expect(batch.peak_parallelism <= 2);
+    try std.testing.expect(batch.peak_admitted_pixels > 0);
+    try std.testing.expect(batch.peak_admitted_bytes > 0);
+    try std.testing.expect(!std.mem.eql(u8, batch.results[0].rendered.?.png, batch.results[2].rendered.?.png));
+}
+
+test "bounded render batch is byte stable across concurrency levels" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{
+        .{ .page_number = 1 },
+        .{ .page_number = 2 },
+    };
+
+    var serial_reader = try reader.Reader.init(alloc, fixture);
+    defer serial_reader.deinit();
+    var serial = try renderParsedPagesBatchAlloc(alloc, &serial_reader, &requests, .{
+        .max_parallel_pages = 1,
+    });
+    defer serial.deinit(alloc);
+
+    var parallel_reader = try reader.Reader.init(alloc, fixture);
+    defer parallel_reader.deinit();
+    var parallel = try renderParsedPagesBatchAlloc(alloc, &parallel_reader, &requests, .{
+        .max_parallel_pages = 2,
+    });
+    defer parallel.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), serial.peak_parallelism);
+    try std.testing.expectEqual(@as(usize, 0), serial.peak_launched_workers);
+    try std.testing.expectEqual(@as(usize, 2), parallel.peak_launched_workers);
+    try std.testing.expect(parallel.peak_parallelism >= 1);
+    try std.testing.expect(parallel.peak_parallelism <= 2);
+    for (serial.results, parallel.results) |serial_result, parallel_result| {
+        try std.testing.expect(serial_result.failure == null);
+        try std.testing.expect(parallel_result.failure == null);
+        try std.testing.expectEqualSlices(u8, serial_result.rendered.?.png, parallel_result.rendered.?.png);
+    }
+}
+
+test "bounded render batch downsizes pages before retaining outputs" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var baseline_reader = try reader.Reader.init(alloc, fixture);
+    defer baseline_reader.deinit();
+    var baseline = try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &baseline_reader, 1, 150, 40_000_000, 2048, .ocr);
+    defer baseline.deinit(alloc);
+    const output_limit = @max(@as(usize, 128), baseline.png.len / 2);
+
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{.{
+        .page_number = 1,
+        .max_dimension = 2048,
+        .max_output_bytes = output_limit,
+        .min_output_dimension = 64,
+        .max_output_attempts = 8,
+    }}, .{ .max_retained_png_bytes = output_limit });
+    defer batch.deinit(alloc);
+
+    try std.testing.expect(batch.results[0].failure == null);
+    const rendered = batch.results[0].rendered.?;
+    try std.testing.expect(rendered.png.len <= output_limit);
+    try std.testing.expect(rendered.width < baseline.width or rendered.height < baseline.height);
+}
+
+test "bounded render batch derives viable geometry from a partial native grant" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    try parsed.setDecodeLimits(.{
+        .max_working_set_bytes = 4 * 1024 * 1024,
+        .max_decoded_stream_bytes = 4 * 1024 * 1024,
+    });
+
+    const raster_budget = 8 * 1024 * 1024;
+    const fixed_bytes = fixture.len + parsed.decode_limits.max_working_set_bytes;
+    const native_grant = fixed_bytes + raster_budget;
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{.{
+        .page_number = 1,
+        .requested_dpi = 300,
+        .max_pixels = 40_000_000,
+        .max_dimension = 4096,
+    }}, .{
+        .max_inflight_bytes = native_grant,
+        .max_retained_png_bytes = 16 * 1024 * 1024,
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expect(batch.results[0].failure == null);
+    const rendered = batch.results[0].rendered.?;
+    try std.testing.expect(rendered.width < 4096 and rendered.height < 4096);
+    try std.testing.expect(batch.peak_admitted_bytes <= native_grant);
+    try std.testing.expect(batch.peak_admitted_pixels <= raster_budget / 12);
+}
+
+test "render worker budget releases freed temporary memory" {
+    var budget = RenderWorkerBudgetAllocator{
+        .backing = std.testing.allocator,
+        .max_live_bytes = 64,
+    };
+    const alloc = budget.allocator();
+    const first = try alloc.alloc(u8, 64);
+    alloc.free(first);
+    const second = try alloc.alloc(u8, 64);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    try std.testing.expect(!budget.limit_exceeded);
+}
+
+test "bounded render batch rejects an already-canceled window" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(std.testing.allocator, fixture);
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Canceled, renderParsedPagesBatchAlloc(
+        std.testing.allocator,
+        &parsed,
+        &.{.{ .page_number = 1 }},
+        .{ .cancellation = .{ .is_cancelled_fn = Cancelled.check } },
+    ));
+
+    parsed.setCancellationProbe(.{ .is_cancelled_fn = Cancelled.check });
+    try std.testing.expectError(error.Canceled, renderParsedPagesBatchAlloc(
+        std.testing.allocator,
+        &parsed,
+        &.{.{ .page_number = 1 }},
+        .{},
+    ));
+}
+
+test "render wave control composes cancellation and measures active workers" {
+    var control = RenderWaveControl{ .external = .{} };
+    try control.probe().check();
+    control.enterRender();
+    control.enterRender();
+    try std.testing.expectEqual(@as(usize, 2), control.peak_active.load(.acquire));
+    control.leaveRender();
+    control.leaveRender();
+    try std.testing.expectEqual(@as(usize, 0), control.active.load(.acquire));
+    control.stop();
+    try std.testing.expectError(error.Canceled, control.probe().check());
+}
+
+test "render wave start gate releases immediately on cancellation" {
+    const Cancellation = struct {
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn check(context: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(context.?));
+            return self.cancelled.load(.acquire);
+        }
+    };
+    const Releaser = struct {
+        control: *RenderWaveControl,
+
+        fn run(self: *@This()) void {
+            // Deliberately expect a worker that never arrives. Cancellation
+            // must still release the gate and let this thread terminate.
+            self.control.releaseStartWhenReady(1);
+        }
+    };
+
+    var cancellation = Cancellation{};
+    var control = RenderWaveControl{ .external = .{
+        .context = &cancellation,
+        .is_cancelled_fn = Cancellation.check,
+    } };
+    var releaser = Releaser{ .control = &control };
+    const thread = try std.Thread.spawn(.{}, Releaser.run, .{&releaser});
+    cancellation.cancelled.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(control.start_released.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), control.arrived.load(.acquire));
+    try std.testing.expectError(error.Canceled, control.probe().check());
+
+    // A worker scheduled after cancellation cannot become trapped behind the
+    // already released start gate.
+    control.enterRender();
+    control.arriveAndWaitForStart();
+    control.leaveRender();
+    try std.testing.expectEqual(@as(usize, 0), control.active.load(.acquire));
+}
+
+test "bounded render batch enforces window admission and retained output limits" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.RenderBatchTooLarge, renderParsedPagesBatchAlloc(alloc, &parsed, &.{
+        .{ .page_number = 1 },
+        .{ .page_number = 2 },
+    }, .{ .max_batch_pages = 1 }));
+
+    var rejected = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{.{ .page_number = 1 }}, .{
+        .max_inflight_bytes = 1,
+    });
+    defer rejected.deinit(alloc);
+    try std.testing.expect(rejected.results[0].rendered == null);
+    try std.testing.expect(rejected.results[0].failure.? == error.RenderBatchAdmissionExceeded);
+    try std.testing.expectEqual(@as(usize, 0), rejected.peak_parallelism);
+
+    try std.testing.expectError(error.RenderBatchRetainedBytesExceeded, renderParsedPagesBatchAlloc(alloc, &parsed, &.{.{ .page_number = 1 }}, .{
+        .max_retained_png_bytes = 1,
+    }));
+}
+
+test "bounded render batch adapts geometry to the inflight pixel window" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    const pixel_window: u64 = 50_000;
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{.{
+        .page_number = 1,
+        .requested_dpi = 150,
+        .max_pixels = 40_000_000,
+    }}, .{
+        .max_inflight_pixels = pixel_window,
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expect(batch.results[0].failure == null);
+    const rendered = batch.results[0].rendered.?;
+    try std.testing.expect(@as(u64, rendered.width) * @as(u64, rendered.height) <= pixel_window);
+    try std.testing.expect(rendered.effective_dpi < rendered.requested_dpi);
+    try std.testing.expect(batch.peak_admitted_pixels <= pixel_window);
 }
 
 test "reader ignores stale positive page-tree Count hints" {
