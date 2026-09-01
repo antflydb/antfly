@@ -359,6 +359,7 @@ pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceAudioChunkConfig = types.InferenceAudioChunkConfig;
 pub const InferenceBackendPriorityEntry = types.InferenceBackendPriorityEntry;
 pub const InferenceBackendRuntimes = types.InferenceBackendRuntimes;
+pub const InferenceBatchExecutionReport = types.InferenceBatchExecutionReport;
 pub const InferenceBinaryContent = types.InferenceBinaryContent;
 pub const InferenceCapacityError = types.InferenceCapacityError;
 pub const InferenceChatMessage = types.InferenceChatMessage;

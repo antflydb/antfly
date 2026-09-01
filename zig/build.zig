@@ -3470,8 +3470,10 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "generating backend factory executes fallback chain across providers",
             "asset producer runtime",
+            "asset producer destroys returned values",
             "inference capabilities",
             "batch capabilities",
+            "work identity and execution reports",
             "remote Antfly",
         },
     });

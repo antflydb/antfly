@@ -562,6 +562,12 @@ components:
           minimum: 1
           format: uint64
           description: "Approximate maximum source bytes to process in one batch for this operation."
+        max_document_pages:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint32
+          description: "Maximum PDF pages admitted for one request-atomic document operation."
     IndexExecutionConfig:
       type: object
       additionalProperties: false

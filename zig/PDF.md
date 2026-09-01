@@ -1,8 +1,8 @@
 # Bounded document preparation and multimodal inference
 
 Status: bounded document preparation, indexed reader execution, multimodal
-generation transport, durable page-image embedding, and post-review batching
-hardening implemented
+generation transport, durable page-image embedding, observed remote execution,
+and post-review batching hardening implemented
 
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
@@ -276,6 +276,41 @@ document. They are architectural requirements, not Florence-specific cleanup:
     attached to that item; valid siblings are applied once and are not rerun
     serially. Compatibility callers that cannot represent item errors may fail
     the outer call, but must still free successful sibling outputs.
+17. **Failure validation could leak a completed producer batch.** Validation
+    owns the returned batch until both its execution report and cardinality
+    pass. Every invalid-report and invalid-cardinality edge destroys successful
+    sibling payloads before returning an error.
+18. **PDF publication retained an unbounded document-sized commit set.** Query
+    visibility is request-atomic, so page artifacts, vector replacement, stale
+    deletion, and coverage cannot be flushed independently without
+    generation-aware index filtering. The implemented safe boundary admits a
+    configurable `max_document_pages` before staging, clamps it to an absolute
+    16,384-page ceiling, cleans invisible staging records in fixed-size delete
+    windows, and uses a key-only bounded scan for page assets plus derived
+    artifacts. The default is 2,048 pages. Lifting the absolute limit requires
+    adding an active generation to vector records and query filtering first; an
+    artifact manifest pointer by itself is insufficient.
+19. **Per-page accumulation had ambiguous allocation ownership.** Page keys,
+    stage keys, and each field of a dense embedding record transfer ownership
+    only after their destination append succeeds. Error paths free exactly the
+    still-local allocations.
+20. **URL reader admission ignored inline payload size and MIME.** Base64
+    `data:` inputs are parsed at the executor boundary, their decoded byte size
+    is charged, and their MIME is checked against the resolved model. Network
+    URLs remain provider-owned until download and must be checked by the
+    server-side media budget afterward.
+21. **Remote execution telemetry was predicted from capabilities.** Read and
+    generation responses now optionally carry an observed execution report.
+    New clients validate and use it; old servers without the field are treated
+    conservatively as serial compatibility. The generation batch endpoint
+    reports serial items while it schedules independent decode invocations.
+22. **Capability single-flight waits ignored cancellation and shutdown.** Waits
+    now poll a semantic cancellation token, honor the request deadline, and
+    bound the catalog HTTP request. Cache shutdown closes admission and drains
+    outstanding flights before destroying their events or keys.
+23. **Generator modality admission omitted raw documents.**
+    `application/pdf` maps to the document modality and is accepted only when
+    the resolved generator advertises document input and PDF MIME support.
 
 ### Post-review implementation contract
 
@@ -285,7 +320,8 @@ The hardening above follows four long-term rules:
   reused by planning and execution. The current implementation uses a bounded
   30-second fresh cache, five-minute stale-if-error interval, and single-flight
   refresh. Discovery failure falls back to compatibility execution; it never
-  upgrades an unknown model to native batching.
+  upgrades an unknown model to native batching. Discovery and single-flight
+  waits are deadline-bounded and cancelable; runtime shutdown drains owners.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
@@ -296,7 +332,10 @@ The hardening above follows four long-term rules:
   invisible; complete current-page promotion and stale-page artifact deletion
   are one transaction; vector/coverage replay is the public generation commit.
   A future storage backend that cannot provide the artifact transaction must
-  instead publish through an atomic active-generation manifest pointer.
+  instead publish through an atomic active-generation manifest pointer. The
+  current vector index is not generation-filtered, so request atomicity is
+  protected by a hard document-page admission ceiling until that migration is
+  complete.
 
 ## Migration sequence and implementation status
 
@@ -371,6 +410,22 @@ The hardening above follows four long-term rules:
     typed internal namespace. Complete promotion removes stale page artifacts
     in the same transaction, while stale vector deletion and replacement
     vectors remain in the atomic generated replay window.
+14. **Implemented after review:** request-atomic PDF publication has explicit
+    page-count admission (`execution.max_document_pages`, default 2,048,
+    absolute maximum 16,384). Invisible stage cleanup uses fixed-size delete
+    pages, stale-artifact maintenance uses a bounded key-only scan, and
+    allocation transfer is failure-safe.
+15. **Implemented after review:** remote read and generation responses carry
+    optional observed execution reports. Clients validate the report, preserve
+    backward compatibility as serial execution, and never upgrade telemetry
+    from a capability prediction.
+16. **Implemented after review:** reader URI admission measures decoded base64
+    data URIs and validates MIME before local callback or remote adaptation.
+    Generator admission recognizes PDF as the
+    document modality.
+17. **Implemented after review:** capability single-flight waiters observe
+    cancellation/deadlines, catalog fetches have a finite timeout, and cache
+    teardown drains in-flight owners instead of asserting they do not exist.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -932,6 +987,7 @@ settings impose hard ceilings. A possible configuration shape is:
 execution:
   batch_items: 8
   batch_bytes: 67108864
+  max_document_pages: 2048
 
 ocr:
   render:
@@ -951,6 +1007,7 @@ ANTFLY_ENRICHMENT_OCR_BATCH_BYTES
 ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES
+ANTFLY_ENRICHMENT_PDF_MAX_DOCUMENT_PAGES
 ```
 
 Empty, zero, overflowing, and malformed values need explicit semantics. In

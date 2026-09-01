@@ -698,6 +698,7 @@ pub const Runtime = struct {
         var native_batches: usize = 0;
         var native_items: usize = 0;
         var serial_items: usize = 0;
+        var fallback_items: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
             const end = try generatorBatchEnd(alloc, capabilities, requests, start);
@@ -709,18 +710,16 @@ pub const Runtime = struct {
             defer resp.deinit();
             if (!resp.ok()) return mapAntflyGenerateBatchStatus(resp.status.code);
             const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
-            const chunk_items = try parseAntflyGenerateBatchResponseAlloc(alloc, payload, chunk);
-            defer alloc.free(chunk_items);
-            for (chunk_items) |item| {
+            const chunk_response = try parseAntflyGenerateBatchResponseAlloc(alloc, payload, chunk);
+            defer alloc.free(chunk_response.items);
+            for (chunk_response.items) |item| {
                 items[initialized] = item;
                 initialized += 1;
             }
-            if (capabilities.batch.executesNatively(chunk.len)) {
-                native_batches += 1;
-                native_items += chunk.len;
-            } else {
-                serial_items += chunk.len;
-            }
+            native_batches += chunk_response.execution.native_batches;
+            native_items += chunk_response.execution.native_items;
+            serial_items += chunk_response.execution.serial_items;
+            fallback_items += chunk_response.execution.fallback_items;
             start = end;
         }
         return .{
@@ -730,6 +729,8 @@ pub const Runtime = struct {
                 .native_batches = native_batches,
                 .native_items = native_items,
                 .serial_items = serial_items,
+                .fallback_items = fallback_items,
+                .fallback_reason = if (fallback_items > 0) "remote_generator_fallback" else null,
             },
         };
     }
@@ -904,17 +905,13 @@ pub const Runtime = struct {
                     .source_fingerprint = chunk_source_fingerprint,
                 })
             else blk: {
-                const items = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
+                break :blk try self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
                     .images = flat_images.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                     .source_fingerprint = chunk_source_fingerprint,
                 });
-                break :blk readers.BatchResult{
-                    .items = items,
-                    .execution = .{ .mode = .serial, .requested_items = items.len },
-                };
             };
             const chunk_results = chunk_batch.items;
             const chunk_execution: ReaderItemExecution = switch (chunk_batch.execution.mode) {
@@ -996,11 +993,7 @@ pub const Runtime = struct {
                 try capabilities.validateMimeType(media.mime_type);
                 encoded_bytes = std.math.add(usize, encoded_bytes, media.bytes.len) catch
                     return error.InferenceEncodedBytesExceeded;
-                if (std.mem.startsWith(u8, media.mime_type, "image/")) {
-                    modalities.image = true;
-                } else if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
-                    modalities.audio = true;
-                } else return error.UnsupportedInferenceMimeType;
+                mergeInferenceModalities(&modalities, try modalityForGeneratorMime(media.mime_type));
             }
             try capabilities.validateInvocation(.generate, .{
                 .item_count = 1,
@@ -1087,11 +1080,17 @@ pub const Runtime = struct {
     }
 
     fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
+        return (try self.readImagesWithConfigReported(alloc, cfg, request)).items;
+    }
+
+    fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
         const local_reader = isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
         if (try self.readerCapabilities(alloc, cfg)) |capabilities| {
+            const inline_shape = try readerUriInvocationShape(capabilities, request);
             try capabilities.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
+                .encoded_bytes = inline_shape.encoded_bytes,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
         } else if (local_reader) {
@@ -1103,7 +1102,8 @@ pub const Runtime = struct {
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            return try read_images(local.ptr, alloc, cfg.model orelse "", request);
+            const items = try read_images(local.ptr, alloc, cfg.model orelse "", request);
+            return .{ .items = items, .execution = .{ .mode = .serial, .requested_items = items.len } };
         }
 
         var registry = readers.Registry.init(alloc);
@@ -1115,7 +1115,35 @@ pub const Runtime = struct {
         try runtime.loadFromRegistry(self.http, &registry);
 
         const provider = try runtime.get("asset");
-        return try provider.read(alloc, request);
+        return try provider.readReported(alloc, request);
+    }
+
+    const ReaderUriInvocationShape = struct {
+        encoded_bytes: usize = 0,
+    };
+
+    /// Inspect inline payloads before selecting a local callback or remote
+    /// adapter. Network URLs remain provider-owned until download, where the
+    /// inference server applies its own byte/MIME limits.
+    fn readerUriInvocationShape(
+        capabilities: inference_work.InferenceCapabilities,
+        request: readers.Request,
+    ) !ReaderUriInvocationShape {
+        var shape = ReaderUriInvocationShape{};
+        for (request.images) |url| {
+            if (!std.ascii.startsWithIgnoreCase(url, "data:")) continue;
+            const comma = std.mem.indexOfScalar(u8, url, ',') orelse return error.InvalidDataURI;
+            const metadata = url["data:".len..comma];
+            if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
+            const mime_type = metadata[0 .. metadata.len - ";base64".len];
+            if (mime_type.len == 0) return error.InvalidDataURI;
+            try capabilities.validateMimeType(mime_type);
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(url[comma + 1 ..]) catch
+                return error.InvalidDataURI;
+            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, decoded_len) catch
+                return error.InferenceEncodedBytesExceeded;
+        }
+        return shape;
     }
 
     fn readEncodedImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) ![]readers.Result {
@@ -1185,17 +1213,15 @@ pub const Runtime = struct {
             urls[i] = url;
             initialized += 1;
         }
-        const items = try self.readImagesWithConfig(alloc, cfg, .{
+        var adapted = try self.readImagesWithConfigReported(alloc, cfg, .{
             .images = urls,
             .prompt = request.prompt,
             .max_tokens = request.max_tokens,
             .inline_content_trust = .trusted_internal,
             .source_fingerprint = request.source_fingerprint,
         });
-        errdefer {
-            for (items) |*item| readers.deinitResult(alloc, item);
-            alloc.free(items);
-        }
+        errdefer adapted.deinit(alloc);
+        const items = adapted.items;
         if (items.len != request.images.len) return error.InvalidReaderResponse;
         for (items, request.images) |*item, image| {
             if (item.item_id.len == 0 and image.item_id.len > 0) item.item_id = try alloc.dupe(u8, image.item_id);
@@ -1204,10 +1230,7 @@ pub const Runtime = struct {
         }
         return .{
             .items = items,
-            .execution = if (capabilities != null and capabilities.?.batch.executesNatively(request.images.len))
-                .{ .mode = .native, .requested_items = request.images.len, .native_batches = 1 }
-            else
-                .{ .mode = .serial, .requested_items = request.images.len },
+            .execution = adapted.execution,
         };
     }
 
@@ -1494,6 +1517,7 @@ fn modalityForGeneratorMime(mime_type: []const u8) !inference_work.Modalities {
     if (std.ascii.startsWithIgnoreCase(mime_type, "image/")) return .{ .image = true };
     if (std.ascii.startsWithIgnoreCase(mime_type, "audio/")) return .{ .audio = true };
     if (std.ascii.eqlIgnoreCase(mime_type, "text/plain")) return .{ .text = true };
+    if (std.ascii.eqlIgnoreCase(mime_type, "application/pdf")) return .{ .document = true };
     return error.UnsupportedInferenceMimeType;
 }
 
@@ -1565,6 +1589,57 @@ fn validateGeneratorInvocation(
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
     }
     try capabilities.validateInvocation(.generate, invocation);
+}
+
+test "asset producer runtime generator admission accepts PDF only for document-capable models" {
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .document = true },
+        .accepted_mime_types = .{ .text_plain = true, .application_pdf = true },
+        .input_granularity = .document,
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_bytes = 16, .max_media_parts_per_item = 1 },
+        .output = .generated_text,
+    };
+    const pdf = [_]u8{ '%', 'P', 'D', 'F' };
+    const requests = [_]asset_producer.Request{.{
+        .producer_type = .generator,
+        .config_json = "{}",
+        .source_text = "ocr",
+        .media = &.{.{ .bytes = &pdf, .mime_type = "application/pdf" }},
+    }};
+    try validateGeneratorInvocation(std.testing.allocator, capabilities, &requests);
+
+    var image_only = capabilities;
+    image_only.input_modalities = .{ .text = true, .image = true };
+    image_only.accepted_mime_types = .{ .text_plain = true, .image_png = true };
+    image_only.input_granularity = .page;
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        validateGeneratorInvocation(std.testing.allocator, image_only, &requests),
+    );
+}
+
+test "asset producer runtime reader URI admission measures data payloads before execution" {
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .read,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_encoded_bytes = 2, .max_media_parts_per_item = 1 },
+        .output = .read_result,
+    };
+    const request = readers.Request{
+        .images = &.{"data:image/png;base64,AQID"},
+        .inline_content_trust = .trusted_internal,
+    };
+    const shape = try Runtime.readerUriInvocationShape(capabilities, request);
+    try std.testing.expectEqual(@as(usize, 3), shape.encoded_bytes);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, capabilities.validateInvocation(.read, .{
+        .item_count = 1,
+        .modalities = .{ .image = true },
+        .encoded_bytes = shape.encoded_bytes,
+        .max_media_parts_per_item = 1,
+    }));
 }
 
 fn generatorBatchEnd(
@@ -1927,11 +2002,16 @@ fn appendBatchFloatField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), nam
     try out.appendSlice(alloc, fragment);
 }
 
+const ParsedGenerateBatchResponse = struct {
+    items: []asset_producer.ProducedItem,
+    execution: inference_work.ExecutionReport,
+};
+
 fn parseAntflyGenerateBatchResponseAlloc(
     alloc: Allocator,
     payload: []const u8,
     requests: []const asset_producer.Request,
-) ![]asset_producer.ProducedItem {
+) !ParsedGenerateBatchResponse {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGenerateBatchResponse;
@@ -1982,7 +2062,32 @@ fn parseAntflyGenerateBatchResponseAlloc(
     for (seen) |was_seen| {
         if (!was_seen) return error.InvalidGenerateBatchResponse;
     }
-    return out;
+    return .{
+        .items = out,
+        .execution = try executionReportFromGenerateWire(parsed.value.object.get("execution"), requests.len),
+    };
+}
+
+fn executionReportFromGenerateWire(value: ?std.json.Value, item_count: usize) !inference_work.ExecutionReport {
+    const raw = value orelse return inference_work.ExecutionReport.serial(item_count);
+    if (raw != .object) return error.InvalidGenerateBatchExecutionReport;
+    var report = inference_work.ExecutionReport{
+        .requested_items = try nonNegativeJsonUsize(raw.object.get("requested_items")),
+        .native_batches = try nonNegativeJsonUsize(raw.object.get("native_batches")),
+        .native_items = try nonNegativeJsonUsize(raw.object.get("native_items")),
+        .serial_items = try nonNegativeJsonUsize(raw.object.get("serial_items")),
+        .fallback_items = try nonNegativeJsonUsize(raw.object.get("fallback_items")),
+    };
+    if (report.fallback_items > 0) report.fallback_reason = "remote_generator_fallback";
+    try report.validate();
+    if (report.requested_items != item_count) return error.InvalidGenerateBatchExecutionReport;
+    return report;
+}
+
+fn nonNegativeJsonUsize(value: ?std.json.Value) !usize {
+    const raw = value orelse return error.InvalidGenerateBatchExecutionReport;
+    if (raw != .integer or raw.integer < 0) return error.InvalidGenerateBatchExecutionReport;
+    return std.math.cast(usize, raw.integer) orelse error.InvalidGenerateBatchExecutionReport;
 }
 
 fn generateResponseContentAlloc(alloc: Allocator, response: std.json.Value) ![]u8 {
@@ -2568,7 +2673,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
             \\{"object":"generate.batch","data":[
             \\{"custom_id":"0","index":0,"response":{"id":"gen-0","object":"chat.completion","created":1,"model":"local-generator","choices":[{"index":0,"message":{"role":"assistant","content":"first answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}},
             \\{"custom_id":"1","index":1,"response":{"id":"gen-1","object":"chat.completion","created":1,"model":"local-generator","choices":[{"index":0,"message":{"role":"assistant","content":"second answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}}
-            \\],"summary":{"total":2,"succeeded":2,"failed":0}}
+            \\],"summary":{"total":2,"succeeded":2,"failed":0},"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"fallback_items":0}}
             ,
         } },
     });
@@ -2644,7 +2749,7 @@ test "asset producer runtime preserves remote reader identity and native executi
             \\{"object":"list","data":[
             \\{"text":"page one","object":"read.result","index":0},
             \\{"text":"page two","object":"read.result","index":1}
-            \\],"model":"florence","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}
+            \\],"model":"florence","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"execution":{"requested_items":2,"native_batches":1,"native_items":2,"serial_items":0,"fallback_items":0}}
             ,
         } },
     });
@@ -2720,7 +2825,7 @@ test "asset producer runtime preserves generator item failures" {
             \\{"object":"generate.batch","data":[
             \\{"custom_id":"0","index":0,"response":{"choices":[{"message":{"content":"ok"}}]}},
             \\{"custom_id":"1","index":1,"error":{"code":"bad_page","message":"unreadable"}}
-            \\],"summary":{"total":2,"succeeded":1,"failed":1}}
+            \\],"summary":{"total":2,"succeeded":1,"failed":1},"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"fallback_items":0}}
             ,
         } },
     });
@@ -2801,7 +2906,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
-            try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
+            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", request.images[0]);
             try std.testing.expectEqualStrings("extract", request.prompt.?);
             try std.testing.expectEqual(readers.InlineContentTrust.untrusted, request.inline_content_trust);
 
@@ -2822,7 +2927,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
         .producer_type = .reader,
         .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
         .source_text = "",
-        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,aaa\"}]",
+        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,YWFh\"}]",
         .content_type = "text/plain",
     });
     defer alloc.free(result);
@@ -2863,8 +2968,8 @@ test "asset producer runtime batches compatible antfly reader requests" {
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expectEqual(@as(usize, 2), request.images.len);
-            try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
-            try std.testing.expectEqualStrings("data:image/png;base64,bbb", request.images[1]);
+            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", request.images[0]);
+            try std.testing.expectEqualStrings("data:image/png;base64,YmJi", request.images[1]);
             try std.testing.expect(request.prompt == null);
             try std.testing.expectEqual(readers.InlineContentTrust.trusted_internal, request.inline_content_trust);
 
@@ -2886,14 +2991,14 @@ test "asset producer runtime batches compatible antfly reader requests" {
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
-            .source_text = "data:image/png;base64,aaa",
+            .source_text = "data:image/png;base64,YWFh",
             .content_type = "text/plain",
             .inline_media_trusted = true,
         },
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
-            .source_text = "data:image/png;base64,bbb",
+            .source_text = "data:image/png;base64,YmJi",
             .content_type = "text/plain",
             .inline_media_trusted = true,
         },
@@ -3153,7 +3258,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
     const requests = try alloc.alloc(asset_producer.Request, request_count);
     defer alloc.free(requests);
     for (0..request_count) |i| {
-        urls[i] = try std.fmt.allocPrint(alloc, "data:image/png;base64,{d}", .{i});
+        urls[i] = try alloc.dupe(u8, "data:image/png;base64,AQ==");
         urls_filled += 1;
         requests[i] = .{
             .producer_type = .reader,

@@ -37,6 +37,8 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             return error.InvalidEnrichmentExecutionConfig;
         if (execution.batch_bytes) |bytes| if (bytes == 0)
             return error.InvalidEnrichmentExecutionConfig;
+        if (execution.max_document_pages) |pages| if (pages == 0)
+            return error.InvalidEnrichmentExecutionConfig;
     }
     if (cfg.full_text_index and cfg.kind == .embedding)
         return error.InvalidEnrichmentConfig;

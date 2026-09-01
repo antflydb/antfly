@@ -10,6 +10,7 @@ pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const BackendPriorityEntry = types.BackendPriorityEntry;
 pub const BackendRuntimes = types.BackendRuntimes;
+pub const BatchExecutionReport = types.BatchExecutionReport;
 pub const BinaryContent = types.BinaryContent;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatMessageContent = types.ChatMessageContent;

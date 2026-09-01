@@ -251,6 +251,7 @@ pub const ExecutionReport = struct {
         if (executed != self.requested_items) return error.InvalidExecutionReport;
         if (self.fallback_items > self.serial_items) return error.InvalidExecutionReport;
         if (self.native_batches == 0 and self.native_items != 0) return error.InvalidExecutionReport;
+        if (self.native_batches > self.native_items) return error.InvalidExecutionReport;
         if (self.fallback_items == 0 and self.fallback_reason != null) return error.InvalidExecutionReport;
     }
 
@@ -414,5 +415,9 @@ test "work identity and execution reports preserve per-item semantics" {
     try std.testing.expectError(
         error.InvalidExecutionReport,
         (ExecutionReport{ .requested_items = 2, .serial_items = 1 }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidExecutionReport,
+        (ExecutionReport{ .requested_items = 1, .native_batches = 2, .native_items = 1 }).validate(),
     );
 }

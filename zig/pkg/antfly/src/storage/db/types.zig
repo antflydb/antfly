@@ -473,6 +473,7 @@ pub const EnrichmentConfig = struct {
 pub const EnrichmentExecutionConfig = struct {
     batch_items: ?u32 = null,
     batch_bytes: ?u64 = null,
+    max_document_pages: ?u32 = null,
 };
 
 pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {

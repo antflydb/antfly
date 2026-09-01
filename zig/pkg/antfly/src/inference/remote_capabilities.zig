@@ -10,10 +10,13 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const work = @import("work.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 const capability_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
 const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;
 const capability_cache_max_entries: usize = 64;
+const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
+const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
 
 fn monotonicNowNs(io: std.Io) u64 {
     const raw = std.Io.Timestamp.now(io, .awake).toNanoseconds();
@@ -35,6 +38,16 @@ const CapabilityFlight = struct {
     ready: std.Io.Event = .unset,
 };
 
+pub const WaitContext = struct {
+    deadline_ns: ?u64 = null,
+    cancellation: CancellationToken = .none,
+
+    fn check(self: @This(), now_ns: u64) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| if (now_ns >= deadline) return error.Timeout;
+    }
+};
+
 /// Runtime-owned, task/model/auth-keyed capability snapshots. Catalog lookups
 /// are single-flight, fresh values are reused across planner and executor
 /// boundaries, and a previously validated snapshot survives a short catalog
@@ -46,6 +59,7 @@ pub const Cache = struct {
     mutex: std.Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(CachedCapability) = .empty,
     flights: std.StringHashMapUnmanaged(*CapabilityFlight) = .empty,
+    closing: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Cache {
         return .{ .alloc = alloc, .io = io };
@@ -53,7 +67,16 @@ pub const Cache = struct {
 
     pub fn deinit(self: *Cache) void {
         self.mutex.lockUncancelable(self.io);
-        std.debug.assert(self.flights.count() == 0);
+        self.closing = true;
+        while (self.flights.count() != 0) {
+            var flights = self.flights.iterator();
+            const flight = flights.next().?.value_ptr.*;
+            flight.refs += 1;
+            self.mutex.unlock(self.io);
+            flight.ready.waitUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            self.releaseFlightLocked(flight);
+        }
         var entries = self.entries.iterator();
         while (entries.next()) |entry| self.alloc.free(@constCast(entry.key_ptr.*));
         self.entries.deinit(self.alloc);
@@ -70,11 +93,30 @@ pub const Cache = struct {
         task: work.Task,
         headers: []const [2][]const u8,
     ) !?work.InferenceCapabilities {
+        return try self.getOrDiscoverWithContext(http, inference_url, model, task, headers, .{
+            .deadline_ns = monotonicNowNs(self.io) +| capability_discovery_timeout_ns,
+        });
+    }
+
+    pub fn getOrDiscoverWithContext(
+        self: *Cache,
+        http: *httpx.Client,
+        inference_url: []const u8,
+        model: []const u8,
+        task: work.Task,
+        headers: []const [2][]const u8,
+        wait_context: WaitContext,
+    ) !?work.InferenceCapabilities {
+        try wait_context.check(monotonicNowNs(self.io));
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, task, headers);
         defer self.alloc.free(key);
         const now_ns = monotonicNowNs(self.io);
 
         self.mutex.lockUncancelable(self.io);
+        if (self.closing) {
+            self.mutex.unlock(self.io);
+            return error.CapabilityCacheClosed;
+        }
         if (self.entries.get(key)) |entry| {
             if (now_ns < entry.expires_at_ns) {
                 self.mutex.unlock(self.io);
@@ -84,10 +126,15 @@ pub const Cache = struct {
         if (self.flights.get(key)) |flight| {
             flight.refs += 1;
             self.mutex.unlock(self.io);
-            flight.ready.waitUncancelable(self.io);
+            waitForFlight(self.io, flight, wait_context) catch |err| {
+                self.mutex.lockUncancelable(self.io);
+                self.releaseFlightLocked(flight);
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.mutex.lockUncancelable(self.io);
             const value = flight.value;
             const flight_err = flight.err;
-            self.mutex.lockUncancelable(self.io);
             self.releaseFlightLocked(flight);
             self.mutex.unlock(self.io);
             if (flight_err) |err| return err;
@@ -111,7 +158,7 @@ pub const Cache = struct {
         };
         self.mutex.unlock(self.io);
 
-        const discovered = discover(self.alloc, http, inference_url, model, task, headers);
+        const discovered = discoverWithDeadline(self.alloc, self.io, http, inference_url, model, task, headers, wait_context.deadline_ns);
         if (discovered) |value| {
             self.mutex.lockUncancelable(self.io);
             self.admitLocked(key, value, monotonicNowNs(self.io)) catch {};
@@ -182,6 +229,25 @@ pub const Cache = struct {
         self.alloc.destroy(flight);
     }
 };
+
+fn waitForFlight(io: std.Io, flight: *CapabilityFlight, context: WaitContext) !void {
+    while (!flight.ready.isSet()) {
+        const now_ns = monotonicNowNs(io);
+        try context.check(now_ns);
+        const wait_ns = if (context.deadline_ns) |deadline|
+            @min(capability_wait_poll_ns, deadline - now_ns)
+        else
+            capability_wait_poll_ns;
+        flight.ready.waitTimeout(io, .{ .duration = .{
+            .raw = std.Io.Duration.fromNanoseconds(@intCast(wait_ns)),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => continue,
+            error.Canceled => return error.Canceled,
+        };
+    }
+    try context.check(monotonicNowNs(io));
+}
 
 fn capabilityCacheKeyAlloc(
     alloc: std.mem.Allocator,
@@ -352,6 +418,35 @@ pub fn discover(
     return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
 }
 
+fn discoverWithDeadline(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    http: *httpx.Client,
+    inference_url: []const u8,
+    model: []const u8,
+    task: work.Task,
+    headers: []const [2][]const u8,
+    deadline_ns: ?u64,
+) !?work.InferenceCapabilities {
+    const now_ns = monotonicNowNs(io);
+    const effective_deadline = @min(
+        deadline_ns orelse now_ns +| capability_discovery_timeout_ns,
+        now_ns +| capability_discovery_timeout_ns,
+    );
+    if (now_ns >= effective_deadline) return error.Timeout;
+    const remaining_ns = effective_deadline - now_ns;
+    const timeout_ms: u64 = @max(1, @min(
+        @as(u64, 30_000),
+        (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+    ));
+    const url = try modelsUrlAlloc(alloc, inference_url);
+    defer alloc.free(url);
+    var response = try http.get(url, .{ .headers = headers, .timeout_ms = timeout_ms });
+    defer response.deinit();
+    if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
+    return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
+}
+
 test "remote Antfly capabilities resolve model modalities and batch mode" {
     const payload =
         \\{"readers":{"florence":{"inputs":["text","image"],"capabilities":["native_batch_read","inference.batch.max_items=12"]}},"embedders":{"clipclap":{"inputs":["text","image","audio"]}}}
@@ -373,4 +468,15 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
     const read = try modelsUrlAlloc(std.testing.allocator, "http://localhost:8082/ai/v1/read");
     defer std.testing.allocator.free(read);
     try std.testing.expectEqualStrings("http://localhost:8082/ai/v1/models", read);
+}
+
+test "remote Antfly capability single-flight wait observes deadline and cancellation" {
+    const io = std.Options.debug_io;
+    var flight = CapabilityFlight{ .key = @constCast("test") };
+    try std.testing.expectError(error.Timeout, waitForFlight(io, &flight, .{ .deadline_ns = 0 }));
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, waitForFlight(io, &flight, .{
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
 }

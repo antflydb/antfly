@@ -17423,6 +17423,12 @@ components:
           minimum: 1
           format: uint64
           description: Approximate maximum source bytes to process in one batch for this operation.
+        max_document_pages:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint32
+          description: Maximum PDF pages admitted for one request-atomic document operation.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -26003,6 +26009,9 @@ components:
           description: Name of model used for reading
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceReadObject:
       allOf:
         - $ref: '#/components/schemas/InferenceReadResult'
@@ -26693,6 +26702,34 @@ components:
           type: integer
         failed:
           type: integer
+    InferenceBatchExecutionReport:
+      type: object
+      required:
+        - requested_items
+        - native_batches
+        - native_items
+        - serial_items
+        - fallback_items
+      properties:
+        requested_items:
+          type: integer
+          minimum: 0
+        native_batches:
+          type: integer
+          minimum: 0
+        native_items:
+          type: integer
+          minimum: 0
+        serial_items:
+          type: integer
+          minimum: 0
+        fallback_items:
+          type: integer
+          minimum: 0
+        fallback_reason:
+          type: string
+          nullable: true
+      description: Observed executor behavior, not a capability prediction.
     InferenceGenerateBatchResponse:
       type: object
       required:
@@ -26710,6 +26747,9 @@ components:
             $ref: '#/components/schemas/InferenceGenerateBatchResultItem'
         summary:
           $ref: '#/components/schemas/InferenceGenerateBatchSummary'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceGenerateChoice:
       type: object
       required:

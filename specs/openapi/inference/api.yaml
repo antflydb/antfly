@@ -2118,6 +2118,9 @@ components:
           description: Name of model used for reading
         usage:
           $ref: '#/components/schemas/GenerateUsage'
+        execution:
+          $ref: '#/components/schemas/BatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     ReadObject:
       allOf:
         - $ref: '#/components/schemas/ReadResult'
@@ -2782,6 +2785,34 @@ components:
           type: integer
         failed:
           type: integer
+    BatchExecutionReport:
+      type: object
+      required:
+        - requested_items
+        - native_batches
+        - native_items
+        - serial_items
+        - fallback_items
+      properties:
+        requested_items:
+          type: integer
+          minimum: 0
+        native_batches:
+          type: integer
+          minimum: 0
+        native_items:
+          type: integer
+          minimum: 0
+        serial_items:
+          type: integer
+          minimum: 0
+        fallback_items:
+          type: integer
+          minimum: 0
+        fallback_reason:
+          type: string
+          nullable: true
+      description: Observed executor behavior, not a capability prediction.
     GenerateBatchResponse:
       type: object
       required:
@@ -2799,6 +2830,9 @@ components:
             $ref: '#/components/schemas/GenerateBatchResultItem'
         summary:
           $ref: '#/components/schemas/GenerateBatchSummary'
+        execution:
+          $ref: '#/components/schemas/BatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     GenerateChoice:
       type: object
       required:

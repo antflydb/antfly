@@ -1165,12 +1165,16 @@ pub const ManagedEmbedder = struct {
                 break :blk &header_storage;
             } else &.{};
             const cache = &@constCast(entry).remote_capability_cache.?;
-            if (cache.getOrDiscover(
+            if (cache.getOrDiscoverWithContext(
                 &http,
                 entry.base_url,
                 entry.model,
                 .embed,
                 headers,
+                .{
+                    .deadline_ns = embeddingOperationDeadline(entry),
+                    .cancellation = entry.cancellation orelse .none,
+                },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,

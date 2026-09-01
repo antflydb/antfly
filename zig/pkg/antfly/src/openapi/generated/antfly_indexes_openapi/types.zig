@@ -3423,11 +3423,14 @@ pub const ExecutionPolicy = struct {
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
     batch_bytes: ?i64 = null,
+    /// Maximum PDF pages admitted for one request-atomic document operation.
+    max_document_pages: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
+        .{ "max_document_pages", "max_document_pages", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3446,6 +3449,10 @@ pub const ExecutionPolicy = struct {
         }
         if (self.batch_bytes) |value| {
             try jw.objectField("batch_bytes");
+            try jw.write(value);
+        }
+        if (self.max_document_pages) |value| {
+            try jw.objectField("max_document_pages");
             try jw.write(value);
         }
         try jw.endObject();

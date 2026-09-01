@@ -232,6 +232,10 @@ const generated_ocr_default_render_parallel_pages: usize = 1;
 const generated_ocr_max_render_parallel_pages: usize = 8;
 const generated_ocr_default_render_inflight_pixels: u64 = 50_000_000;
 const generated_ocr_default_render_inflight_bytes: usize = 256 * 1024 * 1024;
+const generated_pdf_default_max_document_pages: usize = 2048;
+const generated_pdf_absolute_max_document_pages: usize = 16_384;
+const generated_pdf_artifact_scan_max_keys: usize = generated_pdf_absolute_max_document_pages * 8;
+const generated_pdf_stage_cleanup_page_keys: usize = 512;
 const maximum_ocr_inline_png_bytes: usize = 8 * 1024 * 1024;
 const minimum_ocr_inline_render_dimension: u32 = 512;
 const maximum_ocr_inline_render_attempts: u8 = 4;
@@ -405,6 +409,15 @@ fn generatedOcrBatchItems() usize {
     if (raw.len == 0) return generated_ocr_default_batch_items;
     const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_ocr_default_batch_items;
     return @max(@as(usize, 1), parsed);
+}
+
+fn generatedPdfMaxDocumentPages() usize {
+    if (comptime builtin.os.tag == .freestanding) return generated_pdf_default_max_document_pages;
+    const raw = getenv("ANTFLY_ENRICHMENT_PDF_MAX_DOCUMENT_PAGES") orelse
+        return generated_pdf_default_max_document_pages;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch
+        return generated_pdf_default_max_document_pages;
+    return std.math.clamp(parsed, 1, generated_pdf_absolute_max_document_pages);
 }
 
 fn generatedOcrBatchMaxItems() usize {
@@ -10712,6 +10725,11 @@ fn processPdfPageImageEmbedding(
     }
 
     const policy = try enrichment_types.parseExecutionPolicyJson(runtime.alloc, request.execution_json);
+    const max_document_pages = @min(
+        policy.max_document_pages orelse generatedPdfMaxDocumentPages(),
+        generated_pdf_absolute_max_document_pages,
+    );
+    if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = @min(policy.batch_items orelse default_items, capability_items);
@@ -10790,8 +10808,10 @@ fn processPdfPageImageEmbedding(
             const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{result.page_number});
             defer runtime.alloc.free(unit_id);
             const page_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), unit_id);
-            errdefer runtime.alloc.free(page_key);
+            var page_key_owned = true;
+            errdefer if (page_key_owned) runtime.alloc.free(page_key);
             try desired_page_keys.append(runtime.alloc, page_key);
+            page_key_owned = false;
             const stage_key = try pdfPageEmbeddingStageKeyAlloc(
                 runtime.alloc,
                 request.doc_key,
@@ -10799,8 +10819,10 @@ fn processPdfPageImageEmbedding(
                 embedding_name,
                 unit_id,
             );
-            errdefer runtime.alloc.free(stage_key);
+            var stage_key_owned = true;
+            errdefer if (stage_key_owned) runtime.alloc.free(stage_key);
             try staged_page_keys.append(runtime.alloc, stage_key);
+            stage_key_owned = false;
             const source_hash = enrichment_artifact_codec.hashEmbeddingSource(
                 rendered.results[result_index].rendered.?.png,
                 request.producer_json,
@@ -10813,14 +10835,23 @@ fn processPdfPageImageEmbedding(
             defer runtime.alloc.free(staged_payload);
             try storePutWithRetry(runtime, stage_key, staged_payload);
             const artifact_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
-            errdefer runtime.alloc.free(artifact_key);
-            try base_embeddings.append(runtime.alloc, .{
-                .index_name = try runtime.alloc.dupe(u8, embedding_name),
-                .parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key),
-                .doc_key = try runtime.alloc.dupe(u8, page_key),
+            var embedding_owned = true;
+            errdefer if (embedding_owned) runtime.alloc.free(artifact_key);
+            const index_name = try runtime.alloc.dupe(u8, embedding_name);
+            errdefer if (embedding_owned) runtime.alloc.free(index_name);
+            const parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key);
+            errdefer if (embedding_owned) runtime.alloc.free(parent_doc_key);
+            const embedding_doc_key = try runtime.alloc.dupe(u8, page_key);
+            errdefer if (embedding_owned) runtime.alloc.free(embedding_doc_key);
+            const embedding = derived_types.DerivedDenseEmbeddingWrite{
+                .index_name = index_name,
+                .parent_doc_key = parent_doc_key,
+                .doc_key = embedding_doc_key,
                 .artifact_key = artifact_key,
                 .vector = &.{},
-            });
+            };
+            try base_embeddings.append(runtime.alloc, embedding);
+            embedding_owned = false;
         }
         first_page += count;
     }
@@ -10885,15 +10916,21 @@ fn clearPdfPageEmbeddingStages(
         embedding_name,
     );
     defer runtime.alloc.free(root);
-    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, root);
-    defer backend_scan.freeResults(runtime.alloc, existing);
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
-        deletes.deinit(runtime.alloc);
+    while (true) {
+        var page = try backend_scan.scanPrefixKeysPage(
+            runtime.alloc,
+            &runtime.store,
+            root,
+            generated_pdf_stage_cleanup_page_keys,
+        );
+        defer page.deinit(runtime.alloc);
+        if (page.keys.len == 0) return;
+        const deletes = try runtime.alloc.alloc([]const u8, page.keys.len);
+        defer runtime.alloc.free(deletes);
+        for (page.keys, 0..) |key, i| deletes[i] = key;
+        try storePutBatchWithRetry(runtime, &.{}, deletes);
+        if (!page.has_more) return;
     }
-    for (existing) |entry| try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-    if (deletes.items.len > 0) try storePutBatchWithRetry(runtime, &.{}, deletes.items);
 }
 
 fn promotePdfPageEmbeddingStages(
@@ -13455,22 +13492,30 @@ fn deleteStalePageEmbeddingArtifacts(
 ) !StaleEmbeddingDeletes {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", page_artifact_name);
     defer runtime.alloc.free(prefix);
-    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-    defer backend_scan.freeResults(runtime.alloc, existing);
+    const existing = backend_scan.scanPrefixKeysLimited(
+        runtime.alloc,
+        &runtime.store,
+        prefix,
+        generated_pdf_artifact_scan_max_keys,
+    ) catch |err| switch (err) {
+        error.ScanLimitExceeded => return error.PdfDocumentPageLimitExceeded,
+        else => return err,
+    };
+    defer freeKeyList(runtime.alloc, existing);
     if (existing.len == 0) return .{};
 
     var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
-    for (existing) |entry| {
-        if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
-        if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
-        if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_page_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
+    for (existing) |key| {
+        if (!internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
+        if (!internal_keys.matchesDerivedEmbeddingArtifactName(key, embedding_artifact_name)) continue;
+        if (derivedEmbeddingBelongsToDesiredChunk(key, desired_page_keys)) continue;
+        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, key)) |base_key| {
             try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
         }
-        try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
+        try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, key);
     }
     return .{
         .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),

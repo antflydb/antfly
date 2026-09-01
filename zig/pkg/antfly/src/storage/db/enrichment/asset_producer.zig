@@ -220,11 +220,10 @@ pub const Producer = struct {
     /// prediction is never presented as observed telemetry.
     pub fn produceBatchReported(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
         if (self.vtable.produce_batch_reported) |reported| {
-            const batch = try reported(self.ptr, alloc, requests);
+            var batch = try reported(self.ptr, alloc, requests);
+            errdefer batch.deinit(alloc);
             try batch.execution.validate();
             if (batch.items.len != requests.len) {
-                var owned = batch;
-                owned.deinit(alloc);
                 return error.InvalidProducedBatchCardinality;
             }
             return batch;
@@ -298,4 +297,87 @@ test "asset producer parses extractor config" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(ProducerType.extractor, cfg.type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"entities\"") != null);
+}
+
+test "asset producer destroys returned values when reported metadata is invalid" {
+    const Fake = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) anyerror![]u8 {
+            return try alloc.dupe(u8, "unused");
+        }
+
+        fn produceBatchReported(_: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch {
+            const items = try alloc.alloc(ProducedItem, requests.len);
+            errdefer alloc.free(items);
+            for (items, requests) |*item, request| item.* = .{
+                .identity = .{
+                    .item_id = request.item_id,
+                    .source_fingerprint = request.source_fingerprint,
+                    .page_number = request.page_number,
+                },
+                .result = .{ .value = try alloc.dupe(u8, "owned-result") },
+            };
+            return .{
+                .items = items,
+                // Deliberately omits the completed serial items.
+                .execution = .{ .requested_items = requests.len },
+            };
+        }
+    };
+
+    var context: u8 = 0;
+    const producer: Producer = .{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Fake.produce,
+            .produce_batch_reported = Fake.produceBatchReported,
+        },
+    };
+    const requests = [_]Request{.{
+        .producer_type = .reader,
+        .config_json = "{}",
+        .source_text = "source",
+        .item_id = "item-0",
+    }};
+    try std.testing.expectError(
+        error.InvalidExecutionReport,
+        producer.produceBatchReported(std.testing.allocator, &requests),
+    );
+}
+
+test "asset producer destroys returned values when reported cardinality is invalid" {
+    const Fake = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) anyerror![]u8 {
+            return try alloc.dupe(u8, "unused");
+        }
+
+        fn produceBatchReported(_: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!ProducedBatch {
+            const items = try alloc.alloc(ProducedItem, 1);
+            errdefer alloc.free(items);
+            items[0] = .{
+                .identity = .{ .item_id = requests[0].item_id },
+                .result = .{ .value = try alloc.dupe(u8, "owned-result") },
+            };
+            return .{
+                .items = items,
+                .execution = inference_work.ExecutionReport.serial(requests.len),
+            };
+        }
+    };
+
+    var context: u8 = 0;
+    const producer: Producer = .{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Fake.produce,
+            .produce_batch_reported = Fake.produceBatchReported,
+        },
+    };
+    const requests = [_]Request{
+        .{ .producer_type = .reader, .config_json = "{}", .source_text = "source-0", .item_id = "item-0" },
+        .{ .producer_type = .reader, .config_json = "{}", .source_text = "source-1", .item_id = "item-1" },
+    };
+    try std.testing.expectError(
+        error.InvalidProducedBatchCardinality,
+        producer.produceBatchReported(std.testing.allocator, &requests),
+    );
 }

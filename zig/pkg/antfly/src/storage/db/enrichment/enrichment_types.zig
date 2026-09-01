@@ -32,6 +32,7 @@ pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,
     batch_bytes: ?usize = null,
+    max_document_pages: ?usize = null,
 };
 
 pub fn parseExecutionPolicyJson(alloc: Allocator, execution_json: []const u8) !ExecutionPolicy {
@@ -47,9 +48,14 @@ pub fn parseExecutionPolicyValue(value: std.json.Value) !ExecutionPolicy {
     var iter = value.object.iterator();
     while (iter.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "batch_items")) {
+            if (entry.value_ptr.* == .null) continue;
             out.batch_items = try parsePositiveExecutionInteger(entry.value_ptr.*);
         } else if (std.mem.eql(u8, entry.key_ptr.*, "batch_bytes")) {
+            if (entry.value_ptr.* == .null) continue;
             out.batch_bytes = try parsePositiveExecutionInteger(entry.value_ptr.*);
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "max_document_pages")) {
+            if (entry.value_ptr.* == .null) continue;
+            out.max_document_pages = try parsePositiveExecutionInteger(entry.value_ptr.*);
         } else {
             return error.InvalidEnrichmentExecutionConfig;
         }
@@ -74,6 +80,18 @@ pub fn executionBatchItemsOrDefault(alloc: Allocator, execution_json: []const u8
 pub fn executionBatchBytesOrDefault(alloc: Allocator, execution_json: []const u8, default_value: usize) usize {
     const policy = parseExecutionPolicyJson(alloc, execution_json) catch return default_value;
     return policy.batch_bytes orelse default_value;
+}
+
+test "execution policy admits a positive PDF document page ceiling" {
+    const policy = try parseExecutionPolicyJson(
+        std.testing.allocator,
+        "{\"batch_items\":4,\"batch_bytes\":1024,\"max_document_pages\":200}",
+    );
+    try std.testing.expectEqual(@as(?usize, 200), policy.max_document_pages);
+    try std.testing.expectError(
+        error.InvalidEnrichmentExecutionConfig,
+        parseExecutionPolicyJson(std.testing.allocator, "{\"max_document_pages\":0}"),
+    );
 }
 
 pub const GeneratedEnrichmentKind = enum {

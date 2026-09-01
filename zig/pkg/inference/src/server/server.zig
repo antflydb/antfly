@@ -9254,6 +9254,15 @@ pub const Node = struct {
             .object = "generate.batch",
             .data = results,
             .summary = .{ .total = total, .succeeded = succeeded, .failed = total - succeeded },
+            // Admission and scheduling are batched, while model decoding is
+            // still one independent invocation per request.
+            .execution = .{
+                .requested_items = total,
+                .native_batches = 0,
+                .native_items = 0,
+                .serial_items = total,
+                .fallback_items = 0,
+            },
         });
     }
 
@@ -11011,7 +11020,7 @@ pub const Node = struct {
         };
         defer reader.deinit();
 
-        const results = reader.readBatch(image_datas, .{
+        const read_batch = reader.readBatchReported(image_datas, .{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
         }) catch |err| switch (err) {
@@ -11022,6 +11031,7 @@ pub const Node = struct {
             }),
             else => return inferenceFailureResponse(ctx, err),
         };
+        const results = read_batch.results;
         defer {
             for (results) |result| {
                 var tmp = result;
@@ -11045,7 +11055,39 @@ pub const Node = struct {
             .data = results_out,
             .model = body.model,
             .usage = tokenUsage(prompt_tokens, completion_tokens),
+            .execution = observedReaderExecutionReport(read_batch),
         });
+    }
+
+    fn observedReaderExecutionReport(batch: readers_mod.BatchResult) api.BatchExecutionReport {
+        const count: i64 = @intCast(batch.results.len);
+        return switch (batch.mode) {
+            .native => .{
+                .requested_items = count,
+                .native_batches = @intCast(@min(
+                    batch.results.len,
+                    @max(batch.native_batches, @as(usize, if (batch.results.len > 0) 1 else 0)),
+                )),
+                .native_items = count,
+                .serial_items = 0,
+                .fallback_items = 0,
+            },
+            .serial => .{
+                .requested_items = count,
+                .native_batches = 0,
+                .native_items = 0,
+                .serial_items = count,
+                .fallback_items = 0,
+            },
+            .fallback => .{
+                .requested_items = count,
+                .native_batches = @intCast(batch.native_batches),
+                .native_items = 0,
+                .serial_items = count,
+                .fallback_items = count,
+                .fallback_reason = if (batch.fallback_reason) |reason| .{ .value = reason } else .{ .value = "reader_fallback" },
+            },
+        };
     }
 
     fn toApiReadObject(alloc: std.mem.Allocator, result: readers_mod.Result, index: usize) !api.ReadObject {

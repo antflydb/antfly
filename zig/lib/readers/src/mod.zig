@@ -154,11 +154,18 @@ pub const Reader = struct {
 
     pub const VTable = struct {
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
+        read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
         return try self.vtable.read(self.ptr, alloc, req);
+    }
+
+    pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
+        const items = try self.read(alloc, req);
+        return .{ .items = items, .execution = .{ .mode = .serial, .requested_items = items.len } };
     }
 
     pub fn deinit(self: Reader) void {
@@ -353,7 +360,7 @@ const AntflyReaderState = struct {
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -371,6 +378,10 @@ const AntflyReaderState = struct {
     }
 
     fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+        return (try readReported(ptr, alloc, req)).items;
+    }
+
+    fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
@@ -430,9 +441,69 @@ const AntflyReaderState = struct {
             initialized += 1;
         }
         if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return out;
+        return .{
+            .items = out,
+            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+        };
     }
 };
+
+fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count: usize) !BatchExecution {
+    const report = wire orelse return .{ .mode = .serial, .requested_items = item_count };
+    const requested = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport;
+    const native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport;
+    const native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport;
+    const serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport;
+    const fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport;
+    const executed_items = std.math.add(usize, native_items, serial_items) catch
+        return error.InvalidReadExecutionReport;
+    if (requested != item_count or executed_items != requested or fallback_items > serial_items)
+        return error.InvalidReadExecutionReport;
+    if (native_items > 0 and native_batches == 0) return error.InvalidReadExecutionReport;
+    if (native_batches > native_items) return error.InvalidReadExecutionReport;
+    // The reader ABI has one observed mode for the invocation. Reject a mixed
+    // wire report rather than assigning a predicted mode to individual items.
+    if (fallback_items > 0) {
+        if (native_items != 0 or serial_items != requested or fallback_items != serial_items)
+            return error.InvalidReadExecutionReport;
+        return .{
+            .mode = .fallback,
+            .requested_items = requested,
+            .native_batches = native_batches,
+            .fallback_reason = "remote_reader_fallback",
+        };
+    }
+    if (native_items == requested and serial_items == 0) return .{
+        .mode = .native,
+        .requested_items = requested,
+        .native_batches = native_batches,
+    };
+    if (native_items != 0 or serial_items != requested) return error.InvalidReadExecutionReport;
+    return .{ .mode = .serial, .requested_items = requested, .native_batches = native_batches };
+}
+
+test "reader wire execution is observed, validated, and backward compatible" {
+    const legacy = try batchExecutionFromWire(null, 2);
+    try std.testing.expectEqual(BatchExecutionMode.serial, legacy.mode);
+
+    const native = try batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 2,
+        .serial_items = 0,
+        .fallback_items = 0,
+    }, 2);
+    try std.testing.expectEqual(BatchExecutionMode.native, native.mode);
+    try std.testing.expectEqual(@as(usize, 1), native.native_batches);
+
+    try std.testing.expectError(error.InvalidReadExecutionReport, batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 1,
+        .serial_items = 1,
+        .fallback_items = 0,
+    }, 2));
+}
 
 const OpenAiReaderState = CloudReaderState(.openai);
 const VertexReaderState = CloudReaderState(.vertex);

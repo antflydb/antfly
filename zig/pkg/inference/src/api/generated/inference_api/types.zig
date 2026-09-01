@@ -129,6 +129,42 @@ pub const BackendRuntimes = struct {
     }
 };
 
+/// Observed executor behavior, not a capability prediction.
+pub const BatchExecutionReport = struct {
+    requested_items: i64,
+    native_batches: i64,
+    native_items: i64,
+    serial_items: i64,
+    fallback_items: i64,
+    fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("requested_items");
+        try jw.write(self.requested_items);
+        try jw.objectField("native_batches");
+        try jw.write(self.native_batches);
+        try jw.objectField("native_items");
+        try jw.write(self.native_items);
+        try jw.objectField("serial_items");
+        try jw.write(self.serial_items);
+        try jw.objectField("fallback_items");
+        try jw.write(self.fallback_items);
+        switch (self.fallback_reason) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fallback_reason");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fallback_reason");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Binary media content with format-specific metadata.
 pub const BinaryContent = struct {
     /// Base64-encoded binary data (valid WAV, PNG, etc.)
@@ -1471,6 +1507,39 @@ pub const GenerateBatchResponse = struct {
     object: []const u8,
     data: []const GenerateBatchResultItem,
     summary: GenerateBatchSummary,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?BatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "summary", "summary", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("summary");
+        try jw.write(self.summary);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateBatchResultItem = struct {
@@ -2792,6 +2861,42 @@ pub const ReadResponse = struct {
     /// Name of model used for reading
     model: []const u8,
     usage: GenerateUsage,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?BatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "model", "model", false },
+        .{ "usage", "usage", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReadResult = struct {
