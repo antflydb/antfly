@@ -67,6 +67,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const a4b_prepared_pack = @import("../ops/cuda/a4b_prepared_pack.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -150,6 +151,11 @@ const ServerA4bTelemetry = struct {
     route_select_attempts: u64 = 0,
     route_select_successes: u64 = 0,
     route_select_fallbacks: u64 = 0,
+    cuda_resident_source_bytes: u64 = 0,
+    cuda_resident_source_count: u64 = 0,
+    cuda_route_calls: u64 = 0,
+    cuda_decode_calls: u64 = 0,
+    cuda_prefill_calls: u64 = 0,
     slot_lookup_attempts: u64 = 0,
     slot_route_hits: u64 = 0,
     slot_route_misses: u64 = 0,
@@ -194,7 +200,7 @@ const ServerA4bTelemetry = struct {
 fn serverA4bTelemetrySnapshot(cb: ?*const ops.ComputeBackend) ?ops.NativeQuantTimingStats {
     if (!serverA4bTelemetryEnabled()) return null;
     const backend = cb orelse return null;
-    if (backend.kind() != .metal) return null;
+    if (backend.kind() != .metal and backend.kind() != .cuda) return null;
     return backend.debugTimingSnapshot().provider;
 }
 
@@ -206,6 +212,11 @@ fn serverA4bTelemetryDelta(
         .route_select_attempts = after.a4b_moe_route_select_attempts -| before.a4b_moe_route_select_attempts,
         .route_select_successes = after.a4b_moe_route_select_successes -| before.a4b_moe_route_select_successes,
         .route_select_fallbacks = after.a4b_moe_route_select_fallbacks -| before.a4b_moe_route_select_fallbacks,
+        .cuda_resident_source_bytes = after.a4b_cuda_resident_source_bytes,
+        .cuda_resident_source_count = after.a4b_cuda_resident_source_count,
+        .cuda_route_calls = after.a4b_cuda_route_calls -| before.a4b_cuda_route_calls,
+        .cuda_decode_calls = after.a4b_cuda_decode_calls -| before.a4b_cuda_decode_calls,
+        .cuda_prefill_calls = after.a4b_cuda_prefill_calls -| before.a4b_cuda_prefill_calls,
         .slot_lookup_attempts = after.a4b_moe_slot_lookup_attempts -| before.a4b_moe_slot_lookup_attempts,
         .slot_route_hits = after.a4b_moe_slot_route_hits -| before.a4b_moe_slot_route_hits,
         .slot_route_misses = after.a4b_moe_slot_route_misses -| before.a4b_moe_slot_route_misses,
@@ -256,6 +267,21 @@ fn logServerA4bTelemetry(
     const start = before orelse return;
     const backend = cb orelse return;
     const delta = serverA4bTelemetryDelta(backend.debugTimingSnapshot().provider, start);
+    if (backend.kind() == .cuda) {
+        std.log.info(
+            "cuda_a4b_server_request: scope=process_delta model={s} resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} route_fallbacks={d}",
+            .{
+                model_name,
+                delta.cuda_resident_source_bytes,
+                delta.cuda_resident_source_count,
+                delta.cuda_route_calls,
+                delta.cuda_decode_calls,
+                delta.cuda_prefill_calls,
+                delta.route_select_fallbacks,
+            },
+        );
+        return;
+    }
     std.log.info(
         "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_upload_batches={d} slot_uploads={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
         .{
@@ -327,6 +353,11 @@ test "server A4B telemetry reports saturating request deltas" {
     var after = before;
     after.a4b_moe_route_select_attempts = 130;
     after.a4b_moe_route_select_successes = 120;
+    after.a4b_cuda_resident_source_bytes = 14_000_000_000;
+    after.a4b_cuda_resident_source_count = 60;
+    after.a4b_cuda_route_calls = 120;
+    after.a4b_cuda_decode_calls = 90;
+    after.a4b_cuda_prefill_calls = 30;
     after.a4b_moe_slot_lookup_attempts = 120;
     after.a4b_moe_slot_route_hits = 880;
     after.a4b_moe_slot_route_misses = 80;
@@ -360,6 +391,11 @@ test "server A4B telemetry reports saturating request deltas" {
     const delta = serverA4bTelemetryDelta(after, before);
     try std.testing.expectEqual(@as(u64, 120), delta.route_select_attempts);
     try std.testing.expectEqual(@as(u64, 120), delta.route_select_successes);
+    try std.testing.expectEqual(@as(u64, 14_000_000_000), delta.cuda_resident_source_bytes);
+    try std.testing.expectEqual(@as(u64, 60), delta.cuda_resident_source_count);
+    try std.testing.expectEqual(@as(u64, 120), delta.cuda_route_calls);
+    try std.testing.expectEqual(@as(u64, 90), delta.cuda_decode_calls);
+    try std.testing.expectEqual(@as(u64, 30), delta.cuda_prefill_calls);
     try std.testing.expectEqual(@as(u64, 120), delta.slot_lookup_attempts);
     try std.testing.expectEqual(@as(u64, 880), delta.slot_route_hits);
     try std.testing.expectEqual(@as(u64, 80), delta.slot_route_misses);
@@ -1200,6 +1236,11 @@ pub const WarmModelKind = enum {
     extractor,
 };
 
+pub const WarmModelStartupStrategy = enum {
+    eager,
+    prefetch,
+};
+
 pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
@@ -1208,27 +1249,48 @@ pub const WarmModel = struct {
     quantization: ?[]const u8 = null,
     residency_mode: ?ops.A4bResidencyMode = null,
     memory_budget_mb: ?u32 = null,
+    load_strategy: ?ops.A4bLoadStrategy = null,
+    load_workers: ?u8 = null,
+    load_staging_mb: ?u32 = null,
+    prepared_pack: ?ops.A4bPreparedPackMode = null,
+    drop_host_cache_after_load: bool = false,
+    startup_strategy: WarmModelStartupStrategy = .eager,
 
     pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
         const residency_mode = self.residency_mode orelse .auto;
         const memory_budget_mb = self.memory_budget_mb orelse 0;
+        const load_strategy = self.load_strategy orelse .auto;
+        const load_workers = self.load_workers orelse 0;
+        const load_staging_mb = self.load_staging_mb orelse 0;
+        const prepared_pack = self.prepared_pack orelse .auto;
         // The documented wire defaults are policy-neutral. Treating explicit
         // `auto`/`0` as an A4B request makes an otherwise ordinary generator
         // fail geometry qualification merely because defaults were serialized.
-        if (residency_mode == .auto and memory_budget_mb == 0) return null;
-        return .{ .residency_mode = residency_mode, .memory_budget_mb = memory_budget_mb };
+        if (residency_mode == .auto and memory_budget_mb == 0 and
+            load_strategy == .auto and load_workers == 0 and load_staging_mb == 0 and
+            prepared_pack == .auto and !self.drop_host_cache_after_load) return null;
+        return .{
+            .residency_mode = residency_mode,
+            .memory_budget_mb = memory_budget_mb,
+            .load_strategy = load_strategy,
+            .load_workers = load_workers,
+            .load_staging_mb = load_staging_mb,
+            .prepared_pack = prepared_pack,
+            .drop_host_cache_after_load = self.drop_host_cache_after_load,
+        };
     }
 };
 
 fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
     const request = model.a4bRequest();
     if (request != null and model.kind != .generator) return error.A4bUnsupportedModelKind;
-    if (request != null and model.backend != null and model.backend.? != .metal)
-        return error.A4bRequiresMetal;
+    if (request != null and model.backend != null and
+        model.backend.? != .metal and model.backend.? != .cuda)
+        return error.A4bRequiresGpu;
     return request;
 }
 
-test "warm model A4B controls are Metal generator only" {
+test "warm model A4B controls are GPU generator only" {
     try std.testing.expect((WarmModel{
         .name = "ordinary-generator",
         .residency_mode = .auto,
@@ -1242,7 +1304,27 @@ test "warm model A4B controls are Metal generator only" {
     })).?;
     try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
     try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
-    try std.testing.expectError(error.A4bRequiresMetal, validatedWarmModelA4bRequest(.{
+    const cuda_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda",
+        .backend = .cuda,
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+    })).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.resident, cuda_request.residency_mode);
+    const prepared_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda-pack",
+        .backend = .cuda,
+        .load_strategy = .pipeline,
+        .load_workers = 6,
+        .load_staging_mb = 384,
+        .prepared_pack = .required,
+        .drop_host_cache_after_load = true,
+    })).?;
+    try std.testing.expectEqual(ops.A4bLoadStrategy.pipeline, prepared_request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 6), prepared_request.load_workers);
+    try std.testing.expectEqual(ops.A4bPreparedPackMode.required, prepared_request.prepared_pack);
+    try std.testing.expect(prepared_request.drop_host_cache_after_load);
+    try std.testing.expectError(error.A4bRequiresGpu, validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .native,
         .memory_budget_mb = 4096,
@@ -4129,6 +4211,14 @@ pub const Node = struct {
             }
             return error.KernelJitRequiredPreloadMissing;
         }
+        if (self.config.kernel_jit.mode.failClosed() or
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            for (self.config.preload) |model| {
+                if (model.startup_strategy == .prefetch)
+                    return error.KernelJitRequiredPreloadCannotBePrefetchOnly;
+            }
+        }
         if (self.config.kernel_jit.qualified_profile_path != null and self.config.preload.len != 1) {
             return error.KernelJitQualifiedProfileMultiplePreloadsUnsupported;
         }
@@ -4155,6 +4245,8 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.startup_strategy == .prefetch)
+            return self.prefetchWarmModel(allocator, model);
         const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
@@ -4166,6 +4258,37 @@ pub const Node = struct {
         if (materialize_optional_sessions and model.kind != .embedder) {
             try self.materializeWarmModelOptionalSessions(allocator, model);
         }
+    }
+
+    fn prefetchWarmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
+        if (model.backend != null and model.backend.? != .cuda)
+            return error.A4bPrefetchRequiresCuda;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer manifest.deinit();
+        const gguf_path = manifest.gguf_path orelse return error.A4bPrefetchRequiresGguf;
+        const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
+        const started_ns = embedTimingNowNs();
+        if ((model.prepared_pack orelse .auto) != .off) {
+            if (try a4b_prepared_pack.prefetchInstalled(allocator, model_path, gguf_path, workers)) |prepared| {
+                std.log.info(
+                    "prefetched A4B prepared pack model={s} shards={d} bytes={d} workers={d} elapsed_ms={d}",
+                    .{ model.name, prepared.shard_count, prepared.bytes, prepared.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+                );
+                return;
+            } else if ((model.prepared_pack orelse .auto) == .required) {
+                return error.A4bPreparedPackRequired;
+            }
+        }
+        const result = try c_file.prefetchFile(allocator, gguf_path, workers);
+        std.log.info(
+            "prefetched inference generator model={s} artifact={s} bytes={d} workers={d} elapsed_ms={d}",
+            .{ model.name, gguf_path, result.bytes, result.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+        );
     }
 
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {

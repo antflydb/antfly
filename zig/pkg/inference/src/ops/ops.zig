@@ -509,6 +509,8 @@ pub const A4bMappedLayer0PrewarmResult = struct {
 };
 
 pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bLoadStrategy = backend_contracts.A4bLoadStrategy;
+pub const A4bPreparedPackMode = backend_contracts.A4bPreparedPackMode;
 pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
 pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
 pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
@@ -647,6 +649,11 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_route_select_attempts: u64 = 0,
     a4b_moe_route_select_successes: u64 = 0,
     a4b_moe_route_select_fallbacks: u64 = 0,
+    a4b_cuda_resident_source_bytes: u64 = 0,
+    a4b_cuda_resident_source_count: u64 = 0,
+    a4b_cuda_route_calls: u64 = 0,
+    a4b_cuda_decode_calls: u64 = 0,
+    a4b_cuda_prefill_calls: u64 = 0,
     a4b_moe_slot_lookup_attempts: u64 = 0,
     a4b_moe_slot_route_hits: u64 = 0,
     a4b_moe_slot_route_misses: u64 = 0,

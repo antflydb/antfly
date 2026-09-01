@@ -122,6 +122,11 @@ const Options = struct {
     scratch_budget_mb: usize = 0,
     a4b_residency_mode: ops.A4bResidencyMode = .auto,
     a4b_memory_budget_mb: u32 = 0,
+    a4b_load_strategy: ops.A4bLoadStrategy = .auto,
+    a4b_load_workers: u8 = 0,
+    a4b_load_staging_mb: u32 = 0,
+    a4b_prepared_pack: ops.A4bPreparedPackMode = .auto,
+    a4b_drop_host_cache_after_load: bool = false,
     a4b_options_explicit: bool = false,
     raw_prompt: bool = false,
     no_bos: bool = false,
@@ -1847,6 +1852,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.device_allocated_bytes,
                     },
                 );
+                if (cuda_stats.a4b_resident_source_count != 0) {
+                    print(
+                        "cuda_a4b_runtime: resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} fallbacks=0\n",
+                        .{
+                            cuda_stats.a4b_resident_source_bytes,
+                            cuda_stats.a4b_resident_source_count,
+                            cuda_stats.a4b_route_calls,
+                            cuda_stats.a4b_decode_calls,
+                            cuda_stats.a4b_prefill_calls,
+                        },
+                    );
+                }
                 print(
                     "cuda_cross_backend_copy: copies={d} bytes={d} event_records={d} event_waits={d} sync_fallbacks={d}\n",
                     .{
@@ -2905,6 +2922,64 @@ fn cudaStatsCompactJson(
     try appendFmt(
         allocator,
         &out,
+        \\"a4b_resident_source_bytes":{d},
+        \\"a4b_resident_source_count":{d},
+        \\"a4b_load_plan_ns":{d},
+        \\"a4b_load_dense_upload_ns":{d},
+        \\"a4b_load_dense_weight_count":{d},
+        \\"a4b_load_dense_mmap_weight_count":{d},
+        \\"a4b_load_host_stage_ns":{d},
+        \\"a4b_load_h2d_ns":{d},
+        \\"a4b_load_finalize_ns":{d},
+        \\"a4b_load_total_ns":{d},
+        \\"a4b_load_workers":{d},
+        \\"a4b_load_staging_bytes":{d},
+        \\"a4b_load_chunks":{d},
+        \\"a4b_load_pipeline_attempts":{d},
+        \\"a4b_load_pipeline_successes":{d},
+        \\"a4b_load_pipeline_fallbacks":{d},
+        \\"a4b_load_prepared_pack_hits":{d},
+        \\"a4b_load_prepared_pack_misses":{d},
+        \\"a4b_route_calls":{d},
+        \\"a4b_decode_calls":{d},
+        \\"a4b_prefill_calls":{d},
+        \\"a4b_compact_down_hits":{d},
+        \\"a4b_compact_down_fallbacks":{d},
+        \\"a4b_exact_lm_head_hits":{d},
+        \\"a4b_exact_lm_head_fallbacks":{d},
+        \\
+    ,
+        .{
+            stats.a4b_resident_source_bytes,
+            stats.a4b_resident_source_count,
+            stats.a4b_load_plan_ns,
+            stats.a4b_load_dense_upload_ns,
+            stats.a4b_load_dense_weight_count,
+            stats.a4b_load_dense_mmap_weight_count,
+            stats.a4b_load_host_stage_ns,
+            stats.a4b_load_h2d_ns,
+            stats.a4b_load_finalize_ns,
+            stats.a4b_load_total_ns,
+            stats.a4b_load_workers,
+            stats.a4b_load_staging_bytes,
+            stats.a4b_load_chunks,
+            stats.a4b_load_pipeline_attempts,
+            stats.a4b_load_pipeline_successes,
+            stats.a4b_load_pipeline_fallbacks,
+            stats.a4b_load_prepared_pack_hits,
+            stats.a4b_load_prepared_pack_misses,
+            stats.a4b_route_calls,
+            stats.a4b_decode_calls,
+            stats.a4b_prefill_calls,
+            stats.a4b_compact_down_hits,
+            stats.a4b_compact_down_fallbacks,
+            stats.a4b_exact_lm_head_hits,
+            stats.a4b_exact_lm_head_fallbacks,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
         \\"graph_capture_begins":{d},
         \\"graph_capture_replays":{d},
         \\"graph_capture_discards":{d},
@@ -3205,6 +3280,11 @@ fn cudaStatsCompactJson(
         \\"device_kv_paged_block_table_uploads":{d},
         \\"device_kv_paged_block_table_bytes":{d},
         \\"device_kv_paged_identity_attention_reads":{d},
+        \\"device_kv_fail_batch":{d},
+        \\"device_kv_fail_no_cache":{d},
+        \\"device_kv_fail_no_storage":{d},
+        \\"device_kv_fail_no_hook":{d},
+        \\"device_kv_fail_write":{d},
         \\"device_kv_fail_read":{d},
         \\"device_kv_fail_shape":{d}
         \\}}
@@ -3220,6 +3300,11 @@ fn cudaStatsCompactJson(
             stats.device_kv_paged_block_table_uploads,
             stats.device_kv_paged_block_table_bytes,
             stats.device_kv_paged_identity_attention_reads,
+            stats.device_kv_fail_batch,
+            stats.device_kv_fail_no_cache,
+            stats.device_kv_fail_no_storage,
+            stats.device_kv_fail_no_hook,
+            stats.device_kv_fail_write,
             stats.device_kv_fail_read,
             stats.device_kv_fail_shape,
         },
@@ -3261,6 +3346,19 @@ test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
         stats.ple_gate_prefill_bf16_mirror_first_hits = 39;
         stats.ple_gate_prefill_bf16_mirror_first_ineligible = 40;
         stats.ple_gate_decode_q4_fused_preserved = 41;
+        stats.a4b_compact_down_hits = 42;
+        stats.a4b_compact_down_fallbacks = 43;
+        stats.a4b_exact_lm_head_hits = 44;
+        stats.a4b_exact_lm_head_fallbacks = 45;
+        stats.device_kv_attempts = 46;
+        stats.device_kv_successes = 47;
+        stats.device_kv_fail_batch = 48;
+        stats.device_kv_fail_no_cache = 49;
+        stats.device_kv_fail_no_storage = 50;
+        stats.device_kv_fail_no_hook = 51;
+        stats.device_kv_fail_write = 52;
+        stats.device_kv_fail_read = 53;
+        stats.device_kv_fail_shape = 54;
         const json = try cudaStatsCompactJson(std.testing.allocator, stats, 1);
         defer std.testing.allocator.free(json);
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_hits\":11"));
@@ -3294,6 +3392,19 @@ test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_hits\":39"));
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_ineligible\":40"));
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_decode_q4_fused_preserved\":41"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_compact_down_hits\":42"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_compact_down_fallbacks\":43"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_exact_lm_head_hits\":44"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_exact_lm_head_fallbacks\":45"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_attempts\":46"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_successes\":47"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_batch\":48"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_cache\":49"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_storage\":50"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_hook\":51"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_write\":52"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_read\":53"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_shape\":54"));
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
@@ -4367,6 +4478,50 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_out,
+                \\"a4b_resident_source_bytes":{d},
+                \\"a4b_resident_source_count":{d},
+                \\"a4b_load_plan_ns":{d},
+                \\"a4b_load_dense_upload_ns":{d},
+                \\"a4b_load_dense_weight_count":{d},
+                \\"a4b_load_dense_mmap_weight_count":{d},
+                \\"a4b_load_host_stage_ns":{d},
+                \\"a4b_load_h2d_ns":{d},
+                \\"a4b_load_finalize_ns":{d},
+                \\"a4b_load_total_ns":{d},
+                \\"a4b_load_workers":{d},
+                \\"a4b_load_staging_bytes":{d},
+                \\"a4b_load_chunks":{d},
+                \\"a4b_load_pipeline_attempts":{d},
+                \\"a4b_load_pipeline_successes":{d},
+                \\"a4b_load_pipeline_fallbacks":{d},
+                \\"a4b_load_prepared_pack_hits":{d},
+                \\"a4b_load_prepared_pack_misses":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.a4b_resident_source_bytes,
+                    cuda_stats.a4b_resident_source_count,
+                    cuda_stats.a4b_load_plan_ns,
+                    cuda_stats.a4b_load_dense_upload_ns,
+                    cuda_stats.a4b_load_dense_weight_count,
+                    cuda_stats.a4b_load_dense_mmap_weight_count,
+                    cuda_stats.a4b_load_host_stage_ns,
+                    cuda_stats.a4b_load_h2d_ns,
+                    cuda_stats.a4b_load_finalize_ns,
+                    cuda_stats.a4b_load_total_ns,
+                    cuda_stats.a4b_load_workers,
+                    cuda_stats.a4b_load_staging_bytes,
+                    cuda_stats.a4b_load_chunks,
+                    cuda_stats.a4b_load_pipeline_attempts,
+                    cuda_stats.a4b_load_pipeline_successes,
+                    cuda_stats.a4b_load_pipeline_fallbacks,
+                    cuda_stats.a4b_load_prepared_pack_hits,
+                    cuda_stats.a4b_load_prepared_pack_misses,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"temp_buffer_hits":{d},
                 \\"temp_buffer_misses":{d},
                 \\"temp_buffer_releases":{d},
@@ -5118,6 +5273,64 @@ fn writeJsonTiming(
                     cuda_stats.cross_backend_sync_fallbacks,
                     cuda_stats.to_float32_calls,
                     cuda_stats.to_float32_bytes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"a4b_route_calls":{d},
+                \\"a4b_decode_calls":{d},
+                \\"a4b_prefill_calls":{d},
+                \\"a4b_compact_down_hits":{d},
+                \\"a4b_compact_down_fallbacks":{d},
+                \\"a4b_exact_lm_head_hits":{d},
+                \\"a4b_exact_lm_head_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.a4b_route_calls,
+                    cuda_stats.a4b_decode_calls,
+                    cuda_stats.a4b_prefill_calls,
+                    cuda_stats.a4b_compact_down_hits,
+                    cuda_stats.a4b_compact_down_fallbacks,
+                    cuda_stats.a4b_exact_lm_head_hits,
+                    cuda_stats.a4b_exact_lm_head_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"device_kv_attempts":{d},
+                \\"device_kv_successes":{d},
+                \\"device_kv_reads":{d},
+                \\"device_kv_writes":{d},
+                \\"device_kv_paged_block_table_uploads":{d},
+                \\"device_kv_paged_block_table_bytes":{d},
+                \\"device_kv_paged_identity_attention_reads":{d},
+                \\"device_kv_fail_batch":{d},
+                \\"device_kv_fail_no_cache":{d},
+                \\"device_kv_fail_no_storage":{d},
+                \\"device_kv_fail_no_hook":{d},
+                \\"device_kv_fail_write":{d},
+                \\"device_kv_fail_read":{d},
+                \\"device_kv_fail_shape":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.device_kv_attempts,
+                    cuda_stats.device_kv_successes,
+                    cuda_stats.device_kv_reads,
+                    cuda_stats.device_kv_writes,
+                    cuda_stats.device_kv_paged_block_table_uploads,
+                    cuda_stats.device_kv_paged_block_table_bytes,
+                    cuda_stats.device_kv_paged_identity_attention_reads,
+                    cuda_stats.device_kv_fail_batch,
+                    cuda_stats.device_kv_fail_no_cache,
+                    cuda_stats.device_kv_fail_no_storage,
+                    cuda_stats.device_kv_fail_no_hook,
+                    cuda_stats.device_kv_fail_write,
+                    cuda_stats.device_kv_fail_read,
+                    cuda_stats.device_kv_fail_shape,
                 },
             );
             try appendFmt(
@@ -7790,6 +8003,31 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingA4bMemoryBudget;
             opts.a4b_memory_budget_mb = try std.fmt.parseInt(u32, args[i], 10);
             opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-strategy")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadStrategy;
+            opts.a4b_load_strategy = std.meta.stringToEnum(ops.A4bLoadStrategy, args[i]) orelse
+                return error.InvalidA4bLoadStrategy;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-workers")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadWorkers;
+            opts.a4b_load_workers = try std.fmt.parseInt(u8, args[i], 10);
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-staging-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadStagingBudget;
+            opts.a4b_load_staging_mb = try std.fmt.parseInt(u32, args[i], 10);
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-prepared-pack")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bPreparedPackMode;
+            opts.a4b_prepared_pack = std.meta.stringToEnum(ops.A4bPreparedPackMode, args[i]) orelse
+                return error.InvalidA4bPreparedPackMode;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-drop-host-cache-after-load")) {
+            opts.a4b_drop_host_cache_after_load = true;
+            opts.a4b_options_explicit = true;
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -8068,6 +8306,11 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
     return .{
         .residency_mode = opts.a4b_residency_mode,
         .memory_budget_mb = opts.a4b_memory_budget_mb,
+        .load_strategy = opts.a4b_load_strategy,
+        .load_workers = opts.a4b_load_workers,
+        .load_staging_mb = opts.a4b_load_staging_mb,
+        .prepared_pack = opts.a4b_prepared_pack,
+        .drop_host_cache_after_load = opts.a4b_drop_host_cache_after_load,
     };
 }
 
@@ -8078,13 +8321,22 @@ fn preflightModelLoadBudget(
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
     const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
-    if (predicted_backend_type == .metal) {
-        if (try session_factory.resolveA4bInferenceConfigForModelListing(
-            allocator,
-            opts.model_dir,
-            manifest.*,
-            a4bInferenceRequest(opts),
-        ) != null) {
+    if (predicted_backend_type == .metal or predicted_backend_type == .cuda) {
+        const a4b_config = if (predicted_backend_type == .cuda)
+            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                allocator,
+                opts.model_dir,
+                manifest.*,
+                a4bInferenceRequest(opts),
+            )
+        else
+            try session_factory.resolveA4bInferenceConfigForModelListing(
+                allocator,
+                opts.model_dir,
+                manifest.*,
+                a4bInferenceRequest(opts),
+            );
+        if (a4b_config != null) {
             // Exact A4B loads are leased as one bounded weights+KV+scratch
             // envelope by ModelManager. Reserving the full encoded GGUF here
             // would reject the compact path before that authoritative gate.
@@ -8197,7 +8449,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -8647,10 +8899,24 @@ test "parseArgs builds the explicit A4B residency request" {
         "streamed",
         "--a4b-memory-budget-mb",
         "4096",
+        "--a4b-load-strategy",
+        "pipeline",
+        "--a4b-load-workers",
+        "6",
+        "--a4b-load-staging-mb",
+        "384",
+        "--a4b-prepared-pack",
+        "required",
+        "--a4b-drop-host-cache-after-load",
     });
     const request = a4bInferenceRequest(opts).?;
     try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
     try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    try std.testing.expectEqual(ops.A4bLoadStrategy.pipeline, request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 6), request.load_workers);
+    try std.testing.expectEqual(@as(u32, 384), request.load_staging_mb);
+    try std.testing.expectEqual(ops.A4bPreparedPackMode.required, request.prepared_pack);
+    try std.testing.expect(request.drop_host_cache_after_load);
     try std.testing.expect(!serverGenerateSupportsOptions(opts));
 
     try std.testing.expectError(error.InvalidA4bResidencyMode, parseArgs(&.{
