@@ -32,6 +32,8 @@ const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
+const inference_chunker = @import("inference_chunker");
+const chunking_types = @import("../chunking/types.zig");
 
 const ApiHttpServer = antfly.public_api.ApiHttpServer;
 const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
@@ -4785,6 +4787,9 @@ fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedd
         .generate_messages = inferenceProviderGenerateMessages,
         .generate_messages_with_attachments = inferenceProviderGenerateMessagesWithAttachments,
         .model_capabilities = inferenceProviderModelCapabilities,
+        .chunk_input = inferenceProviderChunkInput,
+        .rewrite_texts = inferenceProviderRewriteTexts,
+        .classify_texts = inferenceProviderClassifyTexts,
         .read_images = inferenceProviderReadImages,
         .read_encoded_images = inferenceProviderReadEncodedImages,
         .read_encoded_images_reported = inferenceProviderReadEncodedImagesReported,
@@ -5263,6 +5268,73 @@ fn inferenceProviderModelCapabilities(
         handle,
         .model_capabilities,
         .{ .model = model, .task = task },
+        null,
+    );
+}
+
+fn inferenceProviderChunkInput(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+) anyerror![]inference_chunker.Chunk {
+    return switch (input) {
+        .text => try invokeInferenceProvider([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+            .model = model,
+            .input = input,
+            .config = config,
+            .attachment_count = @as(usize, 0),
+        }, null),
+        .binary => |binary| blk: {
+            const payloads = [_]inference_bridge.ProviderBinaryPayload{.{
+                .bytes = inference_bridge.String.init(binary.data),
+                .content_type = inference_bridge.String.init(binary.mime_type),
+            }};
+            const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
+            break :blk try invokeInferenceProviderWithBinary(
+                []inference_chunker.Chunk,
+                alloc,
+                handle,
+                .chunk_input,
+                .{
+                    .model = model,
+                    .input = inference_chunker.Input{ .binary = .{ .mime_type = binary.mime_type, .data = &.{} } },
+                    .config = config,
+                    .attachment_count = @as(usize, 1),
+                },
+                null,
+                &payloads,
+                &refs,
+            );
+        },
+    };
+}
+
+fn inferenceProviderRewriteTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    inputs: []const []const u8,
+) anyerror![][]const u8 {
+    return try invokeInferenceProvider([][]const u8, alloc, handle, .rewrite_texts, .{
+        .model = model,
+        .inputs = inputs,
+    }, null);
+}
+
+fn inferenceProviderClassifyTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.inference.managed_embedder.ClassificationRequest,
+) anyerror![]const []const antfly.inference.managed_embedder.ClassificationScore {
+    return try invokeInferenceProvider(
+        []const []const antfly.inference.managed_embedder.ClassificationScore,
+        alloc,
+        handle,
+        .classify_texts,
+        .{ .model = model, .request = request },
         null,
     );
 }

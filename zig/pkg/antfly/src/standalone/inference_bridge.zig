@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 21;
+pub const abi_version: u32 = 22;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -161,6 +161,9 @@ pub const ProviderOperation = enum(c_int) {
     generate_messages_with_attachments = 14,
     model_capabilities = 15,
     read_encoded_images_reported = 16,
+    chunk_input = 17,
+    rewrite_texts = 18,
+    classify_texts = 19,
 };
 
 pub const ProviderBinaryPayload = extern struct {

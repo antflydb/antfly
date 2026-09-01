@@ -104,10 +104,9 @@ pub const BatchCapabilities = struct {
     mode: BatchMode = .none,
     preferred_items: usize = 1,
     max_items: usize = 1,
-    /// Null means the executor did not publish a hard ceiling. Zero is never a
-    /// valid known byte/pixel ceiling, avoiding the former unknown/unbounded
-    /// sentinel ambiguity during distributed capability intersection.
-    max_encoded_bytes: ?usize = null,
+    /// Null means the executor did not publish a hard ceiling. Zero is a known
+    /// disabled limit: an invocation containing encoded media is not accepted.
+    max_encoded_media_bytes: ?usize = null,
     max_decoded_pixels: ?u64 = null,
     max_media_parts_per_item: usize = 0,
     per_item_failures: bool = false,
@@ -133,17 +132,20 @@ pub const BatchCapabilities = struct {
     pub fn applyManifestCapability(self: *BatchCapabilities, capability: []const u8) !void {
         const preferred_prefix = "inference.batch.preferred_items=";
         const max_items_prefix = "inference.batch.max_items=";
-        const max_bytes_prefix = "inference.batch.max_encoded_bytes=";
+        const max_media_bytes_prefix = "inference.batch.max_encoded_media_bytes=";
+        const legacy_max_bytes_prefix = "inference.batch.max_encoded_bytes=";
         const max_pixels_prefix = "inference.batch.max_decoded_pixels=";
         const max_parts_prefix = "inference.batch.max_media_parts_per_item=";
         if (std.mem.startsWith(u8, capability, preferred_prefix)) {
             self.preferred_items = clampManifestLimit(self.preferred_items, try parseManifestLimit(usize, capability[preferred_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_items_prefix)) {
             self.max_items = clampManifestLimit(self.max_items, try parseManifestLimit(usize, capability[max_items_prefix.len..]));
-        } else if (std.mem.startsWith(u8, capability, max_bytes_prefix)) {
-            self.max_encoded_bytes = clampOptionalManifestLimit(self.max_encoded_bytes, try parseManifestLimit(usize, capability[max_bytes_prefix.len..]));
+        } else if (std.mem.startsWith(u8, capability, max_media_bytes_prefix)) {
+            self.max_encoded_media_bytes = clampOptionalManifestLimit(self.max_encoded_media_bytes, try parseOptionalManifestLimit(usize, capability[max_media_bytes_prefix.len..]));
+        } else if (std.mem.startsWith(u8, capability, legacy_max_bytes_prefix)) {
+            self.max_encoded_media_bytes = clampOptionalManifestLimit(self.max_encoded_media_bytes, try parseOptionalManifestLimit(usize, capability[legacy_max_bytes_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_pixels_prefix)) {
-            self.max_decoded_pixels = clampOptionalManifestLimit(self.max_decoded_pixels, try parseManifestLimit(u64, capability[max_pixels_prefix.len..]));
+            self.max_decoded_pixels = clampOptionalManifestLimit(self.max_decoded_pixels, try parseOptionalManifestLimit(u64, capability[max_pixels_prefix.len..]));
         } else if (std.mem.startsWith(u8, capability, max_parts_prefix)) {
             self.max_media_parts_per_item = clampManifestLimit(self.max_media_parts_per_item, try parseManifestLimit(usize, capability[max_parts_prefix.len..]));
         }
@@ -155,6 +157,11 @@ fn parseManifestLimit(comptime T: type, raw: []const u8) !T {
     const value = std.fmt.parseUnsigned(T, raw, 10) catch return error.InvalidInferenceCapabilities;
     if (value == 0) return error.InvalidInferenceCapabilities;
     return value;
+}
+
+fn parseOptionalManifestLimit(comptime T: type, raw: []const u8) !T {
+    if (raw.len == 0) return error.InvalidInferenceCapabilities;
+    return std.fmt.parseUnsigned(T, raw, 10) catch return error.InvalidInferenceCapabilities;
 }
 
 fn clampManifestLimit(current: anytype, requested: @TypeOf(current)) @TypeOf(current) {
@@ -171,7 +178,7 @@ fn clampOptionalManifestLimit(current: anytype, requested: std.meta.Child(@TypeO
 pub const InvocationShape = struct {
     item_count: usize,
     modalities: Modalities = .{},
-    encoded_bytes: usize = 0,
+    encoded_media_bytes: usize = 0,
     decoded_pixels: u64 = 0,
     max_media_parts_per_item: usize = 0,
 };
@@ -222,8 +229,8 @@ pub const InferenceCapabilities = struct {
         if (shape.item_count == 0) return;
         if (!self.batch.acceptsItems(shape.item_count)) return error.InferenceBatchTooLarge;
         if (!self.supports(shape.modalities)) return error.UnsupportedInferenceModality;
-        if (self.batch.max_encoded_bytes) |limit| {
-            if (shape.encoded_bytes > limit) return error.InferenceEncodedBytesExceeded;
+        if (self.batch.max_encoded_media_bytes) |limit| {
+            if (shape.encoded_media_bytes > limit) return error.InferenceEncodedBytesExceeded;
         }
         if (self.batch.max_decoded_pixels) |limit| {
             if (shape.decoded_pixels > limit) return error.InferenceDecodedPixelsExceeded;
@@ -431,7 +438,7 @@ test "inference capabilities enforce invocation resource limits" {
             .mode = .native,
             .preferred_items = 2,
             .max_items = 4,
-            .max_encoded_bytes = 1024,
+            .max_encoded_media_bytes = 1024,
             .max_decoded_pixels = 4096,
             .max_media_parts_per_item = 1,
         },
@@ -440,7 +447,7 @@ test "inference capabilities enforce invocation resource limits" {
     try capabilities.validateInvocation(.embed, .{
         .item_count = 2,
         .modalities = .{ .image = true },
-        .encoded_bytes = 512,
+        .encoded_media_bytes = 512,
         .decoded_pixels = 2048,
         .max_media_parts_per_item = 1,
     });
@@ -451,7 +458,7 @@ test "inference capabilities enforce invocation resource limits" {
     );
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
-        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .encoded_bytes = 1025 }),
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .encoded_media_bytes = 1025 }),
     );
     try std.testing.expectError(error.UnsupportedInferenceMimeType, capabilities.validateMimeType("image/webp"));
 }
@@ -461,16 +468,19 @@ test "batch capabilities accept model-owned limit overrides" {
         .mode = .native,
         .preferred_items = 8,
         .max_items = 64,
-        .max_encoded_bytes = 64 * 1024 * 1024,
+        .max_encoded_media_bytes = 64 * 1024 * 1024,
         .max_decoded_pixels = 50_000_000,
         .max_media_parts_per_item = 1,
     };
     try batch.applyManifestCapability("inference.batch.max_items=12");
-    try batch.applyManifestCapability("inference.batch.max_encoded_bytes=4096");
+    try batch.applyManifestCapability("inference.batch.max_encoded_media_bytes=4096");
     try batch.applyManifestCapability("inference.batch.max_decoded_pixels=12345");
     try batch.applyManifestCapability("inference.batch.max_media_parts_per_item=3");
     try std.testing.expectEqual(@as(usize, 12), batch.max_items);
-    try std.testing.expectEqual(@as(?usize, 4096), batch.max_encoded_bytes);
+    try std.testing.expectEqual(@as(?usize, 4096), batch.max_encoded_media_bytes);
+
+    try batch.applyManifestCapability("inference.batch.max_encoded_media_bytes=0");
+    try std.testing.expectEqual(@as(?usize, 0), batch.max_encoded_media_bytes);
     try std.testing.expectEqual(@as(?u64, 12345), batch.max_decoded_pixels);
     try std.testing.expectEqual(@as(usize, 1), batch.max_media_parts_per_item);
     try batch.applyManifestCapability("inference.batch.max_items=128");

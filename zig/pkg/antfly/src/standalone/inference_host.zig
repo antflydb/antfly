@@ -24,6 +24,8 @@ const http_abi = @import("../runtime_http_abi.zig");
 const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_api = @import("inference_api");
+const inference_chunker = @import("inference_chunker");
+const chunking_types = @import("../chunking/types.zig");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
@@ -409,6 +411,23 @@ const TranscribeAudioRequest = struct {
 const ExtractRequest = struct {
     model: []const u8,
     request: antfly.extracting.Request,
+};
+
+const ChunkInputRequest = struct {
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    attachment_count: usize = 0,
+};
+
+const RewriteTextsRequest = struct {
+    model: []const u8,
+    inputs: []const []const u8,
+};
+
+const ClassifyTextsRequest = struct {
+    model: []const u8,
+    request: antfly.inference.managed_embedder.ClassificationRequest,
 };
 
 const ResolvedWarmModels = struct {
@@ -838,6 +857,91 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var result = try state.node.extractDirect(alloc, parsed.value.model, parsed.value.request);
             defer result.deinit();
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
+        },
+        .chunk_input => blk: {
+            var parsed = try std.json.parseFromSlice(ChunkInputRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var input = parsed.value.input;
+            switch (input) {
+                .text => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
+                    return error.InvalidArguments,
+                .binary => |*binary| {
+                    if (parsed.value.attachment_count != 1 or context.binary_payloads_len != 1 or
+                        context.attachment_refs_len != 1 or context.binary_payloads == null)
+                        return error.InvalidArguments;
+                    try validateProviderAttachmentRefs(1, context.attachment_refs, context.attachment_refs_len);
+                    const ref = providerAttachmentRefForItem(context.attachment_refs.?, 1, 0) orelse return error.InvalidArguments;
+                    const payload = context.binary_payloads.?[ref.attachment_index];
+                    if (binary.data.len != 0 or !std.mem.eql(u8, binary.mime_type, payload.content_type.slice()))
+                        return error.InvalidArguments;
+                    binary.data = payload.bytes.slice();
+                },
+            }
+            const cfg = parsed.value.config;
+            const result = try state.node.chunkInputDirect(alloc, parsed.value.model, input, .{
+                .model = if (cfg.model.len > 0) cfg.model else "fixed",
+                .max_chunks = if (cfg.max_chunks > 0) @intCast(cfg.max_chunks) else 50,
+                .threshold = cfg.threshold,
+                .text = .{
+                    .target_tokens = cfg.defaultedTargetTokens(),
+                    .overlap_tokens = cfg.defaultedOverlapTokens(),
+                    .separator = cfg.defaultedSeparator(),
+                },
+                .audio = .{
+                    .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
+                    .overlap_duration_ms = cfg.audio.overlap_duration_ms,
+                },
+            });
+            defer inference_chunker.types.freeChunks(alloc, result);
+            // JSON parsing allocates text/data in the receiving allocator. Mark
+            // the wire copy as owning those allocations, then restore the
+            // borrowed direct result before its local destructor runs.
+            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool }, result.len);
+            defer alloc.free(ownership);
+            for (result, ownership) |*chunk, *original| {
+                original.* = .{
+                    .mime_type = chunk.owns_mime_type,
+                    .text = chunk.owns_text,
+                    .data = chunk.owns_data,
+                };
+                chunk.owns_mime_type = true;
+                chunk.owns_text = chunk.text != null;
+                chunk.owns_data = chunk.data != null;
+            }
+            defer for (result, ownership) |*chunk, original| {
+                chunk.owns_mime_type = original.mime_type;
+                chunk.owns_text = original.text;
+                chunk.owns_data = original.data;
+            };
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .rewrite_texts => blk: {
+            var parsed = try std.json.parseFromSlice(RewriteTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try state.node.rewriteTextsDirect(alloc, parsed.value.model, parsed.value.inputs);
+            defer {
+                for (result) |item| alloc.free(item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .classify_texts => blk: {
+            var parsed = try std.json.parseFromSlice(ClassifyTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const request = parsed.value.request;
+            const result = try state.node.classifyTextsDirect(
+                alloc,
+                parsed.value.model,
+                request.texts,
+                request.labels,
+                request.hypothesis_template,
+                request.multi_label,
+            );
+            defer {
+                for (result) |item| alloc.free(item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .list_models_json => blk: {
             const result = try state.node.listModelsJsonAlloc(alloc, state.io);
@@ -1328,11 +1432,9 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     const capabilities = try localModelCapabilities(node, io, model, .embed);
     var shape = antfly.inference.work.InvocationShape{ .item_count = parts.len };
     for (parts) |part| switch (part) {
-        .text => |value| {
+        .text => {
             shape.modalities.text = true;
             try capabilities.validateMimeType("text/plain");
-            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, value.len) catch
-                return error.InferenceEncodedBytesExceeded;
         },
         .media_url => {
             shape.modalities.image = true;
@@ -1349,7 +1451,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             } else if (std.ascii.eqlIgnoreCase(media.mime_type, "text/plain")) {
                 shape.modalities.text = true;
             } else return error.UnsupportedInferenceMimeType;
-            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, media.data.len) catch
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
                 return error.InferenceEncodedBytesExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
@@ -1479,8 +1581,6 @@ fn validateLocalGenerateCapabilities(
     attachments: []const antfly.inference.work.Attachment,
 ) !void {
     for (attachments) |attachment| try capabilities.validateMimeType(attachment.content_type);
-    const encoded_bytes = std.math.add(usize, preflight.text_bytes, preflight.encoded_media_bytes) catch
-        return error.InferenceEncodedBytesExceeded;
     try capabilities.validateInvocation(.generate, .{
         .item_count = 1,
         .modalities = .{
@@ -1488,7 +1588,7 @@ fn validateLocalGenerateCapabilities(
             .image = preflight.image_count > 0,
             .audio = preflight.has_audio,
         },
-        .encoded_bytes = encoded_bytes,
+        .encoded_media_bytes = preflight.encoded_media_bytes,
         .max_media_parts_per_item = preflight.media_count,
     });
 }
@@ -1500,7 +1600,10 @@ fn localModelCapabilities(
     task: antfly.inference.work.Task,
 ) !antfly.inference.work.InferenceCapabilities {
     if (task == .chunk and
-        (std.mem.eql(u8, model, "fixed_bert") or std.mem.eql(u8, model, "fixed_bpe")))
+        (std.mem.eql(u8, model, "fixed") or
+            std.mem.eql(u8, model, "fixed_bert") or
+            std.mem.eql(u8, model, "fixed_bpe") or
+            std.mem.eql(u8, model, "fixed-bert-tokenizer")))
     {
         return .{
             .task = .chunk,
@@ -1511,7 +1614,7 @@ fn localModelCapabilities(
                 .mode = .none,
                 .preferred_items = 1,
                 .max_items = 1,
-                .max_encoded_bytes = inference.server.requestMediaMaxBytes(node),
+                .max_encoded_media_bytes = 0,
             },
             .output = .chunks,
             .result_cardinality = .one_per_item,
@@ -1617,7 +1720,7 @@ fn localModelCapabilities(
             .mode = if (native_batch) .native else if (max_items == 1) .none else .serial_compatibility,
             .preferred_items = @min(@as(usize, 8), max_items),
             .max_items = max_items,
-            .max_encoded_bytes = inference.server.requestMediaMaxBytes(node),
+            .max_encoded_media_bytes = inference.server.requestMediaMaxBytes(node),
             .max_decoded_pixels = if (max_images > 0)
                 inference.server.requestMediaMaxDecodedPixels(node, max_images)
             else

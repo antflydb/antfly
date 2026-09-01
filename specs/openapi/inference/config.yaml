@@ -1910,6 +1910,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /classify:
+    post:
+      summary: Classify text with a resolved classifier model
+      operationId: classifyText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClassifyRequest"
+      responses:
+        "200":
+          description: Classification completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClassifyResponse"
+        "400":
+          description: Invalid classification request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Classifier model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Classification service temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /read:
     post:
       summary: Read text from images (OCR/document understanding)

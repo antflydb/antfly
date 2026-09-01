@@ -330,7 +330,7 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
     return .ok;
 }
 
-const inference_provider_operation_slots = @intFromEnum(standalone_inference_bridge.ProviderOperation.read_encoded_images_reported) + 1;
+const inference_provider_operation_slots = @intFromEnum(standalone_inference_bridge.ProviderOperation.classify_texts) + 1;
 var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
 
 // Private inference errors are normalized at this archive boundary, so this is

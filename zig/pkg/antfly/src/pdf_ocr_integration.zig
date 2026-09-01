@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
                     .mode = if (task == .generate) .serial_compatibility else .native,
                     .preferred_items = 2,
                     .max_items = 8,
-                    .max_encoded_bytes = 64 * 1024 * 1024,
+                    .max_encoded_media_bytes = 64 * 1024 * 1024,
                     .max_decoded_pixels = 80_000_000,
                     .max_media_parts_per_item = 1,
                     .per_item_failures = true,

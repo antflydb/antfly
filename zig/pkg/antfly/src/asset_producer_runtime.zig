@@ -983,7 +983,7 @@ pub const Runtime = struct {
             try capabilities.validateInvocation(.generate, .{
                 .item_count = 1,
                 .modalities = modalities,
-                .encoded_bytes = encoded_bytes,
+                .encoded_media_bytes = encoded_bytes,
                 .max_media_parts_per_item = request.media.len,
             });
             const attachments = try alloc.alloc(inference_work.Attachment, request.media.len);
@@ -1075,7 +1075,7 @@ pub const Runtime = struct {
             try capabilities.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
-                .encoded_bytes = inline_shape.encoded_bytes,
+                .encoded_media_bytes = inline_shape.encoded_media_bytes,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
         } else if (local_reader) {
@@ -1104,7 +1104,7 @@ pub const Runtime = struct {
     }
 
     const ReaderUriInvocationShape = struct {
-        encoded_bytes: usize = 0,
+        encoded_media_bytes: usize = 0,
     };
 
     /// Inspect inline payloads before selecting a local callback or remote
@@ -1125,7 +1125,7 @@ pub const Runtime = struct {
             try capabilities.validateMimeType(mime_type);
             const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(url[comma + 1 ..]) catch
                 return error.InvalidDataURI;
-            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, decoded_len) catch
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, decoded_len) catch
                 return error.InferenceEncodedBytesExceeded;
         }
         return shape;
@@ -1149,7 +1149,7 @@ pub const Runtime = struct {
             try resolved.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
-                .encoded_bytes = encoded_bytes,
+                .encoded_media_bytes = encoded_bytes,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
         } else if (local_reader) {
@@ -1472,12 +1472,12 @@ fn encodedReaderBatchEnd(
     capabilities: inference_work.BatchCapabilities,
 ) usize {
     const item_end = @min(start +| capabilities.max_items, images.len);
-    const max_encoded_bytes = capabilities.max_encoded_bytes orelse return item_end;
+    const max_encoded_media_bytes = capabilities.max_encoded_media_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
         const next = std.math.add(usize, bytes, images[end].bytes.len) catch break;
-        if (next > max_encoded_bytes and end > start) break;
+        if (next > max_encoded_media_bytes and end > start) break;
         bytes = next;
     }
     return @max(start + 1, end);
@@ -1485,7 +1485,7 @@ fn encodedReaderBatchEnd(
 
 const GeneratorItemShape = struct {
     modalities: inference_work.Modalities = .{},
-    encoded_bytes: usize = 0,
+    encoded_media_bytes: usize = 0,
     media_parts: usize = 0,
 };
 
@@ -1512,6 +1512,14 @@ fn dataUriMimeType(uri: []const u8) ?[]const u8 {
     return uri[5 .. 5 + end];
 }
 
+fn dataUriDecodedSize(uri: []const u8) !?usize {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
+    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
+    const metadata = uri["data:".len..comma];
+    if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
+    return std.base64.standard.Decoder.calcSizeForSlice(uri[comma + 1 ..]) catch error.InvalidDataURI;
+}
+
 fn generatorRequestShape(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
@@ -1522,39 +1530,41 @@ fn generatorRequestShape(
         const parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts, &.{}, false);
         defer freeGeneratorContentParts(alloc, parts);
         for (parts) |part| switch (part) {
-            .text => |value| {
+            .text => {
                 shape.modalities.text = true;
-                shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, value.len) catch
-                    return error.InferenceEncodedBytesExceeded;
                 try capabilities.validateMimeType("text/plain");
             },
             .image_url => |image| {
                 shape.modalities.image = true;
                 shape.media_parts += 1;
-                shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, image.url.len) catch
-                    return error.InferenceEncodedBytesExceeded;
                 if (dataUriMimeType(image.url)) |mime_type| try capabilities.validateMimeType(mime_type);
+                if (try dataUriDecodedSize(image.url)) |media_bytes| {
+                    shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media_bytes) catch
+                        return error.InferenceEncodedBytesExceeded;
+                }
             },
             .media => |media| {
                 shape.media_parts += 1;
                 if (media.mime_type.len == 0) return error.UnsupportedInferenceMimeType;
                 try capabilities.validateMimeType(media.mime_type);
                 mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
-                const media_bytes = if (media.url) |url| url.len else media.data.len;
-                shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, media_bytes) catch
+                const media_bytes = if (media.url) |url|
+                    (try dataUriDecodedSize(url)) orelse 0
+                else
+                    media.data.len;
+                shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media_bytes) catch
                     return error.InferenceEncodedBytesExceeded;
             },
         };
     } else {
         shape.modalities.text = true;
-        shape.encoded_bytes = request.source_text.len;
         try capabilities.validateMimeType("text/plain");
     }
     for (request.media) |media| {
         try capabilities.validateMimeType(media.mime_type);
         mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
         shape.media_parts += 1;
-        shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, media.bytes.len) catch
+        shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.bytes.len) catch
             return error.InferenceEncodedBytesExceeded;
     }
     return shape;
@@ -1569,7 +1579,7 @@ fn validateGeneratorInvocation(
     for (requests) |request| {
         const item = try generatorRequestShape(alloc, capabilities, request);
         mergeInferenceModalities(&invocation.modalities, item.modalities);
-        invocation.encoded_bytes = std.math.add(usize, invocation.encoded_bytes, item.encoded_bytes) catch
+        invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
     }
@@ -1582,7 +1592,7 @@ test "asset producer runtime generator admission accepts PDF only for document-c
         .input_modalities = .{ .text = true, .document = true },
         .accepted_mime_types = .{ .text_plain = true, .application_pdf = true },
         .input_granularity = .document,
-        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_bytes = 16, .max_media_parts_per_item = 1 },
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_media_bytes = 16, .max_media_parts_per_item = 1 },
         .output = .generated_text,
     };
     const pdf = [_]u8{ '%', 'P', 'D', 'F' };
@@ -1610,7 +1620,7 @@ test "asset producer runtime reader URI admission measures data payloads before 
         .input_modalities = .{ .image = true },
         .accepted_mime_types = .{ .image_png = true },
         .input_granularity = .page,
-        .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_encoded_bytes = 2, .max_media_parts_per_item = 1 },
+        .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 2, .max_media_parts_per_item = 1 },
         .output = .read_result,
     };
     const request = readers.Request{
@@ -1618,11 +1628,11 @@ test "asset producer runtime reader URI admission measures data payloads before 
         .inline_content_trust = .trusted_internal,
     };
     const shape = try Runtime.readerUriInvocationShape(capabilities, request);
-    try std.testing.expectEqual(@as(usize, 3), shape.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 3), shape.encoded_media_bytes);
     try std.testing.expectError(error.InferenceEncodedBytesExceeded, capabilities.validateInvocation(.read, .{
         .item_count = 1,
         .modalities = .{ .image = true },
-        .encoded_bytes = shape.encoded_bytes,
+        .encoded_media_bytes = shape.encoded_media_bytes,
         .max_media_parts_per_item = 1,
     }));
 }
@@ -1634,13 +1644,13 @@ fn generatorBatchEnd(
     start: usize,
 ) !usize {
     const item_end = @min(start +| capabilities.batch.max_items, requests.len);
-    const max_encoded_bytes = capabilities.batch.max_encoded_bytes orelse return item_end;
+    const max_encoded_media_bytes = capabilities.batch.max_encoded_media_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
         const item = try generatorRequestShape(alloc, capabilities, requests[end]);
-        const next = std.math.add(usize, bytes, item.encoded_bytes) catch break;
-        if (next > max_encoded_bytes and end > start) break;
+        const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch break;
+        if (next > max_encoded_media_bytes and end > start) break;
         bytes = next;
     }
     return @max(start + 1, end);
@@ -1664,13 +1674,13 @@ test "encoded reader chunks obey model item and byte limits" {
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,
-        .max_encoded_bytes = 5,
+        .max_encoded_media_bytes = 5,
     }));
     try std.testing.expectEqual(@as(usize, 2), encodedReaderBatchEnd(&images, 0, .{
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,
-        .max_encoded_bytes = 6,
+        .max_encoded_media_bytes = 6,
     }));
 }
 
@@ -2339,7 +2349,7 @@ test "asset producer runtime passes rendered bytes to embedded generators withou
                     .mode = .serial_compatibility,
                     .preferred_items = 8,
                     .max_items = 128,
-                    .max_encoded_bytes = 64 * 1024 * 1024,
+                    .max_encoded_media_bytes = 64 * 1024 * 1024,
                     .max_decoded_pixels = 50_000_000,
                     .max_media_parts_per_item = 8,
                 },
@@ -2610,7 +2620,7 @@ fn testNativeReaderCapabilities(
             .mode = .native,
             .preferred_items = 8,
             .max_items = local_reader_batch_ceiling,
-            .max_encoded_bytes = 64 * 1024 * 1024,
+            .max_encoded_media_bytes = 64 * 1024 * 1024,
             .max_decoded_pixels = 50_000_000,
             .max_media_parts_per_item = 1,
         },

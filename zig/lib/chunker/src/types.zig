@@ -25,6 +25,7 @@ pub const Chunk = struct {
     end_time_ms: ?f32 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
+    owns_mime_type: bool = false,
     owns_text: bool = false,
     owns_data: bool = false,
 
@@ -56,6 +57,7 @@ pub const Chunk = struct {
     }
 
     pub fn deinit(self: *Chunk, alloc: std.mem.Allocator) void {
+        if (self.owns_mime_type) alloc.free(@constCast(self.mime_type));
         if (self.owns_text and self.text != null) alloc.free(self.text.?);
         if (self.owns_data and self.data != null) alloc.free(self.data.?);
         self.* = undefined;
@@ -75,7 +77,7 @@ pub const AudioChunkOptions = struct {
 };
 
 pub const FixedChunkConfig = struct {
-    model: []const u8 = "fixed-bert-tokenizer",
+    model: []const u8 = "fixed",
     max_chunks: usize = 50,
     threshold: ?f32 = null,
     text: FixedTextConfig = .{},

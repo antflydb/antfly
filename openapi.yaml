@@ -7030,6 +7030,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/classify:
+    post:
+      summary: Classify text with a resolved classifier model
+      operationId: classifyText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceClassifyRequest'
+      responses:
+        '200':
+          description: Classification completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceClassifyResponse'
+        '400':
+          description: Invalid classification request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Classifier model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -25889,6 +25928,111 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
+    InferenceClassifyRequest:
+      type: object
+      required:
+        - model
+        - texts
+        - labels
+      properties:
+        model:
+          type: string
+          description: Name of classifier model from models_dir/classifiers/
+          example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to classify
+          example:
+            - I love this product!
+            - The service was terrible.
+        labels:
+          type: array
+          items:
+            type: string
+          description: >
+            Candidate labels for zero-shot classification.
+
+            The model will predict which label(s) best describe each text.
+          example:
+            - positive
+            - negative
+            - neutral
+        hypothesis_template:
+          type: string
+          description: >
+            Custom hypothesis template for NLI-based classification.
+
+            Use "{}" as placeholder for the label.
+
+            Default: "This example is {}."
+          example: This text expresses a {} sentiment.
+        multi_label:
+          type: boolean
+          default: false
+          description: >
+            If true, allows multiple labels per text (independent scoring).
+
+            If false (default), scores are normalized across labels.
+    InferenceClassifyResult:
+      type: object
+      required:
+        - label
+        - score
+      properties:
+        label:
+          type: string
+          description: The predicted class/category
+          example: positive
+        score:
+          type: number
+          format: float
+          description: Confidence score (0.0 to 1.0)
+          example: 0.95
+    InferenceClassifyResponse:
+      type: object
+      required:
+        - object
+        - data
+        - model
+        - usage
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: Object type, always "list"
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceClassifyObject'
+          description: Classification result objects, one per input text.
+        model:
+          type: string
+          description: Name of model used for classification
+        usage:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceClassifyObject:
+      type: object
+      required:
+        - object
+        - index
+        - classifications
+      properties:
+        object:
+          type: string
+          enum:
+            - classification
+        index:
+          type: integer
+          description: Original input text index.
+        classifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceClassifyResult'
+          description: >
+            Classification results for this input text.
     InferenceReadRequest:
       type: object
       required:

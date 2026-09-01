@@ -84,6 +84,28 @@ pub fn main() !void {
     if (bridge.errorFromStatus(embedding_status) != error.InvalidArguments)
         return error.InvalidLinkedInferenceEmbeddingBinaryContract;
     if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
+
+    const chunk_request_json =
+        \\{"model":"fixed","input":{"binary":{"mime_type":"application/pdf","data":[]}},"config":{"provider":"antfly","model":"fixed"},"attachment_count":2}
+    ;
+    const chunk_context = bridge.ProviderInvokeContext{
+        .abi_version = bridge.abi_version,
+        .handle = handle.?,
+        .operation = @intFromEnum(bridge.ProviderOperation.chunk_input),
+        .request_json = bridge.String.init(chunk_request_json),
+        .deadline_ns = 0,
+        .has_deadline = 0,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response_json,
+        .binary_payloads = &payloads,
+        .binary_payloads_len = payloads.len,
+        .attachment_refs = &refs,
+        .attachment_refs_len = refs.len,
+    };
+    const chunk_status = table.invoke_provider(&chunk_context);
+    if (bridge.errorFromStatus(chunk_status) != error.InvalidArguments)
+        return error.InvalidLinkedInferenceChunkBinaryContract;
+    if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
 }
 
 fn createContext(io: *const std.Io, out_handle: *?*anyopaque) bridge.CreateContext {

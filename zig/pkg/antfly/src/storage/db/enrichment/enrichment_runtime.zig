@@ -40,6 +40,7 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const inference_work = @import("../../../inference/work.zig");
+const chunk_provider = @import("../../../chunking/provider.zig");
 const document_extraction_mod = @import("document_extraction.zig");
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
@@ -74,12 +75,15 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
 
+pub const ChunkProvider = chunk_provider.Provider;
+
 pub const Config = struct {
     owner_id: []const u8 = "local",
     lease_ttl_ms: u64 = 30_000,
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
     asset_producer: ?asset_producer_mod.Producer = null,
+    chunk_provider: ?ChunkProvider = null,
     enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -2345,7 +2349,7 @@ fn getOrCreateRequestChunks(
     defer runtime.alloc.free(source_text);
 
     const chunks = if (request.chunker_json.len > 0)
-        try chunker_mod.chunkTextWithConfigJson(runtime.alloc, source_text, request.chunker_json)
+        try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, source_text, request.chunker_json, runtime.config.chunk_provider)
     else
         try chunker_mod.chunkText(runtime.alloc, source_text, request.chunk_size, request.chunk_overlap);
 
@@ -2458,6 +2462,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
+                .chunk_provider = config.chunk_provider,
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
@@ -2869,6 +2874,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
+                .chunk_provider = config.chunk_provider,
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
@@ -6379,7 +6385,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             if (!capabilities.supports(.{ .image = true }) or !capabilities.acceptsMimeType("image/png"))
                 return error.UnsupportedInferenceModality;
             admitted_batch_policy.max_items = @min(admitted_batch_policy.max_items, capabilities.batch.max_items);
-            if (capabilities.batch.max_encoded_bytes) |limit|
+            if (capabilities.batch.max_encoded_media_bytes) |limit|
                 admitted_batch_policy.max_bytes = @min(admitted_batch_policy.max_bytes, limit);
             if (capabilities.batch.max_decoded_pixels) |limit|
                 admitted_batch_policy.max_pixels = limit;
@@ -7122,7 +7128,7 @@ fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, entry.chunker_json, runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
@@ -8287,7 +8293,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, context.artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(working_alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJsonAndProvider(working_alloc, unit.text, entry.chunker_json, context.runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(working_alloc, chunks);
@@ -10844,7 +10850,7 @@ fn processPdfPageImageEmbedding(
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = @min(policy.batch_items orelse default_items, capability_items);
-    const capability_bytes = capabilities.batch.max_encoded_bytes orelse generated_ocr_default_render_inflight_bytes;
+    const capability_bytes = capabilities.batch.max_encoded_media_bytes orelse generated_ocr_default_render_inflight_bytes;
     const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 

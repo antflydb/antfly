@@ -17,6 +17,11 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for classifyText.
+pub fn parseClassifyTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClassifyRequest) {
+    return std.json.parseFromSlice(types.ClassifyRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for generateEmbeddings.
 pub fn parseGenerateEmbeddingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EmbedRequest) {
     return std.json.parseFromSlice(types.EmbedRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -86,6 +91,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/classify", .operation_id = "classifyText", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/extract", .operation_id = "extract", .request_body = .buffered, .streaming_response = false },
@@ -114,6 +120,7 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
+        if (!@hasDecl(Impl, "classifyText")) @compileError("ServerRouter: Impl missing required method 'classifyText'");
         if (!@hasDecl(Impl, "generateEmbeddings")) @compileError("ServerRouter: Impl missing required method 'generateEmbeddings'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
@@ -140,6 +147,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
+            try server.post("/classify", httpx.Handler.bind(self.impl, classifyText));
             try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
             try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
             try server.post("/extract", httpx.Handler.bind(self.impl, extract));
@@ -165,6 +173,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /chunk
         fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);
+        }
+
+        /// Classify text with a resolved classifier model
+        /// POST /classify
+        fn classifyText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.classifyText(ctx);
         }
 
         /// Create embeddings (alias of `/embeddings`)
@@ -251,6 +265,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn classifyText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateEmbeddings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response

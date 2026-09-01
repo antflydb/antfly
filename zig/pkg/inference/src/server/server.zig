@@ -1367,6 +1367,7 @@ fn kernelJitMaterializesOptionalSessions(mode: graph_mod.kernel_jit.Mode) bool {
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const max_generate_batch_items: usize = 128;
+pub const max_serial_family_batch_items: usize = 128;
 pub const max_read_batch_images: usize = 64;
 pub const max_generate_media_parts_per_item: usize = 8;
 const default_read_admission_max_tokens: usize = 256;
@@ -3753,6 +3754,186 @@ pub const Node = struct {
         return try pipeline.rerank(query, documents);
     }
 
+    pub fn chunkInputDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: lib_chunker.Input,
+        requested: lib_chunker.FixedChunkConfig,
+    ) ![]lib_chunker.Chunk {
+        if (canonicalFixedChunkModel(model_name) == null or canonicalFixedChunkModel(requested.model) == null)
+            return error.UnsupportedChunkerProvider;
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
+        self.metrics.incRequest("chunk.local");
+        defer self.metrics.decActive();
+        var config = requested;
+        config.model = "fixed";
+        return try lib_chunker.fixed_multimodal.chunkInput(allocator, input, config);
+    }
+
+    pub fn rewriteTextsDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        inputs: []const []const u8,
+    ) ![][]const u8 {
+        if (inputs.len > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
+        if (inputs.len == 0) return try allocator.alloc([]const u8, 0);
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
+        self.metrics.incRequest("rewrite.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rewriters");
+        defer self.allocator.free(model_path);
+
+        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+        const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
+        defer allocator.free(paths.encoder);
+        defer allocator.free(paths.decoder);
+        var component_loader = try self.model_manager.componentLoaderForPaths(
+            model_path,
+            self.session_manager.preferred_backends,
+            &.{ paths.encoder, paths.decoder },
+        );
+        var encoder_managed = try component_loader.load(paths.encoder);
+        defer encoder_managed.deinit();
+        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
+        var decoder_managed = try strict_loader.load(paths.decoder);
+        defer decoder_managed.deinit();
+        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+
+        const hf_tokenizer = @import("inference_hf_tokenizer");
+        const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
+        defer allocator.free(tok_path);
+        const tok_bytes = try c_file.readFile(allocator, tok_path);
+        defer allocator.free(tok_bytes);
+        var hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
+        defer hf_tok.deinitSelf();
+
+        const rewriting = @import("../pipelines/rewriting.zig");
+        var pipeline = rewriting.RewritingPipeline{
+            .allocator = allocator,
+            .enc_dec = .{
+                .allocator = allocator,
+                .encoder = encoder_managed.session,
+                .decoder = decoder_managed.session,
+                .config = dec_config,
+            },
+            .tokenizer = hf_tok.tokenizer(),
+            .config = .{ .max_length = dec_config.max_length },
+        };
+        const outputs = try allocator.alloc([]const u8, inputs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (outputs[0..initialized]) |output| allocator.free(output);
+            allocator.free(outputs);
+        }
+        for (inputs, outputs) |input, *output| {
+            var result = try pipeline.rewrite(input);
+            defer result.deinit();
+            output.* = try allocator.dupe(u8, result.text);
+            initialized += 1;
+        }
+        return outputs;
+    }
+
+    pub const DirectClassificationScore = struct {
+        label: []const u8,
+        score: f32,
+    };
+
+    pub fn classifyTextsDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        hypothesis_template: ?[]const u8,
+        multi_label: bool,
+    ) ![]const []const DirectClassificationScore {
+        if (texts.len == 0 or labels.len == 0) return error.InvalidClassificationRequest;
+        if (texts.len > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
+        self.metrics.incRequest("classify.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const requested = if (model_name.len > 0) model_name else null;
+        const classifier_path = self.resolveModelPath(io_impl.io(), requested, "classifiers") catch |err| switch (requestModelResolutionErrorKind(err)) {
+            .missing => null,
+            .invalid, .internal => return err,
+        };
+        if (classifier_path) |model_path| {
+            defer self.allocator.free(model_path);
+            var model_handle = try self.model_manager.acquireFromDir(model_path);
+            defer model_handle.release();
+            const model = model_handle.get();
+            const entailment_idx: ?usize = if (model.manifest.id2label) |manifest_labels| blk: {
+                for (manifest_labels, 0..) |label, i| {
+                    if (std.ascii.eqlIgnoreCase(label, "entailment")) break :blk i;
+                }
+                break :blk null;
+            } else null;
+            var pipeline = model.classificationPipeline(allocator, .{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = hypothesis_template orelse "This example is {}.",
+                .multi_label = multi_label,
+                .entailment_index = entailment_idx,
+            });
+            const results = try pipeline.classifyBatch(texts, labels);
+            defer {
+                for (results) |item| allocator.free(item);
+                allocator.free(results);
+            }
+            return try copyDirectClassificationResults(allocator, results);
+        }
+
+        const model_path = try self.resolveModelPath(io_impl.io(), requested, "extractors");
+        defer self.allocator.free(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
+        if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
+        var pipeline = model.glinerPipeline(allocator);
+        const results = try pipeline.classifyBatch(texts, labels, .{
+            .threshold = 0.0,
+            .multi_label = multi_label,
+        });
+        defer {
+            for (results) |item| allocator.free(item);
+            allocator.free(results);
+        }
+        return try copyDirectClassificationResults(allocator, results);
+    }
+
+    fn copyDirectClassificationResults(
+        allocator: std.mem.Allocator,
+        results: anytype,
+    ) ![]const []const DirectClassificationScore {
+        const out = try allocator.alloc([]const DirectClassificationScore, results.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |item| allocator.free(item);
+            allocator.free(out);
+        }
+        for (results, out) |source, *destination| {
+            const scores = try allocator.alloc(DirectClassificationScore, source.len);
+            for (source, scores) |score, *copied| copied.* = .{
+                .label = score.label,
+                .score = score.score,
+            };
+            destination.* = scores;
+            initialized += 1;
+        }
+        return out;
+    }
+
     pub fn generateTextDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -5014,6 +5195,7 @@ pub const Node = struct {
         request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
     ) !extracting_api.Response {
+        if (request.inputs.len > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
         switch (admission_owner) {
             .direct => try self.acquireAdmissionUnits(1),
             .http_route => try self.reserveAdmissionUnits(1),
@@ -6235,7 +6417,8 @@ pub const Node = struct {
 
         var config = lib_chunker.FixedChunkConfig{};
         if (body.config) |cfg| {
-            if (cfg.model) |model| config.model = model;
+            if (cfg.model) |model| config.model = canonicalFixedChunkModel(model) orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "unsupported chunking model" });
             if (cfg.max_chunks) |max_chunks| config.max_chunks = @intCast(max_chunks);
             config.threshold = cfg.threshold;
             if (cfg.text) |text_cfg| {
@@ -6298,7 +6481,7 @@ pub const Node = struct {
         return ctx.json(api.ChunkResponse{
             .object = "list",
             .data = api_chunks,
-            .model = if (config.model.len > 0) config.model else "fixed-bert-tokenizer",
+            .model = "fixed",
             .usage = tokenUsage(prompt_tokens, 0),
             .cache_hit = false,
         });
@@ -10618,6 +10801,8 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.texts.len > max_serial_family_batch_items)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "too many classification inputs" });
         const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
         defer self.releaseSlotUnits(admission_units);
@@ -10953,6 +11138,8 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.inputs.len > max_serial_family_batch_items)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "too many rewrite inputs" });
         if (try self.acquireSlot(ctx)) |resp| return resp;
         defer self.releaseSlot();
         self.metrics.incRequest("rewrite");
@@ -11471,6 +11658,9 @@ pub const Node = struct {
         if (body.inputs.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "inputs are required" });
         }
+        if (body.inputs.len > max_serial_family_batch_items) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "too many extraction inputs" });
+        }
         const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
         const operation = canonicalExtractionOperation(body.schema) catch |err| switch (err) {
             error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
@@ -11888,7 +12078,7 @@ pub const Node = struct {
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
-                for ([_][]const u8{ "fixed_bert", "fixed_bpe" }) |name| {
+                for ([_][]const u8{"fixed"}) |name| {
                     if (model_count > 0) try body.append(a, ',');
                     try jsonEncodeString(&body, a, name);
                     try body.append(a, ':');
@@ -13680,9 +13870,11 @@ fn taskMatchesModelListing(
     capabilities: []const []const u8,
     zero_shot_classification: bool,
 ) bool {
-    // Classification is a public extraction capability. Keep `classifier` as
-    // an internal pipeline kind without making its cache bucket a public API.
-    if (std.mem.eql(u8, task, "classifiers")) return false;
+    if (std.mem.eql(u8, task, "classifiers") and
+        model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
+    {
+        return true;
+    }
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
@@ -13872,21 +14064,16 @@ fn appendResolvedInferenceCapabilities(
     accepts_audio: bool,
 ) !void {
     const resolved_task = normalizedInferenceTask(task) orelse return;
-    const max_items: usize = if (std.mem.eql(u8, resolved_task, "read"))
-        max_read_batch_images
-    else if (std.mem.eql(u8, resolved_task, "generate"))
-        max_generate_batch_items
-    else if (std.mem.eql(u8, resolved_task, "embed"))
-        64
-    else
-        1;
+    const max_items = resolvedTaskMaxItems(resolved_task);
     const native = std.mem.eql(u8, resolved_task, "embed") or
         (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
-    const max_bytes = if (std.mem.eql(u8, resolved_task, "read"))
+    const accepts_media = accepts_image or accepts_audio;
+    const max_bytes = if (!accepts_media)
+        0
+    else if (std.mem.eql(u8, resolved_task, "read"))
         @min(default_max_read_batch_bytes, request_media_max_bytes)
     else
         request_media_max_bytes;
-    const accepts_media = accepts_image or accepts_audio;
     const max_parts: usize = if (!accepts_media)
         0
     else if (std.mem.eql(u8, resolved_task, "generate"))
@@ -13894,13 +14081,13 @@ fn appendResolvedInferenceCapabilities(
     else
         1;
 
-    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"task\":");
+    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":2,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
     try jsonEncodeString(buf, allocator, if (native) "native" else if (max_items == 1) "none" else "serial_compatibility");
     const limits_prefix = try std.fmt.allocPrint(
         allocator,
-        ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_bytes\":{d},\"max_decoded_pixels\":",
+        ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_media_bytes\":{d},\"max_decoded_pixels\":",
         .{
             @min(@as(usize, 8), max_items),
             max_items,
@@ -13926,6 +14113,29 @@ fn appendResolvedInferenceCapabilities(
     );
     defer allocator.free(limits_suffix);
     try buf.appendSlice(allocator, limits_suffix);
+}
+
+fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
+    return if (std.mem.eql(u8, resolved_task, "read"))
+        max_read_batch_images
+    else if (std.mem.eql(u8, resolved_task, "generate"))
+        max_generate_batch_items
+    else if (std.mem.eql(u8, resolved_task, "embed"))
+        64
+    else if (std.mem.eql(u8, resolved_task, "rewrite") or
+        std.mem.eql(u8, resolved_task, "classify") or
+        std.mem.eql(u8, resolved_task, "extract"))
+        max_serial_family_batch_items
+    else
+        1;
+}
+
+test "resolved capability item ceilings cover array-oriented model families" {
+    for ([_][]const u8{ "rewrite", "classify", "extract" }) |task|
+        try std.testing.expectEqual(max_serial_family_batch_items, resolvedTaskMaxItems(task));
+    try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("rerank"));
+    try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("transcribe"));
+    try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("chunk"));
 }
 
 test "standalone inference model catalog publishes resolved native reader batching" {
@@ -13959,9 +14169,10 @@ test "standalone inference model catalog publishes resolved native reader batchi
     }
     try std.testing.expect(found);
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 2), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
     try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
-    try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
 }
 
@@ -14029,6 +14240,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
         if (comptime std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/predictors")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
+            std.mem.eql(u8, path, "/classify") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/embed") or
             std.mem.eql(u8, path, "/embeddings") or
@@ -17214,8 +17426,8 @@ test "taskMatchesModelListing exposes extraction-capable models only as extracto
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
     try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
     try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
+    try std.testing.expect(taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
@@ -17948,6 +18160,25 @@ fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Inpu
         .binary => |binary| allocator.free(binary.data),
         .text => {},
     }
+}
+
+fn canonicalFixedChunkModel(raw: []const u8) ?[]const u8 {
+    if (raw.len == 0 or
+        std.mem.eql(u8, raw, "fixed") or
+        std.mem.eql(u8, raw, "fixed_bert") or
+        std.mem.eql(u8, raw, "fixed_bpe") or
+        std.mem.eql(u8, raw, "fixed-bert-tokenizer"))
+    {
+        return "fixed";
+    }
+    return null;
+}
+
+test "fixed chunk model aliases canonicalize and semantic models fail closed" {
+    for ([_][]const u8{ "", "fixed", "fixed_bert", "fixed_bpe", "fixed-bert-tokenizer" }) |alias| {
+        try std.testing.expectEqualStrings("fixed", canonicalFixedChunkModel(alias).?);
+    }
+    try std.testing.expect(canonicalFixedChunkModel("owner/semantic-chunker") == null);
 }
 
 fn chunkInputParseErrorMessage(err: anyerror) []const u8 {

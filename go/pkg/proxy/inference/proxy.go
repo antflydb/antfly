@@ -1156,6 +1156,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/rerank_multimodal", p.handleRerank)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
+	apiMux.HandleFunc("/ai/v1/classify", p.handleClassify)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
 	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
@@ -1232,6 +1233,10 @@ func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) handleRewrite(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rewrite")
+}
+
+func (p *Proxy) handleClassify(w http.ResponseWriter, r *http.Request) {
+	p.proxyRequest(w, r, "classify")
 }
 
 func (p *Proxy) handleTranscribe(w http.ResponseWriter, r *http.Request) {
@@ -1318,7 +1323,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				results <- catalogResult{err: err}
 				return
 			}
-			if authorization := p.registry.upstreamAuthorizationValue(); authorization != "" {
+			if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
 				request.Header.Set("Authorization", authorization)
 			}
 			response, err := p.registry.client.Do(request)
@@ -1548,6 +1553,11 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	if !aok || !bok || a["task"] != b["task"] {
 		return nil, false
 	}
+	aVersion, aok := inferenceCapabilitiesVersion(a)
+	bVersion, bok := inferenceCapabilitiesVersion(b)
+	if !aok || !bok {
+		return nil, false
+	}
 	aBatch, aok := a["batch"].(map[string]any)
 	bBatch, bok := b["batch"].(map[string]any)
 	if !aok || !bok {
@@ -1579,20 +1589,53 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		}
 		batch[field] = value
 	}
-	for _, field := range []string{"max_encoded_bytes", "max_decoded_pixels"} {
-		value, ok := conservativeOptionalLimit(aBatch[field], bBatch[field])
-		if !ok {
-			return nil, false
-		}
-		batch[field] = value
+	aEncodedField := "max_encoded_bytes"
+	bEncodedField := "max_encoded_bytes"
+	if aVersion >= 2 {
+		aEncodedField = "max_encoded_media_bytes"
 	}
+	if bVersion >= 2 {
+		bEncodedField = "max_encoded_media_bytes"
+	}
+	aEncoded, aFound := aBatch[aEncodedField]
+	bEncoded, bFound := bBatch[bEncodedField]
+	if !aFound || !bFound {
+		return nil, false
+	}
+	value, ok := conservativeOptionalLimit(aEncoded, bEncoded, aVersion < 2, bVersion < 2)
+	if !ok {
+		return nil, false
+	}
+	batch["max_encoded_media_bytes"] = value
+	aPixels, aFound := aBatch["max_decoded_pixels"]
+	bPixels, bFound := bBatch["max_decoded_pixels"]
+	if !aFound || !bFound {
+		return nil, false
+	}
+	value, ok = conservativeOptionalLimit(aPixels, bPixels, aVersion < 2, bVersion < 2)
+	if !ok {
+		return nil, false
+	}
+	batch["max_decoded_pixels"] = value
 	aFailures, aok := aBatch["per_item_failures"].(bool)
 	bFailures, bok := bBatch["per_item_failures"].(bool)
 	if !aok || !bok {
 		return nil, false
 	}
 	batch["per_item_failures"] = aFailures && bFailures
-	return map[string]any{"task": a["task"], "batch": batch}, true
+	return map[string]any{"version": float64(2), "task": a["task"], "batch": batch}, true
+}
+
+func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {
+	value, found := capabilities["version"]
+	if !found {
+		return 1, true
+	}
+	number, ok := nonNegativeInteger(value)
+	if !ok || number < 1 || number > 2 {
+		return 0, false
+	}
+	return int(number), true
 }
 
 func validBatchMode(mode string) bool {
@@ -1613,28 +1656,24 @@ func conservativePositiveLimit(left, right any) (float64, bool) {
 	return value, ok && value > 0
 }
 
-// Encoded-byte and decoded-pixel ceilings are nullable. Older nodes used zero
-// for unknown, so zero is accepted as the legacy spelling of null. A known
-// finite ceiling always survives intersection with an unknown value.
-func conservativeOptionalLimit(left, right any) (any, bool) {
-	a, aKnown, aok := optionalLimit(left)
-	b, bKnown, bok := optionalLimit(right)
+// Optional resource ceilings are nullable. Null means unknown and therefore
+// remains unknown when any eligible endpoint cannot prove a safe ceiling.
+// Only v1 used zero as an unknown sentinel; v2 preserves zero as disabled.
+func conservativeOptionalLimit(left, right any, leftZeroUnknown, rightZeroUnknown bool) (any, bool) {
+	a, aKnown, aok := optionalLimit(left, leftZeroUnknown)
+	b, bKnown, bok := optionalLimit(right, rightZeroUnknown)
 	if !aok || !bok {
 		return nil, false
 	}
 	switch {
 	case aKnown && bKnown:
 		return min(a, b), true
-	case aKnown:
-		return a, true
-	case bKnown:
-		return b, true
 	default:
 		return nil, true
 	}
 }
 
-func optionalLimit(value any) (float64, bool, bool) {
+func optionalLimit(value any, zeroUnknown bool) (float64, bool, bool) {
 	if value == nil {
 		return 0, false, true
 	}
@@ -1642,7 +1681,7 @@ func optionalLimit(value any) (float64, bool, bool) {
 	if !ok {
 		return 0, false, false
 	}
-	return number, number != 0, true
+	return number, !zeroUnknown || number != 0, true
 }
 
 func nonNegativeInteger(value any) (float64, bool) {
@@ -1830,6 +1869,20 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 }
 
 func proxyRequestModel(body []byte, operation string) (string, error) {
+	if operation == "chunk" {
+		var request struct {
+			Config *struct {
+				Model string `json:"model"`
+			} `json:"config"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return "", err
+		}
+		if request.Config == nil || strings.TrimSpace(request.Config.Model) == "" {
+			return "fixed", nil
+		}
+		return canonicalChunkModel(request.Config.Model), nil
+	}
 	if operation != "generate.batch" {
 		var request struct {
 			Model string `json:"model"`
@@ -1863,6 +1916,15 @@ func proxyRequestModel(body []byte, operation string) (string, error) {
 		}
 	}
 	return model, nil
+}
+
+func canonicalChunkModel(model string) string {
+	switch strings.TrimSpace(model) {
+	case "", "fixed", "fixed_bert", "fixed_bpe", "fixed-bert-tokenizer":
+		return "fixed"
+	default:
+		return strings.TrimSpace(model)
+	}
 }
 
 func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1978,11 +2040,21 @@ func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint,
 	outReq.RequestURI = ""
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
-	if authorization := p.registry.upstreamAuthorizationValue(); authorization != "" {
+	if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
 		outReq.Header.Set("Authorization", authorization)
 	}
 
 	return p.registry.client.Do(outReq)
+}
+
+// Use one authorization policy for both model discovery and execution. A
+// configured service credential takes precedence; otherwise the caller's
+// scoped credential is forwarded unchanged to both upstream operations.
+func (p *Proxy) upstreamAuthorizationForRequest(r *http.Request) string {
+	if configured := p.registry.upstreamAuthorizationValue(); configured != "" {
+		return configured
+	}
+	return strings.TrimSpace(r.Header.Get("Authorization"))
 }
 
 func (p *Proxy) recordProxyMetrics(pool, model, operation string, started time.Time, status string) {

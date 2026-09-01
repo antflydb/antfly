@@ -107,8 +107,8 @@ const InferenceCapabilities = struct {
         mode: enum { none, serial_compatibility, native },
         preferred_items: usize,
         max_items: usize,
-        // null means the executor has not published a hard ceiling.
-        max_encoded_bytes: ?usize,
+        // null = unknown/not published; zero = encoded media is disabled.
+        max_encoded_media_bytes: ?usize,
         max_decoded_pixels: ?u64,
         max_media_parts_per_item: usize,
         per_item_failures: bool,
@@ -130,7 +130,7 @@ model does not have. Compatibility serialization is reported as
 The local resolver and remote `/ai/v1/models` catalog use the same normalized
 native-batch flags. Manifests may lower the server defaults with
 `inference.batch.preferred_items=`, `inference.batch.max_items=`,
-`inference.batch.max_encoded_bytes=`,
+`inference.batch.max_encoded_media_bytes=`,
 `inference.batch.max_decoded_pixels=`, and
 `inference.batch.max_media_parts_per_item=` capabilities. Planning uses these
 values for window formation and every executor validates the concrete
@@ -184,7 +184,7 @@ observed execution reports without assuming completion order.
 
 The Go inference proxy exposes `GET /ai/v1/models` and the reader, generator,
 embedding, reranking (including multimodal), chunking, extraction, rewriting,
-and transcription surfaces. It routes a
+classification, and transcription surfaces. It routes a
 homogeneous bounded batch intact by its nested model identity and rejects
 mixed-model batches before forwarding. Refreshed endpoint inventory retains
 the advertised task for each model; selection and failover filter by both model
@@ -498,13 +498,15 @@ document. They are architectural requirements, not Florence-specific cleanup:
     operation-eligible endpoints in that scope and rejects a refresh if any
     candidate no longer advertises the requested model/task. Unscoped legacy
     listing remains pool-scoped rather than publishing a cluster-wide union.
-39. **Zero overloaded both an unknown limit and a real numeric value.** Encoded
-    byte and decoded-pixel limits are nullable in the normalized capability
-    contract. Proxy intersection treats legacy zero as unknown, preserves a
-    known finite ceiling when the other node is unknown, and emits null only
-    when every candidate is unknown. Inference nodes now publish their actual
-    aggregate decoded-pixel hard ceiling; dynamic admission may still be lower
-    when encoded media consumes the same request working set.
+39. **Zero overloaded both an unknown limit and a real numeric value.** Version
+    2 capability descriptors use null for unknown/not published and preserve
+    zero as a known disabled ceiling. The media field is named
+    `max_encoded_media_bytes`, because text and URL strings do not consume the
+    encoded-media budget. A v1 `max_encoded_bytes = 0` is translated only at
+    the legacy boundary. If any eligible endpoint has an unknown optional
+    ceiling, conservative intersection remains unknown; a known value cannot
+    safely describe a heterogeneous route that may select the unknown node.
+    Two known ceilings intersect by minimum, including zero.
 40. **A render-window deadline replaced its session cancellation owner.** PDF
     batch rendering now installs a stack-stable composite probe for the full
     synchronous render call. Preflight, worker gates, private Reader forks, and
@@ -514,12 +516,58 @@ document. They are architectural requirements, not Florence-specific cleanup:
     model families.** `Task`, typed output kinds, local/remote capability
     resolution, server descriptors, and proxy-scoped discovery now cover all
     nine current families: readers, generators, embedders, rerankers, chunkers,
-    extractors, rewriters, classifiers, and transcribers. Families without a
-    generic batch executor advertise `mode = none`, `max_items = 1`; they do
-    not borrow native-batch claims from another family. The proxy also forwards
-    rerank-multimodal, rewrite, and transcribe routes. Classification remains a
-    typed capability even where the public server exposes it through the
-    extraction surface.
+    extractors, rewriters, classifiers, and transcribers. Array-oriented
+    extract, rewrite, and classify executors advertise bounded
+    `serial_compatibility`; single-operation families advertise `mode = none`,
+    `max_items = 1`. No family borrows native-batch claims from another family.
+    The proxy also forwards rerank-multimodal, rewrite, classify, and transcribe
+    routes.
+42. **Chunk routing inspected the wrong model field and execution ignored the
+    selected model.** `/chunk` carries model identity in `config.model`, not the
+    request root. The proxy now extracts that nested identity and canonicalizes
+    legacy fixed aliases to `fixed`. The server advertises exactly the built-in
+    executor it can run, returns `fixed` in results, and rejects an unsupported
+    semantic model instead of silently executing the fixed tokenizer. A future
+    semantic chunker is added only when model resolution and a concrete direct
+    executor land together.
+43. **Classification was a descriptor without a routable operation.** The
+    inference OpenAPI and generated router now expose `POST /classify`; server
+    catalog discovery advertises classification-capable classifier or
+    extraction models; the distributed proxy routes and scopes the family as
+    `classifiers`; and linked execution has a typed classification call.
+44. **Several embedded model families stopped at catalog discovery.** Provider
+    ABI v22 adds typed chunk, rewrite, and classify operations alongside the
+    existing embed, rerank, generate, read, transcribe, and extract operations.
+    Linked providers wire all nine current task families to concrete server
+    executors. Descriptor presence is therefore no longer used as a substitute
+    for an executable callback.
+45. **Catalog and execution used different authorization identities.** Both
+    paths now use one policy: a configured upstream service credential wins;
+    otherwise the inbound Authorization value is forwarded. Scoped capability
+    discovery and the request it admits therefore observe the same upstream
+    identity. Background refreshes, which have no caller identity, continue to
+    require the configured service credential.
+46. **A byte ceiling mixed text with media.** Invocation shapes now count only
+    retained encoded attachment bytes against the model media limit. Text is
+    governed by tokenizer/request limits, and remote URLs are admitted after
+    download by the provider-owned request boundary. Inline binary PDF, image,
+    and audio attachments are charged before dispatch.
+47. **Array-oriented families advertised single-item execution.** Rewrite,
+    classify, and extract requests already carry multiple logical inputs. They
+    now publish a shared hard item ceiling and `serial_compatibility` rather
+    than `max_items = 1`; HTTP and direct/linked executors enforce the same
+    ceiling. This preserves batching across a distributed hop without claiming
+    native model batching where an implementation still loops safely under one
+    admitted model invocation. Rerank, chunk, and transcribe remain one logical
+    request item because their inner document/chunk/audio collections are part
+    of that operation's typed input rather than independent routed requests.
+48. **Durable chunk enrichment declared a callback but never invoked it.**
+    Configured chunk enrichment now projects the full embedded provider into a
+    borrowed, chunk-only descriptor and calls it through the checked native
+    boundary. The narrow descriptor avoids pulling generator, reader, and other
+    model-family dependencies into minimal embedded storage builds. Fixed
+    chunking remains the local fallback; a selected unsupported semantic model
+    still fails closed.
 
 ### Post-review implementation contract
 
@@ -567,13 +615,14 @@ The hardening above follows four long-term rules:
 2. **Implemented:** local reader batching is selected from resolved model
    capabilities. Native and serial-compatibility modes are distinct, and OCR
    profiling no longer labels an accepted serial batch as native.
-3. **Implemented:** provider ABI v21 separates borrowed binary payload storage
+3. **Implemented:** provider ABI v22 separates borrowed binary payload storage
    from logical attachment references. One generator item may own several
    attachments, while read and embedding batches retain independent item,
    source, and page identity. Reader, generator, and embedder host paths borrow
    the same representation; remote transports encode only at the HTTP
-   boundary. The version also makes nullable resource ceilings and the expanded
-   model-family task enum an explicit host/component compatibility boundary.
+   boundary. The version also makes capability v2 media-limit semantics and
+   executable chunk, rewrite, and classification operations an explicit
+   host/component compatibility boundary.
 4. **Implemented:** document OCR selects `reader` or `generator` explicitly.
    The generation batch endpoint accepts bounded multimodal requests and uses
    controlled serial execution for projector/session safety until a resolved

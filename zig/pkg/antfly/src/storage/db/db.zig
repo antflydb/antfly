@@ -574,6 +574,7 @@ fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Co
         producer.deinit(alloc);
         cfg.asset_producer = null;
     }
+    cfg.chunk_provider = null;
 }
 
 pub const HAAsyncEffectMirror = struct {

@@ -155,6 +155,17 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Classify text with a resolved classifier model
+    /// POST /ai/v1/classify
+    pub fn classifyText(self: *@This(), body: types.InferenceClassifyRequest) !ApiResponse(types.InferenceClassifyResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/classify", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceClassifyResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Create embeddings (alias of `/embeddings`)
     /// POST /ai/v1/embed
     pub fn generateEmbeddings(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {

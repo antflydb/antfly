@@ -21,15 +21,38 @@ const Chunk = chunk_mod.Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
+const chunk_provider = @import("provider.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 const Allocator = std.mem.Allocator;
+
+const ChunkInputFn = *const fn (
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+) anyerror![]inference_chunker.Chunk;
+const ChunkProviderVTable = struct {
+    chunk_input: ?ChunkInputFn = null,
+};
+const ChunkProviderBoundary = runtime_callback_abi.Boundary(ChunkProviderVTable);
 
 pub const RemoteChunk = inference_chunker.Chunk;
 pub const RemoteInput = inference_chunker.Input;
 pub const RemoteBinaryInput = inference_chunker.BinaryInput;
 
 pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8) ![]Chunk {
-    const shared_chunks = try chunkInput(alloc, cfg, .{ .text = text });
+    return try chunkTextWithProvider(alloc, cfg, text, null);
+}
+
+pub fn chunkTextWithProvider(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    text: []const u8,
+    antfly_provider: ?chunk_provider.Provider,
+) ![]Chunk {
+    const shared_chunks = try chunkInputWithProvider(alloc, cfg, .{ .text = text }, antfly_provider);
     defer freeRemoteChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
@@ -63,6 +86,21 @@ pub fn chunkBinary(alloc: Allocator, cfg: chunking_types.Config, mime_type: []co
 }
 
 pub fn chunkInput(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
+    return try chunkInputWithProvider(alloc, cfg, input, null);
+}
+
+pub fn chunkInputWithProvider(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    input: RemoteInput,
+    antfly_provider: ?chunk_provider.Provider,
+) ![]RemoteChunk {
+    if (cfg.api_url.len == 0) if (antfly_provider) |provider| {
+        const chunk_input: ChunkInputFn = @ptrCast(@alignCast(provider.chunk_input_callback));
+        const chunks = try ChunkProviderBoundary.call("chunk_input", provider.boundary_dispatch, chunk_input, .{ provider.ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
+        defer inference_chunker.types.freeChunks(alloc, chunks);
+        return try cloneRemoteChunks(alloc, chunks);
+    };
     if (cfg.api_url.len == 0) return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
 
@@ -106,7 +144,6 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
     var initialized: usize = 0;
     errdefer {
         for (chunks[0..initialized]) |*chunk| {
-            alloc.free(@constCast(chunk.mime_type));
             chunk.deinit(alloc);
         }
         alloc.free(chunks);
@@ -124,6 +161,7 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
             .end_time_ms = chunk.end_time_ms,
             .frame_index = chunk.frame_index,
             .frame_delay_ms = chunk.frame_delay_ms,
+            .owns_mime_type = true,
             .owns_text = chunk.text != null,
             .owns_data = chunk.data != null,
         };
@@ -133,10 +171,7 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
 }
 
 pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
-    for (chunks) |*chunk| {
-        alloc.free(@constCast(chunk.mime_type));
-        chunk.deinit(alloc);
-    }
+    for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);
 }
 
@@ -220,13 +255,12 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             .end_time_ms = chunk.end_time_ms,
             .frame_index = if (chunk.frame_index) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
             .frame_delay_ms = if (chunk.frame_delay_ms) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .owns_mime_type = true,
             .owns_text = false,
             .owns_data = false,
         };
         errdefer {
-            if (out.mime_type.len > 0) alloc.free(@constCast(out.mime_type));
-            if (out.owns_text and out.text != null) alloc.free(out.text.?);
-            if (out.owns_data and out.data != null) alloc.free(out.data.?);
+            out.deinit(alloc);
         }
         if (chunk.text) |value| {
             out.text = try alloc.dupe(u8, value);
@@ -464,4 +498,47 @@ test "antfly chunker local path preserves explicit zero overlap when target is s
 
     try std.testing.expect(chunks.len > 0);
     try std.testing.expect(chunks[0].text != null);
+}
+
+test "antfly chunker uses the embedded provider executor when available" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn chunk(
+            ptr: *anyopaque,
+            result_alloc: Allocator,
+            model: []const u8,
+            input: inference_chunker.Input,
+            _: chunking_types.Config,
+        ) ![]inference_chunker.Chunk {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("fixed", model);
+            try std.testing.expectEqualStrings("provider input", input.text);
+            const out = try result_alloc.alloc(inference_chunker.Chunk, 1);
+            out[0] = .{
+                .id = 0,
+                .mime_type = try result_alloc.dupe(u8, "text/plain"),
+                .text = try result_alloc.dupe(u8, "provider output"),
+                .owns_mime_type = true,
+                .owns_text = true,
+            };
+            return out;
+        }
+    };
+    var fake = Fake{};
+    const provider = chunk_provider.Provider{
+        .ptr = &fake,
+        .boundary_dispatch = ChunkProviderBoundary.local_dispatch,
+        .chunk_input_callback = @ptrCast(&Fake.chunk),
+    };
+    const cfg = chunking_types.Config{ .provider = .antfly, .model = "fixed" };
+    const chunks = try chunkTextWithProvider(alloc, cfg, "provider input", provider);
+    defer {
+        for (chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("provider output", chunks[0].text.?);
 }

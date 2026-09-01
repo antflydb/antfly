@@ -444,16 +444,15 @@ fn jsonCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !usize {
     return std.math.cast(usize, value.integer) orelse error.InvalidInferenceCapabilities;
 }
 
-fn jsonOptionalCapabilityUsize(object: std.json.ObjectMap, name: []const u8) !?usize {
+fn jsonOptionalCapabilityUsize(object: std.json.ObjectMap, name: []const u8, zero_is_unknown: bool) !?usize {
     const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
     if (value == .null) return null;
     if (value != .integer or value.integer < 0) return error.InvalidInferenceCapabilities;
     const number = std.math.cast(usize, value.integer) orelse return error.InvalidInferenceCapabilities;
-    // Accept zero from pre-nullability servers as the legacy unknown sentinel.
-    return if (number == 0) null else number;
+    return if (zero_is_unknown and number == 0) null else number;
 }
 
-fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities {
+fn parseResolvedBatchCapabilities(value: std.json.Value, version: usize) !work.BatchCapabilities {
     if (value != .object) return error.InvalidInferenceCapabilities;
     const mode_value = value.object.get("mode") orelse return error.InvalidInferenceCapabilities;
     if (mode_value != .string) return error.InvalidInferenceCapabilities;
@@ -471,8 +470,11 @@ fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities
         .mode = mode,
         .preferred_items = try jsonCapabilityUsize(value.object, "preferred_items"),
         .max_items = try jsonCapabilityUsize(value.object, "max_items"),
-        .max_encoded_bytes = try jsonOptionalCapabilityUsize(value.object, "max_encoded_bytes"),
-        .max_decoded_pixels = try jsonOptionalCapabilityUsize(value.object, "max_decoded_pixels"),
+        .max_encoded_media_bytes = if (version >= 2)
+            try jsonOptionalCapabilityUsize(value.object, "max_encoded_media_bytes", false)
+        else
+            try jsonOptionalCapabilityUsize(value.object, "max_encoded_bytes", true),
+        .max_decoded_pixels = try jsonOptionalCapabilityUsize(value.object, "max_decoded_pixels", version < 2),
         .max_media_parts_per_item = try jsonCapabilityUsize(value.object, "max_media_parts_per_item"),
         .per_item_failures = per_item_value.bool,
     };
@@ -481,11 +483,16 @@ fn parseResolvedBatchCapabilities(value: std.json.Value) !work.BatchCapabilities
 fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?work.BatchCapabilities {
     const value = info.get("inference_capabilities") orelse return null;
     if (value != .object) return error.InvalidInferenceCapabilities;
+    const version: usize = if (value.object.get("version")) |version_value| blk: {
+        if (version_value != .integer or version_value.integer < 1) return error.InvalidInferenceCapabilities;
+        break :blk std.math.cast(usize, version_value.integer) orelse return error.InvalidInferenceCapabilities;
+    } else 1;
+    if (version > 2) return error.UnsupportedInferenceCapabilitiesVersion;
     const task_value = value.object.get("task") orelse return error.InvalidInferenceCapabilities;
     if (task_value != .string or !std.mem.eql(u8, task_value.string, @tagName(task)))
         return error.InvalidInferenceCapabilities;
     const batch_value = value.object.get("batch") orelse return error.InvalidInferenceCapabilities;
-    const batch = try parseResolvedBatchCapabilities(batch_value);
+    const batch = try parseResolvedBatchCapabilities(batch_value, version);
     try batch.validate();
     return batch;
 }
@@ -546,7 +553,7 @@ pub fn parseModelCapabilities(
             .mode = .none,
             .preferred_items = 1,
             .max_items = 1,
-            .max_encoded_bytes = null,
+            .max_encoded_media_bytes = null,
             .max_decoded_pixels = null,
             .max_media_parts_per_item = if (modalities.image or modalities.audio) 1 else 0,
             .per_item_failures = false,
@@ -695,6 +702,7 @@ test "remote Antfly model catalog URL normalizes service and operation URLs" {
         "generate/batch",
         "chat/completions",
         "rewrite",
+        "classify",
         "transcribe",
     }) |operation| {
         const operation_url = try std.fmt.allocPrint(std.testing.allocator, "http://localhost:8082/ai/v1/{s}", .{operation});
@@ -717,8 +725,17 @@ test "remote Antfly capability parser maps legacy zero and explicit null to unkn
         \\{"readers":{"florence":{"inputs":["image"],"inference_capabilities":{"task":"read","batch":{"mode":"native","preferred_items":2,"max_items":4,"max_encoded_bytes":null,"max_decoded_pixels":0,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
     ;
     const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "florence", .read)).?;
-    try std.testing.expectEqual(@as(?usize, null), capabilities.batch.max_encoded_bytes);
+    try std.testing.expectEqual(@as(?usize, null), capabilities.batch.max_encoded_media_bytes);
     try std.testing.expectEqual(@as(?u64, null), capabilities.batch.max_decoded_pixels);
+}
+
+test "remote Antfly capability v2 preserves disabled media and pixel limits" {
+    const payload =
+        \\{"generators":{"text-only":{"inputs":["text"],"inference_capabilities":{"version":2,"task":"generate","batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":0,"max_decoded_pixels":0,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "text-only", .generate)).?;
+    try std.testing.expectEqual(@as(?usize, 0), capabilities.batch.max_encoded_media_bytes);
+    try std.testing.expectEqual(@as(?u64, 0), capabilities.batch.max_decoded_pixels);
 }
 
 test "remote Antfly capability single-flight wait observes deadline and cancellation" {

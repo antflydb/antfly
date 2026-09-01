@@ -154,6 +154,20 @@ pub const AntflyProvider = struct {
         input: inference_chunker.Input,
         config: chunking_types.Config,
     ) anyerror![]inference_chunker.Chunk = null,
+    /// The result slice and every returned string are owned by `alloc`.
+    rewrite_texts: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        inputs: []const []const u8,
+    ) anyerror![][]const u8 = null,
+    /// The outer slice, every row, and every score label are owned by `alloc`.
+    classify_texts: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: ClassificationRequest,
+    ) anyerror![]const []const ClassificationScore = null,
     transcribe_audio: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -190,6 +204,31 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
     ) anyerror![]u8 = null,
 };
+
+pub const ClassificationRequest = struct {
+    texts: []const []const u8,
+    labels: []const []const u8,
+    hypothesis_template: ?[]const u8 = null,
+    multi_label: bool = false,
+};
+
+pub const ClassificationScore = struct {
+    label: []const u8,
+    score: f32,
+};
+
+pub fn deinitRewrittenTexts(alloc: std.mem.Allocator, texts: []const []const u8) void {
+    for (texts) |text| alloc.free(text);
+    alloc.free(texts);
+}
+
+pub fn deinitClassificationScores(alloc: std.mem.Allocator, results: []const []const ClassificationScore) void {
+    for (results) |row| {
+        for (row) |score| alloc.free(score.label);
+        alloc.free(row);
+    }
+    alloc.free(results);
+}
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
@@ -4077,10 +4116,8 @@ fn validateDensePartItemInvocation(
 ) !void {
     var shape = inference_work.InvocationShape{ .item_count = items.len };
     for (items) |item| switch (item) {
-        .text => |text| {
+        .text => {
             mergeModalities(&shape.modalities, .{ .text = true });
-            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, text.len) catch
-                return error.InferenceEncodedBytesExceeded;
             try capabilities.validateMimeType("text/plain");
         },
         .media_url => {
@@ -4093,7 +4130,7 @@ fn validateDensePartItemInvocation(
         .binary => |media| {
             mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
             try capabilities.validateMimeType(media.mime_type);
-            shape.encoded_bytes = std.math.add(usize, shape.encoded_bytes, media.data.len) catch
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
                 return error.InferenceEncodedBytesExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
@@ -4108,23 +4145,23 @@ fn densePartBatchEnd(
 ) !usize {
     if (start >= items.len) return start;
     const max_items = capabilities.batch.max_items;
-    var encoded_bytes: usize = 0;
+    var encoded_media_bytes: usize = 0;
     var end = start;
     while (end < items.len and end - start < max_items) : (end += 1) {
         const item_bytes: usize = switch (items[end]) {
-            .text => |value| value.len,
+            .text => 0,
             .binary => |value| value.data.len,
             .media_url => 0,
         };
-        const next_bytes = std.math.add(usize, encoded_bytes, item_bytes) catch
+        const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
             return error.InferenceEncodedBytesExceeded;
-        if (capabilities.batch.max_encoded_bytes) |limit| {
+        if (capabilities.batch.max_encoded_media_bytes) |limit| {
             if (next_bytes > limit) {
                 if (end == start) return error.InferenceEncodedBytesExceeded;
                 break;
             }
         }
-        encoded_bytes = next_bytes;
+        encoded_media_bytes = next_bytes;
     }
     return end;
 }

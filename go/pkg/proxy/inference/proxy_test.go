@@ -1579,7 +1579,53 @@ func TestCatalogTaskScopesCoverEveryRoutableModelFamily(t *testing.T) {
 	}
 }
 
-func TestConservativeCapabilitiesPreserveKnownOptionalLimits(t *testing.T) {
+func TestProxyRequestModelReadsAndCanonicalizesChunkConfig(t *testing.T) {
+	for _, test := range []struct {
+		body string
+		want string
+	}{
+		{`{"input":"hello"}`, "fixed"},
+		{`{"input":"hello","config":{"model":"fixed-bert-tokenizer"}}`, "fixed"},
+		{`{"input":"hello","config":{"model":"owner/semantic-chunker"}}`, "owner/semantic-chunker"},
+	} {
+		got, err := proxyRequestModel([]byte(test.body), "chunk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != test.want {
+			t.Fatalf("model = %q, want %q", got, test.want)
+		}
+	}
+}
+
+func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
+	const caller = "Bearer caller-token"
+	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Authorization"); got != caller {
+			t.Fatalf("Authorization = %q, want %q", got, caller)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"classifiers":{"owner/classifier":{"inputs":["text"]}}}`)),
+			Request:    req,
+		}, nil
+	})}
+	p.RegisterEndpoint("http://classifier.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://classifier.internal", map[string]map[OperationType]bool{
+		"owner/classifier": {"classify": true},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Fclassifier&task=classify", nil)
+	request.Header.Set("Authorization", caller)
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestConservativeCapabilitiesDoNotOverpromiseAcrossUnknownLimits(t *testing.T) {
 	left := map[string]any{
 		"task": "read",
 		"batch": map[string]any{
@@ -1601,8 +1647,35 @@ func TestConservativeCapabilitiesPreserveKnownOptionalLimits(t *testing.T) {
 		t.Fatal("capabilities did not merge")
 	}
 	batch := merged["batch"].(map[string]any)
-	if batch["max_encoded_bytes"] != float64(1024) || batch["max_decoded_pixels"] != float64(2048) {
-		t.Fatalf("known optional limits were discarded: %#v", batch)
+	if batch["max_encoded_media_bytes"] != nil || batch["max_decoded_pixels"] != nil {
+		t.Fatalf("unknown optional limits were over-promised: %#v", batch)
+	}
+}
+
+func TestConservativeCapabilitiesV2PreservesDisabledLimit(t *testing.T) {
+	left := map[string]any{
+		"version": float64(2), "task": "generate",
+		"batch": map[string]any{
+			"mode": "none", "preferred_items": float64(1), "max_items": float64(1),
+			"max_encoded_media_bytes": float64(0), "max_decoded_pixels": float64(0),
+			"max_media_parts_per_item": float64(0), "per_item_failures": false,
+		},
+	}
+	right := map[string]any{
+		"version": float64(2), "task": "generate",
+		"batch": map[string]any{
+			"mode": "none", "preferred_items": float64(1), "max_items": float64(1),
+			"max_encoded_media_bytes": float64(1024), "max_decoded_pixels": float64(2048),
+			"max_media_parts_per_item": float64(0), "per_item_failures": false,
+		},
+	}
+	merged, ok := conservativeInferenceCapabilities(left, right)
+	if !ok {
+		t.Fatal("capabilities did not merge")
+	}
+	batch := merged["batch"].(map[string]any)
+	if batch["max_encoded_media_bytes"] != float64(0) || batch["max_decoded_pixels"] != float64(0) {
+		t.Fatalf("disabled v2 limits were lost: %#v", batch)
 	}
 }
 

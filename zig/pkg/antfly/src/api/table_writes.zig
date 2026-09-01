@@ -26372,6 +26372,7 @@ const ManagedDbEnrichmentSet = struct {
     dense: ?db_embedder.DenseEmbedder = null,
     sparse: ?db_embedder.SparseEmbedder = null,
     asset_runtime: ?*asset_producer_runtime.Runtime = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     generated: bool = false,
 
     fn deinit(self: @This(), allocator: std.mem.Allocator) void {
@@ -26392,6 +26393,7 @@ const ManagedDbEnrichmentSet = struct {
             .dense_embedder = self.dense,
             .sparse_embedder = self.sparse,
             .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+            .chunk_provider = chunkProviderFromAntflyProvider(self.antfly_provider),
             .enable_without_producers = self.generated,
         };
     }
@@ -26400,6 +26402,7 @@ const ManagedDbEnrichmentSet = struct {
         self.dense = null;
         self.sparse = null;
         self.asset_runtime = null;
+        self.antfly_provider = null;
         self.generated = false;
     }
 
@@ -26409,6 +26412,16 @@ const ManagedDbEnrichmentSet = struct {
         return owned;
     }
 };
+
+fn chunkProviderFromAntflyProvider(provider: ?managed_embedder.AntflyProvider) ?db_mod.enrichment_runtime.ChunkProvider {
+    const resolved = provider orelse return null;
+    const callback = resolved.chunk_input orelse return null;
+    return .{
+        .ptr = resolved.ptr,
+        .boundary_dispatch = resolved.boundary_dispatch,
+        .chunk_input_callback = @ptrCast(callback),
+    };
+}
 
 fn createManagedDbEnrichments(
     allocator: std.mem.Allocator,
@@ -26439,6 +26452,7 @@ fn createManagedDbEnrichments(
         .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
         .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
         .asset_runtime = asset_runtime,
+        .antfly_provider = local_provider,
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };
 }
