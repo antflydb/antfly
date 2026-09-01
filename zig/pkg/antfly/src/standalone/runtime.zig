@@ -2246,7 +2246,7 @@ pub fn runFromIterator(
         // embedded provider. Drain them while the node is valid, then release
         // tokenizer reservations while DataServer's ResourceManager is valid.
         // The earlier data_server.deinit defer performs final storage teardown.
-        data_server.quiesceBackgroundWorkWithDeadline(supervisor.deadline());
+        data_server.quiesceExternalProviderUsersWithDeadline(supervisor.deadline());
         if (comptime inline_inference_codegen)
             inference_host.linkedInferenceDestroy(antfly_node)
         else

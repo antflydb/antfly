@@ -4963,6 +4963,7 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_thread: ?std.Thread = null,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     background_work_quiesced: bool = false,
+    external_provider_users_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_target_group_id: u64 = 0,
     provisioned_startup_catch_up_target_table_name: ?[]u8 = null,
@@ -7047,6 +7048,24 @@ pub const DataServer = struct {
         self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
     }
 
+    /// Stop and join every activity that can retain an externally owned
+    /// provider. This is a stronger barrier than quiesceBackgroundWork: cached
+    /// DBs own autonomous enrichment workers and therefore must be closed
+    /// before the provider's model manager or callback context is destroyed.
+    /// Resource accounting remains alive until normal DataServer teardown.
+    pub fn quiesceExternalProviderUsersWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        if (self.external_provider_users_quiesced) return;
+        self.quiesceBackgroundWorkWithDeadline(deadline);
+        self.write_source.quiesce();
+        if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
+        self.provisioned_storage.detachWriteSourceRuntimeHooks();
+        self.provisioned_storage.quiesceExternalProviderUsers();
+        self.external_provider_users_quiesced = true;
+    }
+
     pub fn publicListenerFailure(self: *const DataServer) ?anyerror {
         return if (self.listener) |listener| listener.runtimeFailure() else null;
     }
@@ -7059,7 +7078,7 @@ pub const DataServer = struct {
         self: *DataServer,
         deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
     ) void {
-        self.quiesceBackgroundWorkWithDeadline(deadline);
+        self.quiesceExternalProviderUsersWithDeadline(deadline);
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();

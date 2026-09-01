@@ -6667,6 +6667,7 @@ pub fn build(b: *std.Build) void {
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
+            "provider shutdown barrier closes cached dbs and remains idempotent",
             "writer cache metric pin batch release compacts retired entries once",
             "writer cache bulk transition fences only its table",
             "db runtime relabel cannot reuse cached index serviceability",

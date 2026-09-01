@@ -2171,21 +2171,35 @@ pub const ProvisionedTableWriteCache = struct {
         return .{ .alloc = alloc };
     }
 
-    pub fn deinit(self: *ProvisionedTableWriteCache) void {
+    /// Close every resident DB while preserving the cache allocation itself.
+    /// The storage owner uses this as a provider-lifetime barrier: after all
+    /// source and HTTP work is quiescent, DB.close joins enrichment workers so
+    /// an embedded provider can be destroyed without racing an in-flight call.
+    /// The caller owns the shared cache state mutex when one is bound.
+    pub fn closeAllDbsLocked(self: *ProvisionedTableWriteCache) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
         for (self.entries.items) |entry| {
             entry.deinit(self.alloc, self.backend_runtime);
             self.alloc.destroy(entry);
         }
-        self.entries.deinit(self.alloc);
+        self.entries.clearRetainingCapacity();
         for (self.retired_entries.items) |entry| {
             entry.deinit(self.alloc, self.backend_runtime);
             self.alloc.destroy(entry);
         }
-        self.retired_entries.deinit(self.alloc);
+        self.retired_entries.clearRetainingCapacity();
         for (self.closing_entries.items) |entry| {
             entry.deinit(self.alloc, self.backend_runtime);
             self.alloc.destroy(entry);
         }
+        self.closing_entries.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *ProvisionedTableWriteCache) void {
+        self.closeAllDbsLocked();
+        self.entries.deinit(self.alloc);
+        self.retired_entries.deinit(self.alloc);
         self.closing_entries.deinit(self.alloc);
         for (self.table_metadata.items) |*metadata| metadata.deinit(self.alloc);
         self.table_metadata.deinit(self.alloc);
@@ -11295,7 +11309,13 @@ pub const ProvisionedTableWriteSource = struct {
         const repair_uses_live_writer = metadata.advance_index_repairs and managed_owner_is_live_writer;
         var live_broad_recovery = false;
         if (repair_uses_live_writer) {
-            live_broad_recovery = try managedDbHasBroadCatchUpDebt(alloc, db);
+            // Missing generated coverage is converted to exact, durable
+            // index-repair intent under the exclusive phase below. It needs
+            // that phase once for seeding, but must stop counting as broad
+            // debt afterwards or the repair lane can never consume the intent.
+            const generated_coverage_handoff = try managedDbNeedsGeneratedCoverageReplay(alloc, db);
+            live_broad_recovery = generated_coverage_handoff or
+                try managedDbHasNonRepairCatchUpDebt(alloc, db);
             if (live_broad_recovery) {
                 // Broad recovery must exclude readers, but the live repair
                 // admission above deliberately allows them. Drop that guard
@@ -11373,7 +11393,7 @@ pub const ProvisionedTableWriteSource = struct {
                     result.busy = true;
                     result.index_repair_pending = true;
                 }
-            } else if (try managedDbHasBroadCatchUpDebt(alloc, db)) {
+            } else if (try managedDbHasNonRepairCatchUpDebt(alloc, db)) {
                 // Keep the exact route alive even if its original index intent
                 // completed concurrently. With a resident writer this same
                 // owner is the only path that can continue broad recovery.
@@ -11430,7 +11450,7 @@ pub const ProvisionedTableWriteSource = struct {
         );
         result.automatic_index_repair_discovery_pending = final_automatic_discovery_pending;
         const final_restore_repair_needed = try db.restoreRuntimeRepairNeeded();
-        const final_broad_debt = metadata.advance_index_repairs and try managedDbHasBroadCatchUpDebt(alloc, db);
+        const final_broad_debt = metadata.advance_index_repairs and try managedDbHasNonRepairCatchUpDebt(alloc, db);
         result.index_repair_paused = false;
         result.terminal_degraded = false;
         if (final_restore_repair_needed and final_index_load_failure) {
@@ -21387,7 +21407,7 @@ test "resident writer repair state distinguishes clean and metadata-pending writ
     {
         var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
         defer cached.deinit(alloc);
-        try std.testing.expect(try managedDbHasBroadCatchUpDebt(alloc, cached.db));
+        try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
         const repaired = try catchUpManagedDb(
             &source,
             alloc,
@@ -25473,7 +25493,12 @@ test "startup generated coverage replay uses terminal source outcomes rather tha
     try std.testing.expect(generatedIndexCoverageNeedsReplay(unknown_identity, 10_000));
 }
 
-fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+/// Debt that must retain the group-exclusive catch-up owner instead of being
+/// advanced by the read-compatible, index-scoped repair lane. Generated
+/// coverage is intentionally absent: catchUpManagedDb converts it to exact
+/// durable repair intents while it owns the exclusive seeding phase, after
+/// which the bounded repair scheduler owns progress.
+fn managedDbHasNonRepairCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
     const replay_debt = try db.listDerivedReplayDebt(alloc);
     defer {
         for (replay_debt) |*status| status.deinit(alloc);
@@ -25486,7 +25511,6 @@ fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool 
     if (pending_work.repair_metadata_rebuild_pending) return true;
     const enrichment = pending_work.enrichment;
     if (enrichment.enabled and enrichment.applied_sequence < enrichment.target_sequence) return true;
-    if (try managedDbNeedsGeneratedCoverageReplay(alloc, db)) return true;
     if (try db.restoreRuntimeRepairNeeded()) return true;
     return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
@@ -34394,6 +34418,34 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(initial_cache_stats.miss_count + 1, refreshed_cache_stats.miss_count);
     try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
     try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
+}
+
+test "provider shutdown barrier closes cached dbs and remains idempotent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provider-shutdown-cache-barrier",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var cache = ProvisionedTableWriteCache.init(alloc);
+    defer cache.deinit();
+    var opened: ?db_mod.DB = try db_mod.DB.open(alloc, path, .{});
+    defer if (opened) |*db| db.close();
+    try cache.seedCreatedDbLocked(&opened, 7001, 0, "docs", "{}", "{}");
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    cache.closeAllDbsLocked();
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
+
+    // Standalone explicitly executes this barrier before normal DataServer
+    // teardown, whose cache deinit reaches it again.
+    cache.closeAllDbsLocked();
 }
 
 test "provisioned transition writer fences exact supplied table metadata" {
@@ -43727,7 +43779,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
         cached.db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
     _ = try ReplaySeed.appendDenseReplay(alloc, cached.db, "doc:a", "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}", &[_]f32{ 1, 0 });
-    try std.testing.expect(try managedDbHasBroadCatchUpDebt(alloc, cached.db));
+    try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
     var queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
         .target = .index,
         .artifact_kind = .embedding,
@@ -43772,7 +43824,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     try std.testing.expect(!try cached.db.hasPendingIndexRepairIntents(alloc));
     var repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
-    try std.testing.expect(!try managedDbHasBroadCatchUpDebt(alloc, cached.db));
+    try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
 
     var search = try cached.db.search(alloc, .{
         .index_name = "dense_idx",

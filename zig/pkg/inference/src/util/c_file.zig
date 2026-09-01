@@ -24,6 +24,12 @@ const build_options = @import("build_options");
 
 pub const link_libc = build_options.link_libc;
 
+/// This advisory-I/O implementation is currently enabled only on Linux;
+/// Darwin does not export `posix_fadvise`. Keep capability selection in one
+/// compile-time constant so another libc target cannot accidentally retain an
+/// unresolved reference.
+pub const supports_posix_file_advice = build_options.link_libc and builtin.os.tag == .linux;
+
 pub const c = if (build_options.link_libc) PosixC else struct {};
 
 const PosixC = struct {
@@ -179,8 +185,7 @@ pub const MmapRegion = struct {
     /// advisory Linux optimization and deliberately cannot fail allocation or
     /// inference when a kernel/filesystem declines either hint.
     pub fn discardFileRange(self: *MmapRegion, offset: usize, len: usize) void {
-        if (!comptime build_options.link_libc) return;
-        if (comptime builtin.os.tag != .linux) return;
+        if (comptime !supports_posix_file_advice) return;
         if (offset >= self.data.len or len == 0) return;
 
         const clamped_len = @min(len, self.data.len - offset);
@@ -210,11 +215,11 @@ pub const MmapRegion = struct {
         // envelope even though the evicted model owns no live memory. Both
         // hints are best effort and affect only clean file-backed pages:
         // anonymous, dirty, writeback, and still-shared pages remain charged.
-        if (self.discard_on_deinit and comptime build_options.link_libc and builtin.os.tag == .linux) {
+        if (self.discard_on_deinit and comptime supports_posix_file_advice) {
             advise(self.data.ptr, mapped_len, .dont_need);
         }
         std.posix.munmap(self.data);
-        if (self.discard_on_deinit and comptime build_options.link_libc and builtin.os.tag == .linux) {
+        if (self.discard_on_deinit and comptime supports_posix_file_advice) {
             _ = c.posix_fadvise(
                 fd,
                 0,
@@ -437,8 +442,7 @@ fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
 pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, no_reuse };
 
 pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
-    if (!comptime build_options.link_libc) return;
-    if (comptime builtin.os.tag != .linux) return;
+    if (comptime !supports_posix_file_advice) return;
     const path_z = allocator.dupeZ(u8, path) catch return;
     defer allocator.free(path_z);
     const fd = openReadOnlyZ(path_z) catch return;
@@ -468,8 +472,7 @@ pub fn prefetchFile(
     path: []const u8,
     requested_workers: u8,
 ) !FilePrefetchResult {
-    if (!comptime build_options.link_libc or builtin.os.tag != .linux)
-        return error.UnsupportedPlatform;
+    if (comptime !supports_posix_file_advice) return error.UnsupportedPlatform;
     const workers: usize = std.math.clamp(@as(usize, requested_workers), 1, 8);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);

@@ -69236,7 +69236,11 @@ test "db managed dense enrichment remains searchable after transient rate limits
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var gated = GateDenseEmbedder{ .allowed_successes = .init(std.math.maxInt(usize)) };
+    // Admit the first request, then force the worker through the real
+    // retryable-provider path until this test explicitly releases the gate.
+    // Keeping this at the gate's default is part of the test contract: an
+    // always-open provider would bypass transient recovery entirely.
+    var gated = GateDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
