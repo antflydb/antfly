@@ -12023,6 +12023,16 @@ pub const DB = struct {
         };
         defer state.deinit(alloc);
 
+        try self.refreshIndexRepairAvailabilityForIndexFromState(alloc, index_name, &state, pinned_read_generation);
+    }
+
+    fn refreshIndexRepairAvailabilityForIndexFromState(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        state: *const index_repair_state.State,
+        pinned_read_generation: bool,
+    ) !void {
         // A checkpoint from another root generation is not authority to clear
         // this generation's gate. Startup/root-transition repair owns it.
         if (state.identity.root_generation != self.core.root_generation) return;
@@ -25681,19 +25691,57 @@ pub const DB = struct {
         };
     }
 
-    /// Project the exact O(1) predicate used by query admission. Presence alone
-    /// is insufficient because managed admission installs a gated empty dense
-    /// generation before its first safe snapshot; cardinality is insufficient
-    /// because a published empty snapshot is valid and searchable.
-    fn vectorServingSnapshotReady(self: *DB, kind: types.IndexKind, index_name: []const u8) bool {
+    const ResidentIndexAdmission = enum {
+        admitted,
+        rebuilding,
+        unavailable,
+    };
+
+    /// Observe the resident admission gate used by both query dispatch and
+    /// status. Revalidate only a closed repair gate: healthy observations stay
+    /// allocation-free and O(1), while a gate whose durable intent was removed
+    /// heals without requiring a user query to make status truthful.
+    fn observeResidentIndexAdmission(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        preloaded_repair_state: ?*const index_repair_state.State,
+    ) ResidentIndexAdmission {
+        if (self.core.index_manager.repairUnavailable(index_name)) {
+            if (preloaded_repair_state) |state| {
+                self.refreshIndexRepairAvailabilityForIndexFromState(
+                    alloc,
+                    index_name,
+                    state,
+                    openModeRequiresReadOnlyBackends(self.open_mode),
+                ) catch return .rebuilding;
+            } else {
+                self.refreshIndexRepairAvailabilityForIndex(alloc, index_name) catch return .rebuilding;
+            }
+            if (self.core.index_manager.repairUnavailable(index_name)) return .rebuilding;
+        }
+        if (self.core.index_manager.loadFailure(index_name) != null) return .unavailable;
+        return .admitted;
+    }
+
+    /// Project exact resident query admission. Presence alone is insufficient
+    /// because managed admission installs a gated empty generation before its
+    /// first safe snapshot; cardinality is insufficient because a published
+    /// empty snapshot is valid and searchable.
+    fn vectorServingSnapshotReady(
+        self: *DB,
+        alloc: Allocator,
+        kind: types.IndexKind,
+        index_name: []const u8,
+        preloaded_repair_state: ?*const index_repair_state.State,
+    ) bool {
         const installed = switch (kind) {
             .dense_vector => self.core.denseIndex(index_name) != null,
             .sparse_vector => self.core.sparseIndex(index_name) != null,
             else => false,
         };
         return installed and
-            self.core.index_manager.loadFailure(index_name) == null and
-            !self.core.index_manager.repairUnavailable(index_name);
+            self.observeResidentIndexAdmission(alloc, index_name, preloaded_repair_state) == .admitted;
     }
 
     fn applyDurableIndexRepairStats(
@@ -27027,7 +27075,12 @@ pub const DB = struct {
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                item.serving_snapshot_ready = self.vectorServingSnapshotReady(cfg.kind, cfg.name);
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(
+                    alloc,
+                    cfg.kind,
+                    cfg.name,
+                    if (durable_index_repairs) |*state| state else null,
+                );
             }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
@@ -27234,7 +27287,12 @@ pub const DB = struct {
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, true),
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                item.serving_snapshot_ready = self.vectorServingSnapshotReady(cfg.kind, cfg.name);
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(
+                    alloc,
+                    cfg.kind,
+                    cfg.name,
+                    if (durable_index_repairs) |*state| state else null,
+                );
             }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
             index_stats[index_count] = item;
@@ -29048,11 +29106,11 @@ pub const DB = struct {
     /// clients can tell "broken, drop+recreate to recover" from "missing".
     fn failIfIndexQuarantined(self: *DB, index_name: ?[]const u8) !void {
         const name = index_name orelse return;
-        if (self.core.index_manager.repairUnavailable(name)) {
-            self.refreshIndexRepairAvailabilityForIndex(self.alloc, name) catch return error.IndexRebuilding;
-            if (self.core.index_manager.repairUnavailable(name)) return error.IndexRebuilding;
+        switch (self.observeResidentIndexAdmission(self.alloc, name, null)) {
+            .admitted => {},
+            .rebuilding => return error.IndexRebuilding,
+            .unavailable => return error.IndexUnavailable,
         }
-        if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
     }
 
     fn textIndexIsChunkBackedCallback(
@@ -62053,6 +62111,70 @@ test "db query repair gate revalidates stale debt" {
     try db.core.index_manager.markUnscopedRepairUnavailable("stale_repair");
     try db.failIfIndexQuarantined("stale_repair");
     try std.testing.expect(!db.core.index_manager.repairUnavailable("stale_repair"));
+}
+
+test "db vector status revalidates stale repair admission without a query" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_status",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sparse_status",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "repair_sibling",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Keep unrelated nonblocking durable debt so stats exercises one preloaded
+    // repair snapshot rather than rereading it for each stale vector gate.
+    const sibling_cfg = db.core.index_manager.get("repair_sibling") orelse return error.TestUnexpectedResult;
+    _ = try db.createGenerationRepairIntent(
+        alloc,
+        sibling_cfg.*,
+        .operator_generation_rebuild,
+        0,
+        0,
+        null,
+    );
+
+    // Model a process that observed durable repair debt immediately before
+    // another owner either made the intent serviceable or removed it. Status
+    // is itself an admission observer: it must heal the stale resident gates
+    // rather than wait for a user query to make index wait truthful.
+    try db.core.index_manager.markUnscopedRepairUnavailable("dense_status");
+    try db.core.index_manager.markUnscopedRepairUnavailable("sparse_status");
+    try std.testing.expect(db.core.index_manager.repairUnavailable("dense_status"));
+    try std.testing.expect(db.core.index_manager.repairUnavailable("sparse_status"));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var observed_dense = false;
+    var observed_sparse = false;
+    for (stats.indexes) |index_stats| {
+        if (std.mem.eql(u8, index_stats.name, "dense_status")) {
+            observed_dense = true;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+        } else if (std.mem.eql(u8, index_stats.name, "sparse_status")) {
+            observed_sparse = true;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+        }
+    }
+    try std.testing.expect(observed_dense);
+    try std.testing.expect(observed_sparse);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_status"));
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("sparse_status"));
 }
 
 test "db resolver catalog persists across reopen" {
