@@ -335,7 +335,7 @@ class MultiMetadataBackupCluster:
         try:
             self._start()
         except BaseException:
-            self.stop()
+            self.stop(test_failed=True)
             raise
 
     def _write_config(self) -> None:
@@ -573,7 +573,7 @@ class MultiMetadataBackupCluster:
             raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
         return self.metadata_public_urls[leader_index]
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self.port_reservations.close()
         if self.data_proc is not None and self.data_proc.poll() is None:
             self.data_proc.send_signal(signal.SIGTERM)
@@ -597,12 +597,14 @@ class MultiMetadataBackupCluster:
         for handle in [self.data_log_file, *self.metadata_log_files]:
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
 @pytest.fixture
-def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
+def multi_metadata_backup_cluster(
+    request: pytest.FixtureRequest,
+) -> MultiMetadataBackupCluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     resolved = Path(binary)
     if resolved.name != "antfly":
@@ -614,7 +616,8 @@ def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def test_table_backup_restore_round_trip(backup_api):
