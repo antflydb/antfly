@@ -17,6 +17,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -25,9 +26,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -49,6 +52,26 @@ var ExternalInferencePoolGVR = schema.GroupVersionResource{
 	Resource: "externalinferencepools",
 }
 
+// InferencePoolGVR is the GroupVersionResource for managed InferencePools.
+var InferencePoolGVR = schema.GroupVersionResource{
+	Group:    "antfly.io",
+	Version:  "v1alpha1",
+	Resource: "inferencepools",
+}
+
+const (
+	activationRequestedAtAnnotation = "inference.antfly.io/activation-requested-at"
+	defaultActivationTimeout        = 5 * time.Minute
+	defaultScaleToZeroIdleTimeout   = 15 * time.Minute
+)
+
+type scaleToZeroPool struct {
+	namespace         string
+	activationTimeout time.Duration
+	idleTimeout       time.Duration
+	lastPatched       time.Time
+}
+
 // K8sWatcher watches Kubernetes endpoints for Inference pods
 type K8sWatcher struct {
 	proxy         *Proxy
@@ -61,6 +84,8 @@ type K8sWatcher struct {
 
 	externalMu    sync.Mutex
 	externalAddrs map[string][]string
+	scaleMu       sync.Mutex
+	scalePools    map[string]scaleToZeroPool
 }
 
 // K8sWatcherConfig holds configuration for the K8s watcher
@@ -99,14 +124,17 @@ func NewK8sWatcher(proxy *Proxy, cfg K8sWatcherConfig) (*K8sWatcher, error) {
 		return nil, fmt.Errorf("failed to parse label selector: %w", err)
 	}
 
-	return &K8sWatcher{
+	w := &K8sWatcher{
 		proxy:         proxy,
 		clientset:     clientset,
 		dynamicClient: dynamicClient,
 		namespace:     cfg.Namespace,
 		labelSelector: selector,
 		externalAddrs: make(map[string][]string),
-	}, nil
+		scalePools:    make(map[string]scaleToZeroPool),
+	}
+	proxy.SetPoolActivator(w)
+	return w, nil
 }
 
 // Start begins watching Kubernetes endpoints
@@ -148,20 +176,145 @@ func (w *K8sWatcher) Start(ctx context.Context) error {
 	if err != nil {
 		log.Printf("inference proxy: external inference pool watch disabled: %v", err)
 	}
+	inferenceFactory, inferencePoolInformer, err := w.inferencePoolInformer()
+	if err != nil {
+		return fmt.Errorf("failed to create inference pool informer: %w", err)
+	}
 
 	factory.Start(ctx.Done())
 	if externalFactory != nil {
 		externalFactory.Start(ctx.Done())
 		go w.waitForOptionalExternalPoolSync(ctx, externalPoolInformer)
 	}
+	inferenceFactory.Start(ctx.Done())
 
 	// Wait for cache sync
-	if !cache.WaitForCacheSync(ctx.Done(), endpointSliceInformer.HasSynced, podsInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), endpointSliceInformer.HasSynced, podsInformer.HasSynced, inferencePoolInformer.HasSynced) {
 		return fmt.Errorf("failed to sync caches")
 	}
 
 	<-ctx.Done()
 	return nil
+}
+
+func (w *K8sWatcher) inferencePoolInformer() (dynamicinformer.DynamicSharedInformerFactory, cache.SharedIndexInformer, error) {
+	var factory dynamicinformer.DynamicSharedInformerFactory
+	if w.namespace != "" {
+		factory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(w.dynamicClient, 30*time.Second, w.namespace, nil)
+	} else {
+		factory = dynamicinformer.NewDynamicSharedInformerFactory(w.dynamicClient, 30*time.Second)
+	}
+	informer := factory.ForResource(InferencePoolGVR).Informer()
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    w.onInferencePoolAdd,
+		UpdateFunc: w.onInferencePoolUpdate,
+		DeleteFunc: w.onInferencePoolDelete,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to add inference pool handler: %w", err)
+	}
+	return factory, informer, nil
+}
+
+func (w *K8sWatcher) onInferencePoolAdd(obj any) {
+	w.processInferencePool(obj)
+}
+
+func (w *K8sWatcher) onInferencePoolUpdate(_, newObj any) {
+	w.processInferencePool(newObj)
+}
+
+func (w *K8sWatcher) onInferencePoolDelete(obj any) {
+	u, ok := unstructuredFromDelete(obj)
+	if !ok {
+		return
+	}
+	w.scaleMu.Lock()
+	delete(w.scalePools, u.GetName())
+	w.scaleMu.Unlock()
+}
+
+func (w *K8sWatcher) processInferencePool(obj any) {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return
+	}
+	scaleConfig, found, _ := unstructured.NestedMap(u.Object, "spec", "scaleToZero")
+	enabled, _, _ := unstructured.NestedBool(scaleConfig, "enabled")
+	w.scaleMu.Lock()
+	defer w.scaleMu.Unlock()
+	if !found || !enabled {
+		delete(w.scalePools, u.GetName())
+		return
+	}
+
+	activationTimeout := durationFromUnstructured(scaleConfig, "activationTimeout", defaultActivationTimeout)
+	idleTimeout := durationFromUnstructured(scaleConfig, "idleTimeout", defaultScaleToZeroIdleTimeout)
+	previous := w.scalePools[u.GetName()]
+	w.scalePools[u.GetName()] = scaleToZeroPool{
+		namespace:         u.GetNamespace(),
+		activationTimeout: activationTimeout,
+		idleTimeout:       idleTimeout,
+		lastPatched:       previous.lastPatched,
+	}
+}
+
+// Activate records request activity on a scale-to-zero InferencePool. The
+// operator owns the StatefulSet replica count and consumes this annotation,
+// avoiding a fight between the proxy and reconciler.
+func (w *K8sWatcher) Activate(ctx context.Context, poolName string) (time.Duration, bool, error) {
+	now := time.Now().UTC()
+	w.scaleMu.Lock()
+	pool, enabled := w.scalePools[poolName]
+	if !enabled {
+		w.scaleMu.Unlock()
+		return 0, false, nil
+	}
+	renewAfter := pool.idleTimeout / 3
+	if renewAfter > 30*time.Second {
+		renewAfter = 30 * time.Second
+	}
+	if renewAfter < time.Second {
+		renewAfter = time.Second
+	}
+	if !pool.lastPatched.IsZero() && now.Sub(pool.lastPatched) < renewAfter {
+		w.scaleMu.Unlock()
+		return pool.activationTimeout, true, nil
+	}
+	previousPatch := pool.lastPatched
+	pool.lastPatched = now
+	w.scalePools[poolName] = pool
+	w.scaleMu.Unlock()
+
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]string{activationRequestedAtAnnotation: now.Format(time.RFC3339Nano)},
+		},
+	})
+	if err != nil {
+		return 0, true, err
+	}
+	_, err = w.dynamicClient.Resource(InferencePoolGVR).Namespace(pool.namespace).Patch(ctx, poolName, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		w.scaleMu.Lock()
+		current := w.scalePools[poolName]
+		if current.lastPatched.Equal(now) {
+			current.lastPatched = previousPatch
+			w.scalePools[poolName] = current
+		}
+		w.scaleMu.Unlock()
+		return 0, true, fmt.Errorf("mark InferencePool %s/%s active: %w", pool.namespace, poolName, err)
+	}
+	return pool.activationTimeout, true, nil
+}
+
+func durationFromUnstructured(config map[string]any, field string, fallback time.Duration) time.Duration {
+	raw, _, _ := unstructured.NestedString(config, field)
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func (w *K8sWatcher) externalPoolInformer() (dynamicinformer.DynamicSharedInformerFactory, cache.SharedIndexInformer, error) {

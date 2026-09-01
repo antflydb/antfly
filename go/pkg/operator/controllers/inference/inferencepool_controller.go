@@ -711,8 +711,20 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 	return nil
 }
 
+const defaultInferenceIdleTimeout = 15 * time.Minute
+
 func initialInferenceReplicas(pool *antflyaiv1alpha1.InferencePool) int32 {
+	return desiredInferenceReplicasAt(pool, time.Now())
+}
+
+func desiredInferenceReplicasAt(pool *antflyaiv1alpha1.InferencePool, now time.Time) int32 {
 	replicas := pool.Spec.Replicas.Min
+	if scaleToZeroActiveAt(pool, now) {
+		replicas = 1
+		if pool.Spec.ScaleToZero.WakeReplicas != nil {
+			replicas = *pool.Spec.ScaleToZero.WakeReplicas
+		}
+	}
 	if inferenceAutoscalingEnabled(pool) && pool.Spec.Autoscaling.WarmupReplicas != nil && *pool.Spec.Autoscaling.WarmupReplicas > replicas {
 		replicas = *pool.Spec.Autoscaling.WarmupReplicas
 		if pool.Spec.Replicas.Max > 0 && replicas > pool.Spec.Replicas.Max {
@@ -720,6 +732,24 @@ func initialInferenceReplicas(pool *antflyaiv1alpha1.InferencePool) int32 {
 		}
 	}
 	return replicas
+}
+
+func scaleToZeroActiveAt(pool *antflyaiv1alpha1.InferencePool, now time.Time) bool {
+	if pool.Spec.ScaleToZero == nil || !pool.Spec.ScaleToZero.Enabled {
+		return false
+	}
+	requestedAt, err := time.Parse(time.RFC3339Nano, pool.Annotations[antflyaiv1alpha1.ActivationRequestedAtAnnotation])
+	if err != nil || requestedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if requestedAt.After(now) {
+		requestedAt = now
+	}
+	idleTimeout := defaultInferenceIdleTimeout
+	if pool.Spec.ScaleToZero.IdleTimeout != nil {
+		idleTimeout = pool.Spec.ScaleToZero.IdleTimeout.Duration
+	}
+	return now.Before(requestedAt.Add(idleTimeout))
 }
 
 func inferenceAutoscalingEnabled(pool *antflyaiv1alpha1.InferencePool) bool {
@@ -1152,8 +1182,20 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 			computeClass = "Balanced"
 		}
 
-		// Apply compute class annotation (required for GKE Autopilot non-TPU workloads)
-		podTemplate.Annotations["cloud.google.com/compute-class"] = computeClass
+		// GPU workloads must select both the Accelerator compute class and the
+		// concrete GPU type. GKE reads these as node labels; annotations alone do
+		// not trigger L4 provisioning.
+		if pool.Spec.Hardware.Accelerator != "" && hasInferenceGPUResources(pool.Spec.Resources) {
+			if podTemplate.Spec.NodeSelector == nil {
+				podTemplate.Spec.NodeSelector = make(map[string]string)
+			}
+			podTemplate.Spec.NodeSelector["cloud.google.com/compute-class"] = computeClass
+			podTemplate.Spec.NodeSelector["cloud.google.com/gke-accelerator"] = pool.Spec.Hardware.Accelerator
+		} else {
+			// Preserve the existing annotation behavior for non-GPU pools; changing
+			// their scheduling contract is outside this GPU rollout.
+			podTemplate.Annotations["cloud.google.com/compute-class"] = computeClass
+		}
 
 		// Add spot toleration if using autopilot-spot compute class
 		// GKE Autopilot spot nodes have the taint cloud.google.com/gke-spot=true:NoSchedule
@@ -1169,7 +1211,13 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 		return
 	}
 
-	// Standard GKE mode (non-Autopilot): use node selectors for spot instances
+	// Standard GKE mode (non-Autopilot): select the requested GPU type and spot nodes.
+	if pool.Spec.GKE != nil && pool.Spec.Hardware.Accelerator != "" && hasInferenceGPUResources(pool.Spec.Resources) {
+		if podTemplate.Spec.NodeSelector == nil {
+			podTemplate.Spec.NodeSelector = make(map[string]string)
+		}
+		podTemplate.Spec.NodeSelector["cloud.google.com/gke-accelerator"] = pool.Spec.Hardware.Accelerator
+	}
 	if pool.Spec.Hardware.Spot {
 		// Initialize nodeSelector if nil
 		if podTemplate.Spec.NodeSelector == nil {

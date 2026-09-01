@@ -943,11 +943,17 @@ type Proxy struct {
 	registry     *ModelRegistry
 	router       *Router
 	routeWatcher *RouteWatcher
+	activator    PoolActivator
 	server       *http.Server
 	logger       *zap.Logger
 
 	defaultPool string
 	listenAddr  string
+}
+
+// SetPoolActivator configures request-driven activation for scale-to-zero pools.
+func (p *Proxy) SetPoolActivator(activator PoolActivator) {
+	p.activator = activator
 }
 
 // Config holds proxy configuration

@@ -465,6 +465,81 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 	}
 }
 
+type testPoolActivator struct {
+	activate func(context.Context, string) (time.Duration, bool, error)
+}
+
+func (a testPoolActivator) Activate(ctx context.Context, pool string) (time.Duration, bool, error) {
+	return a.activate(ctx, pool)
+}
+
+func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/gpu",
+		Operations: map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{
+			{Pool: "gpu", Weight: 100},
+		},
+		Fallback: &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var calls atomic.Int32
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, pool string) (time.Duration, bool, error) {
+		if pool != "gpu" {
+			return 0, false, nil
+		}
+		if calls.Add(1) == 1 {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+			}()
+		}
+		return 500 * time.Millisecond, true, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "gliner2"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "gpu" || resolved.Endpoint.Address != "http://gpu.internal" {
+		t.Fatalf("expected activated GPU pool, got pool=%q endpoint=%q", resolved.Pool, resolved.Endpoint.Address)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("expected GPU activation")
+	}
+}
+
+func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: "cpu", Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/gpu-timeout",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, pool string) (time.Duration, bool, error) {
+		if pool == "gpu" {
+			return 20 * time.Millisecond, true, nil
+		}
+		return 0, false, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "gliner2"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected CPU fallback after activation timeout, got %q", resolved.Pool)
+	}
+}
+
 func TestBurstRoutingDistributesAcrossEligibleEndpoints(t *testing.T) {
 	t.Parallel()
 

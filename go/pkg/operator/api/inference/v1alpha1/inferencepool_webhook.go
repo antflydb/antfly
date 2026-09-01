@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -81,6 +82,10 @@ func (r *InferencePool) ValidateInferencePool() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateScaleToZeroConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if len(allErrors) > 0 {
 		return fmt.Errorf("InferencePool validation failed:\n  - %s",
 			strings.Join(allErrors, "\n  - "))
@@ -96,6 +101,13 @@ func (r *InferencePool) validateGKEConfig() error {
 	}
 
 	gke := r.Spec.GKE
+	hasGPU := r.hasGPUResources()
+	if hasGPU && strings.TrimSpace(r.Spec.Hardware.Accelerator) == "" {
+		return fmt.Errorf("spec.hardware.accelerator is required for GKE GPU resources; for example, nvidia-l4")
+	}
+	if gke.Autopilot && hasGPU && gke.AutopilotComputeClass != "Accelerator" {
+		return fmt.Errorf("spec.gke.autopilotComputeClass must be 'Accelerator' for GKE Autopilot GPU resources")
+	}
 
 	// Check Autopilot requirement first — this gives the most helpful error
 	if gke.AutopilotComputeClass != "" && !gke.Autopilot {
@@ -120,8 +132,6 @@ Solution: Either:
 	// Validate Accelerator compute class requires GPU (NOT TPU)
 	// TPU workloads should NOT use Accelerator class - they use node selectors instead
 	if gke.AutopilotComputeClass == "Accelerator" {
-		hasGPU := r.hasGPUResources()
-
 		if !hasGPU {
 			return fmt.Errorf(`spec.gke.autopilotComputeClass='Accelerator' requires GPU resources
 
@@ -331,6 +341,58 @@ func (r *InferencePool) validateAutoscalingConfig() error {
 
 	if len(allErrors) > 0 {
 		return fmt.Errorf("invalid autoscaling configuration:\n    %s", strings.Join(allErrors, "\n    "))
+	}
+	return nil
+}
+
+func (r *InferencePool) validateScaleToZeroConfig() error {
+	config := r.Spec.ScaleToZero
+	if config == nil || !config.Enabled {
+		return nil
+	}
+
+	var allErrors []string
+	if r.Spec.Replicas.Min != 0 {
+		allErrors = append(allErrors, "spec.replicas.min must be 0 when spec.scaleToZero.enabled=true")
+	}
+	if r.Spec.Autoscaling != nil && r.Spec.Autoscaling.Enabled {
+		allErrors = append(allErrors, "spec.autoscaling.enabled must be false when spec.scaleToZero.enabled=true")
+	}
+	idleTimeout := 15 * time.Minute
+	if config.IdleTimeout != nil {
+		idleTimeout = config.IdleTimeout.Duration
+		if config.IdleTimeout.Duration <= 0 {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be greater than 0")
+		} else if config.IdleTimeout.Duration < time.Minute {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be at least 1m")
+		} else if config.IdleTimeout.Duration > 24*time.Hour {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be at most 24h")
+		}
+	}
+	activationTimeout := 5 * time.Minute
+	if config.ActivationTimeout != nil {
+		activationTimeout = config.ActivationTimeout.Duration
+		if config.ActivationTimeout.Duration <= 0 {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be greater than 0")
+		} else if config.ActivationTimeout.Duration < time.Second {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be at least 1s")
+		} else if config.ActivationTimeout.Duration > 30*time.Minute {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be at most 30m")
+		}
+	}
+	if idleTimeout > 0 && activationTimeout > 0 && idleTimeout <= activationTimeout {
+		allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be greater than activationTimeout")
+	}
+	if config.WakeReplicas != nil {
+		if *config.WakeReplicas < 1 {
+			allErrors = append(allErrors, "spec.scaleToZero.wakeReplicas must be at least 1")
+		} else if *config.WakeReplicas > r.Spec.Replicas.Max {
+			allErrors = append(allErrors, "spec.scaleToZero.wakeReplicas cannot exceed spec.replicas.max")
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return fmt.Errorf("invalid scale-to-zero configuration:\n    %s", strings.Join(allErrors, "\n    "))
 	}
 	return nil
 }

@@ -266,9 +266,75 @@ func TestValidateInferencePool_AcceleratorWithGPU(t *testing.T) {
 			"nvidia.com/gpu": resource.MustParse("1"),
 		},
 	}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
 
 	if err := pool.ValidateInferencePool(); err != nil {
 		t.Errorf("expected no error for Accelerator with GPU, got: %v", err)
+	}
+}
+
+func TestValidateInferencePool_AcceleratorRequiresGPUType(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{Autopilot: true, AutopilotComputeClass: "Accelerator"}
+	pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	}}
+
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.hardware.accelerator") {
+		t.Fatalf("expected missing GPU type error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_AutopilotGPURequiresAcceleratorClass(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{Autopilot: true, AutopilotComputeClass: "Balanced"}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
+	pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	}}
+
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "must be 'Accelerator'") {
+		t.Fatalf("expected Autopilot GPU compute class error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_ScaleToZeroContract(t *testing.T) {
+	idle := metav1.Duration{Duration: 10 * time.Minute}
+	wait := metav1.Duration{Duration: 4 * time.Minute}
+	wake := int32(1)
+	pool := validPool()
+	pool.Spec.Replicas = ReplicaConfig{Min: 0, Max: 1}
+	pool.Spec.Autoscaling = &AutoscalingConfig{Enabled: false}
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{
+		Enabled:           true,
+		IdleTimeout:       &idle,
+		ActivationTimeout: &wait,
+		WakeReplicas:      &wake,
+	}
+	if err := pool.ValidateInferencePool(); err != nil {
+		t.Fatalf("expected valid scale-to-zero config, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_RejectsScaleToZeroWithNonzeroMinimum(t *testing.T) {
+	pool := validPool()
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{Enabled: true}
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.replicas.min must be 0") {
+		t.Fatalf("expected scale-to-zero minimum error, got %v", err)
+	}
+}
+
+func TestValidateInferencePool_RejectsScaleToZeroWithHPA(t *testing.T) {
+	pool := validPool()
+	pool.Spec.Replicas.Min = 0
+	pool.Spec.Autoscaling = &AutoscalingConfig{Enabled: true}
+	pool.Spec.ScaleToZero = &ScaleToZeroConfig{Enabled: true}
+	err := pool.ValidateInferencePool()
+	if err == nil || !strings.Contains(err.Error(), "spec.autoscaling.enabled must be false") {
+		t.Fatalf("expected scale-to-zero HPA conflict, got %v", err)
 	}
 }
 

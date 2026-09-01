@@ -153,6 +153,43 @@ func TestReconcileStatefulSetDoesNotResetReplicasWhenAutoscaled(t *testing.T) {
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(4)))
 }
 
+func TestReconcileStatefulSetFollowsScaleToZeroActivation(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newInferenceUnitTestScheme(g)
+	idle := metav1.Duration{Duration: 10 * time.Minute}
+	pool := &antflyaiv1alpha1.InferencePool{
+		TypeMeta: metav1.TypeMeta{APIVersion: antflyaiv1alpha1.GroupVersion.String(), Kind: "InferencePool"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cold-pool",
+			Namespace: "default",
+			UID:       types.UID("cold-pool"),
+			Annotations: map[string]string{
+				antflyaiv1alpha1.ActivationRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Models:      antflyaiv1alpha1.ModelConfig{Preload: []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}}},
+			Replicas:    antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 1},
+			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool).Build()
+	reconciler := &InferencePoolReconciler{Client: client, Scheme: s, AntflyImage: "ghcr.io/antflydb/antfly:zig-test"}
+
+	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())
+	g.Expect(reconciler.reconcileStatefulSet(ctx, pool)).To(Succeed())
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}
+	g.Expect(client.Get(ctx, key, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
+
+	pool.Annotations[antflyaiv1alpha1.ActivationRequestedAtAnnotation] = time.Now().Add(-11 * time.Minute).UTC().Format(time.RFC3339Nano)
+	g.Expect(reconciler.reconcileStatefulSet(ctx, pool)).To(Succeed())
+	g.Expect(client.Get(ctx, key, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+}
+
 func newInferenceUnitTestScheme(g *WithT) *runtime.Scheme {
 	s := runtime.NewScheme()
 	g.Expect(antflyaiv1alpha1.AddToScheme(s)).To(Succeed())

@@ -41,6 +41,13 @@ type ResolveRequest struct {
 	Timestamp time.Time
 }
 
+// PoolActivator wakes and refreshes request-driven scale-to-zero pools.
+// Activate returns enabled=false for pools that are not managed by the
+// activator. When enabled is true, wait is the maximum cold-start window.
+type PoolActivator interface {
+	Activate(ctx context.Context, pool string) (wait time.Duration, enabled bool, err error)
+}
+
 // Resolution is the result of routing a request to a specific endpoint.
 type Resolution struct {
 	Route       *Route
@@ -309,6 +316,15 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 				Message:    err.Error(),
 			}
 		}
+		if dest == nil {
+			activated, activationWait := p.activateRouteDestination(ctx, matchedRoute)
+			if activated {
+				dest = p.waitForRouteDestination(ctx, matchedRoute, routeReq, activationWait)
+				if ctx.Err() != nil {
+					return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: ctx.Err().Error()}
+				}
+			}
+		}
 		if dest != nil {
 			selectedDest = dest
 			pool = dest.Pool
@@ -330,8 +346,15 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 		pool = p.defaultPool
 	}
 
+	activationWait, activationEnabled, activationErr := p.activatePool(ctx, pool)
+	if activationErr != nil {
+		p.logger.Warn("failed to refresh inference pool activation", zap.String("pool", pool), zap.Error(activationErr))
+	}
 	workloadType := resolveWorkloadType(routeReq.Operation, headers)
 	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, reserve)
+	if err != nil && matchedRoute == nil && activationEnabled && activationErr == nil {
+		endpoint, err = p.waitForPoolEndpoint(ctx, routeReq.Model, pool, workloadType, reserve, activationWait)
+	}
 	if err != nil {
 		return nil, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
@@ -345,6 +368,84 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 		Endpoint:    endpoint,
 		Pool:        pool,
 	}, nil
+}
+
+func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route) (bool, time.Duration) {
+	if p.activator == nil {
+		return false, 0
+	}
+	for _, destination := range route.Destinations {
+		wait, enabled, err := p.activatePool(ctx, destination.Pool)
+		if err != nil {
+			p.logger.Warn("failed to activate inference route destination", zap.String("pool", destination.Pool), zap.Error(err))
+			continue
+		}
+		if enabled {
+			return true, wait
+		}
+	}
+	return false, 0
+}
+
+func (p *Proxy) activatePool(ctx context.Context, pool string) (time.Duration, bool, error) {
+	if p.activator == nil || pool == "" {
+		return 0, false, nil
+	}
+	return p.activator.Activate(ctx, pool)
+}
+
+func (p *Proxy) waitForRouteDestination(ctx context.Context, route *Route, req *RouteRequest, maxWait time.Duration) *Destination {
+	if maxWait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			req.Timestamp = time.Now()
+			destination, err := p.router.RouteManager().SelectDestination(route, req, p.registry)
+			if err == nil && destination != nil {
+				return destination
+			}
+		}
+	}
+}
+
+func (p *Proxy) waitForPoolEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, reserve bool, maxWait time.Duration) (*Endpoint, error) {
+	if maxWait <= 0 {
+		return p.resolveEndpoint(ctx, model, pool, workloadType, reserve)
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: "inference pool activation timed out"}
+		case <-ticker.C:
+			endpoint, err := p.resolveEndpoint(ctx, model, pool, workloadType, reserve)
+			if err == nil {
+				return endpoint, nil
+			}
+			lastErr = err
+		}
+	}
 }
 
 func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, reserve bool) (*Endpoint, error) {

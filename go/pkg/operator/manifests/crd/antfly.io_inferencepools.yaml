@@ -839,6 +839,20 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+              scaleToZero:
+                properties:
+                  activationTimeout:
+                    type: string
+                  enabled:
+                    default: false
+                    type: boolean
+                  idleTimeout:
+                    type: string
+                  wakeReplicas:
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
               tolerations:
                 items:
                   properties:

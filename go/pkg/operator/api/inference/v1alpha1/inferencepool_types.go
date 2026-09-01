@@ -48,6 +48,11 @@ const (
 	LoadingStrategyBounded LoadingStrategy = "bounded" // LRU eviction
 )
 
+// ActivationRequestedAtAnnotation is updated by an inference proxy when a
+// request targets a scale-to-zero pool. The operator treats the RFC3339 value
+// as the beginning of the pool's active window.
+const ActivationRequestedAtAnnotation = "inference.antfly.io/activation-requested-at"
+
 // InferencePoolSpec defines the desired state of InferencePool
 type InferencePoolSpec struct {
 	// WorkloadType classifies this pool for routing decisions
@@ -76,6 +81,13 @@ type InferencePoolSpec struct {
 	// Autoscaling defines autoscaling behavior
 	// +optional
 	Autoscaling *AutoscalingConfig `json:"autoscaling,omitempty"`
+
+	// ScaleToZero enables request-driven activation for pools whose minimum
+	// replica count is zero. The inference proxy records request activity on
+	// the pool and the operator keeps wakeReplicas running until idleTimeout
+	// elapses.
+	// +optional
+	ScaleToZero *ScaleToZeroConfig `json:"scaleToZero,omitempty"`
 
 	// Burst defines burst handling configuration
 	// +optional
@@ -244,6 +256,31 @@ type AutoscalingConfig struct {
 	// ScaleDownStabilization is the stabilization window for scale-down
 	// +optional
 	ScaleDownStabilization *metav1.Duration `json:"scaleDownStabilization,omitempty"`
+}
+
+// ScaleToZeroConfig defines request-driven activation and idle shutdown.
+// It is intentionally separate from HPA autoscaling because Kubernetes HPA
+// cannot wake a zero-replica workload from CPU or Pods metrics.
+type ScaleToZeroConfig struct {
+	// Enabled turns on request-driven zero-to-one activation.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// IdleTimeout is how long the operator keeps the pool awake after the most
+	// recent request. Defaults to 15 minutes.
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
+
+	// ActivationTimeout is how long the proxy waits for a healthy endpoint
+	// before applying the route fallback. Defaults to 5 minutes.
+	// +optional
+	ActivationTimeout *metav1.Duration `json:"activationTimeout,omitempty"`
+
+	// WakeReplicas is the number of replicas requested during an active window.
+	// Defaults to 1 and cannot exceed spec.replicas.max.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	WakeReplicas *int32 `json:"wakeReplicas,omitempty"`
 }
 
 // MetricType defines the type of scaling metric

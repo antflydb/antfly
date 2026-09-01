@@ -225,6 +225,40 @@ func TestEnsureTPUResourcesIgnoresNonTPUAccelerator(t *testing.T) {
 	g.Expect(limited).To(BeFalse())
 }
 
+func TestApplyGKEPodSpecSelectsL4GPU(t *testing.T) {
+	g := NewWithT(t)
+	template := &corev1.PodTemplateSpec{}
+	pool := &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+		Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+		Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		}},
+		GKE: &antflyaiv1alpha1.GKEConfig{Autopilot: true, AutopilotComputeClass: "Accelerator"},
+	}}
+
+	(&InferencePoolReconciler{}).applyGKEPodSpec(template, pool)
+	g.Expect(template.Spec.NodeSelector).To(HaveKeyWithValue("cloud.google.com/compute-class", "Accelerator"))
+	g.Expect(template.Spec.NodeSelector).To(HaveKeyWithValue("cloud.google.com/gke-accelerator", "nvidia-l4"))
+}
+
+func TestDesiredInferenceReplicasHonorsActivationWindow(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	idle := metav1.Duration{Duration: 10 * time.Minute}
+	pool := &antflyaiv1alpha1.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			antflyaiv1alpha1.ActivationRequestedAtAnnotation: now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		}},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Replicas:    antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 1},
+			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
+		},
+	}
+
+	g.Expect(desiredInferenceReplicasAt(pool, now)).To(Equal(int32(1)))
+	g.Expect(desiredInferenceReplicasAt(pool, now.Add(6*time.Minute))).To(Equal(int32(0)))
+}
+
 func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(zigWarmModelKind([]string{"embed"})).To(Equal("embedder"))
