@@ -505,7 +505,10 @@ jobs:
           ) &
           unit_pid="$!"
           (
-            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-900}"
+            # A cold Zig compile can legitimately remain silent for more than
+            # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
+            # the independent hard limit without killing an active cold build.
+            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
             hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"

@@ -398,6 +398,21 @@ fn generationStreamShouldContinue(
     return true;
 }
 
+fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled,
+        error.Cancelled,
+        error.EndOfStream,
+        error.StreamClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.SendFailed,
+        error.Timeout,
+        => true,
+        else => false,
+    };
+}
+
 test "generation pipeline session lookup is field safe" {
     var pipeline = struct {}{};
     try std.testing.expect(generationPipelineSession(&pipeline) == null);
@@ -409,6 +424,14 @@ test "generation stream continuation observes writes and peer cancellation" {
     cancellation.store(true, .release);
     try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
     try std.testing.expect(!generationStreamShouldContinue(true, null));
+}
+
+test "generation stream write classification separates peer disconnects from server faults" {
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.SendFailed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.StreamClosed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.Canceled));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.OutOfMemory));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.EventTooLarge));
 }
 
 test "channel-aware Gemma generation stays on projected native backends" {
@@ -583,6 +606,64 @@ fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.Speculatio
     return if (shouldResolveDraftModel(policy)) requested else null;
 }
 
+fn generationSpeculationRequested(effective_draft: ?[]const u8, auto_discovered_draft: ?[]const u8) bool {
+    return effective_draft != null or auto_discovered_draft != null;
+}
+
+fn qualifyAutoDiscoveredDraftSpeculation(options: *GenerateSpeculationOptions) void {
+    // A client cannot name calibration controls without an explicit drafter at
+    // the HTTP trust boundary. Once the server discovers its own best-effort
+    // MTP companion, AUTO therefore has to opt into the bounded cost probe or
+    // the drafter is loaded and admitted only to be disabled as uncalibrated.
+    if (options.policy == .auto and options.calibration == .none) {
+        options.calibration = .probe;
+    }
+}
+
+/// Opt-in: when a request carries no draft_model and the speculation policy is
+/// auto, discover the Gemma4 MTP assistant artifact sitting next to the target
+/// model dir. Kept fail-closed until Metal auto-MTP qualifies as a default.
+fn gemma4MtpAutoDraftDiscoveryEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_AUTO_DRAFT_DISCOVERY", false);
+}
+
+/// Sibling MTP assistant dir for a Gemma4 QAT gguf artifact
+/// (`...-q4_0-gguf` -> `...-q4_0-unquantized-assistant`), or null when the
+/// model dir has no such sibling on disk. Caller owns the returned path.
+/// The name qualification mirrors registry.gemma4MtpAssistantCompanionRefAlloc
+/// so discovery only ever matches artifacts the companion pull can create.
+fn gemma4MtpAssistantSiblingPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+) ?[]const u8 {
+    const suffix = "-gguf";
+    if (!std.mem.endsWith(u8, model_path, suffix)) return null;
+    const base_name = std.fs.path.basename(model_path);
+    if (std.ascii.indexOfIgnoreCase(base_name, "gemma-4-") == null) return null;
+    if (std.ascii.indexOfIgnoreCase(base_name, "-qat-") == null) return null;
+    const sibling = std.fmt.allocPrint(
+        allocator,
+        "{s}-unquantized-assistant",
+        .{model_path[0 .. model_path.len - suffix.len]},
+    ) catch return null;
+    _ = std.Io.Dir.cwd().statFile(io, sibling, .{}) catch {
+        allocator.free(sibling);
+        return null;
+    };
+    return sibling;
+}
+
+/// A discovered drafter must parse as a model before it may join the request:
+/// stale or partial sibling directories degrade to non-speculative generation
+/// rather than failing generate calls the client never asked to speculate.
+fn validateDiscoveredDraftDir(allocator: std.mem.Allocator, dir: []const u8) bool {
+    var draft_manifest = manifest_mod.loadFromDir(allocator, dir) catch return false;
+    defer draft_manifest.deinit();
+    _ = session_factory.loadGptConfigFromModelDir(allocator, dir, draft_manifest) catch return false;
+    return true;
+}
+
 fn validateQualifiedProfileDraft(
     qualified_profile_requested: bool,
     effective_draft_model: ?[]const u8,
@@ -599,6 +680,16 @@ fn generateAdmissionUnitsForSpeculation(
 ) usize {
     if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
     return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
+}
+
+/// Remove only the admission units added for an auto-discovered drafter.
+/// `reserved_units` may have grown independently after media decoding, so
+/// restoring an older base estimate would silently undercharge the request.
+fn takeAutoDraftAdmissionExtra(reserved_units: *usize, auto_draft_extra_units: *usize) usize {
+    const released = @min(reserved_units.*, auto_draft_extra_units.*);
+    reserved_units.* -= released;
+    auto_draft_extra_units.* = 0;
+    return released;
 }
 
 fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.BackendKind {
@@ -1278,6 +1369,7 @@ fn shouldAutoUseMetalWholeModelGenerate(
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
     prompt_cache_requested: bool,
+    speculation_requested: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
@@ -1285,6 +1377,14 @@ fn shouldAutoUseMetalWholeModelGenerate(
     // auto-selecting whole-model compiled execution would ignore an explicit
     // prompt_cache_key and make the opt-in cache appear enabled but inert.
     if (prompt_cache_requested) return false;
+    // Gemma4 MTP and ordinary speculative decoding both need model-specific
+    // draft state, while MTP additionally taps the target's final hidden rows.
+    // The whole-model compiled contract currently exposes logits/tokens only;
+    // selecting it here turns an otherwise supported eager request into a
+    // late MissingGraphCacheForCompiledPartitionBackend failure. Keep draft
+    // requests on the qualified eager decoder-runtime route until compiled
+    // speculation has an explicit two-model graph and hidden-output contract.
+    if (speculation_requested) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
@@ -5514,6 +5614,21 @@ pub const Node = struct {
         return coordinator.acquire(admission);
     }
 
+    /// Rendered prompt and tokenization retained from an admission estimate so
+    /// the generation pipeline can skip re-rendering and re-encoding. Owns its
+    /// memory; must stay alive until generation for the request completes.
+    const NativePromptEstimate = struct {
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        encoded: @import("inference_tokenizer").EncodeResult,
+        prompt_token_limit: usize,
+
+        fn deinit(self: *NativePromptEstimate) void {
+            self.allocator.free(self.prompt);
+            self.encoded.deinit();
+        }
+    };
+
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -5524,13 +5639,15 @@ pub const Node = struct {
         max_tokens: i32,
         speculative_bonus_tokens: usize,
         enable_thinking: ?bool,
+        out_estimate: ?*?NativePromptEstimate,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
             try generation.formatMessages(allocator, messages);
-        defer allocator.free(prompt);
+        var prompt_owned = true;
+        defer if (prompt_owned) allocator.free(prompt);
         const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
             allocator,
             model_dir,
@@ -5553,10 +5670,22 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
-        defer encoded.deinit();
+        var encoded_owned = true;
+        defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
+        const total = std.math.add(usize, count, media_allowance) catch return error.PromptTooLong;
+        if (out_estimate) |out| {
+            out.* = .{
+                .allocator = allocator,
+                .prompt = prompt,
+                .encoded = encoded,
+                .prompt_token_limit = prompt_token_limit,
+            };
+            prompt_owned = false;
+            encoded_owned = false;
+        }
+        return total;
     }
 
     pub fn generateEmbeddings(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -6123,14 +6252,29 @@ pub const Node = struct {
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, false)) {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
-            });
+        // Single JSON parse per request: only bodies that can carry
+        // chat_template_kwargs (substring pre-gate, false positives harmless)
+        // are parsed as an untyped Value, which then doubles as the kwargs
+        // validator input and the typed-parse source. Malformed bodies fall
+        // back to the raw typed parse so their errors stay identical.
+        var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed_body_value) |*owned| owned.deinit();
+        if (std.mem.indexOf(u8, raw_body, "chat_template_kwargs") != null) {
+            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch null;
         }
-        var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (parsed_body_value) |owned| {
+            if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+                });
+            }
+        }
+        var parsed = if (parsed_body_value) |owned|
+            try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
+        else
+            (try ctx.parseJson(api.GenerateRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if (body.prompt_cache_key) |key| {
@@ -6303,7 +6447,7 @@ pub const Node = struct {
                 .message = "draft_model must not be empty",
             });
         }
-        const speculation = parseGenerateSpeculationOptions(
+        var speculation = parseGenerateSpeculationOptions(
             requested_draft_model_name != null,
             body.speculative_k,
             body.speculation_policy,
@@ -6315,9 +6459,63 @@ pub const Node = struct {
             });
         };
         const effective_draft_model_name = effectiveDraftModelName(requested_draft_model_name, speculation.policy);
+        // Auto-discovered MTP drafter, resolved before validation, admission,
+        // and the prompt estimate so they all see the same speculation state
+        // as the pipeline. The sibling's manifest/config are validated here so
+        // a stale or foreign directory degrades to non-speculative generation
+        // instead of failing the request.
+        var auto_draft_sibling: ?[]const u8 = null;
+        defer if (auto_draft_sibling) |path| ctx.allocator.free(path);
+        var auto_draft_extra_units: usize = 0;
+        if (requested_draft_model_name == null and
+            speculation.policy == .auto and
+            gemma4MtpAutoDraftDiscoveryEnabled())
+        {
+            if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
+                if (validateDiscoveredDraftDir(ctx.allocator, sibling)) {
+                    auto_draft_sibling = sibling;
+                } else {
+                    std.log.warn("ignoring invalid Gemma4 MTP assistant sibling {s}", .{sibling});
+                    ctx.allocator.free(sibling);
+                }
+            }
+        }
+        if (auto_draft_sibling != null) {
+            qualifyAutoDiscoveredDraftSpeculation(&speculation);
+            // The discovered drafter loads a second model backend; reserve the
+            // same speculation admission a client-requested draft would get.
+            // A discovered drafter is an optimization, not a client
+            // requirement: when capacity is unavailable the request degrades
+            // to non-speculative generation instead of a capacity rejection.
+            const speculative_units = generateAdmissionUnitsForSpeculation(admission_units, true, speculation.policy);
+            if (speculative_units > reserved_units) {
+                const extra_units = speculative_units - reserved_units;
+                if (self.reserveAdmissionUnits(extra_units)) {
+                    reserved_units += extra_units;
+                    auto_draft_extra_units = extra_units;
+                } else |_| {
+                    std.log.warn("skipping discovered MTP drafter: insufficient admission capacity", .{});
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                }
+            }
+        }
+        if (auto_draft_sibling != null and
+            effective_draft_model_name == null and
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            // Qualified profiles reject a client-requested draft, but automatic
+            // discovery is best-effort and must not turn a plain request into a
+            // 400 response.
+            std.log.warn("skipping discovered MTP drafter: qualified-profile JIT is active", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
+        }
         validateQualifiedProfileDraft(
             self.config.kernel_jit.qualified_profile_path != null,
-            effective_draft_model_name,
+            effective_draft_model_name orelse auto_draft_sibling,
         ) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -6371,7 +6569,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = requested_draft_model_name != null,
+            .speculation_requested = generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -6390,6 +6588,16 @@ pub const Node = struct {
                 },
             });
         };
+        if (auto_draft_sibling != null and backend_selection.native_choice == .onnx) {
+            // ONNX cannot host the discovered native/Metal drafter. As with all
+            // automatic-discovery incompatibilities, continue without it.
+            std.log.warn("skipping discovered MTP drafter: ONNX backend selected", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
+            config.speculation_requested = false;
+        }
         validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -6744,6 +6952,7 @@ pub const Node = struct {
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
             config.prompt_cache_enabled,
+            config.speculation_requested,
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -6778,6 +6987,10 @@ pub const Node = struct {
             kv_dtype,
         );
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
+        // Kept alive for the whole request so the pipeline can reuse the
+        // estimate's rendered prompt and token ids instead of redoing both.
+        var prompt_estimate: ?NativePromptEstimate = null;
+        defer if (prompt_estimate) |*estimate| estimate.deinit();
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
             model_path,
@@ -6787,6 +7000,7 @@ pub const Node = struct {
             configured_max_tokens,
             if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
             config.enable_thinking,
+            &prompt_estimate,
         ) catch |err| {
             if (err == error.PromptTooLong) {
                 return ctx.status(400).json(.{
@@ -6806,13 +7020,33 @@ pub const Node = struct {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
-                .requested_units = admission_units,
+            native_generate_lease = self.acquireNativeGenerateLease(coordinator, .{
+                .requested_units = reserved_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = configured_max_tokens,
-            });
+            }) catch |err| blk: {
+                // A discovered drafter is an optimization: give back its extra
+                // admission and retry single-model before surfacing capacity
+                // errors the client's own request never earned.
+                if (auto_draft_sibling != null) {
+                    std.log.warn("skipping discovered MTP drafter: insufficient scheduler capacity", .{});
+                    const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+                    if (released > 0) self.releaseSlotUnits(released);
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                    config.speculation_requested = false;
+                    break :blk try self.acquireNativeGenerateLease(coordinator, .{
+                        .requested_units = reserved_units,
+                        .prompt_bytes = prompt_bytes,
+                        .prompt_tokens = prompt_tokens,
+                        .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                        .max_tokens = configured_max_tokens,
+                    });
+                }
+                return err;
+            };
         }
 
         const tok = model.getTokenizer();
@@ -6840,6 +7074,8 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
+        var resolved_draft_model_path: ?[]const u8 = null;
+        var draft_was_discovered = false;
         if (effective_draft_model_name) |draft_model_name| {
             if (shouldResolveDraftModel(config.speculation_policy)) {
                 const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
@@ -6851,67 +7087,148 @@ pub const Node = struct {
                         .message = "draft_model must resolve to a model different from model",
                     });
                 }
-                config.draft_model = draft_model_path;
-                var load_draft_backend = true;
-                if (config.speculation_policy == .auto) {
-                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                        return modelLoadFailureResponse(ctx, err);
-                    defer draft_manifest.deinit();
-                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
-                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
-                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
-                        draft_gpt_config = draft_cfg;
-                        load_draft_backend = false;
+                resolved_draft_model_path = draft_model_path;
+            }
+        } else if (auto_draft_sibling) |sibling| {
+            // Ownership moves to the request-scoped draft path storage;
+            // config.speculation_requested was already set at config build so
+            // admission, the estimate, and scheduler batching stayed
+            // consistent with the pipeline.
+            draft_model_path_storage = sibling;
+            resolved_draft_model_path = sibling;
+            auto_draft_sibling = null;
+            draft_was_discovered = true;
+        }
+        var draft_degraded = false;
+        if (resolved_draft_model_path) |draft_model_path| draft_setup: {
+            config.draft_model = draft_model_path;
+            var load_draft_backend = true;
+            if (config.speculation_policy == .auto) {
+                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                defer draft_manifest.deinit();
+                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                };
+                if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
+                    draft_gpt_config = draft_cfg;
+                    load_draft_backend = false;
                 }
-                if (load_draft_backend) {
-                    draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
-                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return modelLoadFailureResponse(ctx, err);
-                    } else self.model_manager.acquireFromDir(draft_model_path) catch |err|
+            }
+            if (load_draft_backend) {
+                draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
+                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err| {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
                         return modelLoadFailureResponse(ctx, err);
-                    const draft_model = draft_model_handle.?.get();
-                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_MODEL",
-                            .message = "draft_model does not support generation",
-                        });
-                    const draft_tok = draft_model.getTokenizer();
-                    const target_special = tok.specialTokens();
-                    const draft_special = draft_tok.specialTokens();
-                    if (draft_tok.vocabSize() != tok.vocabSize() or
-                        draft_cfg.vocab_size != gpt_config.vocab_size or
-                        draft_special.cls_id != target_special.cls_id or
-                        draft_special.sep_id != target_special.sep_id or
-                        draft_special.pad_id != target_special.pad_id or
-                        draft_special.unk_id != target_special.unk_id)
-                    {
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "draft_model tokenizer is incompatible with target model",
-                        });
+                    };
+                } else self.model_manager.acquireFromDir(draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                const draft_model = draft_model_handle.?.get();
+                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_MODEL",
+                        .message = "draft_model does not support generation",
+                    });
+                };
+                const draft_tok = draft_model.getTokenizer();
+                const target_special = tok.specialTokens();
+                const draft_special = draft_tok.specialTokens();
+                if (draft_tok.vocabSize() != tok.vocabSize() or
+                    draft_cfg.vocab_size != gpt_config.vocab_size or
+                    draft_special.cls_id != target_special.cls_id or
+                    draft_special.sep_id != target_special.sep_id or
+                    draft_special.pad_id != target_special.pad_id or
+                    draft_special.unk_id != target_special.unk_id)
+                {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model tokenizer is incompatible with target model",
+                    });
+                }
 
-                    const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
-                        .native => .native,
-                        .metal => .metal,
-                        .cuda => .cuda,
-                        .pjrt, .onnx, .wasm => return ctx.status(400).json(.{
+                const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
+                    .native => .native,
+                    .metal => .metal,
+                    .cuda => .cuda,
+                    .pjrt, .onnx, .wasm => {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
+                        return ctx.status(400).json(.{
                             .@"error" = "INVALID_MODEL",
                             .message = "draft_model does not use a supported generation backend",
-                        }),
-                    };
-                    const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
-                        draft_model.session,
-                        actual_draft_backend,
-                    );
-                    draft_model_for_generation = draft_model;
-                    draft_backend_kind = actual_draft_backend;
-                    draft_kv_dtype = actual_draft_kv_dtype;
-                    draft_gpt_config = draft_cfg;
-                }
+                        });
+                    },
+                };
+                const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
+                    draft_model.session,
+                    actual_draft_backend,
+                );
+                draft_model_for_generation = draft_model;
+                draft_backend_kind = actual_draft_backend;
+                draft_kv_dtype = actual_draft_kv_dtype;
+                draft_gpt_config = draft_cfg;
+            }
+        }
+        if (draft_degraded) {
+            // A discovered drafter is best-effort: unwind it and continue as a
+            // plain single-model request instead of failing the generate call.
+            std.log.warn("skipping discovered MTP drafter: draft setup failed", .{});
+            config.draft_model = null;
+            config.speculation_requested = false;
+            if (draft_model_handle) |*handle| handle.release();
+            draft_model_handle = null;
+            draft_model_for_generation = null;
+            draft_backend_kind = null;
+            draft_kv_dtype = null;
+            draft_gpt_config = null;
+        }
+        if (draft_was_discovered and draft_model_for_generation == null and auto_draft_extra_units > 0) {
+            // Setup failures and deliberate AUTO-policy disablement both mean
+            // there is no second backend. Give back its exact slot and
+            // scheduler reservations while preserving any media-driven growth.
+            if (native_generate_lease) |lease| {
+                if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+                native_generate_lease = null;
+            }
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            if (model.native_generate_coordinator) |coordinator| {
+                native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
+                    .requested_units = reserved_units,
+                    .prompt_bytes = prompt_bytes,
+                    .prompt_tokens = prompt_tokens,
+                    .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                    .max_tokens = configured_max_tokens,
+                });
             }
         }
 
@@ -7291,6 +7608,16 @@ pub const Node = struct {
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            // The admission estimate rendered and encoded with the same
+            // template, messages, and enable_thinking (after the final
+            // tool-prompt prepend), so the pipeline may reuse both. The
+            // pipeline revalidates the encode's token limit itself.
+            .preformatted_prompt = if (prompt_estimate) |estimate| estimate.prompt else null,
+            .pre_encoded_prompt = if (prompt_estimate) |estimate| .{
+                .ids = estimate.encoded.ids,
+                .attention_mask = estimate.encoded.attention_mask,
+                .prompt_token_limit = estimate.prompt_token_limit,
+            } else null,
             .print_timing = request_generate_timing,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
@@ -8185,6 +8512,7 @@ pub const Node = struct {
                         configs[pos].max_tokens,
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
                         configs[pos].enable_thinking,
+                        null,
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
@@ -8728,15 +9056,17 @@ pub const Node = struct {
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
 
         writeStreamCompletion(
-            ctx.allocator,
+            &chunk_payload,
             &writer,
             stream_id,
             stream_created,
@@ -8753,7 +9083,7 @@ pub const Node = struct {
         };
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -9030,15 +9360,18 @@ pub const Node = struct {
             stream_id: []const u8,
             stream_created: i64,
             model_name: []const u8,
-            allocator: std.mem.Allocator,
+            payload: *std.Io.Writer.Allocating,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
             defer_content: bool,
-            errored: bool = false,
+            write_error: ?anyerror = null,
+            parser_failed: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return !stream.errored and !stream.request_context.isCancellationRequested();
+                return stream.write_error == null and
+                    !stream.parser_failed and
+                    !stream.request_context.isCancellationRequested();
             }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
@@ -9050,46 +9383,48 @@ pub const Node = struct {
                 if (stream.defer_content) return true;
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
-                        stream.errored = true;
+                        stream.parser_failed = true;
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
-                            stream.errored = true;
+                        emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
-                                stream.errored = true;
+                            emitToolCallDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch |err| {
+                                stream.write_error = err;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
-                            stream.errored = true;
+                        emitToolCallDeltaUpdate(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, delta) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
-                    stream.errored = true;
+                emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch |err| {
+                    stream.write_error = err;
                     return false;
                 };
                 return true;
             }
         };
 
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
         var stream_ctx = StreamCtx{
             .writer = &writer,
             .stream_id = stream_id,
             .stream_created = stream_created,
             .model_name = model_name,
-            .allocator = ctx.allocator,
+            .payload = &chunk_payload,
             .parser = tool_parser,
             .request_context = ctx,
             .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
@@ -9102,7 +9437,7 @@ pub const Node = struct {
             pipeline.continue_fn = StreamCtx.shouldContinue;
         }
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
@@ -9155,8 +9490,23 @@ pub const Node = struct {
             }
         }
 
-        if (stream_ctx.errored) {
-            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});
+        if (stream_ctx.write_error) |err| {
+            // Generation already stopped through shouldContinue. Classify only
+            // transport/cancellation errors as routine peer abandonment; JSON
+            // formatting, allocation, and other server faults remain errors.
+            const peer_disconnect = generationStreamWriteIsPeerDisconnect(err);
+            if (!builtin.is_test) {
+                if (peer_disconnect)
+                    std.log.info("generation stream closed after client disconnect", .{})
+                else
+                    std.log.err("inference request failed code=STREAM_WRITE_FAILED: {s}", .{@errorName(err)});
+            }
+            if (!peer_disconnect) writer.writeEvent("error", internal_error_message) catch {};
+            writer.close() catch {};
+            return ctx.response.build();
+        }
+        if (stream_ctx.parser_failed) {
+            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_PARSE_FAILED", .{});
             writer.writeEvent("error", internal_error_message) catch {};
             writer.close() catch {};
             return ctx.response.build();
@@ -9172,7 +9522,7 @@ pub const Node = struct {
 
         if (stream_ctx.defer_content) {
             writeStreamCompletion(
-                ctx.allocator,
+                &chunk_payload,
                 &writer,
                 stream_id,
                 stream_created,
@@ -9191,7 +9541,7 @@ pub const Node = struct {
             if (result.reasoning_text) |reasoning| {
                 if (reasoning.len > 0) emitReasoningDelta(
                     &writer,
-                    ctx.allocator,
+                    &chunk_payload,
                     stream_id,
                     stream_created,
                     model_name,
@@ -9203,13 +9553,13 @@ pub const Node = struct {
                 };
             }
             if (tool_parser != null) {
-                flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                flushStreamParserState(&chunk_payload, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
                     writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                     writer.close() catch {};
                     return ctx.response.build();
                 };
             } else {
-                emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                emitFinishDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
                     writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                     writer.close() catch {};
                     return ctx.response.build();
@@ -9219,7 +9569,7 @@ pub const Node = struct {
 
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -9238,7 +9588,7 @@ pub const Node = struct {
     }
 
     fn writeStreamCompletion(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
@@ -9250,37 +9600,37 @@ pub const Node = struct {
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         if (reasoning_text) |reasoning| {
-            if (reasoning.len > 0) try emitReasoningDelta(writer, allocator, stream_id, stream_created, model_name, reasoning);
+            if (reasoning.len > 0) try emitReasoningDelta(writer, payload, stream_id, stream_created, model_name, reasoning);
         }
         if (tool_parser) |parser| {
             parser.reset();
             _ = try parser.feed(full_text);
-            const remaining = try parser.finishText(allocator);
-            defer allocator.free(remaining);
+            const remaining = try parser.finishText(payload.allocator);
+            defer payload.allocator.free(remaining);
             const calls = parser.toolCalls();
-            if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+            if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
             if (calls.len > 0) {
-                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
                     .index = idx,
                     .id = call.id,
                     .type = call.type,
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
+                try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, "tool_calls", speculative);
                 return;
             }
-            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+            try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
             return;
         }
 
-        if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+        if (full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
     }
 
     fn flushStreamParserState(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
@@ -9289,11 +9639,11 @@ pub const Node = struct {
         parser: *tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
-        const remaining = try parser.finishRemainingText(allocator);
-        defer allocator.free(remaining);
-        if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+        const remaining = try parser.finishRemainingText(payload.allocator);
+        defer payload.allocator.free(remaining);
+        if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, finish_reason, speculative);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -9309,17 +9659,19 @@ pub const Node = struct {
 
     fn writeGenerateChunkEvent(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         chunk: api.GenerateChunk,
     ) !void {
-        const payload = try std.json.Stringify.valueAlloc(allocator, chunk, .{});
-        defer allocator.free(payload);
-        try writer.writeEvent(null, payload);
+        // Stream-owned buffer, reset per event: streaming emits one chunk per
+        // token and per-token alloc/free churn is measurable overhead.
+        payload.clearRetainingCapacity();
+        std.json.Stringify.value(chunk, .{}, &payload.writer) catch return error.OutOfMemory;
+        try writer.writeEvent(null, payload.written());
     }
 
     fn emitRoleDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9328,7 +9680,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .role = .assistant },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9339,7 +9691,7 @@ pub const Node = struct {
 
     fn emitContentDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9349,7 +9701,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .content = .{ .value = token_text } },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9360,7 +9712,7 @@ pub const Node = struct {
 
     fn emitReasoningDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9370,7 +9722,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .reasoning_content = .{ .value = reasoning_text } },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9381,7 +9733,7 @@ pub const Node = struct {
 
     fn emitToolCallDeltaUpdate(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9401,7 +9753,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .tool_calls = &tool_calls },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9412,14 +9764,14 @@ pub const Node = struct {
 
     fn emitToolCallDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
         index: usize,
         call: tool_parser_mod.ToolCall,
     ) !void {
-        try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+        try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
             .index = index,
             .id = call.id,
             .type = call.type,
@@ -9430,7 +9782,7 @@ pub const Node = struct {
 
     fn emitFinishDelta(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9442,7 +9794,7 @@ pub const Node = struct {
             .delta = .{},
             .finish_reason = parseFinishReason(finish_reason),
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9457,7 +9809,7 @@ pub const Node = struct {
 
     fn emitTerminalUsageAndDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9465,7 +9817,7 @@ pub const Node = struct {
         completion_tokens: usize,
         cached_prompt_tokens: usize,
     ) !void {
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -9478,7 +9830,7 @@ pub const Node = struct {
 
     fn emitTerminalUsageOrDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -9490,7 +9842,7 @@ pub const Node = struct {
         if (include_usage) {
             return emitTerminalUsageAndDone(
                 writer,
-                allocator,
+                payload,
                 stream_id,
                 stream_created,
                 model_name,
@@ -13178,11 +13530,25 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectEqual(@as(u32, 4), defaults.k);
     try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, defaults.calibration);
+    var discovered = defaults;
+    qualifyAutoDiscoveredDraftSpeculation(&discovered);
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, discovered.calibration);
     const probing = try parseGenerateSpeculationOptions(true, null, null, "probe");
     try std.testing.expectEqual(generation.SpeculationCalibration.probe, probing.calibration);
-    const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    var forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
+    qualifyAutoDiscoveredDraftSpeculation(&forced);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
     try std.testing.expect(!shouldResolveDraftModel(.off));
+    try std.testing.expect(!generationSpeculationRequested(
+        effectiveDraftModelName("draft", .off),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(
+        effectiveDraftModelName("draft", .auto),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(null, "auto-draft"));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, false, .auto));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, true, .off));
     try std.testing.expectEqual(@as(usize, 14), generateAdmissionUnitsForSpeculation(7, true, .auto));
@@ -13211,6 +13577,24 @@ test "generate admission units conservatively charge active draft requests" {
     var off = parsed.value;
     off.speculation_policy = "off";
     try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestAdmissionUnits(off, 256));
+}
+
+test "auto draft admission unwind preserves independent request growth" {
+    var reserved_units: usize = 10;
+    var auto_draft_extra_units: usize = 2;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
+    try std.testing.expectEqual(@as(usize, 0), auto_draft_extra_units);
+
+    // Repeated degradation is idempotent and cannot consume media admission.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {
@@ -13288,8 +13672,10 @@ test "generation SSE orders finish then usage then done" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageAndDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageAndDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
 
     try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
     var finish = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[0], .{});
@@ -13326,8 +13712,10 @@ test "generation SSE omits usage unless requested" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageOrDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageOrDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
 
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     try std.testing.expectEqualStrings("[DONE]", capture.events.items[1]);
@@ -13442,6 +13830,18 @@ test "generate chat template kwargs preserve default and parse explicit thinking
     ,
         false,
     ));
+
+    // The single-parse request path validates the untyped Value and then
+    // builds the typed request from that same Value instead of re-parsing
+    // the raw body.
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, allocator, disabled_json, .{});
+    defer parsed_value.deinit();
+    try std.testing.expect(generateRequestChatTemplateKwargsAreValid(parsed_value.value));
+    var from_value = try std.json.parseFromValue(api.GenerateRequest, allocator, parsed_value.value, .{ .ignore_unknown_fields = true });
+    defer from_value.deinit();
+    try std.testing.expectEqual(@as(?bool, false), from_value.value.chat_template_kwargs.?.enable_thinking);
+    try std.testing.expectEqualStrings("m", from_value.value.model);
+    try std.testing.expectEqual(@as(usize, 1), from_value.value.messages.len);
 }
 
 test "generate speculation status exposes disabled decisions" {
@@ -15905,7 +16305,16 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
 
     try std.testing.expectEqual(@as(u16, 507), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--host-budget-mb") != null);
+    for ([_][]const u8{
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+        "--process-memory-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, option) != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
 
     const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
@@ -16117,11 +16526,12 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, auto_default));
     try validatePromptCacheExecutionMode(true, auto_default);
 
     const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
@@ -16134,7 +16544,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
@@ -19248,7 +19658,7 @@ const GenerationRequestFailure = struct {
 };
 
 const memory_budget_exceeded_message =
-    "model execution exceeds the configured inference memory budget; increase the relevant budget (for CPU models, --host-budget-mb) or choose a smaller/quantized model";
+    "model execution exceeds the configured inference memory budget; increase the applicable --host-budget-mb, --backend-budget-mb, --combined-budget-mb, --kv-budget-mb, --scratch-budget-mb, or --process-memory-budget-mb, or choose a smaller/quantized model";
 
 fn logMemoryBudgetExceeded(
     session: backends_mod.Session,
@@ -19350,6 +19760,10 @@ fn writeInternalStreamError(
     stage: []const u8,
     err: anyerror,
 ) void {
+    if (std.mem.eql(u8, stage, "STREAM_WRITE_FAILED") and generationStreamWriteIsPeerDisconnect(err)) {
+        if (!builtin.is_test) std.log.info("generation stream closed after client disconnect", .{});
+        return;
+    }
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 

@@ -850,6 +850,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_decode_gqa_split_calls: u64 = 0,
+    metal_runtime_decode_gqa_split_min_kv_tokens: u64 = 0,
+    metal_runtime_decode_gqa_split_below_min_kv_calls: u64 = 0,
     metal_runtime_decode_gqa_split_fallback_calls: u64 = 0,
     metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
@@ -966,6 +968,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
     metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
+    metal_runtime_lm_head_q4_resident_sampling_rejections: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
     /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
     metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,

@@ -353,24 +353,44 @@ pub fn runFromArgs(
     }
 }
 
+const run_usage_options =
+    \\options:
+    \\  --host <address>                    Listen address (default: 127.0.0.1)
+    \\  --port <port>                       Listen port (default: 8090)
+    \\  --models-dir <path>                 AI model directory
+    \\  --ml-dir <path>                     Predictor model directory
+    \\  --config <path>                     JSON run configuration
+    \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
+    \\  --max-concurrent-requests <count>    Request concurrency limit
+    \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
+    \\  --host-budget-mb <n>                 Host-memory admission override (MiB)
+    \\  --backend-budget-mb <n>              Device-memory admission override (MiB)
+    \\  --combined-budget-mb <n>             Combined-memory admission override (MiB)
+    \\  --kv-budget-mb <n>                   KV-cache admission override (MiB)
+    \\  --scratch-budget-mb <n>              Scratch-memory admission override (MiB)
+    \\  --kernel-jit-mode <mode>             off, shadow, on, or required
+    \\  --preload-model <spec>               Warm a model at startup; repeatable
+    \\  --allow-insecure-public-bind         Permit a non-loopback listener without built-in auth/TLS
+    \\  --allow-unknown-models               Allow models absent from the registry
+    \\  -h, --help                           Show this help and exit
+    \\
+;
+
 fn printRunUsage(usage_name: []const u8) void {
-    print(
-        \\usage: {s} run [options]
-        \\
-        \\options:
-        \\  --host <address>                    Listen address (default: 127.0.0.1)
-        \\  --port <port>                       Listen port (default: 8090)
-        \\  --models-dir <path>                 AI model directory
-        \\  --ml-dir <path>                     Predictor model directory
-        \\  --config <path>                     JSON run configuration
-        \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
-        \\  --max-concurrent-requests <count>    Request concurrency limit
-        \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
-        \\  --preload-model <spec>               Warm a model at startup; repeatable
-        \\  --allow-unknown-models               Allow models absent from the registry
-        \\  -h, --help                           Show this help and exit
-        \\
-    , .{usage_name});
+    print("usage: {s} run [options]\n\n{s}", .{ usage_name, run_usage_options });
+}
+
+test "run help documents every accepted memory budget override" {
+    for ([_][]const u8{
+        "--process-memory-budget-mb",
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, run_usage_options, option) != null);
+    }
 }
 
 const ProcessMemoryBudgetSource = enum {
@@ -403,6 +423,16 @@ fn resolveProcessMemoryBudgetMib(
     };
     if (config_value) |value| return .{ .value_mib = value, .source = .config };
     return .{ .value_mib = null, .source = .automatic };
+}
+
+/// `parseMaxLoadedModelsOverride` validates and resolves this option before the
+/// server loop. The loop must still consume the option and its value so they do
+/// not fall through to `InvalidArguments`.
+fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) bool {
+    if (!std.mem.eql(u8, args[index.*], "--max-loaded-models")) return false;
+    if (index.* + 1 >= args.len) return false;
+    index.* += 1;
+    return true;
 }
 
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -444,6 +474,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
+        } else if (consumeParsedMaxLoadedModelsOption(args, &i)) {
+            // Parsed once above so duplicate flags retain the documented
+            // last-value-wins behavior without a second conversion path.
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
@@ -592,6 +625,19 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     try node.serve(allocator, io, host, port);
 
     print("server stopped.\n", .{});
+}
+
+test "run server option loop consumes max loaded models override" {
+    var index: usize = 0;
+    try std.testing.expect(consumeParsedMaxLoadedModelsOption(
+        &.{ "--max-loaded-models", "1" },
+        &index,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), index);
+
+    index = 0;
+    try std.testing.expect(!consumeParsedMaxLoadedModelsOption(&.{"--host"}, &index));
+    try std.testing.expectEqual(@as(usize, 0), index);
 }
 
 fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {

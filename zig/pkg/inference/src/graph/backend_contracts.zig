@@ -520,6 +520,10 @@ pub const DecoderRuntimeApplyRmsNormLinearRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    /// Diagnostic-only escape hatch used by the fail-closed LM-head repack
+    /// quality campaign. Ordinary full-logit consumers retain checkpoint
+    /// semantics through the exact companion slot.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = struct {
@@ -559,6 +563,11 @@ pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = struct {
 /// Sample from the full logits left resident in the backend's sample-logits
 /// buffer by the most recent decode frame's fused lm-head tail.
 pub const DecoderRuntimeSampleResidentLogitsRequest = struct {
+    /// Identifies the tail that produced the resident buffer. Backends use the
+    /// slot and shape to reject sampling when that buffer contains lossy
+    /// transformed logits rather than checkpoint-format logits.
+    linear_slot: usize,
+    hidden_size: usize,
     out_dim: usize,
     /// Gemma-style final-logit softcap applied on-device before sampling
     /// (0 = disabled).
@@ -582,6 +591,17 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
+    /// True only for the vocab-projection (lm_head) slot; gates head-specific
+    /// prepare transforms (the opt-in Q4 repack) so shape heuristics cannot
+    /// misfire on large FFN projections.
+    lm_head: bool = false,
+    /// Optional slot that retains the checkpoint-format lm_head while `slot`
+    /// carries a lossy fast-path transform. Backends that do not implement
+    /// exact candidate refinement ignore it.
+    lm_head_refine_slot: ?usize = null,
+    /// Stage this dense-BF16 slot to Q8_0 at prepare time (half the bytes,
+    /// planned quant-MMV route instead of a dense encoder break).
+    prefer_q8_over_dense_bf16: bool = false,
     allow_direct_quant_fallback: bool = false,
     prefer_bf16_fallback: bool = false,
     prefer_f16_mps_fallback: bool = false,
@@ -600,6 +620,8 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     input: CT,
     in_dim: usize,
     out_dim: usize,
+    /// See DecoderRuntimeApplyRmsNormLinearRequest.use_transformed_lm_head.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {
