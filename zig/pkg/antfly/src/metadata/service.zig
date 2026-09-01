@@ -886,6 +886,78 @@ fn storesHaveDenseNativeStorageStatus(stores: []const metadata_table_manager.Sto
     return false;
 }
 
+fn storesHaveDenseNativeAuthority(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        for (store.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (index_status.dense_native_storage_phase == .native_authoritative) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn validateDenseNativeStoreAdmission(
+    stores: []const metadata_table_manager.StoreRecord,
+    record: metadata_table_manager.StoreRecord,
+) !void {
+    if (!metadata_table_manager.storeServesTableData(record.role)) return;
+    // The committed store set is the rollout floor. Once every table-serving
+    // member is capable, do not admit a legacy member during the shadow-build
+    // window: already-running stores may have opened their monotonic migration
+    // gate even before the first native pointer is published.
+    var saw_table_store = false;
+    var all_table_stores_capable = true;
+    for (stores) |store| {
+        if (!metadata_table_manager.storeServesTableData(store.role)) continue;
+        saw_table_store = true;
+        if (!metadata_table_manager.denseNativeStorageProtocolSupported(
+            store.reporter_incarnation,
+            store.dense_native_storage_protocol_version,
+        )) all_table_stores_capable = false;
+    }
+    if (!storesHaveDenseNativeAuthority(stores) and
+        !(saw_table_store and all_table_stores_capable)) return;
+    if (!metadata_table_manager.denseNativeStorageProtocolSupported(
+        record.reporter_incarnation,
+        record.dense_native_storage_protocol_version,
+    )) return error.DenseNativeStorageProtocolUnavailable;
+}
+
+test "native authority rejects legacy table-store admission but permits metadata roles" {
+    const indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "dense_idx",
+        .kind = "dense_vector",
+        .dense_native_storage_phase = .native_authoritative,
+    }};
+    const runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .indexes = @constCast(&indexes),
+    }};
+    const stores = [_]metadata_table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .reporter_incarnation = 10,
+        .dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version,
+        .runtime_statuses = @constCast(&runtime_statuses),
+    }};
+    const legacy_data = metadata_table_manager.StoreRecord{
+        .store_id = 2,
+        .node_id = 2,
+    };
+    try std.testing.expectError(
+        error.DenseNativeStorageProtocolUnavailable,
+        validateDenseNativeStoreAdmission(&stores, legacy_data),
+    );
+    var metadata_only = legacy_data;
+    metadata_only.role = "metadata";
+    try validateDenseNativeStoreAdmission(&stores, metadata_only);
+
+    var capable_data = legacy_data;
+    capable_data.reporter_incarnation = 11;
+    capable_data.dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version;
+    try validateDenseNativeStoreAdmission(&stores, capable_data);
+}
+
 fn storesHaveRuntimeReporterFence(stores: []const metadata_table_manager.StoreRecord) bool {
     for (stores) |store| {
         if (store.reporter_incarnation != 0) return true;
@@ -927,6 +999,7 @@ fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.status_generation = 0;
     record.artifact_sources_protocol_version = 0;
     record.native_generation_restore_version = 0;
+    record.dense_native_storage_protocol_version = 0;
 }
 
 fn runtimeStatusProtocolSafeCommand(
@@ -952,7 +1025,8 @@ fn runtimeStatusProtocolSafeCommand(
                 storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
                 record.artifact_sources_protocol_version != 0 or
-                record.native_generation_restore_version != 0;
+                record.native_generation_restore_version != 0 or
+                record.dense_native_storage_protocol_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             // Projection debt is a readiness fence. Encoding it as v12/v13
             // would turn pending work into ready state, so it has no safe
@@ -962,7 +1036,8 @@ fn runtimeStatusProtocolSafeCommand(
             // clone of already-committed v13 state. Downgrading it would erase
             // causal authority. Retry after readiness can be proven instead.
             if (record.reporter_incarnation != 0 or
-                record.native_generation_restore_version != 0)
+                record.native_generation_restore_version != 0 or
+                record.dense_native_storage_protocol_version != 0)
             {
                 return error.RuntimeStatusProtocolUnavailable;
             }
@@ -985,7 +1060,8 @@ fn runtimeStatusProtocolSafeCommand(
                 storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
                 record.artifact_sources_protocol_version != 0 or
-                record.native_generation_restore_version != 0;
+                record.native_generation_restore_version != 0 or
+                record.dense_native_storage_protocol_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             if (native_storage_status or vector_projection_pending) return error.RuntimeStatusProtocolUnavailable;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
@@ -2560,6 +2636,9 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
+        const stores = try self.listProjectedStores(self.alloc);
+        defer self.freeProjectedStores(self.alloc, stores);
+        try validateDenseNativeStoreAdmission(stores, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
@@ -4609,6 +4688,11 @@ pub const MetadataHttpService = struct {
         return @max(cached, version);
     }
 
+    fn denseNativeStorageProtocolActivationVersion(self: *MetadataHttpService) u16 {
+        const store = self.projectedStore() orelse return 0;
+        return store.getDenseNativeStorageProtocolActivationVersion(self.metadata_group_id) catch 0;
+    }
+
     fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
         if (self.runtimeStatusProtocolActivationVersion() >=
             metadata_runtime_status_protocol.native_restore_identity_record_version) return true;
@@ -4835,6 +4919,9 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
+        const stores = try self.listProjectedStores(self.alloc);
+        defer self.freeProjectedStores(self.alloc, stores);
+        try validateDenseNativeStoreAdmission(stores, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
@@ -5684,6 +5771,8 @@ pub const MetadataHttpService = struct {
         snapshot: *MetadataStatus,
     ) void {
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
+        snapshot.dense_native_storage_protocol_activated_version =
+            self.denseNativeStorageProtocolActivationVersion();
         snapshot.runtime_status_protocol_ready_version =
             if (self.runtimeStatusRepairProtocolReady())
                 metadata_runtime_status_protocol.current_record_version

@@ -752,6 +752,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
         .store_id = 13,
         .node_id = 1,
         .reporter_incarnation = 0x1234,
+        .dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version,
     } });
     defer std.testing.allocator.free(activate_reporter_fence);
     const reporter_fence_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -763,11 +764,33 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
         .commit_index = 4,
         .entries_bytes = reporter_fence_entries,
     });
-    try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
+    try std.testing.expectEqual(@as(u64, 4), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try source.getRuntimeStatusProtocolActivationVersion(group_id),
     );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try source.getDenseNativeStorageProtocolActivationVersion(group_id),
+    );
+    const stale_legacy_store = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 14,
+        .node_id = 2,
+    } });
+    defer std.testing.allocator.free(stale_legacy_store);
+    const stale_legacy_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 5, .entry_type = .normal, .data = stale_legacy_store },
+    });
+    defer std.testing.allocator.free(stale_legacy_entries);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 5,
+        .entries_bytes = stale_legacy_entries,
+    });
+    const activated_stores = try source.listStores(std.testing.allocator, group_id);
+    defer source.freeStores(std.testing.allocator, activated_stores);
+    try std.testing.expectEqual(@as(usize, 1), activated_stores.len);
+    try std.testing.expectEqual(@as(u64, 13), activated_stores[0].store_id);
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(snapshot);
     source.deinit();
@@ -777,22 +800,30 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
     const reopened_cursor = try reopened.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, reopened_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 2), reopened_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 4), reopened_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
     );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try reopened.getDenseNativeStorageProtocolActivationVersion(group_id),
+    );
 
     var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
     defer target.deinit();
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 4, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 5, snapshot));
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
     const installed_cursor = try target.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, installed_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 2), installed_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 4), installed_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try target.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try target.getDenseNativeStorageProtocolActivationVersion(group_id),
     );
 }
 
@@ -1347,6 +1378,23 @@ pub const RaftApplyStore = struct {
         };
         defer self.alloc.free(encoded);
         return (try decodeMetadataIncarnationRecord(encoded)).runtime_status_record_version;
+    }
+
+    /// Returns the durable data-plane capability floor. Unlike an observed
+    /// store snapshot, this value is monotonic and is applied in the same Raft
+    /// transaction that closes admission to legacy table-serving stores.
+    pub fn getDenseNativeStorageProtocolActivationVersion(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !u16 {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return (try decodeMetadataIncarnationRecord(encoded)).dense_native_storage_protocol_activated_version;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -2666,6 +2714,7 @@ pub const RaftApplyStore = struct {
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
                 defer metadata_table_manager.freeStore(self.alloc, applied);
+                if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
@@ -2685,6 +2734,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
+                if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
@@ -4467,7 +4517,8 @@ fn replicationCutoverRetirementCleared(
 const transition_magic = "afmd1";
 const group_status_record_version: u16 = 4;
 const metadata_incarnation_extension_magic = "afmi1";
-const metadata_incarnation_extension_version: u16 = 1;
+const metadata_incarnation_extension_runtime_status_version: u16 = 1;
+const metadata_incarnation_extension_version: u16 = 2;
 // Store records predate framing and are read by mixed-version metadata
 // replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
 // self-identifying for current readers, but legacy readers do not ignore them;
@@ -4476,13 +4527,15 @@ const store_record_extension_magic = "afsx1";
 const store_record_extension_legacy_version: u16 = 1;
 const store_record_extension_reporter_version: u16 = 2;
 const store_record_extension_native_restore_version: u16 = 3;
-const store_record_extension_version: u16 = 4;
+const store_record_extension_artifact_sources_version: u16 = 4;
+const store_record_extension_version: u16 = 5;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
 const MetadataIncarnationRecord = struct {
     incarnation: metadata_incarnation.MetadataClusterIncarnation,
     runtime_status_record_version: u16 = 0,
+    dense_native_storage_protocol_activated_version: u16 = 0,
 };
 
 fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationRecord {
@@ -4494,8 +4547,8 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
     if (encoded.len == incarnation_len) return .{ .incarnation = incarnation };
 
-    const extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
-    if (encoded.len != incarnation_len + extension_len or
+    const minimum_extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    if (encoded.len < incarnation_len + minimum_extension_len or
         !std.mem.eql(
             u8,
             encoded[incarnation_len..][0..metadata_incarnation_extension_magic.len],
@@ -4507,17 +4560,61 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     var pos: usize = incarnation_len + metadata_incarnation_extension_magic.len;
     const extension_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
     pos += @sizeOf(u16);
-    if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    if (extension_version != metadata_incarnation_extension_runtime_status_version and
+        extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    const trailing_len: usize = if (extension_version >= metadata_incarnation_extension_version)
+        @sizeOf(u16)
+    else
+        0;
+    const expected_len = incarnation_len + minimum_extension_len + trailing_len;
+    if (encoded.len != expected_len) return error.InvalidMetadataIncarnation;
     const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
-    if (runtime_status_record_version < runtime_status_protocol.repair_status_record_version or
-        runtime_status_record_version > runtime_status_protocol.current_record_version)
+    pos += @sizeOf(u16);
+    if (runtime_status_record_version != 0 and
+        (runtime_status_record_version < runtime_status_protocol.repair_status_record_version or
+            runtime_status_record_version > runtime_status_protocol.current_record_version))
     {
         return error.InvalidMetadataIncarnation;
     }
+    const dense_native_storage_protocol_activated_version = if (extension_version >= metadata_incarnation_extension_version)
+        std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little)
+    else
+        0;
+    if (dense_native_storage_protocol_activated_version >
+        metadata_table_manager.dense_native_storage_protocol_version) return error.InvalidMetadataIncarnation;
     return .{
         .incarnation = incarnation,
         .runtime_status_record_version = runtime_status_record_version,
+        .dense_native_storage_protocol_activated_version = dense_native_storage_protocol_activated_version,
     };
+}
+
+fn writeMetadataIncarnationRecordTxn(
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    record: MetadataIncarnationRecord,
+) !void {
+    var key_buf: [160]u8 = undefined;
+    const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len +
+        @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16);
+    var encoded: [encoded_len]u8 = undefined;
+    @memcpy(encoded[0..incarnation_len], &record.incarnation);
+    var pos: usize = incarnation_len;
+    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
+    pos += metadata_incarnation_extension_magic.len;
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], record.runtime_status_record_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(
+        u16,
+        encoded[pos..][0..@sizeOf(u16)],
+        record.dense_native_storage_protocol_activated_version,
+        .little,
+    );
+    try txn.put(key, &encoded);
 }
 
 fn activateRuntimeStatusProtocolTxn(
@@ -4534,22 +4631,75 @@ fn activateRuntimeStatusProtocolTxn(
         error.NotFound => return,
         else => return err,
     };
-    const decoded = try decodeMetadataIncarnationRecord(existing);
+    var decoded = try decodeMetadataIncarnationRecord(existing);
     if (target_version < runtime_status_protocol.repair_status_record_version or
         target_version > runtime_status_protocol.current_record_version) return error.InvalidMetadataTransitionEncoding;
     if (decoded.runtime_status_record_version >= target_version) return;
 
-    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
-    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
-    var encoded: [encoded_len]u8 = undefined;
-    @memcpy(encoded[0..incarnation_len], &decoded.incarnation);
-    var pos: usize = incarnation_len;
-    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
-    pos += metadata_incarnation_extension_magic.len;
-    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
-    pos += @sizeOf(u16);
-    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], target_version, .little);
-    try txn.put(key, &encoded);
+    decoded.runtime_status_record_version = target_version;
+    try writeMetadataIncarnationRecordTxn(txn, group_id, decoded);
+}
+
+/// Atomically admits a store against the durable dense-native capability
+/// floor and activates that floor when `incoming` completes a fully capable
+/// table-serving set. Returning false makes a stale, already-committed legacy
+/// registration a deterministic no-op instead of reopening an unsafe rollout
+/// window between service-side validation and Raft application.
+fn admitDenseNativeStoreTxn(
+    self: *RaftApplyStore,
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    incoming: metadata.StoreRecord,
+) !bool {
+    var incarnation_key_buf: [160]u8 = undefined;
+    const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
+    const encoded_incarnation = txn.get(incarnation_key) catch |err| switch (err) {
+        // Preserve direct state-machine test/embedding behavior before cluster
+        // initialization. Production registration initializes this first.
+        error.NotFound => return true,
+        else => return err,
+    };
+    var incarnation_record = try decodeMetadataIncarnationRecord(encoded_incarnation);
+    const incoming_serves_tables = metadata_table_manager.storeServesTableData(incoming.role);
+    const incoming_capable = metadata_table_manager.denseNativeStorageProtocolSupported(
+        incoming.reporter_incarnation,
+        incoming.dense_native_storage_protocol_version,
+    );
+    if (incarnation_record.dense_native_storage_protocol_activated_version >=
+        metadata_table_manager.dense_native_storage_protocol_version)
+    {
+        return !incoming_serves_tables or incoming_capable;
+    }
+    if (!incoming_serves_tables or !incoming_capable) return true;
+
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = try storePrefixForGroup(&prefix_buf, group_id);
+    var cur = try txn.openCursor();
+    defer cur.close();
+    var entry = try cur.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cur.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const store = try decodeStoreRecord(self.alloc, kv.value);
+        defer metadata_table_manager.freeStore(self.alloc, store);
+        if (store.store_id == incoming.store_id or
+            !metadata_table_manager.storeServesTableData(store.role)) continue;
+        if (!metadata_table_manager.denseNativeStorageProtocolSupported(
+            store.reporter_incarnation,
+            store.dense_native_storage_protocol_version,
+        )) return true;
+    }
+
+    incarnation_record.dense_native_storage_protocol_activated_version =
+        metadata_table_manager.dense_native_storage_protocol_version;
+    try writeMetadataIncarnationRecordTxn(txn, group_id, incarnation_record);
+    // Activation changes placement admissibility and must advance the durable
+    // catalog revision. The paired store update is otherwise status-only and
+    // deliberately does not invalidate catalog projections.
+    self.notifyProjectionListeners(.{
+        .kind = .metadata_incarnation,
+        .metadata_group_id = group_id,
+    });
+    return true;
 }
 
 fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
@@ -4581,7 +4731,8 @@ fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     if (record.reporter_incarnation != 0 or record.status_generation != 0 or
-        record.native_generation_restore_version != 0)
+        record.native_generation_restore_version != 0 or
+        record.dense_native_storage_protocol_version != 0)
         return runtime_status_protocol.current_record_version;
     if (storeHasDenseNativeStorageStatus(record)) return runtime_status_protocol.dense_native_storage_record_version;
     if (storeHasVectorProjectionStatus(record)) return runtime_status_protocol.vector_projection_record_version;
@@ -5383,6 +5534,10 @@ fn appendStoreRecordExtensions(
         record.reporter_incarnation,
         record.artifact_sources_protocol_version,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        record.reporter_incarnation,
+        record.dense_native_storage_protocol_version,
+    )) return error.InvalidStoreReporterFence;
     var observation_count: u32 = 0;
     for (record.group_statuses) |status| {
         if (status.observed_reallocation_request_id != 0) observation_count += 1;
@@ -5390,11 +5545,15 @@ fn appendStoreRecordExtensions(
     const has_reporter_fence = record.reporter_incarnation != 0 or record.status_generation != 0;
     const has_artifact_protocol = record.artifact_sources_protocol_version != 0;
     const has_native_restore_capability = record.native_generation_restore_version != 0;
-    if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and !has_native_restore_capability) return;
+    const has_dense_native_protocol = record.dense_native_storage_protocol_version != 0;
+    if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and
+        !has_native_restore_capability and !has_dense_native_protocol) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_artifact_protocol)
+    const version: u16 = if (has_dense_native_protocol)
         store_record_extension_version
+    else if (has_artifact_protocol)
+        store_record_extension_artifact_sources_version
     else if (has_native_restore_capability)
         store_record_extension_native_restore_version
     else if (has_reporter_fence)
@@ -5409,8 +5568,10 @@ fn appendStoreRecordExtensions(
     if (version >= store_record_extension_native_restore_version) {
         try appendInt(alloc, out, u16, record.native_generation_restore_version);
     }
-    if (version >= store_record_extension_version)
+    if (version >= store_record_extension_artifact_sources_version)
         try appendInt(alloc, out, u16, record.artifact_sources_protocol_version);
+    if (version >= store_record_extension_version)
+        try appendInt(alloc, out, u16, record.dense_native_storage_protocol_version);
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -5494,6 +5655,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .status_generation = extensions.status_generation,
         .artifact_sources_protocol_version = extensions.artifact_sources_protocol_version,
         .native_generation_restore_version = extensions.native_generation_restore_version,
+        .dense_native_storage_protocol_version = extensions.dense_native_storage_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -5517,7 +5679,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0 } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -5534,6 +5696,7 @@ fn readStoreRecordExtensions(
     if (version != store_record_extension_legacy_version and
         version != store_record_extension_reporter_version and
         version != store_record_extension_native_restore_version and
+        version != store_record_extension_artifact_sources_version and
         version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
@@ -5548,13 +5711,21 @@ fn readStoreRecordExtensions(
         try readInt(encoded, pos, u16)
     else
         0;
-    const artifact_sources_protocol_version = if (version >= store_record_extension_version)
+    const artifact_sources_protocol_version = if (version >= store_record_extension_artifact_sources_version)
+        try readInt(encoded, pos, u16)
+    else
+        0;
+    const dense_native_storage_protocol_version = if (version >= store_record_extension_version)
         try readInt(encoded, pos, u16)
     else
         0;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         reporter_incarnation,
         artifact_sources_protocol_version,
+    )) return error.InvalidMetadataTransitionEncoding;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        reporter_incarnation,
+        dense_native_storage_protocol_version,
     )) return error.InvalidMetadataTransitionEncoding;
     const observation_count = try readInt(encoded, pos, u32);
     var observation_index: u32 = 0;
@@ -5572,6 +5743,7 @@ fn readStoreRecordExtensions(
         .status_generation = status_generation,
         .artifact_sources_protocol_version = artifact_sources_protocol_version,
         .native_generation_restore_version = native_generation_restore_version,
+        .dense_native_storage_protocol_version = dense_native_storage_protocol_version,
     };
 }
 
@@ -11421,6 +11593,7 @@ test "metadata raft apply store transition codec preserves combined store capabi
             .reporter_incarnation = 0x1234,
             .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
             .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -11435,6 +11608,10 @@ test "metadata raft apply store transition codec preserves combined store capabi
     try std.testing.expectEqual(
         metadata_table_manager.artifact_sources_protocol_version,
         decoded.register_store.artifact_sources_protocol_version,
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        decoded.register_store.dense_native_storage_protocol_version,
     );
 }
 

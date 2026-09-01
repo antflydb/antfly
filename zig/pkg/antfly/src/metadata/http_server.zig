@@ -2748,6 +2748,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
         native_generation_restore_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -2777,6 +2778,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -2788,6 +2793,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -2880,6 +2886,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -2903,6 +2910,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -2914,6 +2925,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,

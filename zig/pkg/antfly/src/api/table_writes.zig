@@ -1548,6 +1548,7 @@ pub const ProvisionedTableWriteCache = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    dense_native_migration_policy_source: ?db_mod.DenseNativeMigrationPolicySource = null,
     /// Cross-shard entity-resolution candidate source applied to every managed
     /// DB this cache opens (set after open; see `setResolutionCandidateSource`).
     resolution_candidate_source: ?db_mod.CandidateSource = null,
@@ -6574,6 +6575,7 @@ pub const ProvisionedTableWriteSource = struct {
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     restore_open_options: backups_api.OpenOptions = .{},
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    dense_native_migration_policy_source: ?db_mod.DenseNativeMigrationPolicySource = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource = null,
@@ -9922,6 +9924,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.destination_authorizer = self.destination_authorizer;
             effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
+            effective_open_options.dense_native_migration_policy_source = cache.dense_native_migration_policy_source;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
             effective_open_options.ha_async_batch_mirror = effective_ha_mirror;
@@ -10983,6 +10986,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .inference_api_url = self.inference_api_url,
+                    .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
                     .schema_json_before_index_load = metadata.schema_json,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
@@ -11367,6 +11371,7 @@ pub const ProvisionedTableWriteSource = struct {
                     identity_namespace,
                     .{
                         .drain_resolver_backfill = false,
+                        .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
                         .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .ha_write_gate = self.ha_write_gate,
@@ -23644,6 +23649,7 @@ const ManagedDbOpenOptions = struct {
     native_restore_open_plan: ?*const db_mod.NativeRestoreOpenPlan = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
     transaction_recovery: db_mod.transaction_runtime.Config = .{},
+    dense_native_migration_policy_source: ?db_mod.DenseNativeMigrationPolicySource = null,
     /// Restrict metadata reconciliation during a cold open to one index. The
     /// full JSON remains available to construct managed producer runtimes, but
     /// sibling index and resolver catalogs are left untouched.
@@ -23812,6 +23818,12 @@ fn existingPrimaryBackend() @TypeOf((db_mod.OpenOptions{}).primary_backend) {
     };
 }
 
+fn managedIndexBackends(
+    source: ?db_mod.DenseNativeMigrationPolicySource,
+) @TypeOf((db_mod.OpenOptions{}).index_backends) {
+    return .{ .dense_native_migration_policy_source = source };
+}
+
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -23888,12 +23900,14 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 resolved.ttl_cleanup = .{ .enabled = false };
                 resolved.transaction_recovery = .{ .enabled = false };
                 resolved.text_merge = .{ .enabled = false };
+                resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
                 return try db_mod.DB.open(allocator, db_path, resolved);
             }
 
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
                 .hbc_cache = vector_cache,
+                .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                 .lsm_root_generation = root_generation,
                 .resource_manager = manager,
                 .backend_runtime = runtime,
@@ -23916,6 +23930,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -23934,6 +23949,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -23959,6 +23975,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -23978,6 +23995,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .startup_catch_up => try db_mod.DB.open(allocator, db_path, .{
                     .lsm_cache = cache,
                     .hbc_cache = vector_cache,
+                    .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
                     .backend_runtime = runtime,
@@ -24019,6 +24037,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -24041,6 +24060,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -24062,6 +24082,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -24081,6 +24102,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -24099,6 +24121,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -24118,6 +24141,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
+                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,

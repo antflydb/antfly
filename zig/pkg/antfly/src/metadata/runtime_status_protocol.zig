@@ -41,4 +41,8 @@ pub const dense_native_storage_record_version: u16 = 18;
 /// length-delimited TLV extension area. Unknown extensions can be skipped
 /// during rolling upgrades without positional tail arithmetic.
 pub const framed_index_status_record_version: u16 = 19;
-pub const current_record_version: u16 = framed_index_status_record_version;
+/// V20 carries the data-plane native HBC authority capability in StoreRecord's
+/// framed extension. Activation must precede publishing that capability so an
+/// older metadata voter never encounters the new extension version.
+pub const dense_native_capability_record_version: u16 = 20;
+pub const current_record_version: u16 = dense_native_capability_record_version;

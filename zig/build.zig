@@ -8629,7 +8629,10 @@ pub fn build(b: *std.Build) void {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            .max_rss = 8 * 1024 * 1024 * 1024,
+            // The consolidated service/HTTP lane reaches roughly 9.3 GiB on
+            // macOS Zig 0.16. This is compiler scheduling capacity, not an
+            // Antfly runtime budget; retain headroom for codegen variance.
+            .max_rss = 12 * 1024 * 1024 * 1024,
         });
     }
     const unit_metadata_compile_step = b.step(

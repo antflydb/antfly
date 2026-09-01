@@ -9324,34 +9324,33 @@ pub const HBCIndex = struct {
         generation_owned = false;
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_overlay_collapsed_wal_bytes = state.wal_committed_bytes;
-        self.cleanupLegacyLsmArtifactsAfterNativeReopenBestEffort();
         self.detachLegacyLsmAfterNativeActivationBestEffort();
     }
 
-    /// Native authority is crash-sticky, but the process that publishes it can
-    /// still have pre-publication query leases on compatibility LSM runs. Do
-    /// not unlink those files in that process. On a later native-first reopen
-    /// no LSM handle was created, the posting generation has been fully
-    /// validated above, and the duplicate files can be reclaimed safely.
-    fn cleanupLegacyLsmArtifactsAfterNativeReopenBestEffort(self: *HBCIndex) void {
+    /// Physical retirement is deliberately separate from native authority.
+    /// The catalog must retain legacy files through its downgrade/rollback
+    /// window and call this only after advancing the cluster's minimum binary
+    /// floor. Merely reopening an authoritative generation is not proof that
+    /// every possible owner has crossed that floor.
+    pub fn retireLegacyLsmArtifactsAfterCatalogFence(self: *HBCIndex) !void {
         if (self.env_owner != .native) return;
         const native = self.env_owner.native;
         const directories = [_][]const u8{ "runs", "wal" };
         for (directories) |name| {
-            const path = std.fs.path.join(self.alloc, &.{ native.root_dir, name }) catch return;
+            const path = try std.fs.path.join(self.alloc, &.{ native.root_dir, name });
             defer self.alloc.free(path);
             native.storage.deleteTree(path) catch |err| switch (err) {
                 error.FileNotFound => {},
-                else => std.log.warn("HBC native legacy LSM directory cleanup deferred path={s} err={s}", .{ name, @errorName(err) }),
+                else => return err,
             };
         }
         const files = [_][]const u8{ "manifest.bin", "writer.lock", "wal.lock" };
         for (files) |name| {
-            const path = std.fs.path.join(self.alloc, &.{ native.root_dir, name }) catch return;
+            const path = try std.fs.path.join(self.alloc, &.{ native.root_dir, name });
             defer self.alloc.free(path);
             native.storage.deleteFileAbsolute(path) catch |err| switch (err) {
                 error.FileNotFound => {},
-                else => std.log.warn("HBC native legacy LSM file cleanup deferred path={s} err={s}", .{ name, @errorName(err) }),
+                else => return err,
             };
         }
     }
@@ -20147,6 +20146,19 @@ test "stable generation finalization bootstraps capture-free rebuild into native
     try std.testing.expect(reopened.env_owner == .native);
     reopened.setExternalVectorLoader(&loader_context, Loader.load);
     try std.testing.expectEqual(@as(u64, 7), try reopened.activateExperimentalPostingReadsAtOrAfter(7));
+    // Native authority and physical retirement are distinct catalog phases.
+    // Reopen must preserve the legacy generation for the rollback window.
+    for ([_][]const u8{ "runs", "wal", "manifest.bin" }) |name| {
+        const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(path), name });
+        defer alloc.free(legacy_path);
+        try std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{});
+    }
+    var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
+    try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
+
+    try reopened.retireLegacyLsmArtifactsAfterCatalogFence();
     for ([_][]const u8{ "runs", "wal", "manifest.bin", "writer.lock", "wal.lock" }) |name| {
         const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(path), name });
         defer alloc.free(legacy_path);
@@ -20155,10 +20167,6 @@ test "stable generation finalization bootstraps capture-free rebuild into native
             std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
         );
     }
-    var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
-    defer results.deinit();
-    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
-    try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
 }
 
 test "posting WAL capture can begin inside a streaming replay session" {

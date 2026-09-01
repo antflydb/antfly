@@ -506,6 +506,8 @@ pub const OpenOptions = struct {
     ha_write_gate: ?HAWriteGate = null,
 };
 
+pub const DenseNativeMigrationPolicySource = db_config.DenseNativeMigrationPolicySource;
+
 /// Immutable backend decision shared by every phase of one native restore.
 /// The runtime configurator is evaluated once against the final logical DB
 /// identity; candidate opens receive an explicit path-bound proof and never
@@ -889,6 +891,7 @@ fn retryableIndexRepairTerminalPhase(
     // after source artifacts are reprocessed. Structural-invalid and
     // externally supplied generations retain fail-closed classification.
     if (trigger != .operator_generation_rebuild and
+        trigger != .storage_format_migration and
         trigger != .artifact_coverage_mismatch and
         trigger != .replay_artifact_unavailable)
     {
@@ -12221,7 +12224,7 @@ pub const DB = struct {
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
-            .operator_generation_rebuild => intent.phase == .activating or
+            .operator_generation_rebuild, .storage_format_migration => intent.phase == .activating or
                 intent.phase == .validating or
                 intent.phase == .rolling_back,
             .replay_artifact_unavailable => intent.phase == .activating or
@@ -12873,6 +12876,8 @@ pub const DB = struct {
     ) !?AutomaticDenseGenerationRepairClassification {
         if (cfg.kind != .dense_vector) return null;
         const entry = self.core.index_manager.denseIndex(cfg.name) orelse return null;
+        const physical_migration_required =
+            try self.core.index_manager.denseNativePhysicalMigrationRequired(cfg.name);
         const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
         if (checkpoint.config_hash != types.indexConfigHash(cfg)) return .{
             .trigger = .projection_generation_invalid,
@@ -12882,23 +12887,30 @@ pub const DB = struct {
             .trigger = .projection_generation_invalid,
             .last_error = "dense_projection_checkpoint_repair_required",
         };
-        if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg)) return null;
+        if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg)) return if (physical_migration_required) .{
+            .trigger = .storage_format_migration,
+            .last_error = "dense_native_v2_migration",
+        } else null;
         const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse return .{
             .trigger = .artifact_counter_missing,
             .last_error = "dense_artifact_counter_missing",
         };
-        if (entry.index.stats().active_count <= expected) return null;
-        const target_sequence = try self.probeDerivedReplayTargetSequence(
-            alloc,
-            self.core.replaySource(),
-            .{ .name = cfg.name, .kind = .dense_vector },
-            checkpoint.applied_sequence,
-        );
-        if (checkpoint.applied_sequence < target_sequence) return null;
-        return .{
-            .trigger = .artifact_coverage_mismatch,
-            .last_error = "dense_artifact_coverage_surplus",
-        };
+        if (entry.index.stats().active_count > expected) {
+            const target_sequence = try self.probeDerivedReplayTargetSequence(
+                alloc,
+                self.core.replaySource(),
+                .{ .name = cfg.name, .kind = .dense_vector },
+                checkpoint.applied_sequence,
+            );
+            if (checkpoint.applied_sequence >= target_sequence) return .{
+                .trigger = .artifact_coverage_mismatch,
+                .last_error = "dense_artifact_coverage_surplus",
+            };
+        }
+        return if (physical_migration_required) .{
+            .trigger = .storage_format_migration,
+            .last_error = "dense_native_v2_migration",
+        } else null;
     }
 
     /// Performs the potentially linear structural proof only on the admitted
@@ -13371,7 +13383,7 @@ pub const DB = struct {
 
     fn automaticDenseGenerationRepairTriggerPriority(trigger: index_repair_state.Trigger) u8 {
         return switch (trigger) {
-            .operator_generation_rebuild, .operator_generation_validation => 0,
+            .operator_generation_rebuild, .operator_generation_validation, .storage_format_migration => 0,
             .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
             .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => 3,
@@ -13407,13 +13419,15 @@ pub const DB = struct {
     ) !AutomaticDenseGenerationRepairIntentOutcome {
         std.debug.assert(trigger == .artifact_coverage_mismatch or
             trigger == .artifact_counter_missing or
-            trigger == .projection_generation_invalid);
+            trigger == .projection_generation_invalid or
+            trigger == .storage_format_migration);
 
-        // Every automatic generation repair represents missing correctness
-        // proof. Close the query gate before persistence so an I/O failure
-        // cannot leave a known-unverified index available.
+        // Correctness repairs close the query gate before persistence. A
+        // physical-format migration is different: v1 remains the proven
+        // serving generation while its v2 shadow is built and caught up.
+        const close_query_gate = trigger != .storage_format_migration;
         const was_unavailable = self.core.index_manager.repairUnavailable(cfg.name);
-        try self.core.index_manager.markUnscopedRepairUnavailable(cfg.name);
+        if (close_query_gate) try self.core.index_manager.markUnscopedRepairUnavailable(cfg.name);
 
         const existing_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
         const repair_id = existing_repair_id orelse try self.createGenerationRepairIntent(
@@ -13441,7 +13455,7 @@ pub const DB = struct {
             if (automaticDenseGenerationRepairTriggerPriority(trigger) <=
                 automaticDenseGenerationRepairTriggerPriority(entry.intent.trigger)) return .{
                 .repair_id = repair_id,
-                .made_progress = !was_unavailable or existing_repair_id == null,
+                .made_progress = existing_repair_id == null or (close_query_gate and !was_unavailable),
             };
             self.updateIndexRepairIntent(alloc, repair_id, .{
                 .trigger = trigger,
@@ -15329,6 +15343,7 @@ pub const DB = struct {
                 entry.intent.kind == .dense_vector and
                 self.enrichment_runtime != null and
                 (current_trigger == .operator_generation_rebuild or
+                    current_trigger == .storage_format_migration or
                     current_trigger == .artifact_coverage_mismatch or
                     current_trigger == .replay_artifact_unavailable))
             {
@@ -15377,6 +15392,7 @@ pub const DB = struct {
             const retryable_replacement_coverage =
                 err == error.RepairSourceCoverageIncomplete and
                 (current_trigger == .operator_generation_rebuild or
+                    current_trigger == .storage_format_migration or
                     current_trigger == .artifact_coverage_mismatch or
                     current_trigger == .replay_artifact_unavailable);
             const terminal_failure =
@@ -16296,10 +16312,18 @@ pub const DB = struct {
             }
         }
 
+        var shadow_backends = self.index_backends;
+        // The parent catalog capability floor authorizes creation of this
+        // private candidate. It must become independently authoritative before
+        // the checksummed manifest and active pointer can publish it.
+        shadow_backends.dense_native_candidate_build_authorized = if (self.index_backends.dense_native_migration_policy_source) |source|
+            source.authorityPermitted()
+        else
+            true;
         var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
             alloc,
             shadow_base,
-            self.index_backends,
+            shadow_backends,
         );
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
@@ -16583,13 +16607,14 @@ pub const DB = struct {
             true,
             false,
         );
-        try index_generation_manifest.writeReady(
+        try index_generation_manifest.writeReadyForPhysicalFormat(
             alloc,
             shadow_index_path,
             generation_id,
             cfg.name,
             types.indexConfigHash(cfg),
             converged_sequence,
+            try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .ready,
@@ -16665,13 +16690,14 @@ pub const DB = struct {
                 false,
                 false,
             );
-            try index_generation_manifest.writeReady(
+            try index_generation_manifest.writeReadyForPhysicalFormat(
                 alloc,
                 shadow_index_path,
                 generation_id,
                 cfg.name,
                 types.indexConfigHash(cfg),
                 converged_sequence,
+                try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
             );
             if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
                 .phase = .ready,
@@ -16704,13 +16730,14 @@ pub const DB = struct {
             true,
             true,
         );
-        try index_generation_manifest.writeReady(
+        try index_generation_manifest.writeReadyForPhysicalFormat(
             alloc,
             shadow_index_path,
             generation_id,
             cfg.name,
             types.indexConfigHash(cfg),
             converged_sequence,
+            try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
         const ready_sequence = try index_generation_manifest.validateReady(
             alloc,
@@ -16855,13 +16882,14 @@ pub const DB = struct {
         // Final replay may advance beyond the preliminary ready marker. Make
         // readiness describe the exact durable generation installed by the
         // pointer swap, not merely the pre-barrier candidate.
-        try index_generation_manifest.writeReady(
+        try index_generation_manifest.writeReadyForPhysicalFormat(
             alloc,
             shadow_index_path,
             generation_id,
             cfg.name,
             types.indexConfigHash(cfg),
             reached_target,
+            try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
         try ensureRepairActivationDeadline(activation_deadline_ns);
         const manifest_sequence = try index_generation_manifest.validateReady(
@@ -17191,6 +17219,18 @@ pub const DB = struct {
         );
     }
 
+    fn shadowIndexPhysicalFormat(
+        shadow_manager: *index_manager_mod.IndexManager,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !index_generation_manifest.PhysicalFormat {
+        if (index_ref.kind != .dense_vector) return .legacy_lsm;
+        const entry = shadow_manager.denseIndex(index_ref.name) orelse return error.IndexNotFound;
+        return if (entry.index.experimentalPostingWalAuthoritative())
+            .dense_native_v2
+        else
+            .legacy_lsm;
+    }
+
     fn indexGenerationRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
         if (self.core.index_manager.loadFailure(index_name) != null) return true;
         // A durable generation intent is itself authoritative repair debt.
@@ -17201,6 +17241,7 @@ pub const DB = struct {
         // fail-closing service. Healthy indexes still require `force` because
         // they have neither an intent nor any of the conditions below.
         if (try self.indexRepairIdForIndex(alloc, index_name) != null) return true;
+        if (try self.core.index_manager.denseNativePhysicalMigrationRequired(index_name)) return true;
         const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
         switch (checkpoint.status) {
             .degraded, .repair_required => return true,
@@ -24136,6 +24177,7 @@ pub const DB = struct {
             applied_sequence: u64,
             target_sequence: u64,
             artifact_counter_required: bool,
+            physical_migration_required: bool = false,
             fallback_target_count: u64 = 0,
             invalid_generation_error: ?[]const u8 = null,
 
@@ -24175,6 +24217,8 @@ pub const DB = struct {
         }
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+            const physical_migration_required =
+                try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name);
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             const generation_repair_pending = entry.index.generationRepairPending();
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
@@ -24184,7 +24228,8 @@ pub const DB = struct {
             else
                 0;
             const watermark_regressed = watermark_count > entry.index.stats().active_count;
-            if (!artifact_backed and !watermark_regressed and !generation_repair_pending) continue;
+            if (!artifact_backed and !watermark_regressed and !generation_repair_pending and
+                !physical_migration_required) continue;
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
@@ -24217,6 +24262,7 @@ pub const DB = struct {
             if (persisted_resume == null and
                 !generation_repair_pending and
                 !checkpoint_config_mismatch and
+                !physical_migration_required and
                 applied_sequence < target_sequence and
                 projection_checkpoint.status != .rebuilding and
                 projection_checkpoint.status != .repair_required)
@@ -24246,6 +24292,7 @@ pub const DB = struct {
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
                 .artifact_counter_required = artifact_counter_required,
+                .physical_migration_required = physical_migration_required,
                 .fallback_target_count = watermark_count,
                 .invalid_generation_error = invalid_generation_error,
             });
@@ -24301,6 +24348,15 @@ pub const DB = struct {
                     .dense_index_idx = dense_index_idx,
                     .trigger = .artifact_coverage_mismatch,
                     .last_error = "dense_artifact_coverage_surplus",
+                });
+                if (candidate.persisted_resume != null) try rebuild_state_cleanups.append(alloc, dense_index_idx);
+                continue;
+            }
+            if (candidate.physical_migration_required) {
+                try generation_repairs.append(alloc, .{
+                    .dense_index_idx = dense_index_idx,
+                    .trigger = .storage_format_migration,
+                    .last_error = "dense_native_v2_migration",
                 });
                 if (candidate.persisted_resume != null) try rebuild_state_cleanups.append(alloc, dense_index_idx);
                 continue;
@@ -25636,7 +25692,7 @@ pub const DB = struct {
                 item.backfill_active = intent.phase != .terminal;
                 item.repair_degraded = true;
             },
-            .operator_generation_rebuild => {
+            .operator_generation_rebuild, .storage_format_migration => {
                 // The prior generation remains the serving generation during
                 // construction. Report background rebuild activity without
                 // falsely degrading a healthy index; activation/validation or
@@ -25664,6 +25720,7 @@ pub const DB = struct {
             return true;
         }
         const generation_build = std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_rebuild)) or
+            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.storage_format_migration)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
@@ -78353,6 +78410,70 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
     );
     try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
     try std.testing.expect(!(try db.hasPendingDenseArtifactRebuild(alloc)));
+}
+
+test "managed dense physical migration is online and uses durable repair intent" {
+    const Gate = struct {
+        permitted: bool = false,
+
+        fn read(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.permitted;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var gate = Gate{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .index_backends = .{ .dense_native_migration_policy_source = .{
+            .ptr = &gate,
+            .authority_permitted = Gate.read,
+        } },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
+    gate.permitted = true;
+    try std.testing.expect(try db.indexGenerationRepairRequired(alloc, "dense_idx"));
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const healthy_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try db.core.saveProjectionCheckpoint("dense_idx", .{
+        .applied_sequence = healthy_checkpoint.applied_sequence,
+        .status = .repair_required,
+        .generation = healthy_checkpoint.generation,
+        .config_hash = healthy_checkpoint.config_hash,
+    });
+    const correctness_classification =
+        (try db.classifyCurrentDenseGenerationRepair(alloc, cfg.*)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        index_repair_state.Trigger.projection_generation_invalid,
+        correctness_classification.trigger,
+    );
+    try db.core.saveProjectionCheckpoint("dense_idx", healthy_checkpoint);
+    const classification = (try db.classifyCurrentDenseGenerationRepair(alloc, cfg.*)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(index_repair_state.Trigger.storage_format_migration, classification.trigger);
+    const repair_id = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        classification.trigger,
+        classification.last_error,
+    );
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_idx"));
+    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Trigger.storage_format_migration, repair.intent.trigger);
+    try std.testing.expectEqual(IndexRepairAdmission.serviceable, DB.indexRepairAdmission(repair.intent));
 }
 
 test "db source artifact debt does not synthesize index generation repair debt" {

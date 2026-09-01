@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const process_memory = @import("antfly_platform").process_memory;
 const hbc_mod = @import("../storage/hbc_adapter.zig");
+const db_mod = @import("../storage/db/db.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -155,6 +156,10 @@ const SmartResourceBudgets = struct {
     lsm_cache_budget_bytes: usize,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
+    /// Closed by default for provisioned databases. Metadata opens this only
+    /// after the complete table-serving store set advertises the native HBC
+    /// protocol, so a rolling old binary can never be handed native authority.
+    dense_native_authority_permitted: std.atomic.Value(bool) = .init(false),
 };
 
 fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
@@ -376,6 +381,7 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
         self.write_cache.remote_content = write_source.remote_content;
+        self.write_cache.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         self.startup_write_cache.lsm_cache = &self.lsm_cache;
         self.startup_write_cache.hbc_cache = &self.hbc_cache;
         self.startup_write_cache.resource_manager = &self.resource_manager;
@@ -383,6 +389,7 @@ pub const ProvisionedGroupStorage = struct {
         self.startup_write_cache.antfly_provider = write_source.antfly_provider;
         self.startup_write_cache.secret_store = write_source.secret_store;
         self.startup_write_cache.remote_content = write_source.remote_content;
+        self.startup_write_cache.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
@@ -395,7 +402,27 @@ pub const ProvisionedGroupStorage = struct {
             &self.write_cache_state_mutex,
         );
         write_source.runtime_status_cache = &self.runtime_status_cache;
+        write_source.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+    }
+
+    pub fn setDenseNativeAuthorityPermitted(self: *ProvisionedGroupStorage, permitted: bool) void {
+        // Monotonic within a process. The durable per-index AUTHORITY marker is
+        // the crash-sticky decision; a transient or older catalog snapshot may
+        // never revoke it or make a later callback close the gate again.
+        if (permitted) self.dense_native_authority_permitted.store(true, .release);
+    }
+
+    fn denseNativeAuthorityPermitted(ptr: *const anyopaque) bool {
+        const self: *const ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        return self.dense_native_authority_permitted.load(.acquire);
+    }
+
+    pub fn denseNativeMigrationPolicySource(self: *const ProvisionedGroupStorage) db_mod.DenseNativeMigrationPolicySource {
+        return .{
+            .ptr = self,
+            .authority_permitted = denseNativeAuthorityPermitted,
+        };
     }
 
     pub fn attachBackendRuntime(
@@ -502,6 +529,17 @@ pub const ProvisionedGroupStorage = struct {
         self.finishGroupVisibleRootGenerationReservation(group_id, advance);
     }
 };
+
+test "provisioned dense native authority gate is fail-closed and monotonic" {
+    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const source = storage.denseNativeMigrationPolicySource();
+    try std.testing.expect(!source.authorityPermitted());
+    storage.setDenseNativeAuthorityPermitted(true);
+    try std.testing.expect(source.authorityPermitted());
+    storage.setDenseNativeAuthorityPermitted(false);
+    try std.testing.expect(source.authorityPermitted());
+}
 
 test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);

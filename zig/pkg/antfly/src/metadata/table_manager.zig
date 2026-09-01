@@ -15,6 +15,9 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+/// The store understands native HBC authority markers, WAL recovery, and the
+/// fail-closed placement contract used during rolling upgrades.
+pub const dense_native_storage_protocol_version: u16 = 1;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -326,6 +329,7 @@ pub const StoreRecord = struct {
     /// not-yet-observed reporter and therefore fails cluster admission closed.
     artifact_sources_protocol_version: u16 = 0,
     native_generation_restore_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -677,6 +681,7 @@ pub const StoreStatusReport = struct {
     /// Monotonic snapshot generation within `reporter_incarnation`.
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -708,6 +713,17 @@ pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_vers
     return reporter_incarnation != 0 and
         protocol_version >= artifact_sources_protocol_version and
         artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= dense_native_storage_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+pub fn denseNativeStorageProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and
+        protocol_version >= dense_native_storage_protocol_version and
+        denseNativeStorageProtocolValid(reporter_incarnation, protocol_version);
 }
 
 /// Store roles are placement classes, not process kinds. Data runtimes may use
@@ -2153,6 +2169,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
+        .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,

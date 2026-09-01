@@ -3657,6 +3657,53 @@ discarded: repeat controlled lifecycles remain the gate for a precise RSS
 claim. The load-time, recall, query-latency, and throughput acceptance gates all
 pass.
 
+## Versioned physical-index lifecycle and rolling upgrades
+
+Native HBC is now a physical vector-index version rather than an in-place
+reinterpretation of the logical index directory. The logical catalog name and
+configuration remain stable. In managed deployments, committed store records
+advertise the native-v2 recovery capability through the rolling metadata
+protocol. Authority remains closed until every table-serving store advertises
+that capability. The Raft apply transaction that observes the complete capable
+set records a monotonic activation version alongside the metadata incarnation;
+data stores open their local authority gates only from that durable value, not
+from an observed membership snapshot. The state machine then makes any stale
+legacy store registration a deterministic no-op, closing the proposal/apply
+race during the pre-promotion shadow-build window. Activation survives leader
+changes, restart, and snapshot restore.
+
+A legacy index continues serving while the durable index-repair state machine
+builds a native shadow, replays it to a bounded activation gap, validates
+coverage and structure, and atomically publishes it. Generation-manifest v2
+records `dense_native_v2`, and the active-root pointer uses a deliberately
+incompatible v2 header. Reopen requires the checksummed manifest and the
+crash-sticky HBC `AUTHORITY` marker. This means an older binary fails closed
+instead of silently opening stale compatibility LSM state. Manifest v1 remains
+readable as `legacy_lsm`, so existing indexes need no offline rewrite.
+
+Physical retirement is a separate catalog phase. Initial v1 files remain on
+disk after v2 promotion and can be selected by the captured rollback pointer;
+native reopen no longer deletes them. An explicit catalog-fenced retirement
+call reclaims them only after the downgrade/rollback window advances. The same
+shadow/pointer machinery applies to newly created managed indexes, avoiding a
+special migration-only serving path. Standalone/Lite databases, which own their
+entire compatibility domain, may still authorize local native publication.
+
+The natural extension for reusable embeddings and other source artifacts is a
+catalog-managed immutable artifact identity. Indexes should hold references,
+not ownership by convention. Index-created artifacts remain scoped to their
+producer; an explicit user promotion changes their lifecycle to managed/shared,
+after which another index can reference the same artifact ID. Promotion must
+verify schema/model/dimensions/source-generation identity and add a durable
+reference before producer-index deletion can release its ownership. Physical
+HBC posting/tree generations are index-specific and are not promoted as shared
+source artifacts.
+
+These controls add heartbeat/status fields, maintenance-time migration checks,
+and O(1) manifest/pointer reads on open or promotion. They do not add work to
+candidate routing, scoring, exact completion, or foreground mutation loops, so
+the qualified r124-r126 latency and throughput measurements remain applicable.
+
 ## Native generation lifecycle hardening
 
 The post-r126 PR review found three lifecycle gaps and the implementation now
@@ -3742,10 +3789,10 @@ published.
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
    now exist; exhaustive crash-matrix automation remains the release gate.
-6. Move the WAL-authoritative store from rollout environment flags to an
-   explicit catalog capability once mixed-version upgrade/downgrade policy is
-   defined. Keep the persisted authority marker sticky and require an explicit
-   source-journal rebuild to move back to the general LSM.
+6. Add the public catalog/API lifecycle for promoting index-managed immutable
+   source artifacts to shared artifacts, with generation-fenced references,
+   compatibility validation, and deletion-safe reference accounting. Do not
+   share index-specific HBC topology/posting generations.
 7. Reduce the remaining primary document/artifact contention. The final 1M
    load still accumulated 3.565 GB of mutable snapshot copies and 1.936 GB of
    read-snapshot rotations. Attribute those copies by reader class and compare

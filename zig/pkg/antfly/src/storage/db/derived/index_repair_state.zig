@@ -81,6 +81,9 @@ pub const Trigger = enum(u8) {
     /// Rebuild the missing coverage in a shadow while retaining query access
     /// until the replacement reaches its fenced activation boundary.
     replay_artifact_unavailable = 8,
+    /// Online physical-format upgrade. The legacy generation remains serving
+    /// while a native v2 shadow is built, caught up, validated, and promoted.
+    storage_format_migration = 9,
 };
 
 pub const Phase = enum(u8) {

@@ -43,6 +43,10 @@ pub const MetadataStatus = struct {
     /// This may lead activation by one command and lets rolling reporters
     /// establish their incarnation without speculative registration churn.
     runtime_status_protocol_ready_version: u16 = 0,
+    /// Highest dense-native storage protocol durably activated by the
+    /// metadata state machine after every table-serving store advertised it.
+    /// Once non-zero, legacy table stores can no longer be admitted.
+    dense_native_storage_protocol_activated_version: u16 = 0,
     /// Whether this replica currently has one capability probe in flight.
     runtime_status_protocol_probe_in_flight: bool = false,
     /// Consecutive failed probes since the last successful probe or durable

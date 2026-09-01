@@ -2961,6 +2961,7 @@ const StoreStatusHeartbeatCache = struct {
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -11085,6 +11086,7 @@ pub const DataServer = struct {
             .reporter_incarnation = try self.reporterIncarnation(),
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -11095,6 +11097,10 @@ pub const DataServer = struct {
         try remote_metadata.registerNode(record);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        self.provisioned_storage.setDenseNativeAuthorityPermitted(
+            snapshot.status.dense_native_storage_protocol_activated_version >=
+                antfly.metadata.table_manager.dense_native_storage_protocol_version,
+        );
         if (!storeRegistrationVisible(snapshot.stores, record)) return error.StoreRegistrationNotVisible;
         self.store_registration_confirmed = true;
         self.clearMetadataBootstrapRetry();
@@ -11677,6 +11683,10 @@ pub const DataServer = struct {
         const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        self.provisioned_storage.setDenseNativeAuthorityPermitted(
+            snapshot.status.dense_native_storage_protocol_activated_version >=
+                antfly.metadata.table_manager.dense_native_storage_protocol_version,
+        );
         const reporter_incarnation = try self.reporterIncarnation();
         if (snapshot.status.runtime_status_protocol_ready_version >=
             metadata_runtime_status_protocol.current_record_version and
@@ -11769,6 +11779,7 @@ pub const DataServer = struct {
             .reporter_incarnation = reporter_incarnation,
             .status_generation = status_generation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -12153,6 +12164,7 @@ pub const DataServer = struct {
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -12183,6 +12195,7 @@ pub const DataServer = struct {
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = report.dense_native_storage_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -17998,6 +18011,7 @@ fn storeRegistrationVisible(
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
         if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
+        if (store.dense_native_storage_protocol_version != record.dense_native_storage_protocol_version) continue;
         return true;
     }
     return false;
@@ -18034,13 +18048,17 @@ test "data store registration waits for native generation capability acknowledgm
         .role = "data",
         .reporter_incarnation = 0x1234,
         .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+        .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
     };
     var committed = expected;
     committed.native_generation_restore_version = 0;
+    committed.dense_native_storage_protocol_version = 0;
 
     try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(!storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
     committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
+    try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+    committed.dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version;
     try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
 }

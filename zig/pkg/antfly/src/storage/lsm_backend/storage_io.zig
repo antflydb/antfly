@@ -3224,7 +3224,7 @@ const NativeAtomicWriteSink = struct {
                 _ = std.posix.system.fcntl(self.fd, std.posix.F.NODIRECT, enabled);
             },
             .linux => {
-                const advice = if (intent == .cold_sequential)
+                const advice: std.os.linux.POSIX_FADV = if (intent == .cold_sequential)
                     std.os.linux.POSIX_FADV.SEQUENTIAL
                 else
                     std.os.linux.POSIX_FADV.NORMAL;

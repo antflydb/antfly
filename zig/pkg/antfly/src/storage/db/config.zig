@@ -262,6 +262,19 @@ pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
 
 pub const sparse_lsm_options_default = graph_reverse_lsm_options_default;
 
+/// Catalog-owned rollout gate for the irreversible native HBC authority
+/// transition. A missing source means the DB is a standalone owner and may
+/// cut over locally; provisioned/distributed DBs always install a source that
+/// remains closed until every possible shard owner advertises support.
+pub const DenseNativeMigrationPolicySource = struct {
+    ptr: *const anyopaque,
+    authority_permitted: *const fn (ptr: *const anyopaque) bool,
+
+    pub fn authorityPermitted(self: @This()) bool {
+        return self.authority_permitted(self.ptr);
+    }
+};
+
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
@@ -282,6 +295,11 @@ pub const IndexBackendOptions = struct {
     /// null uses ResourceManager-derived capacity and dynamic admission;
     /// false is a hard operator opt-out and true permits governed retention.
     retained_vector_cache_enabled: ?bool = null,
+    dense_native_migration_policy_source: ?DenseNativeMigrationPolicySource = null,
+    /// Private capability delegated only to a shadow builder after its parent
+    /// catalog has observed the migration floor. It may never be set on an
+    /// ordinary active managed DB open.
+    dense_native_candidate_build_authorized: bool = false,
     // Binding a caller-owned shared cache requires a manager whose lifetime
     // covers that cache. Per-DB fallback managers govern local work but must
     // not be installed into external caches.
@@ -482,6 +500,8 @@ pub fn indexBackendOptionsForPrimary(
         .lsm_root_generation = if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
         .resource_manager = overrides.resource_manager orelse resource_manager,
         .retained_vector_cache_enabled = overrides.retained_vector_cache_enabled,
+        .dense_native_migration_policy_source = overrides.dense_native_migration_policy_source,
+        .dense_native_candidate_build_authorized = overrides.dense_native_candidate_build_authorized,
         .bind_cache_resource_manager = overrides.bind_cache_resource_manager and bind_cache_resource_manager,
         .text_main_lsm_options = mergedIndexLsmOptions(
             overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
