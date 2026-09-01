@@ -18937,6 +18937,30 @@ pub const DB = struct {
             else => return err,
         }
 
+        // Native backup artifacts are authenticated into their portable
+        // canonical paths. Before the staged root can become visible, rehome
+        // every valid native dense projection beneath an explicit physical
+        // generation and publish the same incompatible v2 pointer used by an
+        // online migration. This is an O(index-count) rename/publication step;
+        // restoring native data must never manufacture a corpus-wide rebuild.
+        for (native_generation.value().projections) |projection| {
+            if (native_generation.projectionInvalid(projection.name) or
+                !std.mem.eql(u8, projection.kind, @tagName(types.IndexKind.dense_vector)) or
+                !std.mem.eql(
+                    u8,
+                    projection.backend_id,
+                    index_manager_mod.IndexManager.dense_native_backup_backend_id,
+                )) continue;
+            try index_manager_mod.IndexManager.publishRestoredNativePhysicalGeneration(
+                alloc,
+                path,
+                projection.name,
+                projection.config_hash,
+                projection.applied_sequence,
+                native_generation.value().capture_target_sequence,
+            );
+        }
+
         var validation_opts = opts;
         validation_opts.open_mode = if (native_generation.invalid_projections.items.len == 0)
             .query_readonly
@@ -78781,8 +78805,15 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
         @as(u64, 0),
         db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
-    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
-    try std.testing.expect(!(try db.hasPendingDenseArtifactRebuild(alloc)));
+    // Standalone databases now use the same explicit v2 shadow publication as
+    // provisioned storage. The only debt here is that online format migration;
+    // ordinary replay lag must not be reclassified as missing/corrupt data.
+    try std.testing.expect(try db.indexGenerationRepairRequired(alloc, "dense_idx"));
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const classification = (try db.classifyCurrentDenseGenerationRepair(alloc, cfg.*)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(index_repair_state.Trigger.storage_format_migration, classification.trigger);
+    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
 }
 
 test "managed dense physical migration is online and uses durable repair intent" {
@@ -102761,12 +102792,36 @@ test "db native deferred restore preserves generated dense generation without em
             .sync_level = .full_index,
         });
         try source.runUntilIdle();
+        // Native-v2 publication is deliberately owned by the durable repair
+        // lane rather than the replay/posting idle drain: a large corpus must
+        // not turn an otherwise bounded idle barrier into a surprise linear
+        // rebuild. Exercise the same discovery + bounded execution sequence
+        // used by the public table runtime before capturing the source.
+        try std.testing.expect(try source.denseArtifactRebuildMaintenanceNeeded(alloc));
+        try std.testing.expect(try source.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+        const migration = try source.repairRecoverableStartupIndexFailures(alloc, 1, .{});
+        try std.testing.expectEqual(@as(usize, 1), migration.repaired);
+        try source.runUntilIdle();
         const cfg = source.core.index_manager.get("semantic_idx") orelse return error.TestUnexpectedResult;
         const checkpoint = try source.core.loadProjectionCheckpoint(alloc, cfg.name);
         source_applied = checkpoint.applied_sequence;
         source_generation = checkpoint.generation;
         source_count = source.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count;
         try std.testing.expect(source_count > 0);
+        _ = try source.core.index_manager.cleanupInactiveRepairShadowRootsPage();
+        const active_relative = (try source.core.index_manager.captureActiveIndexRootPointer("semantic_idx")) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(active_relative);
+        const active_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(source_path), active_relative });
+        defer alloc.free(active_root);
+        for ([_][]const u8{ "runs", "wal", "manifest.bin" }) |legacy_name| {
+            const legacy_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ active_root, legacy_name });
+            defer alloc.free(legacy_path);
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+            );
+        }
         _ = try source.snapshotNative("native-fast");
     }
 
@@ -102867,6 +102922,8 @@ test "db native deferred restore preserves generated dense generation without em
     try std.testing.expectEqual(source_applied, checkpoint.applied_sequence);
     try std.testing.expectEqual(source_generation, checkpoint.generation);
     try std.testing.expectEqual(source_count, restored.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count);
+    try std.testing.expect(!try restored.core.index_manager.denseNativePhysicalMigrationRequired("semantic_idx"));
+    try std.testing.expect((try restored.indexRepairIdForIndex(alloc, "semantic_idx")) == null);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     const vector = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);

@@ -3589,6 +3589,11 @@ pub const HBCIndex = struct {
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
     experimental_posting_wal_mutations_enabled: bool = false,
+    /// First authority publication is a physical-generation capability, not a
+    /// side effect of observing an available native base. Ordinary active v1
+    /// indexes keep dual-writing their compatibility store; only an inactive
+    /// candidate (or an already-v2 generation) receives this capability.
+    experimental_posting_authority_transition_permitted: bool = false,
     experimental_posting_wal_authoritative: std.atomic.Value(bool) = .init(false),
     experimental_posting_wal_authoritative_persisted: bool = false,
     experimental_posting_mutation_base_generation: ?*ExperimentalPostingReadGeneration = null,
@@ -7537,6 +7542,11 @@ pub const HBCIndex = struct {
         if (!self.experimentalPostingReadsEnabled()) return error.PostingWalMutationStoreUnavailable;
 
         if (options.make_authoritative) {
+            if (!self.experimental_posting_authority_transition_permitted and
+                !self.experimental_posting_wal_authoritative.load(.acquire))
+            {
+                return error.PostingWalAuthorityTransitionNotPermitted;
+            }
             if (!self.hasExternalVectorLoader()) return error.ExternalVectorLoaderRequired;
             if (self.experimental_posting_write_store == null) {
                 self.experimental_posting_write_store = try self.openExperimentalPostingStore();
@@ -7832,6 +7842,10 @@ pub const HBCIndex = struct {
     /// still use the general store until the first complete checkpoint exists.
     pub fn enableExperimentalPostingWalMutations(self: *HBCIndex) void {
         self.experimental_posting_wal_mutations_enabled = true;
+    }
+
+    pub fn setExperimentalPostingAuthorityTransitionPermitted(self: *HBCIndex, permitted: bool) void {
+        self.experimental_posting_authority_transition_permitted = permitted;
     }
 
     pub fn experimentalPostingWalAuthoritative(self: *const HBCIndex) bool {
@@ -10194,6 +10208,8 @@ pub const HBCIndex = struct {
     fn markExperimentalPostingWalAuthoritative(self: *HBCIndex, txn: anytype) !void {
         if (self.experimental_posting_mutation_base_generation == null or
             self.experimental_posting_wal_authoritative_persisted) return;
+        if (!self.experimental_posting_authority_transition_permitted and
+            !self.experimental_posting_wal_authoritative.load(.acquire)) return;
         if (self.experimental_posting_wal_authoritative.load(.acquire)) {
             self.experimental_posting_wal_authoritative_persisted = true;
             return;
@@ -20126,6 +20142,14 @@ test "stable generation finalization bootstraps capture-free rebuild into native
         }, .{ .skip_vector_store = true });
         try std.testing.expect(idx.experimentalPostingDurableAppliedSequence() == null);
 
+        try std.testing.expectError(
+            error.PostingWalAuthorityTransitionNotPermitted,
+            idx.finalizeExperimentalPostingGenerationAtAppliedSequence(7, .{
+                .make_authoritative = true,
+            }),
+        );
+        try std.testing.expect(!idx.experimentalPostingWalAuthoritative());
+        idx.setExperimentalPostingAuthorityTransitionPermitted(true);
         try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(7, .{
             .make_authoritative = true,
         });

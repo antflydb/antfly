@@ -3732,6 +3732,32 @@ is reduced from O(committed WAL bytes) to descriptor acquisition plus immutable
 hardlink metadata. Publication adds one flat, filename-only inventory scan; it
 does not read segment contents or recurse through the database tree.
 
+The subsequent upgrade/restore review closed the remaining physical-generation
+ownership gaps:
+
+- Native authority can no longer appear as a side effect of an ordinary v1
+  mutation. HBC requires an explicit authority-transition capability, and the
+  catalog grants it only to an inactive candidate or an already-selected v2
+  generation. Standalone storage skips distributed capability negotiation but
+  still uses the same manifest plus incompatible pointer publication as a
+  provisioned table.
+- An authenticated native restore is rehomed into a deterministic v2 generation
+  with an atomic directory rename, checksummed ready manifest, directory fsyncs,
+  and pointer publication last. Retry validates or completes the same generation;
+  it neither copies vector/index files nor replays the corpus.
+- Compatibility LSM files inside the active v2 generation are restart-stable
+  cleanup debt. The existing durable cleanup lane removes them only after native
+  authority and the catalog capability floor are both proven (or, for standalone
+  storage, after the v2 pointer has made downgrade fail closed).
+
+The public serving and mutation loops are unchanged. Authority gating adds no
+steady-state branch after the persisted-authority fast return; restore work is
+O(index count) metadata plus directory renames; legacy retirement runs in the
+background cleanup lane. A full DB lifecycle test now proves v1 remains
+queryable during shadow construction, v2 promotion precedes retirement, native
+backup/restore needs no embedder, and the restored read-only index has neither
+format-migration nor repair debt.
+
 A fresh post-merge r128 50K public-API lifecycle qualified correctness under
 heavy host contention: recall was 0.9876 live, cold-reopened, and warm-reopened;
 the published generation covered all 50,000 vectors; and no capture, generation,

@@ -119,6 +119,13 @@ fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
 }
+
+fn restoredNativeGenerationId(index_name: []const u8, config_hash: u64, restore_generation: u64) u128 {
+    const low = std.hash.Wyhash.hash(config_hash, index_name) ^ restore_generation;
+    const high = std.hash.Wyhash.hash(restore_generation, index_name) ^ config_hash;
+    const value = (@as(u128, high) << 64) | low;
+    return if (value == 0) 1 else value;
+}
 const index_generation_manifest = @import("../derived/index_generation_manifest.zig");
 
 fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
@@ -3817,10 +3824,24 @@ pub const IndexManager = struct {
     }
 
     fn denseNativeAuthorityPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
-        const source = self.dense_native_migration_policy_source orelse return true;
-        if (!source.authorityPermitted()) return false;
+        if (self.dense_native_migration_policy_source) |source| {
+            if (!source.authorityPermitted()) return false;
+        }
+        // Native authority is never published into an ordinary active v1
+        // root. Standalone databases bypass distributed capability
+        // negotiation, but still build an inactive candidate and acquire the
+        // same versioned pointer/manifest boundary as provisioned storage.
         return self.dense_native_candidate_build_authorized or
             entry.native_physical_v2;
+    }
+
+    fn denseNativeLegacyRetirementPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (!entry.native_physical_v2 or !entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (self.dense_native_migration_policy_source) |source|
+            return source.authorityPermitted();
+        // A standalone v2 pointer is itself the durable downgrade fence: an
+        // older binary cannot select this generation.
+        return true;
     }
 
     /// Managed databases migrate through a shadow physical generation. The
@@ -3828,8 +3849,9 @@ pub const IndexManager = struct {
     /// capability floor permits an online v2 rebuild and atomic promotion.
     pub fn denseNativePhysicalMigrationRequired(self: *IndexManager, name: []const u8) !bool {
         if (!densePostingWalMutationStoreEnabled()) return false;
-        const source = self.dense_native_migration_policy_source orelse return false;
-        if (!source.authorityPermitted()) return false;
+        if (self.dense_native_migration_policy_source) |source| {
+            if (!source.authorityPermitted()) return false;
+        }
         const entry = self.denseIndex(name) orelse return false;
         return !entry.native_physical_v2;
     }
@@ -9194,6 +9216,101 @@ pub const IndexManager = struct {
         return try self.readActiveIndexRootPointer(target_path, name);
     }
 
+    /// Converts an already-authenticated native backup projection into the
+    /// same explicit physical generation produced by an online shadow build.
+    /// No corpus bytes are copied: the unpublished canonical directory is
+    /// renamed beneath a deterministic restore-generation root, certified,
+    /// and then selected by the incompatible v2 pointer. Repeating the call
+    /// after a crash validates and completes the same publication.
+    pub fn publishRestoredNativePhysicalGeneration(
+        alloc: Allocator,
+        db_root: []const u8,
+        index_name: []const u8,
+        config_hash: u64,
+        covered_source_sequence: u64,
+        restore_generation: u64,
+    ) !void {
+        if (builtin.os.tag == .freestanding) return error.Unsupported;
+        var manager = try IndexManager.init(alloc, db_root);
+        defer manager.deinit();
+
+        const canonical_path = try manager.indexPath(index_name);
+        defer alloc.free(canonical_path);
+        if (try manager.activeIndexRootPointerUsesNativeV2(index_name)) {
+            const relative = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
+                return error.InvalidIndexRootPointer;
+            defer alloc.free(relative);
+            const active_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ db_root, relative });
+            defer alloc.free(active_path);
+            var manifest = try index_generation_manifest.load(alloc, active_path);
+            defer manifest.deinit(alloc);
+            if (!std.mem.eql(u8, manifest.index_name, index_name) or
+                manifest.config_hash != config_hash or
+                manifest.ready_applied_sequence != covered_source_sequence or
+                manifest.physical_format != .dense_native_v2)
+            {
+                return error.IndexGenerationManifestMismatch;
+            }
+            return;
+        }
+        if (try manager.readActiveIndexRootPointer(canonical_path, index_name)) |relative| {
+            alloc.free(relative);
+            return error.InvalidIndexRootPointer;
+        }
+
+        const shadow_name = try std.fmt.allocPrint(alloc, ".repair-shadow-restored-{x}", .{restore_generation});
+        defer alloc.free(shadow_name);
+        const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ db_root, shadow_name });
+        defer alloc.free(shadow_indexes_path);
+        const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, index_name });
+        defer alloc.free(shadow_index_path);
+        const relative_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ shadow_name, index_name });
+        defer alloc.free(relative_path);
+        if (!validRelativeRepairIndexRoot(index_name, relative_path)) return error.InvalidIndexRootPointer;
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const target_exists = blk: {
+            std.Io.Dir.cwd().access(io, shadow_index_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        const generation_id = restoredNativeGenerationId(index_name, config_hash, restore_generation);
+        if (!target_exists) {
+            const authority_path = try std.fs.path.join(
+                alloc,
+                &.{ canonical_path, "posting-segments", posting_segment_store_mod.authority_name },
+            );
+            defer alloc.free(authority_path);
+            try std.Io.Dir.cwd().access(io, authority_path, .{});
+            try index_generation_manifest.writeReadyForPhysicalFormat(
+                alloc,
+                canonical_path,
+                generation_id,
+                index_name,
+                config_hash,
+                covered_source_sequence,
+                .dense_native_v2,
+            );
+            try fs_paths.createDirPathPortable(io, shadow_indexes_path);
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), canonical_path, std.Io.Dir.cwd(), shadow_index_path, io);
+            try fs_paths.syncDirPortable(io, shadow_indexes_path);
+            const canonical_parent = std.fs.path.dirname(canonical_path) orelse db_root;
+            try fs_paths.syncDirPortable(io, canonical_parent);
+        }
+        _ = try index_generation_manifest.validateReady(
+            alloc,
+            shadow_index_path,
+            generation_id,
+            index_name,
+            config_hash,
+        );
+        try manager.writeActiveIndexRootPointer(canonical_path, relative_path);
+    }
+
     /// Restores the exact generation captured before replacement activation.
     /// The candidate is retained for postmortem/retry cleanup; this method
     /// changes only the durable pointer and in-memory runtime selection.
@@ -9296,6 +9413,16 @@ pub const IndexManager = struct {
         if (builtin.os.tag == .freestanding) return false;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+
+        // Compatibility LSM files live inside the active native generation,
+        // so inactive-root collection cannot discover them. Their continued
+        // presence is the restart-stable cleanup cursor. Drain it only after
+        // the same catalog floor that authorized v2 publication (or the
+        // standalone incompatible pointer) makes downgrade fail closed.
+        for (self.dense_indexes.items) |*entry| {
+            if (!self.denseNativeLegacyRetirementPermitted(entry)) continue;
+            try entry.index.retireLegacyLsmArtifactsAfterCatalogFence();
+        }
 
         // Once no durable repair intent protects rollback, canonical roots
         // selected through a pointer contain only stale generation data plus
@@ -15396,6 +15523,14 @@ pub const IndexManager = struct {
                 if (self.resource_manager) |manager| {
                     index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
                 }
+                const native_catalog_floor_permitted = if (self.dense_native_migration_policy_source) |source|
+                    source.authorityPermitted()
+                else
+                    true;
+                index.setExperimentalPostingAuthorityTransitionPermitted(
+                    native_catalog_floor_permitted and
+                        (self.dense_native_candidate_build_authorized or native_physical_v2),
+                );
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
                 const vector_loader_context = try self.alloc.create(DenseVectorLoadContext);
@@ -26100,6 +26235,105 @@ test "dense native migration policy is fail closed when provisioned" {
     try std.testing.expect(try manager.denseNativePhysicalMigrationRequired("dv_v1"));
     manager.dense_native_candidate_build_authorized = true;
     try std.testing.expect(manager.denseNativeAuthorityPermitted(entry));
+}
+
+test "standalone dense native migration still requires an explicit physical generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!manager.denseNativeAuthorityPermitted(entry));
+    try std.testing.expect(try manager.denseNativePhysicalMigrationRequired("dv_v1"));
+    try std.testing.expect(try manager.finalizeNativePostingGenerationAtStableTip(
+        "dv_v1",
+        0,
+        .{ .validate_payloads = true },
+    ));
+    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
+    manager.dense_native_candidate_build_authorized = true;
+    try std.testing.expect(manager.denseNativeAuthorityPermitted(entry));
+}
+
+test "restored native projection publishes an idempotent v2 physical generation without copying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const index_name = "dense_idx";
+    const config_hash: u64 = 0xabc123;
+    const source_sequence: u64 = 77;
+    const restore_generation: u64 = 91;
+    const canonical_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ path, index_name });
+    defer alloc.free(canonical_path);
+    const posting_path = try std.fmt.allocPrint(alloc, "{s}/posting-segments", .{canonical_path});
+    defer alloc.free(posting_path);
+    try fs_paths.createDirPathPortable(std.testing.io, posting_path);
+    const authority_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}",
+        .{ posting_path, posting_segment_store_mod.authority_name },
+    );
+    defer alloc.free(authority_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = authority_path,
+        .data = posting_segment_store_mod.authority_value,
+    });
+
+    try IndexManager.publishRestoredNativePhysicalGeneration(
+        alloc,
+        path,
+        index_name,
+        config_hash,
+        source_sequence,
+        restore_generation,
+    );
+    // Publication is restart/retry safe and never copies the corpus back into
+    // the canonical compatibility root.
+    try IndexManager.publishRestoredNativePhysicalGeneration(
+        alloc,
+        path,
+        index_name,
+        config_hash,
+        source_sequence,
+        restore_generation,
+    );
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    try std.testing.expect(try manager.activeIndexRootPointerUsesNativeV2(index_name));
+    const active_path = try manager.activeIndexPath(index_name);
+    defer alloc.free(active_path);
+    try std.testing.expect(!std.mem.eql(u8, active_path, canonical_path));
+    _ = try index_generation_manifest.validateReady(
+        alloc,
+        active_path,
+        restoredNativeGenerationId(index_name, config_hash, restore_generation),
+        index_name,
+        config_hash,
+    );
+    const restored_authority = try std.fmt.allocPrint(
+        alloc,
+        "{s}/posting-segments/{s}",
+        .{ active_path, posting_segment_store_mod.authority_name },
+    );
+    defer alloc.free(restored_authority);
+    try std.Io.Dir.cwd().access(std.testing.io, restored_authority, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, authority_path, .{}));
 }
 
 fn denseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {
