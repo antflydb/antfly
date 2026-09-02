@@ -3889,6 +3889,42 @@ error instead of relying on `std.debug.assert`, preserving the authority fence
 in production `ReleaseFast` builds without adding work to mutation or query
 hot loops.
 
+### Review hardening: artifact identity is a set
+
+The exact-vector projection originally inferred one artifact family from
+`embedding_name` or the index name. That model is incomplete for indexes which
+union several embedding sources and was also inconsistent with the supported
+external single-source form whose artifact name differs from its index name.
+The durable contract is now explicit and shared by backfill, mutation-WAL
+publication, mmap projection reads, topology projection builds, snapshot
+construction, and readiness:
+
+- a single-source index owns exactly its configured `embedding_name`, falling
+  back to the index name only when no name was configured;
+- a multi-source index owns the configured set of artifact families and each
+  posting member retains its exact source artifact key;
+- table-wide generation manifests declare the union of those scopes;
+- base cardinality readiness sums the per-source certificates for the logical
+  index instead of consulting an index-name surrogate.
+
+This keeps the common single-source lookup at one derived key and adds no query
+I/O. Multi-source projection lookup is cheaper than the broken path because it
+uses the already-materialized member key directly. Tests publish both source
+families through the native mutation WAL and certify their combined immutable
+base coverage.
+
+### Review hardening: orphan deletion is reauthorized
+
+The initial canonical-pointer inventory remains an efficient filter, but it is
+not deletion authority: another manager can publish a repair generation after
+that scan and clear its construction marker. Cleanup now re-reads all canonical
+pointers for each unmarked deletion candidate immediately before touching its
+filesystem or algebraic state. The required publication order is therefore a
+complete handoff: the construction marker protects the pre-pointer window and
+the revalidated pointer protects the post-publication window. Invalid pointers
+fail closed. A deterministic hook test publishes and clears the marker exactly
+between inventory and deletion and verifies that the live generation survives.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
@@ -3950,3 +3986,11 @@ hot loops.
     bounded vector-block source reads and primary LSM closure/output windows,
     preserving crash-safe final-shard publication and progress on an
     indivisible compaction closure.
+14. Bound online HBC tree height under adversarially ordered vectors. The Debug
+    aggregate's branch-local `flat traversal does not treat a full candidate
+    heap as a pruning proof` fixture inserts 128 collinear inner-product vectors
+    in increasing order and entered a deeply recursive internal split/range
+    recomputation path, consuming about 1.5 GiB before the diagnostic run was
+    stopped. Keep that adversarial coverage: add a maximum-height/balanced-split
+    invariant or convert an over-deep online subtree through the recursive bulk
+    builder. Do not make the test faster by hiding the production-shaped order.

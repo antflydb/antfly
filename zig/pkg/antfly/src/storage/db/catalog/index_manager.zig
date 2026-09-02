@@ -145,6 +145,12 @@ const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
 var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
 
+const RepairShadowCleanupTestHook = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque) anyerror!void,
+};
+var test_repair_shadow_cleanup_after_pointer_snapshot: ?RepairShadowCleanupTestHook = null;
+
 const FreshDenseNativeGeneration = struct {
     alloc: Allocator,
     shadow_root: []u8,
@@ -2920,13 +2926,80 @@ pub const IndexManager = struct {
         return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
 
-    fn denseVectorArtifactScopeHash(entry: *const DenseIndex) u64 {
-        return internal_keys.embeddingArtifactScopeHashForName(entry.embedding_name orelse entry.config.name);
+    fn denseVectorArtifactNameCount(entry: *const DenseIndex) usize {
+        return if (entry.embedding_names.len != 0) entry.embedding_names.len else 1;
+    }
+
+    fn denseVectorArtifactNameAt(entry: *const DenseIndex, index: usize) []const u8 {
+        if (entry.embedding_names.len != 0) return entry.embedding_names[index];
+        std.debug.assert(index == 0);
+        return entry.embedding_name orelse entry.config.name;
+    }
+
+    fn denseVectorArtifactScopeHashAt(entry: *const DenseIndex, index: usize) u64 {
+        return internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index));
+    }
+
+    /// Resolve HBC member metadata to the authoritative exact-vector artifact
+    /// identity. Multi-source members carry that identity directly; every
+    /// other index has one configured family derived from its document/chunk
+    /// metadata. All WAL, projection-build, and fallback readers use this one
+    /// contract so a serving optimization cannot silently change provenance.
+    fn denseVectorArtifactKeyForMetadataAlloc(
+        alloc: Allocator,
+        entry: *const DenseIndex,
+        metadata: []const u8,
+    ) ![]u8 {
+        if (entry.embedding_names.len != 0) {
+            if (!embeddingArtifactKeyMatchesAnySource(metadata, entry.embedding_names))
+                return error.InvalidEmbeddingArtifactSource;
+            return try alloc.dupe(u8, metadata);
+        }
+        const artifact_name = denseVectorArtifactNameAt(entry, 0);
+        if (internal_keys.isInternalUserKey(metadata))
+            return try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, metadata, artifact_name);
+        return try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, metadata, artifact_name);
+    }
+
+    /// Return the cardinality certificate for the complete logical source set
+    /// of one dense index. Multi-source indexes store each configured artifact
+    /// family independently in the shared projection; readiness is the sum of
+    /// those disjoint families, never an index-name surrogate.
+    fn denseVectorArtifactCoverageCount(
+        opened: *const vector_block_store_mod.Opened,
+        entry: *const DenseIndex,
+    ) ?u64 {
+        var total: u64 = 0;
+        for (0..denseVectorArtifactNameCount(entry)) |index| {
+            const scope_hash = denseVectorArtifactScopeHashAt(entry, index);
+            var duplicate = false;
+            for (0..index) |previous| {
+                if (denseVectorArtifactScopeHashAt(entry, previous) == scope_hash) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            const coverage = opened.baseOnlyCoverage(scope_hash) orelse return null;
+            total = std.math.add(u64, total, coverage.vector_count) catch return null;
+        }
+        return total;
     }
 
     fn vectorBlockArtifactScopeHashesAlloc(self: *const IndexManager) ![]u64 {
-        const hashes = try self.alloc.alloc(u64, self.dense_indexes.items.len);
-        for (self.dense_indexes.items, hashes) |*entry, *hash| hash.* = denseVectorArtifactScopeHash(entry);
+        var scope_count: usize = 0;
+        for (self.dense_indexes.items) |*entry| {
+            scope_count = std.math.add(usize, scope_count, denseVectorArtifactNameCount(entry)) catch
+                return error.OutOfMemory;
+        }
+        const hashes = try self.alloc.alloc(u64, scope_count);
+        var offset: usize = 0;
+        for (self.dense_indexes.items) |*entry| {
+            for (0..denseVectorArtifactNameCount(entry)) |index| {
+                hashes[offset] = denseVectorArtifactScopeHashAt(entry, index);
+                offset += 1;
+            }
+        }
         std.mem.sort(u64, hashes, {}, std.sort.asc(u64));
         var unique_count: usize = 0;
         for (hashes) |hash| {
@@ -3104,7 +3177,7 @@ pub const IndexManager = struct {
     fn vectorBlockReadyAtSequenceAndCount(
         self: *IndexManager,
         source_sequence: u64,
-        artifact_scope_hash: u64,
+        entry: *const DenseIndex,
         expected_count: u64,
     ) bool {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
@@ -3113,7 +3186,7 @@ pub const IndexManager = struct {
         return vectorBlockGenerationReadyAtSequenceAndCount(
             generation,
             source_sequence,
-            artifact_scope_hash,
+            entry,
             expected_count,
         );
     }
@@ -3121,7 +3194,7 @@ pub const IndexManager = struct {
     fn vectorBlockGenerationReadyAtSequenceAndCount(
         generation: *const SharedVectorBlockGeneration,
         source_sequence: u64,
-        artifact_scope_hash: u64,
+        entry: *const DenseIndex,
         expected_count: u64,
     ) bool {
         if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) return false;
@@ -3131,8 +3204,8 @@ pub const IndexManager = struct {
         // are already transactionally authoritative and intentionally have no
         // additive physical-count shortcut.
         if (generation.opened.baseOnlyVectorCount() != null) {
-            const coverage = generation.opened.baseOnlyCoverage(artifact_scope_hash) orelse return false;
-            return coverage.vector_count == expected_count;
+            const coverage_count = denseVectorArtifactCoverageCount(&generation.opened, entry) orelse return false;
+            return coverage_count == expected_count;
         }
         // An empty structural base followed only by WAL/delta records is
         // transactionally queryable, but it has not completed initial
@@ -3166,7 +3239,7 @@ pub const IndexManager = struct {
         const source_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
         return self.vectorBlockReadyAtSequenceAndCount(
             source_sequence,
-            denseVectorArtifactScopeHash(entry),
+            entry,
             entry.index.stats().active_count,
         );
     }
@@ -3197,7 +3270,7 @@ pub const IndexManager = struct {
         const entry = self.denseIndex(name) orelse return false;
         return self.vectorBlockReadyAtSequenceAndCount(
             source_sequence,
-            denseVectorArtifactScopeHash(entry),
+            entry,
             expected_count,
         );
     }
@@ -3335,12 +3408,13 @@ pub const IndexManager = struct {
             for (keys[0..key_count]) |key| self.alloc.free(key);
             self.alloc.free(keys);
         }
-        const artifact_name = entry.embedding_name orelse entry.config.name;
         for (mutations, 0..) |mutation, index| {
-            const key = if (internal_keys.isInternalUserKey(mutation.metadata))
-                try internal_keys.derivedEmbeddingArtifactKeyAlloc(self.alloc, mutation.metadata, artifact_name)
-            else
-                try internal_keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, mutation.metadata, artifact_name);
+            // A multi-source posting member is already identified by its
+            // authoritative embedding-artifact key. Preserve that identity in
+            // the WAL instead of deriving a nonexistent index-named artifact.
+            // Single-source metadata continues to name the document/chunk
+            // base from which its one managed artifact key is derived.
+            const key = try denseVectorArtifactKeyForMetadataAlloc(self.alloc, entry, mutation.metadata);
             keys[index] = key;
             key_count += 1;
             const revision = switch (mutation.kind) {
@@ -3429,9 +3503,9 @@ pub const IndexManager = struct {
         var compacted = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
         var compacted_owned = true;
         errdefer if (compacted_owned) compacted.deinit();
-        const coverage = compacted.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
+        const coverage_count = denseVectorArtifactCoverageCount(&compacted, entry);
         if (compacted.store.covered_source_sequence != covered_source_sequence or
-            coverage == null or coverage.?.vector_count != entry.index.stats().active_count)
+            coverage_count == null or coverage_count.? != entry.index.stats().active_count)
         {
             // The shared empty generation can predate this index's artifact
             // scope. Delta compaction preserves only scopes already declared
@@ -3581,12 +3655,12 @@ pub const IndexManager = struct {
             const preferred_layout = current.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
             const base_only = current.opened.baseOnlyVectorCount() != null;
             const established_overlay = !base_only and (current.opened.baseVectorCount() orelse 0) != 0;
-            const certified_coverage = current.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
+            const certified_coverage_count = denseVectorArtifactCoverageCount(&current.opened, entry);
             current.release();
             if (current_coverage == applied_sequence and preferred_encoding and preferred_layout and
                 (established_overlay or
                     (base_only and
-                        (certified_coverage != null and certified_coverage.?.vector_count == entry.index.stats().active_count))))
+                        (certified_coverage_count != null and certified_coverage_count.? == entry.index.stats().active_count))))
             {
                 self.vector_block_projection_dirty.store(false, .release);
                 return;
@@ -3643,7 +3717,7 @@ pub const IndexManager = struct {
             try self.loadVectorBlockGenerationIfPresent();
             if (self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
-                denseVectorArtifactScopeHash(entry),
+                entry,
                 entry.index.stats().active_count,
             )) {
                 self.vector_block_projection_dirty.store(false, .release);
@@ -3800,7 +3874,7 @@ pub const IndexManager = struct {
         if (publisher.covered_source_sequence == applied_sequence and
             !self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
-                denseVectorArtifactScopeHash(entry),
+                entry,
                 entry.index.stats().active_count,
             ))
             return error.VectorBlockPublishedGenerationNotReady;
@@ -4125,8 +4199,8 @@ pub const IndexManager = struct {
                         (generation.opened.baseVectorCount() orelse 0) == 0;
                 break :blk true;
             }
-            const coverage = generation.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry)) orelse break :blk false;
-            break :blk coverage.vector_count == active_vector_count;
+            const coverage_count = denseVectorArtifactCoverageCount(&generation.opened, entry) orelse break :blk false;
+            break :blk coverage_count == active_vector_count;
         };
         const immediate_initial_bootstrap = (!has_native_generation or native_generation_requires_initial_flatten) and
             active_vector_count <= vector_block_immediate_bootstrap_max_vectors;
@@ -7639,13 +7713,13 @@ pub const IndexManager = struct {
             if (posting_sequence != source_sequence) continue;
             if (!self.vectorBlockReadyAtSequenceAndCount(
                 source_sequence,
-                denseVectorArtifactScopeHash(entry),
+                entry,
                 entry.index.stats().active_count,
             )) {
                 try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
                 changed = self.vectorBlockReadyAtSequenceAndCount(
                     source_sequence,
-                    denseVectorArtifactScopeHash(entry),
+                    entry,
                     entry.index.stats().active_count,
                 ) or changed;
             }
@@ -9628,6 +9702,9 @@ pub const IndexManager = struct {
         // post-publication window.
         try self.collectPublishedRepairShadowRoots(&active_roots);
         try self.collectActiveRepairShadowRoots(&active_roots);
+        if (builtin.is_test) {
+            if (test_repair_shadow_cleanup_after_pointer_snapshot) |hook| try hook.callback(hook.context);
+        }
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -9646,6 +9723,14 @@ pub const IndexManager = struct {
             const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name });
             defer self.alloc.free(path);
             if (repairShadowRootInProgress(path)) continue;
+            // The inventory above is only a scan optimization. A cooperating
+            // manager may publish this root and durably clear its construction
+            // marker after that scan. Re-read canonical publication authority
+            // now, after observing marker absence and before deleting either
+            // primary or algebraic state. The publisher's marker -> pointer ->
+            // marker-clear order makes one of these two checks protect every
+            // live generation.
+            if (try self.publishedRepairShadowRootSelected(io, entry.name)) continue;
             if (try self.cleanupAlgebraicNamespacesInRepairRootPage(io, path, entry.name)) return true;
             deleteIndexDirIfPresent(path);
         }
@@ -15479,6 +15564,47 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Revalidate deletion authority for one candidate without requiring its
+    /// catalog row or pointed-to payload to be readable. Invalid pointers fail
+    /// closed: cleanup must never turn publication corruption into data loss.
+    fn publishedRepairShadowRootSelected(self: *IndexManager, io: std.Io, candidate_root: []const u8) !bool {
+        if (builtin.os.tag == .freestanding) return false;
+        const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
+        defer self.alloc.free(indexes_path);
+
+        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer indexes_dir.close(io);
+
+        var iter = indexes_dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, entry.name });
+            defer self.alloc.free(canonical_path);
+            const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
+            defer self.alloc.free(pointer_path);
+            const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+
+            const magic = if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v2))
+                active_index_root_pointer_magic_v2
+            else if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v1))
+                active_index_root_pointer_magic_v1
+            else
+                return error.InvalidIndexRootPointer;
+            const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
+            if (!validRelativeRepairIndexRoot(entry.name, relative)) return error.InvalidIndexRootPointer;
+            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse return error.InvalidIndexRootPointer;
+            if (std.mem.eql(u8, relative[0..separator], candidate_root)) return true;
+        }
+        return false;
+    }
+
     fn collectActiveRepairShadowRoot(
         self: *IndexManager,
         active_roots: *std.StringHashMapUnmanaged(void),
@@ -18012,12 +18138,12 @@ pub const IndexManager = struct {
                 // the same contract: the native vector WAL can then authenticate
                 // this payload and future repair/backup paths have one stable
                 // source key instead of reparsing documents by convention.
-                if (ctx.entry.embedding_name == null and ctx.entry.embedding_names.len == 0) {
+                if (ctx.entry.embedding_names.len == 0) {
                     try ctx.manager.writeDenseEmbeddingArtifactTxn(
                         ctx.mapping_batch,
                         raw_key,
                         raw_key,
-                        ctx.entry.config.name,
+                        denseVectorArtifactNameAt(ctx.entry, 0),
                         "_embeddings",
                         null,
                         vector_values,
@@ -21794,12 +21920,6 @@ pub const IndexManager = struct {
         const scratch_floats = std.math.mul(usize, dims, vector_ids.len) catch return error.BufferTooSmall;
         if (batch_scratch.len < scratch_floats) return error.BufferTooSmall;
 
-        const multi_source = entry.embedding_names.len > 0;
-        const artifact_name = entry.embedding_name orelse blk: {
-            if (multi_source) break :blk "";
-            if (!entry.external) return error.Unsupported;
-            break :blk entry.config.name;
-        };
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
@@ -21832,12 +21952,7 @@ pub const IndexManager = struct {
                 continue;
             }
             const doc_key = maybe_doc_key orelse continue;
-            const artifact_key = if (multi_source)
-                try manager.alloc.dupe(u8, doc_key)
-            else if (internal_keys.isInternalUserKey(doc_key))
-                try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
-            else
-                try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
+            const artifact_key = try denseVectorArtifactKeyForMetadataAlloc(manager.alloc, entry, doc_key);
             artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
@@ -21915,12 +22030,6 @@ pub const IndexManager = struct {
         if (dims == 0) return error.InvalidVectorDimensions;
         if (scratch.len < dims) return error.BufferTooSmall;
 
-        const multi_source = entry.embedding_names.len > 0;
-        const artifact_name = entry.embedding_name orelse blk: {
-            if (multi_source) break :blk "";
-            if (!entry.external) return error.Unsupported;
-            break :blk entry.config.name;
-        };
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
@@ -21955,12 +22064,7 @@ pub const IndexManager = struct {
                 continue;
             }
             const doc_key = maybe_doc_key orelse return error.NotFound;
-            const artifact_key = if (multi_source)
-                try manager.alloc.dupe(u8, doc_key)
-            else if (internal_keys.isInternalUserKey(doc_key))
-                try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
-            else
-                try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
+            const artifact_key = try denseVectorArtifactKeyForMetadataAlloc(manager.alloc, entry, doc_key);
             artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
@@ -21992,7 +22096,7 @@ pub const IndexManager = struct {
                 !vectorBlockGenerationReadyAtSequenceAndCount(
                     generation,
                     vector_sequence,
-                    denseVectorArtifactScopeHash(entry),
+                    entry,
                     entry.index.stats().active_count,
                 ))
             {
@@ -22139,10 +22243,6 @@ pub const IndexManager = struct {
             generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16)
             return error.Unsupported;
 
-        const artifact_name = entry.embedding_name orelse blk: {
-            if (!entry.external) return error.Unsupported;
-            break :blk entry.config.name;
-        };
         const reads = try manager.alloc.alloc(DenseArtifactReadKey, vector_ids.len);
         var key_count: usize = 0;
         defer {
@@ -22151,10 +22251,7 @@ pub const IndexManager = struct {
         }
         for (metadata, 0..) |maybe_doc_key, i| {
             const doc_key = maybe_doc_key orelse return error.NotFound;
-            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
-                try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
-            else
-                try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
+            const artifact_key = try denseVectorArtifactKeyForMetadataAlloc(manager.alloc, entry, doc_key);
             reads[i] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
@@ -22429,10 +22526,6 @@ pub const IndexManager = struct {
             .l2_squared => 0,
         } else 0;
 
-        // Dense apply always publishes the authoritative vector artifact under
-        // the configured embedding name, or the index name for direct fields.
-        const multi_source = entry.embedding_names.len > 0;
-        const artifact_name = entry.embedding_name orelse entry.config.name;
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
@@ -22546,12 +22639,7 @@ pub const IndexManager = struct {
             }
             for (missing_positions[0..missing_count]) |i| {
                 const doc_key = metadata[i] orelse continue;
-                const storage_key = if (multi_source)
-                    try key_alloc.dupe(u8, doc_key)
-                else if (internal_keys.isInternalUserKey(doc_key))
-                    try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
-                else
-                    try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
+                const storage_key = try denseVectorArtifactKeyForMetadataAlloc(key_alloc, entry, doc_key);
                 artifact_reads[key_count] = DenseArtifactReadKey.init(storage_key, i);
                 key_count += 1;
             }
@@ -22633,12 +22721,7 @@ pub const IndexManager = struct {
                 }
                 if (profile) |p| p.vector_cache_misses += 1;
                 const doc_key = maybe_doc_key orelse continue;
-                const storage_key = if (multi_source)
-                    try key_alloc.dupe(u8, doc_key)
-                else if (internal_keys.isInternalUserKey(doc_key))
-                    try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
-                else
-                    try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
+                const storage_key = try denseVectorArtifactKeyForMetadataAlloc(key_alloc, entry, doc_key);
                 artifact_reads[key_count] = DenseArtifactReadKey.init(storage_key, i);
                 key_count += 1;
             }
@@ -22885,7 +22968,7 @@ pub const IndexManager = struct {
                 cache_vectors[0..cache_count],
                 vector_cache_epoch,
             );
-            if (!entry.external and entry.embedding_name == null and !multi_source) {
+            if (!entry.external and entry.embedding_name == null and entry.embedding_names.len == 0) {
                 try scoreDirectDenseDocumentFallbackBatch(
                     manager,
                     store,
@@ -22968,7 +23051,7 @@ pub const IndexManager = struct {
             cache_vectors[0..cache_count],
             vector_cache_epoch,
         );
-        if (!entry.external and entry.embedding_name == null and !multi_source) {
+        if (!entry.external and entry.embedding_name == null and entry.embedding_names.len == 0) {
             try scoreDirectDenseDocumentFallbackBatch(
                 manager,
                 store,
@@ -26742,6 +26825,61 @@ test "active repair shadow root validation rejects escapes" {
     try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ".shadow-1/indexes/ft_v1"));
 }
 
+test "repair shadow cleanup revalidates a pointer published after inventory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var publisher = try IndexManager.init(alloc, base_path);
+    defer publisher.deinit();
+    var cleaner = try IndexManager.init(alloc, base_path);
+    defer cleaner.deinit();
+
+    const index_name = "dense_idx";
+    const root_name = ".repair-shadow-publish-race";
+    const relative = root_name ++ "/indexes/" ++ index_name;
+    const shadow_path = try std.fs.path.join(alloc, &.{ base_path, root_name });
+    defer alloc.free(shadow_path);
+    const active_path = try std.fs.path.join(alloc, &.{ base_path, relative });
+    defer alloc.free(active_path);
+    try fs_paths.createDirPathPortable(std.testing.io, active_path);
+    try IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_path);
+    const sentinel_path = try std.fs.path.join(alloc, &.{ active_path, "sentinel" });
+    defer alloc.free(sentinel_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sentinel_path, .data = "live" });
+
+    const PublishContext = struct {
+        manager: *IndexManager,
+        canonical_path: []const u8,
+        relative_path: []const u8,
+        shadow_path: []const u8,
+
+        fn publish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.manager.writeActiveIndexRootPointer(self.canonical_path, self.relative_path);
+            try IndexManager.clearRepairShadowInProgressMarker(self.manager.alloc, self.shadow_path);
+        }
+    };
+    const canonical_path = try publisher.indexPath(index_name);
+    defer alloc.free(canonical_path);
+    var context = PublishContext{
+        .manager = &publisher,
+        .canonical_path = canonical_path,
+        .relative_path = relative,
+        .shadow_path = shadow_path,
+    };
+    test_repair_shadow_cleanup_after_pointer_snapshot = .{
+        .context = &context,
+        .callback = PublishContext.publish,
+    };
+    defer test_repair_shadow_cleanup_after_pointer_snapshot = null;
+
+    _ = try cleaner.cleanupInactiveRepairShadowRootsPage();
+    try std.Io.Dir.cwd().access(std.testing.io, sentinel_path, .{});
+    try std.testing.expect(try cleaner.publishedRepairShadowRootSelected(std.testing.io, root_name));
+}
+
 test "native physical generation pointer is versioned and fails closed without authority" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -26771,7 +26909,7 @@ test "native physical generation pointer is versioned and fails closed without a
     defer alloc.free(authority_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = authority_path,
-        .data = "native\n",
+        .data = posting_segment_store_mod.authority_value,
     });
     const canonical_path = try manager.indexPath(index_name);
     defer alloc.free(canonical_path);
@@ -27164,7 +27302,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     const cfg: types.IndexConfig = .{
         .name = "dv_v2",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"embedding_name\":\"source_vectors\",\"external\":true}",
     };
     test_vector_block_primary_snapshot_builds = 0;
     try manager.add(&store, cfg);
@@ -27175,7 +27313,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(?u64, snapshot_sequence), entry.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
-    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", cfg.name);
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", "source_vectors");
     defer alloc.free(artifact_key);
     const artifact = try store.get(alloc, artifact_key);
     defer alloc.free(artifact);
@@ -27185,6 +27323,9 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
         &.{ 1.0, 2.0 },
         try enrichment_artifact_codec.decodeDenseEmbeddingInto(artifact, &artifact_vector),
     );
+    const wrong_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", cfg.name);
+    defer alloc.free(wrong_artifact_key);
+    try std.testing.expectError(error.NotFound, store.get(alloc, wrong_artifact_key));
     const canonical_path = try manager.indexPath(cfg.name);
     defer alloc.free(canonical_path);
     const relative_path = (try manager.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
@@ -27241,8 +27382,8 @@ test "fresh native dense backfill extends a shared vector generation without a s
 
     const generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
     defer generation.release();
-    const first_scope = IndexManager.denseVectorArtifactScopeHash(manager.denseIndex(first.name).?);
-    const second_scope = IndexManager.denseVectorArtifactScopeHash(manager.denseIndex(second.name).?);
+    const first_scope = IndexManager.denseVectorArtifactScopeHashAt(manager.denseIndex(first.name).?, 0);
+    const second_scope = IndexManager.denseVectorArtifactScopeHashAt(manager.denseIndex(second.name).?, 0);
     try std.testing.expectEqual(@as(u64, 0), generation.opened.baseOnlyCoverage(first_scope).?.vector_count);
     try std.testing.expectEqual(@as(u64, 1), generation.opened.baseOnlyCoverage(second_scope).?.vector_count);
 }
@@ -29393,6 +29534,37 @@ test "dense index unions multiple embedding artifact sources without overwriting
     defer alloc.free(body_payload);
     try store.put(title_artifact, title_payload);
     try store.put(body_artifact, body_payload);
+    const entry = manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
+    const native_base_sequence = store.lastReplaySequence(0);
+    try manager.prepareFreshDenseVectorCaptureBase(entry, native_base_sequence);
+    try std.testing.expect(try manager.publishVectorBlockMutationWal(
+        entry,
+        &.{
+            .{
+                .kind = .upsert,
+                .vector_id = deterministicDenseVectorId(title_artifact),
+                .metadata = @constCast(title_artifact),
+                .vector = @constCast(&[_]f32{ 1, 0, 0 }),
+            },
+            .{
+                .kind = .upsert,
+                .vector_id = deterministicDenseVectorId(body_artifact),
+                .metadata = @constCast(body_artifact),
+                .vector = @constCast(&[_]f32{ 0, 1, 0 }),
+            },
+        },
+        native_base_sequence,
+    ));
+    {
+        const captured = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+        defer captured.release();
+        for ([_][]const u8{ title_artifact, body_artifact }) |artifact_key| {
+            switch (try captured.opened.get(artifact_key, native_base_sequence, null)) {
+                .vector => {},
+                .missing, .tombstone => return error.TestUnexpectedResult,
+            }
+        }
+    }
 
     const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "foreign_dense_v1");
     defer alloc.free(foreign_artifact);
@@ -29416,7 +29588,6 @@ test "dense index unions multiple embedding artifact sources without overwriting
     // preserve artifact identity exactly like the named maintenance API.
     try manager.applyDenseEmbeddingWrites(&store, &writes);
 
-    const entry = manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
     try std.testing.expect(!entry.supports_unit_grouping);
     try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
     const title_metadata = (try entry.index.getMetadata(deterministicDenseVectorId(title_artifact))) orelse return error.TestUnexpectedResult;
@@ -29430,6 +29601,26 @@ test "dense index unions multiple embedding artifact sources without overwriting
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
     try std.testing.expectEqualStrings(title_artifact, results.getHits()[0].metadata.?);
+
+    _ = try manager.publishVectorBlockBasesAtStableTip();
+    try std.testing.expect(manager.vectorBlockReadyForDenseIndex("document_vectors"));
+    const native_generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+    defer native_generation.release();
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        IndexManager.denseVectorArtifactCoverageCount(&native_generation.opened, entry),
+    );
+    for ([_][]const u8{ title_artifact, body_artifact }) |artifact_key| {
+        const found = try native_generation.opened.get(
+            artifact_key,
+            native_generation.opened.store.covered_source_sequence,
+            null,
+        );
+        switch (found) {
+            .vector => {},
+            .missing, .tombstone => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "sparse multi-source requests carry semantic producer identity" {
