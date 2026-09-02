@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "channels": {
+    "stable": {
+      "tag_kind": "stable",
+      "ordering": "semver",
+      "journal_key": "antfly/channels/stable.json",
+      "bootstrap": "github-latest",
+      "npm_tag": "latest",
+      "publish_pypi": true,
+      "publish_homebrew": true,
+      "container_alias": "latest",
+      "object_alias": "latest",
+      "github_release": "latest",
+      "recovery_source": "github-release"
+    },
+    "next": {
+      "tag_kind": "prerelease",
+      "ordering": "semver",
+      "journal_key": "antfly/channels/next.json",
+      "bootstrap": "npm",
+      "npm_tag": "next",
+      "publish_pypi": true,
+      "publish_homebrew": false,
+      "container_alias": "next",
+      "object_alias": "next",
+      "github_release": "prerelease",
+      "recovery_source": "github-release"
+    },
+    "nightly": {
+      "tag_kind": "nightly",
+      "ordering": "sequence",
+      "journal_key": "antfly/channels/nightly.json",
+      "bootstrap": "npm",
+      "npm_tag": "nightly",
+      "publish_pypi": false,
+      "publish_homebrew": false,
+      "container_alias": "nightly",
+      "object_alias": "nightly",
+      "github_release": "none",
+      "recovery_source": "object-storage"
+    }
+  }
+}

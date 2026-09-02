@@ -102,10 +102,19 @@ class CAbiPackagingTests(unittest.TestCase):
         release_build_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-release-build.yml"
         ).read_text()
+        artifact_build_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-artifact-build.yml"
+        ).read_text()
+        nightly_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-nightly.yml"
+        ).read_text()
         release_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-release.yml").read_text()
         container_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-container.yml").read_text()
         dev_publish = (REPO_ROOT / "scripts" / "publish-zig-runtime-dev.sh").read_text()
         platform_policy = json.loads((REPO_ROOT / "scripts" / "release" / "platforms.json").read_text())
+        channel_policy = json.loads(
+            (REPO_ROOT / "scripts" / "release" / "channels.json").read_text()
+        )
         self.assertEqual(platform_policy["glibc_minimum"], minimum_glibc)
         gnu_floors = {
             match
@@ -141,20 +150,33 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("source_commit:", package_workflow)
         self.assertIn("antfly-cli-snapshot", package_workflow)
         self.assertIn("publish_npm_package.sh", release_workflow)
-        self.assertIn("uses: ./.github/workflows/cli-package.yml", release_build_workflow)
+        self.assertIn("uses: ./.github/workflows/cli-package.yml", artifact_build_workflow)
+        self.assertIn(
+            "uses: ./.github/workflows/antfly-artifact-build.yml",
+            release_build_workflow,
+        )
         self.assertIn('tags:\n      - "v*"', release_build_workflow)
         self.assertIn("permissions:\n  contents: read", release_build_workflow)
         self.assertNotIn("contents: write", release_build_workflow)
         self.assertNotIn("id-token: write", release_build_workflow)
         self.assertNotIn("environment:", release_build_workflow)
         self.assertNotIn("publish_objectstorage.py", release_build_workflow)
+        self.assertIn("permissions:\n  contents: read", artifact_build_workflow)
+        self.assertNotIn("contents: write", artifact_build_workflow)
+        self.assertNotIn("id-token: write", artifact_build_workflow)
+        self.assertNotIn("environment:", artifact_build_workflow)
+        self.assertNotIn("publish_objectstorage.py", artifact_build_workflow)
         self.assertNotIn("workflow_dispatch:", release_workflow)
         self.assertNotIn('tags:\n      - "v*"', release_workflow)
         self.assertIn("workflow_run:", release_workflow)
-        self.assertIn('workflows: ["Release build"]', release_workflow)
+        self.assertIn(
+            'workflows: ["Release build", "Nightly snapshot"]', release_workflow
+        )
         self.assertIn("repository_dispatch:", release_workflow)
         self.assertIn("promote-cli-release", release_workflow)
-        self.assertIn("release_platforms.py github-matrix", release_build_workflow)
+        self.assertIn("promote-release-channel", release_workflow)
+        self.assertIn("release_channels.py resolve", artifact_build_workflow)
+        self.assertIn("release_platforms.py github-matrix", artifact_build_workflow)
         self.assertIn("verify_release_ledger.py", release_workflow)
         self.assertIn("--scope cli", release_workflow)
         self.assertIn("--scope runtime", release_workflow)
@@ -180,10 +202,28 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("group: antfly-release-promotion", release_workflow)
         self.assertIn("release_channel_state.py begin", release_workflow)
         self.assertIn("release_channel_state.py finish", release_workflow)
-        self.assertIn("Commit stable container aliases", release_workflow)
+        self.assertIn("Commit container channel aliases", release_workflow)
         self.assertIn("Commit the stable Homebrew formula", release_workflow)
         self.assertIn('CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}', release_workflow)
         self.assertNotIn("npm dist-tag add", release_workflow)
+        self.assertNotIn("contains(needs.prepare-release-promotion.outputs.version", release_workflow)
+
+        channels = channel_policy["channels"]
+        self.assertEqual(set(channels), {"stable", "next", "nightly"})
+        self.assertEqual(channels["stable"]["npm_tag"], "latest")
+        self.assertEqual(channels["next"]["container_alias"], "next")
+        self.assertEqual(channels["nightly"]["object_alias"], "nightly")
+        self.assertFalse(channels["nightly"]["publish_pypi"])
+        self.assertFalse(channels["nightly"]["publish_homebrew"])
+        self.assertEqual(channels["nightly"]["github_release"], "none")
+        self.assertIn("workflow_dispatch:", nightly_workflow)
+        self.assertNotIn("schedule:", nightly_workflow)
+        self.assertNotIn("push:", nightly_workflow)
+        self.assertIn("v0.0.0-dev.${GITHUB_RUN_ID}", nightly_workflow)
+        self.assertIn(
+            "uses: ./.github/workflows/antfly-artifact-build.yml", nightly_workflow
+        )
+        self.assertIn("channel: nightly", nightly_workflow)
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()

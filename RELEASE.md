@@ -49,19 +49,25 @@ SDK and enables Metal and Accelerate.
 
 ## Pipeline Ownership
 
-Release is deliberately split across two workflows so code loaded from an
-untrusted tag never receives publication credentials.
+Release is split into an unprivileged artifact plane and a default-branch
+promotion plane so code loaded from a tag never receives publication
+credentials.
 
-1. `.github/workflows/antfly-release-build.yml` is the tag workflow. With only
-   read permission, it builds the canonical Zig archives, calls
-   `.github/workflows/cli-package.yml`, and uploads the native archives, CLI
-   snapshot, and source-commit-bound release request as Actions artifacts.
-2. Completion triggers `.github/workflows/antfly-release.yml` through
+1. `.github/workflows/antfly-artifact-build.yml` is the sole reusable artifact
+   builder. With only read permission, it builds the canonical Zig archives,
+   calls `.github/workflows/cli-package.yml`, and uploads the native archives,
+   CLI snapshot, and source-commit-and-channel-bound release request as Actions
+   artifacts. The tag-triggered `.github/workflows/antfly-release-build.yml`
+   and manually triggered `.github/workflows/antfly-nightly.yml` are thin
+   callers of this same builder.
+2. Completion of either caller triggers `.github/workflows/antfly-release.yml` through
    `workflow_run`. GitHub loads this privileged promotion workflow from the
-   default branch. It checks the tag and source commit, combines the build
+   default branch. It checks the channel identity and source commit, combines the build
    outputs into one schema-versioned artifact ledger, verifies it, attests
-   every payload file, and stores the exact bytes on a draft GitHub Release and
-   under immutable, content-addressed object-storage keys.
+   every payload file, and stores the exact bytes under immutable,
+   content-addressed object-storage keys. Stable and next additionally stage
+   those bytes on a draft GitHub Release; nightly deliberately does not create
+   a GitHub Release.
 3. The promotion controller separates the complete payload into
    ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
    exact scope membership, and every digest.
@@ -72,15 +78,13 @@ untrusted tag never receives publication credentials.
    digest, and then compare-or-creates the version tags. A retry can reuse an
    identical image but cannot overwrite a released version with different
    bytes.
-5. Mutable install channels are transactions. Compare-and-swap journals in R2
-   record `pending` and `current` release identities (tag, source commit, and
-   ledger digest) for both `stable` and `next`. Only after that preflight may
-   npm publish with its required `latest` or `next` dist-tag. Stable releases
-   then update Homebrew, container `latest`, object-storage `latest`, and GitHub
-   release visibility before committing the journal. RC releases publish the
-   GitHub prerelease and commit the `next` journal. A failed run must resume the
-   same pending identity; historical recovery cannot move either channel
-   backward.
+5. Mutable install channels are transactions. `scripts/release/channels.json`
+   is the canonical policy for `stable`, `next`, and `nightly`: tag class,
+   ordering rule, journal, package-registry eligibility, mutable aliases,
+   GitHub visibility, and recovery source. Compare-and-swap journals in R2
+   record each channel's `pending` and `current` release identity (tag, source
+   commit, and ledger digest). A failed run must resume the same pending
+   identity, and recovery cannot move a channel backward.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
@@ -91,7 +95,8 @@ one-way: a retry may add missing identical assets to a published release but
 never returns it to draft state.
 
 Normal registry promotion is triggered by `workflow_run`; the explicit
-`promote-cli-release` `repository_dispatch` event is only the recovery path.
+`promote-release-channel` `repository_dispatch` event is the general recovery
+path (`promote-cli-release` remains as a compatible stable/next event name).
 Both entry points load the promotion workflow from the default branch rather
 than an operator-selected ref. The `pypi` and `npm` environments admit this CLI
 promotion from `main`; typed tag rules preserve pre-transition `v*` releases
@@ -117,8 +122,10 @@ journal and aliases, rather than disguising an old-release recovery as a new
 promotion.
 
 The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
-in `scripts/release/platforms.json`. Release jobs, CLI packaging, and Homebrew
-read that policy instead of maintaining independent platform tables. Python
+in `scripts/release/platforms.json`; channel behavior lives in
+`scripts/release/channels.json`. Release jobs, CLI packaging, Homebrew, and
+promotion read those policies instead of maintaining independent conditionals
+or platform tables. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
 
@@ -131,9 +138,15 @@ scripts under `scripts/release/`:
 - `create_github_release.py` creates or updates the draft GitHub Release,
   generates release notes through the GitHub API, and accepts existing assets
   only when their digest matches the local payload.
-- `release_channel_state.py` compare-and-swaps the stable and prerelease channel
-  journals, prevents backward promotion using SemVer precedence, and makes an
-  interrupted promotion resumable only by the same release identity.
+- `release_channels.py` validates and resolves the canonical channel policy.
+  Stable and next use SemVer precedence; nightly uses its monotonically
+  increasing workflow-run sequence.
+- `release_channel_state.py` compare-and-swaps each channel journal, prevents
+  backward promotion, and makes an interrupted promotion resumable only by the
+  same release identity.
+- `download_objectstorage.py` restores a nightly's exact ledger members from
+  immutable object storage for recovery; the normal ledger and attestation
+  verification still runs before promotion.
 - `publish_objectstorage.py` first writes content-addressed and versioned keys
   with compare-or-fail semantics, then updates mutable channel aliases only
   after every immutable upload succeeds. The release workflow currently uses
@@ -142,7 +155,14 @@ scripts under `scripts/release/`:
 
 ## Version Behavior
 
-Stable tags use `vX.Y.Z`; RC tags use `vX.Y.Z-rc.N`.
+Stable tags use `vX.Y.Z`; RC tags use `vX.Y.Z-rc.N`. Nightly snapshots use
+`v0.0.0-dev.<GitHub run ID>`. A nightly is a channel, not a cadence: the
+workflow is manual today, and a schedule or default-branch trigger can be added
+later without changing the artifact or promotion model.
+
+Run a snapshot for the current default-branch head with
+`gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific
+default-branch commit, add `-f source_commit=<40-character-commit>`.
 
 Stable releases publish:
 
@@ -158,13 +178,23 @@ RC releases publish:
 
 - GitHub Release artifacts marked prerelease
 - R2 release artifacts
+- `next` R2 channel artifacts
 - npm CLI packages with dist-tag `next`
 - PyPI CLI wheels using PEP 440 prerelease versions, for example
   `0.2.0-rc.1` becomes `0.2.0rc1`
-- container tag `<version>`
+- container tags `<version>` and `next`
 
 RC releases do not update the `latest` R2 channel, Homebrew stable formula, or
 container `latest` tag.
+
+Nightly snapshots publish:
+
+- immutable R2 release artifacts and the `nightly` R2 channel
+- npm CLI packages with dist-tag `nightly`
+- container tags `<version>` and `nightly`
+
+Nightlies do not publish to PyPI or Homebrew and do not create GitHub Releases.
+Their immutable recovery source is R2.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.

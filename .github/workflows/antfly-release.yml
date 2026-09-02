@@ -1,13 +1,13 @@
 name: Release promotion
 
-# Both entry points load this workflow from the default branch. Completed tag
-# builds are promoted automatically; repository_dispatch is the recovery path.
+# All entry points load this controller from the default branch. Build workflows
+# produce immutable inputs; repository_dispatch is the exact-ledger recovery path.
 on:
   workflow_run:
-    workflows: ["Release build"]
+    workflows: ["Release build", "Nightly snapshot"]
     types: [completed]
   repository_dispatch:
-    types: [promote-cli-release]
+    types: [promote-cli-release, promote-release-channel]
 
 permissions:
   contents: read
@@ -41,6 +41,16 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       commit: ${{ steps.identity.outputs.commit }}
       ledger_sha256: ${{ steps.ledger.outputs.sha256 }}
+      channel: ${{ steps.identity.outputs.channel }}
+      journal_key: ${{ steps.identity.outputs.journal_key }}
+      bootstrap: ${{ steps.identity.outputs.bootstrap }}
+      npm_tag: ${{ steps.identity.outputs.npm_tag }}
+      publish_pypi: ${{ steps.identity.outputs.publish_pypi }}
+      publish_homebrew: ${{ steps.identity.outputs.publish_homebrew }}
+      container_alias: ${{ steps.identity.outputs.container_alias }}
+      object_alias: ${{ steps.identity.outputs.object_alias }}
+      github_release: ${{ steps.identity.outputs.github_release }}
+      recovery_source: ${{ steps.identity.outputs.recovery_source }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -82,20 +92,27 @@ jobs:
           BUILD_COMMIT: ${{ github.event.workflow_run.head_sha }}
           BUILD_EVENT: ${{ github.event.workflow_run.event }}
           RAW_RECOVERY_VERSION: ${{ github.event.client_payload.version }}
+          RAW_RECOVERY_CHANNEL: ${{ github.event.client_payload.channel }}
+          RAW_RECOVERY_COMMIT: ${{ github.event.client_payload.commit }}
           RECOVERY_LEDGER_SHA256: ${{ github.event.client_payload.ledger_sha256 }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           expected_ledger=""
           if [ "$EVENT_NAME" = workflow_run ]; then
-            test "$BUILD_EVENT" = push
             request=dist/release-request/release-request.json
-            test "$(jq -r .schema_version "$request")" = 1
+            test "$(jq -r .schema_version "$request")" = 2
             raw="$(jq -r .tag "$request")"
             commit="$(jq -r .commit "$request")"
-            test "$commit" = "$BUILD_COMMIT"
+            requested_channel="$(jq -r .channel "$request")"
+            case "$BUILD_EVENT" in
+              push) test "$commit" = "$BUILD_COMMIT" ;;
+              workflow_dispatch) test "$requested_channel" = nightly ;;
+              *) echo "unsupported artifact build event: $BUILD_EVENT" >&2; exit 2 ;;
+            esac
           else
             raw="$RAW_RECOVERY_VERSION"
+            requested_channel="${RAW_RECOVERY_CHANNEL:-auto}"
             expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
             test -n "$expected_ledger"
           fi
@@ -105,8 +122,18 @@ jobs:
           fi
           version="${raw#v}"
           tag="v${version}"
+          resolved="$(python scripts/release/release_channels.py resolve \
+            --tag "$tag" \
+            --channel "$requested_channel" \
+            --github-output "$GITHUB_OUTPUT")"
+          channel="$(jq -r .channel <<<"$resolved")"
           if [ "$EVENT_NAME" != workflow_run ]; then
-            commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
+            if [ "$channel" = nightly ]; then
+              commit="${RAW_RECOVERY_COMMIT,,}"
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            else
+              commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
+            fi
           fi
           {
             echo "version=$version"
@@ -119,11 +146,16 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          RELEASE_CHANNEL: ${{ steps.identity.outputs.channel }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          if [ "$RELEASE_CHANNEL" != nightly ]; then
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          else
+            git cat-file -e "$RELEASE_COMMIT^{commit}"
+          fi
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
 
       - uses: actions/setup-python@v5
@@ -131,7 +163,6 @@ jobs:
           python-version: "3.13"
 
       - name: Install hash-locked object storage client
-        if: ${{ github.event_name == 'workflow_run' }}
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
@@ -176,7 +207,7 @@ jobs:
           subject-path: dist/release-payload/*
 
       - name: Save immutable assets on a draft GitHub release
-        if: ${{ github.event_name == 'workflow_run' }}
+        if: ${{ github.event_name == 'workflow_run' && steps.identity.outputs.github_release != 'none' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
@@ -207,7 +238,7 @@ jobs:
             dist/release-payload/*
 
       - name: Recover the complete immutable payload from GitHub
-        if: ${{ github.event_name == 'repository_dispatch' }}
+        if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.recovery_source == 'github-release' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
@@ -217,7 +248,22 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --dir dist/release-payload
 
-      - name: Verify recovered GitHub attestations
+      - name: Recover the complete immutable payload from object storage
+        if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.recovery_source == 'object-storage' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          python scripts/release/download_objectstorage.py \
+            --provider s3 \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --prefix "antfly/${RELEASE_TAG}" \
+            --out-dir dist/release-payload
+
+      - name: Verify recovered artifact attestations
         if: ${{ github.event_name == 'repository_dispatch' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -305,6 +351,7 @@ jobs:
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
     needs: prepare-release-promotion
+    if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -362,18 +409,18 @@ jobs:
       - name: Publish npm packages in dependency order
         env:
           VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
-          CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
+          NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
         run: |
           set -euo pipefail
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-darwin-arm64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-darwin-arm64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-arm64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-linux-arm64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-x64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-linux-x64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-darwin-arm64 "$VERSION" "$NPM_TAG" "./dist/cli-snapshot/antfly-cli-darwin-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-arm64 "$VERSION" "$NPM_TAG" "./dist/cli-snapshot/antfly-cli-linux-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-x64 "$VERSION" "$NPM_TAG" "./dist/cli-snapshot/antfly-cli-linux-x64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli "$VERSION" "$NPM_TAG" "./dist/cli-snapshot/antfly-cli-${VERSION}.tgz"
 
   prepare-zig-homebrew:
     name: Prepare antfly Homebrew formula
     needs: prepare-release-promotion
-    if: ${{ !contains(needs.prepare-release-promotion.outputs.version, '-') }}
+    if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
     runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
@@ -408,7 +455,7 @@ jobs:
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
-          needs.publish-cli-pypi.result == 'success' &&
+          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') }}
     permissions:
       contents: read
@@ -431,7 +478,7 @@ jobs:
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
-          needs.publish-cli-pypi.result == 'success' &&
+          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
           needs.publish-container.result == 'success' }}
     runs-on: arc-antfly-standard
@@ -447,12 +494,12 @@ jobs:
         with:
           python-version: "3.13"
       - uses: actions/setup-node@v6
-        if: ${{ contains(needs.prepare-release-promotion.outputs.version, '-') }}
+        if: ${{ needs.prepare-release-promotion.outputs.bootstrap == 'npm' }}
         with:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
       - name: Install exact npm client for prerelease channel discovery
-        if: ${{ contains(needs.prepare-release-promotion.outputs.version, '-') }}
+        if: ${{ needs.prepare-release-promotion.outputs.bootstrap == 'npm' }}
         run: |
           npm install -g "npm@$NPM_VERSION"
           test "$(npm --version)" = "$NPM_VERSION"
@@ -463,19 +510,23 @@ jobs:
       - name: Resolve current release channel
         id: channel
         env:
-          RELEASE_VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          CHANNEL: ${{ needs.prepare-release-promotion.outputs.channel }}
+          BOOTSTRAP: ${{ needs.prepare-release-promotion.outputs.bootstrap }}
+          NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ "$RELEASE_VERSION" == *-* ]]; then
-            channel=next
-            current_version="$(npm view @antfly/cli@next version 2>/dev/null || true)"
-            current_tag="${current_version:+v$current_version}"
-          else
-            channel=stable
-            current_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
-          fi
-          echo "name=$channel" >> "$GITHUB_OUTPUT"
+          case "$BOOTSTRAP" in
+            github-latest)
+              current_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+              ;;
+            npm)
+              current_version="$(npm view "@antfly/cli@${NPM_TAG}" version 2>/dev/null || true)"
+              current_tag="${current_version:+v$current_version}"
+              ;;
+            *) echo "unsupported channel bootstrap: $BOOTSTRAP" >&2; exit 2 ;;
+          esac
+          echo "name=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
       - name: Begin or resume the release channel transaction
         env:
@@ -486,6 +537,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
           CHANNEL: ${{ steps.channel.outputs.name }}
+          JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           CURRENT_TAG: ${{ steps.channel.outputs.current_tag }}
         run: |
           set -euo pipefail
@@ -496,20 +548,19 @@ jobs:
           python scripts/release/release_channel_state.py begin \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
-            --key "antfly/channels/${CHANNEL}.json" \
+            --key "$JOURNAL_KEY" \
             --channel "$CHANNEL" \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --ledger-sha256 "$LEDGER_SHA256" \
             "${bootstrap_args[@]}"
 
-  promote-stable-channels:
-    name: Commit stable Homebrew, container, and storage channels
+  promote-channel-aliases:
+    name: Commit policy-selected mutable channel aliases
     needs:
       - prepare-release-promotion
       - begin-release-channel
       - publish-cli-npm
-    if: ${{ needs.begin-release-channel.outputs.channel == 'stable' }}
     runs-on: arc-antfly-standard
     environment: container-publish
     permissions:
@@ -528,6 +579,7 @@ jobs:
           name: antfly-release-payload
           path: dist/release-payload
       - uses: actions/download-artifact@v6
+        if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
         with:
           name: antfly-homebrew-formula
           path: dist/homebrew
@@ -536,12 +588,14 @@ jobs:
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
       - uses: actions/checkout@v6
+        if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
         with:
           repository: antflydb/homebrew-taps
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-taps
           fetch-depth: 1
       - name: Commit the stable Homebrew formula
+        if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
         env:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
         run: |
@@ -555,7 +609,7 @@ jobs:
           git add Formula/antfly.rb
           git commit -m "Update antfly to ${RELEASE_TAG}"
           git push origin HEAD:main
-      - name: Authenticate to Google Cloud for stable container aliases
+      - name: Authenticate to Google Cloud for container channel aliases
         id: auth
         uses: google-github-actions/auth@v3
         with:
@@ -564,25 +618,27 @@ jobs:
           token_format: access_token
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
-      - name: Commit stable container aliases
+      - name: Commit container channel aliases
         env:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
         run: |
           set -euo pipefail
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
           crane copy \
             "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${RELEASE_TAG}" \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:latest"
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${CONTAINER_ALIAS}"
           crane copy \
             "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
-            "ghcr.io/antflydb/antfly:latest"
+            "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}"
       - name: Commit object-storage channel aliases
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          OBJECT_ALIAS: ${{ needs.prepare-release-promotion.outputs.object_alias }}
         run: |
           python scripts/release/publish_objectstorage.py \
             --provider s3 \
@@ -590,26 +646,61 @@ jobs:
             --bucket antfly-releases \
             --prefix "antfly/${RELEASE_TAG}" \
             --content-addressed-prefix antfly/artifacts \
-            --latest-prefix antfly/latest \
+            --latest-prefix "antfly/${OBJECT_ALIAS}" \
             --publish-latest \
             dist/release-payload/*
 
-  complete-release-channel:
-    name: Publish release and commit channel transaction
+  publish-github-release:
+    name: Publish policy-selected GitHub release
     needs:
       - prepare-release-promotion
       - begin-release-channel
       - publish-cli-npm
-      - promote-stable-channels
+      - promote-channel-aliases
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
           needs.publish-cli-npm.result == 'success' &&
-          (needs.promote-stable-channels.result == 'success' || needs.promote-stable-channels.result == 'skipped') }}
+          needs.promote-channel-aliases.result == 'success' &&
+          needs.prepare-release-promotion.outputs.github_release != 'none' }}
     runs-on: arc-antfly-standard
     permissions:
       contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Publish the verified GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          GITHUB_RELEASE_MODE: ${{ needs.prepare-release-promotion.outputs.github_release }}
+        run: |
+          case "$GITHUB_RELEASE_MODE" in
+            latest) gh release edit "$RELEASE_TAG" --draft=false --latest ;;
+            prerelease) gh release edit "$RELEASE_TAG" --draft=false --prerelease ;;
+            *) echo "unsupported GitHub release mode: $GITHUB_RELEASE_MODE" >&2; exit 2 ;;
+          esac
+
+  complete-release-channel:
+    name: Commit release channel transaction
+    needs:
+      - prepare-release-promotion
+      - begin-release-channel
+      - publish-cli-npm
+      - promote-channel-aliases
+      - publish-github-release
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
+          needs.publish-cli-npm.result == 'success' &&
+          needs.promote-channel-aliases.result == 'success' &&
+          (needs.publish-github-release.result == 'success' || needs.publish-github-release.result == 'skipped') }}
+    runs-on: arc-antfly-standard
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -621,16 +712,6 @@ jobs:
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
-      - name: Publish the verified GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
-        run: |
-          if [[ "$RELEASE_TAG" == *-* ]]; then
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease
-          else
-            gh release edit "$RELEASE_TAG" --draft=false --latest
-          fi
       - name: Commit the release channel transaction
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -640,11 +721,12 @@ jobs:
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
           CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
+          JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
         run: |
           python scripts/release/release_channel_state.py finish \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
-            --key "antfly/channels/${CHANNEL}.json" \
+            --key "$JOURNAL_KEY" \
             --channel "$CHANNEL" \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \

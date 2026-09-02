@@ -37,9 +37,10 @@ consumers.
 
 ## Release Flow
 
-1. Publish the normal Antfly release tag, for example `v0.2.0`.
+1. Push a stable or RC Antfly tag, or manually dispatch the `Nightly snapshot`
+   workflow. Both entry points call the same read-only reusable artifact build.
 2. The reusable CLI packaging workflow consumes the native GitHub Actions
-   artifacts from that same run and builds all npm tarballs and Python wheels
+   artifacts from that same build and builds all npm tarballs and Python wheels
    once.
 3. The workflow records their hashes, source commit, npm version, and PEP 440
    Python version in `cli-snapshot.json`. The tag workflow has read-only
@@ -58,8 +59,10 @@ consumers.
    GNU runtime scope to the single container image, and stable archives to
    Homebrew. Container builds are first sealed under the release-ledger digest;
    version tags are compare-or-created and cannot be overwritten by a retry.
-   npm `latest` and `next`, plus stable mutable aliases and GitHub release
-   visibility, are committed through compare-and-swap channel transactions.
+   npm `latest`, `next`, or `nightly`, plus the channel's container and R2
+   aliases and policy-selected GitHub visibility, are committed through
+   compare-and-swap channel transactions. PyPI and Homebrew are omitted for
+   nightlies.
    Registry jobs skip an existing version only after comparing its digest, so
    retries cannot conceal drift.
    Native archives remain available under
@@ -87,6 +90,23 @@ and GitHub `latest` channels move only forward. An interrupted promotion leaves
 a journaled pending identity and only that exact tag, source commit, and ledger
 digest may resume it. A published GitHub release is never changed back to
 draft.
+
+Nightly recovery uses the general channel event because nightlies deliberately
+have no GitHub Release. Supply its exact source commit and ledger digest; the
+controller restores the immutable versioned payload from R2 before running the
+same attestation and ledger checks:
+
+```sh
+gh api --method POST repos/antflydb/antfly/dispatches \
+  -f event_type=promote-release-channel \
+  -f 'client_payload[channel]=nightly' \
+  -f 'client_payload[version]=v0.0.0-dev.<run-id>' \
+  -f 'client_payload[commit]=<40-character-source-commit>' \
+  -f 'client_payload[ledger_sha256]=<64-character-sha256>'
+```
+
+The channel contract is centralized in `scripts/release/channels.json` rather
+than encoded as version-string tests throughout the workflows.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub

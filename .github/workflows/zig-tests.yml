@@ -194,9 +194,12 @@ jobs:
             scripts/release/build_cli_snapshot.py \
             scripts/release/build_release_payload.py \
             scripts/release/create_github_release.py \
+            scripts/release/download_objectstorage.py \
             scripts/release/prepare_pypi_promotion.py \
             scripts/release/publish_objectstorage.py \
+            scripts/release/channels.json \
             scripts/release/platforms.json \
+            scripts/release/release_channels.py \
             scripts/release/release_platforms.py \
             scripts/release/release_channel_state.py \
             scripts/release/requirements.lock \
@@ -211,7 +214,9 @@ jobs:
             docs/guides/quickstart.mdx \
             RELEASE.md \
             zig/cloudbuild.runtime.yaml \
+            .github/workflows/antfly-artifact-build.yml \
             .github/workflows/antfly-container.yml \
+            .github/workflows/antfly-nightly.yml \
             .github/workflows/antfly-release-build.yml \
             .github/workflows/antfly-release.yml \
             .github/workflows/cli-package.yml \

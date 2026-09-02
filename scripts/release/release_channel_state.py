@@ -10,76 +10,17 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-TAG_PATTERN = re.compile(
-    r"^v(?P<major>0|[1-9][0-9]*)\."
-    r"(?P<minor>0|[1-9][0-9]*)"
-    r"(?:\.(?P<patch>0|[1-9][0-9]*))?"
-    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
-    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+from release_channels import (
+    compare_channel_tags,
+    load_policy,
+    validate_channel_tag,
 )
-
-
-def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
-    match = TAG_PATTERN.fullmatch(tag)
-    if not match:
-        raise SystemExit(f"release channel requires a semantic version tag: {tag}")
-    prerelease = match.group("prerelease")
-    identifiers = tuple(prerelease.split(".")) if prerelease else None
-    if identifiers and any(
-        identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0")
-        for identifier in identifiers
-    ):
-        raise SystemExit(f"invalid semantic version prerelease: {tag}")
-    return (
-        (
-            int(match.group("major")),
-            int(match.group("minor")),
-            int(match.group("patch") or 0),
-        ),
-        identifiers,
-    )
-
-
-def compare_version_precedence(left: str, right: str) -> int:
-    left_core, left_pre = parse_version(left)
-    right_core, right_pre = parse_version(right)
-    if left_core != right_core:
-        return -1 if left_core < right_core else 1
-    if left_pre is None or right_pre is None:
-        if left_pre is right_pre:
-            return 0
-        return 1 if left_pre is None else -1
-    for left_id, right_id in zip(left_pre, right_pre):
-        if left_id == right_id:
-            continue
-        left_numeric = left_id.isdigit()
-        right_numeric = right_id.isdigit()
-        if left_numeric and right_numeric:
-            return -1 if int(left_id) < int(right_id) else 1
-        if left_numeric != right_numeric:
-            return -1 if left_numeric else 1
-        return -1 if left_id < right_id else 1
-    if len(left_pre) == len(right_pre):
-        return 0
-    return -1 if len(left_pre) < len(right_pre) else 1
-
-
-def validate_channel_tag(tag: str, channel: str) -> None:
-    _, prerelease = parse_version(tag)
-    if channel == "stable" and prerelease is not None:
-        raise SystemExit(
-            f"stable channel requires a stable semantic version tag: {tag}"
-        )
-    if channel == "next" and prerelease is None:
-        raise SystemExit(
-            f"next channel requires a prerelease semantic version tag: {tag}"
-        )
 
 
 def release_identity(
     tag: str, commit: str, ledger_sha256: str, channel: str = "stable"
 ) -> dict[str, str]:
-    validate_channel_tag(tag, channel)
+    validate_channel_tag(tag, channel, load_policy())
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise SystemExit(f"invalid release commit: {commit}")
     if not re.fullmatch(r"[0-9a-f]{64}", ledger_sha256):
@@ -170,8 +111,15 @@ def begin_promotion(
     bootstrap_current: str | None,
     channel: str = "stable",
 ) -> None:
+    policy = load_policy()
+    validate_channel_tag(identity["tag"], channel, policy)
     stored = store.load()
     state = stored.document
+    stored_channel = state.get("channel")
+    if stored_channel not in {None, channel}:
+        raise SystemExit(
+            f"release channel journal belongs to {stored_channel}, not {channel}"
+        )
     current = state.get("current")
     pending = state.get("pending")
     if current is not None and not (
@@ -179,7 +127,7 @@ def begin_promotion(
     ):
         raise SystemExit("release channel has malformed current identity")
     if current is None and bootstrap_current:
-        validate_channel_tag(bootstrap_current, channel)
+        validate_channel_tag(bootstrap_current, channel, policy)
         current = {"tag": bootstrap_current}
     if pending is not None:
         if same_identity(pending, identity):
@@ -190,15 +138,15 @@ def begin_promotion(
             f"release channel promotion for {pending_tag} is incomplete; resume it before {identity['tag']}"
         )
     if bootstrap_current and isinstance(current, dict):
-        validate_channel_tag(bootstrap_current, channel)
+        validate_channel_tag(bootstrap_current, channel, policy)
         if current["tag"] != bootstrap_current:
             raise SystemExit(
                 f"release channel journal is {current['tag']} but observed alias is {bootstrap_current}"
             )
     if isinstance(current, dict) and isinstance(current.get("tag"), str):
         current_tag = str(current["tag"])
-        validate_channel_tag(current_tag, channel)
-        precedence = compare_version_precedence(identity["tag"], current_tag)
+        validate_channel_tag(current_tag, channel, policy)
+        precedence = compare_channel_tags(identity["tag"], current_tag, channel, policy)
         if precedence < 0:
             raise SystemExit(
                 f"release channel cannot move backward from {current_tag} to {identity['tag']}"
@@ -215,14 +163,23 @@ def begin_promotion(
                 raise SystemExit(
                     f"release channel {identity['tag']} has a different {field}"
                 )
-    next_state = {"schema_version": 1, "current": current, "pending": identity}
+    next_state = {
+        "schema_version": 1,
+        "channel": channel,
+        "current": current,
+        "pending": identity,
+    }
     store.compare_and_swap(stored, next_state)
     print(f"began release channel promotion for {identity['tag']}")
 
 
-def finish_promotion(store: S3ChannelStore, identity: dict[str, str]) -> None:
+def finish_promotion(
+    store: S3ChannelStore, identity: dict[str, str], channel: str = "stable"
+) -> None:
     stored = store.load()
     state = stored.document
+    if state.get("channel") not in {None, channel}:
+        raise SystemExit(f"release channel journal does not belong to {channel}")
     if state.get("pending") is None and same_identity(state.get("current"), identity):
         print(f"release channel promotion already committed for {identity['tag']}")
         return
@@ -230,7 +187,12 @@ def finish_promotion(store: S3ChannelStore, identity: dict[str, str]) -> None:
         raise SystemExit(
             f"release channel has no matching pending promotion for {identity['tag']}"
         )
-    next_state = {"schema_version": 1, "current": identity, "pending": None}
+    next_state = {
+        "schema_version": 1,
+        "channel": channel,
+        "current": identity,
+        "pending": None,
+    }
     store.compare_and_swap(stored, next_state)
     print(f"committed release channel promotion for {identity['tag']}")
 
@@ -241,13 +203,21 @@ def main() -> int:
     parser.add_argument("--endpoint")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--key", default="antfly/channels/stable.json")
-    parser.add_argument("--channel", choices=("stable", "next"), default="stable")
+    parser.add_argument("--channel", default="stable")
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ledger-sha256", required=True)
     parser.add_argument("--bootstrap-current")
     args = parser.parse_args()
 
+    policy = load_policy()
+    channel_policy = policy["channels"].get(args.channel)
+    if not isinstance(channel_policy, dict):
+        raise SystemExit(f"unknown release channel: {args.channel}")
+    if args.key != channel_policy["journal_key"]:
+        raise SystemExit(
+            f"release channel {args.channel} requires journal {channel_policy['journal_key']}"
+        )
     identity = release_identity(args.tag, args.commit, args.ledger_sha256, args.channel)
     store = S3ChannelStore(args.endpoint, args.bucket, args.key)
     if args.command == "begin":
@@ -255,7 +225,7 @@ def main() -> int:
     else:
         if args.bootstrap_current:
             parser.error("finish does not accept --bootstrap-current")
-        finish_promotion(store, identity)
+        finish_promotion(store, identity, args.channel)
     return 0
 
 

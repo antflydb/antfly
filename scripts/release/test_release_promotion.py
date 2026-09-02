@@ -13,6 +13,7 @@ from unittest import mock
 
 RELEASE_DIR = Path(__file__).resolve().parent
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
+sys.path.insert(0, str(RELEASE_DIR))
 
 
 def load_module(name: str, filename: str):
@@ -27,6 +28,65 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_release_channel_policy_resolves_all_supported_channels(self) -> None:
+        channels = load_module("release_channels_test", "release_channels.py")
+        policy = channels.load_policy()
+
+        stable_name, stable = channels.resolve_channel("v1.2.3", "auto", policy)
+        next_name, next_channel = channels.resolve_channel(
+            "v1.3.0-rc.2", "auto", policy
+        )
+        nightly_name, nightly = channels.resolve_channel(
+            "v0.0.0-dev.123", "nightly", policy
+        )
+
+        self.assertEqual((stable_name, stable["npm_tag"]), ("stable", "latest"))
+        self.assertEqual((next_name, next_channel["npm_tag"]), ("next", "next"))
+        self.assertEqual(
+            (nightly_name, nightly["npm_tag"], nightly["github_release"]),
+            ("nightly", "nightly", "none"),
+        )
+        self.assertGreater(
+            channels.compare_channel_tags(
+                "v0.0.0-dev.10", "v0.0.0-dev.2", "nightly", policy
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(SystemExit, "requires the nightly channel"):
+            channels.resolve_channel("v0.0.0-dev.123", "auto", policy)
+
+    def test_object_storage_recovery_restores_exact_ledger_members(self) -> None:
+        download = load_module(
+            "download_objectstorage_test", "download_objectstorage.py"
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            prefix = root / "release" / "antfly" / "v0.0.0-dev.123"
+            prefix.mkdir(parents=True)
+            ledger = {
+                "schema_version": 2,
+                "artifacts": [
+                    {"name": "metadata.json"},
+                    {"name": "artifact.tgz"},
+                ],
+            }
+            (prefix / "artifacts.json").write_text(json.dumps(ledger))
+            (prefix / "metadata.json").write_text('{"tag":"v0.0.0-dev.123"}')
+            (prefix / "artifact.tgz").write_bytes(b"snapshot")
+            out_dir = root / "restored"
+
+            download.restore_payload(
+                download.LocalReader(root, "release"),
+                "antfly/v0.0.0-dev.123",
+                out_dir,
+            )
+
+            self.assertEqual(
+                {path.name for path in out_dir.iterdir()},
+                {"artifacts.json", "metadata.json", "artifact.tgz"},
+            )
+            self.assertEqual((out_dir / "artifact.tgz").read_bytes(), b"snapshot")
+
     def test_release_channel_store_uses_atomic_create_and_update(self) -> None:
         channel = load_module("release_channel_store_test", "release_channel_state.py")
 
@@ -108,7 +168,12 @@ class ReleasePromotionTests(unittest.TestCase):
         channel.finish_promotion(store, candidate)
         self.assertEqual(
             store.document,
-            {"schema_version": 1, "current": candidate, "pending": None},
+            {
+                "schema_version": 1,
+                "channel": "stable",
+                "current": candidate,
+                "pending": None,
+            },
         )
         channel.finish_promotion(store, candidate)
         self.assertEqual(store.writes, 2, "committed transaction should replay")
@@ -216,6 +281,43 @@ class ReleasePromotionTests(unittest.TestCase):
         older = channel.release_identity("v1.3.0-rc.3", "4" * 40, "5" * 64, "next")
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
             channel.begin_promotion(store, older, None, "next")
+
+    def test_nightly_channel_uses_numeric_run_sequence(self) -> None:
+        channel = load_module(
+            "release_channel_nightly_test", "release_channel_state.py"
+        )
+
+        class MemoryStore:
+            def __init__(self) -> None:
+                self.document = {
+                    "schema_version": 1,
+                    "channel": "nightly",
+                    "current": {"tag": "v0.0.0-dev.9"},
+                    "pending": None,
+                }
+
+            def load(self):
+                return channel.StoredState(self.document, "1")
+
+            def compare_and_swap(self, _previous, document: dict) -> None:
+                self.document = document
+
+        candidate = channel.release_identity(
+            "v0.0.0-dev.10", COMMIT, "3" * 64, "nightly"
+        )
+        store = MemoryStore()
+        channel.begin_promotion(store, candidate, None, "nightly")
+        self.assertEqual(store.document["pending"], candidate)
+
+        store.document = {
+            "schema_version": 1,
+            "channel": "nightly",
+            "current": {"tag": "v0.0.0-dev.10"},
+            "pending": None,
+        }
+        older = channel.release_identity("v0.0.0-dev.9", "4" * 40, "5" * 64, "nightly")
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            channel.begin_promotion(store, older, None, "nightly")
 
     def test_github_asset_is_compare_or_fail(self) -> None:
         github = load_module("create_github_release_test", "create_github_release.py")
