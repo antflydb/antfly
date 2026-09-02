@@ -2435,12 +2435,13 @@ fn aggregateIndexStatusIndexed(
             (publicIndexRepairState(item) == null or shard_repair_lifecycle.action_required);
         const shard_load_failure_blocks = matches_desired_incarnation and shard_load_error_is_terminal and
             !shard_repair_lifecycle.active_generation_serviceable;
-        const shard_enrichment_failure_blocks = matches_desired_incarnation and item.enrichment_failed and
-            !shard_repair_lifecycle.active_generation_serviceable;
         // This counter is the cross-shard terminal-failure reduction. Repair
         // admission is reduced independently below, retaining its recoverable
         // lifecycle instead of relabelling a blocked rebuild as a failure.
-        if (shard_load_failure_blocks or shard_enrichment_failure_blocks) {
+        // `enrichment_failed` records isolated source outcomes. The physical
+        // index remains safe to query (including as an empty published shard),
+        // so only generation/load failures belong in query admission.
+        if (shard_load_failure_blocks) {
             aggregate.query_blocking_group_count +|= 1;
         }
         // Integrity failures are current index-scoped facts even when the
@@ -2956,6 +2957,7 @@ fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.type
 const EmbeddingsRuntimeView = struct {
     backfill_active: bool,
     backfill_progress: f64,
+    coverage_pending: bool,
     coverage_degraded: bool,
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
@@ -4442,7 +4444,7 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false,\"blocks_complete\":false}") != null);
 }
 
-test "serviceable repair cannot mask sibling shard serving failures" {
+test "serviceable repair cannot mask sibling shard load failure" {
     var repair_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "thumbnail",
         .kind = .dense_vector,
@@ -4479,6 +4481,7 @@ test "serviceable repair cannot mask sibling shard serving failures" {
                 .doc_count = 1,
                 .index_count = 1,
                 .indexes = repair_indexes[0..],
+                .enrichment = .{ .enabled = true },
             },
         },
         .{
@@ -4489,6 +4492,7 @@ test "serviceable repair cannot mask sibling shard serving failures" {
                 .doc_count = 1,
                 .index_count = 1,
                 .indexes = failed_indexes[0..],
+                .enrichment = .{ .enabled = true },
             },
         },
     };
@@ -4540,7 +4544,10 @@ test "serviceable repair cannot mask sibling shard serving failures" {
         null,
     ) orelse return error.TestUnexpectedResult;
     try std.testing.expect(enrichment_failed.repair_active_generation_serviceable);
-    try std.testing.expectEqual(@as(u64, 1), enrichment_failed.query_blocking_group_count);
+    // An isolated source outcome is completion debt, not a shard-wide query
+    // failure. The sibling can keep serving while supervised source coverage
+    // continues on this shard.
+    try std.testing.expectEqual(@as(u64, 0), enrichment_failed.query_blocking_group_count);
     try std.testing.expect(enrichment_failed.load_error == null);
     encoded.clearRetainingCapacity();
     try appendSingleIndexRuntimeStatus(
@@ -4561,7 +4568,11 @@ test "serviceable repair cannot mask sibling shard serving failures" {
         null,
         true,
     );
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\",\"queryable\":false,\"complete\":false") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false},\"milestones\":{\"queryable\":{\"blockers\":[\"source_coverage\",\"publication\"]}}}",
+        encoded.items,
+    );
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -4766,6 +4777,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     var view: EmbeddingsRuntimeView = .{
         .backfill_active = if (observation_current) item.backfill_active else true,
         .backfill_progress = if (observation_current) item.backfill_progress else 0.0,
+        .coverage_pending = false,
         .coverage_degraded = false,
         .replay_applied_sequence = if (observation_current) item.replay_applied_sequence else 0,
         .replay_target_sequence = if (observation_current) item.replay_target_sequence else 0,
@@ -4787,6 +4799,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         !coverage_incomplete,
         replay_current,
     );
+    view.coverage_pending = if (coverage.pending) |pending| pending != 0 else false;
     view.coverage_degraded = coverage.degraded;
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
@@ -5439,14 +5452,21 @@ fn appendSingleIndexRuntimeStatus(
     // and identity, so keep readiness aligned with the legacy terminal state
     // without allowing a retained replacement snapshot to poison its
     // successor.
-    // Coverage and replay are incarnation- and index-scoped, whereas the
-    // enrichment owner telemetry is group-scoped. Use the exact index facts
-    // to decide whether an isolated source failure is terminal; unrelated
-    // activity in a sibling index must neither mask nor manufacture failure.
+    // Coverage, replay, and activity are incarnation- and index-scoped. A
+    // healthy supervisor plus exact pending coverage is durable ownership
+    // evidence even between activity samples; heartbeat cadence must not make
+    // an actively progressing generation flicker to failed. Group telemetry
+    // contributes only the supervisor's terminal worker state, never a
+    // sibling's transient phase.
     const index_activity_pending = index_type == .embeddings and
         item.embedding_activity.epoch != 0 and
         item.embedding_activity.effectivePhase() != .idle;
-    const enrichment_work_pending = index_activity_pending or
+    const supervised_coverage_pending = if (visible_enrichment) |stats|
+        stats.enabled and !stats.worker_failed and
+            (if (embeddings_view) |view| view.coverage_pending else false)
+    else
+        false;
+    const enrichment_work_pending = supervised_coverage_pending or index_activity_pending or
         replay_catch_up_required or replay_applied_sequence < replay_target_sequence or
         catch_up_pending;
     const coverage_degraded = (if (embeddings_view) |view| view.coverage_degraded else false) and
@@ -8347,11 +8367,21 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         progressing_encoded,
     );
 
-    indexes[0].coverage_terminal_failed_count = 1;
+    // Activity is sampled and may be idle between batches. Exact pending
+    // coverage under a healthy supervisor remains the durable lifecycle fact.
     indexes[0].embedding_activity = .{};
     local_items[0].stats.enrichment.target_sequence = 1;
     local_items[0].stats.enrichment.applied_sequence = 1;
     local_items[0].stats.enrichment.retrying = false;
+    const between_batches_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer alloc.free(between_batches_encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"backfill_state\":\"running\",\"readiness\":{\"state\":\"pending\"},\"source_coverage\":{\"pending\":1,\"failed\":0}}}",
+        between_batches_encoded,
+    );
+
+    indexes[0].coverage_terminal_failed_count = 1;
 
     const failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(failed_encoded);
