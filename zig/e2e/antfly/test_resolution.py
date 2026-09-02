@@ -64,6 +64,16 @@ def _new_e2e_deadline() -> "_Deadline":
     return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
 
 
+def _retry_after_delay_s(response: requests.Response) -> float:
+    """Read the same-service Retry-After delta, falling back fail-safe."""
+    raw_delay = response.headers.get("Retry-After", "").strip()
+    try:
+        delay_s = int(raw_delay, 10)
+    except ValueError:
+        return POLL_INTERVAL_S
+    return delay_s if delay_s >= 0 else POLL_INTERVAL_S
+
+
 DOCUMENTS_INDEXES = {
     # Materializes each document's `relations` field into the `relations_v1`
     # extraction asset the resolver consumes (no LLM needed). The resolver is
@@ -203,7 +213,7 @@ class _Api:
             last_not_admitted_response = (
                 f"HTTP {response.status_code}: {response.text[:512]}"
             )
-            deadline.sleep()
+            deadline.sleep(_retry_after_delay_s(response))
 
     def insert(
         self,
@@ -400,10 +410,11 @@ class _Deadline:
             )
         return min(max_timeout_s, remaining)
 
-    def sleep(self) -> None:
+    def sleep(self, delay_s: float = POLL_INTERVAL_S) -> None:
         remaining = self.remaining()
-        if remaining > 0.0:
-            time.sleep(min(POLL_INTERVAL_S, remaining))
+        bounded_delay_s = min(max(0.0, delay_s), remaining)
+        if bounded_delay_s > 0.0:
+            time.sleep(bounded_delay_s)
 
 
 def _test_response(
@@ -423,6 +434,39 @@ def _test_response(
     return response
 
 
+@pytest.mark.parametrize(
+    ("retry_after", "expected_delay_s"),
+    [
+        (None, POLL_INTERVAL_S),
+        ("invalid", POLL_INTERVAL_S),
+        ("-1", POLL_INTERVAL_S),
+        ("0", 0.0),
+        ("2", 2.0),
+    ],
+)
+def test_retry_after_delay_uses_valid_delta_seconds_or_poll_fallback(
+    retry_after: str | None,
+    expected_delay_s: float,
+):
+    headers = {"Retry-After": retry_after} if retry_after is not None else None
+    response = _test_response("http://data-a/db/v1/tables/documents", 503, headers=headers)
+
+    assert _retry_after_delay_s(response) == expected_delay_s
+
+
+def test_deadline_sleep_clamps_retry_after_to_remaining_time(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    deadline = _Deadline(10.0)
+    sleep_delays: list[float] = []
+    monkeypatch.setattr(deadline, "remaining", lambda: 0.25)
+    monkeypatch.setattr(time, "sleep", sleep_delays.append)
+
+    deadline.sleep(2.0)
+
+    assert sleep_delays == [0.25]
+
+
 def test_create_table_retries_explicit_non_admission_within_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -436,13 +480,17 @@ def test_create_table_retries_explicit_non_admission_within_deadline(
             _test_response(
                 url,
                 503,
-                headers=METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS,
+                headers={
+                    **METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS,
+                    "Retry-After": "1",
+                },
                 body=b"metadata leader unavailable",
             ),
             _test_response(url, 200, body=b"{}"),
         ]
     )
     post_calls = 0
+    sleep_delays: list[float] = []
 
     def post(*_: Any, **__: Any) -> requests.Response:
         nonlocal post_calls
@@ -451,10 +499,11 @@ def test_create_table_retries_explicit_non_admission_within_deadline(
 
     deadline = _Deadline(10.0)
     monkeypatch.setattr(api.s, "post", post)
-    monkeypatch.setattr(deadline, "sleep", lambda: None)
+    monkeypatch.setattr(deadline, "sleep", sleep_delays.append)
 
     assert api.create_table("documents", deadline=deadline) == {}
     assert post_calls == 2
+    assert sleep_delays == [1.0]
 
 
 @pytest.mark.parametrize(
