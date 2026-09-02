@@ -35171,7 +35171,7 @@ test "api http server create index expands schema-derived algebraic config" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                 },
             };
         }
@@ -35239,6 +35239,28 @@ test "api http server create index expands schema-derived algebraic config" {
             try std.testing.expect(parsed.value.object.get("measure_fields") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const current: metadata_table_manager.TableRecord = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = schema_json,
+                .indexes_json = self.indexes_json,
+                .placement_role = "data",
+            };
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            const stored = (try indexes_api.storedIndexConfigJsonAlloc(std.testing.allocator, replacement.indexes_json, "sales_rollup")) orelse
+                return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(stored);
+            try ant_json.testing.expectSubsetJsonText(
+                std.testing.allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                stored,
+            );
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            self.replaceIndexesJson(std.testing.allocator, next, true);
         }
     };
 
@@ -35632,7 +35654,7 @@ test "api http server serves table create and drop" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                     .wait_table_projection = waitTableProjection,
                 },
@@ -35702,6 +35724,14 @@ test "api http server serves table create and drop" {
             try std.testing.expectEqualStrings("docs", table_name);
             const next = try indexes_api.addIndexToTableIndexesJson(inner_alloc, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(inner_alloc, next, true);
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.created or !metadata_table_manager.tableDefinitionsEqual(self.table_record, expected))
+                return error.TableGenerationChanged;
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            self.replaceIndexesJson(std.testing.allocator, next, true);
         }
 
         fn dropIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -38946,7 +38976,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
 test "api http server returns retryable not leader through public table adapter mutation" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        create_index_calls: usize = 0,
+        replace_definition_calls: usize = 0,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -38955,7 +38985,7 @@ test "api http server returns retryable not leader through public table adapter 
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                 },
             };
         }
@@ -38993,7 +39023,15 @@ test "api http server returns retryable not leader through public table adapter 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("body", index_name);
-            self.create_index_calls += 1;
+            self.replace_definition_calls += 1;
+            return error.LeaderTransferInProgress;
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", expected.name);
+            try std.testing.expectEqualStrings("docs", replacement.name);
+            self.replace_definition_calls += 1;
             return error.LeaderTransferInProgress;
         }
     };
@@ -39012,7 +39050,7 @@ test "api http server returns retryable not leader through public table adapter 
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), source.create_index_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.replace_definition_calls);
 }
 
 test "api http server returns retryable not leader when cluster backup read barrier times out" {

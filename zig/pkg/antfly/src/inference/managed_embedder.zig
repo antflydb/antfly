@@ -2381,13 +2381,13 @@ fn validateEmbeddingEnrichmentProducer(
     if (name != .string or name.string.len == 0) return error.InvalidEmbeddingArtifactProducer;
     const expected_dims = try embeddingEnrichmentExpectedDimensionsOptional(enrichment);
     const producer_json = object.get("producer_json") orelse {
-        // Inline create-table enrichments may omit producer_json when the
-        // embeddings index that owns this artifact carries the executable
-        // embedder. Only the complete-catalog pass can prove that ownership;
-        // standalone enrichment admission must still require a producer.
-        const entries = executable_entries orelse return error.MissingEmbeddingArtifactProducer;
-        const owner_index = managedEntryIndexForArtifact(entries, name.string) orelse
-            return error.MissingEmbeddingArtifactProducer;
+        // Producer-less enrichments are valid dormant declarations and may be
+        // staged before their executable owner. If the complete catalog has an
+        // owner, validate its shape here. Otherwise the artifact-backed index
+        // registration pass below rejects the configuration only when a
+        // non-external index actually consumes the dormant declaration.
+        const entries = executable_entries orelse return;
+        const owner_index = managedEntryIndexForArtifact(entries, name.string) orelse return;
         const owner = &entries[owner_index];
         if (owner.sparse) {
             if (expected_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
@@ -5109,6 +5109,12 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
             .{ .antfly_provider = local.provider() },
         ),
     );
+
+    var dormant = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{"enrichments":[{"name":"staged_producer","kind":"embedding","field":"body","expected_dims":384}]}
+    , .{ .antfly_provider = local.provider() });
+    defer dormant.deinit();
+    try std.testing.expect(!dormant.hasEntries());
 
     try std.testing.expectError(
         error.MissingEmbeddingArtifactProducer,

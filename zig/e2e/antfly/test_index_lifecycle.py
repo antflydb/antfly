@@ -611,7 +611,7 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
         stateful_api.delete(
             f"/tables/{table_name}/artifacts/document_units_v1/enrichment"
         )
-    assert exc_info.value.response.status_code == 400
+    assert exc_info.value.response.status_code == 409
 
     decoded_name = "document chunks v2"
     assert (
