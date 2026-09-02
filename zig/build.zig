@@ -3693,6 +3693,7 @@ pub fn build(b: *std.Build) void {
         "catalog ownership rejects duplicate executable owners and endpoint mismatches",
         "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
+        "managed embedder admission follows the selected attachment transport",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",

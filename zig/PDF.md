@@ -173,6 +173,13 @@ The client-side reservation is released only after the remote invocation no
 longer borrows the page buffers. Cancellation and deadlines cover capability
 lookup, single-flight waits, and inference transport; retry or failover must
 reuse stable work identities so durable publication stays idempotent.
+The physical attachment representation is selected by that concrete route:
+linked execution charges borrowed binary bytes, ordinary HTTP media fields
+charge base64 payload bytes, and reader URL adapters charge the complete data
+URI including its MIME prefix. A remote catalog always publishes
+`borrowed_attachments=false`, even when its upstream inference process also
+has a linked ABI, because the proxy's outward route cannot borrow caller
+memory.
 
 Batch formation is currently per resolved endpoint and model invocation. A
 load balancer may route one complete bounded request to an eligible inference
@@ -227,10 +234,12 @@ prefetch window and is enabled only after admission reserves the combined peak
 of both windows. Estimates guide scheduling; hard bounded allocators, decoder
 limits, and model admission remain the enforcement boundary.
 
-### Generic borrowed attachment ABI
+### Generic attachment transport ABI
 
-Reader, generator, and embedder invocations use one versioned borrowed
-attachment representation:
+Reader, generator, embedder, and extractor invocations use one versioned
+borrowed attachment representation. The same representation is available to
+future multimodal rerankers, classifiers, rewriters, transcribers, or other
+task families without changing document preparation:
 
 ```zig
 const Attachment = extern struct {
@@ -392,8 +401,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     only after their destination append succeeds. Error paths free exactly the
     still-local allocations.
 20. **URL reader admission ignored inline payload size and MIME.** Base64
-    `data:` inputs are parsed at the executor boundary, their decoded byte size
-    is charged, and their MIME is checked against the resolved model. Network
+    `data:` inputs are parsed at the executor boundary, their complete resident
+    data-URI size is charged after canonical base64 validation, and their MIME
+    is checked against the resolved model. Network
     URLs remain provider-owned until download and must be checked by the
     server-side media budget afterward.
 21. **Remote execution telemetry was predicted from capabilities.** Read and
@@ -590,7 +600,7 @@ document. They are architectural requirements, not Florence-specific cleanup:
 52. **The distributed capability descriptor was too coarse to round-trip the
     normalized contract.** Capability wire version 3 publishes exact input
     modalities, accepted MIME types, granularity, output kind, result
-    cardinality, prompt policy, borrowed-attachment availability, and the
+    cardinality, prompt policy, local borrowed-attachment compatibility, and the
     bounded batch descriptor. The proxy conservatively intersects arrays and
     boolean support and requires scalar semantics to agree. V1/V2 remain
     readable at their legacy boundary but cannot acquire V3 claims.
@@ -644,9 +654,11 @@ document. They are architectural requirements, not Florence-specific cleanup:
     structured output representation, parses the provider envelope once into
     the generated extraction response type, verifies the resolved model, and
     rejects malformed top-level and known per-item fields while preserving
-    schema-permitted provider extensions. Every input carries a unique wire ID;
-    response items are mapped by that ID, and missing, duplicate, or unknown
-    identities fail the whole batch before any output is assigned. Non-JSON
+    schema-permitted provider extensions. Every input carries a unique,
+    invocation-local opaque wire ID that is independent of the caller's item
+    identity; response items are mapped by that ID, then the caller-visible ID
+    is restored. Missing, duplicate, or unknown wire identities fail the whole
+    batch before any output is assigned. Non-JSON
     extraction falls back to independent task executions, where one response
     has one unambiguous owner.
 61. **The proxy validated numeric batch fields but treated malformed V3 exact
@@ -672,6 +684,32 @@ document. They are architectural requirements, not Florence-specific cleanup:
     while advertising a multi-item extraction request.** Catalog pixel
     admission now uses the extractor executor's full serial-family item cap,
     matching the linked resolver and its concrete invocation ceiling.
+64. **Admission inferred transport representation from model capabilities.**
+    A model can be reached through both linked and HTTP executors, so
+    `borrowed_attachments` cannot determine resident-byte accounting. A common
+    `AttachmentTransport` now represents borrowed binary, base64 payload, or
+    data URI. Reader, generator, embedder, and extractor windowing and final
+    admission receive the transport selected by the concrete route. Remote
+    capabilities are normalized to non-borrowed, and the distributed proxy
+    never republishes an upstream linked-memory claim.
+65. **Scoped model discovery broke the HTTP test boundary.** The reusable test
+    server treated the full request target, including `?model=...&task=...`, as
+    the route path. It now parses and exposes target, path, and query
+    independently and matches only the path. The full generation/reader target
+    consequently exercises successful scoped discovery without 404 fallback,
+    excess requests, or a blocked server fiber.
+66. **Operation URL normalization could drift from the task enum.** Classifier
+    URLs were omitted from a hand-maintained suffix list. Primary operation
+    suffixes now come from an exhaustive `Task` switch; only explicit
+    compatibility aliases remain separate, longest-first. Every current model
+    family, including classifiers, normalizes to the scoped model catalog.
+67. **Extraction used caller item IDs as provider demultiplexing keys.** Page
+    identities are intentionally local to a source, so two documents may both
+    contain `page:000001`. Extraction now generates opaque invocation-local
+    wire IDs, maps reordered results by those IDs, and restores or removes the
+    caller-visible ID in each typed output. Cross-document batching therefore
+    preserves the full work identity without rejecting legitimate repeated
+    item labels or leaking transport identifiers.
 
 ### Post-review implementation contract
 
@@ -688,6 +726,10 @@ The hardening above follows four long-term rules:
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
+- Admission receives the executor-selected attachment representation rather
+  than inferring it from model capabilities. Linked callbacks charge borrowed
+  bytes, remote generator/embedder/extractor payloads charge exact base64
+  expansion, and remote reader adapters charge the complete data URI.
 - Every logical result carries the request identity. Remote indexed responses
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.
@@ -722,9 +764,10 @@ The hardening above follows four long-term rules:
 3. **Implemented:** provider ABI v23 separates borrowed binary payload storage
    from logical attachment references. One generator item may own several
    attachments, while read and embedding batches retain independent item,
-   source, and page identity. Reader, generator, and embedder host paths borrow
-   the same representation; remote transports encode only at the HTTP
-   boundary. The version also makes capability v2 media-limit semantics and
+   source, and page identity. Reader, generator, embedder, and extractor host
+   paths borrow the same representation; remote transports encode only at the
+   HTTP boundary and explicitly select their resident representation for
+   admission. The version also makes capability v2 media-limit semantics and
    executable chunk, rewrite, classification, and borrowed extraction
    operations an explicit
    host/component compatibility boundary.

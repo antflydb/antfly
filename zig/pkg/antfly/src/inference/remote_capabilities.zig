@@ -336,24 +336,38 @@ fn capabilityCacheKeyAlloc(
     });
 }
 
+fn primaryOperationSuffix(task: work.Task) []const u8 {
+    return switch (task) {
+        .read => "/read",
+        .generate => "/generate",
+        .embed => "/embed",
+        .rerank => "/rerank",
+        .chunk => "/chunk",
+        .extract => "/extract",
+        .rewrite => "/rewrite",
+        .classify => "/classify",
+        .transcribe => "/transcribe",
+    };
+}
+
 fn trimOperationSuffix(value: []const u8) []const u8 {
     var out = std.mem.trimEnd(u8, value, "/");
-    // Longest suffixes must come first because several operations share a
-    // prefix (for example generate and generate/batch).
+    // Compatibility aliases are checked first because some extend a primary
+    // route (for example generate/batch extends generate). Primary routes are
+    // derived exhaustively from Task so adding a family cannot silently omit
+    // catalog URL normalization.
     for ([_][]const u8{
         "/chat/completions",
         "/generate/batch",
         "/rerank_multimodal",
-        "/transcribe",
         "/embeddings",
-        "/generate",
-        "/extract",
-        "/rewrite",
-        "/rerank",
-        "/chunk",
-        "/embed",
-        "/read",
     }) |suffix| {
+        if (std.mem.endsWith(u8, out, suffix)) {
+            return std.mem.trimEnd(u8, out[0 .. out.len - suffix.len], "/");
+        }
+    }
+    for (std.enums.values(work.Task)) |task| {
+        const suffix = primaryOperationSuffix(task);
         if (std.mem.endsWith(u8, out, suffix)) {
             out = out[0 .. out.len - suffix.len];
             break;
@@ -684,7 +698,10 @@ pub fn parseModelCapabilities(
         .output = if (exact) |value| value.output else outputForTask(task),
         .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
-        .borrowed_attachments = if (exact) |value| value.borrowed_attachments else false,
+        // Discovery is performed across an HTTP boundary. A remote catalog
+        // cannot turn that concrete route into a borrowed-memory invocation,
+        // even if a misconfigured upstream publishes its local ABI fact.
+        .borrowed_attachments = false,
     };
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
@@ -876,6 +893,19 @@ test "remote Antfly capability v3 preserves exact task contract" {
     try std.testing.expectEqual(work.PromptPolicy.structured_schema, capabilities.prompt_policy);
     try std.testing.expectEqual(work.BatchMode.serial_compatibility, capabilities.batch.mode);
     try std.testing.expectEqual(@as(usize, 32), capabilities.batch.max_items);
+    try std.testing.expect(!capabilities.borrowed_attachments);
+}
+
+test "remote Antfly capability cannot advertise borrowed HTTP attachments" {
+    const payload =
+        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":3,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":true,"batch":{"mode":"serial_compatibility","preferred_items":8,"max_items":32,"max_encoded_media_bytes":4096,"max_decoded_pixels":8192,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(
+        std.testing.allocator,
+        payload,
+        "vision-extractor",
+        .extract,
+    )).?;
     try std.testing.expect(!capabilities.borrowed_attachments);
 }
 

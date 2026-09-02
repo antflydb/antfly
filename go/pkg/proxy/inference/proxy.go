@@ -1723,12 +1723,16 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 			}
 			result[field] = a[field]
 		}
-		aBorrowed, aok := a["borrowed_attachments"].(bool)
-		bBorrowed, bok := b["borrowed_attachments"].(bool)
+		_, aok := a["borrowed_attachments"].(bool)
+		_, bok := b["borrowed_attachments"].(bool)
 		if !aok || !bok {
 			return nil, false
 		}
-		result["borrowed_attachments"] = aBorrowed && bBorrowed
+		// The merged catalog is itself served over HTTP. Borrowing is a
+		// property of a linked executor route, not of the model, and cannot be
+		// preserved through this proxy even if every upstream describes its
+		// local ABI as borrowed.
+		result["borrowed_attachments"] = false
 		version = 3
 		result["version"] = float64(version)
 		if !validExactInferenceCapabilities(result) {

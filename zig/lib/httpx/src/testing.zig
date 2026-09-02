@@ -44,7 +44,12 @@ pub const HeaderPair = struct {
 
 pub const RequestInfo = struct {
     method: types.Method,
+    /// Complete HTTP request target exactly as received.
+    target: []const u8,
+    /// Path component used for route matching (never includes `?query`).
     path: []const u8,
+    /// Query string without the leading `?`, or an empty slice.
+    query: []const u8,
     headers: []const HeaderPair,
     body: []const u8,
 
@@ -158,7 +163,10 @@ pub const TestServer = struct {
 
         const path_start = method_end + 1;
         const path_end = mem.indexOfPos(u8, request_line, path_start, " ") orelse return error.MalformedRequest;
-        const path = request_line[path_start..path_end];
+        const target = request_line[path_start..path_end];
+        const query_start = mem.indexOfScalar(u8, target, '?');
+        const path = if (query_start) |index| target[0..index] else target;
+        const query = if (query_start) |index| target[index + 1 ..] else "";
 
         const method = parseMethod(method_str) orelse return error.UnknownMethod;
 
@@ -197,7 +205,9 @@ pub const TestServer = struct {
             if (route.assert_request) |assert_request| {
                 try assert_request(.{
                     .method = method,
+                    .target = target,
                     .path = path,
+                    .query = query,
                     .headers = headers.items,
                     .body = body,
                 });
@@ -386,6 +396,48 @@ test "TestServer round trip GET" {
     try ts.handleOne();
 
     // Wait for client fiber.
+    group.await(io) catch {};
+}
+
+test "TestServer matches path separately from query" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        fn request(info: RequestInfo) !void {
+            try std.testing.expectEqualStrings("/models", info.path);
+            try std.testing.expectEqualStrings("model=owner%2Fmodel&task=read", info.query);
+            try std.testing.expectEqualStrings(
+                "/models?model=owner%2Fmodel&task=read",
+                info.target,
+            );
+        }
+    };
+    var ts = try TestServer.start(alloc, io, &.{.{
+        .method = .GET,
+        .path = "/models",
+        .assert_request = Assert.request,
+        .respond = .{ .body = "{}" },
+    }});
+    defer ts.deinit();
+
+    var group = Io.Group.init;
+    const ClientFiber = struct {
+        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+            var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer c.deinit();
+            const url_value = std.fmt.allocPrint(
+                a,
+                "{s}/models?model=owner%2Fmodel&task=read",
+                .{base},
+            ) catch return;
+            defer a.free(url_value);
+            var response = c.get(url_value, .{}) catch return;
+            defer response.deinit();
+            std.testing.expect(response.ok()) catch return;
+        }
+    };
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch return;
+    try ts.handleOne();
     group.await(io) catch {};
 }
 

@@ -451,7 +451,14 @@ pub const Runtime = struct {
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
         if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
             capabilities.batch.mode == .none) return false;
-        validateExtractorBatchPlan(alloc, capabilities, requests) catch return false;
+        var cfg = extracting.parseConfigFromSlice(alloc, requests[0].config_json) catch return false;
+        defer cfg.deinit(alloc);
+        validateExtractorBatchPlan(
+            alloc,
+            capabilities,
+            extractorAttachmentTransport(cfg),
+            requests,
+        ) catch return false;
         return true;
     }
 
@@ -638,7 +645,10 @@ pub const Runtime = struct {
         }
 
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return error.BatchIncompatible;
-        try validateExtractorBatchCompatibility(alloc, capabilities, requests);
+        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        defer cfg.deinit(alloc);
+        const attachment_transport = extractorAttachmentTransport(cfg);
+        try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
         errdefer if (outputs_owned) {
@@ -649,8 +659,8 @@ pub const Runtime = struct {
         var windows: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
-            const end = try extractorBatchEnd(alloc, capabilities, requests, start);
-            try validateExtractorInvocation(alloc, capabilities, requests[start..end]);
+            const end = try extractorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
+            try validateExtractorInvocation(alloc, capabilities, attachment_transport, requests[start..end]);
             const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end]);
             defer alloc.free(chunk_outputs);
             if (chunk_outputs.len != end - start) {
@@ -690,8 +700,8 @@ pub const Runtime = struct {
             for (input_ids[0..input_ids_filled]) |id| alloc.free(id);
             alloc.free(input_ids);
         }
-        var input_id_indexes = std.StringHashMapUnmanaged(usize).empty;
-        defer input_id_indexes.deinit(alloc);
+        const output_ids = try alloc.alloc([]const u8, requests.len);
+        defer alloc.free(output_ids);
 
         var attachment_count: usize = 0;
         for (requests) |request| attachment_count = try std.math.add(usize, attachment_count, request.media.len);
@@ -700,14 +710,12 @@ pub const Runtime = struct {
         var attachment_index: usize = 0;
 
         for (requests, 0..) |request, i| {
-            input_ids[i] = if (request.item_id.len > 0)
-                try alloc.dupe(u8, request.item_id)
-            else
-                try std.fmt.allocPrint(alloc, "antfly-batch-item-{d}", .{i});
+            // The wire identifier is invocation-local demultiplexing state,
+            // never the caller's durable identity. Distinct documents may
+            // legitimately reuse page-local item IDs such as page:000001.
+            input_ids[i] = try std.fmt.allocPrint(alloc, "antfly-batch-item-{d}", .{i});
             input_ids_filled += 1;
-            const id_entry = try input_id_indexes.getOrPut(alloc, input_ids[i]);
-            if (id_entry.found_existing) return error.InvalidWorkIdentity;
-            id_entry.value_ptr.* = i;
+            output_ids[i] = request.item_id;
             inputs[i] = .{
                 .id = input_ids[i],
                 .content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json),
@@ -736,7 +744,7 @@ pub const Runtime = struct {
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
         defer response.deinit();
 
-        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids);
+        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids, output_ids);
     }
 
     fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -809,9 +817,10 @@ pub const Runtime = struct {
         var fallback_items: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
-            const end = try generatorBatchEnd(alloc, capabilities, requests, start);
+            const attachment_transport: inference_work.AttachmentTransport = .base64_payload;
+            const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
-            try validateGeneratorInvocation(alloc, capabilities, chunk);
+            try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
             const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, chunk);
             defer alloc.free(body);
             var resp = try self.http.post(batch_url, .{ .json = body, .headers = headers, .timeout_ms = 300_000 });
@@ -994,7 +1003,12 @@ pub const Runtime = struct {
             // source boundary until their transport also carries per-item
             // identity.
             const image_end = if (uses_encoded_media)
-                encodedReaderBatchEnd(flat_encoded.items, image_offset, capabilities.batch)
+                encodedReaderBatchEnd(
+                    flat_encoded.items,
+                    image_offset,
+                    capabilities.batch,
+                    if (local_reader) .borrowed_binary else .data_uri,
+                )
             else if (local_reader)
                 readerBatchEnd(flat_source_fingerprints.items, image_offset, reader_chunk_max_images)
             else
@@ -1243,9 +1257,8 @@ pub const Runtime = struct {
             const mime_type = metadata[0 .. metadata.len - ";base64".len];
             if (mime_type.len == 0) return error.InvalidDataURI;
             try capabilities.validateMimeType(mime_type);
-            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(url[comma + 1 ..]) catch
-                return error.InvalidDataURI;
-            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, decoded_len) catch
+            _ = try validateStandardBase64(url[comma + 1 ..]);
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
                 return error.InferenceEncodedBytesExceeded;
         }
         return shape;
@@ -1261,9 +1274,14 @@ pub const Runtime = struct {
         const capabilities = try self.readerCapabilities(alloc, cfg);
         if (capabilities) |resolved| {
             var encoded_bytes: usize = 0;
+            const transport: inference_work.AttachmentTransport = if (local_reader)
+                .borrowed_binary
+            else
+                .data_uri;
             for (request.images) |image| {
                 try resolved.validateMimeType(image.mime_type);
-                encoded_bytes = std.math.add(usize, encoded_bytes, image.bytes.len) catch
+                const resident = try transport.residentSize(image.bytes.len, image.mime_type.len);
+                encoded_bytes = std.math.add(usize, encoded_bytes, resident) catch
                     return error.InferenceEncodedBytesExceeded;
             }
             try resolved.validateInvocation(.read, .{
@@ -1385,7 +1403,12 @@ pub const Runtime = struct {
         defer cfg.deinit(alloc);
 
         if (try self.extractorCapabilities(alloc, cfg)) |capabilities| {
-            try validateExtractorInvocation(alloc, capabilities, &.{request});
+            try validateExtractorInvocation(
+                alloc,
+                capabilities,
+                extractorAttachmentTransport(cfg),
+                &.{request},
+            );
         }
 
         const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
@@ -1603,13 +1626,18 @@ fn encodedReaderBatchEnd(
     images: []const readers.EncodedImage,
     start: usize,
     capabilities: inference_work.BatchCapabilities,
+    transport: inference_work.AttachmentTransport,
 ) usize {
     const item_end = @min(start +| capabilities.max_items, images.len);
     const max_encoded_media_bytes = capabilities.max_encoded_media_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
-        const next = std.math.add(usize, bytes, images[end].bytes.len) catch break;
+        const resident = transport.residentSize(
+            images[end].bytes.len,
+            images[end].mime_type.len,
+        ) catch break;
+        const next = std.math.add(usize, bytes, resident) catch break;
         if (next > max_encoded_media_bytes and end > start) break;
         bytes = next;
     }
@@ -1699,16 +1727,17 @@ fn inlineBase64ResidentSize(data: []const u8) !usize {
     return data.len;
 }
 
-fn borrowedMediaResidentSize(capabilities: inference_work.InferenceCapabilities, bytes: []const u8) usize {
-    return if (capabilities.borrowed_attachments)
-        bytes.len
+fn extractorAttachmentTransport(cfg: extracting.Config) inference_work.AttachmentTransport {
+    return if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl()))
+        .borrowed_binary
     else
-        std.base64.standard.Encoder.calcSize(bytes.len);
+        .base64_payload;
 }
 
 fn generatorRequestShape(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     request: asset_producer.Request,
 ) !GeneratorItemShape {
     var shape = GeneratorItemShape{};
@@ -1750,7 +1779,8 @@ fn generatorRequestShape(
         try capabilities.validateMimeType(media.mime_type);
         mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
         shape.media_parts += 1;
-        shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, borrowedMediaResidentSize(capabilities, media.bytes)) catch
+        const resident = try attachment_transport.residentSize(media.bytes.len, media.mime_type.len);
+        shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
             return error.InferenceEncodedBytesExceeded;
     }
     return shape;
@@ -1759,11 +1789,12 @@ fn generatorRequestShape(
 fn validateGeneratorInvocation(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
     var invocation = inference_work.InvocationShape{ .item_count = requests.len };
     for (requests) |request| {
-        const item = try generatorRequestShape(alloc, capabilities, request);
+        const item = try generatorRequestShape(alloc, capabilities, attachment_transport, request);
         mergeInferenceModalities(&invocation.modalities, item.modalities);
         invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;
@@ -1810,6 +1841,7 @@ fn addExtractorMediaShape(
 fn extractorRequestShape(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     request: asset_producer.Request,
 ) !ExtractorItemShape {
     var shape = ExtractorItemShape{ .prompt = try alloc.dupe(u8, "") };
@@ -1900,7 +1932,7 @@ fn extractorRequestShape(
         request,
         &shape,
         media.mime_type,
-        borrowedMediaResidentSize(capabilities, media.bytes),
+        try attachment_transport.residentSize(media.bytes.len, media.mime_type.len),
         true,
     );
 
@@ -1919,6 +1951,7 @@ fn extractorRequestShape(
 fn validateExtractorInvocation(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
     if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item)
@@ -1926,7 +1959,7 @@ fn validateExtractorInvocation(
     var invocation = inference_work.InvocationShape{ .item_count = requests.len };
     var uses_media: ?bool = null;
     for (requests) |request| {
-        var item = try extractorRequestShape(alloc, capabilities, request);
+        var item = try extractorRequestShape(alloc, capabilities, attachment_transport, request);
         defer item.deinit(alloc);
         const item_uses_media = item.media_parts > 0;
         if (uses_media) |expected| {
@@ -1943,6 +1976,7 @@ fn validateExtractorInvocation(
 fn validateExtractorBatchCompatibility(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
     if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
@@ -1952,7 +1986,7 @@ fn validateExtractorBatchCompatibility(
     defer if (media_prompt) |prompt| alloc.free(prompt);
     for (requests) |request| {
         if (request.content_type.len > 0 and !isJsonContentType(request.content_type)) return error.BatchIncompatible;
-        var item = try extractorRequestShape(alloc, capabilities, request);
+        var item = try extractorRequestShape(alloc, capabilities, attachment_transport, request);
         defer item.deinit(alloc);
         const item_uses_media = item.media_parts > 0;
         if (uses_media) |expected| {
@@ -1971,13 +2005,14 @@ fn validateExtractorBatchCompatibility(
 fn validateExtractorBatchPlan(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
-    try validateExtractorBatchCompatibility(alloc, capabilities, requests);
+    try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
     var start: usize = 0;
     while (start < requests.len) {
-        const end = try extractorBatchEnd(alloc, capabilities, requests, start);
-        try validateExtractorInvocation(alloc, capabilities, requests[start..end]);
+        const end = try extractorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
+        try validateExtractorInvocation(alloc, capabilities, attachment_transport, requests[start..end]);
         start = end;
     }
 }
@@ -1998,7 +2033,7 @@ test "asset producer runtime generator admission accepts PDF only for document-c
         .source_text = "ocr",
         .media = &.{.{ .bytes = &pdf, .mime_type = "application/pdf" }},
     }};
-    try validateGeneratorInvocation(std.testing.allocator, capabilities, &requests);
+    try validateGeneratorInvocation(std.testing.allocator, capabilities, .borrowed_binary, &requests);
 
     var image_only = capabilities;
     image_only.input_modalities = .{ .text = true, .image = true };
@@ -2006,7 +2041,7 @@ test "asset producer runtime generator admission accepts PDF only for document-c
     image_only.input_granularity = .page;
     try std.testing.expectError(
         error.UnsupportedInferenceMimeType,
-        validateGeneratorInvocation(std.testing.allocator, image_only, &requests),
+        validateGeneratorInvocation(std.testing.allocator, image_only, .borrowed_binary, &requests),
     );
 }
 
@@ -2024,11 +2059,11 @@ test "asset producer runtime generator admission accounts for resident inline me
         .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AQID\"}}]" },
         .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,BAUG\"}}]" },
     };
-    try std.testing.expectEqual(@as(usize, 1), try generatorBatchEnd(std.testing.allocator, capabilities, &requests, 0));
-    try validateGeneratorInvocation(std.testing.allocator, capabilities, requests[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), try generatorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
+    try validateGeneratorInvocation(std.testing.allocator, capabilities, .base64_payload, requests[0..1]);
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
-        validateGeneratorInvocation(std.testing.allocator, capabilities, &requests),
+        validateGeneratorInvocation(std.testing.allocator, capabilities, .base64_payload, &requests),
     );
 }
 
@@ -2040,7 +2075,7 @@ test "asset producer runtime media accounting follows attachment transport" {
         .source_text = "",
         .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }},
     };
-    var capabilities = inference_work.InferenceCapabilities{
+    const capabilities = inference_work.InferenceCapabilities{
         .task = .generate,
         .input_modalities = .{ .text = true, .image = true },
         .accepted_mime_types = .{ .text_plain = true, .image_png = true },
@@ -2049,11 +2084,10 @@ test "asset producer runtime media accounting follows attachment transport" {
         .output = .generated_text,
         .borrowed_attachments = false,
     };
-    const encoded = try generatorRequestShape(std.testing.allocator, capabilities, request);
+    const encoded = try generatorRequestShape(std.testing.allocator, capabilities, .base64_payload, request);
     try std.testing.expectEqual(@as(usize, 4), encoded.encoded_media_bytes);
 
-    capabilities.borrowed_attachments = true;
-    const borrowed = try generatorRequestShape(std.testing.allocator, capabilities, request);
+    const borrowed = try generatorRequestShape(std.testing.allocator, capabilities, .borrowed_binary, request);
     try std.testing.expectEqual(@as(usize, 3), borrowed.encoded_media_bytes);
 
     const extractor_request = asset_producer.Request{
@@ -2070,11 +2104,10 @@ test "asset producer runtime media accounting follows attachment transport" {
     extractor_capabilities.output = .extraction;
     extractor_capabilities.result_cardinality = .one_per_item;
 
-    var extractor_borrowed = try extractorRequestShape(std.testing.allocator, extractor_capabilities, extractor_request);
+    var extractor_borrowed = try extractorRequestShape(std.testing.allocator, extractor_capabilities, .borrowed_binary, extractor_request);
     defer extractor_borrowed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), extractor_borrowed.encoded_media_bytes);
-    extractor_capabilities.borrowed_attachments = false;
-    var extractor_encoded = try extractorRequestShape(std.testing.allocator, extractor_capabilities, extractor_request);
+    var extractor_encoded = try extractorRequestShape(std.testing.allocator, extractor_capabilities, .base64_payload, extractor_request);
     defer extractor_encoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), extractor_encoded.encoded_media_bytes);
 }
@@ -2103,7 +2136,7 @@ test "asset producer runtime reader URI admission measures data payloads before 
         .inline_content_trust = .trusted_internal,
     };
     const shape = try Runtime.readerUriInvocationShape(capabilities, request);
-    try std.testing.expectEqual(@as(usize, 3), shape.encoded_media_bytes);
+    try std.testing.expectEqual(request.images[0].len, shape.encoded_media_bytes);
     try std.testing.expectError(error.InferenceEncodedBytesExceeded, capabilities.validateInvocation(.read, .{
         .item_count = 1,
         .modalities = .{ .image = true },
@@ -2115,6 +2148,7 @@ test "asset producer runtime reader URI admission measures data payloads before 
 fn generatorBatchEnd(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
     start: usize,
 ) !usize {
@@ -2123,7 +2157,9 @@ fn generatorBatchEnd(
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
-        const item = try generatorRequestShape(alloc, capabilities, requests[end]);
+        const item = try generatorRequestShape(alloc, capabilities, attachment_transport, requests[end]);
+        if (item.encoded_media_bytes > max_encoded_media_bytes)
+            return error.InferenceEncodedBytesExceeded;
         const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch break;
         if (next > max_encoded_media_bytes and end > start) break;
         bytes = next;
@@ -2134,6 +2170,7 @@ fn generatorBatchEnd(
 fn extractorBatchEnd(
     alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
     start: usize,
 ) !usize {
@@ -2142,7 +2179,7 @@ fn extractorBatchEnd(
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
-        var item = try extractorRequestShape(alloc, capabilities, requests[end]);
+        var item = try extractorRequestShape(alloc, capabilities, attachment_transport, requests[end]);
         defer item.deinit(alloc);
         if (item.encoded_media_bytes > max_encoded_media_bytes) return error.InferenceEncodedBytesExceeded;
         const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
@@ -2168,14 +2205,14 @@ test "asset producer runtime extractor windows obey resolved item and encoded-by
         .output = .extraction,
         .prompt_policy = .structured_schema,
     };
-    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, &requests, 0));
-    try validateExtractorInvocation(std.testing.allocator, capabilities, requests[0..1]);
-    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateExtractorInvocation(std.testing.allocator, capabilities, requests[0..2]));
-    try validateExtractorBatchPlan(std.testing.allocator, capabilities, &requests);
+    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
+    try validateExtractorInvocation(std.testing.allocator, capabilities, .base64_payload, requests[0..1]);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateExtractorInvocation(std.testing.allocator, capabilities, .base64_payload, requests[0..2]));
+    try validateExtractorBatchPlan(std.testing.allocator, capabilities, .base64_payload, &requests);
 
     var different_prompts = requests;
     different_prompts[1].source_text = "different prompt";
-    try std.testing.expectError(error.BatchIncompatible, validateExtractorBatchPlan(std.testing.allocator, capabilities, &different_prompts));
+    try std.testing.expectError(error.BatchIncompatible, validateExtractorBatchPlan(std.testing.allocator, capabilities, .base64_payload, &different_prompts));
 }
 
 test "asset producer runtime extractor admission accounts for resident inline source parts" {
@@ -2195,14 +2232,14 @@ test "asset producer runtime extractor admission accounts for resident inline so
         .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,BAUG\"}]" },
     };
     try std.testing.expectEqual(first_uri.len, second_uri.len);
-    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, &requests, 0));
-    try validateExtractorBatchPlan(std.testing.allocator, capabilities, &requests);
+    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
+    try validateExtractorBatchPlan(std.testing.allocator, capabilities, .base64_payload, &requests);
 
     var untrusted = requests[0];
     untrusted.inline_media_trusted = false;
     try std.testing.expectError(
         error.UntrustedInlineMedia,
-        validateExtractorInvocation(std.testing.allocator, capabilities, &.{untrusted}),
+        validateExtractorInvocation(std.testing.allocator, capabilities, .base64_payload, &.{untrusted}),
     );
 
     var text_capabilities = capabilities;
@@ -2211,14 +2248,14 @@ test "asset producer runtime extractor admission accounts for resident inline so
     text_capabilities.input_granularity = .item;
     try std.testing.expectError(
         error.UnsupportedInferenceMimeType,
-        validateExtractorInvocation(std.testing.allocator, text_capabilities, requests[0..1]),
+        validateExtractorInvocation(std.testing.allocator, text_capabilities, .base64_payload, requests[0..1]),
     );
 
     var plain = requests[0];
     plain.content_type = "text/plain";
     try std.testing.expectError(
         error.BatchIncompatible,
-        validateExtractorBatchCompatibility(std.testing.allocator, capabilities, &.{plain}),
+        validateExtractorBatchCompatibility(std.testing.allocator, capabilities, .base64_payload, &.{plain}),
     );
 }
 
@@ -2234,7 +2271,7 @@ test "asset producer runtime extractor shape is allocation-failure safe" {
                 .output = .extraction,
                 .prompt_policy = .structured_schema,
             };
-            var shape = try extractorRequestShape(alloc, capabilities, .{
+            var shape = try extractorRequestShape(alloc, capabilities, .base64_payload, .{
                 .producer_type = .extractor,
                 .config_json = "{}",
                 .source_text = "",
@@ -2266,13 +2303,23 @@ test "encoded reader chunks obey model item and byte limits" {
         .preferred_items = 2,
         .max_items = 2,
         .max_encoded_media_bytes = 5,
-    }));
+    }, .borrowed_binary));
     try std.testing.expectEqual(@as(usize, 2), encodedReaderBatchEnd(&images, 0, .{
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,
         .max_encoded_media_bytes = 6,
-    }));
+    }, .borrowed_binary));
+    const data_uri_bytes = try inference_work.AttachmentTransport.data_uri.residentSize(
+        bytes.len,
+        "image/png".len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), encodedReaderBatchEnd(&images, 0, .{
+        .mode = .native,
+        .preferred_items = 2,
+        .max_items = 2,
+        .max_encoded_media_bytes = data_uri_bytes * 2 - 1,
+    }, .data_uri));
 }
 
 /// Preserve an exact source label for same-document batches. Mixed-document
@@ -2468,11 +2515,13 @@ fn extractionResultsJsonAlloc(
     alloc: Allocator,
     response_json: []const u8,
     expected_model: []const u8,
-    expected_ids: []const []const u8,
+    wire_ids: []const []const u8,
+    output_ids: []const []const u8,
 ) ![][]u8 {
+    if (wire_ids.len != output_ids.len) return error.InvalidWorkIdentity;
     var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
     defer expected_by_id.deinit(alloc);
-    for (expected_ids, 0..) |id, index| {
+    for (wire_ids, 0..) |id, index| {
         if (id.len == 0) return error.InvalidWorkIdentity;
         const entry = try expected_by_id.getOrPut(alloc, id);
         if (entry.found_existing) return error.InvalidWorkIdentity;
@@ -2498,28 +2547,33 @@ fn extractionResultsJsonAlloc(
     if (!std.mem.eql(u8, typed.value.object, "extraction") or
         !std.mem.eql(u8, typed.value.model, expected_model))
         return error.InvalidExtractorResponse;
-    if (typed.value.data.len != expected_ids.len) return error.InvalidExtractorResponse;
+    if (typed.value.data.len != wire_ids.len) return error.InvalidExtractorResponse;
     if (raw.value != .object) return error.InvalidExtractorResponse;
     const raw_data = raw.value.object.get("data") orelse return error.InvalidExtractorResponse;
-    if (raw_data != .array or raw_data.array.items.len != expected_ids.len)
+    if (raw_data != .array or raw_data.array.items.len != wire_ids.len)
         return error.InvalidExtractorResponse;
 
-    const out = try alloc.alloc([]u8, expected_ids.len);
+    const out = try alloc.alloc([]u8, wire_ids.len);
     for (out) |*item| item.* = &.{};
     errdefer {
         for (out) |item| if (item.len > 0) alloc.free(item);
         alloc.free(out);
     }
-    const seen = try alloc.alloc(bool, expected_ids.len);
+    const seen = try alloc.alloc(bool, wire_ids.len);
     defer alloc.free(seen);
     @memset(seen, false);
-    for (raw_data.array.items) |item| {
-        if (item != .object) return error.InvalidExtractorResponse;
+    for (raw_data.array.items) |*item| {
+        if (item.* != .object) return error.InvalidExtractorResponse;
         const id_value = item.object.get("id") orelse return error.InvalidExtractorResponse;
         if (id_value != .string) return error.InvalidExtractorResponse;
         const index = expected_by_id.get(id_value.string) orelse return error.InvalidExtractorResponse;
         if (seen[index]) return error.InvalidExtractorResponse;
-        out[index] = try std.json.Stringify.valueAlloc(alloc, item, .{});
+        if (output_ids[index].len > 0) {
+            try item.object.put(alloc, "id", .{ .string = output_ids[index] });
+        } else {
+            _ = item.object.orderedRemove("id");
+        }
+        out[index] = try std.json.Stringify.valueAlloc(alloc, item.*, .{});
         seen[index] = true;
     }
     for (seen) |was_seen| if (!was_seen) return error.InvalidExtractorResponse;
@@ -2534,6 +2588,7 @@ test "asset producer runtime extractor batch response preserves extensions and m
         "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-b\",\"provider_extension\":{\"rank\":2}},{\"id\":\"page-a\",\"provider_extension\":{\"rank\":1}}]}",
         "owner/model",
         &ids,
+        &ids,
     );
     defer {
         for (exact) |item| alloc.free(item);
@@ -2541,34 +2596,66 @@ test "asset producer runtime extractor batch response preserves extensions and m
     }
     try std.testing.expectEqualStrings("{\"id\":\"page-a\",\"provider_extension\":{\"rank\":1}}", exact[0]);
     try std.testing.expectEqualStrings("{\"id\":\"page-b\",\"provider_extension\":{\"rank\":2}}", exact[1]);
+
+    const wire_ids = [_][]const u8{ "wire-a", "wire-b" };
+    const repeated_output_ids = [_][]const u8{ "page:000001", "page:000001" };
+    const repeated = try extractionResultsJsonAlloc(
+        alloc,
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"wire-b\",\"rank\":2},{\"id\":\"wire-a\",\"rank\":1}]}",
+        "owner/model",
+        &wire_ids,
+        &repeated_output_ids,
+    );
+    defer {
+        for (repeated) |item| alloc.free(item);
+        alloc.free(repeated);
+    }
+    try std.testing.expectEqualStrings("{\"id\":\"page:000001\",\"rank\":1}", repeated[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"page:000001\",\"rank\":2}", repeated[1]);
+
+    const no_output_ids = [_][]const u8{ "", "" };
+    const anonymous = try extractionResultsJsonAlloc(
+        alloc,
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"wire-a\"},{\"id\":\"wire-b\"}]}",
+        "owner/model",
+        &wire_ids,
+        &no_output_ids,
+    );
+    defer {
+        for (anonymous) |item| alloc.free(item);
+        alloc.free(anonymous);
+    }
+    try std.testing.expectEqualStrings("{}", anonymous[0]);
+    try std.testing.expectEqualStrings("{}", anonymous[1]);
+
     const duplicate_ids = [_][]const u8{ "page-a", "page-a" };
     try std.testing.expectError(
         error.InvalidWorkIdentity,
-        extractionResultsJsonAlloc(alloc, "{}", "owner/model", &duplicate_ids),
+        extractionResultsJsonAlloc(alloc, "{}", "owner/model", &duplicate_ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"}]}", "owner/model", &ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-a\"}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-a\"}]}", "owner/model", &ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"unknown\"}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"unknown\"}]}", "owner/model", &ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{}]}", "owner/model", &ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\",\"entities\":[1]},{\"id\":\"page-b\"}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\",\"entities\":[1]},{\"id\":\"page-b\"}]}", "owner/model", &ids, &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-b\"}]}", "owner/model", &ids),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-b\"}]}", "owner/model", &ids, &ids),
     );
 }
 
@@ -2580,6 +2667,7 @@ test "asset producer runtime typed extractor response parsing is allocation-fail
                 alloc,
                 "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-b\"},{\"id\":\"page-a\"}]}",
                 "owner/model",
+                &ids,
                 &ids,
             );
             defer {
@@ -3474,7 +3562,7 @@ test "asset producer runtime preserves remote reader identity and native executi
             \\{"object":"list","data":[
             \\{"text":"page one","object":"read.result","index":0},
             \\{"text":"page two","object":"read.result","index":1}
-            \\],"model":"florence","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"execution":{"requested_items":2,"native_batches":1,"native_items":2,"serial_items":0,"fallback_items":0}}
+            \\],"model":"florence","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"execution":{"requested_items":2,"native_batches":1,"native_items":2,"serial_items":0,"rejected_items":0,"fallback_items":0}}
             ,
         } },
     });

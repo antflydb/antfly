@@ -1142,6 +1142,10 @@ pub const ManagedEmbedder = struct {
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
         const capabilities = try denseCapabilities(ptr, alloc, embedding_name);
+        const attachment_transport: inference_work.AttachmentTransport = if (entry.antfly_provider != null)
+            .borrowed_binary
+        else
+            .base64_payload;
         if (items.len == 0) return try alloc.alloc([]const f32, 0);
 
         // The planner normally forms capability-sized windows, but this is
@@ -1156,9 +1160,9 @@ pub const ManagedEmbedder = struct {
         }
         var offset: usize = 0;
         while (offset < items.len) {
-            const end = try densePartBatchEnd(capabilities, items, offset);
+            const end = try densePartBatchEnd(capabilities, attachment_transport, items, offset);
             const chunk = items[offset..end];
-            try validateDensePartItemInvocation(capabilities, chunk);
+            try validateDensePartItemInvocation(capabilities, attachment_transport, chunk);
             const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims);
             defer alloc.free(chunk_vectors);
             for (chunk_vectors) |vector| {
@@ -1229,7 +1233,7 @@ pub const ManagedEmbedder = struct {
             .input_granularity = if (entry.multimodal) .page else .chunk,
             .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1, .max_media_parts_per_item = 1 },
             .output = .embedding,
-            .borrowed_attachments = entry.multimodal,
+            .borrowed_attachments = false,
         };
     }
 
@@ -4112,6 +4116,7 @@ fn mergeModalities(target: *inference_work.Modalities, value: inference_work.Mod
 
 fn validateDensePartItemInvocation(
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     items: []const template_mod.ContentPart,
 ) !void {
     var shape = inference_work.InvocationShape{ .item_count = items.len };
@@ -4130,7 +4135,8 @@ fn validateDensePartItemInvocation(
         .binary => |media| {
             mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
             try capabilities.validateMimeType(media.mime_type);
-            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
+            const resident = try attachment_transport.residentSize(media.data.len, media.mime_type.len);
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
                 return error.InferenceEncodedBytesExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
@@ -4140,6 +4146,7 @@ fn validateDensePartItemInvocation(
 
 fn densePartBatchEnd(
     capabilities: inference_work.InferenceCapabilities,
+    attachment_transport: inference_work.AttachmentTransport,
     items: []const template_mod.ContentPart,
     start: usize,
 ) !usize {
@@ -4150,7 +4157,7 @@ fn densePartBatchEnd(
     while (end < items.len and end - start < max_items) : (end += 1) {
         const item_bytes: usize = switch (items[end]) {
             .text => 0,
-            .binary => |value| value.data.len,
+            .binary => |value| try attachment_transport.residentSize(value.data.len, value.mime_type.len),
             .media_url => 0,
         };
         const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
@@ -4164,6 +4171,41 @@ fn densePartBatchEnd(
         encoded_media_bytes = next_bytes;
     }
     return end;
+}
+
+test "managed embedder admission follows the selected attachment transport" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const items = [_]template_mod.ContentPart{
+        .{ .binary = .{ .mime_type = "image/png", .data = &bytes } },
+        .{ .binary = .{ .mime_type = "image/png", .data = &bytes } },
+    };
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 2,
+            .max_items = 2,
+            .max_encoded_media_bytes = 7,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .embedding,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try densePartBatchEnd(capabilities, .borrowed_binary, &items, 0),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try densePartBatchEnd(capabilities, .base64_payload, &items, 0),
+    );
+    try validateDensePartItemInvocation(capabilities, .base64_payload, items[0..1]);
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        validateDensePartItemInvocation(capabilities, .base64_payload, &items),
+    );
 }
 
 /// Embed a bounded window of independently addressable document assets. Each

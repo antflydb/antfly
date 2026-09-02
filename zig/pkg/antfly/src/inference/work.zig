@@ -183,6 +183,38 @@ pub const InvocationShape = struct {
     max_media_parts_per_item: usize = 0,
 };
 
+/// Physical representation selected by the concrete executor boundary.
+///
+/// This is deliberately separate from `InferenceCapabilities`: a model may be
+/// reachable through both a linked, borrowed-byte ABI and a remote HTTP route.
+/// Admission must charge the route that will actually execute, not a model or
+/// catalog property.
+pub const AttachmentTransport = enum {
+    borrowed_binary,
+    base64_payload,
+    data_uri,
+
+    pub fn residentSize(
+        self: AttachmentTransport,
+        raw_bytes: usize,
+        mime_type_len: usize,
+    ) !usize {
+        if (self == .borrowed_binary) return raw_bytes;
+        const rounded = std.math.add(usize, raw_bytes, 2) catch
+            return error.InferenceEncodedBytesExceeded;
+        const encoded = std.math.mul(usize, rounded / 3, 4) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (self == .base64_payload) return encoded;
+        const prefix = std.math.add(
+            usize,
+            "data:".len + ";base64,".len,
+            mime_type_len,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        return std.math.add(usize, prefix, encoded) catch
+            error.InferenceEncodedBytesExceeded;
+    }
+};
+
 pub const InferenceCapabilities = struct {
     task: Task,
     input_modalities: Modalities,
@@ -192,6 +224,9 @@ pub const InferenceCapabilities = struct {
     output: OutputKind,
     result_cardinality: ResultCardinality = .one_per_item,
     prompt_policy: PromptPolicy = .explicit,
+    // Compatibility/catalog fact for the local provider ABI. Callers must not
+    // use this to select byte accounting: transport is an executor property
+    // and is supplied explicitly through AttachmentTransport.
     borrowed_attachments: bool = false,
 
     pub fn validate(self: InferenceCapabilities) !void {
@@ -411,6 +446,25 @@ test "inference capabilities distinguish native and compatibility batches" {
     try std.testing.expect(!compatibility.batch.executesNatively(8));
 }
 
+test "attachment transport charges the concrete resident representation" {
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        try AttachmentTransport.borrowed_binary.residentSize(3, "image/png".len),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 4),
+        try AttachmentTransport.base64_payload.residentSize(3, "image/png".len),
+    );
+    try std.testing.expectEqual(
+        "data:image/png;base64,AQID".len,
+        try AttachmentTransport.data_uri.residentSize(3, "image/png".len),
+    );
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        AttachmentTransport.base64_payload.residentSize(std.math.maxInt(usize), 0),
+    );
+}
+
 test "inference capabilities keep every model family output typed" {
     const cases = [_]struct { Task, OutputKind }{
         .{ .read, .read_result },
@@ -429,6 +483,10 @@ test "inference capabilities keep every model family output typed" {
             .input_modalities = .{ .text = true },
             .input_granularity = .item,
             .output = case[1],
+            .result_cardinality = switch (case[0]) {
+                .rerank, .chunk, .transcribe => .one_per_request,
+                else => .one_per_item,
+            },
         };
         try capabilities.validate();
     }

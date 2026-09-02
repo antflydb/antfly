@@ -1726,6 +1726,15 @@ func TestConservativeCapabilitiesV3PreservesExactContract(t *testing.T) {
 		!reflect.DeepEqual(merged["accepted_mime_types"], []string{"image/png"}) || merged["borrowed_attachments"] != false {
 		t.Fatalf("exact v3 contract was not conservatively preserved: %#v", merged)
 	}
+
+	// The proxy's outward catalog describes its HTTP route, so even two
+	// linked-capable upstreams cannot advertise borrowed memory downstream.
+	left = base([]any{"image"}, []any{"image/png"}, true)
+	right = base([]any{"image"}, []any{"image/png"}, true)
+	merged, ok = conservativeInferenceCapabilities(left, right)
+	if !ok || merged["borrowed_attachments"] != false {
+		t.Fatalf("proxy leaked an upstream borrowed-memory claim: %#v", merged)
+	}
 }
 
 func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
