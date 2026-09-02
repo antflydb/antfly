@@ -3180,10 +3180,17 @@ test "vector block store publishes base and replays committed WAL" {
     try std.testing.expectEqual(TopologyEpoch{ .base_generation = 1, .wal_mutation_sequence = 2 }, opened.store.topologyEpoch().?);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, (try opened.get("artifact-a", 1, 1)).vector.vectorView().?);
     var lookup_scratch: [64]u8 = undefined;
+    var decoded_base: [2]f32 = undefined;
     try std.testing.expectEqualSlices(
         f32,
         &.{ 1.0, 2.0 },
-        (try opened.getHashedInto("artifact-a", vector_block.keyHash("artifact-a"), 1, 1, &lookup_scratch)).vector.vectorView().?,
+        try (try opened.getHashedInto(
+            "artifact-a",
+            vector_block.keyHash("artifact-a"),
+            1,
+            1,
+            &lookup_scratch,
+        )).vector.decodeInto(&decoded_base),
     );
     const latest = (try opened.get("artifact-a", 2, 2)).vector;
     try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, latest.vectorView().?);

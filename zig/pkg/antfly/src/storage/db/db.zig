@@ -1565,6 +1565,26 @@ var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(fa
 var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
 var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
 var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+var legacy_dense_test_policy_token: u8 = 0;
+
+fn denyDenseNativeAuthorityForLegacyTest(_: *const anyopaque) bool {
+    return false;
+}
+
+/// Opens a fixture whose canonical HBC directory deliberately represents the
+/// released v1 layout. Recovery tests that delete or corrupt that directory
+/// must opt into this helper; fresh indexes otherwise use the v2 shadow
+/// generation and touching the canonical construction path tests nothing.
+fn openLegacyDenseTestDB(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
+    var opts = requested_opts;
+    std.debug.assert(opts.index_backends.dense_native_migration_policy_source == null);
+    opts.index_backends.dense_native_migration_policy_source = .{
+        .ptr = &legacy_dense_test_policy_token,
+        .authority_permitted = denyDenseNativeAuthorityForLegacyTest,
+    };
+    return DB.open(alloc, path, opts);
+}
+
 const PublishedDenseCatalogLookupTestHook = struct {
     io: std.Io,
     entered: std.Io.Event = .unset,
@@ -14215,7 +14235,9 @@ pub const DB = struct {
         }
         const candidate = entry.intent.candidate_relative_path orelse return .not_active;
         try index_repair_state.validateCandidateRelativePath(entry.intent.index_name, candidate);
-        const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
+        const active_pointer = try self.core.index_manager.capturePublishedIndexRootPointerForRecovery(
+            entry.intent.index_name,
+        );
         defer if (active_pointer) |value| alloc.free(value);
         if (active_pointer == null or !std.mem.eql(u8, active_pointer.?, candidate)) return .not_active;
         const cfg = self.core.index_manager.get(entry.intent.index_name) orelse return .not_active;
@@ -14340,7 +14362,9 @@ pub const DB = struct {
             lockApply(self);
             defer self.core.unlockApply();
 
-            const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
+            const active_pointer = try self.core.index_manager.capturePublishedIndexRootPointerForRecovery(
+                entry.intent.index_name,
+            );
             defer if (active_pointer) |value| alloc.free(value);
             const candidate_active = active_pointer != null and
                 std.mem.eql(u8, active_pointer.?, candidate);
@@ -51402,16 +51426,31 @@ fn finishDerivedCatchUpSessionAsync(
     // watermark. Report that fact explicitly to the executor instead of
     // replaying the same boundary through the capability-free coalescer. The
     // lifecycle finalizer below remains the sole readiness/publication pass.
-    const applied_sequence_persisted = capture_advances_applied_sequence and
+    const posting_applied_sequence_persisted = capture_advances_applied_sequence and
         ctx.index_manager.densePostingCoverageIncludesByName(index_ref.name, applied_sequence);
     var lifecycle_completed = false;
-    _ = blk: {
+    const lifecycle_handoff_persisted = blk: {
         var seq_lock = lockAtomicWithBackoffProfiled(
             &ctx.applied_sequence_mutex,
             &ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
-        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name, &lifecycle_completed);
+        // The native capture commit above owns posting durability. It must
+        // still hand the covered sequence to projection finalization before
+        // the executor may skip its generic persistence callback. Without
+        // this explicit note the finished-index flush has nothing to consume,
+        // leaving a durably caught-up index stuck in rebuilding forever.
+        if (posting_applied_sequence_persisted) {
+            _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+            _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+            try ctx.applied_sequence_coalescer.note(ctx.alloc, index_ref.name, applied_sequence);
+        }
+        const published = try flushFinishedDenseAppliedSequenceLocked(
+            ctx,
+            index_ref.name,
+            if (posting_applied_sequence_persisted) applied_sequence else null,
+            &lifecycle_completed,
+        );
         break :blk published;
     };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
@@ -51445,7 +51484,9 @@ fn finishDerivedCatchUpSessionAsync(
     // the idle observation and durable lifecycle completion.
     lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name) or lifecycle_completed;
     if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
-    return .{ .applied_sequence_persisted = applied_sequence_persisted };
+    return .{
+        .applied_sequence_persisted = posting_applied_sequence_persisted and lifecycle_handoff_persisted,
+    };
 }
 
 fn storeHasReplayRecordForHintAfter(
@@ -52594,6 +52635,7 @@ fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
 fn flushFinishedDenseAppliedSequenceLocked(
     ctx: *AsyncContext,
     index_name: []const u8,
+    posting_persisted_through: ?u64,
     lifecycle_completed: *bool,
 ) !bool {
     const pending = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
@@ -52624,12 +52666,17 @@ fn flushFinishedDenseAppliedSequenceLocked(
             // Persist the captured mutation and publish its immutable query
             // generation, but do not rewrite the generic checkpoint or source
             // LSM status row for every replay window.
-            const posting_started = monotonicTimeNs();
-            // Applied-sequence/status work has no mutation authority. The
-            // owning catch-up callback publishes its exact capture token
-            // before reaching this coverage-only checkpoint.
-            try ctx.index_manager.persistDensePostingSidecarByName(pending.owned_name, pending.sequence);
-            posting_publish_ns +|= elapsedSince(posting_started);
+            // The coalescer may already contain a newer sequence than the
+            // capture which invoked this flush. Skip posting I/O only when
+            // that exact pending boundary is known durable.
+            if (posting_persisted_through == null or posting_persisted_through.? < pending.sequence) {
+                const posting_started = monotonicTimeNs();
+                // Applied-sequence/status work has no mutation authority. The
+                // owning catch-up callback publishes its exact capture token
+                // before reaching this coverage-only checkpoint.
+                try ctx.index_manager.persistDensePostingSidecarByName(pending.owned_name, pending.sequence);
+                posting_publish_ns +|= elapsedSince(posting_started);
+            }
         } else {
             const metadata_started = monotonicTimeNs();
             try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
@@ -79075,15 +79122,11 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
         @as(u64, 0),
         db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
-    // Standalone databases now use the same explicit v2 shadow publication as
-    // provisioned storage. The only debt here is that online format migration;
-    // ordinary replay lag must not be reclassified as missing/corrupt data.
-    try std.testing.expect(try db.indexGenerationRepairRequired(alloc, "dense_idx"));
-    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
-    const classification = (try db.classifyCurrentDenseGenerationRepair(alloc, cfg.*)) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(index_repair_state.Trigger.storage_format_migration, classification.trigger);
-    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
+    // Fresh standalone indexes are created directly in the current native
+    // format. Ordinary asynchronous replay lag is work for the replay worker,
+    // not repair or format-migration debt.
+    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
+    try std.testing.expect(!(try db.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "managed dense physical migration is online and uses durable repair intent" {
@@ -82514,7 +82557,7 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{});
         defer db.close();
 
         try db.addIndex(.{
@@ -82544,7 +82587,7 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
     });
@@ -82866,7 +82909,7 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -82898,7 +82941,7 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
         hbc.close();
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -82941,7 +82984,7 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
     };
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -82969,7 +83012,7 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
         hbc.close();
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -83104,7 +83147,7 @@ test "db index repair rebuilds dense index with missing native publication" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -83137,7 +83180,7 @@ test "db index repair rebuilds dense index with missing native publication" {
         hbc.close();
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -83296,6 +83339,8 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    var dense_path: ?[]u8 = null;
+    defer if (dense_path) |value| alloc.free(value);
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
@@ -83311,18 +83356,17 @@ test "quarantine binding reconciliation serializes with terminal transition" {
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
         });
+        dense_path = try db.core.index_manager.activeIndexPath("dense_idx");
     }
 
-    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
-    defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeZ(u8, dense_path.?);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
             .dims = 2,
             .storage_backend = .lsm,
         }, .{});
-        try hbc.beginBulkIngestSession();
+        try hbc.markPublishedGenerationIncompleteForTest();
         hbc.close();
     }
 
@@ -83409,7 +83453,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -83440,7 +83484,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
 
     var repair_id: u128 = 0;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -83480,7 +83524,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
         }));
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -83594,7 +83638,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
 
     var old_repair_id: u128 = 0;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .lsm_root_generation = 1,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -83625,7 +83669,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
     }
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .lsm_root_generation = 1,
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
@@ -83661,7 +83705,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
         db.shadow_index_repair_hook = null;
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .lsm_root_generation = 2,
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
@@ -83858,7 +83902,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -83889,7 +83933,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
 
     var repair_id: u128 = 0;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -83934,7 +83978,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
         }));
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -83983,7 +84027,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     };
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -84028,7 +84072,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     var repair_id: u128 = 0;
     var candidate_path: []u8 = undefined;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -84083,7 +84127,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     var documents_reprocessed: u64 = 1;
     var observed_catch_up_yield = false;
     {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
+        var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -84108,7 +84152,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
 
     // Reopen from the durable replay checkpoint, proving a yielded catch-up
     // turn is independently restartable just like a yielded source scan.
-    var final_reopened = try DB.open(alloc, std.mem.span(path), .{
+    var final_reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -86358,7 +86402,7 @@ test "db dense repair defers before candidate creation when node admission is ex
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -86394,7 +86438,7 @@ test "db dense repair defers before candidate creation when node admission is ex
     };
     var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer resources.deinit(alloc);
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -87765,7 +87809,11 @@ test "db failed activated dense generation rolls back to retained predecessor" {
             .dims = 2,
             .storage_backend = .lsm,
         }, .{});
-        try hbc.beginBulkIngestSession();
+        // Corrupt the selected generation through the format-agnostic fault
+        // boundary. Native v2 has no generic namespace batch in which to
+        // persist the legacy incomplete-bulk marker; dropping CURRENT models
+        // the equivalent unpublished generation without weakening that rule.
+        try hbc.markPublishedGenerationIncompleteForTest();
         hbc.close();
     }
 
@@ -88781,7 +88829,7 @@ test "db dense artifact rebuild checks artifact counters before clean checkpoint
     };
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -88812,7 +88860,7 @@ test "db dense artifact rebuild checks artifact counters before clean checkpoint
     defer alloc.free(dense_index_path);
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -88890,7 +88938,7 @@ test "db dense artifact rebuild bootstraps missing counter metadata" {
     };
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -88926,7 +88974,7 @@ test "db dense artifact rebuild bootstraps missing counter metadata" {
 
     var repair_id: u128 = 0;
     {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
+        var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -88949,7 +88997,7 @@ test "db dense artifact rebuild bootstraps missing counter metadata" {
     // The missing-proof gate is reconstructed from the durable intent before
     // any repair owner resumes work after process restart.
     {
-        var resumed = try DB.open(alloc, std.mem.span(path), .{
+        var resumed = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -89444,7 +89492,7 @@ test "db dense artifact rebuild resumes from persisted state" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -89484,7 +89532,7 @@ test "db dense artifact rebuild resumes from persisted state" {
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
     {
-        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+        var interrupted = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -89553,7 +89601,7 @@ test "db dense artifact rebuild resumes from persisted state" {
     }
 
     {
-        var resumed = try DB.open(alloc, std.mem.span(path), .{
+        var resumed = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -89678,7 +89726,7 @@ test "db dense artifact rebuild resume keys are owned by plan allocator" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(db_alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(db_alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -89717,7 +89765,7 @@ test "db dense artifact rebuild resume keys are owned by plan allocator" {
     defer alloc.free(dense_index_path);
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
-    var reopened = try DB.open(db_alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(db_alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -89739,7 +89787,7 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -89786,7 +89834,7 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
     defer alloc.free(dense_b_path);
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_b_path);
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -89834,7 +89882,7 @@ test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -89863,7 +89911,7 @@ test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
     defer alloc.free(dense_index_path);
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -89885,7 +89933,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .enrichment = .{
                 .owner_id = "worker-a",
                 .dense_embedder = deterministic.interface(),
@@ -89914,7 +89962,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
     {
-        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+        var interrupted = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -89963,7 +90011,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
     }
 
     {
-        var resumed = try DB.open(alloc, std.mem.span(path), .{
+        var resumed = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -90006,7 +90054,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -90055,7 +90103,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
     const rebuild_state = backfill_state_mod.RebuildState.init(dense_a_path);
 
     {
-        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+        var interrupted = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -90102,7 +90150,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
     }
 
     {
-        var resumed = try DB.open(alloc, std.mem.span(path), .{
+        var resumed = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -90133,7 +90181,7 @@ test "db dense artifact rebuild ignores stale wrong-dimension artifacts when cou
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -90166,7 +90214,7 @@ test "db dense artifact rebuild ignores stale wrong-dimension artifacts when cou
     defer alloc.free(dense_index_path);
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -90208,7 +90256,7 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
     defer cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -90227,7 +90275,7 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
     }
 
     {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
+        var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
@@ -90267,7 +90315,7 @@ test "db dense artifact rebuild waits for replay debt instead of raw doc count a
     var appended_sequence: u64 = 0;
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{
+        var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -90309,7 +90357,7 @@ test "db dense artifact rebuild waits for replay debt instead of raw doc count a
         try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },

@@ -8548,19 +8548,21 @@ fn appendRuntimeIndexStatusRecordBody(
     try appendInt(alloc, out, u64, record.edge_count);
     try appendInt(alloc, out, u64, record.node_count);
     try appendInt(alloc, out, u64, record.root_node);
-    try appendInt(alloc, out, u64, record.coverage_produced_count);
-    try appendInt(alloc, out, u64, record.coverage_skipped_count);
-    try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
-    try appendInt(alloc, out, u64, record.coverage_generation);
-    try appendInt(alloc, out, u64, record.coverage_config_hash);
-    try out.append(alloc, if (record.coverage_identity_ready) 1 else 0);
-    try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
+    if (version >= 5) {
+        try appendInt(alloc, out, u64, record.coverage_produced_count);
+        try appendInt(alloc, out, u64, record.coverage_skipped_count);
+        try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
+    }
+    if (version >= 7) try appendInt(alloc, out, u64, record.coverage_generation);
+    if (version >= 6) try appendInt(alloc, out, u64, record.coverage_config_hash);
+    if (version >= 7) try out.append(alloc, if (record.coverage_identity_ready) 1 else 0);
+    if (version >= 6) try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
     try out.append(alloc, if (record.backfill_active) 1 else 0);
     try appendInt(alloc, out, u16, record.backfill_progress_millis);
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
-    try appendOptionalString(alloc, out, record.load_error);
+    if (version >= 11) try appendOptionalString(alloc, out, record.load_error);
     if (version >= runtime_status_protocol.repair_status_record_version) {
         try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
         try out.append(

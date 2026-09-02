@@ -4049,6 +4049,7 @@ pub const IndexManager = struct {
     ) bool {
         if (native_physical_v2) return true;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -4075,6 +4076,12 @@ pub const IndexManager = struct {
     pub fn denseNativePhysicalMigrationRequired(self: *IndexManager, name: []const u8) !bool {
         if (!densePostingWalMutationStoreEnabled()) return false;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
+        // Migration publishes a host-visible generation through an atomic
+        // ACTIVE_ROOT rename. Backend-local namespaces remain healthy v1
+        // authority until their adapter exposes an equivalent staged
+        // generation/promote contract; repeatedly scheduling an impossible
+        // migration only creates permanent repair debt.
+        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -9516,6 +9523,20 @@ pub const IndexManager = struct {
         return try self.readActiveIndexRootPointer(target_path, name);
     }
 
+    /// Captures the catalog transaction's selected pointer without requiring
+    /// the selected generation to remain healthy. This capability is limited
+    /// to activation reconciliation and rollback: ordinary open/serving paths
+    /// must continue through `captureActiveIndexRootPointer` and therefore
+    /// fail closed when v2 authority is absent or corrupt.
+    pub fn capturePublishedIndexRootPointerForRecovery(
+        self: *const IndexManager,
+        name: []const u8,
+    ) !?[]u8 {
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        return try self.readPublishedIndexRootPointer(target_path, name);
+    }
+
     /// Converts an already-authenticated native backup projection into the
     /// same explicit physical generation produced by an online shadow build.
     /// No corpus bytes are copied: the unpublished canonical directory is
@@ -9624,7 +9645,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         const target_path = try self.indexPath(name);
         defer self.alloc.free(target_path);
-        const current_pointer = try self.readActiveIndexRootPointer(target_path, name);
+        const current_pointer = try self.readPublishedIndexRootPointer(target_path, name);
         defer if (current_pointer) |value| self.alloc.free(value);
         if (!optionalBytesEqual(current_pointer, expected_candidate_relative_path)) {
             return error.IndexRootPointerChanged;
@@ -9663,7 +9684,7 @@ pub const IndexManager = struct {
         }
         const target_path = try self.indexPath(name);
         defer self.alloc.free(target_path);
-        const current_pointer = try self.readActiveIndexRootPointer(target_path, name);
+        const current_pointer = try self.readPublishedIndexRootPointer(target_path, name);
         defer if (current_pointer) |value| self.alloc.free(value);
         if (!optionalBytesEqual(current_pointer, expected_candidate_relative_path)) {
             return error.IndexRootPointerChanged;
@@ -9694,15 +9715,11 @@ pub const IndexManager = struct {
         name: []const u8,
         candidate_relative_path: []const u8,
     ) !bool {
-        const active_path = try self.activeIndexPath(name);
-        defer self.alloc.free(active_path);
-        const candidate_path = try std.fmt.allocPrint(
-            self.alloc,
-            "{s}/{s}",
-            .{ self.base_path, candidate_relative_path },
-        );
-        defer self.alloc.free(candidate_path);
-        return std.mem.eql(u8, active_path, candidate_path);
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        const selected = try self.readPublishedIndexRootPointer(target_path, name);
+        defer if (selected) |value| self.alloc.free(value);
+        return selected != null and std.mem.eql(u8, selected.?, candidate_relative_path);
     }
 
     /// Advance at most one bounded algebraic key-deletion batch while also
@@ -15412,7 +15429,17 @@ pub const IndexManager = struct {
         try fs_paths.syncDirPortable(io, shadow_root_path);
     }
 
-    fn readActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
+    const ActiveIndexRootPointerValidation = enum {
+        syntax_only,
+        physical_authority,
+    };
+
+    fn readActiveIndexRootPointerWithValidation(
+        self: *const IndexManager,
+        canonical_path: []const u8,
+        name: []const u8,
+        validation: ActiveIndexRootPointerValidation,
+    ) !?[]u8 {
         if (builtin.os.tag == .freestanding) return null;
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
@@ -15437,10 +15464,32 @@ pub const IndexManager = struct {
         const trimmed = std.mem.trim(u8, raw[magic.len..], "\r\n");
         if (trimmed.len == 0) return error.InvalidIndexRootPointer;
         if (!validRelativeRepairIndexRoot(name, trimmed)) return error.InvalidIndexRootPointer;
-        if (is_v2 and !try self.relativeIndexRootHasNativePhysicalAuthority(trimmed)) {
+        if (is_v2 and validation == .physical_authority and
+            !try self.relativeIndexRootHasNativePhysicalAuthority(trimmed))
+        {
             return error.InvalidIndexRootPointer;
         }
         return try self.alloc.dupe(u8, trimmed);
+    }
+
+    /// Reads a pointer selected for serving and authenticates the physical
+    /// authority promised by its version. Recovery code must use the
+    /// syntax-only variant below so a damaged candidate can still be
+    /// identified and atomically rolled back to its captured predecessor.
+    fn readActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
+        return try self.readActiveIndexRootPointerWithValidation(
+            canonical_path,
+            name,
+            .physical_authority,
+        );
+    }
+
+    fn readPublishedIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
+        return try self.readActiveIndexRootPointerWithValidation(
+            canonical_path,
+            name,
+            .syntax_only,
+        );
     }
 
     fn relativeIndexRootHasNativePhysicalAuthority(self: *const IndexManager, relative_path: []const u8) !bool {
@@ -15539,7 +15588,10 @@ pub const IndexManager = struct {
         try fs_paths.syncDirPortable(io, parent);
     }
 
-    fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+    /// Returns the authenticated physical root currently selected for an
+    /// index. Callers that retain this path across a mutation must also hold
+    /// the appropriate catalog/structural lease.
+    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         const canonical_path = try self.indexPath(name);
         errdefer self.alloc.free(canonical_path);
         if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {

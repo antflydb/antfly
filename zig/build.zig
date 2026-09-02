@@ -3671,7 +3671,7 @@ pub fn build(b: *std.Build) void {
         "enrichment index status encodes worker lifecycle diagnostics",
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
-        "metadata status JSON preserves compact managed repair admission state",
+        "metadata status JSON preserves compact managed index admission state",
         "catalog sources without compact routing fail closed",
         "span routing uses compact catalog snapshot when available",
         "span routing confirms eventual misses with a linearizable compact snapshot",
