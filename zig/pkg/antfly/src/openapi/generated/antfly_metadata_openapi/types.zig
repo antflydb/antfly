@@ -4688,6 +4688,21 @@ pub const IdempotentBatchError = struct {
     reconcile: []const u8,
 };
 
+pub const IdempotentBatchResponse = struct {
+    /// Durable commit and recovery state for this operation.
+    status: []const u8,
+    /// Number of documents inserted by the sealed operation.
+    inserted: i64,
+    /// Number of documents deleted by the sealed operation.
+    deleted: i64,
+    /// Number of documents transformed by the sealed operation.
+    transformed: i64,
+    /// Stable transaction receipt ID for replay and reconciliation.
+    transaction_id: []const u8,
+    /// Transaction-session status path for this operation.
+    reconcile: []const u8,
+};
+
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue

@@ -4884,9 +4884,9 @@ pub const AntflyApiHandler = struct {
         const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
         if (!self.api_server.txn_sessions.hasDurableStore() or
             (!self.api_server.cfg.deployment_mode.isStandalone() and
-                self.api_server.txn_sessions.durable_scope != .cluster_shared))
+                !self.api_server.txn_sessions.hasAtomicClusterSharedStore()))
         {
-            return try idempotentBatchError(ctx, 503, "unknown", "idempotency_unavailable", "cluster-shared durable idempotency storage is not configured", true, &txn_hex);
+            return try idempotentBatchError(ctx, 503, "unknown", "idempotency_unavailable", "atomically fenced durable idempotency storage is not configured", true, &txn_hex);
         }
         const session = self.api_server.txn_sessions.beginIdempotentForPrincipal(
             alloc,

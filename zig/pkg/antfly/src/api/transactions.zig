@@ -1371,6 +1371,16 @@ pub const SessionRegistry = struct {
         return self.durable != null;
     }
 
+    /// A scope declaration alone is not a concurrency primitive. Distributed
+    /// idempotency is safe only when receipt creation and ownership transfer
+    /// are fenced atomically in the shared keyspace.
+    pub fn hasAtomicClusterSharedStore(self: *const SessionRegistry) bool {
+        return self.durable != null and
+            self.durable_scope == .cluster_shared and
+            self.lease_store != null and
+            self.owner_lease_ttl_ns != null;
+    }
+
     pub fn durableMissIsAuthoritative(self: *const SessionRegistry) bool {
         return self.durable != null and self.durable_scope == .cluster_shared;
     }
@@ -4935,6 +4945,29 @@ test "transaction session commit request is sealed across retries" {
         error.TransactionCommitSealed,
         reader.stage(alloc, txn_id, &changed_body),
     );
+}
+
+test "cluster-shared idempotency requires atomic owner fencing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-shared-capability", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+
+    var unfenced = SessionRegistry.init(&durable);
+    defer unfenced.deinit(alloc);
+    unfenced.durable_scope = .cluster_shared;
+    try std.testing.expect(!unfenced.hasAtomicClusterSharedStore());
+
+    var fenced = SessionRegistry.initWithLeaseTtl(&durable, SessionLeaseStore.init(alloc, &store), std.time.ns_per_s);
+    defer fenced.deinit(alloc);
+    fenced.durable_scope = .cluster_shared;
+    try std.testing.expect(fenced.hasAtomicClusterSharedStore());
 }
 
 test "durable recovery index tracks only validated commit execution and terminal handoff" {

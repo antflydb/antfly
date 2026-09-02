@@ -473,6 +473,8 @@ from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
 from .idempotent_batch_error import IdempotentBatchError
 from .idempotent_batch_error_status import IdempotentBatchErrorStatus
+from .idempotent_batch_response import IdempotentBatchResponse
+from .idempotent_batch_response_status import IdempotentBatchResponseStatus
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -1451,6 +1453,8 @@ __all__ = (
     "HierarchyProjection",
     "IdempotentBatchError",
     "IdempotentBatchErrorStatus",
+    "IdempotentBatchResponse",
+    "IdempotentBatchResponseStatus",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",

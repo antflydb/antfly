@@ -7,9 +7,9 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.batch_request import BatchRequest
-from ...models.batch_response import BatchResponse
 from ...models.error import Error
 from ...models.idempotent_batch_error import IdempotentBatchError
+from ...models.idempotent_batch_response import IdempotentBatchResponse
 from ...types import Response
 
 
@@ -39,19 +39,19 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> BatchResponse | Error | IdempotentBatchError | None:
+) -> Error | IdempotentBatchError | IdempotentBatchResponse | None:
     if response.status_code == 200:
-        response_200 = BatchResponse.from_dict(response.json())
+        response_200 = IdempotentBatchResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 201:
-        response_201 = BatchResponse.from_dict(response.json())
+        response_201 = IdempotentBatchResponse.from_dict(response.json())
 
         return response_201
 
     if response.status_code == 202:
-        response_202 = BatchResponse.from_dict(response.json())
+        response_202 = IdempotentBatchResponse.from_dict(response.json())
 
         return response_202
 
@@ -64,6 +64,11 @@ def _parse_response(
         response_409 = IdempotentBatchError.from_dict(response.json())
 
         return response_409
+
+    if response.status_code == 413:
+        response_413 = Error.from_dict(response.json())
+
+        return response_413
 
     if response.status_code == 429:
         response_429 = IdempotentBatchError.from_dict(response.json())
@@ -88,7 +93,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[BatchResponse | Error | IdempotentBatchError]:
+) -> Response[Error | IdempotentBatchError | IdempotentBatchResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -103,7 +108,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: BatchRequest,
     idempotency_key: str,
-) -> Response[BatchResponse | Error | IdempotentBatchError]:
+) -> Response[Error | IdempotentBatchError | IdempotentBatchResponse]:
     """Perform a durably idempotent batch operation on a table
 
      Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
@@ -111,7 +116,8 @@ def sync_detailed(
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
     transaction-session retention period; callers must not reuse a key after that period. Distributed
-    deployments fail closed unless the receipt store is cluster-shared.
+    deployments fail closed unless the receipt store is cluster-shared and supports atomic owner
+    fencing.
 
     Args:
         table_name (str):
@@ -155,7 +161,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BatchResponse | Error | IdempotentBatchError]
+        Response[Error | IdempotentBatchError | IdempotentBatchResponse]
     """
 
     kwargs = _get_kwargs(
@@ -177,7 +183,7 @@ def sync(
     client: AuthenticatedClient,
     body: BatchRequest,
     idempotency_key: str,
-) -> BatchResponse | Error | IdempotentBatchError | None:
+) -> Error | IdempotentBatchError | IdempotentBatchResponse | None:
     """Perform a durably idempotent batch operation on a table
 
      Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
@@ -185,7 +191,8 @@ def sync(
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
     transaction-session retention period; callers must not reuse a key after that period. Distributed
-    deployments fail closed unless the receipt store is cluster-shared.
+    deployments fail closed unless the receipt store is cluster-shared and supports atomic owner
+    fencing.
 
     Args:
         table_name (str):
@@ -229,7 +236,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BatchResponse | Error | IdempotentBatchError
+        Error | IdempotentBatchError | IdempotentBatchResponse
     """
 
     return sync_detailed(
@@ -246,7 +253,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: BatchRequest,
     idempotency_key: str,
-) -> Response[BatchResponse | Error | IdempotentBatchError]:
+) -> Response[Error | IdempotentBatchError | IdempotentBatchResponse]:
     """Perform a durably idempotent batch operation on a table
 
      Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
@@ -254,7 +261,8 @@ async def asyncio_detailed(
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
     transaction-session retention period; callers must not reuse a key after that period. Distributed
-    deployments fail closed unless the receipt store is cluster-shared.
+    deployments fail closed unless the receipt store is cluster-shared and supports atomic owner
+    fencing.
 
     Args:
         table_name (str):
@@ -298,7 +306,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BatchResponse | Error | IdempotentBatchError]
+        Response[Error | IdempotentBatchError | IdempotentBatchResponse]
     """
 
     kwargs = _get_kwargs(
@@ -318,7 +326,7 @@ async def asyncio(
     client: AuthenticatedClient,
     body: BatchRequest,
     idempotency_key: str,
-) -> BatchResponse | Error | IdempotentBatchError | None:
+) -> Error | IdempotentBatchError | IdempotentBatchResponse | None:
     """Perform a durably idempotent batch operation on a table
 
      Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
@@ -326,7 +334,8 @@ async def asyncio(
     contract. Keys are scoped to the authenticated principal and table and may be replayed after
     timeouts, lost responses, topology changes, or process restarts. Receipts use the configured
     transaction-session retention period; callers must not reuse a key after that period. Distributed
-    deployments fail closed unless the receipt store is cluster-shared.
+    deployments fail closed unless the receipt store is cluster-shared and supports atomic owner
+    fencing.
 
     Args:
         table_name (str):
@@ -370,7 +379,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BatchResponse | Error | IdempotentBatchError
+        Error | IdempotentBatchError | IdempotentBatchResponse
     """
 
     return (

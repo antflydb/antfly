@@ -112,6 +112,7 @@ pub const HierarchyMatchHit = types.HierarchyMatchHit;
 pub const HierarchyMatches = types.HierarchyMatches;
 pub const HierarchyProjection = types.HierarchyProjection;
 pub const IdempotentBatchError = types.IdempotentBatchError;
+pub const IdempotentBatchResponse = types.IdempotentBatchResponse;
 pub const IncompleteDetails = types.IncompleteDetails;
 pub const IndexMutationServiceUnavailableError = types.IndexMutationServiceUnavailableError;
 pub const IndexRuntimeCapabilities = types.IndexRuntimeCapabilities;

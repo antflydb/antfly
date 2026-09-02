@@ -6188,6 +6188,7 @@ pub fn build(b: *std.Build) void {
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
             "idempotent batch identities are scoped and session bodies are sealed",
+            "cluster-shared idempotency requires atomic owner fencing",
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",

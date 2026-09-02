@@ -15,6 +15,7 @@ from antfly import (  # noqa: E402
     CreatedEmbeddingsIndex,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
+    IdempotentBatchError,
     IndexMutationTemporarilyUnavailableError,
     StorageResourceExhaustedError,
     antfly_embedder,
@@ -935,15 +936,30 @@ class TestAntflyClient:
         expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         mock_httpx = MagicMock()
-        configure_response(mock_httpx, 201, {"inserted": 1})
+        configure_response(
+            mock_httpx,
+            201,
+            {
+                "status": "committed",
+                "inserted": 1,
+                "deleted": 0,
+                "transformed": 0,
+                "transaction_id": "abc123",
+                "reconcile": "/db/v1/transactions/abc123",
+            },
+        )
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080")
-        client.idempotent_batch(
+        receipt = client.idempotent_batch(
             table="users/archive",
             idempotency_key="import-generation-7",
             inserts={"user:1": {"name": "Zoë"}},
         )
+
+        assert receipt.status.value == "committed"
+        assert receipt.transaction_id == "abc123"
+        assert receipt.reconcile == "/db/v1/transactions/abc123"
 
         mock_httpx.stream.assert_called_once_with(
             "POST",
@@ -954,6 +970,38 @@ class TestAntflyClient:
                 "Idempotency-Key": "import-generation-7",
             },
         )
+
+    @patch("antfly.client.Client")
+    def test_idempotent_batch_preserves_typed_retry_receipt(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(
+            mock_httpx,
+            503,
+            {
+                "status": "unknown",
+                "code": "idempotency_unavailable",
+                "message": "atomic receipt storage is unavailable",
+                "retryable": True,
+                "transaction_id": "abc123",
+                "reconcile": "/db/v1/transactions/abc123",
+            },
+        )
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(IdempotentBatchError) as exc_info:
+            client.idempotent_batch(
+                table="users",
+                idempotency_key="import-generation-7",
+                inserts={"user:1": {"name": "Zoë"}},
+            )
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.status == "unknown"
+        assert exc_info.value.code == "idempotency_unavailable"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.transaction_id == "abc123"
+        assert exc_info.value.reconcile == "/db/v1/transactions/abc123"
 
     def test_request_reads_chunked_json_and_closes(self) -> None:
         stream = ChunkStream([b'{"ok":', b"true}"])

@@ -19,6 +19,29 @@ class AntflyAuthError(AntflyException):
     pass
 
 
+class IdempotentBatchError(AntflyException):
+    """Typed durable outcome returned by an idempotent batch request."""
+
+    def __init__(
+        self,
+        status_code: int,
+        status: str,
+        code: str,
+        message: str,
+        retryable: bool,
+        transaction_id: str,
+        reconcile: str,
+    ) -> None:
+        self.status_code = status_code
+        self.status = status
+        self.code = code
+        self.detail = message
+        self.retryable = retryable
+        self.transaction_id = transaction_id
+        self.reconcile = reconcile
+        super().__init__(f"idempotent batch failed ({status_code}, {status}): {message}")
+
+
 class InferenceAPIError(AntflyException):
     """Structured error returned by the inference API."""
 

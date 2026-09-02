@@ -338,6 +338,7 @@ pub const HierarchyMatches = types.HierarchyMatches;
 pub const HierarchyProjection = types.HierarchyProjection;
 pub const IPRangeQuery = types.IPRangeQuery;
 pub const IdempotentBatchError = types.IdempotentBatchError;
+pub const IdempotentBatchResponse = types.IdempotentBatchResponse;
 pub const ImageURL = types.ImageURL;
 pub const ImageURLContentPart = types.ImageURLContentPart;
 pub const IncompleteDetails = types.IncompleteDetails;

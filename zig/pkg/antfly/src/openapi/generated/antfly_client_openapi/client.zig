@@ -1257,7 +1257,7 @@ pub const Client = struct {
 
     /// Perform a durably idempotent batch operation on a table
     /// POST /db/v1/tables/{tableName}/idempotent-batch
-    pub fn idempotentBatchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest, idempotency_key: []const u8) !ApiResponse(types.BatchResponse) {
+    pub fn idempotentBatchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest, idempotency_key: []const u8) !ApiResponse(types.IdempotentBatchResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/idempotent-batch", .{ self.base_url, encoded_table_name });
@@ -1269,7 +1269,7 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.IdempotentBatchResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List all indexes for a table

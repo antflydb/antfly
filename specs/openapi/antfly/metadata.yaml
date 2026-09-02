@@ -5035,6 +5035,41 @@ components:
           type: string
           nullable: true
           description: Transaction-session status path for this keyed batch.
+    IdempotentBatchResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - inserted
+        - deleted
+        - transformed
+        - transaction_id
+        - reconcile
+      properties:
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+            - committed_visibility_pending
+            - committed_recovery_pending
+            - committed_repair_required
+          description: Durable commit and recovery state for this operation.
+        inserted:
+          type: integer
+          description: Number of documents inserted by the sealed operation.
+        deleted:
+          type: integer
+          description: Number of documents deleted by the sealed operation.
+        transformed:
+          type: integer
+          description: Number of documents transformed by the sealed operation.
+        transaction_id:
+          type: string
+          description: Stable transaction receipt ID for replay and reconciliation.
+        reconcile:
+          type: string
+          description: Transaction-session status path for this operation.
     IdempotentBatchError:
       type: object
       additionalProperties: false
@@ -10850,7 +10885,8 @@ paths:
         after timeouts, lost responses, topology changes, or process restarts.
         Receipts use the configured transaction-session retention period;
         callers must not reuse a key after that period. Distributed deployments
-        fail closed unless the receipt store is cluster-shared.
+        fail closed unless the receipt store is cluster-shared and supports
+        atomic owner fencing.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -10872,21 +10908,23 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BatchResponse"
+                $ref: "#/components/schemas/IdempotentBatchResponse"
         "201":
           description: Operation committed
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BatchResponse"
+                $ref: "#/components/schemas/IdempotentBatchResponse"
         "202":
           description: Commit is durable; visibility, recovery, or receipt handoff remains pending
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BatchResponse"
+                $ref: "#/components/schemas/IdempotentBatchResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "409":
           description: Durable non-application or an outcome that must be reconciled by stable key
           content:

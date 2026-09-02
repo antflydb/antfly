@@ -944,7 +944,7 @@ export interface paths {
         put?: never;
         /**
          * Perform a durably idempotent batch operation on a table
-         * @description Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured transaction-session retention period; callers must not reuse a key after that period. Distributed deployments fail closed unless the receipt store is cluster-shared.
+         * @description Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured transaction-session retention period; callers must not reuse a key after that period. Distributed deployments fail closed unless the receipt store is cluster-shared and supports atomic owner fencing.
          */
         post: operations["idempotentBatchWrite"];
         delete?: never;
@@ -5237,6 +5237,23 @@ export interface components {
             transaction_id?: string | null;
             /** @description Transaction-session status path for this keyed batch. */
             reconcile?: string | null;
+        };
+        IdempotentBatchResponse: {
+            /**
+             * @description Durable commit and recovery state for this operation.
+             * @enum {string}
+             */
+            status: "committed" | "committed_pending" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
+            /** @description Number of documents inserted by the sealed operation. */
+            inserted: number;
+            /** @description Number of documents deleted by the sealed operation. */
+            deleted: number;
+            /** @description Number of documents transformed by the sealed operation. */
+            transformed: number;
+            /** @description Stable transaction receipt ID for replay and reconciliation. */
+            transaction_id: string;
+            /** @description Transaction-session status path for this operation. */
+            reconcile: string;
         };
         IdempotentBatchError: {
             /** @enum {string} */
@@ -16513,7 +16530,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchResponse"];
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
                 };
             };
             /** @description Operation committed */
@@ -16522,7 +16539,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchResponse"];
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
                 };
             };
             /** @description Commit is durable; visibility, recovery, or receipt handoff remains pending */
@@ -16531,7 +16548,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchResponse"];
+                    "application/json": components["schemas"]["IdempotentBatchResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -16544,6 +16561,7 @@ export interface operations {
                     "application/json": components["schemas"]["IdempotentBatchError"];
                 };
             };
+            413: components["responses"]["PayloadTooLarge"];
             /** @description Durable idempotency receipt capacity is exhausted */
             429: {
                 headers: {

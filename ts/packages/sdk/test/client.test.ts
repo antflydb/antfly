@@ -36,6 +36,7 @@ vi.mock("openapi-fetch", () => ({
 const {
   AntflyClient,
   HierarchyCursorStaleError,
+  IdempotentBatchError,
   IndexMutationTemporarilyUnavailableError,
   QueryTemporarilyUnavailableError,
   StorageResourceExhaustedError,
@@ -572,16 +573,26 @@ describe("AntflyClient", () => {
     });
 
     it("should send idempotent batches on the fail-closed route with the stable key", async () => {
+      const receipt = {
+        status: "committed" as const,
+        inserted: 1,
+        deleted: 0,
+        transformed: 0,
+        transaction_id: "abc123",
+        reconcile: "/db/v1/transactions/abc123",
+      };
       const mockFetch = vi
         .spyOn(globalThis, "fetch")
-        .mockResolvedValueOnce(new Response(JSON.stringify({ inserted: 1 }), { status: 201 }));
+        .mockResolvedValueOnce(new Response(JSON.stringify(receipt), { status: 201 }));
 
-      await client.tables.idempotentBatch(
-        "products/archive",
-        "import-generation-7",
-        { inserts: { "prod:1": { title: "Notebook" } } },
-        { maxRequestBytes: 1024, maxResponseBytes: 1024 }
-      );
+      await expect(
+        client.tables.idempotentBatch(
+          "products/archive",
+          "import-generation-7",
+          { inserts: { "prod:1": { title: "Notebook" } } },
+          { maxRequestBytes: 1024, maxResponseBytes: 1024 }
+        )
+      ).resolves.toEqual(receipt);
 
       expect(mockFetch).toHaveBeenCalledWith(
         "http://localhost:8080/db/v1/tables/products%2Farchive/idempotent-batch",
@@ -590,6 +601,43 @@ describe("AntflyClient", () => {
           headers: expect.objectContaining({ "Idempotency-Key": "import-generation-7" }),
         })
       );
+
+      mockFetch.mockRestore();
+    });
+
+    it("should preserve typed idempotent retry receipts", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "unknown",
+            code: "idempotency_unavailable",
+            message: "atomic receipt storage is unavailable",
+            retryable: true,
+            transaction_id: "abc123",
+            reconcile: "/db/v1/transactions/abc123",
+          }),
+          { status: 503 }
+        )
+      );
+
+      const error = await client.tables
+        .idempotentBatch(
+          "products/archive",
+          "import-generation-7",
+          { inserts: { "prod:1": { title: "Notebook" } } },
+          { maxRequestBytes: 1024, maxResponseBytes: 1024 }
+        )
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(IdempotentBatchError);
+      expect(error).toMatchObject({
+        httpStatus: 503,
+        outcome: "unknown",
+        code: "idempotency_unavailable",
+        retryable: true,
+        transactionId: "abc123",
+        reconcile: "/db/v1/transactions/abc123",
+      });
 
       mockFetch.mockRestore();
     });

@@ -34,6 +34,7 @@ from antfly.client_generated.models import (
     GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
+    IdempotentBatchResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
@@ -43,6 +44,7 @@ from antfly.client_generated.types import UNSET
 
 from .exceptions import (
     AntflyException,
+    IdempotentBatchError,
     IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
@@ -651,6 +653,24 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        error_body is not None
+                        and isinstance(error_body.get("status"), str)
+                        and isinstance(error_body.get("code"), str)
+                        and isinstance(error_body.get("message"), str)
+                        and isinstance(error_body.get("retryable"), bool)
+                        and isinstance(error_body.get("transaction_id"), str)
+                        and isinstance(error_body.get("reconcile"), str)
+                    ):
+                        raise IdempotentBatchError(
+                            response.status_code,
+                            error_body["status"],
+                            error_body["code"],
+                            error_body["message"],
+                            error_body["retryable"],
+                            error_body["transaction_id"],
+                            error_body["reconcile"],
+                        )
                     if (
                         response.status_code == 429
                         and error_body is not None
@@ -1301,13 +1321,13 @@ class AntflyClient:
         idempotency_key: str,
         inserts: dict[str, dict[str, Any]] | None = None,
         deletes: list[str] | None = None,
-    ) -> None:
-        """Perform a durably idempotent batch that is safe to replay by key."""
+    ) -> IdempotentBatchResponse:
+        """Perform a durably idempotent batch and return its reconciliation receipt."""
         batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
         request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
         encoded = self._encode_write_request("Idempotent batch", request.to_dict())
 
-        self._request(
+        result = self._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/idempotent-batch",
             content=encoded,
@@ -1316,3 +1336,9 @@ class AntflyClient:
                 "Idempotency-Key": idempotency_key,
             },
         )
+        if not isinstance(result, Mapping):
+            raise AntflyException("idempotent batch returned an invalid response")
+        try:
+            return IdempotentBatchResponse.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException(f"idempotent batch returned an invalid response: {exc}") from exc
