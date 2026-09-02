@@ -39,6 +39,9 @@ jobs:
     outputs:
       version: ${{ steps.identity.outputs.version }}
       tag: ${{ steps.identity.outputs.tag }}
+      npm_version: ${{ steps.registry-identity.outputs.npm_version }}
+      python_version: ${{ steps.registry-identity.outputs.python_version }}
+      container_tag: ${{ steps.registry-identity.outputs.container_tag }}
       commit: ${{ steps.identity.outputs.commit }}
       build_controller_commit: ${{ steps.identity.outputs.build_controller_commit }}
       promotion_controller_commit: ${{ steps.identity.outputs.promotion_controller_commit }}
@@ -330,6 +333,27 @@ jobs:
             --ledger-sha256 "$actual"
           echo "sha256=$actual" >> "$GITHUB_OUTPUT"
 
+      - name: Bind authenticated registry versions to the sealed ledger
+        id: registry-identity
+        env:
+          RESOLVED_NPM_VERSION: ${{ steps.identity.outputs.npm_version }}
+          RESOLVED_PYTHON_VERSION: ${{ steps.identity.outputs.python_version }}
+          RESOLVED_CONTAINER_TAG: ${{ steps.identity.outputs.container_tag }}
+        run: |
+          set -euo pipefail
+          ledger=dist/release-payload/artifacts.json
+          npm_version="$(jq -er '.registry_versions.npm | strings | select(length > 0)' "$ledger")"
+          python_version="$(jq -er '.registry_versions.python | strings | select(length > 0)' "$ledger")"
+          container_tag="$(jq -er '.registry_versions.container | strings | select(length > 0)' "$ledger")"
+          test "$npm_version" = "$RESOLVED_NPM_VERSION"
+          test "$python_version" = "$RESOLVED_PYTHON_VERSION"
+          test "$container_tag" = "$RESOLVED_CONTAINER_TAG"
+          {
+            echo "npm_version=$npm_version"
+            echo "python_version=$python_version"
+            echo "container_tag=$container_tag"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Resolve immutable container identity and validate channel state
         id: container-state
         env:
@@ -443,10 +467,13 @@ jobs:
           path: dist/cli-snapshot
       - name: Select digest-verified Python distributions
         id: pypi
+        env:
+          PYTHON_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.python_version }}
         run: |
           python scripts/release/prepare_pypi_promotion.py \
             --project antfly-cli \
             --snapshot-dir dist/cli-snapshot \
+            --expected-version "$PYTHON_PACKAGE_VERSION" \
             --out-dir dist/pypi
       - name: Publish wheels
         if: ${{ steps.pypi.outputs.has_packages == 'true' }}
@@ -454,10 +481,13 @@ jobs:
         with:
           packages-dir: dist/pypi
       - name: Verify exact PyPI release contents
+        env:
+          PYTHON_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.python_version }}
         run: |
           python scripts/release/prepare_pypi_promotion.py \
             --project antfly-cli \
             --snapshot-dir dist/cli-snapshot \
+            --expected-version "$PYTHON_PACKAGE_VERSION" \
             --verify-complete \
             --attempts 30 \
             --retry-seconds 10
@@ -490,7 +520,7 @@ jobs:
           test "$(npm --version)" = "$NPM_VERSION"
       - name: Publish npm packages in dependency order
         env:
-          VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}
           NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
         run: |
           set -euo pipefail
@@ -646,22 +676,25 @@ jobs:
           path: dist/cli-snapshot
       - name: Preflight exact PyPI release contents
         if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+        env:
+          PYTHON_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.python_version }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/pypi-preflight"
           python scripts/release/prepare_pypi_promotion.py \
             --project antfly-cli \
             --snapshot-dir dist/cli-snapshot \
+            --expected-version "$PYTHON_PACKAGE_VERSION" \
             --out-dir "$RUNNER_TEMP/pypi-preflight"
       - name: Preflight every immutable npm package
         env:
-          RELEASE_VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          NPM_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}
           NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
         run: |
           set -euo pipefail
           python scripts/release/prepare_npm_promotion.py \
             --snapshot-dir dist/cli-snapshot \
-            --version "$RELEASE_VERSION" \
+            --version "$NPM_PACKAGE_VERSION" \
             --tag "$NPM_TAG"
       - name: Authenticate to Google Cloud for container preflight
         id: auth
@@ -674,7 +707,7 @@ jobs:
         uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
       - name: Preflight every immutable container version tag
         env:
-          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CONTAINER_VERSION: ${{ needs.prepare-release-promotion.outputs.container_tag }}
           CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
         run: |
           set -euo pipefail
@@ -687,16 +720,16 @@ jobs:
           arm64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected one linux/arm64 manifest") end' <<<"$manifest")"
           python3 scripts/release/registryctl.py container-version-check \
             --source "${gar_image}@${amd64_digest}" \
-            --destination "${gar_image}:${RELEASE_TAG}-amd64"
+            --destination "${gar_image}:${CONTAINER_VERSION}-amd64"
           python3 scripts/release/registryctl.py container-version-check \
             --source "${gar_image}@${arm64_digest}" \
-            --destination "${gar_image}:${RELEASE_TAG}-arm64"
+            --destination "${gar_image}:${CONTAINER_VERSION}-arm64"
           python3 scripts/release/registryctl.py container-version-check \
             --source "$source" \
-            --destination "${gar_image}:${RELEASE_TAG}"
+            --destination "${gar_image}:${CONTAINER_VERSION}"
           python3 scripts/release/registryctl.py container-version-check \
             --source "$source" \
-            --destination "ghcr.io/antflydb/antfly:${RELEASE_TAG}"
+            --destination "ghcr.io/antflydb/antfly:${CONTAINER_VERSION}"
 
   begin-release-channel:
     name: Reserve complete release identity
@@ -847,7 +880,7 @@ jobs:
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Commit digest-pinned container version and channel aliases
         env:
-          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CONTAINER_VERSION: ${{ needs.prepare-release-promotion.outputs.container_tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
           CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
@@ -864,16 +897,16 @@ jobs:
           arm64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected one linux/arm64 manifest") end' <<<"$manifest")"
           python3 scripts/release/registryctl.py container-version \
             --source "${gar_image}@${amd64_digest}" \
-            --destination "${gar_image}:${RELEASE_TAG}-amd64"
+            --destination "${gar_image}:${CONTAINER_VERSION}-amd64"
           python3 scripts/release/registryctl.py container-version \
             --source "${gar_image}@${arm64_digest}" \
-            --destination "${gar_image}:${RELEASE_TAG}-arm64"
+            --destination "${gar_image}:${CONTAINER_VERSION}-arm64"
           python3 scripts/release/registryctl.py container-version \
             --source "$source" \
-            --destination "${gar_image}:${RELEASE_TAG}"
+            --destination "${gar_image}:${CONTAINER_VERSION}"
           python3 scripts/release/registryctl.py container-version \
             --source "$source" \
-            --destination "ghcr.io/antflydb/antfly:${RELEASE_TAG}"
+            --destination "ghcr.io/antflydb/antfly:${CONTAINER_VERSION}"
           python3 scripts/release/registryctl.py container-alias \
             --source "$source" \
             --destination "${gar_image}:${CONTAINER_ALIAS}"
@@ -998,23 +1031,23 @@ jobs:
           test "$observed" = "$CONTAINER_DIGEST"
       - name: Verify npm channel aliases before committing the journal
         env:
-          RELEASE_VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          NPM_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}
           NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
         run: |
           set -euo pipefail
           for package in @antfly/cli-darwin-arm64 @antfly/cli-linux-arm64 @antfly/cli-linux-x64 @antfly/cli; do
             observed="$(python3 scripts/release/registryctl.py npm-tag \
               --package "$package" --tag "$NPM_TAG")"
-            test "$observed" = "$RELEASE_VERSION"
+            test "$observed" = "$NPM_PACKAGE_VERSION"
           done
       - name: Verify public container aliases before committing the journal
         env:
-          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CONTAINER_VERSION: ${{ needs.prepare-release-promotion.outputs.container_tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
           CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
         run: |
           python3 scripts/release/registryctl.py container-verify \
-            --ref "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
+            --ref "ghcr.io/antflydb/antfly:${CONTAINER_VERSION}" \
             --digest "$CONTAINER_DIGEST"
           python3 scripts/release/registryctl.py container-verify \
             --ref "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}" \

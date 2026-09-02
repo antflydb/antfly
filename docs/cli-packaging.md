@@ -76,6 +76,11 @@ consumers.
    version tags are create-or-verify and cannot move to another digest; only
    channel tags are mutable. Every copy reads from a digest-pinned source and
    is verified afterward.
+   The channel resolver alone interprets release syntax and emits exact npm,
+   Python, and container registry versions. The promotion controller binds them
+   to the digest-verified ledger, and every downstream check and publisher
+   consumes those sealed projections, including legacy recovery, rather than
+   parsing the release tag again.
    npm `latest`, `next`, or `nightly`, plus the channel's container and R2
    aliases and policy-selected GitHub visibility, are committed through
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for

@@ -241,6 +241,27 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("preflight-release-channel:", release_workflow)
         self.assertIn("preflight-publication:", release_workflow)
         self.assertIn("prepare_npm_promotion.py", release_workflow)
+        self.assertIn(
+            "npm_version: ${{ steps.registry-identity.outputs.npm_version }}",
+            release_workflow,
+        )
+        self.assertIn(
+            "python_version: ${{ steps.registry-identity.outputs.python_version }}",
+            release_workflow,
+        )
+        self.assertIn(
+            "container_tag: ${{ steps.registry-identity.outputs.container_tag }}",
+            release_workflow,
+        )
+        self.assertIn(
+            "Bind authenticated registry versions to the sealed ledger",
+            release_workflow,
+        )
+        self.assertIn('--expected-version "$PYTHON_PACKAGE_VERSION"', release_workflow)
+        self.assertIn(
+            "VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}",
+            release_workflow,
+        )
         self.assertEqual(
             release_workflow.count("registryctl.py container-version-check"), 4
         )

@@ -127,6 +127,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True)
     parser.add_argument("--snapshot-dir", type=Path, required=True)
+    parser.add_argument("--expected-version")
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--verify-complete", action="store_true")
     parser.add_argument("--attempts", type=int, default=1)
@@ -149,6 +150,11 @@ def main() -> int:
             f"CLI snapshot contains multiple Python versions: {sorted(versions)}"
         )
     version = versions.pop()
+    if args.expected_version and version != args.expected_version:
+        raise SystemExit(
+            f"Python package version differs: expected={args.expected_version} "
+            f"actual={version}"
+        )
     expected_files = expected_release_files(wheels)
     if args.verify_complete:
         verify_complete_release(

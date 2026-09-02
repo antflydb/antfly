@@ -117,6 +117,13 @@ credentials.
    failed run must resume the same complete pending identity, and recovery
    cannot move a channel backward.
 
+The authenticated channel resolver is the only component that interprets
+release-version syntax. It projects the accepted release identity into exact
+npm, Python, and container registry versions. The controller requires those
+projections to match the digest-verified release ledger, then exports the sealed
+values. Preflight, publication, and final verification consume them verbatim;
+they do not independently reinterpret canonical or legacy version spellings.
+
 Channel bootstrap is fail-closed. The discovery controller treats only an
 explicit missing release, package, or dist-tag as empty state; authentication,
 rate-limit, malformed-response, and network failures stop promotion.
@@ -214,7 +221,8 @@ scripts under `scripts/release/`:
   missing objects, content drift, authentication and network failures, and
   post-copy verification.
 - `prepare_npm_promotion.py` read-only verifies every ledger-defined npm
-  package and required channel tag as part of the global publication gate.
+  package and required channel tag against the authenticated npm registry
+  version as part of the global publication gate.
 - `download_objectstorage.py` restores a nightly's exact ledger members from
   immutable object storage for recovery; the normal ledger and attestation
   verification still runs before promotion.

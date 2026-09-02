@@ -13,7 +13,6 @@ from pathlib import Path
 from build_cli_snapshot import NPM_PACKAGES
 from registry.model import RegistryError
 from registry.npm import dist_tag, version_integrity
-from release_channels import normalize_release_version
 
 IntegrityReader = Callable[[str, str], "str | None"]
 TagReader = Callable[[str, str], "str | None"]
@@ -64,6 +63,12 @@ def snapshot_packages(snapshot_dir: Path, version: str) -> dict[str, Path]:
         or not isinstance(document.get("artifacts"), list)
     ):
         raise SystemExit("CLI snapshot manifest has an invalid npm release identity")
+    registry_versions = document.get("registry_versions")
+    if (
+        not isinstance(registry_versions, dict)
+        or registry_versions.get("npm") != version
+    ):
+        raise SystemExit("CLI snapshot has a different npm registry version")
 
     packages: dict[str, Path] = {}
     for artifact in document["artifacts"]:
@@ -98,7 +103,9 @@ def main() -> int:
     parser.add_argument("--tag", required=True)
     args = parser.parse_args()
 
-    version = normalize_release_version(args.version)
+    version = args.version
+    if not version or version != version.strip():
+        parser.error("--version must be a non-empty exact registry version")
     if not args.tag:
         parser.error("--tag must not be empty")
     try:

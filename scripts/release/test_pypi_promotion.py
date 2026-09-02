@@ -40,6 +40,7 @@ class PyPIPromotionTests(unittest.TestCase):
         *,
         verify_complete: bool = False,
         attempts: int = 1,
+        expected_version: str | None = None,
     ) -> int:
         argv = [
             str(SCRIPT),
@@ -50,6 +51,8 @@ class PyPIPromotionTests(unittest.TestCase):
         ]
         if output is not None:
             argv.extend(("--out-dir", str(output)))
+        if expected_version is not None:
+            argv.extend(("--expected-version", expected_version))
         if verify_complete:
             argv.extend(
                 (
@@ -94,6 +97,16 @@ class PyPIPromotionTests(unittest.TestCase):
                 self.assertRaisesRegex(SystemExit, "different contents"),
             ):
                 self.run_promotion(module, snapshot, output)
+
+    def test_expected_python_registry_version_is_enforced(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            snapshot, output = root / "snapshot", root / "output"
+            snapshot.mkdir()
+            write_wheel(snapshot / "antfly_cli-1.2.3-py3-none-any.whl")
+            with self.assertRaisesRegex(SystemExit, "Python package version differs"):
+                self.run_promotion(module, snapshot, output, expected_version="1.2.4")
 
     def test_untracked_registry_file_fails(self) -> None:
         module = load_module()
