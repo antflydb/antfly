@@ -194,7 +194,11 @@ pub const AttachmentTransport = enum {
     base64_payload,
     data_uri,
 
-    pub fn residentSize(
+    /// Bytes contributed by one attachment to the provider's encoded-media
+    /// request ceiling. This is a wire/logical limit, not a process-memory
+    /// estimate: a buffered HTTP adapter may temporarily retain both the raw
+    /// source and its encoded request body.
+    pub fn wireSize(
         self: AttachmentTransport,
         raw_bytes: usize,
         mime_type_len: usize,
@@ -213,7 +217,146 @@ pub const AttachmentTransport = enum {
         return std.math.add(usize, prefix, encoded) catch
             error.InferenceEncodedBytesExceeded;
     }
+
+    /// Peak media bytes retained while a raw attachment is materialized for
+    /// this transport. HTTP adapters are required to build a single request
+    /// body directly; request-envelope overhead is separately charged to the
+    /// caller's allocator. Borrowed execution adds no transport copy.
+    pub fn peakResidentSize(
+        self: AttachmentTransport,
+        raw_bytes: usize,
+        mime_type_len: usize,
+    ) !usize {
+        if (self == .borrowed_binary) return raw_bytes;
+        const wire_bytes = try self.wireSize(raw_bytes, mime_type_len);
+        return std.math.add(usize, raw_bytes, wire_bytes) catch
+            error.InferenceEncodedBytesExceeded;
+    }
+
+    /// Conservative aggregate wire size for `item_count` separately encoded
+    /// attachments whose raw bytes sum to `raw_bytes`. Separate base64 padding
+    /// can add at most one four-byte quantum per item after the first; data URIs
+    /// additionally repeat their prefix for every item.
+    pub fn batchWireSizeUpperBound(
+        self: AttachmentTransport,
+        raw_bytes: usize,
+        mime_type_len: usize,
+        item_count: usize,
+    ) !usize {
+        if (item_count == 0) return 0;
+        if (self == .borrowed_binary) return raw_bytes;
+        const encoded = try AttachmentTransport.base64_payload.wireSize(raw_bytes, 0);
+        const padding_slack = std.math.mul(usize, item_count - 1, 4) catch
+            return error.InferenceEncodedBytesExceeded;
+        const encoded_upper = std.math.add(usize, encoded, padding_slack) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (self == .base64_payload) return encoded_upper;
+        const prefix = std.math.add(
+            usize,
+            "data:".len + ";base64,".len,
+            mime_type_len,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        const prefixes = std.math.mul(usize, item_count, prefix) catch
+            return error.InferenceEncodedBytesExceeded;
+        return std.math.add(usize, prefixes, encoded_upper) catch
+            error.InferenceEncodedBytesExceeded;
+    }
+
+    pub fn batchPeakResidentSize(
+        self: AttachmentTransport,
+        raw_bytes: usize,
+        mime_type_len: usize,
+        item_count: usize,
+    ) !usize {
+        if (self == .borrowed_binary) return raw_bytes;
+        const wire_bytes = try self.batchWireSizeUpperBound(raw_bytes, mime_type_len, item_count);
+        return std.math.add(usize, raw_bytes, wire_bytes) catch
+            error.InferenceEncodedBytesExceeded;
+    }
+
+    /// Largest raw attachment aggregate satisfying both the provider's wire
+    /// ceiling and the caller's resident-media ceiling. Monotonic binary search
+    /// keeps the inverse exact across base64 padding boundaries.
+    pub fn maxRawBytesForLimits(
+        self: AttachmentTransport,
+        mime_type_len: usize,
+        item_count: usize,
+        wire_limit: usize,
+        resident_limit: usize,
+    ) !usize {
+        var low: usize = 0;
+        var high: usize = @min(wire_limit, resident_limit);
+        while (low < high) {
+            const distance = high - low;
+            const candidate = low + distance / 2 + distance % 2;
+            const wire_bytes = self.batchWireSizeUpperBound(candidate, mime_type_len, item_count) catch {
+                high = candidate - 1;
+                continue;
+            };
+            const resident_bytes = self.batchPeakResidentSize(candidate, mime_type_len, item_count) catch {
+                high = candidate - 1;
+                continue;
+            };
+            if (wire_bytes <= wire_limit and resident_bytes <= resident_limit)
+                low = candidate
+            else
+                high = candidate - 1;
+        }
+        return low;
+    }
 };
+
+pub const InlineDataUri = struct {
+    mime_type: []const u8,
+    decoded_size: usize,
+};
+
+fn standardBase64Index(byte: u8) ?u8 {
+    return switch (byte) {
+        'A'...'Z' => byte - 'A',
+        'a'...'z' => byte - 'a' + 26,
+        '0'...'9' => byte - '0' + 52,
+        '+' => 62,
+        '/' => 63,
+        else => null,
+    };
+}
+
+/// Validate a complete padded standard-base64 value, including canonical
+/// trailing bits, without allocating its decoded representation.
+pub fn validateCanonicalStandardBase64(data: []const u8) !usize {
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(data) catch
+        return error.InvalidDataURI;
+    var padding: usize = 0;
+    while (padding < data.len and data[data.len - 1 - padding] == '=') : (padding += 1) {}
+    if (padding > 2) return error.InvalidDataURI;
+    const content_end = data.len - padding;
+    for (data[0..content_end]) |byte| _ = standardBase64Index(byte) orelse return error.InvalidDataURI;
+    for (data[content_end..]) |byte| if (byte != '=') return error.InvalidDataURI;
+    if (padding == 1) {
+        if (content_end < 3 or (standardBase64Index(data[content_end - 1]).? & 0x03) != 0)
+            return error.InvalidDataURI;
+    } else if (padding == 2) {
+        if (content_end < 2 or (standardBase64Index(data[content_end - 1]).? & 0x0f) != 0)
+            return error.InvalidDataURI;
+    }
+    return decoded_size;
+}
+
+/// Parse an inline base64 data URI. Non-data URLs return null and remain owned
+/// by the remote provider's download admission path.
+pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
+    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
+    const metadata = uri["data:".len..comma];
+    if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
+    const mime_type = metadata[0 .. metadata.len - ";base64".len];
+    if (mime_type.len == 0) return error.InvalidDataURI;
+    return .{
+        .mime_type = mime_type,
+        .decoded_size = try validateCanonicalStandardBase64(uri[comma + 1 ..]),
+    };
+}
 
 pub const InferenceCapabilities = struct {
     task: Task,
@@ -446,23 +589,36 @@ test "inference capabilities distinguish native and compatibility batches" {
     try std.testing.expect(!compatibility.batch.executesNatively(8));
 }
 
-test "attachment transport charges the concrete resident representation" {
+test "attachment transport separates wire and peak resident representations" {
     try std.testing.expectEqual(
         @as(usize, 3),
-        try AttachmentTransport.borrowed_binary.residentSize(3, "image/png".len),
+        try AttachmentTransport.borrowed_binary.wireSize(3, "image/png".len),
     );
     try std.testing.expectEqual(
         @as(usize, 4),
-        try AttachmentTransport.base64_payload.residentSize(3, "image/png".len),
+        try AttachmentTransport.base64_payload.wireSize(3, "image/png".len),
     );
     try std.testing.expectEqual(
         "data:image/png;base64,AQID".len,
-        try AttachmentTransport.data_uri.residentSize(3, "image/png".len),
+        try AttachmentTransport.data_uri.wireSize(3, "image/png".len),
     );
+    try std.testing.expectEqual(@as(usize, 7), try AttachmentTransport.base64_payload.peakResidentSize(3, 0));
+    try std.testing.expectEqual(@as(usize, 3), try AttachmentTransport.base64_payload.maxRawBytesForLimits(0, 1, 4, 7));
+    try std.testing.expectEqual(@as(usize, 0), try AttachmentTransport.base64_payload.maxRawBytesForLimits(0, 1, 3, 7));
+    try std.testing.expectEqual(@as(usize, 12), try AttachmentTransport.base64_payload.batchWireSizeUpperBound(6, 0, 2));
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
-        AttachmentTransport.base64_payload.residentSize(std.math.maxInt(usize), 0),
+        AttachmentTransport.base64_payload.wireSize(std.math.maxInt(usize), 0),
     );
+}
+
+test "inline data URI parser validates canonical metadata" {
+    const parsed = (try parseInlineDataUri("data:image/png;base64,AQID")).?;
+    try std.testing.expectEqualStrings("image/png", parsed.mime_type);
+    try std.testing.expectEqual(@as(usize, 3), parsed.decoded_size);
+    try std.testing.expect((try parseInlineDataUri("https://example.invalid/image.png")) == null);
+    try std.testing.expectError(error.InvalidDataURI, parseInlineDataUri("data:;base64,AQID"));
+    try std.testing.expectError(error.InvalidDataURI, parseInlineDataUri("data:image/png;base64,YR=="));
 }
 
 test "inference capabilities keep every model family output typed" {

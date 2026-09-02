@@ -360,6 +360,18 @@ test "raw HTTP response parsing" {
     try std.testing.expectEqualStrings("{\"msg\":\"hi\"}", client_body orelse "NO BODY");
 }
 
+const TestClientOutcome = struct {
+    completed_successfully: std.atomic.Value(bool) = .init(false),
+
+    fn complete(self: *@This()) void {
+        self.completed_successfully.store(true, .release);
+    }
+
+    fn expectSuccess(self: *@This()) !void {
+        try std.testing.expect(self.completed_successfully.load(.acquire));
+    }
+};
+
 test "TestServer round trip GET" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -370,9 +382,10 @@ test "TestServer round trip GET" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -384,10 +397,11 @@ test "TestServer round trip GET" {
 
             std.testing.expect(resp.ok()) catch return;
             std.testing.expectEqualStrings("{\"msg\":\"hi\"}", resp.body orelse "") catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         // No fiber support — skip test.
         return;
     };
@@ -396,7 +410,8 @@ test "TestServer round trip GET" {
     try ts.handleOne();
 
     // Wait for client fiber.
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }
 
 test "TestServer matches path separately from query" {
@@ -421,8 +436,9 @@ test "TestServer matches path separately from query" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
             const url_value = std.fmt.allocPrint(
@@ -434,11 +450,13 @@ test "TestServer matches path separately from query" {
             var response = c.get(url_value, .{}) catch return;
             defer response.deinit();
             std.testing.expect(response.ok()) catch return;
+            result.complete();
         }
     };
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch return;
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch return;
     try ts.handleOne();
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }
 
 test "TestServer round trip POST" {
@@ -451,9 +469,10 @@ test "TestServer round trip POST" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -466,15 +485,17 @@ test "TestServer round trip POST" {
             std.testing.expect(resp.ok()) catch return;
             const body = resp.body orelse "";
             std.testing.expect(mem.indexOf(u8, body, "vectors") != null) catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         return;
     };
 
     try ts.handleOne();
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }
 
 test "TestServer 404 for unmatched route" {
@@ -487,9 +508,10 @@ test "TestServer 404 for unmatched route" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -501,13 +523,15 @@ test "TestServer 404 for unmatched route" {
 
             std.testing.expect(!resp.ok()) catch return;
             std.testing.expectEqual(@as(u16, 404), resp.status.code) catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         return;
     };
 
     try ts.handleOne();
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }

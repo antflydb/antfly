@@ -35,6 +35,114 @@ const EmbedWireRequest = struct {
     encoding_format: []const u8 = "float",
 };
 
+fn jsonStringEncodedSize(value: []const u8) !usize {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+    var size: usize = 2;
+    for (value) |byte| {
+        const encoded: usize = switch (byte) {
+            '\\', '"', 0x08, 0x0c, '\n', '\r', '\t' => 2,
+            0x00...0x07, 0x0b, 0x0e...0x1f => 6,
+            else => 1,
+        };
+        size = std.math.add(usize, size, encoded) catch return error.OutOfMemory;
+    }
+    return size;
+}
+
+fn addRequestSize(total: *usize, amount: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.OutOfMemory;
+}
+
+fn embedPartsRequestSize(model: []const u8, parts: []const template_mod.ContentPart) !usize {
+    var total: usize = "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len;
+    try addRequestSize(&total, try jsonStringEncodedSize(model));
+    for (parts, 0..) |part, index| {
+        if (index > 0) try addRequestSize(&total, 1);
+        switch (part) {
+            .text => |text| {
+                try addRequestSize(&total, "{\"type\":\"text\",\"text\":".len + "}".len);
+                try addRequestSize(&total, try jsonStringEncodedSize(text));
+            },
+            .media_url => |url| {
+                try addRequestSize(&total, "{\"type\":\"image_url\",\"image_url\":{\"url\":".len + "}}".len);
+                try addRequestSize(&total, try jsonStringEncodedSize(url));
+            },
+            .binary => |binary_part| {
+                try addRequestSize(&total, "{\"type\":\"media\",\"data\":\"".len + "\",\"mime_type\":".len + "}".len);
+                try addRequestSize(&total, std.base64.standard.Encoder.calcSize(binary_part.data.len));
+                try addRequestSize(&total, try jsonStringEncodedSize(binary_part.mime_type));
+            },
+        }
+    }
+    return total;
+}
+
+/// Build the remote multimodal embedding request in one allocation. Binary
+/// media is base64-encoded directly into the final JSON body, so raw page bytes
+/// never coexist with both an intermediate encoded buffer and a second JSON
+/// copy.
+fn embedPartsRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(
+        alloc,
+        try embedPartsRequestSize(model, parts),
+    );
+    defer output.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &output.writer };
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(model);
+    try stringify.objectField("input");
+    try stringify.beginArray();
+    for (parts) |part| {
+        try stringify.beginObject();
+        switch (part) {
+            .text => |text| {
+                try stringify.objectField("type");
+                try stringify.write("text");
+                try stringify.objectField("text");
+                try stringify.write(text);
+            },
+            .media_url => |url| {
+                try stringify.objectField("type");
+                try stringify.write("image_url");
+                try stringify.objectField("image_url");
+                try stringify.beginObject();
+                try stringify.objectField("url");
+                try stringify.write(url);
+                try stringify.endObject();
+            },
+            .binary => |binary_part| {
+                try stringify.objectField("type");
+                try stringify.write("media");
+                try stringify.objectField("data");
+                try stringify.beginWriteRaw();
+                try stringify.writer.writeByte('"');
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
+                const encoded = try stringify.writer.writableSlice(encoded_len);
+                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                try stringify.writer.writeByte('"');
+                stringify.endWriteRaw();
+                try stringify.objectField("mime_type");
+                try stringify.write(binary_part.mime_type);
+            },
+        }
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+    try stringify.objectField("encoding_format");
+    try stringify.write("float");
+    try stringify.endObject();
+    if (output.writer.end != output.writer.buffer.len) return error.InvalidEmbedRequestSize;
+    const body = output.writer.buffer;
+    output.writer.buffer = &.{};
+    output.writer.end = 0;
+    return body;
+}
+
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
@@ -213,56 +321,9 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        var values = std.json.Array.init(alloc);
-        defer values.deinit();
-        var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (encoded_buffers.items) |buf| alloc.free(buf);
-            encoded_buffers.deinit(alloc);
-        }
-
-        for (parts) |part| {
-            switch (part) {
-                .text => |text| {
-                    var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "text" });
-                    try obj.put(alloc, "text", .{ .string = text });
-                    try values.append(.{ .object = obj });
-                },
-                .media_url => |url| {
-                    var image_url = std.json.ObjectMap.empty;
-                    errdefer image_url.deinit(alloc);
-                    try image_url.put(alloc, "url", .{ .string = url });
-
-                    var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "image_url" });
-                    try obj.put(alloc, "image_url", .{ .object = image_url });
-                    try values.append(.{ .object = obj });
-                },
-                .binary => |binary_part| {
-                    const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                    const encoded = try alloc.alloc(u8, encoded_len);
-                    errdefer alloc.free(encoded);
-                    _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                    try encoded_buffers.append(alloc, encoded);
-
-                    var obj = std.json.ObjectMap.empty;
-                    errdefer {
-                        obj.deinit(alloc);
-                        _ = encoded_buffers.pop();
-                        alloc.free(encoded);
-                    }
-                    try obj.put(alloc, "type", .{ .string = "media" });
-                    try obj.put(alloc, "data", .{ .string = encoded });
-                    try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
-                    try values.append(.{ .object = obj });
-                },
-            }
-        }
-
-        return try self.embedJsonInput(alloc, model, .{ .array = values });
+        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts);
+        defer alloc.free(json_body);
+        return try self.embedJsonBody(alloc, json_body);
     }
 
     fn embedImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, inputs: []const []const u8) anyerror!inference.EmbedResult {
@@ -274,13 +335,17 @@ pub const Provider = struct {
     }
 
     fn embedJsonInput(self: *Provider, alloc: std.mem.Allocator, model: []const u8, input: std.json.Value) !inference.EmbedResult {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, EmbedWireRequest{
+        const json_body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
             .model = model,
             .input = input,
         });
-        defer self.allocator.free(json_body);
+        defer alloc.free(json_body);
+        return try self.embedJsonBody(alloc, json_body);
+    }
+
+    fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8) !inference.EmbedResult {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
+        defer self.allocator.free(url);
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.authHeaders(),
@@ -496,7 +561,21 @@ test "antfly embed request omits nullable generated fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
 
-test "antfly embed parts preserves binary base64 until request serialization" {
+test "antfly embed parts request sizing is exact for escaped strings" {
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "line\nquoted \"text\"" },
+        .{ .media_url = "https://example.invalid/a\\b.png" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+    };
+    const body = try embedPartsRequestJsonAlloc(std.testing.allocator, "clip\"clap", &parts);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqual(try embedPartsRequestSize("clip\"clap", &parts), body.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "antfly embed parts streams binary base64 into one request body" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

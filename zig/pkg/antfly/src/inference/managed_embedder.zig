@@ -869,6 +869,8 @@ pub const ManagedEmbedder = struct {
             .dense_embed_part_items_fn = embedDensePartItems,
             .media_part_limit_fn = denseMediaPartLimit,
             .capabilities_fn = denseCapabilities,
+            .attachment_transport_fn = denseAttachmentTransport,
+            .attachment_envelope_fn = denseAttachmentEnvelopeBytes,
             .deinit_fn = deinitDenseEmbedder,
             .foreground_bounded = self.denseForegroundBounded(),
         };
@@ -1181,6 +1183,47 @@ pub const ManagedEmbedder = struct {
         // independently addressable input. The limit is a model/task semantic,
         // not a blanket property of the Antfly provider.
         return if (entry.multimodal and isAntflyProvider(entry.provider)) 1 else null;
+    }
+
+    fn denseAttachmentTransport(ptr: *anyopaque, embedding_name: []const u8) inference_work.AttachmentTransport {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findEntry(embedding_name) orelse return .borrowed_binary;
+        return if (entry.antfly_provider != null) .borrowed_binary else .base64_payload;
+    }
+
+    fn jsonStringUpperBound(value: []const u8) !usize {
+        const escaped = std.math.mul(usize, value.len, 6) catch return error.InferenceEncodedBytesExceeded;
+        return std.math.add(usize, escaped, 2) catch return error.InferenceEncodedBytesExceeded;
+    }
+
+    fn denseAttachmentEnvelopeBytes(
+        ptr: *anyopaque,
+        embedding_name: []const u8,
+        item_count: usize,
+        mime_type: []const u8,
+    ) !usize {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.antfly_provider != null) return 0;
+
+        const outer = std.math.add(
+            usize,
+            "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len,
+            try jsonStringUpperBound(entry.model),
+        ) catch return error.InferenceEncodedBytesExceeded;
+        const per_item = std.math.add(
+            usize,
+            "{\"type\":\"media\",\"data\":\"".len + "\",\"mime_type\":".len + "}".len,
+            try jsonStringUpperBound(mime_type),
+        ) catch return error.InferenceEncodedBytesExceeded;
+        const items = std.math.mul(usize, item_count, per_item) catch
+            return error.InferenceEncodedBytesExceeded;
+        const commas = if (item_count == 0) 0 else item_count - 1;
+        return std.math.add(
+            usize,
+            outer,
+            std.math.add(usize, items, commas) catch return error.InferenceEncodedBytesExceeded,
+        ) catch return error.InferenceEncodedBytesExceeded;
     }
 
     fn denseCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
@@ -4114,6 +4157,18 @@ fn mergeModalities(target: *inference_work.Modalities, value: inference_work.Mod
     target.* = @bitCast(target_bits | value_bits);
 }
 
+fn denseMediaUrlWireBytes(
+    capabilities: inference_work.InferenceCapabilities,
+    url: []const u8,
+) !usize {
+    const parsed_uri = (try inference_work.parseInlineDataUri(url)) orelse return 0;
+    if (parsed_uri.decoded_size == 0) return error.InvalidDataURI;
+    if (!std.ascii.startsWithIgnoreCase(parsed_uri.mime_type, "image/"))
+        return error.UnsupportedInferenceMimeType;
+    try capabilities.validateMimeType(parsed_uri.mime_type);
+    return url.len;
+}
+
 fn validateDensePartItemInvocation(
     capabilities: inference_work.InferenceCapabilities,
     attachment_transport: inference_work.AttachmentTransport,
@@ -4125,17 +4180,20 @@ fn validateDensePartItemInvocation(
             mergeModalities(&shape.modalities, .{ .text = true });
             try capabilities.validateMimeType("text/plain");
         },
-        .media_url => {
+        .media_url => |url| {
             // The embedding transport currently defines media_url as an image
-            // URL. Its concrete MIME and byte/pixel shape are revalidated after
-            // download by the provider-owned request admission path.
+            // URL. Inline data URIs are fully known and therefore admitted here;
+            // network URL MIME and bytes remain provider-owned until download.
             mergeModalities(&shape.modalities, .{ .image = true });
+            const wire_bytes = try denseMediaUrlWireBytes(capabilities, url);
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, wire_bytes) catch
+                return error.InferenceEncodedBytesExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
         .binary => |media| {
             mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
             try capabilities.validateMimeType(media.mime_type);
-            const resident = try attachment_transport.residentSize(media.data.len, media.mime_type.len);
+            const resident = try attachment_transport.wireSize(media.data.len, media.mime_type.len);
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
                 return error.InferenceEncodedBytesExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
@@ -4157,8 +4215,8 @@ fn densePartBatchEnd(
     while (end < items.len and end - start < max_items) : (end += 1) {
         const item_bytes: usize = switch (items[end]) {
             .text => 0,
-            .binary => |value| try attachment_transport.residentSize(value.data.len, value.mime_type.len),
-            .media_url => 0,
+            .binary => |value| try attachment_transport.wireSize(value.data.len, value.mime_type.len),
+            .media_url => |url| try denseMediaUrlWireBytes(capabilities, url),
         };
         const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
             return error.InferenceEncodedBytesExceeded;
@@ -4205,6 +4263,43 @@ test "managed embedder admission follows the selected attachment transport" {
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
         validateDensePartItemInvocation(capabilities, .base64_payload, &items),
+    );
+}
+
+test "managed embedder partitions and validates inline image data URIs" {
+    const first = "data:image/png;base64,AQID";
+    const second = "data:image/png;base64,BAUG";
+    const items = [_]template_mod.ContentPart{
+        .{ .media_url = first },
+        .{ .media_url = second },
+    };
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 2,
+            .max_items = 2,
+            .max_encoded_media_bytes = first.len + 1,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .embedding,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(capabilities, .base64_payload, &items, 0));
+    try validateDensePartItemInvocation(capabilities, .base64_payload, items[0..1]);
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        validateDensePartItemInvocation(capabilities, .base64_payload, &items),
+    );
+    try std.testing.expectError(
+        error.InvalidDataURI,
+        denseMediaUrlWireBytes(capabilities, "data:image/png;base64,"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        denseMediaUrlWireBytes(capabilities, "data:audio/wav;base64,AQID"),
     );
 }
 
@@ -6460,7 +6555,7 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     , provider);
     defer managed.deinit();
 
-    const media_parts = [_]template_mod.ContentPart{.{ .media_url = "data:image/png;base64,aaa" }};
+    const media_parts = [_]template_mod.ContentPart{.{ .media_url = "data:image/png;base64,YWFh" }};
     const sparse_entry = managed.findEntry("sparse_idx").?;
     const multimodal_entry = managed.findEntry("multimodal_idx").?;
 
@@ -6700,7 +6795,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             try std.testing.expectEqualStrings("local-model", model);
             try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
             try std.testing.expectEqualStrings("caption", parts_slice[0].text);
-            try std.testing.expectEqualStrings("data:image/png;base64,aaa", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", parts_slice[1].media_url);
             try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
             self.saw_parts = true;
 
@@ -6742,7 +6837,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
 
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
-        .{ .media_url = "data:image/png;base64,aaa" },
+        .{ .media_url = "data:image/png;base64,YWFh" },
         .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
     };
     const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);

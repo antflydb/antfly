@@ -1257,7 +1257,8 @@ pub const Runtime = struct {
             const mime_type = metadata[0 .. metadata.len - ";base64".len];
             if (mime_type.len == 0) return error.InvalidDataURI;
             try capabilities.validateMimeType(mime_type);
-            _ = try validateStandardBase64(url[comma + 1 ..]);
+            const decoded_size = try validateStandardBase64(url[comma + 1 ..]);
+            if (decoded_size == 0) return error.InvalidDataURI;
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
                 return error.InferenceEncodedBytesExceeded;
         }
@@ -1280,7 +1281,7 @@ pub const Runtime = struct {
                 .data_uri;
             for (request.images) |image| {
                 try resolved.validateMimeType(image.mime_type);
-                const resident = try transport.residentSize(image.bytes.len, image.mime_type.len);
+                const resident = try transport.wireSize(image.bytes.len, image.mime_type.len);
                 encoded_bytes = std.math.add(usize, encoded_bytes, resident) catch
                     return error.InferenceEncodedBytesExceeded;
             }
@@ -1633,7 +1634,7 @@ fn encodedReaderBatchEnd(
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
-        const resident = transport.residentSize(
+        const resident = transport.wireSize(
             images[end].bytes.len,
             images[end].mime_type.len,
         ) catch break;
@@ -1681,49 +1682,24 @@ fn dataUriDecodedSize(uri: []const u8) !?usize {
     return validateStandardBase64(uri[comma + 1 ..]) catch error.InvalidDataURI;
 }
 
-fn standardBase64Index(byte: u8) ?u8 {
-    return switch (byte) {
-        'A'...'Z' => byte - 'A',
-        'a'...'z' => byte - 'a' + 26,
-        '0'...'9' => byte - '0' + 52,
-        '+' => 62,
-        '/' => 63,
-        else => null,
-    };
-}
-
 /// Validate the complete padded standard-base64 representation without
 /// allocating its decoded payload. Return the exact decoded size.
 fn validateStandardBase64(data: []const u8) !usize {
-    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(data) catch
-        return error.InvalidDataURI;
-    var padding: usize = 0;
-    while (padding < data.len and data[data.len - 1 - padding] == '=') : (padding += 1) {}
-    if (padding > 2) return error.InvalidDataURI;
-    const content_end = data.len - padding;
-    for (data[0..content_end]) |byte| _ = standardBase64Index(byte) orelse return error.InvalidDataURI;
-    for (data[content_end..]) |byte| if (byte != '=') return error.InvalidDataURI;
-    if (padding == 1) {
-        if (content_end < 3 or (standardBase64Index(data[content_end - 1]).? & 0x03) != 0)
-            return error.InvalidDataURI;
-    } else if (padding == 2) {
-        if (content_end < 2 or (standardBase64Index(data[content_end - 1]).? & 0x0f) != 0)
-            return error.InvalidDataURI;
-    }
-    return decoded_size;
+    return inference_work.validateCanonicalStandardBase64(data);
 }
 
 // Admission is defined in terms of the representation resident at the task
 // boundary. Inline strings coexist with their decoded buffers, so charge the
 // encoded source length after validating it rather than only its decoded size.
 fn dataUriResidentSize(uri: []const u8) !?usize {
-    if ((try dataUriDecodedSize(uri)) == null) return null;
+    const decoded_size = (try dataUriDecodedSize(uri)) orelse return null;
+    if (decoded_size == 0) return error.InvalidDataURI;
     return uri.len;
 }
 
 fn inlineBase64ResidentSize(data: []const u8) !usize {
     if (try dataUriResidentSize(data)) |bytes| return bytes;
-    _ = try validateStandardBase64(data);
+    if (try validateStandardBase64(data) == 0) return error.InvalidDataURI;
     return data.len;
 }
 
@@ -1779,7 +1755,7 @@ fn generatorRequestShape(
         try capabilities.validateMimeType(media.mime_type);
         mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
         shape.media_parts += 1;
-        const resident = try attachment_transport.residentSize(media.bytes.len, media.mime_type.len);
+        const resident = try attachment_transport.wireSize(media.bytes.len, media.mime_type.len);
         shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
             return error.InferenceEncodedBytesExceeded;
     }
@@ -1932,7 +1908,7 @@ fn extractorRequestShape(
         request,
         &shape,
         media.mime_type,
-        try attachment_transport.residentSize(media.bytes.len, media.mime_type.len),
+        try attachment_transport.wireSize(media.bytes.len, media.mime_type.len),
         true,
     );
 
@@ -2120,6 +2096,8 @@ test "asset producer runtime validates the complete base64 representation" {
     try std.testing.expectError(error.InvalidDataURI, validateStandardBase64("YQ=A"));
     try std.testing.expectError(error.InvalidDataURI, validateStandardBase64("YR=="));
     try std.testing.expectError(error.InvalidDataURI, dataUriResidentSize("data:image/png;base64,!!!!"));
+    try std.testing.expectError(error.InvalidDataURI, dataUriResidentSize("data:image/png;base64,"));
+    try std.testing.expectError(error.InvalidDataURI, inlineBase64ResidentSize(""));
 }
 
 test "asset producer runtime reader URI admission measures data payloads before execution" {
@@ -2143,6 +2121,13 @@ test "asset producer runtime reader URI admission measures data payloads before 
         .encoded_media_bytes = shape.encoded_media_bytes,
         .max_media_parts_per_item = 1,
     }));
+    try std.testing.expectError(
+        error.InvalidDataURI,
+        Runtime.readerUriInvocationShape(capabilities, .{
+            .images = &.{"data:image/png;base64,"},
+            .inline_content_trust = .trusted_internal,
+        }),
+    );
 }
 
 fn generatorBatchEnd(
@@ -2310,7 +2295,7 @@ test "encoded reader chunks obey model item and byte limits" {
         .max_items = 2,
         .max_encoded_media_bytes = 6,
     }, .borrowed_binary));
-    const data_uri_bytes = try inference_work.AttachmentTransport.data_uri.residentSize(
+    const data_uri_bytes = try inference_work.AttachmentTransport.data_uri.wireSize(
         bytes.len,
         "image/png".len,
     );

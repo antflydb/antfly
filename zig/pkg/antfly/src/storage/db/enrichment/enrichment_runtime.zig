@@ -6256,6 +6256,26 @@ fn splitPdfRenderMemoryBudget(available_bytes: usize, requested_retained_bytes: 
     };
 }
 
+fn splitPdfEmbeddingRenderMemoryBudget(
+    available_bytes: usize,
+    wire_limit: usize,
+    request_envelope_bytes: usize,
+    transport: inference_work.AttachmentTransport,
+    mime_type_len: usize,
+    item_count: usize,
+) !PdfRenderMemoryBudget {
+    if (request_envelope_bytes >= available_bytes) return error.DocumentExtractionWorkingSetTooLarge;
+    const resident_media_limit = available_bytes - request_envelope_bytes;
+    const retained_limit = try transport.maxRawBytesForLimits(
+        mime_type_len,
+        item_count,
+        wire_limit,
+        resident_media_limit,
+    );
+    if (retained_limit == 0) return error.DocumentExtractionWorkingSetTooLarge;
+    return splitPdfRenderMemoryBudget(available_bytes, retained_limit);
+}
+
 test "PDF render memory budget jointly bounds scratch and retained output" {
     const small_output = try splitPdfRenderMemoryBudget(100, 20);
     try std.testing.expectEqual(@as(usize, 80), small_output.scratch_bytes);
@@ -6266,6 +6286,30 @@ test "PDF render memory budget jointly bounds scratch and retained output" {
     try std.testing.expectEqual(@as(usize, 50), output_dominates.scratch_bytes);
     try std.testing.expectEqual(@as(usize, 50), output_dominates.retained_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, splitPdfRenderMemoryBudget(1, 1));
+}
+
+test "PDF embedding render budget reserves remote transport materialization" {
+    const envelope = 10;
+    const budget = try splitPdfEmbeddingRenderMemoryBudget(
+        110,
+        100,
+        envelope,
+        .base64_payload,
+        "image/png".len,
+        2,
+    );
+    const wire_bytes = try inference_work.AttachmentTransport.base64_payload.batchWireSizeUpperBound(
+        budget.retained_bytes,
+        "image/png".len,
+        2,
+    );
+    try std.testing.expect(budget.scratch_bytes + budget.retained_bytes <= 110);
+    try std.testing.expect(budget.retained_bytes + wire_bytes + envelope <= 110);
+    try std.testing.expect(wire_bytes <= 100);
+    try std.testing.expectError(
+        error.DocumentExtractionWorkingSetTooLarge,
+        splitPdfEmbeddingRenderMemoryBudget(10, 10, 10, .base64_payload, "image/png".len, 1),
+    );
 }
 
 fn renderRuntimePdfWindow(
@@ -10853,6 +10897,7 @@ fn processPdfPageImageEmbedding(
     const capability_bytes = capabilities.batch.max_encoded_media_bytes orelse generated_ocr_default_render_inflight_bytes;
     const batch_bytes = @min(policy.batch_bytes orelse capability_bytes, capability_bytes);
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
+    const attachment_transport = dense_embedder.attachmentTransport(embedding_name);
 
     try heartbeatEnrichmentLease(runtime);
     const fence_epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
@@ -10901,7 +10946,19 @@ fn processPdfPageImageEmbedding(
         const requests = try runtime.alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
         defer runtime.alloc.free(requests);
         const available_bytes = @min(try coordinator.availableRenderBytes(), render_config.pdf_render_max_inflight_bytes);
-        const memory_budget = try splitPdfRenderMemoryBudget(available_bytes, batch_bytes);
+        const request_envelope_bytes = try dense_embedder.attachmentEnvelopeBytes(
+            embedding_name,
+            count,
+            "image/png",
+        );
+        const memory_budget = try splitPdfEmbeddingRenderMemoryBudget(
+            available_bytes,
+            batch_bytes,
+            request_envelope_bytes,
+            attachment_transport,
+            "image/png".len,
+            count,
+        );
         const per_page_bytes = @max(@as(usize, 1), memory_budget.retained_bytes / count);
         for (requests, 0..) |*page_request, i| page_request.* = .{
             .page_number = first_page + i,

@@ -686,10 +686,12 @@ document. They are architectural requirements, not Florence-specific cleanup:
     matching the linked resolver and its concrete invocation ceiling.
 64. **Admission inferred transport representation from model capabilities.**
     A model can be reached through both linked and HTTP executors, so
-    `borrowed_attachments` cannot determine resident-byte accounting. A common
+    `borrowed_attachments` cannot determine transport accounting. A common
     `AttachmentTransport` now represents borrowed binary, base64 payload, or
-    data URI. Reader, generator, embedder, and extractor windowing and final
-    admission receive the transport selected by the concrete route. Remote
+    data URI. It exposes provider wire size separately from peak resident media
+    size; batch upper bounds include per-item base64 padding and repeated data
+    URI prefixes. Reader, generator, embedder, and extractor windowing and
+    final admission receive the transport selected by the concrete route. Remote
     capabilities are normalized to non-borrowed, and the distributed proxy
     never republishes an upstream linked-memory claim.
 65. **Scoped model discovery broke the HTTP test boundary.** The reusable test
@@ -710,6 +712,34 @@ document. They are architectural requirements, not Florence-specific cleanup:
     caller-visible ID in each typed output. Cross-document batching therefore
     preserves the full work identity without rejecting legitimate repeated
     item labels or leaking transport identifiers.
+68. **Inline embedding data URIs bypassed executor admission.** Multimodal
+    embedding previously treated every `media_url` as provider-owned and zero
+    bytes, even when the URL was an inline data URI whose MIME, canonical
+    base64, decoded nonempty size, and complete encoded length were already
+    known. Inline image URIs now use the shared strict parser, participate in
+    MIME and byte validation, and split at the resolved provider ceiling.
+    Genuine network URLs remain unknown until inference-node download
+    admission.
+69. **The PDF image-embedding render budget confused wire bytes with peak
+    memory.** The planner used `max_encoded_media_bytes` directly as a raw PNG
+    retention allowance and retained the complete page window while the remote
+    adapter created base64 and JSON buffers. Dense embedders now expose the
+    concrete attachment transport and a worst-case request-envelope size. The
+    planner inverses the wire and resident ceilings, including per-item padding,
+    before rendering. Remote multimodal embedding encodes base64 directly into
+    one final request allocation owned by the operation allocator, so raw pages
+    coexist with one admitted body rather than an intermediate encoding and a
+    second JSON copy.
+70. **The scoped TestServer regression could pass on a 404.** Client fibers
+    swallowed failed response assertions and the owner swallowed their group
+    result, so an unmatched route never ran the server assertion yet still
+    passed. Reusable client outcomes now require an explicit successful
+    completion, and group failures propagate before the test returns.
+71. **Inline empty media differed from borrowed media.** Borrowed reader images
+    rejected empty bytes, while `data:image/png;base64,` and empty inline base64
+    crossed the remote boundary and failed later. The shared canonical parser
+    still permits callers to validate generic empty base64, but every media
+    boundary now requires a nonzero decoded size before batching or transport.
 
 ### Post-review implementation contract
 
@@ -729,7 +759,10 @@ The hardening above follows four long-term rules:
 - Admission receives the executor-selected attachment representation rather
   than inferring it from model capabilities. Linked callbacks charge borrowed
   bytes, remote generator/embedder/extractor payloads charge exact base64
-  expansion, and remote reader adapters charge the complete data URI.
+  expansion, and remote reader adapters charge the complete data URI. Provider
+  wire ceilings and process resident ceilings are distinct: render planning
+  reserves retained raw media, one concrete transport body, and its bounded
+  request envelope against the same operation-owned allocator.
 - Every logical result carries the request identity. Remote indexed responses
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.
