@@ -55,7 +55,7 @@ def main() -> int:
         )
 
     ledger = json.loads(args.ledger.read_text(encoding="utf-8"))
-    if ledger.get("schema_version") not in {1, 2}:
+    if ledger.get("schema_version") not in {1, 2, 3}:
         raise SystemExit("unsupported release ledger schema")
     if ledger.get("tag") != args.tag or ledger.get("commit") != args.commit:
         raise SystemExit("release ledger does not match the requested tag and commit")
@@ -75,7 +75,7 @@ def main() -> int:
             or name in entries
         ):
             raise SystemExit("release ledger contains an invalid or duplicate artifact")
-        if ledger.get("schema_version") == 2 and entry.get("scope") not in {
+        if ledger.get("schema_version") in {2, 3} and entry.get("scope") not in {
             "runtime",
             "cli",
             "support",

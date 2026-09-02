@@ -30,6 +30,30 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_source_commit_must_declare_a_supported_build_contract(self) -> None:
+        contract = load_module(
+            "validate_source_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 1,
+            "required_source_paths": sorted(contract.REQUIRED_PATHS),
+        }
+
+        def read_object(_root: Path, _commit: str, path: str) -> bytes:
+            if path == contract.CONTRACT_PATH:
+                return json.dumps(document).encode()
+            return b"present"
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 1)
+
+        document["schema_version"] = 999
+        with (
+            mock.patch.object(contract, "git_object", side_effect=read_object),
+            self.assertRaisesRegex(SystemExit, "unsupported release build contract"),
+        ):
+            contract.validate(RELEASE_DIR, COMMIT)
+
     def test_release_source_snapshot_is_extracted_from_the_exact_commit(self) -> None:
         stage = load_module("stage_release_source_test", "stage_release_source.py")
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -95,6 +119,16 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(SystemExit, "requires the nightly channel"):
             channels.resolve_channel("v0.0.0-dev.123", "auto", policy)
+        for legacy in ("v1.2.3-rc2", "v1.2.3-pre.2", "v1.2.3-preview2"):
+            with (
+                self.subTest(legacy=legacy),
+                self.assertRaisesRegex(SystemExit, "canonical tag syntax"),
+            ):
+                channels.resolve_channel(legacy, "next", policy)
+            self.assertEqual(
+                channels.resolve_channel(legacy, "next", policy, allow_legacy=True)[0],
+                "next",
+            )
         for unsupported in (
             "v1.2",
             "v1.2.3+build.1",
@@ -133,6 +167,20 @@ class ReleasePromotionTests(unittest.TestCase):
                 ),
             ),
             "v1.3.0-rc.2",
+        )
+        self.assertEqual(
+            discovery.discover_npm_integrity(
+                "@antfly/cli",
+                "1.3.0-rc.2",
+                lambda *_args, **_kwargs: response(
+                    {
+                        "versions": {
+                            "1.3.0-rc.2": {"dist": {"integrity": "sha512-exact"}}
+                        }
+                    }
+                ),
+            ),
+            "sha512-exact",
         )
 
         def http_error(code: int):
@@ -376,6 +424,14 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
             channel.begin_promotion(store, older, None, "next")
 
+        store.document = {
+            "schema_version": 1,
+            "current": {"tag": "v1.3.0-rc10"},
+            "pending": None,
+        }
+        with self.assertRaisesRegex(SystemExit, "precedence collision"):
+            channel.begin_promotion(store, candidate, None, "next")
+
     def test_nightly_channel_uses_numeric_run_sequence(self) -> None:
         channel = load_module(
             "release_channel_nightly_test", "release_channel_state.py"
@@ -616,7 +672,11 @@ class ReleasePromotionTests(unittest.TestCase):
                     {
                         "version": "1.2.3",
                         "commit": COMMIT,
-                        "registry_versions": {"npm": "1.2.3", "python": "1.2.3"},
+                        "registry_versions": {
+                            "npm": "1.2.3",
+                            "python": "1.2.3",
+                            "container": "v1.2.3",
+                        },
                     }
                 )
             )
@@ -645,6 +705,25 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(SystemExit, "does not match"):
                 payload.verify_source_snapshot(source, "f" * 40)
+            release_spec = root / "release-request.json"
+            release_spec.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "tag": "v1.2.3",
+                        "version": "1.2.3",
+                        "channel": "stable",
+                        "source_commit": COMMIT,
+                        "controller_commit": "f" * 40,
+                        "build_contract_schema": 1,
+                        "registry_versions": {
+                            "npm": "1.2.3",
+                            "python": "1.2.3",
+                            "container": "v1.2.3",
+                        },
+                    }
+                )
+            )
             argv = [
                 "build_release_payload.py",
                 "--tag",
@@ -659,6 +738,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 str(source),
                 "--out-dir",
                 str(output),
+                "--release-spec",
+                str(release_spec),
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -666,16 +747,19 @@ class ReleasePromotionTests(unittest.TestCase):
             ):
                 self.assertEqual(payload.main(), 0)
             ledger = json.loads((output / "artifacts.json").read_text())
-            self.assertEqual(ledger["schema_version"], 2)
+            self.assertEqual(ledger["schema_version"], 3)
+            self.assertEqual(ledger["controller_commit"], "f" * 40)
             self.assertEqual(ledger["generated_at"], "1970-01-01T00:00:00Z")
             self.assertEqual(
-                ledger["registry_versions"], {"npm": "1.2.3", "python": "1.2.3"}
+                ledger["registry_versions"],
+                {"npm": "1.2.3", "python": "1.2.3", "container": "v1.2.3"},
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
             self.assertIn("source-manifest", kinds)
+            self.assertIn("release-spec", kinds)
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 

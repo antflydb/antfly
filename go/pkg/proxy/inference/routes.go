@@ -429,7 +429,10 @@ func staticDestinationEligible(dest *Destination, req *RouteRequest) bool {
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
-	stats := registry.PoolConditionStats(dest.Pool, req.Model)
+	return rm.evaluateConditionStats(dest, req, registry.PoolConditionStats(dest.Pool, req.Model))
+}
+
+func (rm *RouteManager) evaluateConditionStats(dest *Destination, req *RouteRequest, stats PoolConditionStats) bool {
 	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}

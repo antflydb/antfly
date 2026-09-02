@@ -405,19 +405,32 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 }
 
 // resolvePoolTarget resolves one concrete pool through a single state machine:
-// refresh its activation lease, try it immediately, wait only when it was
-// genuinely cold, and return the result to the caller for fallback handling.
+// refresh its activation lease, satisfy the selected route's runtime
+// conditions when it was genuinely cold, acquire an endpoint, and return the
+// result to the caller for fallback handling.
 func (p *Proxy) resolvePoolTarget(ctx context.Context, namespace, pool string, req *RouteRequest, workloadType WorkloadType, reserve bool, destination *Destination) (*Endpoint, error) {
 	wasCold := p.registry.PoolConditionStats(pool, req.Model).HealthyEndpoints == 0
 	activationWait, activationEnabled, activationErr := p.activatePool(ctx, namespace, pool)
 	if activationErr != nil {
 		p.logger.Warn("failed to refresh inference pool activation", zap.String("namespace", namespace), zap.String("pool", pool), zap.Error(activationErr))
 	}
+	if wasCold && destination != nil && activationEnabled && activationErr == nil {
+		// Activation may make an endpoint visible synchronously. It is still not
+		// acquirable until the selected destination's dynamic conditions hold.
+		// Keeping that selection and acquisition in this state machine prevents
+		// a newly visible endpoint from bypassing model/queue/replica/latency rules.
+		if p.waitForRouteDestination(ctx, destination, req, activationWait) == nil {
+			return nil, noEligibleDestinationsError()
+		}
+		if reserve {
+			return p.router.AcquireDestinationEndpoint(req, destination, workloadType)
+		}
+		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+	}
 
-	// Destination conditions are the selection snapshot for this request. Do not
-	// reevaluate them after resolveEndpoint reserves a circuit-breaker probe: the
-	// reservation intentionally makes a half-open endpoint unavailable to other
-	// requests and would cause this request to reject (and strand) its own lease.
+	if destination != nil && reserve {
+		return p.router.AcquireDestinationEndpoint(req, destination, workloadType)
+	}
 	endpoint, err := p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
 	if err == nil {
 		return endpoint, nil
@@ -456,6 +469,10 @@ func routeNamespace(route *Route) string {
 func (p *Proxy) waitForRouteDestination(ctx context.Context, destination *Destination, req *RouteRequest, maxWait time.Duration) *Destination {
 	if maxWait <= 0 {
 		return nil
+	}
+	req.Timestamp = time.Now()
+	if p.router.RouteManager().evaluateConditions(destination, req, p.registry) {
+		return destination
 	}
 	timer := time.NewTimer(maxWait)
 	defer timer.Stop()

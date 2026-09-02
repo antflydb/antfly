@@ -13,14 +13,20 @@ from typing import Any
 from release_channels import (
     compare_channel_tags,
     load_policy,
+    validate_observed_channel_tag,
     validate_channel_tag,
 )
 
 
 def release_identity(
-    tag: str, commit: str, ledger_sha256: str, channel: str = "stable"
+    tag: str,
+    commit: str,
+    ledger_sha256: str,
+    channel: str = "stable",
+    *,
+    allow_legacy: bool = False,
 ) -> dict[str, str]:
-    validate_channel_tag(tag, channel, load_policy())
+    validate_channel_tag(tag, channel, load_policy(), allow_legacy=allow_legacy)
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise SystemExit(f"invalid release commit: {commit}")
     if not re.fullmatch(r"[0-9a-f]{64}", ledger_sha256):
@@ -112,7 +118,9 @@ def begin_promotion(
     channel: str = "stable",
 ) -> None:
     policy = load_policy()
-    validate_channel_tag(identity["tag"], channel, policy)
+    # The candidate was validated when its identity was created. Journal and
+    # registry state may contain legacy spellings and are observation-only.
+    validate_observed_channel_tag(identity["tag"], channel, policy)
     stored = store.load()
     state = stored.document
     stored_channel = state.get("channel")
@@ -127,7 +135,7 @@ def begin_promotion(
     ):
         raise SystemExit("release channel has malformed current identity")
     if current is None and bootstrap_current:
-        validate_channel_tag(bootstrap_current, channel, policy)
+        validate_observed_channel_tag(bootstrap_current, channel, policy)
         current = {"tag": bootstrap_current}
     if pending is not None:
         if same_identity(pending, identity):
@@ -138,14 +146,14 @@ def begin_promotion(
             f"release channel promotion for {pending_tag} is incomplete; resume it before {identity['tag']}"
         )
     if bootstrap_current and isinstance(current, dict):
-        validate_channel_tag(bootstrap_current, channel, policy)
+        validate_observed_channel_tag(bootstrap_current, channel, policy)
         if current["tag"] != bootstrap_current:
             raise SystemExit(
                 f"release channel journal is {current['tag']} but observed alias is {bootstrap_current}"
             )
     if isinstance(current, dict) and isinstance(current.get("tag"), str):
         current_tag = str(current["tag"])
-        validate_channel_tag(current_tag, channel, policy)
+        validate_observed_channel_tag(current_tag, channel, policy)
         precedence = compare_channel_tags(identity["tag"], current_tag, channel, policy)
         if precedence < 0:
             raise SystemExit(
@@ -208,6 +216,7 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ledger-sha256", required=True)
     parser.add_argument("--bootstrap-current")
+    parser.add_argument("--allow-legacy-candidate", action="store_true")
     args = parser.parse_args()
 
     policy = load_policy()
@@ -218,7 +227,13 @@ def main() -> int:
         raise SystemExit(
             f"release channel {args.channel} requires journal {channel_policy['journal_key']}"
         )
-    identity = release_identity(args.tag, args.commit, args.ledger_sha256, args.channel)
+    identity = release_identity(
+        args.tag,
+        args.commit,
+        args.ledger_sha256,
+        args.channel,
+        allow_legacy=args.allow_legacy_candidate,
+    )
     store = S3ChannelStore(args.endpoint, args.bucket, args.key)
     if args.command == "begin":
         begin_promotion(store, identity, args.bootstrap_current, args.channel)

@@ -551,6 +551,36 @@ func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
 	}
 }
 
+func TestSynchronousColdActivationCannotBypassDynamicConditions(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/model-gated-cold",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+		if pool != "gpu" {
+			return 0, false, nil
+		}
+		// The endpoint becomes healthy inside Activate, but the requested model
+		// is deliberately not loaded there.
+		p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+		return 20 * time.Millisecond, true, nil
+	}})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected CPU fallback when activated endpoint fails model condition, got %q", resolved.Pool)
+	}
+}
+
 func TestRuntimeIneligiblePoolFallsBackWithoutColdStartWait(t *testing.T) {
 	t.Parallel()
 

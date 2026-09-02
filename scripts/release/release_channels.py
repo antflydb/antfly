@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,41 @@ TAG_PATTERN = re.compile(
     r"(?:-(?P<prerelease>(?P<pre_label>dev|alpha|a|beta|b|rc|pre|preview)\.?(?P<pre_number>[0-9]+)))?$"
 )
 NIGHTLY_PATTERN = re.compile(r"^v0\.0\.0-dev\.(?P<sequence>[1-9][0-9]*)$")
+CANONICAL_PRERELEASE_PATTERN = re.compile(
+    r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"-(?:alpha|beta|rc)\.(?:0|[1-9][0-9]*)$"
+)
+CANONICAL_STABLE_PATTERN = re.compile(
+    r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
 CONTAINER_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class ReleaseSpec:
+    tag: str
+    channel: str
+    source_commit: str
+    controller_commit: str
+    npm_version: str
+    python_version: str
+    container_tag: str
+
+    def document(self) -> dict[str, object]:
+        return {
+            "schema_version": 3,
+            "tag": self.tag,
+            "version": self.tag.removeprefix("v"),
+            "channel": self.channel,
+            "source_commit": self.source_commit,
+            "controller_commit": self.controller_commit,
+            "build_contract_schema": 1,
+            "registry_versions": {
+                "npm": self.npm_version,
+                "python": self.python_version,
+                "container": self.container_tag,
+            },
+        }
 
 
 def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
@@ -62,14 +97,16 @@ def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | Non
     )
 
 
-def normalize_release_version(raw: str) -> str:
+def normalize_release_version(raw: str, *, allow_legacy: bool = False) -> str:
     tag = raw if raw.startswith("v") else f"v{raw}"
     parse_version(tag)
+    if not allow_legacy and not is_canonical_tag(tag):
+        raise SystemExit(f"release candidate must use canonical tag syntax: {tag}")
     return tag.removeprefix("v")
 
 
-def python_version_from_release(raw: str) -> str:
-    version = normalize_release_version(raw)
+def python_version_from_release(raw: str, *, allow_legacy: bool = False) -> str:
+    version = normalize_release_version(raw, allow_legacy=allow_legacy)
     match = TAG_PATTERN.fullmatch(f"v{version}")
     assert match is not None
     python_version = (
@@ -87,13 +124,53 @@ def python_version_from_release(raw: str) -> str:
     return python_version
 
 
-def registry_identity(tag: str) -> dict[str, str]:
-    version = normalize_release_version(tag)
+def registry_identity(tag: str, *, allow_legacy: bool = False) -> dict[str, str]:
+    version = normalize_release_version(tag, allow_legacy=allow_legacy)
     return {
         "npm_version": version,
-        "python_version": python_version_from_release(version),
+        "python_version": python_version_from_release(
+            version, allow_legacy=allow_legacy
+        ),
         "container_tag": f"v{version}",
     }
+
+
+def is_canonical_tag(tag: str) -> bool:
+    return bool(
+        CANONICAL_STABLE_PATTERN.fullmatch(tag)
+        or CANONICAL_PRERELEASE_PATTERN.fullmatch(tag)
+        or NIGHTLY_PATTERN.fullmatch(tag)
+    )
+
+
+def build_release_spec(
+    tag: str,
+    requested_channel: str,
+    source_commit: str,
+    controller_commit: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> ReleaseSpec:
+    for name, commit in (
+        ("source", source_commit),
+        ("controller", controller_commit),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise SystemExit(f"invalid {name} commit: {commit}")
+    channel_name, _ = resolve_channel(
+        tag, requested_channel, policy, allow_legacy=allow_legacy
+    )
+    registry = registry_identity(tag, allow_legacy=allow_legacy)
+    return ReleaseSpec(
+        tag=tag,
+        channel=channel_name,
+        source_commit=source_commit,
+        controller_commit=controller_commit,
+        npm_version=registry["npm_version"],
+        python_version=registry["python_version"],
+        container_tag=registry["container_tag"],
+    )
 
 
 def compare_version_precedence(left: str, right: str) -> int:
@@ -193,7 +270,9 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     return policy
 
 
-def validate_channel_tag(tag: str, channel_name: str, policy: dict[str, Any]) -> None:
+def validate_observed_channel_tag(
+    tag: str, channel_name: str, policy: dict[str, Any]
+) -> None:
     channel = policy["channels"].get(channel_name)
     if not isinstance(channel, dict):
         raise SystemExit(f"unknown release channel: {channel_name}")
@@ -219,22 +298,38 @@ def validate_channel_tag(tag: str, channel_name: str, policy: dict[str, Any]) ->
         raise SystemExit(f"nightly snapshot tag requires the nightly channel: {tag}")
 
 
+def validate_channel_tag(
+    tag: str,
+    channel_name: str,
+    policy: dict[str, Any],
+    *,
+    allow_legacy: bool = False,
+) -> None:
+    validate_observed_channel_tag(tag, channel_name, policy)
+    if not allow_legacy and not is_canonical_tag(tag):
+        raise SystemExit(f"release candidate must use canonical tag syntax: {tag}")
+
+
 def resolve_channel(
-    tag: str, requested: str = "auto", policy: dict[str, Any] | None = None
+    tag: str,
+    requested: str = "auto",
+    policy: dict[str, Any] | None = None,
+    *,
+    allow_legacy: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     policy = policy or load_policy()
     _, prerelease = parse_version(tag)
     if requested == "auto":
         requested = "next" if prerelease is not None else "stable"
-    validate_channel_tag(tag, requested, policy)
+    validate_channel_tag(tag, requested, policy, allow_legacy=allow_legacy)
     return requested, dict(policy["channels"][requested])
 
 
 def compare_channel_tags(
     left: str, right: str, channel_name: str, policy: dict[str, Any]
 ) -> int:
-    validate_channel_tag(left, channel_name, policy)
-    validate_channel_tag(right, channel_name, policy)
+    validate_observed_channel_tag(left, channel_name, policy)
+    validate_observed_channel_tag(right, channel_name, policy)
     channel = policy["channels"][channel_name]
     if channel["ordering"] == "semver":
         return compare_version_precedence(left, right)
@@ -247,7 +342,11 @@ def compare_channel_tags(
 
 
 def github_outputs(
-    channel_name: str, channel: dict[str, Any], tag: str | None = None
+    channel_name: str,
+    channel: dict[str, Any],
+    tag: str | None = None,
+    *,
+    allow_legacy: bool = False,
 ) -> dict[str, str]:
     result = {"channel": channel_name}
     for key, value in channel.items():
@@ -256,16 +355,19 @@ def github_outputs(
         else:
             result[key] = str(value)
     if tag:
-        result.update(registry_identity(tag))
+        result.update(registry_identity(tag, allow_legacy=allow_legacy))
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "resolve"))
+    parser.add_argument("command", choices=("validate", "resolve", "spec"))
     parser.add_argument("--tag")
     parser.add_argument("--channel", default="auto")
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--controller-commit")
+    parser.add_argument("--allow-legacy", action="store_true")
     args = parser.parse_args()
 
     policy = load_policy()
@@ -274,8 +376,25 @@ def main() -> int:
         return 0
     if not args.tag:
         parser.error("resolve requires --tag")
-    channel_name, channel = resolve_channel(args.tag, args.channel, policy)
-    outputs = github_outputs(channel_name, channel, args.tag)
+    if args.command == "spec":
+        if not args.source_commit or not args.controller_commit:
+            parser.error("spec requires --source-commit and --controller-commit")
+        spec = build_release_spec(
+            args.tag,
+            args.channel,
+            args.source_commit,
+            args.controller_commit,
+            policy,
+            allow_legacy=args.allow_legacy,
+        )
+        print(json.dumps(spec.document(), indent=2, sort_keys=True))
+        return 0
+    channel_name, channel = resolve_channel(
+        args.tag, args.channel, policy, allow_legacy=args.allow_legacy
+    )
+    outputs = github_outputs(
+        channel_name, channel, args.tag, allow_legacy=args.allow_legacy
+    )
     output_path = args.github_output
     if output_path is None and os.environ.get("GITHUB_OUTPUT"):
         output_path = Path(os.environ["GITHUB_OUTPUT"])

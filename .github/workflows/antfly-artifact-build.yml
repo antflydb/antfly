@@ -33,21 +33,25 @@ jobs:
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       channel: ${{ steps.channel.outputs.channel }}
+      controller_commit: ${{ steps.controller.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
-      - name: Require immutable default-branch source
+      - name: Record release controller
+        id: controller
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require compatible immutable default-branch source
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           git fetch --no-tags origin "$DEFAULT_BRANCH"
           git merge-base --is-ancestor "$SOURCE_COMMIT" "origin/$DEFAULT_BRANCH"
+          python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT"
       - name: Validate release channel
         id: channel
         env:
@@ -163,10 +167,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ needs.release-plan.outputs.controller_commit }}
           fetch-depth: 0
       - name: Stage exact source objects
         run: |
+          git fetch --no-tags origin "${{ inputs.source_commit }}"
           python scripts/release/stage_release_source.py \
             --commit "${{ inputs.source_commit }}" \
             --out-dir dist/release-source
@@ -185,19 +190,22 @@ jobs:
       - package-release-source
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-plan.outputs.controller_commit }}
       - name: Write request
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
-          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.controller_commit }}
           RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
         run: |
           mkdir -p dist/release-request
-          jq -n \
-            --arg tag "$RELEASE_TAG" \
-            --arg commit "$RELEASE_COMMIT" \
-            --arg channel "$RELEASE_CHANNEL" \
-            --argjson schema_version 2 \
-            '{schema_version: $schema_version, tag: $tag, commit: $commit, channel: $channel}' \
+          python scripts/release/release_channels.py spec \
+            --tag "$RELEASE_TAG" \
+            --channel "$RELEASE_CHANNEL" \
+            --source-commit "$SOURCE_COMMIT" \
+            --controller-commit "$CONTROLLER_COMMIT" \
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@v6
         with:

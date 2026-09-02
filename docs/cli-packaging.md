@@ -55,6 +55,10 @@ consumers.
    `sha256/<digest>/`.
 5. GitHub starts that promotion through `workflow_run`, so the privileged code
    is always loaded from the default branch. The controller verifies the
+   source commit's declared build-contract schema and consumes its immutable
+   `ReleaseSpec`, which independently records the source and controller commits.
+   The channel transaction is opened before any registry version is published.
+   The controller then verifies the
    complete release bundle before promoting its CLI scope to PyPI and npm, its
    GNU runtime scope to the single container image, and stable archives to
    Homebrew. Container builds are first sealed under the release-ledger digest;
@@ -63,8 +67,9 @@ consumers.
    aliases and policy-selected GitHub visibility, are committed through
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for
    nightlies.
-   Registry jobs skip an existing version only after comparing its digest, so
-   retries cannot conceal drift.
+   Registry jobs skip an existing version only after comparing its digest; npm
+   additionally verifies the requested dist-tag, so retries cannot conceal
+   content or channel drift.
    Native archives remain available under
    `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
 

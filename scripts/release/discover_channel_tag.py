@@ -78,12 +78,38 @@ def discover_npm_tag(package: str, tag: str, opener: OpenURL) -> str:
     return f"v{version}"
 
 
+def discover_npm_integrity(package: str, version: str, opener: OpenURL) -> str:
+    if not package or not version:
+        raise SystemExit("npm version discovery requires a package and version")
+    encoded_package = urllib.parse.quote(package, safe="")
+    document = load_json(
+        f"https://registry.npmjs.org/{encoded_package}",
+        {"Accept": "application/json", "User-Agent": "antfly-release-controller"},
+        opener,
+    )
+    if document is None:
+        return ""
+    versions = document.get("versions")
+    if not isinstance(versions, dict):
+        raise SystemExit("npm package metadata has no versions object")
+    release = versions.get(version)
+    if release is None:
+        return ""
+    if not isinstance(release, dict) or not isinstance(release.get("dist"), dict):
+        raise SystemExit(f"npm version {version} has invalid metadata")
+    integrity = release["dist"].get("integrity")
+    if not isinstance(integrity, str) or not integrity:
+        raise SystemExit(f"npm version {version} has no integrity")
+    return integrity
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bootstrap", choices=("github-latest", "npm"))
+    parser.add_argument("bootstrap", choices=("github-latest", "npm", "npm-version"))
     parser.add_argument("--repository")
     parser.add_argument("--npm-package", default="@antfly/cli")
     parser.add_argument("--npm-tag")
+    parser.add_argument("--npm-version")
     args = parser.parse_args()
 
     if args.bootstrap == "github-latest":
@@ -92,9 +118,13 @@ def main() -> int:
             os.environ.get("GH_TOKEN", ""),
             urllib.request.urlopen,
         )
-    else:
+    elif args.bootstrap == "npm":
         current = discover_npm_tag(
             args.npm_package, args.npm_tag or "", urllib.request.urlopen
+        )
+    else:
+        current = discover_npm_integrity(
+            args.npm_package, args.npm_version or "", urllib.request.urlopen
         )
     print(current)
     return 0

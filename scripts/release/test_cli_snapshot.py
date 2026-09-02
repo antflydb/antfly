@@ -59,12 +59,18 @@ class CLISnapshotTests(unittest.TestCase):
             "cli_release_packager",
             REPO_ROOT / "scripts" / "packaging" / "package_cli_release.py",
         )
-        for version in ("1.2.3", "1.2.3-dev4", "1.2.3-rc2", "1.2.3-rc.2"):
+        for version in ("1.2.3", "1.2.3-alpha.4", "1.2.3-beta.2", "1.2.3-rc.2"):
             self.assertEqual(
                 snapshot.python_version_from_release(version),
                 packager.python_version_from_release(version),
             )
-        for unsupported in ("1.2", "1.2.3+CUDA.1", "1.2.3-experimental.1"):
+        for unsupported in (
+            "1.2",
+            "1.2.3+CUDA.1",
+            "1.2.3-experimental.1",
+            "1.2.3-dev4",
+            "1.2.3-rc2",
+        ):
             with self.subTest(unsupported=unsupported), self.assertRaises(SystemExit):
                 snapshot.python_version_from_release(unsupported)
 

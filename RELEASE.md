@@ -54,11 +54,16 @@ promotion plane so code loaded from a tag never receives publication
 credentials.
 
 1. `.github/workflows/antfly-artifact-build.yml` is the sole reusable artifact
-   builder. With only read permission, it builds the canonical Zig archives,
+   builder. Its release controller is checked out from the default branch,
+   while the requested source commit supplies the versioned builder inputs.
+   The controller first requires that source to declare the supported
+   `scripts/release/build-contract.json` schema and all required build paths.
+   With only read permission, it builds the canonical Zig archives,
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
-   source-commit-and-channel-bound release request as Actions artifacts. The
+   canonical `ReleaseSpec` (source commit, controller commit, channel, build
+   contract, and all registry versions) as an Actions artifact. The
    tag-triggered `.github/workflows/antfly-release-build.yml`
    and manually triggered `.github/workflows/antfly-nightly.yml` are thin
    callers of this same builder.
@@ -80,7 +85,10 @@ credentials.
    digest, and then compare-or-creates the version tags. A retry can reuse an
    identical image but cannot overwrite a released version with different
    bytes.
-5. Mutable install channels are transactions. `scripts/release/channels.json`
+5. Mutable install channels are transactions. The compare-and-swap transaction
+   begins before PyPI, npm, or container publication, so a precedence or
+   identity collision cannot be discovered after publishing a registry
+   version. `scripts/release/channels.json`
    is the canonical policy for `stable`, `next`, and `nightly`: tag class,
    ordering rule, journal, package-registry eligibility, mutable aliases,
    GitHub visibility, and recovery source. Compare-and-swap journals in R2
@@ -94,7 +102,10 @@ rate-limit, malformed-response, and network failures stop promotion.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
-publication is safe to retry without hiding content drift. Existing GitHub
+publication is safe to retry without hiding content drift. An existing npm
+version is resumable only if its requested dist-tag also points to that exact
+version; trusted-publishing recovery otherwise stops with an explicit dist-tag
+repair requirement. Existing GitHub
 release assets are likewise accepted only when byte-identical; release
 automation never replaces a saved artifact. GitHub release visibility is also
 one-way: a retry may add missing identical assets to a published release but
@@ -164,15 +175,17 @@ scripts under `scripts/release/`:
 
 ## Version Behavior
 
-Stable tags use `vX.Y.Z`; RC tags use `vX.Y.Z-rc.N`. Nightly snapshots use
+Stable tags use `vX.Y.Z`; prerelease tags use the canonical
+`vX.Y.Z-alpha.N`, `vX.Y.Z-beta.N`, or `vX.Y.Z-rc.N` spellings. Nightly snapshots use
 `v0.0.0-dev.<GitHub run ID>`. A nightly is a channel, not a cadence: the
 workflow is manual today, and a schedule or default-branch trigger can be added
 later without changing the artifact or promotion model.
 
 Release identity is deliberately narrower than generic SemVer: the core always
-contains three components, prereleases use the supported dev/alpha/beta/RC
-forms, and build metadata is rejected because it cannot be represented by every
-publication target (notably container tags).
+contains three components and build metadata is rejected because it cannot be
+represented by every publication target (notably container tags). Historical
+spellings such as `rc2`, `pre.2`, and `preview2` can be read from existing
+journals during recovery, but cannot create a new release candidate.
 
 Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific

@@ -12,7 +12,10 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from release_channels import build_release_spec
+
 SOURCE_MANIFEST = "source-snapshot.json"
+RELEASE_SPEC = "release-spec.json"
 REQUIRED_SOURCE_FILES = {"install.sh", "openapi.yaml"}
 
 
@@ -44,6 +47,8 @@ def artifact_kind(path: Path) -> str:
         return "openapi"
     if name == SOURCE_MANIFEST:
         return "source-manifest"
+    if name == RELEASE_SPEC:
+        return "release-spec"
     if name == "cli-snapshot.json":
         return "cli-manifest"
     if name.endswith(".whl"):
@@ -119,6 +124,22 @@ def verify_source_snapshot(source_dir: Path, commit: str) -> list[Path]:
     return [*verified, manifest_path]
 
 
+def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
+    if not path.is_file():
+        raise SystemExit(f"missing release spec: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise SystemExit("release spec does not match the release identity")
+    controller_commit = document.get("controller_commit")
+    channel = document.get("channel")
+    if not isinstance(controller_commit, str) or not isinstance(channel, str):
+        raise SystemExit("release spec does not match the release identity")
+    expected = build_release_spec(tag, channel, commit, controller_commit).document()
+    if document != expected:
+        raise SystemExit("release spec does not match the release identity")
+    return document
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -145,12 +166,14 @@ def main() -> int:
     parser.add_argument(
         "--out-dir", type=Path, required=True, help="output payload directory"
     )
+    parser.add_argument("--release-spec", type=Path, required=True)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
     tag = args.tag
     version = tag.removeprefix("v")
     prerelease = "-" in version
+    release_spec = verify_release_spec(args.release_spec, tag, args.commit)
 
     out_dir = args.out_dir.resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -185,6 +208,8 @@ def main() -> int:
                 "CLI snapshot does not match the release version and commit"
             )
         registry_versions = cli_manifest.get("registry_versions")
+        if registry_versions != release_spec.get("registry_versions"):
+            raise SystemExit("CLI registry versions do not match the release spec")
 
     checksums = out_dir / "antfly_zig_checksums.txt"
     with checksums.open("w", encoding="utf-8") as dst:
@@ -195,6 +220,9 @@ def main() -> int:
 
     for source in verify_source_snapshot(args.source_dir, args.commit):
         copied.append(copy_payload_file(source, out_dir))
+    spec_copy = out_dir / RELEASE_SPEC
+    shutil.copy2(args.release_spec, spec_copy)
+    copied.append(spec_copy)
 
     release_generated_at = generated_at(repo_root, args.commit)
     artifacts = []
@@ -213,6 +241,7 @@ def main() -> int:
         "tag": tag,
         "version": version,
         "commit": args.commit,
+        "controller_commit": release_spec["controller_commit"],
         "prerelease": prerelease,
         "generated_at": release_generated_at,
         "registry_versions": registry_versions,
@@ -240,7 +269,8 @@ def main() -> int:
                 "tag": tag,
                 "version": version,
                 "commit": args.commit,
-                "schema_version": 2,
+                "controller_commit": release_spec["controller_commit"],
+                "schema_version": 3,
                 "generated_at": release_generated_at,
                 "registry_versions": registry_versions,
                 "artifacts": ledger_artifacts,

@@ -40,6 +40,8 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       tag: ${{ steps.identity.outputs.tag }}
       commit: ${{ steps.identity.outputs.commit }}
+      controller_commit: ${{ steps.identity.outputs.controller_commit }}
+      allow_legacy: ${{ steps.identity.outputs.allow_legacy }}
       ledger_sha256: ${{ steps.ledger.outputs.sha256 }}
       channel: ${{ steps.identity.outputs.channel }}
       journal_key: ${{ steps.identity.outputs.journal_key }}
@@ -110,10 +112,12 @@ jobs:
           expected_ledger=""
           if [ "$EVENT_NAME" = workflow_run ]; then
             request=dist/release-request/release-request.json
-            test "$(jq -r .schema_version "$request")" = 2
+            test "$(jq -r .schema_version "$request")" = 3
             raw="$(jq -r .tag "$request")"
-            commit="$(jq -r .commit "$request")"
+            commit="$(jq -r .source_commit "$request")"
+            controller_commit="$(jq -r .controller_commit "$request")"
             requested_channel="$(jq -r .channel "$request")"
+            allow_legacy=false
             case "$BUILD_EVENT" in
               push) test "$commit" = "$BUILD_COMMIT" ;;
               workflow_dispatch) test "$requested_channel" = nightly ;;
@@ -124,6 +128,8 @@ jobs:
             requested_channel="${RAW_RECOVERY_CHANNEL:-auto}"
             expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
             test -n "$expected_ledger"
+            controller_commit=""
+            allow_legacy=true
           fi
           if ! [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
             echo "invalid release version: $raw" >&2
@@ -131,9 +137,12 @@ jobs:
           fi
           version="${raw#v}"
           tag="v${version}"
+          legacy_args=()
+          if [ "$allow_legacy" = true ]; then legacy_args=(--allow-legacy); fi
           resolved="$(python scripts/release/release_channels.py resolve \
             --tag "$tag" \
             --channel "$requested_channel" \
+            "${legacy_args[@]}" \
             --github-output "$GITHUB_OUTPUT")"
           channel="$(jq -r .channel <<<"$resolved")"
           if [ "$EVENT_NAME" != workflow_run ]; then
@@ -148,6 +157,8 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
             echo "commit=$commit"
+            echo "controller_commit=$controller_commit"
+            echo "allow_legacy=$allow_legacy"
             echo "expected_ledger=$expected_ledger"
           } >> "$GITHUB_OUTPUT"
 
@@ -156,6 +167,7 @@ jobs:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
           RELEASE_CHANNEL: ${{ steps.identity.outputs.channel }}
+          CONTROLLER_COMMIT: ${{ steps.identity.outputs.controller_commit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
@@ -166,6 +178,11 @@ jobs:
             git cat-file -e "$RELEASE_COMMIT^{commit}"
           fi
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
+          if [ -n "$CONTROLLER_COMMIT" ]; then
+            [[ "$CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            git cat-file -e "$CONTROLLER_COMMIT^{commit}"
+            git merge-base --is-ancestor "$CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -193,6 +210,7 @@ jobs:
             --archive-dir dist/release-archives \
             --extra-dir dist/cli-snapshot \
             --source-dir dist/release-source \
+            --release-spec dist/release-request/release-request.json \
             --out-dir dist/release-payload
 
       - name: Verify the newly assembled release ledger before sealing
@@ -360,7 +378,9 @@ jobs:
 
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
-    needs: prepare-release-promotion
+    needs:
+      - prepare-release-promotion
+      - begin-release-channel
     if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
     runs-on: ubuntu-latest
     environment:
@@ -460,11 +480,13 @@ jobs:
   publish-container:
     needs:
       - prepare-release-promotion
+      - begin-release-channel
       - publish-cli-pypi
       - prepare-zig-homebrew
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
           (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') }}
     permissions:
@@ -480,17 +502,7 @@ jobs:
 
   begin-release-channel:
     name: Begin mutable release channel transaction
-    needs:
-      - prepare-release-promotion
-      - publish-cli-pypi
-      - prepare-zig-homebrew
-      - publish-container
-    if: >-
-      ${{ always() &&
-          needs.prepare-release-promotion.result == 'success' &&
-          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
-          (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
-          needs.publish-container.result == 'success' }}
+    needs: prepare-release-promotion
     runs-on: arc-antfly-standard
     permissions:
       contents: read
@@ -534,12 +546,15 @@ jobs:
           CHANNEL: ${{ steps.channel.outputs.name }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           CURRENT_TAG: ${{ steps.channel.outputs.current_tag }}
+          ALLOW_LEGACY: ${{ needs.prepare-release-promotion.outputs.allow_legacy }}
         run: |
           set -euo pipefail
           bootstrap_args=()
           if [ -n "$CURRENT_TAG" ]; then
             bootstrap_args=(--bootstrap-current "$CURRENT_TAG")
           fi
+          legacy_args=()
+          if [ "$ALLOW_LEGACY" = true ]; then legacy_args=(--allow-legacy-candidate); fi
           python scripts/release/release_channel_state.py begin \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
@@ -548,6 +563,7 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --ledger-sha256 "$LEDGER_SHA256" \
+            "${legacy_args[@]}" \
             "${bootstrap_args[@]}"
 
   promote-channel-aliases:
@@ -556,6 +572,7 @@ jobs:
       - prepare-release-promotion
       - begin-release-channel
       - publish-cli-npm
+      - publish-container
     runs-on: arc-antfly-standard
     environment: container-publish
     permissions:
@@ -707,6 +724,17 @@ jobs:
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
+      - name: Verify npm channel aliases before committing the journal
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          for package in @antfly/cli-darwin-arm64 @antfly/cli-linux-arm64 @antfly/cli-linux-x64 @antfly/cli; do
+            observed="$(python scripts/release/discover_channel_tag.py npm \
+              --npm-package "$package" --npm-tag "$NPM_TAG")"
+            test "$observed" = "v${RELEASE_VERSION}"
+          done
       - name: Commit the release channel transaction
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -717,7 +745,10 @@ jobs:
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
           CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
+          ALLOW_LEGACY: ${{ needs.prepare-release-promotion.outputs.allow_legacy }}
         run: |
+          legacy_args=()
+          if [ "$ALLOW_LEGACY" = true ]; then legacy_args=(--allow-legacy-candidate); fi
           python scripts/release/release_channel_state.py finish \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
@@ -725,4 +756,5 @@ jobs:
             --channel "$CHANNEL" \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
+            "${legacy_args[@]}" \
             --ledger-sha256 "$LEDGER_SHA256"

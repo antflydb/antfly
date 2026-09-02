@@ -497,7 +497,10 @@ func (r *ModelRegistry) getAvailableEndpointsForModelLocked(model, pool string) 
 func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.availableEndpointsForPoolLocked(pool)
+}
 
+func (r *ModelRegistry) availableEndpointsForPoolLocked(pool string) []*Endpoint {
 	endpoints := r.pools[pool]
 	result := make([]*Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
@@ -511,7 +514,10 @@ func (r *ModelRegistry) GetEndpointsForPool(pool string) []*Endpoint {
 func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.poolConditionStatsLocked(pool, model)
+}
 
+func (r *ModelRegistry) poolConditionStatsLocked(pool, model string) PoolConditionStats {
 	stats := PoolConditionStats{}
 	endpoints := r.pools[pool]
 	if len(endpoints) == 0 {
@@ -547,6 +553,44 @@ func (r *ModelRegistry) PoolConditionStats(pool, model string) PoolConditionStat
 	}
 
 	return stats
+}
+
+// AcquireDestinationEndpoint evaluates a route destination and reserves one
+// matching endpoint under the same registry snapshot. The circuit-breaker
+// reservation happens after condition evaluation, so a half-open probe cannot
+// invalidate the condition snapshot that admitted it.
+func (r *Router) AcquireDestinationEndpoint(req *RouteRequest, destination *Destination, workloadType WorkloadType) (*Endpoint, error) {
+	r.registry.mu.RLock()
+	defer r.registry.mu.RUnlock()
+
+	stats := r.registry.poolConditionStatsLocked(destination.Pool, req.Model)
+	if !r.routeManager.evaluateConditionStats(destination, req, stats) {
+		return nil, fmt.Errorf("route destination %s does not satisfy its conditions", destination.Pool)
+	}
+
+	endpoints := r.registry.getAvailableEndpointsForModelLocked(req.Model, destination.Pool)
+	if len(endpoints) == 0 {
+		endpoints = r.registry.availableEndpointsForPoolLocked(destination.Pool)
+	}
+	candidates := append([]*Endpoint(nil), endpoints...)
+	for len(candidates) > 0 {
+		endpoint, err := r.selectEndpoint(req.Model, workloadType, candidates, true)
+		if err != nil {
+			return nil, err
+		}
+		breaker := r.registry.circuitBreakers[endpoint.Address]
+		if breaker != nil && breaker.TryAcquire() {
+			return endpoint, nil
+		}
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if candidate.Address != endpoint.Address {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = filtered
+	}
+	return nil, fmt.Errorf("no healthy endpoints available for model %s", req.Model)
 }
 
 func newModelInfo(name string) *ModelInfo {
