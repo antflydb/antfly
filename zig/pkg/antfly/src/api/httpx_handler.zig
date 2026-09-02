@@ -501,7 +501,7 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    fn metadataMutationNotAdmittedResponse(ctx: *httpx.Context) !httpx.Response {
+    fn markMetadataMutationNotAdmitted(ctx: *httpx.Context) !void {
         // This is stronger than the metadata routing hint: callers may replay
         // a mutation only when the authority layer proved that no proposal was
         // admitted. Keep this marker off ambiguous and read-only failures.
@@ -509,7 +509,18 @@ pub const AntflyApiHandler = struct {
             http_common.metadata_mutation_not_admitted_header,
             http_common.metadata_mutation_not_admitted_value,
         );
+    }
+
+    fn metadataMutationNotAdmittedResponse(ctx: *httpx.Context) !httpx.Response {
+        try markMetadataMutationNotAdmitted(ctx);
         return metadataNotLeaderResponse(ctx);
+    }
+
+    fn metadataMutationNotAdmittedTextResponse(ctx: *httpx.Context, message: []const u8) !httpx.Response {
+        try markMetadataMutationNotAdmitted(ctx);
+        try ctx.setHeader("Retry-After", "1");
+        _ = ctx.status(503);
+        return ctx.text(message);
     }
 
     fn metadataMutationOutcomeUnknownResponse(ctx: *httpx.Context) !httpx.Response {
@@ -4575,14 +4586,10 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("table topology changed; retry with the current table state");
                 },
                 error.TableTopologyProtocolUpgradeRequired => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata cluster upgrade in progress; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata cluster upgrade in progress; retry later");
                 },
                 error.RaftMutationDeadlineExceeded => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata mutation deadline exceeded before admission; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
                     return metadataMutationOutcomeUnknownResponse(ctx);
@@ -4706,14 +4713,10 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("table topology changed or is extension-owned");
                 },
                 error.TableTopologyProtocolUpgradeRequired => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata cluster upgrade in progress; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata cluster upgrade in progress; retry later");
                 },
                 error.RaftMutationDeadlineExceeded => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
-                    return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+                    return metadataMutationNotAdmittedTextResponse(ctx, "metadata mutation deadline exceeded before admission; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
                     return metadataMutationOutcomeUnknownResponse(ctx);
