@@ -3919,7 +3919,7 @@ fn remoteMediaQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         .string => |s| s,
         else => "raw",
     } else "raw";
-    if (std.mem.startsWith(u8, url_str, "data:")) {
+    if (scraping.data_uri.hasScheme(url_str)) {
         const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url {s}>>>", .{url_str});
         return .{ .safe_string = result };
     }
@@ -4181,8 +4181,8 @@ fn embedWithEntryParts(
 }
 
 fn modalityForContentType(content_type: []const u8) !inference_work.Modalities {
-    if (std.mem.startsWith(u8, content_type, "image/")) return .{ .image = true };
-    if (std.mem.startsWith(u8, content_type, "audio/")) return .{ .audio = true };
+    if (std.ascii.startsWithIgnoreCase(content_type, "image/")) return .{ .image = true };
+    if (std.ascii.startsWithIgnoreCase(content_type, "audio/")) return .{ .audio = true };
     if (std.ascii.eqlIgnoreCase(content_type, "application/pdf")) return .{ .document = true };
     if (std.ascii.eqlIgnoreCase(content_type, "text/plain")) return .{ .text = true };
     return error.UnsupportedInferenceMimeType;

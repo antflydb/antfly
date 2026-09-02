@@ -178,7 +178,7 @@ fn appendOpenAiMediaContentPartJson(
     out: *std.ArrayListUnmanaged(u8),
     media: MediaContent,
 ) !void {
-    if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedOpenAIContentPart;
+    if (!std.ascii.startsWithIgnoreCase(media.mime_type, "image/")) return error.UnsupportedOpenAIContentPart;
     const image_url = if (media.url) |url|
         url
     else

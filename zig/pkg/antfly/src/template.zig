@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hbs = @import("handlebars");
 const transcribing = @import("antfly_transcribing");
+const data_uri = @import("antfly_scraping").data_uri;
 const Value = hbs.Value;
 const Helper = hbs.Helper;
 const HelperContext = hbs.HelperContext;
@@ -492,7 +493,7 @@ pub fn textToParts(alloc: Allocator, text: []const u8) ![]ContentPart {
 
         const url = cleaned[url_start..marker_end];
 
-        if (std.mem.startsWith(u8, url, "data:")) {
+        if (data_uri.hasScheme(url)) {
             // Parse data URI into binary content
             if (parseDataURI(alloc, url)) |binary| {
                 try parts.append(alloc, .{ .binary = binary });
@@ -525,31 +526,19 @@ pub fn freeContentParts(alloc: Allocator, parts: []const ContentPart) void {
     alloc.free(parts);
 }
 
-/// Parse a data URI (data:mime/type;base64,DATA) into mime type and decoded bytes.
+/// Parse an RFC 2397 data URI into its effective MIME type and decoded bytes.
 pub fn parseDataURI(alloc: Allocator, uri: []const u8) !ContentPart.BinaryContent {
-    if (!std.mem.startsWith(u8, uri, "data:")) return error.InvalidDataURI;
-
-    const after_data = uri[5..];
-    // Find ;base64, separator
-    const base64_marker = ";base64,";
-    const sep_idx = std.mem.indexOf(u8, after_data, base64_marker) orelse return error.InvalidDataURI;
-
-    const mime_type = try alloc.dupe(u8, after_data[0..sep_idx]);
-    errdefer alloc.free(mime_type);
-
-    const encoded = after_data[sep_idx + base64_marker.len ..];
-
-    // Decode base64
-    const decoder = std.base64.standard;
-    const decoded_len = decoder.Decoder.calcSizeForSlice(encoded) catch return error.InvalidDataURI;
-    const decoded = try alloc.alloc(u8, decoded_len);
-    errdefer alloc.free(decoded);
-    decoder.Decoder.decode(decoded, encoded) catch return error.InvalidDataURI;
-
-    return .{
-        .mime_type = mime_type,
-        .data = decoded,
+    var decoded = data_uri.decodeAlloc(alloc, uri) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDataURI,
     };
+    errdefer decoded.deinit(alloc);
+    const result = ContentPart.BinaryContent{
+        .mime_type = decoded.media_type,
+        .data = decoded.data,
+    };
+    decoded = undefined;
+    return result;
 }
 
 // ============================================================================
@@ -569,7 +558,7 @@ fn remoteMediaHelper(ctx: HelperContext) anyerror!Value {
     if (url_str.len == 0) return .{ .safe_string = "" };
 
     // If it's already a data URI, emit media directive directly
-    if (std.mem.startsWith(u8, url_str, "data:")) {
+    if (data_uri.hasScheme(url_str)) {
         const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url {s}>>>", .{url_str});
         return .{ .safe_string = result };
     }
@@ -971,10 +960,13 @@ test "parseDataURI invalid prefix" {
     try std.testing.expectError(error.InvalidDataURI, result);
 }
 
-test "parseDataURI missing base64 marker" {
+test "parseDataURI accepts case-insensitive percent-encoded payload" {
     const alloc = std.testing.allocator;
-    const result = parseDataURI(alloc, "data:image/png,rawdata");
-    try std.testing.expectError(error.InvalidDataURI, result);
+    const result = try parseDataURI(alloc, "DATA:IMAGE/PNG,%01%02%20raw");
+    defer alloc.free(@constCast(result.mime_type));
+    defer alloc.free(@constCast(result.data));
+    try std.testing.expectEqualStrings("IMAGE/PNG", result.mime_type);
+    try std.testing.expectEqualStrings(&[_]u8{ 1, 2, ' ', 'r', 'a', 'w' }, result.data);
 }
 
 // ============================================================================

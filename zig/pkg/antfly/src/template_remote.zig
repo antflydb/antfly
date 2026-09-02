@@ -266,7 +266,7 @@ fn remoteMediaHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteMedia missing HTTP context");
         return .{ .safe_string = result };
     };
-    if (url_str.len >= "data:".len and std.ascii.eqlIgnoreCase(url_str[0.."data:".len], "data:")) {
+    if (scraping.data_uri.hasScheme(url_str)) {
         if (mediaPartLimitReached(render_ctx)) return .{ .safe_string = "" };
         const decoded_size = scraping.dataUriDecodedSize(url_str) catch |err| {
             if (latchFatalRenderError(render_ctx, err)) return err;

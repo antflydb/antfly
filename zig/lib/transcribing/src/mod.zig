@@ -733,7 +733,7 @@ fn appendMultipartFile(
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
-    if (std.ascii.startsWithIgnoreCase(url, "data:")) {
+    if (scraping.data_uri.hasScheme(url)) {
         return try decodeDataUriAlloc(alloc, url);
     }
 

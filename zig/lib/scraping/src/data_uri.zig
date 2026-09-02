@@ -10,6 +10,14 @@ const std = @import("std");
 
 pub const Encoding = enum { base64, percent };
 
+/// URI schemes are case-insensitive. Keep this predicate next to the parser so
+/// admission, transport selection, and decoding cannot disagree about whether
+/// a source is an inline data URI.
+pub fn hasScheme(value: []const u8) bool {
+    return value.len >= "data:".len and
+        std.ascii.eqlIgnoreCase(value[0.."data:".len], "data:");
+}
+
 /// A parsed RFC 2397 data URI. The media type is optional in the grammar; when
 /// omitted, RFC 2397 defines `text/plain;charset=US-ASCII` as the effective
 /// value. Callers that require an explicit image/audio type must enforce that
@@ -47,7 +55,7 @@ pub const Decoded = struct {
 };
 
 pub fn parse(value: []const u8) !?Parsed {
-    if (!std.ascii.startsWithIgnoreCase(value, "data:")) return null;
+    if (!hasScheme(value)) return null;
     const comma = std.mem.indexOfScalar(u8, value, ',') orelse return error.InvalidDataUri;
     const metadata = value["data:".len..comma];
     const is_base64 = std.ascii.endsWithIgnoreCase(metadata, ";base64");

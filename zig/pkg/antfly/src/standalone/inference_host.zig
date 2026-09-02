@@ -1484,9 +1484,9 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
         },
         .binary => |media| {
             try capabilities.validateMimeType(media.mime_type);
-            if (std.mem.startsWith(u8, media.mime_type, "image/")) {
+            if (std.ascii.startsWithIgnoreCase(media.mime_type, "image/")) {
                 shape.modalities.image = true;
-            } else if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
+            } else if (std.ascii.startsWithIgnoreCase(media.mime_type, "audio/")) {
                 shape.modalities.audio = true;
             } else if (std.ascii.eqlIgnoreCase(media.mime_type, "application/pdf")) {
                 shape.modalities.document = true;
@@ -1845,6 +1845,7 @@ const LocalGenerateMediaDescriptor = struct {
     mime_type: []const u8,
     encoded_bytes: usize,
     decoded_bytes: usize,
+    is_data_uri: bool = false,
 };
 
 pub const LocalGenerateDecodeBudget = struct {
@@ -1862,26 +1863,35 @@ fn inspectLocalGenerateDataUri(
 ) !LocalGenerateMediaDescriptor {
     var mime_type = declared_mime_type orelse "application/octet-stream";
     var payload = raw;
-    if (std.mem.startsWith(u8, raw, "data:")) {
-        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
-        const meta = raw["data:".len..comma];
-        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
-        const embedded_mime = meta[0 .. meta.len - ";base64".len];
-        if (embedded_mime.len > 0) {
-            if (declared_mime_type) |declared| {
-                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
-            }
-            mime_type = embedded_mime;
+    var is_data_uri = false;
+    var decoded_bytes: usize = undefined;
+    if (antfly.inference.work.hasDataUriScheme(raw)) {
+        const parsed = (try antfly.inference.work.parseInlineDataUri(raw)) orelse
+            return error.UnsupportedGeneratorProvider;
+        if (declared_mime_type) |declared| {
+            if (!std.ascii.eqlIgnoreCase(mimeEssence(declared), parsed.mime_type))
+                return error.UnsupportedGeneratorProvider;
         }
-        payload = raw[comma + 1 ..];
+        mime_type = parsed.mime_type;
+        payload = parsed.payload;
+        decoded_bytes = parsed.decoded_size;
+        is_data_uri = true;
+    } else {
+        decoded_bytes = try antfly.inference.work.validateCanonicalStandardBase64(payload);
     }
 
     return .{
         .payload = payload,
         .mime_type = mime_type,
         .encoded_bytes = raw.len,
-        .decoded_bytes = try std.base64.standard.Decoder.calcSizeForSlice(payload),
+        .decoded_bytes = decoded_bytes,
+        .is_data_uri = is_data_uri,
     };
+}
+
+fn mimeEssence(value: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    return std.mem.trim(u8, value[0..end], &std.ascii.whitespace);
 }
 
 fn addLocalGenerateBytes(total: *usize, amount: usize) !void {
@@ -1893,8 +1903,8 @@ fn addLocalGenerateMediaPreflight(
     descriptor: LocalGenerateMediaDescriptor,
     image_only: bool,
 ) !void {
-    const is_image = std.mem.startsWith(u8, descriptor.mime_type, "image/");
-    const is_audio = std.mem.startsWith(u8, descriptor.mime_type, "audio/");
+    const is_image = std.ascii.startsWithIgnoreCase(descriptor.mime_type, "image/");
+    const is_audio = std.ascii.startsWithIgnoreCase(descriptor.mime_type, "audio/");
     if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
 
     try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
@@ -1936,7 +1946,10 @@ fn preflightLocalGenerateMessagesInternal(
                         if (attachment_index >= attachments.?.len) return error.InvalidArguments;
                         const attachment = attachments.?[attachment_index];
                         try attachment.validate();
-                        if (media.mime_type.len > 0 and !std.mem.eql(u8, media.mime_type, attachment.content_type))
+                        if (media.mime_type.len > 0 and !std.ascii.eqlIgnoreCase(
+                            mimeEssence(media.mime_type),
+                            mimeEssence(attachment.content_type),
+                        ))
                             return error.InvalidArguments;
                         try addLocalGenerateMediaPreflight(&preflight, .{
                             .payload = attachment.bytes,
@@ -2049,7 +2062,7 @@ fn convertLocalGenerateParts(
                 const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                if (!std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/")) {
                     return error.UnsupportedGeneratorProvider;
                 }
                 try images.append(alloc, decoded.data);
@@ -2063,13 +2076,16 @@ fn convertLocalGenerateParts(
                     if (attachment_index.* >= attachments.?.len) return error.InvalidArguments;
                     const attachment = attachments.?[attachment_index.*];
                     try attachment.validate();
-                    if (media.mime_type.len > 0 and !std.mem.eql(u8, media.mime_type, attachment.content_type))
+                    if (media.mime_type.len > 0 and !std.ascii.eqlIgnoreCase(
+                        mimeEssence(media.mime_type),
+                        mimeEssence(attachment.content_type),
+                    ))
                         return error.InvalidArguments;
                     try decode_budget.reserve(attachment.bytes.len);
-                    if (std.mem.startsWith(u8, attachment.content_type, "image/")) {
+                    if (std.ascii.startsWithIgnoreCase(attachment.content_type, "image/")) {
                         try images.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .image = images.items.len - 1 });
-                    } else if (std.mem.startsWith(u8, attachment.content_type, "audio/")) {
+                    } else if (std.ascii.startsWithIgnoreCase(attachment.content_type, "audio/")) {
                         try audio.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     } else return error.UnsupportedGeneratorProvider;
@@ -2079,12 +2095,12 @@ fn convertLocalGenerateParts(
                 const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                if (std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/")) {
                     try images.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
-                } else if (std.mem.startsWith(u8, decoded.mime_type, "audio/")) {
+                } else if (std.ascii.startsWithIgnoreCase(decoded.mime_type, "audio/")) {
                     try audio.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
@@ -2148,6 +2164,17 @@ pub fn decodeLocalGenerateDataUri(
 ) !DecodedLocalMedia {
     const descriptor = try inspectLocalGenerateDataUri(raw, declared_mime_type);
     try decode_budget.reserve(descriptor.decoded_bytes);
+    if (descriptor.is_data_uri) {
+        var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, raw);
+        errdefer decoded.deinit(alloc);
+        if (decoded.data.len != descriptor.decoded_bytes or
+            !std.ascii.eqlIgnoreCase(mimeEssence(decoded.mime_type), descriptor.mime_type))
+            return error.InvalidGenerationAdmission;
+        alloc.free(decoded.mime_type);
+        const data = decoded.data;
+        decoded = undefined;
+        return .{ .data = data, .mime_type = descriptor.mime_type };
+    }
     const decoded = try alloc.alloc(u8, descriptor.decoded_bytes);
     errdefer alloc.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, descriptor.payload);

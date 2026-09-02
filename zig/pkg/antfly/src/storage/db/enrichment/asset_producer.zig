@@ -167,8 +167,9 @@ pub const Producer = struct {
         batch_mode: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!inference_work.BatchMode = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         capabilities_for_requests: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!?inference_work.InferenceCapabilities = null,
-        /// Complete peak-memory contract for the concrete route selected by
-        /// these requests. Required for invocations containing media.
+        /// Complete peak-memory and result contract for the concrete route
+        /// selected by these requests. Implementations that publish this hook
+        /// apply it to every invocation, independent of how media is encoded.
         invocation_memory_for_requests: ?*const fn (
             ptr: *anyopaque,
             alloc: Allocator,
@@ -198,7 +199,7 @@ pub const Producer = struct {
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
         const requests = [_]Request{request};
-        const plan = try self.mediaInvocationPlan(alloc, &requests);
+        const plan = try self.resolvedInvocationPlan(alloc, &requests);
         if (plan) |resolved| {
             var bounded = inference_work.BoundedInvocationAllocator.init(
                 alloc,
@@ -219,7 +220,7 @@ pub const Producer = struct {
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
-        const plan = try self.mediaInvocationPlan(alloc, requests);
+        const plan = try self.resolvedInvocationPlan(alloc, requests);
         if (plan) |resolved| {
             var bounded = inference_work.BoundedInvocationAllocator.init(
                 alloc,
@@ -265,7 +266,7 @@ pub const Producer = struct {
     /// are conservatively classified as compatibility execution; capability
     /// prediction is never presented as observed telemetry.
     pub fn produceBatchReported(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
-        const plan = try self.mediaInvocationPlan(alloc, requests);
+        const plan = try self.resolvedInvocationPlan(alloc, requests);
         if (plan) |resolved| {
             var bounded = inference_work.BoundedInvocationAllocator.init(
                 alloc,
@@ -298,17 +299,18 @@ pub const Producer = struct {
         return try producedBatchFromOutputs(alloc, requests, items, inference_work.ExecutionReport.compatibility(requests.len));
     }
 
-    fn mediaInvocationPlan(
+    fn resolvedInvocationPlan(
         self: Producer,
         alloc: Allocator,
         requests: []const Request,
     ) !?inference_work.InvocationMemoryPlan {
-        var has_media = false;
-        for (requests) |request| has_media = has_media or request.media.len > 0;
-        if (!has_media) return null;
-        const plan = try self.invocationMemoryForRequests(alloc, requests);
-        try plan.validate();
-        return plan;
+        if (requests.len == 0) return null;
+        if (self.vtable.invocation_memory_for_requests == null) {
+            if (requestsRequireInvocationContract(requests))
+                return error.InferenceInvocationMemoryUnavailable;
+            return null;
+        }
+        return try self.resolveInvocationMemoryForRequests(alloc, requests);
     }
 
     /// Describes how the request set will execute. This preserves the important
@@ -341,17 +343,29 @@ pub const Producer = struct {
         alloc: Allocator,
         requests: []const Request,
     ) !inference_work.InvocationMemoryPlan {
-        const resolve = self.vtable.invocation_memory_for_requests orelse {
-            for (requests) |request| if (request.media.len > 0)
+        if (self.vtable.invocation_memory_for_requests == null) {
+            if (requestsRequireInvocationContract(requests))
                 return error.InferenceInvocationMemoryUnavailable;
             return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
-        };
-        const plan = try resolve(self.ptr, alloc, requests);
-        if (requests.len > 0) {
-            var has_media = false;
-            for (requests) |request| has_media = has_media or request.media.len > 0;
-            if (has_media) try plan.validate();
         }
+        return try self.resolveInvocationMemoryForRequests(alloc, requests);
+    }
+
+    fn resolveInvocationMemoryForRequests(
+        self: Producer,
+        alloc: Allocator,
+        requests: []const Request,
+    ) !inference_work.InvocationMemoryPlan {
+        const resolve = self.vtable.invocation_memory_for_requests.?;
+        var bounded = inference_work.BoundedInvocationAllocator.init(
+            alloc,
+            try invocationResolutionLimit(requests),
+        );
+        const plan = resolve(self.ptr, bounded.allocator(), requests) catch |err| {
+            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            return err;
+        };
+        if (requests.len > 0) try plan.validate();
         return plan;
     }
 
@@ -359,6 +373,35 @@ pub const Producer = struct {
         if (self.vtable.deinit) |deinit_fn| deinit_fn(self.ptr, alloc);
     }
 };
+
+fn requestsRequireInvocationContract(requests: []const Request) bool {
+    for (requests) |request| {
+        if (request.media.len > 0 or request.source_parts_json != null or
+            request.producer_type == .transcriber) return true;
+    }
+    return false;
+}
+
+fn invocationResolutionLimit(requests: []const Request) !usize {
+    var source_bytes: usize = 0;
+    for (requests) |request| {
+        source_bytes = std.math.add(usize, source_bytes, request.config_json.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        source_bytes = std.math.add(usize, source_bytes, request.source_text.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (request.source_parts_json) |parts| source_bytes = std.math.add(
+            usize,
+            source_bytes,
+            parts.len,
+        ) catch return error.InferenceEncodedBytesExceeded;
+    }
+    const parsed = std.math.mul(usize, source_bytes, 8) catch
+        return error.InferenceEncodedBytesExceeded;
+    const control = std.math.mul(usize, @max(requests.len, 1), 4096) catch
+        return error.InferenceEncodedBytesExceeded;
+    return std.math.add(usize, parsed, control) catch
+        error.InferenceEncodedBytesExceeded;
+}
 
 fn invocationAllocatorLimit(
     plan: inference_work.InvocationMemoryPlan,
@@ -495,6 +538,95 @@ test "asset producer enforces media allocator and result contracts at execution"
     try std.testing.expectError(
         error.InferenceInvocationMemoryExceeded,
         producer.produce(std.testing.allocator, request),
+    );
+}
+
+test "asset producer enforces invocation contracts for non-media and source parts" {
+    const Stub = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, request: Request) ![]u8 {
+            return try alloc.dupe(u8, request.source_text);
+        }
+
+        fn memory(_: *anyopaque, _: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 32,
+                .allocator_limit_bytes = 32,
+                .max_result_bytes = 4,
+            };
+        }
+    };
+    var context: u8 = 0;
+    const bounded = Producer{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Stub.produce,
+            .invocation_memory_for_requests = Stub.memory,
+        },
+    };
+    try std.testing.expectError(
+        error.InferenceResultTooLarge,
+        bounded.produce(std.testing.allocator, .{
+            .producer_type = .copy,
+            .config_json = "{}",
+            .source_text = "12345",
+        }),
+    );
+
+    const legacy = Producer{
+        .ptr = &context,
+        .vtable = &.{ .produce = Stub.produce },
+    };
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        legacy.produce(std.testing.allocator, .{
+            .producer_type = .generator,
+            .config_json = "{}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"hello\"}]",
+        }),
+    );
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        legacy.produce(std.testing.allocator, .{
+            .producer_type = .transcriber,
+            .config_json = "{}",
+            .source_text = "file:///tmp/audio.wav",
+        }),
+    );
+}
+
+test "asset producer bounds invocation contract resolution allocations" {
+    const Stub = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) ![]u8 {
+            return try alloc.alloc(u8, 0);
+        }
+
+        fn memory(_: *anyopaque, alloc: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
+            _ = try alloc.alloc(u8, 8192);
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 1,
+                .allocator_limit_bytes = 1,
+                .max_result_bytes = 1,
+            };
+        }
+    };
+    var context: u8 = 0;
+    const producer = Producer{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Stub.produce,
+            .invocation_memory_for_requests = Stub.memory,
+        },
+    };
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryExceeded,
+        producer.produce(std.testing.allocator, .{
+            .producer_type = .copy,
+            .config_json = "{}",
+            .source_text = "small",
+        }),
     );
 }
 

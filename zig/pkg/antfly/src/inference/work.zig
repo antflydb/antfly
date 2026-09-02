@@ -428,9 +428,14 @@ test "bounded invocation allocator enforces peak live bytes and credits frees" {
 
 pub const InlineDataUri = struct {
     mime_type: []const u8,
+    payload: []const u8,
     decoded_size: usize,
-    encoding: enum { base64, percent },
+    encoding: data_uri.Encoding,
 };
+
+pub fn hasDataUriScheme(value: []const u8) bool {
+    return data_uri.hasScheme(value);
+}
 
 /// Validate a complete padded standard-base64 value, including canonical
 /// trailing bits, without allocating its decoded representation.
@@ -450,12 +455,34 @@ pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     if (!value.has_explicit_media_type) return error.InvalidDataURI;
     return .{
         .mime_type = value.media_type_essence,
+        .payload = value.payload,
         .decoded_size = value.decodedSize() catch return error.InvalidDataURI,
-        .encoding = switch (value.encoding) {
-            .base64 => .base64,
-            .percent => .percent,
-        },
+        .encoding = value.encoding,
     };
+}
+
+pub const DecodedInlineDataUri = struct {
+    mime_type: []u8,
+    data: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.mime_type);
+        alloc.free(self.data);
+        self.* = undefined;
+    }
+};
+
+pub fn decodeInlineDataUriAlloc(
+    alloc: std.mem.Allocator,
+    uri: []const u8,
+) !DecodedInlineDataUri {
+    const parsed = parseInlineDataUri(uri) catch return error.InvalidDataURI;
+    if (parsed == null) return error.InvalidDataURI;
+    const decoded = data_uri.decodeAlloc(alloc, uri) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDataURI,
+    };
+    return .{ .mime_type = decoded.media_type, .data = decoded.data };
 }
 
 pub const InferenceCapabilities = struct {

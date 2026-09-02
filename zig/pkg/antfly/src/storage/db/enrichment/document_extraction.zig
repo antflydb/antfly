@@ -244,7 +244,7 @@ pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.Re
 }
 
 pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
-    if (!std.mem.startsWith(u8, source_text, "data:")) return false;
+    if (!scraping.data_uri.hasScheme(source_text)) return false;
     const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
     return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
 }

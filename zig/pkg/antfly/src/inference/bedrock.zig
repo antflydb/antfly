@@ -8,6 +8,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
+const inference_work = @import("work.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -570,7 +571,7 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
             if (std.mem.trim(u8, text, " \t\r\n").len > 0) saw_content = true;
         },
         .binary => |binary| {
-            if (!std.mem.startsWith(u8, binary.mime_type, "image/")) return error.UnsupportedMediaType;
+            if (!std.ascii.startsWithIgnoreCase(binary.mime_type, "image/")) return error.UnsupportedMediaType;
             if (image_seen) return error.TooManyImages;
             image_seen = true;
             const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
@@ -636,7 +637,7 @@ fn cohereV4Body(alloc: std.mem.Allocator, parts: []const template_mod.ContentPar
             try content.append(.{ .object = obj });
         },
         .binary => |binary| {
-            if (!std.mem.startsWith(u8, binary.mime_type, "image/")) return error.UnsupportedMediaType;
+            if (!std.ascii.startsWithIgnoreCase(binary.mime_type, "image/")) return error.UnsupportedMediaType;
             const data_uri = try imageDataUriAlloc(alloc, binary.mime_type, binary.data);
             var image_url = std.json.ObjectMap.empty;
             errdefer image_url.deinit(alloc);
@@ -693,23 +694,20 @@ fn imageDataUriAlloc(alloc: std.mem.Allocator, mime_type: []const u8, data: []co
 }
 
 fn bedrockImageDataUri(alloc: std.mem.Allocator, url: []const u8) !template_mod.ContentPart.BinaryContent {
-    if (!std.mem.startsWith(u8, url, "data:")) return error.RemoteMediaRequired;
-    const after_data = url[5..];
-    const base64_marker = ";base64,";
-    const sep_idx = std.mem.indexOf(u8, after_data, base64_marker) orelse return error.InvalidDataURI;
-    const mime_type_slice = after_data[0..sep_idx];
-    if (!std.mem.startsWith(u8, mime_type_slice, "image/")) return error.UnsupportedMediaType;
-
-    const mime_type = try alloc.dupe(u8, mime_type_slice);
-    errdefer alloc.free(mime_type);
-
-    const encoded = after_data[sep_idx + base64_marker.len ..];
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidDataURI;
-    const data = try alloc.alloc(u8, decoded_len);
-    errdefer alloc.free(data);
-    std.base64.standard.Decoder.decode(data, encoded) catch return error.InvalidDataURI;
-
-    return .{ .mime_type = mime_type, .data = data };
+    if (!inference_work.hasDataUriScheme(url)) return error.RemoteMediaRequired;
+    var decoded = inference_work.decodeInlineDataUriAlloc(alloc, url) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDataURI,
+    };
+    errdefer decoded.deinit(alloc);
+    if (!std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/"))
+        return error.UnsupportedMediaType;
+    const result = template_mod.ContentPart.BinaryContent{
+        .mime_type = decoded.mime_type,
+        .data = decoded.data,
+    };
+    decoded = undefined;
+    return result;
 }
 
 fn flattenPartsToText(alloc: std.mem.Allocator, parts: []const template_mod.ContentPart) ![]u8 {
@@ -1588,6 +1586,17 @@ test "titan multimodal body accepts data URI and rejects remote URL" {
 
 test "cohere v4 body accepts data URI and rejects remote URL" {
     try testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
+}
+
+test "bedrock image media uses shared RFC 2397 decoding" {
+    const alloc = std.testing.allocator;
+    const binary = try bedrockImageDataUri(alloc, "DATA:IMAGE/PNG,%01%02");
+    defer {
+        alloc.free(@constCast(binary.mime_type));
+        alloc.free(@constCast(binary.data));
+    }
+    try std.testing.expectEqualStrings("IMAGE/PNG", binary.mime_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, binary.data);
 }
 
 test "titan multimodal body combines text and rejects multiple images" {

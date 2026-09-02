@@ -768,7 +768,7 @@ fn appendVertexTextPart(alloc: Allocator, parts: *std.json.Array, text: []const 
 fn appendVertexImagePart(alloc: Allocator, parts: *std.json.Array, url: []const u8) !void {
     var obj = std.json.ObjectMap.empty;
     errdefer obj.deinit(alloc);
-    if (std.mem.startsWith(u8, url, "data:")) {
+    if (data_uri.hasScheme(url)) {
         const parsed = parseDataUriImage(url) orelse return error.InvalidReaderConfig;
         var inline_data = std.json.ObjectMap.empty;
         errdefer inline_data.deinit(alloc);

@@ -297,7 +297,7 @@ fn downloadContentOutcomeAllocImpl(
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
     if (maybe_context) |context| try context.io.checkCancel();
-    if (uri.len >= "data:".len and std.ascii.eqlIgnoreCase(uri[0.."data:".len], "data:")) {
+    if (data_uri.hasScheme(uri)) {
         const maybe_ceiling: ?DownloadCeiling = if (maybe_context) |context|
             try DownloadCeiling.init(context, security)
         else
@@ -363,36 +363,7 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
 }
 
 pub fn dataUriDecodedSize(uri: []const u8) !usize {
-    const prefix = "data:";
-    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
-
-    const payload = uri[prefix.len..];
-    const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
-    const meta = payload[0..comma];
-    const body = payload[comma + 1 ..];
-
-    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
-        return std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
-    }
-
-    return try percentDecodedLen(body);
-}
-
-fn percentDecodedLen(value: []const u8) !usize {
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < value.len) {
-        if (value[i] == '%') {
-            if (i + 2 >= value.len) return error.InvalidDataUri;
-            _ = std.fmt.charToDigit(value[i + 1], 16) catch return error.InvalidDataUri;
-            _ = std.fmt.charToDigit(value[i + 2], 16) catch return error.InvalidDataUri;
-            i += 3;
-        } else {
-            i += 1;
-        }
-        len += 1;
-    }
-    return len;
+    return (try data_uri.parseRequired(uri)).decodedSize();
 }
 
 fn validateDownloadSize(decoded_len: usize, security: ?*const ContentSecurityConfig) !void {

@@ -852,6 +852,54 @@ document. They are architectural requirements, not Florence-specific cleanup:
     the payload explicitly release the MIME allocation; consumers that retain
     both transfer both. This keeps request parsing allocation-failure safe while
     preserving parameter-only RFC media types such as `;charset=utf-8`.
+87. **Invocation enforcement depended on the `media` field instead of the
+    effective input.** Generator and extractor media can live in
+    `source_parts_json`, and transcription audio lives in `source_text`; copy
+    and document extraction also return potentially large results without a
+    model media array. A runtime that publishes an invocation contract now
+    applies it to every nonempty producer call. Legacy implementations fail
+    closed when the request contains borrowed media, structured content parts,
+    or transcription input. Result ceilings consequently protect all producer
+    families, including copy and document extraction, rather than only visual
+    model calls. A planned batch must share one producer task, configuration,
+    and attachment representation; mixed work is repartitioned by its caller
+    rather than borrowing the first item's route contract.
+88. **URL-only embedding items bypassed the memory and result contract.** The
+    part-item embedder previously resolved a plan only after finding a binary
+    attachment. It now resolves the concrete route before sanitization for
+    text, network URL, inline data URI, and binary items alike. Sanitized text,
+    serialized URL/content-part upper bounds, transport copies, provider
+    allocations, returned cardinality, vector dimensions, and aggregate vector
+    bytes all execute under one freeing live-allocation ceiling. A URL-only
+    embedder without a route plan fails closed.
+89. **Data-URI classification could disagree with RFC 2397 decoding.** Several
+    call sites tested a case-sensitive `data:` prefix before calling the shared
+    case-insensitive parser. Uppercase schemes could therefore be classified as
+    network URLs or bare base64, bypassing the admission calculation that later
+    decoding required. Scheme recognition now belongs to the shared parser and
+    is used by readers, generators, embedders, templates, transcription,
+    Bedrock/Vertex adapters, and inference-node request parsing. Local
+    generation preflight and materialization use the same parsed payload,
+    encoding, decoded size, and MIME essence; borrowed attachment MIME
+    comparisons are also essence-based and case-insensitive.
+90. **Route-plan resolution allocated before the invocation was bounded.** A
+    provider config or structured input could force JSON parsing and route
+    construction on the unrestricted caller allocator before the executor
+    ceiling existed. Producer contract resolution now runs through a separate
+    bounded allocator derived with overflow-checked arithmetic from the exact
+    config, source, structured-parts, and item counts. Dense part sanitization
+    similarly starts only after its route plan and preprocessing allowance are
+    established. Exceeding either pre-execution ceiling returns the same
+    invocation-memory failure used during execution.
+91. **Logical result policy and HTTP wire limits described different maximums.**
+    A configured logical result can expand to six bytes per byte when encoded
+    as a JSON string, while an unrelated 64-MiB transport clamp could make the
+    advertised logical limit impossible. Remote producer planning now derives
+    both limits together: the response body reserves a conservative six-times
+    JSON expansion plus its envelope, and the logical result ceiling is reduced
+    when the caller/client/provider outer cap is smaller. Execution validates
+    the effective logical ceiling, so a request is never admitted under a
+    result promise its transport cannot carry.
 
 ### Post-review implementation contract
 
@@ -875,12 +923,28 @@ The hardening above follows these long-term rules:
   capabilities. Linked callbacks charge borrowed bytes, base64 transports
   charge exact expansion, and data-URI adapters charge the complete URI plus
   downstream serialization copy. The plan also contains hard allocator and
-  result ceilings. Every public executor entry point containing borrowed media
-  applies those ceilings even when invoked outside the PDF scheduler. Provider
+  result ceilings. Every public producer invocation from a
+  contract-publishing runtime and every part-item embedding invocation applies
+  those ceilings even when invoked outside the PDF scheduler. Structured JSON
+  parts, inline data URIs, URL-only inputs, transcription sources, and
+  non-model producers do not bypass this boundary. Provider
   wire ceilings and process resident ceilings are distinct: render planning
   reserves retained raw media, one concrete transport body, and the complete
   route-specific fixed peak for envelopes, responses, parsing, typed results,
   and bounded control storage against the same operation grant.
+- Route resolution and input normalization are themselves admitted work. They
+  run under small request-derived preprocessing ceilings before model/provider
+  execution begins; an implementation cannot allocate an unbounded parse tree
+  in order to discover what its later memory limit would have been.
+- Inline media has one RFC 2397 authority. Scheme and encoding markers are
+  case-insensitive, payload validation and decoded sizing precede allocation,
+  MIME policy compares normalized essences, and materialization consumes the
+  same parse contract used by admission.
+- A result policy names logical retained bytes. Remote transport planning maps
+  that policy to a conservative encoded JSON response ceiling and lowers the
+  logical allowance when an outer client or provider limit is tighter. Local
+  and remote result validation therefore enforce achievable limits in the same
+  unit.
 - Every logical result carries the request identity. Remote indexed responses
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.
@@ -1076,6 +1140,14 @@ The hardening above follows these long-term rules:
     process that executes it; provider response ceilings are operation-scoped;
     and all inline-data consumers share the RFC 2397 parser while keeping MIME
     acceptance and ownership as explicit task-layer contracts.
+34. **Implemented after representation review:** producer plans cover every
+    runtime invocation rather than only the binary `media` field, transcription
+    and structured-part routes fail closed without a contract, URL-only dense
+    embedding is bounded before normalization, route discovery has its own
+    request-derived allocation ceiling, and logical output policy is reconciled
+    with worst-case JSON wire expansion. Batches with different tasks,
+    configurations, or attachment representations cannot inherit the first
+    item's plan.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

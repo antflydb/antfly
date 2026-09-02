@@ -5094,7 +5094,7 @@ pub const Node = struct {
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
         var media_shape: RequestMediaAdmissionShape = .{};
-        if (std.mem.startsWith(u8, request.url, "data:"))
+        if (data_uri_mod.hasScheme(request.url))
             media_shape.addInline(request.url.len, false)
         else
             media_shape.has_remote = true;
@@ -5115,7 +5115,7 @@ pub const Node = struct {
         var downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, request.url, &media_budget);
         defer downloaded.deinit(allocator);
         const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
-        const resident_bytes = if (std.mem.startsWith(u8, request.url, "data:"))
+        const resident_bytes = if (data_uri_mod.hasScheme(request.url))
             std.math.add(usize, media_budget.used_bytes, downloaded.data.len) catch std.math.maxInt(usize)
         else
             downloaded.data.len;
@@ -8295,12 +8295,12 @@ pub const Node = struct {
                                 errdefer if (owns_decoded_data) allocator.free(decoded_payload.data);
                                 if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type))
                                     return error.GenerateMediaDataMimeTypeMismatch;
-                                if (std.mem.startsWith(u8, mime_value.string, "image/")) {
+                                if (std.ascii.startsWithIgnoreCase(mime_value.string, "image/")) {
                                     try decoded_images.append(allocator, decoded_payload.data);
                                     owns_decoded_data = false;
                                     try msg_images.append(allocator, decoded_payload.data);
                                     try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
-                                } else if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
+                                } else if (std.ascii.startsWithIgnoreCase(mime_value.string, "audio/")) {
                                     try decoded_audio.append(allocator, decoded_payload.data);
                                     owns_decoded_data = false;
                                     try msg_audio.append(allocator, decoded_payload.data);
@@ -9786,7 +9786,7 @@ pub const Node = struct {
                         else
                             null;
                         const url = url_str orelse return error.UnsupportedContentPartType;
-                        if (std.mem.startsWith(u8, url, "data:")) {
+                        if (data_uri_mod.hasScheme(url)) {
                             const decoded = decodeDataUriWithBudget(allocator, url, media_budget) catch |err| switch (err) {
                                 error.OutOfMemory, error.RemoteContentTooLarge => return err,
                                 else => return error.InvalidImageDataUri,
@@ -9804,7 +9804,7 @@ pub const Node = struct {
                         const data_val = obj.get("data") orelse return error.UnsupportedContentPartType;
                         const mime_val = obj.get("mime_type") orelse return error.UnsupportedContentPartType;
                         if (data_val != .string or mime_val != .string) return error.UnsupportedContentPartType;
-                        if (!std.mem.startsWith(u8, mime_val.string, "image/")) return error.UnsupportedContentPartType;
+                        if (!std.ascii.startsWithIgnoreCase(mime_val.string, "image/")) return error.UnsupportedContentPartType;
                         const decoded_payload = decodeMediaDataWithBudget(allocator, data_val.string, media_budget) catch |err| switch (err) {
                             error.OutOfMemory, error.RemoteContentTooLarge => return err,
                             else => return error.UnsupportedContentPartType,
@@ -11509,7 +11509,7 @@ pub const Node = struct {
             error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
             error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = if (std.mem.startsWith(u8, body.audio, "data:")) "invalid audio data URI" else "invalid base64 audio data",
+                .message = if (data_uri_mod.hasScheme(body.audio)) "invalid audio data URI" else "invalid base64 audio data",
             }),
             error.OutOfMemory => return err,
         };
@@ -13248,7 +13248,7 @@ fn appendDirectExtractionContent(
                             var owns_decoded = true;
                             errdefer if (owns_decoded) allocator.free(decoded.data);
                             if (decoded.mime_type) |mime| {
-                                if (!std.mem.startsWith(u8, mime, "image/")) return error.UnsupportedInput;
+                                if (!std.ascii.startsWithIgnoreCase(mime, "image/")) return error.UnsupportedInput;
                             }
                             try out.images.append(allocator, decoded.data);
                             try out.owned_images.append(allocator, decoded.data);
@@ -13297,7 +13297,7 @@ fn appendDownloadedExtractionImage(
     const downloaded = try downloadRemoteContentWithBudgetForRequest(node, allocator, url, media_budget);
     defer allocator.free(downloaded.content_type);
     errdefer allocator.free(downloaded.data);
-    if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
+    if (!std.ascii.startsWithIgnoreCase(downloaded.content_type, "image/")) return error.UnsupportedInput;
     try out.images.append(allocator, downloaded.data);
     try out.owned_images.append(allocator, downloaded.data);
 }
@@ -19014,7 +19014,7 @@ fn appendDenseEmbedImageUrl(
     errdefer allocator.free(downloaded.data);
     defer allocator.free(downloaded.content_type);
 
-    if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
+    if (!std.ascii.startsWithIgnoreCase(downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
     try parsed.images.append(allocator, .{
         .index = index,
         .bytes = downloaded.data,
@@ -19032,7 +19032,7 @@ fn appendDenseEmbedBinary(
     owned: bool,
 ) !void {
     if (bytes.len == 0) return error.InvalidMediaBase64;
-    if (std.mem.startsWith(u8, mime_type, "image/")) {
+    if (std.ascii.startsWithIgnoreCase(mime_type, "image/")) {
         if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
         try parsed.images.append(allocator, .{
             .index = index,
@@ -19043,7 +19043,7 @@ fn appendDenseEmbedBinary(
         return;
     }
 
-    if (std.mem.startsWith(u8, mime_type, "audio/")) {
+    if (std.ascii.startsWithIgnoreCase(mime_type, "audio/")) {
         if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
         try parsed.audio.append(allocator, .{
             .index = index,
@@ -20748,7 +20748,7 @@ const RequestMediaAdmissionShape = struct {
     }
 
     fn addImageUrlSlice(self: *RequestMediaAdmissionShape, source: []const u8) void {
-        if (std.mem.startsWith(u8, source, "data:")) {
+        if (data_uri_mod.hasScheme(source)) {
             self.addInline(source.len, true);
             return;
         }
@@ -20789,8 +20789,8 @@ fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDe
         .image_url => |url| shape.addImageUrlSlice(url),
         .media => |media| {
             if (media.data.len == 0) return error.InvalidMediaBase64;
-            const is_image = std.mem.startsWith(u8, media.mime_type, "image/");
-            const is_audio = std.mem.startsWith(u8, media.mime_type, "audio/");
+            const is_image = std.ascii.startsWithIgnoreCase(media.mime_type, "image/");
+            const is_audio = std.ascii.startsWithIgnoreCase(media.mime_type, "audio/");
             if (!is_image and !is_audio) return error.UnsupportedMediaMimeType;
             has_audio = has_audio or is_audio;
             shape.addBorrowed(media.data.len, is_image);
@@ -20822,7 +20822,7 @@ fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionSha
             const data = part.object.get("data") orelse continue;
             const mime = part.object.get("mime_type") orelse continue;
             if (data != .string or mime != .string) continue;
-            shape.addInline(data.string.len, std.mem.startsWith(u8, mime.string, "image/"));
+            shape.addInline(data.string.len, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
         }
     }
     return shape;
@@ -20844,7 +20844,7 @@ fn denseEmbedRequestMediaShape(input: std.json.Value) RequestMediaAdmissionShape
         const data = part.object.get("data") orelse continue;
         const mime = part.object.get("mime_type") orelse continue;
         if (data != .string or mime != .string) continue;
-        shape.addInline(data.string.len, std.mem.startsWith(u8, mime.string, "image/"));
+        shape.addInline(data.string.len, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
     }
     return shape;
 }
@@ -20866,7 +20866,7 @@ fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestM
             if (!std.mem.eql(u8, part_type.string, "media")) continue;
             const data = part.object.get("data") orelse continue;
             const mime = part.object.get("mime_type") orelse continue;
-            if (data != .string or mime != .string or !std.mem.startsWith(u8, mime.string, "image/")) continue;
+            if (data != .string or mime != .string or !std.ascii.startsWithIgnoreCase(mime.string, "image/")) continue;
             shape.addInline(data.string.len, true);
         }
     }
@@ -20988,7 +20988,7 @@ fn downloadRemoteContentWithBudgetForRequestOptionalContext(
     // data: URLs are already resident in the request body. Enforce the
     // encoded-source ceiling before allocating their decoded payload; remote
     // sources continue to charge the downloaded payload bytes.
-    const inline_budget_bytes: ?usize = if (std.mem.startsWith(u8, url, "data:"))
+    const inline_budget_bytes: ?usize = if (data_uri_mod.hasScheme(url))
         encodedMediaBudgetSize(url) catch null
     else
         null;
@@ -21262,7 +21262,7 @@ fn boundedReadContentSecurity(
     // Only the in-process enrichment bridge can assert trusted_internal.
     // Public callers can also submit data URIs, so URL shape alone must never
     // weaken the configured content policy.
-    if (inline_content_trust == .trusted_internal and std.mem.startsWith(u8, url, "data:")) {
+    if (inline_content_trust == .trusted_internal and data_uri_mod.hasScheme(url)) {
         bounded.max_download_size_bytes = remaining_bytes;
     } else {
         bounded.max_download_size_bytes = if (bounded.max_download_size_bytes) |limit|
@@ -21308,7 +21308,7 @@ fn readInlineSourceByteCap(self: *const Node) usize {
 }
 
 fn addReadInlineSourceBytes(current: usize, url: []const u8, max_bytes: usize) !usize {
-    if (!std.mem.startsWith(u8, url, "data:")) return current;
+    if (!data_uri_mod.hasScheme(url)) return current;
     const total = std.math.add(usize, current, url.len) catch return error.ReadBatchTooLarge;
     if (total > max_bytes) return error.ReadBatchTooLarge;
     return total;
@@ -21605,7 +21605,7 @@ fn decodeDataUri(allocator: std.mem.Allocator, uri: []const u8) !DecodedDataUri 
 }
 
 fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataUri {
-    if (std.ascii.startsWithIgnoreCase(data, "data:")) return try decodeDataUri(allocator, data);
+    if (data_uri_mod.hasScheme(data)) return try decodeDataUri(allocator, data);
 
     const decoded_len = try data_uri_mod.validateCanonicalStandardBase64(data);
     const decoded = try allocator.alloc(u8, decoded_len);
@@ -21618,7 +21618,7 @@ fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataU
 }
 
 fn decodedMediaDataSize(data: []const u8) !usize {
-    if (std.ascii.startsWithIgnoreCase(data, "data:")) return (try data_uri_mod.parseRequired(data)).decodedSize();
+    if (data_uri_mod.hasScheme(data)) return (try data_uri_mod.parseRequired(data)).decodedSize();
     return data_uri_mod.validateCanonicalStandardBase64(data);
 }
 
@@ -21626,7 +21626,7 @@ fn encodedMediaBudgetSize(data: []const u8) !usize {
     // Size data URIs independently of their transfer encoding. The scraping
     // layer accepts both base64 and percent-encoded payloads, and both must be
     // admitted by their resident request-body footprint before decoding.
-    if (std.ascii.startsWithIgnoreCase(data, "data:")) {
+    if (data_uri_mod.hasScheme(data)) {
         const comma = std.mem.indexOfScalar(u8, data, ',') orelse return error.InvalidDataUri;
         return if (comma + 1 == data.len) 0 else data.len;
     }

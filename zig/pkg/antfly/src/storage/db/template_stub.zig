@@ -125,7 +125,7 @@ pub fn textToParts(alloc: Allocator, text: []const u8) ![]ContentPart {
         };
 
         const url = cleaned[url_start..marker_end];
-        if (std.mem.startsWith(u8, url, "data:")) {
+        if (std.ascii.startsWithIgnoreCase(url, "data:")) {
             if (parseDataURI(alloc, url)) |binary| {
                 try parts.append(alloc, .{ .binary = binary });
             } else |_| {
@@ -379,7 +379,7 @@ pub fn containsErrorDirective(text: []const u8) bool {
 }
 
 fn parseDataURI(alloc: Allocator, uri: []const u8) !ContentPart.BinaryContent {
-    if (!std.mem.startsWith(u8, uri, "data:")) return error.InvalidDataURI;
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return error.InvalidDataURI;
 
     const after_data = uri[5..];
     const base64_marker = ";base64,";

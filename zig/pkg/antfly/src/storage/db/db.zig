@@ -101,6 +101,7 @@ else
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
+const inference_work = @import("../../inference/work.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const portable_backup = @import("../portable_backup.zig");
@@ -52604,7 +52605,7 @@ const ImageDecodingPartsEmbedder = struct {
                 return try dupeTestVector(alloc, &.{ 0.0, 1.0, 0.0 });
             }
 
-            if (std.mem.startsWith(u8, binary.mime_type, "image/")) return error.EmbedRequestFailed;
+            if (std.ascii.startsWithIgnoreCase(binary.mime_type, "image/")) return error.EmbedRequestFailed;
         }
 
         return error.EmbedRequestFailed;
@@ -62256,7 +62257,23 @@ const TestAssetProducer = struct {
     fn producer(self: *@This()) asset_producer_mod.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce },
+            .vtable = &.{
+                .produce = produce,
+                .invocation_memory_for_requests = invocationMemory,
+            },
+        };
+    }
+
+    fn invocationMemory(
+        _: *anyopaque,
+        _: Allocator,
+        _: []const asset_producer_mod.Request,
+    ) !inference_work.InvocationMemoryPlan {
+        return .{
+            .attachment_transport = .data_uri,
+            .fixed_bytes = 16 << 20,
+            .allocator_limit_bytes = 16 << 20,
+            .max_result_bytes = 8 << 20,
         };
     }
 

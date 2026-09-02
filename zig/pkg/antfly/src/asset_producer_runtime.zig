@@ -38,6 +38,9 @@ const invocation_response_resident_multiplier: usize = 4;
 const invocation_nonmedia_allocator_multiplier: usize = 8;
 const invocation_control_bytes_per_item: usize = 4096;
 const default_provider_response_envelope_bytes: usize = 1 << 20;
+// A JSON string may encode one logical byte as a six-byte \u00XX escape. Use
+// the task-neutral worst case until a provider publishes a tighter wire codec.
+const provider_json_result_wire_multiplier: usize = 6;
 
 pub const ResultLimits = struct {
     reader_bytes_per_item: usize = 256 << 10,
@@ -96,6 +99,61 @@ test "reader execution report preserves mixed native and fallback completion" {
     try std.testing.expectEqual(@as(usize, 1), report.fallback_items);
     try std.testing.expectEqual(@as(usize, 2), report.native_batches);
     try std.testing.expectEqualStrings("native_batch_failed", report.fallback_reason.?);
+}
+
+test "asset producer runtime derives coherent logical and wire result ceilings" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{
+        .keep_alive = false,
+        .max_response_size = 64,
+    });
+    defer client.deinit();
+    var limits = ResultLimits{};
+    limits.generator_bytes_per_item = 10;
+    var runtime = Runtime.initWithOptions(alloc, &client, .{
+        .max_provider_response_bytes = 64,
+        .provider_response_envelope_bytes = 8,
+        .result_limits = limits,
+    });
+    defer runtime.deinit();
+
+    const request = asset_producer.Request{
+        .producer_type = .generator,
+        .config_json = "{\"provider\":\"openai\",\"model\":\"vision\",\"url\":\"https://example.test/v1\"}",
+        .source_text = "prompt",
+    };
+    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(@as(usize, 9), plan.max_result_bytes);
+    try std.testing.expectEqual(@as(usize, 64), runtime.responseLimitForTask(.generator, 1));
+    var different_task = request;
+    different_task.producer_type = .copy;
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        runtime.producer().invocationMemoryForRequests(alloc, &.{ request, different_task }),
+    );
+}
+
+test "asset producer runtime applies result ceilings to non-model producers" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var limits = ResultLimits{};
+    limits.copy_bytes_per_item = 4;
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .result_limits = limits });
+    defer runtime.deinit();
+
+    try std.testing.expectError(
+        error.InferenceResultTooLarge,
+        runtime.producer().produce(alloc, .{
+            .producer_type = .copy,
+            .config_json = "",
+            .source_text = "12345",
+        }),
+    );
 }
 
 pub const Runtime = struct {
@@ -217,12 +275,10 @@ pub const Runtime = struct {
     ) !inference_work.InvocationMemoryPlan {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (requests.len == 0) return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
-        if (!requestsShareConfig(requests)) return error.InferenceInvocationMemoryUnavailable;
+        if (!requestsShareRoute(requests)) return error.InferenceInvocationMemoryUnavailable;
 
-        var has_media = false;
         var nonmedia_bytes: usize = 0;
         for (requests) |request| {
-            has_media = has_media or request.media.len > 0;
             nonmedia_bytes = std.math.add(usize, nonmedia_bytes, request.config_json.len) catch
                 return error.InferenceEncodedBytesExceeded;
             nonmedia_bytes = std.math.add(usize, nonmedia_bytes, request.source_text.len) catch
@@ -230,10 +286,9 @@ pub const Runtime = struct {
             if (request.source_parts_json) |parts| nonmedia_bytes = std.math.add(usize, nonmedia_bytes, parts.len) catch
                 return error.InferenceEncodedBytesExceeded;
         }
-        if (!has_media) return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = nonmedia_bytes };
-
         var remote = false;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
+            .copy, .document_extraction => .borrowed_binary,
             .reader => blk: {
                 var parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
                     .allocate = .alloc_always,
@@ -274,9 +329,27 @@ pub const Runtime = struct {
                 }
                 break :blk extractorAttachmentTransport(parsed);
             },
-            // Audio and future family adapters must publish an exact route
-            // before they can participate in bounded media planning.
-            .transcriber, .copy, .document_extraction => return error.InferenceInvocationMemoryUnavailable,
+            .transcriber => blk: {
+                var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                remote = !isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl());
+                if (!remote) {
+                    const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    if (local.transcribe_audio == null) return error.InferenceInvocationMemoryUnavailable;
+                }
+                const inline_source = inference_work.hasDataUriScheme(requests[0].source_text);
+                for (requests[1..]) |request| {
+                    if (inference_work.hasDataUriScheme(request.source_text) != inline_source)
+                        return error.InferenceInvocationMemoryUnavailable;
+                }
+                break :blk if (inline_source)
+                    .data_uri
+                else
+                    .borrowed_binary;
+            },
         };
 
         var fixed = std.math.mul(usize, nonmedia_bytes, invocation_nonmedia_allocator_multiplier) catch
@@ -284,12 +357,12 @@ pub const Runtime = struct {
         const control = std.math.mul(usize, requests.len, invocation_control_bytes_per_item) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
-        const results = std.math.mul(
-            usize,
-            requests.len,
-            self.result_limits.forProducer(requests[0].producer_type),
-        ) catch
-            return error.InferenceEncodedBytesExceeded;
+        const configured_results = try self.configuredResultLimit(requests[0].producer_type, requests.len);
+        const results = if (remote)
+            self.remoteLogicalResultLimit(requests[0].producer_type, requests.len)
+        else
+            configured_results;
+        if (results == 0) return error.InvalidInferenceInvocationMemory;
         fixed = std.math.add(usize, fixed, results) catch return error.InferenceEncodedBytesExceeded;
         var allocator_limit = fixed;
         if (remote) {
@@ -321,17 +394,43 @@ pub const Runtime = struct {
         producer_type: asset_producer.ProducerType,
         item_count: usize,
     ) usize {
-        const result_bytes = std.math.mul(
+        const result_bytes = self.configuredResultLimit(producer_type, item_count) catch
+            std.math.maxInt(usize);
+        const encoded_results = std.math.mul(
             usize,
-            @max(item_count, 1),
-            self.result_limits.forProducer(producer_type),
+            result_bytes,
+            provider_json_result_wire_multiplier,
         ) catch std.math.maxInt(usize);
         const envelope = std.math.add(
             usize,
-            result_bytes,
+            encoded_results,
             self.provider_response_envelope_bytes,
         ) catch std.math.maxInt(usize);
         return @min(self.http.maxResponseSize(), @min(self.max_provider_response_bytes, envelope));
+    }
+
+    fn configuredResultLimit(
+        self: *const Runtime,
+        producer_type: asset_producer.ProducerType,
+        item_count: usize,
+    ) !usize {
+        return std.math.mul(
+            usize,
+            @max(item_count, 1),
+            self.result_limits.forProducer(producer_type),
+        ) catch error.InferenceEncodedBytesExceeded;
+    }
+
+    fn remoteLogicalResultLimit(
+        self: *const Runtime,
+        producer_type: asset_producer.ProducerType,
+        item_count: usize,
+    ) usize {
+        const configured = self.configuredResultLimit(producer_type, item_count) catch
+            std.math.maxInt(usize);
+        const response_limit = self.responseLimitForTask(producer_type, item_count);
+        const wire_capacity = response_limit -| self.provider_response_envelope_bytes;
+        return @min(configured, wire_capacity / provider_json_result_wire_multiplier);
     }
 
     fn requestForegroundBounded(self: *Runtime, alloc: Allocator, request: asset_producer.Request) !bool {
@@ -394,7 +493,7 @@ pub const Runtime = struct {
 
     fn capabilitiesForRequests(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        if (requests.len == 0 or !requestsShareConfig(requests)) return null;
+        if (requests.len == 0 or !requestsShareRoute(requests)) return null;
         return switch (requests[0].producer_type) {
             .reader => blk: {
                 var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
@@ -500,15 +599,16 @@ pub const Runtime = struct {
         };
     }
 
-    fn requestsShareConfig(requests: []const asset_producer.Request) bool {
+    fn requestsShareRoute(requests: []const asset_producer.Request) bool {
         for (requests[1..]) |request| {
+            if (request.producer_type != requests[0].producer_type) return false;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return false;
         }
         return true;
     }
 
     fn canReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        if (!requestsShareConfig(requests)) return false;
+        if (!requestsShareRoute(requests)) return false;
         const uses_encoded_media = requests[0].media.len > 0;
         if (uses_encoded_media and !requests[0].inline_media_trusted) return false;
         for (requests[1..]) |request| {
@@ -590,7 +690,7 @@ pub const Runtime = struct {
     }
 
     fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        if (!requestsShareConfig(requests)) return false;
+        if (!requestsShareRoute(requests)) return false;
         var all_have_media = true;
         for (requests) |request| {
             if (request.media.len > 0 and !request.inline_media_trusted) return false;
@@ -614,7 +714,7 @@ pub const Runtime = struct {
     }
 
     fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        if (!requestsShareConfig(requests)) return false;
+        if (!requestsShareRoute(requests)) return false;
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
         if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
             capabilities.batch.mode == .none) return false;
@@ -4528,6 +4628,21 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     defer runtime.deinit();
     const producer = runtime.producer();
+
+    const inline_audio = asset_producer.Request{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\"}",
+        .source_text = "DATA:audio/wav;BASE64,AQ==",
+        .content_type = "text/plain",
+    };
+    const inline_plan = try producer.invocationMemoryForRequests(alloc, &.{inline_audio});
+    try std.testing.expectEqual(inference_work.AttachmentTransport.data_uri, inline_plan.attachment_transport);
+    var remote_audio = inline_audio;
+    remote_audio.source_text = "file:///tmp/audio.wav";
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        producer.invocationMemoryForRequests(alloc, &.{ inline_audio, remote_audio }),
+    );
 
     const requests = [_]asset_producer.Request{
         .{

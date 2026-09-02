@@ -152,65 +152,66 @@ pub const DenseEmbedder = struct {
         dims: u32,
     ) ![]const []const f32 {
         const embed_items = self.dense_embed_part_items_fn orelse return error.UnsupportedEmbeddingProvider;
-        var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, items);
-        defer sanitized.deinit(alloc);
+        const planning_mime = try invocationPlanningMime(items);
+        const invocation_plan = try self.partInvocationMemory(embedding_name, items.len, planning_mime, dims);
+        var transport_copy_bytes: usize = 0;
+        for (items) |item| switch (item) {
+            .binary => |binary| {
+                const resident = try invocation_plan.attachment_transport.peakResidentSize(binary.data.len, binary.mime_type.len);
+                transport_copy_bytes = std.math.add(
+                    usize,
+                    transport_copy_bytes,
+                    resident - binary.data.len,
+                ) catch return error.InferenceEncodedBytesExceeded;
+            },
+            else => {},
+        };
+        var invocation_limit = std.math.add(
+            usize,
+            invocation_plan.allocator_limit_bytes,
+            transport_copy_bytes,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        invocation_limit = std.math.add(
+            usize,
+            invocation_limit,
+            try contentPartPreparationBytes(items),
+        ) catch return error.InferenceEncodedBytesExceeded;
+        var bounded = inference_work.BoundedInvocationAllocator.init(alloc, invocation_limit);
+        const invocation_alloc = bounded.allocator();
+        var sanitized = sanitizeContentPartsForEmbeddingAlloc(invocation_alloc, items) catch |err| {
+            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            return err;
+        };
+        defer sanitized.deinit(invocation_alloc);
         const safe_items = sanitized.partsSlice();
-        const media_mime = try homogeneousInlineMediaMime(safe_items);
-        var invocation_plan: ?DensePartInvocationMemory = null;
-        var bounded: inference_work.BoundedInvocationAllocator = undefined;
-        const invocation_alloc = if (media_mime) |mime_type| blk: {
-            const plan = try self.partInvocationMemory(embedding_name, items.len, mime_type, dims);
-            invocation_plan = plan;
-            var transport_copy_bytes: usize = 0;
-            for (safe_items) |item| switch (item) {
-                .binary => |binary| {
-                    const resident = try plan.attachment_transport.peakResidentSize(binary.data.len, binary.mime_type.len);
-                    transport_copy_bytes = std.math.add(
-                        usize,
-                        transport_copy_bytes,
-                        resident - binary.data.len,
-                    ) catch return error.InferenceEncodedBytesExceeded;
-                },
-                else => {},
-            };
-            bounded = inference_work.BoundedInvocationAllocator.init(
-                alloc,
-                std.math.add(usize, plan.allocator_limit_bytes, transport_copy_bytes) catch
-                    return error.InferenceEncodedBytesExceeded,
-            );
-            break :blk bounded.allocator();
-        } else alloc;
         const vectors = embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims) catch |err| {
-            if (media_mime != null and bounded.limit_exceeded)
-                return error.InferenceInvocationMemoryExceeded;
+            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
         if (vectors.len != items.len) {
             freeDenseEmbeddingBatch(alloc, vectors);
             return error.InvalidEmbeddingResponse;
         }
-        if (media_mime != null) {
-            const expected_values = std.math.mul(usize, items.len, @as(usize, dims)) catch {
-                freeDenseEmbeddingBatch(alloc, vectors);
-                return error.InvalidEmbeddingResponse;
-            };
-            var actual_values: usize = 0;
-            for (vectors) |vector| actual_values = std.math.add(usize, actual_values, vector.len) catch {
-                freeDenseEmbeddingBatch(alloc, vectors);
-                return error.InvalidEmbeddingResponse;
-            };
-            if (actual_values != expected_values) {
-                freeDenseEmbeddingBatch(alloc, vectors);
-                return error.InvalidEmbeddingResponse;
-            }
-            const result_bytes = std.math.mul(usize, actual_values, @sizeOf(f32)) catch {
-                freeDenseEmbeddingBatch(alloc, vectors);
-                return error.InvalidEmbeddingResponse;
-            };
-            if (result_bytes > invocation_plan.?.max_result_bytes) {
-                freeDenseEmbeddingBatch(alloc, vectors);
-                return error.InferenceResultTooLarge;
-            }
+        const expected_values = std.math.mul(usize, items.len, @as(usize, dims)) catch {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        };
+        var actual_values: usize = 0;
+        for (vectors) |vector| actual_values = std.math.add(usize, actual_values, vector.len) catch {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        };
+        if (actual_values != expected_values) {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        }
+        const result_bytes = std.math.mul(usize, actual_values, @sizeOf(f32)) catch {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        };
+        if (result_bytes > invocation_plan.max_result_bytes) {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InferenceResultTooLarge;
         }
         return vectors;
     }
@@ -221,21 +222,54 @@ pub const DenseEmbedder = struct {
     }
 };
 
-fn homogeneousInlineMediaMime(parts: []const template_mod.ContentPart) !?[]const u8 {
-    var mime_type: ?[]const u8 = null;
+fn invocationPlanningMime(parts: []const template_mod.ContentPart) ![]const u8 {
+    var media_mime: ?[]const u8 = null;
     for (parts) |part| switch (part) {
         .binary => |binary| {
-            if (mime_type) |known| {
-                if (!std.ascii.eqlIgnoreCase(known, binary.mime_type))
-                    return error.InferenceInvocationMemoryUnavailable;
-            } else mime_type = binary.mime_type;
+            if (binary.mime_type.len == 0) return error.UnsupportedInferenceMimeType;
+            try mergeInvocationPlanningMime(&media_mime, binary.mime_type);
         },
-        // URL-backed media is downloaded and admitted by its concrete remote
-        // executor. Only caller-retained binary attachments participate in this
-        // borrowed-media boundary.
-        .text, .media_url => {},
+        .media_url => |url| {
+            if (try inference_work.parseInlineDataUri(url)) |parsed| {
+                try mergeInvocationPlanningMime(&media_mime, parsed.mime_type);
+            } else try mergeInvocationPlanningMime(&media_mime, "image/png");
+        },
+        .text => {},
     };
-    return mime_type;
+    return media_mime orelse "text/plain";
+}
+
+fn mergeInvocationPlanningMime(current: *?[]const u8, next: []const u8) !void {
+    if (current.*) |known| {
+        if (!std.ascii.eqlIgnoreCase(known, next))
+            return error.InferenceInvocationMemoryUnavailable;
+    } else current.* = next;
+}
+
+fn contentPartPreparationBytes(parts: []const template_mod.ContentPart) !usize {
+    var total: usize = 0;
+    for (parts) |part| switch (part) {
+        .text => |value| {
+            // Invalid UTF-8 can expand to one three-byte replacement scalar per
+            // source byte; JSON serialization can then escape every byte.
+            const sanitized = std.math.mul(usize, value.len, 3) catch
+                return error.InferenceEncodedBytesExceeded;
+            const serialized = std.math.mul(usize, sanitized, 6) catch
+                return error.InferenceEncodedBytesExceeded;
+            total = std.math.add(usize, total, sanitized) catch
+                return error.InferenceEncodedBytesExceeded;
+            total = std.math.add(usize, total, serialized) catch
+                return error.InferenceEncodedBytesExceeded;
+        },
+        .media_url => |value| {
+            const serialized = std.math.mul(usize, value.len, 6) catch
+                return error.InferenceEncodedBytesExceeded;
+            total = std.math.add(usize, total, serialized) catch
+                return error.InferenceEncodedBytesExceeded;
+        },
+        .binary => {},
+    };
+    return total;
 }
 
 pub const SparseEmbedder = struct {
@@ -711,6 +745,13 @@ test "media part item embedding fails closed without an invocation contract" {
         error.InferenceInvocationMemoryUnavailable,
         embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 1),
     );
+    const url_parts = [_]template_mod.ContentPart{.{
+        .media_url = "DATA:image/png;BASE64,AQ==",
+    }};
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        embedder.embedDensePartItems(std.testing.allocator, "images", &url_parts, 1),
+    );
 }
 
 test "media part item embedding enforces its result contract" {
@@ -753,5 +794,12 @@ test "media part item embedding enforces its result contract" {
     try std.testing.expectError(
         error.InferenceResultTooLarge,
         embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 1),
+    );
+    const url_parts = [_]template_mod.ContentPart{.{
+        .media_url = "DATA:image/png;BASE64,AQ==",
+    }};
+    try std.testing.expectError(
+        error.InferenceResultTooLarge,
+        embedder.embedDensePartItems(std.testing.allocator, "images", &url_parts, 1),
     );
 }

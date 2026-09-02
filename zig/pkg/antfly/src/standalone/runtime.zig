@@ -6133,7 +6133,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "data:image/png;base64,AQI=",
+                .url = "DATA:IMAGE/PNG,%01%02",
                 .mime_type = "image/png",
             } },
         } },
