@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,23 +39,66 @@ def artifact_kind(path: Path) -> str:
         return "installer"
     if name == "openapi.yaml":
         return "openapi"
+    if name == "cli-snapshot.json":
+        return "cli-manifest"
+    if name.endswith(".whl"):
+        return "python-wheel"
+    if name.endswith(".tgz"):
+        return "npm-package"
     return "support"
+
+
+def generated_at(repo_root: Path, commit: str) -> str:
+    raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if raw_epoch is None:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show", "-s", "--format=%ct", commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        raw_epoch = result.stdout.strip()
+    try:
+        epoch = int(raw_epoch)
+    except ValueError as exc:
+        raise SystemExit(f"invalid release source timestamp: {raw_epoch}") from exc
+    return (
+        datetime.fromtimestamp(epoch, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tag", required=True, help="release tag, for example v0.2.0-rc.1")
+    parser.add_argument(
+        "--tag", required=True, help="release tag, for example v0.2.0-rc.1"
+    )
     parser.add_argument("--commit", required=True, help="commit SHA for this release")
-    parser.add_argument("--archive-dir", type=Path, required=True, help="directory containing antfly_*.tar.gz")
-    parser.add_argument("--out-dir", type=Path, required=True, help="output payload directory")
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        required=True,
+        help="directory containing antfly_*.tar.gz",
+    )
+    parser.add_argument(
+        "--extra-dir",
+        type=Path,
+        help="directory containing prebuilt registry package artifacts",
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, required=True, help="output payload directory"
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
     tag = args.tag
-    version = tag[1:] if tag.startswith("v") else tag
+    version = tag.removeprefix("v")
     prerelease = "-" in version
 
     out_dir = args.out_dir.resolve()
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise SystemExit(f"release payload directory must be empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
@@ -63,6 +108,27 @@ def main() -> int:
 
     for archive in archives:
         copied.append(copy_payload_file(archive, out_dir))
+
+    registry_versions = None
+    if args.extra_dir:
+        extra_files = sorted(
+            path for path in args.extra_dir.iterdir() if path.is_file()
+        )
+        if not extra_files:
+            raise SystemExit(f"no extra release artifacts found in {args.extra_dir}")
+        for extra in extra_files:
+            if any(path.name == extra.name for path in copied):
+                raise SystemExit(f"duplicate release payload file: {extra.name}")
+            copied.append(copy_payload_file(extra, out_dir))
+        cli_manifest = json.loads((args.extra_dir / "cli-snapshot.json").read_text())
+        if (
+            cli_manifest.get("commit") != args.commit
+            or cli_manifest.get("version") != version
+        ):
+            raise SystemExit(
+                "CLI snapshot does not match the release version and commit"
+            )
+        registry_versions = cli_manifest.get("registry_versions")
 
     checksums = out_dir / "antfly_zig_checksums.txt"
     with checksums.open("w", encoding="utf-8") as dst:
@@ -74,7 +140,7 @@ def main() -> int:
     copied.append(copy_payload_file(repo_root / "scripts" / "install.sh", out_dir))
     copied.append(copy_payload_file(repo_root / "openapi.yaml", out_dir))
 
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    release_generated_at = generated_at(repo_root, args.commit)
     artifacts = [
         {
             "name": path.name,
@@ -89,20 +155,25 @@ def main() -> int:
         "version": version,
         "commit": args.commit,
         "prerelease": prerelease,
-        "generated_at": generated_at,
+        "generated_at": release_generated_at,
+        "registry_versions": registry_versions,
         "artifacts": artifacts,
     }
 
     metadata_path = out_dir / "metadata.json"
     artifacts_path = out_dir / "artifacts.json"
-    metadata_path.write_text(json.dumps(metadata, separators=(",", ":")) + "\n", encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(metadata, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
     artifacts_path.write_text(
         json.dumps(
             {
                 "tag": tag,
                 "version": version,
                 "commit": args.commit,
-                "generated_at": generated_at,
+                "schema_version": 1,
+                "generated_at": release_generated_at,
+                "registry_versions": registry_versions,
                 "artifacts": artifacts,
             },
             indent=2,

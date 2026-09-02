@@ -130,7 +130,12 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", release_workflow)
         self.assertIn("gh attestation verify", release_workflow)
         self.assertIn("actions/attest-build-provenance@v3", release_workflow)
-        self.assertIn("gh release upload", release_workflow)
+        self.assertIn("--immutable-assets", release_workflow)
+        self.assertIn("--content-addressed-prefix", release_workflow)
+        self.assertIn("--signer-workflow", release_workflow)
+        self.assertIn("prepare_pypi_promotion.py", release_workflow)
+        self.assertNotIn("--replace-assets", release_workflow)
+        self.assertNotIn("skip-existing:", release_workflow)
         platform_publish = [
             release_workflow.index(f"@antfly/cli-{name} \"$version\"")
             for name in ("darwin-arm64", "linux-arm64", "linux-x64")

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import mimetypes
 import os
@@ -13,7 +14,6 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 
 API_BASE = "https://api.github.com"
 UPLOAD_BASE = "https://uploads.github.com"
@@ -53,7 +53,9 @@ def request_json(
     return json.loads(payload)
 
 
-def request_bytes(method: str, url: str, token: str, data: bytes, content_type: str) -> dict:
+def request_bytes(
+    method: str, url: str, token: str, data: bytes, content_type: str
+) -> dict:
     req = Request(
         url,
         data=data,
@@ -73,7 +75,26 @@ def request_bytes(method: str, url: str, token: str, data: bytes, content_type: 
         raise GitHubError(f"{method} {url} failed with {exc.code}: {detail}") from exc
 
 
-def github_api(method: str, repo: str, path: str, token: str, body: dict | None = None) -> dict | list | None:
+def download_bytes(url: str, token: str) -> bytes:
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(req) as resp:
+            return resp.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise GitHubError(f"GET {url} failed with {exc.code}: {detail}") from exc
+
+
+def github_api(
+    method: str, repo: str, path: str, token: str, body: dict | None = None
+) -> dict | list | None:
     return request_json(method, f"{API_BASE}/repos/{repo}{path}", token, body)
 
 
@@ -146,10 +167,45 @@ def expand_assets(patterns: list[str]) -> list[Path]:
     return sorted(assets, key=lambda path: path.name)
 
 
-def upload_asset(repo: str, release: dict, asset: Path, token: str, replace_assets: bool) -> None:
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as src:
+        for chunk in iter(lambda: src.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def existing_asset_sha256(existing: dict, token: str) -> str:
+    digest = existing.get("digest")
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        return digest.removeprefix("sha256:")
+    url = existing.get("url") or existing.get("browser_download_url")
+    if not isinstance(url, str) or not url:
+        raise GitHubError(f"release asset {existing.get('name')} has no download URL")
+    return hashlib.sha256(download_bytes(url, token)).hexdigest()
+
+
+def upload_asset(
+    repo: str,
+    release: dict,
+    asset: Path,
+    token: str,
+    replace_assets: bool,
+    immutable_assets: bool,
+) -> None:
     release_id = release["id"]
     for existing in release.get("assets", []):
         if existing.get("name") == asset.name:
+            if immutable_assets:
+                local_digest = sha256(asset)
+                remote_digest = existing_asset_sha256(existing, token)
+                if local_digest != remote_digest:
+                    raise SystemExit(
+                        f"immutable release asset differs: {asset.name}\n"
+                        f"GitHub: {remote_digest}\nlocal:  {local_digest}"
+                    )
+                print(f"immutable GitHub release asset already matches: {asset.name}")
+                return
             if not replace_assets:
                 raise SystemExit(f"release asset already exists: {asset.name}")
             github_api("DELETE", repo, f"/releases/assets/{existing['id']}", token)
@@ -164,14 +220,34 @@ def upload_asset(repo: str, release: dict, asset: Path, token: str, replace_asse
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo")
+    parser.add_argument(
+        "--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo"
+    )
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
-    parser.add_argument("--asset", action="append", default=[], help="asset glob to upload")
-    parser.add_argument("--draft", action="store_true", help="create/update as a draft release")
-    parser.add_argument("--replace-assets", action="store_true", help="replace existing assets with matching names")
+    parser.add_argument(
+        "--asset", action="append", default=[], help="asset glob to upload"
+    )
+    parser.add_argument(
+        "--draft", action="store_true", help="create/update as a draft release"
+    )
+    parser.add_argument(
+        "--replace-assets",
+        action="store_true",
+        help="replace existing assets with matching names",
+    )
+    parser.add_argument(
+        "--immutable-assets",
+        action="store_true",
+        help="skip byte-identical existing assets and reject content drift",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    if args.replace_assets and args.immutable_assets:
+        raise SystemExit(
+            "--replace-assets and --immutable-assets are mutually exclusive"
+        )
 
     if not args.repo:
         raise SystemExit("--repo is required when GITHUB_REPOSITORY is unset")
@@ -208,13 +284,17 @@ def main() -> int:
         release = created
         print(f"created GitHub release draft for {args.tag}")
     else:
-        updated = github_api("PATCH", args.repo, f"/releases/{release['id']}", token, payload)
+        updated = github_api(
+            "PATCH", args.repo, f"/releases/{release['id']}", token, payload
+        )
         assert isinstance(updated, dict)
         release = updated
         print(f"updated GitHub release draft for {args.tag}")
 
     for asset in assets:
-        upload_asset(args.repo, release, asset, token, args.replace_assets)
+        upload_asset(
+            args.repo, release, asset, token, args.replace_assets, args.immutable_assets
+        )
         release = get_release_by_tag(args.repo, args.tag, token) or release
     return 0
 

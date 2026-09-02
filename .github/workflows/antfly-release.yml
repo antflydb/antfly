@@ -182,9 +182,12 @@ jobs:
     name: Publish release assets
     needs:
       - build-zig-runtime-archives
+      - package-cli-artifacts
     runs-on: arc-antfly-standard
     permissions:
-      contents: write # Required only here for creating the draft release.
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -196,6 +199,12 @@ jobs:
           merge-multiple: true
           path: dist/release-archives
 
+      - name: Download immutable CLI snapshot
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -205,11 +214,21 @@ jobs:
 
       - name: Build release payload
         run: |
+          python scripts/release/verify_cli_snapshot.py \
+            --snapshot-dir dist/cli-snapshot \
+            --version "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA"
           python scripts/release/build_release_payload.py \
             --tag "$GITHUB_REF_NAME" \
             --commit "$GITHUB_SHA" \
             --archive-dir dist/release-archives \
+            --extra-dir dist/cli-snapshot \
             --out-dir dist/release-payload
+
+      - name: Attest immutable release ledger and artifacts
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/release-payload/*
 
       - name: Create GitHub draft release
         env:
@@ -220,11 +239,8 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --commit "$GITHUB_SHA" \
             --draft \
-            --replace-assets \
-            --asset 'dist/release-payload/antfly_*.tar.gz' \
-            --asset dist/release-payload/antfly_zig_checksums.txt \
-            --asset dist/release-payload/metadata.json \
-            --asset dist/release-payload/artifacts.json
+            --immutable-assets \
+            --asset 'dist/release-payload/*'
 
       - name: Publish release payload to object storage
         run: |
@@ -233,6 +249,7 @@ jobs:
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
             --prefix "antfly/${GITHUB_REF_NAME}" \
+            --content-addressed-prefix antfly/artifacts \
             --latest-prefix antfly/latest \
             --publish-latest-if-stable "$GITHUB_REF_NAME" \
             dist/release-payload/*
@@ -243,9 +260,7 @@ jobs:
 
   package-cli-artifacts:
     name: Build immutable CLI package snapshot
-    needs:
-      - build-zig-runtime-archives
-      - publish-release-assets
+    needs: build-zig-runtime-archives
     if: ${{ github.event_name == 'push' }}
     uses: ./.github/workflows/cli-package.yml
     with:
@@ -291,15 +306,21 @@ jobs:
 
       - name: Verify release attestations and snapshot manifest
         env:
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           for artifact in dist/cli-snapshot/*; do
-            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/antfly-release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "$RELEASE_COMMIT"
           done
           python scripts/release/verify_cli_snapshot.py \
             --snapshot-dir dist/cli-snapshot \
             --version "$RELEASE_VERSION" \
-            --commit "${{ steps.version.outputs.commit }}"
+            --commit "$RELEASE_COMMIT"
 
       - name: Upload recovered CLI snapshot
         uses: actions/upload-artifact@v6
@@ -308,66 +329,15 @@ jobs:
           path: dist/cli-snapshot/
           if-no-files-found: error
 
-  persist-cli-snapshot:
-    name: Attest and persist immutable CLI package snapshot
-    needs: package-cli-artifacts
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/download-artifact@v6
-        with:
-          name: antfly-cli-snapshot
-          path: dist/cli-snapshot
-
-      - name: Verify immutable CLI snapshot
-        run: |
-          python scripts/release/verify_cli_snapshot.py \
-            --snapshot-dir dist/cli-snapshot \
-            --version "$GITHUB_REF_NAME" \
-            --commit "$GITHUB_SHA"
-
-      - name: Attest immutable CLI package artifacts
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: dist/cli-snapshot/*
-
-      - name: Persist immutable CLI snapshot on the GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          existing_dir="$RUNNER_TEMP/existing-cli-snapshot"
-          mkdir -p "$existing_dir"
-          for artifact in dist/cli-snapshot/*; do
-            name="${artifact##*/}"
-            if gh release download "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "$name" \
-              --dir "$existing_dir"
-            then
-              cmp --silent "$artifact" "$existing_dir/$name" || {
-                echo "refusing to replace immutable release asset: $name" >&2
-                exit 1
-              }
-            else
-              gh release upload "$GITHUB_REF_NAME" "$artifact" --repo "$GITHUB_REPOSITORY"
-            fi
-          done
-
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
     needs:
       - package-cli-artifacts
       - restore-cli-artifacts
-      - persist-cli-snapshot
+      - publish-release-assets
     if: >-
       ${{ always() &&
-          ((github.event_name == 'push' && needs.persist-cli-snapshot.result == 'success') ||
+          ((github.event_name == 'push' && needs.publish-release-assets.result == 'success') ||
            (github.event_name == 'workflow_dispatch' && needs.restore-cli-artifacts.result == 'success')) }}
     runs-on: ubuntu-latest
     environment:
@@ -376,31 +346,36 @@ jobs:
     permissions:
       id-token: write
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot
 
-      - name: Select the attested Python distributions
+      - name: Select digest-verified Python distributions
+        id: pypi
         run: |
-          mkdir -p dist/pypi
-          cp dist/cli-snapshot/*.whl dist/pypi/
+          python scripts/release/prepare_pypi_promotion.py \
+            --project antfly-cli \
+            --snapshot-dir dist/cli-snapshot \
+            --out-dir dist/pypi
 
       - name: Publish wheels
+        if: ${{ steps.pypi.outputs.has_packages == 'true' }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/pypi
-          skip-existing: true
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm
     needs:
       - package-cli-artifacts
       - restore-cli-artifacts
-      - persist-cli-snapshot
+      - publish-release-assets
     if: >-
       ${{ always() &&
-          ((github.event_name == 'push' && needs.persist-cli-snapshot.result == 'success') ||
+          ((github.event_name == 'push' && needs.publish-release-assets.result == 'success') ||
            (github.event_name == 'workflow_dispatch' && needs.restore-cli-artifacts.result == 'success')) }}
     runs-on: ubuntu-latest
     environment: npm

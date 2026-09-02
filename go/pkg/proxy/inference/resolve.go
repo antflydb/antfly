@@ -321,7 +321,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 		if dest == nil {
 			activatedDestination, activationWait := p.activateRouteDestination(ctx, matchedRoute, routeReq)
 			if activatedDestination != nil {
-				dest = p.waitForRouteDestination(ctx, matchedRoute, routeReq, activationWait)
+				dest = p.waitForRouteDestination(ctx, activatedDestination, routeReq, activationWait)
 				if ctx.Err() != nil {
 					return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: ctx.Err().Error()}
 				}
@@ -381,28 +381,11 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 		return nil, 0
 	}
 	namespace := routeNamespace(route)
-	eligible := make([]Destination, 0, len(route.Destinations))
-	totalWeight := int32(0)
-	for _, destination := range route.Destinations {
-		if p.activator.IsEnabled(namespace, destination.Pool) {
-			eligible = append(eligible, destination)
-			totalWeight += destination.Weight
-		}
-	}
-	if len(eligible) == 0 {
+	selected := p.router.RouteManager().SelectActivationDestination(route, req, func(pool string) bool {
+		return p.activator.IsEnabled(namespace, pool)
+	})
+	if selected == nil {
 		return nil, 0
-	}
-	selected := &eligible[0]
-	if len(eligible) > 1 && totalWeight > 0 {
-		selection := weightedSelectionValue(route, req, totalWeight)
-		cumulative := int32(0)
-		for i := range eligible {
-			cumulative += eligible[i].Weight
-			if selection < cumulative {
-				selected = &eligible[i]
-				break
-			}
-		}
 	}
 	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
 	if err != nil {
@@ -433,7 +416,7 @@ func routeNamespace(route *Route) string {
 	return namespace
 }
 
-func (p *Proxy) waitForRouteDestination(ctx context.Context, route *Route, req *RouteRequest, maxWait time.Duration) *Destination {
+func (p *Proxy) waitForRouteDestination(ctx context.Context, destination *Destination, req *RouteRequest, maxWait time.Duration) *Destination {
 	if maxWait <= 0 {
 		return nil
 	}
@@ -450,8 +433,7 @@ func (p *Proxy) waitForRouteDestination(ctx context.Context, route *Route, req *
 			return nil
 		case <-ticker.C:
 			req.Timestamp = time.Now()
-			destination, err := p.router.RouteManager().SelectDestination(route, req, p.registry)
-			if err == nil && destination != nil {
+			if p.router.RouteManager().evaluateConditions(destination, req, p.registry) {
 				return destination
 			}
 		}

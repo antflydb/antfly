@@ -54,29 +54,30 @@ SDK and enables Metal and Accelerate.
 1. `build-zig-runtime-archives` builds the canonical Zig archives on the
    appropriate native or cross-compilation runners and uploads them as GitHub
    Actions artifacts.
-2. `publish-release-assets` builds the release payload, creates or updates the
-   draft GitHub Release, uploads the Zig archives and release metadata as GitHub
-   Release assets, then publishes the payload to object storage.
-3. `package-cli-artifacts` calls `.github/workflows/cli-package.yml` to build the
+2. `package-cli-artifacts` calls `.github/workflows/cli-package.yml` to build the
    `antfly-cli` wheels and `@antfly/cli` npm packages directly from the native
    Actions artifacts. It creates one source-commit-bound manifest for those
-   exact bytes; `persist-cli-snapshot` attests them and stores them on the
-   GitHub Release before top-level trusted-publisher jobs promote them. A manual
-   dispatch verifies and promotes that saved snapshot without rebuilding it.
+   exact bytes.
+3. `publish-release-assets` combines the native archives and CLI snapshot into
+   one deterministic artifact ledger, attests every payload file, and stores the
+   exact bytes on the draft GitHub Release and under immutable, content-addressed
+   object-storage keys. Top-level trusted-publisher jobs promote those same CLI
+   bytes. A manual dispatch verifies the saved snapshot against its tag, commit,
+   digest, and release-workflow signer before promoting it without rebuilding.
 4. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
    Zig archive checksums. RC tags do not update the stable tap formula.
 5. `publish-container` calls `.github/workflows/antfly-container.yml` with
    `artifact_source: github`, so the container image uses the Linux archives
    already built by the release.
 
-After the native archives and release payload are published, package registry
-publishes, Homebrew, and container publishing fan out independently. A PyPI or
-npm publish failure must not block the container image for the same tag. npm
-platform packages publish before the top-level selector, and existing versions
-are skipped only when their registry integrity matches, so a partial publication
-is safe to retry without hiding content drift. Existing GitHub package assets
+After the unified release payload is published, package registry publishes,
+Homebrew, and container publishing fan out independently. A PyPI or npm publish
+failure must not block the container image for the same tag. npm platform
+packages publish before the top-level selector, and existing npm or PyPI files
+are skipped only when their registry digest matches, so a partial publication
+is safe to retry without hiding content drift. Existing GitHub release assets
 are likewise accepted only when byte-identical; release automation never
-replaces a saved snapshot.
+replaces a saved artifact.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the GNU Linux archives on native Linux
@@ -93,12 +94,13 @@ scripts under `scripts/release/`:
   payload directory, writes `antfly_zig_checksums.txt`, and generates
   `metadata.json` and `artifacts.json`.
 - `create_github_release.py` creates or updates the draft GitHub Release,
-  generates release notes through the GitHub API, and replaces matching release
-  assets.
-- `publish_objectstorage.py` uploads the payload to object storage. The release
-  workflow currently uses the S3-compatible path for Cloudflare R2, but the
-  script also has GCS and local modes for future storage backends and dry-run
-  smoke tests.
+  generates release notes through the GitHub API, and accepts existing assets
+  only when their digest matches the local payload.
+- `publish_objectstorage.py` first writes content-addressed and versioned keys
+  with compare-or-fail semantics, then updates mutable channel aliases only
+  after every immutable upload succeeds. The release workflow currently uses
+  the S3-compatible path for Cloudflare R2, but the script also has GCS and
+  local modes for future storage backends and dry-run smoke tests.
 
 ## Version Behavior
 

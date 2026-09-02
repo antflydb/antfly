@@ -592,6 +592,79 @@ func TestColdRouteActivationUsesDestinationWeights(t *testing.T) {
 	}
 }
 
+func TestColdRouteActivationHonorsDestinationTimeCondition(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	var activated string
+	p.SetPoolActivator(testPoolActivator{
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			activated = pool
+			return time.Second, true, nil
+		},
+	})
+	route := &Route{
+		Name: "default/time-window",
+		Destinations: []Destination{
+			{Pool: "inactive", Weight: 100, TimeCondition: &TimeWindow{StartHour: 13, EndHour: 14}},
+			{Pool: "active", Weight: 1, TimeCondition: &TimeWindow{StartHour: 11, EndHour: 13}},
+		},
+	}
+	destination, _ := p.activateRouteDestination(context.Background(), route, &RouteRequest{
+		Timestamp: time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if destination == nil || destination.Pool != "active" || activated != "active" {
+		t.Fatalf("expected only the active time-window destination, got destination=%v activated=%q", destination, activated)
+	}
+}
+
+func TestColdRouteWaitRemainsBoundToSelectedDestination(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	selected := make(chan string, 1)
+	var calls atomic.Int32
+	p.SetPoolActivator(testPoolActivator{
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			if calls.Add(1) == 1 {
+				selected <- pool
+				other := "gpu-a"
+				if pool == other {
+					other = "gpu-b"
+				}
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					p.RegisterEndpoint("http://other.internal", other, WorkloadTypeGeneral)
+					time.Sleep(330 * time.Millisecond)
+					p.RegisterEndpoint("http://selected.internal", pool, WorkloadTypeGeneral)
+				}()
+			}
+			return time.Second, true, nil
+		},
+	})
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/bound-cold",
+		Operations: map[OperationType]bool{OperationType("embed"): true},
+		Destinations: []Destination{
+			{Pool: "gpu-a", Weight: 50},
+			{Pool: "gpu-b", Weight: 50},
+		},
+	})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{
+		Operation: OperationType("embed"),
+		Model:     "model-a",
+		Timestamp: time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	want := <-selected
+	if resolved.Pool != want || resolved.Endpoint.Address != "http://selected.internal" {
+		t.Fatalf("resolution drifted from selected cold pool %q: pool=%q endpoint=%q", want, resolved.Pool, resolved.Endpoint.Address)
+	}
+}
+
 func TestBurstRoutingDistributesAcrossEligibleEndpoints(t *testing.T) {
 	t.Parallel()
 

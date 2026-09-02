@@ -42,17 +42,23 @@ consumers.
    artifacts from that same run and builds all npm tarballs and Python wheels
    once.
 3. The workflow records their hashes, source commit, npm version, and PEP 440
-   Python version in `cli-snapshot.json`. It verifies and attests that immutable
-   snapshot before adding it to the draft GitHub release.
-4. Top-level trusted-publisher jobs promote the exact snapshot bytes to PyPI
-   and npm. Native archives are also published under
-   `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
+   Python version in `cli-snapshot.json`. The top-level workflow merges that
+   snapshot with the native archives into a deterministic `artifacts.json`
+   ledger and attests every exact payload file.
+4. GitHub Release assets and versioned object-storage objects are immutable:
+   retries accept an existing object only when its digest matches. Object
+   storage also retains content-addressed objects under `sha256/<digest>/`.
+5. Top-level trusted-publisher jobs promote the exact snapshot bytes to PyPI
+   and npm. They skip an existing version only after comparing the registry
+   digest, so retries cannot conceal drift. Native archives remain available
+   under `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
 
 For recovery, manually dispatch `.github/workflows/antfly-release.yml` with an
 existing release version. Recovery downloads the saved npm tarballs, wheels,
-and manifest from the GitHub release, verifies every GitHub attestation and
-hash, checks the manifest against the tag commit, and promotes those exact
-bytes. It never checks out historical source to rebuild registry artifacts.
+and manifest from the GitHub release; verifies every GitHub attestation against
+the expected release-workflow signer, tag ref, repository, and source-commit
+digest; verifies every artifact hash; and promotes those exact bytes. It never
+checks out historical source to rebuild registry artifacts.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow.
