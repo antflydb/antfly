@@ -24,6 +24,7 @@ pub const ObjectChecksumAlgorithm = objectstore.ObjectChecksumAlgorithm;
 pub const ObjectChecksumType = objectstore.ObjectChecksumType;
 pub const ObjectChecksumScope = objectstore.ObjectChecksumScope;
 pub const PutOptions = objectstore.PutOptions;
+pub const BucketOptions = objectstore.BucketOptions;
 pub const GetOptions = objectstore.GetOptions;
 pub const CancellationToken = objectstore.CancellationToken;
 pub const DeleteOptions = objectstore.DeleteOptions;
@@ -87,16 +88,16 @@ test "host object storage delegates through callbacks" {
             _ = self;
         }
 
-        fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+        fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: BucketOptions) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var client = self.backing.client();
-            return try client.bucketExists(bucket);
+            return try client.bucketExistsWithOptions(bucket, opts);
         }
 
-        fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+        fn makeBucket(ptr: *anyopaque, bucket: []const u8, opts: BucketOptions) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var client = self.backing.client();
-            try client.makeBucket(bucket);
+            try client.makeBucketWithOptions(bucket, opts);
         }
 
         fn putObject(

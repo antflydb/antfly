@@ -868,6 +868,7 @@ const LocalStandaloneMetadata = struct {
                 .replace_table_definition = replaceTableDefinition,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
+                .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .update_schema_versioned = updateSchemaVersioned,
                 .create_index = createIndex,
@@ -1235,15 +1236,37 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+        var result = try dropTableExact(ptr, std.heap.page_allocator, table_name);
+        result.deinit(std.heap.page_allocator);
+    }
+
+    fn dropTableExact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !antfly.metadata.topology_protocol.DropResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        const table_id = table.table_id;
+        const ranges = try self.manager.listRanges(alloc);
+        defer self.manager.freeRanges(alloc, ranges);
+        var dropped_group_ids = std.ArrayListUnmanaged(u64).empty;
+        errdefer dropped_group_ids.deinit(alloc);
+        for (ranges) |range| {
+            if (range.table_id == table_id) try dropped_group_ids.append(alloc, range.group_id);
+        }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
-        _ = self.manager.removeTableTopology(table.table_id);
+        _ = self.manager.removeTableTopology(table_id);
         self.epoch +|= 1;
         try mutation.commit(self);
+        return .{
+            .table_id = table_id,
+            .expected_transition_generation = 0,
+            .group_ids = try dropped_group_ids.toOwnedSlice(alloc),
+        };
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -2303,6 +2326,7 @@ pub fn runFromIterator(
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .inference_request_admission_source = .{
                 .ptr = antfly_node,
                 .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
@@ -7876,6 +7900,11 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     };
     defer metadata.deinit();
     try metadata.manager.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try metadata.manager.upsertRange(.{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+    });
     metadata.epoch = 9;
 
     const source = metadata.statusSource();
@@ -7890,6 +7919,12 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     defer source.freeAdminSnapshot(&rebound_snapshot);
     try std.testing.expectEqual(@as(usize, 1), rebound_snapshot.stores.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:49152", rebound_snapshot.stores[0].api_url);
+
+    var dropped = try source.dropTableExact(alloc, "docs");
+    defer dropped.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7), dropped.table_id);
+    try std.testing.expectEqualSlices(u64, &.{7001}, dropped.group_ids);
+    try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
 }
 
 test "standalone routing watch does not report absence after one probe" {
