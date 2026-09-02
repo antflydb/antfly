@@ -7128,6 +7128,7 @@ pub const DenseVectorPublicationStatus = struct {
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
+    target_observation,
     missing_group,
     unknown_group,
     remote_unknown_group,
@@ -7139,6 +7140,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .runtime_unavailable => "runtime_unavailable",
+            .target_observation => "target_observation",
             .missing_group => "missing_group",
             .unknown_group => "unknown_group",
             .remote_unknown_group => "remote_unknown_group",
@@ -7157,6 +7159,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "target_observation", .target_observation },
             .{ "missing_group", .missing_group },
             .{ "unknown_group", .unknown_group },
             .{ "remote_unknown_group", .remote_unknown_group },
@@ -17046,6 +17049,7 @@ pub const IndexReadinessReason = enum {
     load_failure,
     enrichment_failure,
     runtime_unavailable,
+    target_observation,
     shard_observation_incomplete,
     incarnation_pending,
     source_publication,
@@ -17060,6 +17064,7 @@ pub const IndexReadinessReason = enum {
             .load_failure => "load_failure",
             .enrichment_failure => "enrichment_failure",
             .runtime_unavailable => "runtime_unavailable",
+            .target_observation => "target_observation",
             .shard_observation_incomplete => "shard_observation_incomplete",
             .incarnation_pending => "incarnation_pending",
             .source_publication => "source_publication",
@@ -17081,6 +17086,7 @@ pub const IndexReadinessReason = enum {
             .{ "load_failure", .load_failure },
             .{ "enrichment_failure", .enrichment_failure },
             .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "target_observation", .target_observation },
             .{ "shard_observation_incomplete", .shard_observation_incomplete },
             .{ "incarnation_pending", .incarnation_pending },
             .{ "source_publication", .source_publication },

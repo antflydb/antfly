@@ -367,6 +367,12 @@ Embeddings status additionally separates lifecycle truth from work telemetry:
   phase independently of counters; aggregation reduces those phases with
   `waiting_retry > embedding > publishing > preparing > idle`. A counter from
   a lower-priority owner cannot mask a higher-priority phase.
+- Serving authority, convergence authority, and activity freshness are
+  independent. A cached published incarnation may remain queryable when the
+  owner heartbeat is absent. `complete` additionally requires the group owner
+  to have observed the latest accepted target; until then status reports
+  `target_observation` without discarding the last coverage or publication
+  counters.
 
 These dimensions have a strict dependency direction:
 
@@ -388,18 +394,22 @@ it. Lazy posting centroid or quantized-payload debt is diagnostic maintenance,
 not repair state: queries use the exact fallback while bounded background work
 refreshes those caches. Structural generation faults remain repair blockers.
 
-Wait clients select `queryable` or `complete` explicitly. For current responses,
-the selected milestone and its blockers are authoritative; generic lifecycle,
-catch-up, and coverage fields may describe work that belongs only to the later
-milestone. The v0.2.0 response has no milestone map, so clients use its
-historical fully-settled readiness rules only as a separate compatibility path.
+Wait clients select an explicit useful outcome such as `complete`,
+`source-covered=N%`, or `searchable-artifacts=N`. Threshold waits also require
+query admission for the same incarnation. The v0.2.0 response has no milestone
+map, so clients use its historical fully-settled readiness rules only as a
+separate compatibility path.
 
-A best-effort live overlay may add activity or newly observed debt, but it may
-remove a readiness blocker only when lifecycle, physical artifact counters, and
-coverage were refreshed under the same apply-lock boundary. On contention the
-retained blocker wins until the next bounded authoritative refresh. This avoids
-publishing `complete` from an idle worker snapshot paired with stale vector
-counts, without adding blocking work to ordinary status requests.
+There is no request-time live overlay. A table commit marks the cached target
+observation pending in a small monotonic status watermark, and the runtime owner
+publishes replay target, coverage, physical artifact counters, and serving
+state together. Each publication carries the target revision captured before
+sampling, so an older in-flight publisher cannot clear a newer commit fence.
+HTTP reads only clone that immutable snapshot. Writer/apply
+lock contention can therefore delay convergence or activity observation, but
+cannot revoke a published serving generation or reset its counters. Explicit
+root replacement, exact-index mutation, and corruption fences remain the only
+paths that can revoke the corresponding serving authority.
 
 Distributed publication has two released profiles: v12 for v0.2.0 peers and
 v15 for current admission/restore safety facts. V13 and v14 were development
@@ -544,8 +554,9 @@ Current Phase 4 implementation shape:
   `runtime_status_cache`. Heartbeats do not open DBs or trigger repair work;
   they serialize already-published owner status.
 - Runtime summaries contain table/group identity, freshness/source metadata,
-  topology/status generations, compact table/enrichment state, and per-index
-  counters needed by index status responses.
+  topology/status generations, target-observation authority, compact
+  table/enrichment state, and per-index counters needed by index status
+  responses.
 - API nodes merge local read-cache status with propagated remote store records.
   Local status wins for a group; remote records fill groups the API node cannot
   observe locally. There is still no request-time fanout to data owners.

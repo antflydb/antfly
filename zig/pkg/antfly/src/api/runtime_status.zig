@@ -48,6 +48,16 @@ pub const RuntimeStatusMetadata = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
+    // Monotonic cache-local commit watermark captured before the owner sampled
+    // this observation. It is diagnostic across reporters; the accompanying
+    // completeness bit is the portable authority decision.
+    target_observation_revision: u64 = 0,
+    // Independent convergence authority. A committed table mutation clears
+    // this bit in the immutable status cache; only a subsequent runtime-owner
+    // publication may assert that its replay target and coverage describe the
+    // latest accepted table target. Serving authority remains index-scoped in
+    // DBIndexStats and is intentionally unaffected by this bit.
+    target_observation_complete: bool = true,
     store_id: u64 = 0,
     node_id: u64 = 0,
 
@@ -225,6 +235,7 @@ pub const TableRuntimeSnapshotCache = struct {
     pub const PublicationToken = struct {
         table_epoch: TableEpoch,
         observation_generation: u64,
+        target_observation_revision: u64,
     };
 
     pub const PublishResult = enum {
@@ -238,6 +249,7 @@ pub const TableRuntimeSnapshotCache = struct {
         topology_revision: u64,
         complete_catalog: bool,
         observation_generation: u64,
+        target_observation_revision: u64,
         table_epochs: std.StringHashMapUnmanaged(TableEpoch) = .empty,
 
         pub fn deinit(self: *@This()) void {
@@ -269,6 +281,9 @@ pub const TableRuntimeSnapshotCache = struct {
     const TableState = struct {
         epoch: TableEpoch,
         groups: std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus) = .empty,
+        // Latest commit watermark that each group must have observed before
+        // its coverage may be treated as current.
+        required_target_observation_revisions: std.AutoHashMapUnmanaged(u64, u64) = .empty,
         // Exact index names whose in-place catalog reconciliation is still in
         // flight. Publications may replace the target, but an opening/catch-up
         // observation cannot revoke authority from an untouched sibling.
@@ -278,6 +293,7 @@ pub const TableRuntimeSnapshotCache = struct {
             var it = self.groups.valueIterator();
             while (it.next()) |status| status.deinit(alloc);
             self.groups.deinit(alloc);
+            self.required_target_observation_revisions.deinit(alloc);
             var fence_it = self.targeted_index_fences.keyIterator();
             while (fence_it.next()) |name| alloc.free(@constCast(name.*));
             self.targeted_index_fences.deinit(alloc);
@@ -290,6 +306,7 @@ pub const TableRuntimeSnapshotCache = struct {
     topology_revision: u64 = 1,
     next_invalidation_epoch: u64 = 1,
     next_observation_generation: u64 = 1,
+    target_observation_revision: u64 = 1,
     tables: std.StringHashMapUnmanaged(TableState) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) @This() {
@@ -501,6 +518,7 @@ pub const TableRuntimeSnapshotCache = struct {
         return .{
             .table_epoch = state.epoch,
             .observation_generation = self.takeObservationGenerationLocked(),
+            .target_observation_revision = self.target_observation_revision,
         };
     }
 
@@ -517,6 +535,7 @@ pub const TableRuntimeSnapshotCache = struct {
             .topology_revision = 0,
             .complete_catalog = complete_catalog,
             .observation_generation = 0,
+            .target_observation_revision = 0,
         };
         errdefer token.deinit();
 
@@ -524,6 +543,7 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.mutex.unlock();
         token.topology_revision = self.topology_revision;
         token.observation_generation = self.takeObservationGenerationLocked();
+        token.target_observation_revision = self.target_observation_revision;
         // A complete refresh is also authoritative for tables absent from the
         // catalog. Capture cached epochs as removal candidates so publication
         // can prove that an unseen table was not invalidated or recreated
@@ -569,6 +589,12 @@ pub const TableRuntimeSnapshotCache = struct {
             owned.deinit(self.alloc);
             return .stale_table;
         }
+        self.applyTargetObservationAuthorityLocked(
+            state,
+            status.group_id,
+            &owned,
+            token.target_observation_revision,
+        );
         if (state.groups.getPtr(status.group_id)) |previous| {
             if (previous.cache_observation_generation > token.observation_generation) {
                 owned.deinit(self.alloc);
@@ -638,6 +664,12 @@ pub const TableRuntimeSnapshotCache = struct {
         for (owned, statuses) |*next, status| {
             next.cache_observation_generation = token.observation_generation;
             next.withMetadataDefaults(.live_writer_publish, now_ns);
+            self.applyTargetObservationAuthorityLocked(
+                state,
+                status.group_id,
+                next,
+                token.target_observation_revision,
+            );
             if (state.groups.getPtr(status.group_id)) |previous| {
                 if (previous.cache_observation_generation > token.observation_generation) {
                     next.deinit(self.alloc);
@@ -702,10 +734,17 @@ pub const TableRuntimeSnapshotCache = struct {
 
         const observation_generation = self.takeObservationGenerationLocked();
         const now_ns = platform_time.monotonicNs();
-        var replacement_it = replacement.valueIterator();
-        while (replacement_it.next()) |status| {
+        var replacement_it = replacement.iterator();
+        while (replacement_it.next()) |entry| {
+            const status = entry.value_ptr;
             status.cache_observation_generation = observation_generation;
             status.withMetadataDefaults(.live_writer_publish, now_ns);
+            self.applyTargetObservationAuthorityLocked(
+                state,
+                entry.key_ptr.*,
+                status,
+                token.target_observation_revision,
+            );
         }
 
         self.advanceInvalidationEpochLocked();
@@ -771,6 +810,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 state.?,
                 &snapshot_entry.statuses,
                 catalog_token.observation_generation,
+                catalog_token.target_observation_revision,
                 now_ns,
             );
             snapshot_entry.deinit(self.alloc);
@@ -817,6 +857,33 @@ pub const TableRuntimeSnapshotCache = struct {
         while (it.next()) |status| : (initialized += 1) items[initialized] = try status.clone(alloc);
         std.mem.sort(LocalTableRuntimeStatus, items, {}, lessThanGroupId);
         return .{ .items = items };
+    }
+
+    /// Records one group's committed target advance without changing any
+    /// published serving fact. This is an O(1) commit-path watermark update
+    /// under the small status-cache mutex; HTTP readers only clone the result
+    /// and never consult the writer cache or DB.
+    pub fn markGroupTargetObservationPending(self: *@This(), table_name: []const u8, group_id: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.ensureTableLocked(table_name) catch {
+            self.clearTablesLocked();
+            self.advanceInvalidationEpochLocked();
+            return;
+        };
+        self.advanceTargetObservationRevisionLocked();
+        state.required_target_observation_revisions.put(
+            self.alloc,
+            group_id,
+            self.target_observation_revision,
+        ) catch {
+            // Failure to record the convergence fence cannot leave an older
+            // completion proof visible. Retire the table observation instead.
+            self.invalidateTableStateLocked(state);
+            return;
+        };
+        if (state.groups.getPtr(group_id)) |status|
+            status.metadata.target_observation_complete = false;
     }
 
     pub fn snapshotGroupStatus(
@@ -903,6 +970,7 @@ pub const TableRuntimeSnapshotCache = struct {
         state: *TableState,
         statuses: *LocalTableRuntimeStatuses,
         observation_generation: u64,
+        target_observation_revision: u64,
         now_ns: u64,
     ) !void {
         var replacement = std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus).empty;
@@ -926,6 +994,12 @@ pub const TableRuntimeSnapshotCache = struct {
             moved += 1;
             owned.cache_observation_generation = observation_generation;
             owned.withMetadataDefaults(.background_refresh, now_ns);
+            self.applyTargetObservationAuthorityLocked(
+                state,
+                owned.group_id,
+                &owned,
+                target_observation_revision,
+            );
             owned = try self.prepareRefreshStatusLocked(
                 state.groups.getPtr(owned.group_id),
                 owned,
@@ -979,6 +1053,7 @@ pub const TableRuntimeSnapshotCache = struct {
         var it = state.groups.valueIterator();
         while (it.next()) |status| status.deinit(self.alloc);
         state.groups.clearRetainingCapacity();
+        state.required_target_observation_revisions.clearRetainingCapacity();
     }
 
     fn invalidateTableStateLocked(self: *@This(), state: *TableState) void {
@@ -1090,6 +1165,25 @@ pub const TableRuntimeSnapshotCache = struct {
         self.next_observation_generation +%= 1;
         if (self.next_observation_generation == 0) self.next_observation_generation = 1;
         return generation;
+    }
+
+    fn advanceTargetObservationRevisionLocked(self: *@This()) void {
+        self.target_observation_revision +%= 1;
+        if (self.target_observation_revision == 0) self.target_observation_revision = 1;
+    }
+
+    fn applyTargetObservationAuthorityLocked(
+        self: *@This(),
+        state: *const TableState,
+        group_id: u64,
+        status: *LocalTableRuntimeStatus,
+        observed_revision: u64,
+    ) void {
+        _ = self;
+        const required_revision = state.required_target_observation_revisions.get(group_id) orelse 0;
+        status.metadata.target_observation_revision = observed_revision;
+        status.metadata.target_observation_complete = status.metadata.target_observation_complete and
+            observed_revision >= required_revision;
     }
 };
 
@@ -3098,6 +3192,9 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
 
     const in_flight_token = try cache.capturePublicationToken("docs");
     const transition_token = try cache.capturePublicationToken("docs");
+    // A data commit accepted after the structural owner captured its snapshot
+    // must remain a convergence fence across the lifecycle replacement.
+    cache.markGroupTargetObservationPending("docs", 7);
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishLifecycleTransition(transition_token, "docs", &.{
@@ -3133,6 +3230,18 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
     try std.testing.expectEqual(@as(usize, 1), docs.items.len);
     try std.testing.expectEqual(@as(u64, 7), docs.items[0].group_id);
     try std.testing.expectEqual(RuntimeStatusFreshness.catching_up, docs.items[0].metadata.freshness);
+    try std.testing.expect(!docs.items[0].metadata.target_observation_complete);
+
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(current_token, "docs", .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 11 },
+        }),
+    );
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    try std.testing.expect(observed.metadata.target_observation_complete);
 }
 
 test "table runtime snapshot cache batch preserves newer group observations" {

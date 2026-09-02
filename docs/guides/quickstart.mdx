@@ -377,6 +377,10 @@ publication, or retry work; incomplete coverage alone never implies
 `activity` is `null` and the CLI reports activity as unavailable. A transient
 status-sampling miss retains the last matching owner sample for up to 90 seconds,
 so normal lifecycle contention does not make progress flicker.
+Status reads never inspect or wait for the resident writer. If a newly accepted
+target has not yet been observed by its owner, the last published incarnation
+and searchable counts remain available and `queryable_partial`; only
+`complete` gains a `target_observation` blocker until the next publication.
 `queryable_partial` means the active generation is safe to query but incomplete;
 `ready` means coverage is complete.
 </Callout>

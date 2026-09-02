@@ -2065,6 +2065,7 @@ const AggregatedIndexStatus = struct {
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
+    target_observation_group_count: u64 = 0,
     stale_group_count: u64 = 0,
     missing_group_count: u64 = 0,
     remote_unknown_group_count: u64 = 0,
@@ -2190,6 +2191,7 @@ const IndexObservationAuthority = struct {
     incarnation_current: bool,
     freshness_authoritative: bool,
     readiness_authoritative: bool,
+    convergence_authoritative: bool,
     coverage_authoritative: bool,
 };
 
@@ -2222,6 +2224,7 @@ fn classifyIndexObservation(
         .incarnation_current = incarnation_current,
         .freshness_authoritative = false,
         .readiness_authoritative = false,
+        .convergence_authoritative = false,
         .coverage_authoritative = false,
     };
 
@@ -2245,8 +2248,16 @@ fn classifyIndexObservation(
         item.coverage_summary_ready
     else
         true;
+    const target_observation_complete = if (metadata) |value|
+        value.target_observation_complete
+    else if (@hasField(Item, "target_observation_group_count") and @hasField(Item, "expected_group_count"))
+        item.expected_group_count == 0 or item.target_observation_group_count == item.expected_group_count
+    else
+        true;
     const repair_proves_serviceability = publicIndexRepairState(item) != null and
         repairActiveGenerationServiceable(item);
+    const published_snapshot_proves_serviceability = indexObservationIsDerived(item) and
+        @hasField(Item, "serving_snapshot_ready") and item.serving_snapshot_ready;
     const transition_serviceable = if (metadata) |value|
         incarnation_current and
             ((targeted_sibling_proves_authority and
@@ -2264,7 +2275,8 @@ fn classifyIndexObservation(
     // not carry one table-level metadata label. Their stale/missing counters
     // remain an independent completeness fence during serialization.
     const metadata_authoritative = if (metadata) |value|
-        statusFreshnessCountsAsFresh(value) or transition_serviceable
+        statusFreshnessCountsAsFresh(value) or transition_serviceable or
+            (incarnation_current and published_snapshot_proves_serviceability)
     else if (@hasField(Item, "runtime_fresh"))
         item.runtime_fresh
     else
@@ -2276,9 +2288,10 @@ fn classifyIndexObservation(
         .incarnation_current = incarnation_current,
         .freshness_authoritative = freshness_authoritative,
         .readiness_authoritative = readiness_authoritative,
+        .convergence_authoritative = target_observation_complete,
         // Coverage may be incomplete, but its counters are authoritative once
         // the observation is fresh and bound to the requested incarnation.
-        .coverage_authoritative = readiness_authoritative,
+        .coverage_authoritative = readiness_authoritative and target_observation_complete,
     };
 }
 
@@ -2378,6 +2391,11 @@ fn aggregateIndexStatusIndexed(
             coverage_generation,
             coverage_config_hash,
         );
+        // Target observation is a group-level convergence watermark, separate
+        // from this index's incarnation match. A stale incarnation should
+        // report config_mismatch without fabricating a second target gap.
+        if (runtime.metadata.target_observation_complete)
+            aggregate.target_observation_group_count += 1;
         const index_observation_fresh = authority.freshness_authoritative;
         if (index_observation_fresh) {
             aggregate.fresh_group_count += 1;
@@ -2878,6 +2896,7 @@ const CoverageEvaluation = struct {
 
 const CoverageIncompleteReason = enum {
     runtime_unavailable,
+    target_observation,
     missing_group,
     unknown_group,
     remote_unknown_group,
@@ -3666,6 +3685,54 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":0,\"complete\":false}}",
+        encoded.items,
+    );
+}
+
+test "missing target observation preserves serving snapshot and blocks only completion" {
+    const alloc = std.testing.allocator;
+    const item = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 266,
+        .serving_snapshot_ready = true,
+        .publication_target_count = 266,
+        .publication_target_ready = true,
+        .coverage_produced_count = 64,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 266,
+        .replay_target_sequence = 266,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendSingleIndexRuntimeStatus(
+        alloc,
+        &encoded,
+        .embeddings,
+        item,
+        10_000,
+        .strict,
+        false,
+        42,
+        99,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        .{
+            .source = .live_writer_publish,
+            .freshness = .stale,
+            .target_observation_complete = false,
+        },
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"incarnation\":\"g-000000000000002a\",\"searchable_vectors\":266,\"activity\":null,\"source_coverage\":{\"covered\":64,\"observation_complete\":false,\"observation_incomplete_reasons\":[\"target_observation\"]},\"milestones\":{\"queryable\":{\"reached\":true},\"complete\":{\"reached\":false,\"blockers\":[\"target_observation\",\"source_coverage\",\"publication\"]}},\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"target_observation\",\"backfill\",\"coverage\",\"publication\"]}}",
         encoded.items,
     );
 }
@@ -4829,6 +4896,8 @@ fn appendCoverageIncompleteReasons(
     var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
 
     if (!runtime_present) reasons.insert(.runtime_unavailable);
+    if (runtime_present and !authority.convergence_authoritative)
+        reasons.insert(.target_observation);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
         reasons.insert(.missing_group);
     if ((@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) or
@@ -5812,6 +5881,7 @@ fn appendIndexReadinessStatus(
     else
         1;
     const observation_fresh = authority.freshness_authoritative;
+    const target_observation_complete = authority.convergence_authoritative;
     const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
         item.expected_group_count == item.fresh_group_count
     else
@@ -5854,7 +5924,7 @@ fn appendIndexReadinessStatus(
             item.source_replay;
         break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
     } else true;
-    const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or !sources_complete or
+    const pending = !failed and (!observation_fresh or !target_observation_complete or !topology_complete or !incarnation_current or !sources_complete or
         backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
     const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
@@ -5930,6 +6000,7 @@ fn appendIndexReadinessStatus(
     if (!complete) {
         if (failed) try appendBlocker(alloc, out, "failure", &complete_blocker_emitted);
         if (!observation_fresh) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
+        if (!target_observation_complete) try appendBlocker(alloc, out, "target_observation", &complete_blocker_emitted);
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &complete_blocker_emitted);
         if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &complete_blocker_emitted);
         if (repair_blocks_complete) try appendBlocker(alloc, out, "repair", &complete_blocker_emitted);
@@ -5972,6 +6043,7 @@ fn appendIndexReadinessStatus(
     if (terminal_load_failure) try appendReason(alloc, out, "load_failure", &emitted);
     if (terminal_enrichment_failure) try appendReason(alloc, out, "enrichment_failure", &emitted);
     if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
+    if (!target_observation_complete) try appendReason(alloc, out, "target_observation", &emitted);
     if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
     if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);
     if (!sources_complete) try appendReason(alloc, out, "source_publication", &emitted);
@@ -6029,6 +6101,7 @@ test "published embeddings snapshot remains queryable after isolated source fail
             .incarnation_current = true,
             .freshness_authoritative = true,
             .readiness_authoritative = true,
+            .convergence_authoritative = true,
             .coverage_authoritative = true,
         },
         false,

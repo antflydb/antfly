@@ -970,6 +970,13 @@ pub const RuntimeGroupStatusReport = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
+    /// Opaque monotonic watermark captured before the owner sampled this
+    /// group. It is ordered only within one reporter incarnation.
+    target_observation_revision: u64 = 0,
+    /// True only when this immutable owner observation includes the latest
+    /// accepted replay target for the group. Heartbeat/activity freshness is
+    /// intentionally independent from this convergence proof.
+    target_observation_complete: bool = true,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -1145,6 +1152,7 @@ pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
         return true;
     }
     for (record.runtime_statuses) |runtime_status| {
+        if (!runtime_status.target_observation_complete) return true;
         for (runtime_status.indexes) |index_status| {
             if (runtimeIndexRequiresCurrentProfile(index_status)) return true;
         }
@@ -2543,6 +2551,8 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .topology_generation = record.topology_generation,
         .lsm_root_generation = record.lsm_root_generation,
         .status_generation = record.status_generation,
+        .target_observation_revision = record.target_observation_revision,
+        .target_observation_complete = record.target_observation_complete,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

@@ -7888,6 +7888,10 @@ fn appendRuntimeGroupStatusRecord(
     try appendInt(alloc, out, u64, record.topology_generation);
     try appendInt(alloc, out, u64, record.lsm_root_generation);
     try appendInt(alloc, out, u64, record.status_generation);
+    if (version == runtime_status_protocol.current_record_version) {
+        try appendInt(alloc, out, u64, record.target_observation_revision);
+        try out.append(alloc, if (record.target_observation_complete) 1 else 0);
+    }
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
     try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
@@ -8080,6 +8084,16 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     const topology_generation = try readInt(encoded, pos, u64);
     const lsm_root_generation = try readInt(encoded, pos, u64);
     const status_generation = try readInt(encoded, pos, u64);
+    const target_observation_revision = if (version == runtime_status_protocol.current_record_version)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const target_observation_complete = if (version == runtime_status_protocol.current_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else true;
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
@@ -8122,6 +8136,8 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
         .topology_generation = topology_generation,
         .lsm_root_generation = lsm_root_generation,
         .status_generation = status_generation,
+        .target_observation_revision = target_observation_revision,
+        .target_observation_complete = target_observation_complete,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .disk_bytes_known = disk_bytes_known,
@@ -14931,6 +14947,48 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
             ),
         );
     }
+}
+
+test "current runtime status profile preserves convergence authority" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    const pending = metadata.RuntimeGroupStatusReport{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 7,
+        .store_id = 3,
+        .node_id = 4,
+        .target_observation_revision = 91,
+        .target_observation_complete = false,
+    };
+    try appendRuntimeGroupStatusRecord(
+        alloc,
+        &encoded,
+        pending,
+        runtime_status_protocol.current_record_version,
+    );
+    var pos: usize = 0;
+    const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(u64, 91), decoded.target_observation_revision);
+    try std.testing.expect(!decoded.target_observation_complete);
+
+    encoded.clearRetainingCapacity();
+    try appendRuntimeGroupStatusRecord(
+        alloc,
+        &encoded,
+        pending,
+        runtime_status_protocol.v0_2_0_record_version,
+    );
+    pos = 0;
+    const legacy = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, legacy);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(u64, 0), legacy.target_observation_revision);
+    try std.testing.expect(legacy.target_observation_complete);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

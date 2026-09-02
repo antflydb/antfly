@@ -19297,6 +19297,8 @@ fn runtimeStatusReportFromLocalStatus(
         .topology_generation = status.metadata.topology_generation,
         .lsm_root_generation = status.metadata.lsm_root_generation,
         .status_generation = status.metadata.status_generation,
+        .target_observation_revision = status.metadata.target_observation_revision,
+        .target_observation_complete = status.metadata.target_observation_complete,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
         .disk_bytes_known = status.disk_bytes_known,

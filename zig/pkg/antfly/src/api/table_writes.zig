@@ -12677,14 +12677,14 @@ pub const ProvisionedTableWriteSource = struct {
                 return;
             },
             .status => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, false)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, false)) return;
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
                         self.notifyLocalChange(table_name, .data);
                         return;
                     }
                 }
-                self.markWriteCacheDirty(table_name);
+                self.markWriteCacheRefreshPending(table_name);
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
@@ -12692,13 +12692,13 @@ pub const ProvisionedTableWriteSource = struct {
                 if (db) |managed_db| {
                     _ = self.overlayCachedManagedRuntimeStatusBestEffort(table_name, group_id, managed_db);
                 } else {
-                    self.markWriteCacheDirty(table_name);
+                    self.markWriteCacheRefreshPending(table_name);
                 }
                 self.notifyLocalChange(table_name, .runtime_activity);
                 return;
             },
             .publish => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
                         self.invalidateReadCache(table_name);
@@ -12707,10 +12707,12 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 }
-                self.markWriteCacheDirty(table_name);
+                if (self.runtime_status_cache) |cache|
+                    cache.markGroupTargetObservationPending(table_name, group_id);
+                self.markWriteCacheRefreshPending(table_name);
             },
             .publish_consistent => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
                         var published = true;
@@ -12725,16 +12727,19 @@ pub const ProvisionedTableWriteSource = struct {
                             }
                         };
                         if (published) _ = self.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
+                        if (!published) snapshot_cache.markGroupTargetObservationPending(table_name, group_id);
                         self.invalidateReadCache(table_name);
-                        self.markWriteCacheDirty(table_name);
+                        self.markWriteCacheRefreshPending(table_name);
                         self.notifyLocalChange(table_name, .data);
                         return;
                     }
                 }
-                self.markWriteCacheDirty(table_name);
+                if (self.runtime_status_cache) |cache|
+                    cache.markGroupTargetObservationPending(table_name, group_id);
+                self.markWriteCacheRefreshPending(table_name);
             },
             .publish_blocking => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
                         publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
@@ -12744,7 +12749,7 @@ pub const ProvisionedTableWriteSource = struct {
                                 @errorName(err),
                             });
                             self.invalidateRuntimeStatusCache(table_name);
-                            self.markWriteCacheDirty(table_name);
+                            self.markWriteCacheRefreshPending(table_name);
                             self.invalidateReadCache(table_name);
                             self.notifyLocalChange(table_name, .data);
                             return;
@@ -12757,9 +12762,9 @@ pub const ProvisionedTableWriteSource = struct {
                     }
                 }
                 self.invalidateRuntimeStatusCache(table_name);
-                self.markWriteCacheDirty(table_name);
+                self.markWriteCacheRefreshPending(table_name);
             },
-            .invalidate => if (self.deferManagedRuntimeStatusPublication(table_name, true)) return,
+            .invalidate => if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return,
         }
         self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .data);
@@ -12778,6 +12783,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn deferManagedRuntimeStatusPublication(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
+        group_id: u64,
         invalidate_reads: bool,
     ) bool {
         // Query-visibility hooks run on DB/index workers. Sampling whole-DB
@@ -12785,7 +12791,13 @@ pub const ProvisionedTableWriteSource = struct {
         // together. A configured runtime owner is the serialization boundary:
         // the hook only records debt and asks that owner to sample later.
         if (self.local_change_hook == null) return false;
-        self.markWriteCacheDirty(table_name);
+        // Publication-class edges are the earliest commit-boundary signal that
+        // an accepted target may have advanced. Fence completion immediately;
+        // the owner publication below will restore the proof together with the
+        // exact replay target. Serving authority is not touched.
+        if (invalidate_reads) if (self.runtime_status_cache) |cache|
+            cache.markGroupTargetObservationPending(table_name, group_id);
+        self.markWriteCacheRefreshPending(table_name);
         if (invalidate_reads) self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .runtime_status);
         return true;
@@ -15137,62 +15149,6 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.takeStatusesWithoutActiveGroups(alloc, &owned, active_groups);
     }
 
-    fn appendOrReplaceRuntimeStatusClone(
-        alloc: std.mem.Allocator,
-        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
-        item: runtime_status.LocalTableRuntimeStatus,
-    ) !void {
-        for (items.items) |*existing| {
-            if (existing.group_id != item.group_id) continue;
-            var cloned = try item.clone(alloc);
-            errdefer cloned.deinit(alloc);
-            existing.deinit(alloc);
-            existing.* = cloned;
-            return;
-        }
-        var cloned = try item.clone(alloc);
-        errdefer cloned.deinit(alloc);
-        try items.append(alloc, cloned);
-    }
-
-    fn appendOrReplaceRuntimeStatusClones(
-        alloc: std.mem.Allocator,
-        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
-        statuses: *const runtime_status.LocalTableRuntimeStatuses,
-    ) !void {
-        for (statuses.items) |item| {
-            try appendOrReplaceRuntimeStatusClone(alloc, items, item);
-        }
-    }
-
-    fn mergedRuntimeStatusReplacement(
-        alloc: std.mem.Allocator,
-        current: *const runtime_status.LocalTableRuntimeStatuses,
-        refresh: *const runtime_status.LocalTableRuntimeStatuses,
-    ) !runtime_status.LocalTableRuntimeStatuses {
-        var merged = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
-        errdefer {
-            for (merged.items) |*item| item.deinit(alloc);
-            merged.deinit(alloc);
-        }
-
-        try merged.ensureTotalCapacity(alloc, current.items.len + refresh.items.len);
-        try appendOrReplaceRuntimeStatusClones(alloc, &merged, current);
-        try appendOrReplaceRuntimeStatusClones(alloc, &merged, refresh);
-        return .{ .items = try merged.toOwnedSlice(alloc) };
-    }
-
-    fn replaceRuntimeStatusesWithMergedRefresh(
-        alloc: std.mem.Allocator,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-        refresh: *const runtime_status.LocalTableRuntimeStatuses,
-    ) !void {
-        var replacement = try mergedRuntimeStatusReplacement(alloc, statuses, refresh);
-        errdefer replacement.deinit(alloc);
-        statuses.deinit(alloc);
-        statuses.* = replacement;
-    }
-
     fn indexHasVisibilityFactsForStatus(item: db_mod.types.DBIndexStats) bool {
         return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0 or
             item.repair_degraded or item.repair_issue_count != 0;
@@ -15226,15 +15182,8 @@ pub const ProvisionedTableWriteSource = struct {
             var metadata = item.metadata.withDefaults(.cached_snapshot, now_ns);
             metadata.source = .cached_snapshot;
             metadata.freshness = .fresh;
+            metadata.target_observation_complete = true;
             item.replaceMetadata(metadata);
-        }
-    }
-
-    fn markRuntimeStatusesStale(statuses: *runtime_status.LocalTableRuntimeStatuses) void {
-        for (statuses.items) |*item| {
-            if (item.metadata.freshness == .fresh) {
-                item.replaceFreshness(.stale);
-            }
         }
     }
 
@@ -15273,22 +15222,6 @@ pub const ProvisionedTableWriteSource = struct {
         return recovered;
     }
 
-    fn recoverRuntimeStatusesFromStorage(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?runtime_status.LocalTableRuntimeStatuses {
-        const snapshot_cache = self.runtime_status_cache orelse return null;
-        const publication_token = try snapshot_cache.capturePublicationToken(table_name);
-        var recovered = (try self.snapshotRuntimeStatusesFromStorageBestEffort(alloc, table_name)) orelse return null;
-        errdefer recovered.deinit(alloc);
-        for (recovered.items) |item| _ = try snapshot_cache.publishGroup(publication_token, table_name, item);
-        if (!self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &recovered)) {
-            markRuntimeStatusesStale(&recovered);
-        }
-        return recovered;
-    }
-
     pub fn snapshotRuntimeStatusesBestEffort(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -15303,162 +15236,35 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         snapshot_only: bool,
     ) !?runtime_status.LocalTableRuntimeStatuses {
-        if (snapshot_only or self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
-            const snapshot_cache = self.runtime_status_cache orelse return null;
-            var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
-            // Structural/index transitions deliberately keep the status path
-            // cache-only so it cannot contend with publication. The snapshot
-            // remains useful for diagnostics, but it is not authoritative for
-            // readiness until live admission resumes.
-            if (!self.retainOnlyTargetedStatusSnapshotFreshnessBestEffort(table_name, &cached)) {
-                markRuntimeStatusesStale(&cached);
-            }
-            return cached;
-        }
         if (self.runtime_status_cache == null) {
+            if (snapshot_only or self.structuralStatusSnapshotOnlyBestEffort(table_name)) return null;
             // Standalone/uncached sources have no owner-published status plane
             // to consult. Their caller holds status admission, so a cold
             // read-only inspection is serialized with structural publication
             // without opening a competing writer or changing cache semantics.
             return try self.snapshotRuntimeStatusesFromStorageBestEffort(alloc, table_name);
         }
-        // Keep the hot HTTP status path on the cached status plane. After a
+        // Keep the HTTP status path exclusively on the immutable cached status
+        // plane. After a
         // process restart the cache is empty, or can contain only a synthetic
         // dense placeholder. Production sources delegate recovery to the
         // coalesced runtime owner so status polling never opens a DB inline.
-        // Standalone sources without that owner retain guarded synchronous
-        // recovery for compatibility.
+        // A configured cache always has a publisher; an absent observation is
+        // retried by that owner rather than inspected synchronously here.
         const snapshot_cache = self.runtime_status_cache.?;
         var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse {
-            if (self.local_change_hook != null) {
-                self.notifyLocalChange(table_name, .runtime_status);
-                return null;
-            }
-            return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+            self.notifyLocalChange(table_name, .runtime_status);
+            return null;
         };
         errdefer cached.deinit(alloc);
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
         if (needs_cold_refresh) {
-            if (self.local_change_hook != null) {
-                for (cached.items) |*status| {
-                    status.replaceFreshness(.stale);
-                }
-                self.notifyLocalChange(table_name, .runtime_status);
-                return cached;
+            for (cached.items) |*status| {
+                status.replaceFreshness(.stale);
             }
-            cached.deinit(alloc);
-            return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
-        }
-
-        // Cached snapshots are the steady-state status plane, but an active
-        // writer can advance derived replay after its last publish, including
-        // after primary-write dirtiness has been cleared. Refresh stale/aged
-        // snapshots from an already-open writer. Tables without one continue
-        // to use the published snapshot, so polling never opens a DB.
-        // Reconciliation can spend minutes building an unpublished index on
-        // the resident writer. Status is observational and already has an
-        // immutable published snapshot; do not contend on live DB stats merely
-        // to refresh optional counters during that interval.
-        if (!self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
-            try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
-            if (!self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &cached)) {
-                markRuntimeStatusesStale(&cached);
-            }
+            self.notifyLocalChange(table_name, .runtime_status);
         }
         return cached;
-    }
-
-    fn refreshRuntimeStatusesFromWriteCache(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-    ) !void {
-        const now_ns = platform_time.monotonicNs();
-        if (!runtimeStatusesNeedWriterRefresh(statuses, now_ns)) return;
-
-        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
-        defer {
-            for (leases.items) |*lease| {
-                const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
-                lease.deinit(release_alloc);
-            }
-            leases.deinit(alloc);
-        }
-
-        lockAtomic(&self.local_db_mutex);
-        const has_leases = self.collectRuntimeStatusLeasesFromWriteCacheLocked(alloc, table_name, &leases) catch |err| {
-            self.local_db_mutex.unlock();
-            self.drainWriteCachePendingCloses();
-            return err;
-        };
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
-        if (!has_leases) return;
-
-        var live_statuses = (try self.runtimeStatusesFromCachedDbLeasesBestEffort(alloc, table_name, leases.items)) orelse return;
-        defer live_statuses.deinit(alloc);
-
-        try replaceRuntimeStatusesWithMergedRefresh(alloc, statuses, &live_statuses);
-    }
-
-    fn runtimeStatusesNeedWriterRefresh(statuses: *const runtime_status.LocalTableRuntimeStatuses, now_ns: u64) bool {
-        const min_refresh_interval_ns = std.time.ns_per_s;
-        if (statuses.items.len == 0) return true;
-        for (statuses.items) |status| {
-            // A live-writer publication is still a point-in-time cache entry.
-            // Enrichment and derived-index workers can advance immediately
-            // after it is published (notably after inline table creation), so
-            // treating it as permanently current strands readiness at the
-            // pre-replay snapshot. Refresh both recovered and writer-published
-            // observations from the already-open writer at the bounded cadence.
-            switch (status.metadata.source) {
-                .cached_snapshot, .live_writer_publish => {},
-                else => continue,
-            }
-            if (!runtime_status.statusRuntimeFresh(status)) return true;
-            if (status.metadata.updated_at_ns == 0) return true;
-            if (now_ns -| status.metadata.updated_at_ns >= min_refresh_interval_ns) return true;
-        }
-        return false;
-    }
-
-    fn overlayManagedWriterReplayTargetsBestEffort(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-    ) bool {
-        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
-        defer {
-            for (leases.items) |*lease| {
-                const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
-                lease.deinit(release_alloc);
-            }
-            leases.deinit(alloc);
-        }
-
-        if (!self.local_db_mutex.tryLock()) return false;
-        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.write_cache, &leases) catch {
-            self.local_db_mutex.unlock();
-            return false;
-        };
-        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.startup_write_cache, &leases) catch {
-            self.local_db_mutex.unlock();
-            return false;
-        };
-        self.local_db_mutex.unlock();
-
-        for (leases.items) |lease| {
-            const entry = lease.entry orelse continue;
-            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            for (statuses.items) |*status| {
-                if (status.group_id != entry.group_id) continue;
-                overlayRuntimeStatusReplayTargetFromDb(alloc, status, lease.db);
-                break;
-            }
-        }
-        return true;
     }
 
     pub fn lsmMaintenanceStats(self: *ProvisionedTableWriteSource) lsm_backend.Backend.MaintenanceStats {
@@ -16153,6 +15959,15 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn markWriteCacheDirty(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (self.local_write_owner) |owner| return owner.markWriteCacheDirty(table_name);
+        self.markWriteCacheRefreshPending(table_name);
+    }
+
+    /// Schedules another owner snapshot without claiming that the durable data
+    /// target advanced. Visibility/activity callbacks use this path so a
+    /// successful publication cannot immediately invalidate its own
+    /// convergence proof.
+    fn markWriteCacheRefreshPending(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (self.local_write_owner) |owner| return owner.markWriteCacheRefreshPending(table_name);
         if (self.write_cache == null) return;
         lockAtomic(&self.dirty_write_tables_mutex);
         if (self.hasDirtyWriteTableLocked(table_name)) {
@@ -19093,7 +18908,6 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endTableRequest(table_name);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
         errdefer {
             lockAtomic(&self.local_db_mutex);
@@ -20022,7 +19836,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginReplicatedApplyOperation(table_name, group_id);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
         defer {
             self.endGroupOperation(table_name, group_id);
@@ -20789,10 +20602,15 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.localRuntimeStatuses(alloc, table_name);
-        // Status must not observe a structural generation transition, but it
-        // is safe to serve immutable snapshots during ordinary group work.
-        // The narrower admission avoids deadlocking status callers that run
-        // inside a group operation while still fencing restore/drop/publish.
+        // Managed/hosted sources have an owner-published immutable cache. Its
+        // lifecycle and index fences are authoritative, so the HTTP request
+        // path needs no activity admission and cannot wait behind structural
+        // reconciliation.
+        if (self.runtime_status_cache != null)
+            return try self.snapshotRuntimeStatusesBestEffortWithAdmission(alloc, table_name, false);
+        // Status must not observe a structural generation transition, but
+        // uncached standalone sources still inspect storage synchronously and
+        // therefore retain structural admission.
         const admission = self.beginStatusRequest(table_name);
         defer self.endStatusRequest(table_name, admission);
         return try self.snapshotRuntimeStatusesBestEffortWithAdmission(alloc, table_name, admission == .snapshot_only);
@@ -23271,15 +23089,14 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |hosted_cache| {
-            {
-                lockAtomic(&hosted_cache.mutex);
-                defer hosted_cache.mutex.unlock();
-                const statuses = try hosted_cache.write_cache.snapshotRuntimeStatusesLocked(alloc, table_name);
-                if (statuses) |owned| return owned;
-            }
+            // Hosted status is an owner-published control-plane snapshot. Do
+            // not inspect or wait for the mutable writer cache on the HTTP
+            // request path: a temporarily older snapshot remains valid for
+            // serving, while its independent target-observation authority
+            // keeps completion conservative until the owner publishes again.
             if (try hosted_cache.runtime_status_cache.snapshot(alloc, table_name)) |statuses| return statuses;
         }
-        return try snapshotLocalTableRuntimeStatusesUncached(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name);
+        return null;
     }
 
     fn corruptEmbeddingArtifact(
@@ -28339,104 +28156,6 @@ fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod.DB)
     }
 }
 
-fn overlayRuntimeStatusReplayTargetFromDb(
-    alloc: std.mem.Allocator,
-    status: *runtime_status.LocalTableRuntimeStatus,
-    db: *db_mod.DB,
-) void {
-    // Cold/query-only recovery has no producer runtime of its own. If a live
-    // writer is resident, overlay its runtime diagnostics and try to refresh
-    // lifecycle plus physical counters under one apply-lock boundary. A
-    // contended best-effort read may add debt but must not remove a blocker.
-    const lifecycle_authoritative = db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-    const async_stats = status.stats.async_indexing;
-    for (status.stats.indexes) |*item| {
-        const prior_backfill_active = item.backfill_active;
-        const prior_backfill_progress = item.backfill_progress;
-        const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
-        if (lifecycle_authoritative) {
-            if (db.executor.appliedSequence(item.name)) |live_applied| {
-                item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
-            }
-        }
-        // The primary replay head is shared by every managed index. Derive the
-        // target from this index's matching replay lane so unrelated commits
-        // cannot manufacture replay debt in public provisioned status.
-        item.replay_target_sequence = db.managedIndexReplayTargetSequence(
-            alloc,
-            item.name,
-            item.kind,
-            item.replay_applied_sequence,
-        ) catch @max(item.replay_target_sequence, item.replay_applied_sequence);
-        item.replay_target_sequence = @max(item.replay_target_sequence, item.replay_applied_sequence);
-        item.catch_up_target_sequence = item.replay_target_sequence;
-        item.catch_up_applied_sequence = item.replay_applied_sequence;
-        const live_catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
-        item.catch_up_active = live_catch_up_active or (!lifecycle_authoritative and item.catch_up_active);
-        if (live_catch_up_active or lifecycle_authoritative)
-            item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence or
-            (!lifecycle_authoritative and item.replay_catch_up_required);
-        if (item.catch_up_active or item.replay_catch_up_required) {
-            item.backfill_active = true;
-            if (item.replay_target_sequence > 0) {
-                item.backfill_progress = @min(
-                    1.0,
-                    @as(f64, @floatFromInt(item.replay_applied_sequence)) /
-                        @as(f64, @floatFromInt(item.replay_target_sequence)),
-                );
-            }
-        } else if (prior_backfill_active and (!lifecycle_authoritative or preserve_non_replay_backfill)) {
-            item.backfill_active = true;
-            item.backfill_progress = prior_backfill_progress;
-        } else {
-            item.backfill_active = false;
-            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
-        }
-    }
-}
-
-fn runtimeStatusHasNonReplayBackfillSignal(item: db_mod.types.DBIndexStats) bool {
-    if (!item.backfill_active) return false;
-    // Health and activity are independent axes. Load failures, terminal
-    // coverage gaps, and incomplete repair summaries are degraded states, but
-    // none proves that a worker is still making progress. Preserve the bit
-    // only when a durable build/checkpoint or algebraic runtime explicitly
-    // reports active work.
-    if (std.mem.eql(u8, item.projection_checkpoint_status, "rebuilding")) return true;
-    if (item.index_repair_id != null and
-        !std.mem.eql(u8, item.index_repair_phase, "terminal") and
-        !std.mem.eql(u8, item.index_repair_automation, "paused")) return true;
-    if (item.algebraic_active_progress != null) return true;
-    if (item.algebraic_adaptive_backfilling_count != 0) return true;
-    return false;
-}
-
-test "runtime status distinguishes degraded health from active generation work" {
-    var degraded = db_mod.types.DBIndexStats{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .backfill_active = true,
-        .repair_degraded = true,
-        .repair_issue_count = 3,
-        .repair_summary_ready = false,
-        .projection_checkpoint_status = "degraded",
-    };
-    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
-
-    degraded.projection_checkpoint_status = "rebuilding";
-    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
-
-    degraded.projection_checkpoint_status = "degraded";
-    degraded.index_repair_id = 42;
-    degraded.index_repair_phase = "building";
-    degraded.index_repair_automation = "enabled";
-    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
-
-    degraded.index_repair_automation = "paused";
-    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
-}
-
 fn startupCatchUpStatsForPhase(
     phase: db_mod.types.StartupCatchUpPhase,
     db: ?*db_mod.DB,
@@ -28718,6 +28437,7 @@ fn setRuntimeStatusMetadata(
     freshness: runtime_status.RuntimeStatusFreshness,
 ) void {
     status.relabel(source, freshness, platform_time.monotonicNs());
+    status.metadata.target_observation_complete = true;
 }
 
 fn markStartupRuntimeStatus(
@@ -34317,6 +34037,16 @@ test "dirty auto bulk writer publishes runtime status without closing the cached
     try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", stale);
 
     var refreshed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.cached_snapshot, refreshed.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, refreshed.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), refreshed.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(refreshed.items[0].stats.indexes[0].replay_catch_up_required);
+    refreshed.deinit(alloc);
+
+    // Reads never repair or overlay the snapshot. The resident owner publishes
+    // the next atomic lifecycle/target observation instead.
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
+    refreshed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, refreshed.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, refreshed.items[0].metadata.freshness);
@@ -39540,7 +39270,8 @@ test "provisioned table write source runtime status serves cached snapshot durin
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
 }
 
 test "provisioned table write source runtime status serves cached snapshot while dirty and request busy" {
@@ -39799,7 +39530,8 @@ test "provisioned table write source runtime status still serves unrelated table
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
 }
 
 test "provisioned table write source runtime status serves cached snapshot while dirty and busy" {
@@ -44942,7 +44674,7 @@ test "provisioned table write source publishes replay debt from owner db handle"
     try std.testing.expect(statuses.items[0].stats.indexes[0].replay_target_sequence > statuses.items[0].stats.indexes[0].replay_applied_sequence);
 }
 
-test "provisioned runtime status overlays live writer replay target without republishing stats" {
+test "provisioned owner publication advances exact index replay target" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -45016,15 +44748,23 @@ test "provisioned runtime status overlays live writer replay target without repu
     var cached_only = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer cached_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), cached_only.items[0].stats.indexes[0].replay_target_sequence);
+    snapshot_cache.markGroupTargetObservationPending("docs", 7001);
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expect(!statuses.items[0].metadata.target_observation_complete);
+    statuses.deinit(alloc);
+
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+    statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
+    statuses.deinit(alloc);
 
     const unrelated_sequence = cached.db.core.store.nextReplaySequence(1);
     const unrelated_payload = try change_journal_mod.encodeRecord(alloc, .{
@@ -45036,8 +44776,10 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expectEqual(@as(u64, 3), cached.db.core.nextDerivedSequence());
 
     // A global replay entry for another managed-index kind must not recreate
-    // dense replay debt in the public provisioned status overlay.
-    overlayRuntimeStatusReplayTargetFromDb(alloc, &statuses.items[0], cached.db);
+    // dense replay debt in the next authoritative owner publication.
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+    statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
@@ -45330,7 +45072,7 @@ test "targeted repair publication preserves sibling authority fence" {
     try std.testing.expect(!thumbnail.runtime_observation_stale);
 }
 
-test "provisioned runtime status live replay overlay preserves cold dense visibility refresh" {
+test "provisioned owner publication fills cold dense visibility" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -45394,25 +45136,7 @@ test "provisioned runtime status live replay overlay preserves cold dense visibi
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
 
-    var sparse = runtime_status.LocalTableRuntimeStatus{
-        .group_id = 7001,
-        .metadata = .{
-            .updated_at_ns = 1,
-            .source = .live_writer_publish,
-            .freshness = .fresh,
-        },
-        .stats = .{
-            .doc_count = 1,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    defer sparse.deinit(alloc);
-    sparse.stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "dv_v1"),
-        .kind = .dense_vector,
-    };
-    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", sparse);
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -45423,7 +45147,7 @@ test "provisioned runtime status live replay overlay preserves cold dense visibi
     try std.testing.expect(statuses.items[0].stats.indexes[0].replay_target_sequence > 0);
 }
 
-test "provisioned runtime status live replay overlay clears ambiguous replay-only backfill" {
+test "provisioned owner publication clears ambiguous replay-only backfill" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -45508,6 +45232,7 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -45518,7 +45243,7 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
     try std.testing.expectEqual(@as(f64, 1.0), statuses.items[0].stats.indexes[0].backfill_progress);
 }
 
-test "provisioned runtime status live replay overlay preserves non-replay backfill" {
+test "provisioned owner publication preserves non-replay backfill" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -45604,6 +45329,7 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -46546,41 +46272,6 @@ test "runtime status request does not finish expired auto bulk ingest" {
     try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
     try write_cache.finishAutoBulkIngestLocked(7001, "docs");
-}
-
-test "runtime status refresh preserves current snapshot on allocation failure" {
-    const Runner = struct {
-        fn run(alloc: std.mem.Allocator) !void {
-            const current_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-            var current = runtime_status.LocalTableRuntimeStatuses{ .items = current_items };
-            defer current.deinit(alloc);
-            current.items[0] = .{
-                .group_id = 7001,
-                .stats = .{ .doc_count = 11 },
-            };
-
-            const refresh_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-            var refresh = runtime_status.LocalTableRuntimeStatuses{ .items = refresh_items };
-            defer refresh.deinit(alloc);
-            refresh.items[0] = .{
-                .group_id = 7001,
-                .stats = .{ .doc_count = 99 },
-            };
-
-            ProvisionedTableWriteSource.replaceRuntimeStatusesWithMergedRefresh(alloc, &current, &refresh) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    try std.testing.expectEqual(@as(usize, 1), current.items.len);
-                    try std.testing.expectEqual(@as(u64, 11), current.items[0].stats.doc_count);
-                    return error.OutOfMemory;
-                },
-            };
-
-            try std.testing.expectEqual(@as(usize, 1), current.items.len);
-            try std.testing.expectEqual(@as(u64, 99), current.items[0].stats.doc_count);
-        }
-    };
-
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "provisioned table write source startup snapshot preserves existing group status" {
@@ -51653,29 +51344,110 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
 }
 
-test "runtime status refreshes aged live writer publications" {
-    const now_ns = 2 * std.time.ns_per_s;
-    var item = runtime_status.LocalTableRuntimeStatus{
-        .group_id = 7001,
-        .metadata = .{
-            .source = .live_writer_publish,
-            .freshness = .fresh,
-            .updated_at_ns = 1,
-        },
-        .stats = .{},
+test "cached runtime status is independent of writer lock and target observation" {
+    const alloc = std.testing.allocator;
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-    var items = [_]runtime_status.LocalTableRuntimeStatus{item};
-    var statuses = runtime_status.LocalTableRuntimeStatuses{ .items = items[0..] };
-    try std.testing.expect(ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
 
-    item.metadata.updated_at_ns = now_ns;
-    statuses.items[0] = item;
-    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+    var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(token, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 10_000,
+                .indexes = @constCast((&[_]db_mod.types.DBIndexStats{.{
+                    .name = "semantic",
+                    .kind = .dense_vector,
+                    .doc_count = 266,
+                    .serving_snapshot_ready = true,
+                    .coverage_produced_count = 64,
+                    .coverage_generation = 42,
+                    .coverage_config_hash = 99,
+                    .coverage_identity_ready = true,
+                    .coverage_summary_ready = true,
+                }})[0..]),
+            },
+        }),
+    );
+    // Capture a would-be owner publication before the next commit edge. It
+    // must not be able to reassert convergence after that edge races it.
+    const in_flight_token = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7001);
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(in_flight_token, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 10_000,
+                .indexes = @constCast((&[_]db_mod.types.DBIndexStats{.{
+                    .name = "semantic",
+                    .kind = .dense_vector,
+                    .doc_count = 266,
+                    .serving_snapshot_ready = true,
+                    .coverage_produced_count = 64,
+                    .coverage_generation = 42,
+                    .coverage_config_hash = 99,
+                    .coverage_identity_ready = true,
+                    .coverage_summary_ready = true,
+                }})[0..]),
+            },
+        }),
+    );
 
-    item.metadata.source = .synthetic_config;
-    item.metadata.updated_at_ns = 1;
-    statuses.items[0] = item;
-    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-pure-runtime-status", NoCatalog.iface());
+    defer source.deinit();
+    source.runtime_status_cache = &cache;
+
+    // Holding both resident-writer and structural-activity mutexes must neither
+    // block nor degrade a managed status read. The request path consumes only
+    // the immutable cache and its explicit lifecycle fences.
+    lockAtomic(&source.local_db_mutex);
+    defer source.local_db_mutex.unlock();
+    const io = source.table_activity_threaded.io();
+    source.table_activity_mutex.lockUncancelable(io);
+    defer source.table_activity_mutex.unlock(io);
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(!statuses.items[0].metadata.target_observation_complete);
+    try std.testing.expectEqual(@as(u64, 266), statuses.items[0].stats.indexes[0].doc_count);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].serving_snapshot_ready);
+    try std.testing.expectEqual(@as(u64, 64), statuses.items[0].stats.indexes[0].coverage_produced_count);
+
+    const owner_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(owner_token, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .source_doc_count = 10_001 },
+        }),
+    );
+    var owner_status = (try cache.snapshotGroupStatus(alloc, "docs", 7001)).?;
+    defer owner_status.deinit(alloc);
+    try std.testing.expect(owner_status.metadata.target_observation_complete);
 }
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {
@@ -53178,7 +52950,7 @@ test "hosted write cache opens current visible root generation" {
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
 }
 
-test "hosted runtime status prefers live writer over stale hosted snapshot" {
+test "hosted runtime status reads owner snapshot without inspecting live writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -53303,13 +53075,18 @@ test "hosted runtime status prefers live writer over stale hosted snapshot" {
     defer cached_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 99), cached_only.items[0].stats.doc_count);
 
+    // The hosted adapter must not regress to the mutable write-cache path.
+    // Holding its coordination mutex while reading status proves that the
+    // owner-published snapshot remains an independent control plane.
+    lockAtomic(&hosted_cache.mutex);
+    defer hosted_cache.mutex.unlock();
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
-    try std.testing.expect(statuses.items[0].metadata.updated_at_ns != 1);
-    try std.testing.expect(statuses.items[0].stats.doc_count != 99);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].metadata.updated_at_ns);
+    try std.testing.expectEqual(@as(u64, 99), statuses.items[0].stats.doc_count);
 }
 
 test "write cache adopts just-created db across reconcile generation bump" {

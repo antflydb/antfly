@@ -164,6 +164,18 @@ bulk work.
 Managed embeddings expose three independent status dimensions. They must not be
 collapsed into one generic progress percentage:
 
+- Serving authority is incarnation-scoped and comes from the immutable
+  published snapshot used by query admission. It alone determines
+  `milestones.queryable`.
+- Convergence authority proves that coverage and publication targets were
+  observed after the latest accepted table target. A commit clears that proof;
+  the runtime owner restores it in its next atomic status publication. A
+  cache-local monotonic target revision prevents an observation captured before
+  the commit from racing in afterward and restoring the proof.
+- Activity freshness describes only whether the current owner heartbeat is
+  recent. Losing it sets `activity` to `null` without changing serving or
+  convergence facts.
+
 - `source_coverage` is generation-scoped durable outcome accounting. `total` is
   the source-document population; every source is exactly one of `pending`,
   `covered`, `skipped`, or `failed` once the observation is complete. A missing
@@ -199,6 +211,12 @@ failure. It can prevent `complete` under the configured coverage policy, but an
 exact, already published snapshot remains queryable and can satisfy a
 `searchable-artifacts` threshold. Only an incarnation-wide runtime/load failure
 or a query-blocking repair fence revokes that serving proof.
+
+Status HTTP reads clone the immutable cache and never inspect the resident DB
+or acquire its writer-cache mutex. While convergence is awaiting the next owner
+publication, the last safe incarnation and counts remain visible and
+queryable; `complete` is blocked by `target_observation` in addition to any
+coverage/publication debt.
 
 Initial materialization and corruption recovery share a crash-resumable,
 bounded generation scheduler, but remain distinct durable work classes. A
@@ -293,10 +311,10 @@ The durable runtime-status codec has two negotiated profiles, not a numeric
 feature ladder. It reads and writes the exact v12 profile released by v0.2.0,
 and reads and writes current v15. Every other numeric version is an unreleased
 development artifact and is rejected. Reporter fences, repair state,
-artifact-source replay/failure facts, and native-generation restore identity
-are one mandatory v15 admission-safety profile and wait until every current
-metadata voter supports v15. Activity never
-enters that codec.
+artifact-source replay/failure facts, native-generation restore identity, and
+the group convergence-authority watermark form one mandatory v15 admission-
+safety profile and wait until every current metadata voter supports v15.
+Activity never enters that codec.
 
 ## Full-Text Routing From Enrichments
 

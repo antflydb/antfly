@@ -13,6 +13,7 @@ class IndexReadinessReason(str, Enum):
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
     SHARD_OBSERVATION_INCOMPLETE = "shard_observation_incomplete"
     SOURCE_PUBLICATION = "source_publication"
+    TARGET_OBSERVATION = "target_observation"
 
     def __str__(self) -> str:
         return str(self.value)

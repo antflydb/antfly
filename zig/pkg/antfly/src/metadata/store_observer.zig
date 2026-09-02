@@ -460,6 +460,8 @@ fn runtimeStatusEqual(
         lhs.topology_generation != rhs.topology_generation or
         lhs.lsm_root_generation != rhs.lsm_root_generation or
         lhs.status_generation != rhs.status_generation or
+        lhs.target_observation_revision != rhs.target_observation_revision or
+        lhs.target_observation_complete != rhs.target_observation_complete or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
         lhs.disk_bytes_known != rhs.disk_bytes_known or

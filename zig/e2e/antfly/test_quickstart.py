@@ -15,6 +15,10 @@
 """Portable quickstart-style E2E tests for antfly-zig."""
 
 import json
+import os
+import subprocess
+import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -1054,6 +1058,41 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert "source_coverage" in milestones["complete"]["blockers"]
     assert partial_status["searchable_vectors"] == partial_status["total_indexed"]
 
+    # Exercise the documented CLI outcome, not only the fixture's equivalent
+    # HTTP polling loop. ANTFLY_URL points at the process root because the CLI
+    # owns public API prefix selection.
+    server = backup_api._server
+    if server is not None and Path(server.binary).name == "antfly":
+        cli_env = os.environ.copy()
+        cli_env["ANTFLY_URL"] = server.url
+        cli_wait = subprocess.run(
+            [
+                server.binary,
+                "index",
+                "wait",
+                "--table",
+                table_name,
+                "--index",
+                index_name,
+                "--until",
+                "searchable-artifacts=1",
+                "--timeout",
+                "5s",
+                "--poll-interval",
+                "25ms",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+            env=cli_env,
+            check=False,
+        )
+        assert cli_wait.returncode == 0, (
+            f"stdout:\n{cli_wait.stdout}\nstderr:\n{cli_wait.stderr}\n"
+            f"server logs:\n{backup_api.debug_logs()}"
+        )
+        assert "reached searchable-artifacts=1" in cli_wait.stdout
+
     # Activity is leader-local and can be briefly absent during handoff, but
     # the delivery pipeline must produce a heartbeat for the current index
     # incarnation while durable readiness remains independently queryable.
@@ -1162,6 +1201,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         if (
             readiness.get("queryable") is True
             and int(status.get("searchable_vectors", 0)) >= 1
+            and int((status.get("source_coverage") or {}).get("covered", 0)) >= 1
         ):
             return status
         return None
@@ -1176,6 +1216,39 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         backup_api.get_index(table_name, index_name)["status"]["readiness"]["complete"]
         is False
     )
+
+    # Status is a bounded immutable-snapshot read. Sample across several owner
+    # refresh cycles while both incarnations are active: a missed heartbeat may
+    # remove activity, but must never revoke serving authority or zero facts.
+    first_incarnation = partial_status["readiness"]["incarnation"]
+    first_floor = int(partial_status["searchable_vectors"])
+    first_coverage_floor = int(partial_status["source_coverage"]["covered"])
+    second_floor = int(second_partial["searchable_vectors"])
+    sampling_deadline = time.monotonic() + 3.0
+    samples = 0
+    while time.monotonic() < sampling_deadline:
+        for sampled_index, incarnation, artifacts_floor, coverage_floor in (
+            (index_name, first_incarnation, first_floor, first_coverage_floor),
+            (second_index_name, second_incarnation, second_floor, 1),
+        ):
+            request_started = time.monotonic()
+            sampled = backup_api.get_index(table_name, sampled_index)["status"]
+            request_elapsed = time.monotonic() - request_started
+            assert request_elapsed < 1.0, (
+                f"status request for {sampled_index} took {request_elapsed:.3f}s"
+            )
+            sampled_readiness = sampled.get("readiness") or {}
+            assert sampled_readiness.get("state") != "runtime_unavailable", sampled
+            assert sampled_readiness.get("incarnation") == incarnation, sampled
+            assert sampled_readiness.get("queryable") is True, sampled
+            assert int(sampled.get("searchable_vectors", 0)) >= artifacts_floor, sampled
+            assert (
+                int((sampled.get("source_coverage") or {}).get("covered", 0))
+                >= coverage_floor
+            ), sampled
+        samples += 1
+        time.sleep(0.05)
+    assert samples >= 3
 
     progressive_openai_embedder.allow_rate_limited_requests()
     complete = backup_api.wait_index_ready(

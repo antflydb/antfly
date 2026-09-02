@@ -3315,6 +3315,8 @@ const ParsedRuntimeGroupStatus = struct {
     topology_generation: ?u64 = null,
     lsm_root_generation: ?u64 = null,
     status_generation: ?u64 = null,
+    target_observation_revision: ?u64 = null,
+    target_observation_complete: ?bool = null,
     doc_count: ?u64 = null,
     disk_bytes: ?u64 = null,
     disk_bytes_known: ?bool = null,
@@ -3616,6 +3618,11 @@ fn cloneParsedRuntimeGroupStatus(
         .topology_generation = parsed.topology_generation orelse 0,
         .lsm_root_generation = parsed.lsm_root_generation orelse 0,
         .status_generation = parsed.status_generation orelse 0,
+        .target_observation_revision = parsed.target_observation_revision orelse 0,
+        // v0.2.0 reporters predate this field and their v12 profile carries
+        // the historical converged interpretation. Current reporters send an
+        // explicit false whenever the commit watermark is pending.
+        .target_observation_complete = parsed.target_observation_complete orelse true,
         .doc_count = parsed.doc_count orelse 0,
         .disk_bytes = parsed.disk_bytes orelse 0,
         .disk_bytes_known = parsed.disk_bytes_known orelse false,

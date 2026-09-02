@@ -4499,7 +4499,7 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
         target_index: ?IndexRuntimeTarget,
-        force_write_refresh: bool,
+        include_write_owner_snapshot: bool,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
@@ -4509,7 +4509,7 @@ pub const ApiHttpServer = struct {
             items.deinit(self.alloc);
         }
 
-        var read_needs_refresh = false;
+        var read_needs_owner_snapshot = false;
         var read_statuses_present = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
@@ -4519,10 +4519,10 @@ pub const ApiHttpServer = struct {
                 } else {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
-                    read_needs_refresh = if (target_index) |target|
-                        runtimeStatusesNeedWriterRefreshForIndex(owned.items, target)
+                    read_needs_owner_snapshot = if (target_index) |target|
+                        runtimeStatusesNeedOwnerSnapshotForIndex(owned.items, target)
                     else
-                        runtimeStatusesNeedWriterRefresh(owned.items);
+                        runtimeStatusesNeedOwnerSnapshot(owned.items);
                     try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
                 }
             }
@@ -4534,21 +4534,21 @@ pub const ApiHttpServer = struct {
                 try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot, target_index);
             }
         }
-        const should_query_writes = force_write_refresh or if (snapshot == null)
-            self.table_reads == null or !read_statuses_present or read_needs_refresh
+        const should_read_owner_snapshot = include_write_owner_snapshot or if (snapshot == null)
+            self.table_reads == null or !read_statuses_present or read_needs_owner_snapshot
         else
-            items.items.len == 0 or !read_statuses_present or read_needs_refresh;
-        if (should_query_writes and self.table_writes != null) {
-            // Local write-source statuses are a best-effort refresh: a shard
-            // that is not hosted locally must not fail the status request.
-            const write_statuses = self.table_writes.?.localRuntimeStatuses(self.alloc, table_name) catch |err| blk: {
+            items.items.len == 0 or !read_statuses_present or read_needs_owner_snapshot;
+        if (should_read_owner_snapshot and self.table_writes != null) {
+            // Local write-owner statuses are best-effort immutable snapshots:
+            // a shard that is not hosted locally must not fail the request.
+            const owner_statuses = self.table_writes.?.localRuntimeStatuses(self.alloc, table_name) catch |err| blk: {
                 std.log.warn("index status local write-source runtime statuses unavailable table={s} err={s}", .{ table_name, @errorName(err) });
                 break :blk null;
             };
-            if (write_statuses) |statuses| {
+            if (owner_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                if (force_write_refresh) {
+                if (include_write_owner_snapshot) {
                     // Lifecycle classification needs the writer observation in
                     // addition to the best read/remote observation. A read DB
                     // can legitimately be fresh for its retained generation
@@ -4585,41 +4585,41 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
-    fn runtimeStatusNeedsWriterRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusNeedsOwnerSnapshot(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
         if (status.metadata.source == .live_writer_publish) return false;
         return status.stats.indexes.len != 0;
     }
 
-    fn runtimeStatusesNeedWriterRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusesNeedOwnerSnapshot(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
-            if (runtimeStatusNeedsWriterRefresh(status)) return true;
+            if (runtimeStatusNeedsOwnerSnapshot(status)) return true;
         }
         return false;
     }
 
-    fn runtimeStatusesNeedWriterRefreshForIndex(
+    fn runtimeStatusesNeedOwnerSnapshotForIndex(
         statuses: []const runtime_status.LocalTableRuntimeStatus,
         target: IndexRuntimeTarget,
     ) bool {
         for (statuses) |status| {
-            if (runtimeStatusTargetNeedsWriterRefresh(status, target)) return true;
+            if (runtimeStatusTargetNeedsOwnerSnapshot(status, target)) return true;
         }
         return false;
     }
 
-    fn runtimeStatusTargetNeedsWriterRefresh(
+    fn runtimeStatusTargetNeedsOwnerSnapshot(
         status: runtime_status.LocalTableRuntimeStatus,
         target: IndexRuntimeTarget,
     ) bool {
-        if (runtimeStatusNeedsWriterRefresh(status)) return true;
+        if (runtimeStatusNeedsOwnerSnapshot(status)) return true;
         // A read snapshot can be fresh for its retained index generation
         // while the live writer is admitting or advancing a newer index.
         if (runtimeStatusTargetRank(status, target) < 2) return true;
         // The read cache's freshness describes the observation it retained;
         // it does not make an incomplete lifecycle observation terminal. Only
-        // the requested index detail path pays for this writer refresh, and it
+        // the requested index detail path reads the owner snapshot, and it
         // stops doing so as soon as the cached proof is complete.
         for (status.stats.indexes) |index| {
             if (!std.mem.eql(u8, index.name, target.name)) continue;
@@ -4815,13 +4815,13 @@ pub const ApiHttpServer = struct {
                 const existing_rank = runtimeStatusTargetRank(existing.*, index_target);
                 if (candidate_rank != existing_rank) break :blk candidate_rank > existing_rank;
                 // Once an incomplete cached observation caused a targeted
-                // writer refresh, the live writer is the authoritative view
+                // owner-snapshot lookup, the live writer is authoritative
                 // for that same incarnation even if its freshness is still
                 // catching_up. Otherwise the cached value can win forever.
                 const candidate_is_writer = status.metadata.source == .live_writer_publish;
                 const existing_is_writer = existing.metadata.source == .live_writer_publish;
                 if (candidate_is_writer != existing_is_writer and
-                    runtimeStatusTargetNeedsWriterRefresh(existing.*, index_target))
+                    runtimeStatusTargetNeedsOwnerSnapshot(existing.*, index_target))
                 {
                     break :blk candidate_is_writer;
                 }
@@ -5042,6 +5042,8 @@ pub const ApiHttpServer = struct {
                 .topology_generation = report.topology_generation,
                 .lsm_root_generation = report.lsm_root_generation,
                 .status_generation = report.status_generation,
+                .target_observation_revision = report.target_observation_revision,
+                .target_observation_complete = report.target_observation_complete,
                 .store_id = report.store_id,
                 .node_id = report.node_id,
             },
@@ -36973,7 +36975,7 @@ test "api index status refreshes synthetic configured index status from write so
             .indexes = @constCast(synthetic_indexes[0..]),
         },
     }};
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(synthetic_statuses[0..]));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(synthetic_statuses[0..]));
 
     const live_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "search",
@@ -36987,7 +36989,7 @@ test "api index status refreshes synthetic configured index status from write so
             .indexes = @constCast(live_indexes[0..]),
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(live_statuses[0..]));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {
@@ -37006,11 +37008,11 @@ test "api index status refreshes writer when read snapshot omits requested index
         },
     }};
 
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(statuses[0..], .{
         .name = "older_idx",
         .identity = null,
     }));
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(statuses[0..], .{
         .name = "newer_idx",
         .identity = null,
     }));
@@ -37028,11 +37030,11 @@ test "api index status refreshes writer when read snapshot omits requested index
             .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(current_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(current_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 42, .config_hash = 99 },
     }));
@@ -37048,7 +37050,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(unrelated_incomplete_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37068,14 +37070,14 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(incomplete_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var retained_live_incomplete = incomplete_statuses[0];
     retained_live_incomplete.metadata.source = .live_writer_publish;
-    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(&.{retained_live_incomplete}, .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37093,7 +37095,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_issue_count = 1,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(terminal_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
@@ -37110,7 +37112,7 @@ test "api index status refreshes writer when read snapshot omits requested index
             .repair_degraded = true,
         },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshotForIndex(terminal_phase_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));

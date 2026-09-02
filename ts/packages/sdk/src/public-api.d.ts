@@ -10301,7 +10301,7 @@ export interface components {
          * @description Stable machine-readable reason why an index is pending, partial, or failed.
          * @enum {string}
          */
-        IndexReadinessReason: "load_failure" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "incarnation_pending" | "source_publication" | "repair" | "backfill" | "coverage" | "replay" | "publication";
+        IndexReadinessReason: "load_failure" | "enrichment_failure" | "runtime_unavailable" | "target_observation" | "shard_observation_incomplete" | "incarnation_pending" | "source_publication" | "repair" | "backfill" | "coverage" | "replay" | "publication";
         /**
          * @description Stable machine-readable reason why an artifact source is pending or failed.
          * @enum {string}
@@ -10513,7 +10513,7 @@ export interface components {
          * @description A structured reason why the coverage projection cannot be treated as globally complete.
          * @enum {string}
          */
-        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch" | "counter_mismatch";
+        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "target_observation" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch" | "counter_mismatch";
         EmbeddingSourceCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
             /** @description Whether total and all outcome counts are exact across the expected shards. */
