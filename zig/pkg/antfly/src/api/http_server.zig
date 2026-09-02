@@ -36191,14 +36191,14 @@ test "api http server reports exhausted table mutation authority consistently" {
         .body = "{}",
     });
     defer public_create.deinit(alloc);
-    try expectPublicMetadataNotLeaderResponse(public_create);
+    try expectPublicMetadataMutationNotAdmittedResponse(public_create);
 
     var public_drop = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
     defer public_drop.deinit(alloc);
-    try expectPublicMetadataNotLeaderResponse(public_drop);
+    try expectPublicMetadataMutationNotAdmittedResponse(public_drop);
 
     var mcp_create = try server.executeMcpCreateTable("docs", "{}", null);
     defer mcp_create.deinit(alloc);
@@ -38980,6 +38980,15 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expect(metadata_not_leader);
 }
 
+fn expectPublicMetadataMutationNotAdmittedResponse(resp: http_common.HttpResponse) !void {
+    try expectPublicMetadataNotLeaderResponse(resp);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        resp.header(http_common.metadata_mutation_not_admitted_header) orelse
+            return error.MissingMutationNotAdmittedHeader,
+    );
+}
+
 fn expectPublicMetadataMutationOutcomeUnknownResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 409), resp.status);
     try std.testing.expectEqualStrings(
@@ -39135,7 +39144,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
     });
     defer resp.deinit(alloc);
 
-    try expectPublicMetadataNotLeaderResponse(resp);
+    try expectPublicMetadataMutationNotAdmittedResponse(resp);
     try std.testing.expectEqual(@as(usize, 3), source.create_calls);
 }
 

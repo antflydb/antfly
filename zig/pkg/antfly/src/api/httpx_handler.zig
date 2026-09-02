@@ -501,6 +501,17 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn metadataMutationNotAdmittedResponse(ctx: *httpx.Context) !httpx.Response {
+        // This is stronger than the metadata routing hint: callers may replay
+        // a mutation only when the authority layer proved that no proposal was
+        // admitted. Keep this marker off ambiguous and read-only failures.
+        try ctx.setHeader(
+            http_common.metadata_mutation_not_admitted_header,
+            http_common.metadata_mutation_not_admitted_value,
+        );
+        return metadataNotLeaderResponse(ctx);
+    }
+
     fn metadataMutationOutcomeUnknownResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader(
             metadata_http_routes.Routes.raft_mutation_outcome_header,
@@ -4592,7 +4603,7 @@ pub const AntflyApiHandler = struct {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
-                        return metadataNotLeaderResponse(ctx);
+                        return metadataMutationNotAdmittedResponse(ctx);
                     }
                     if (metadata_authority.isRetryableError(err))
                         return metadataMutationOutcomeUnknownResponse(ctx);
@@ -4714,7 +4725,7 @@ pub const AntflyApiHandler = struct {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
-                        return metadataNotLeaderResponse(ctx);
+                        return metadataMutationNotAdmittedResponse(ctx);
                     }
                     if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
                         return metadataMutationOutcomeUnknownResponse(ctx);
