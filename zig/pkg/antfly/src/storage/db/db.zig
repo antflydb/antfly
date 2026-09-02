@@ -1299,6 +1299,12 @@ const IndexRepairSchedulerDirectory = struct {
     }
 };
 
+const AsyncDenseCatchUpSession = struct {
+    index_name: []u8,
+    index_incarnation: u64,
+    lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
+};
+
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
@@ -1332,8 +1338,9 @@ const AsyncContext = struct {
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
-    dense_capture_lease_mutex: std.atomic.Mutex = .unlocked,
-    dense_capture_leases: std.StringHashMapUnmanaged(index_manager_mod.IndexManager.DensePostingCaptureLease) = .empty,
+    dense_catch_up_session_mutex: std.atomic.Mutex = .unlocked,
+    dense_catch_up_session_nonce: AtomicU64 = .init(0),
+    dense_catch_up_sessions: std.AutoHashMapUnmanaged(u64, AsyncDenseCatchUpSession) = .empty,
     active_dense_catch_up_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1374,17 +1381,17 @@ const AsyncContext = struct {
     fn deinit(self: *@This(), alloc: Allocator) void {
         self.index_repair_scheduler.deinit(alloc);
         self.applied_sequence_coalescer.deinit(alloc);
-        var capture_it = self.dense_capture_leases.iterator();
+        var capture_it = self.dense_catch_up_sessions.iterator();
         while (capture_it.next()) |entry| {
-            if (entry.value_ptr.ownsLifecycle()) {
+            if (entry.value_ptr.lease) |lease| if (lease.ownsLifecycle()) {
                 self.index_manager.cancelDensePostingSidecarCaptureLeaseByName(
-                    entry.key_ptr.*,
-                    entry.value_ptr.*,
+                    entry.value_ptr.index_name,
+                    lease,
                 ) catch {};
-            }
-            alloc.free(@constCast(entry.key_ptr.*));
+            };
+            alloc.free(entry.value_ptr.index_name);
         }
-        self.dense_capture_leases.deinit(alloc);
+        self.dense_catch_up_sessions.deinit(alloc);
         var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
         while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
         self.pending_dense_projection_finalizations.deinit(alloc);
@@ -41778,6 +41785,37 @@ fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns
     gop.value_ptr.* = now_ns;
 }
 
+test "async dense catch-up tokens bind one exact session" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    const first_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 11, null);
+    try std.testing.expect(!first_token.isNone());
+    try std.testing.expectError(
+        error.DenseCatchUpSessionSuperseded,
+        takeAsyncDenseCatchUpSession(&ctx, "other", first_token),
+    );
+    const first = try takeAsyncDenseCatchUpSession(&ctx, "vec", first_token);
+    defer ctx.alloc.free(first.index_name);
+    try std.testing.expectEqual(@as(u64, 11), first.index_incarnation);
+
+    const second_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 12, null);
+    try std.testing.expect(second_token.value > first_token.value);
+    try std.testing.expectError(
+        error.DenseCatchUpSessionSuperseded,
+        takeAsyncDenseCatchUpSession(&ctx, "vec", first_token),
+    );
+    const second = try takeAsyncDenseCatchUpSession(&ctx, "vec", second_token);
+    defer ctx.alloc.free(second.index_name);
+    try std.testing.expectEqual(@as(u64, 12), second.index_incarnation);
+}
+
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
@@ -51125,125 +51163,151 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
-fn installAsyncDenseCaptureLease(
+fn installAsyncDenseCatchUpSession(
     ctx: *AsyncContext,
     index_name: []const u8,
-    lease: index_manager_mod.IndexManager.DensePostingCaptureLease,
-) !void {
-    if (!lease.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
+    index_incarnation: u64,
+    lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
+) !derived_executor_mod.CatchUpSessionToken {
+    if (lease) |value| if (!value.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
     const owned_name = try ctx.alloc.dupe(u8, index_name);
     errdefer ctx.alloc.free(owned_name);
-    lockAtomicWithBackoff(&ctx.dense_capture_lease_mutex);
-    defer ctx.dense_capture_lease_mutex.unlock();
-    const entry = try ctx.dense_capture_leases.getOrPut(ctx.alloc, owned_name);
-    if (entry.found_existing) return error.PostingWalCaptureOwnershipConflict;
-    entry.key_ptr.* = owned_name;
-    entry.value_ptr.* = lease;
+    var observed = ctx.dense_catch_up_session_nonce.load(.monotonic);
+    const session_id = while (true) {
+        if (observed == std.math.maxInt(u64)) return error.DenseCatchUpSessionTokenExhausted;
+        const candidate = observed + 1;
+        if (ctx.dense_catch_up_session_nonce.cmpxchgWeak(observed, candidate, .monotonic, .monotonic)) |raced| {
+            observed = raced;
+            continue;
+        }
+        break candidate;
+    };
+    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
+    defer ctx.dense_catch_up_session_mutex.unlock();
+    const entry = try ctx.dense_catch_up_sessions.getOrPut(ctx.alloc, session_id);
+    if (entry.found_existing) return error.DenseCatchUpSessionTokenExhausted;
+    entry.value_ptr.* = .{
+        .index_name = owned_name,
+        .index_incarnation = index_incarnation,
+        .lease = lease,
+    };
+    return .{ .value = session_id };
 }
 
-fn takeAsyncDenseCaptureLease(
+fn takeAsyncDenseCatchUpSession(
     ctx: *AsyncContext,
     index_name: []const u8,
-) ?index_manager_mod.IndexManager.DensePostingCaptureLease {
-    lockAtomicWithBackoff(&ctx.dense_capture_lease_mutex);
-    defer ctx.dense_capture_lease_mutex.unlock();
-    const removed = ctx.dense_capture_leases.fetchRemove(index_name) orelse return null;
-    defer ctx.alloc.free(@constCast(removed.key));
+    token: derived_executor_mod.CatchUpSessionToken,
+) !AsyncDenseCatchUpSession {
+    if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
+    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
+    defer ctx.dense_catch_up_session_mutex.unlock();
+    const current = ctx.dense_catch_up_sessions.get(token.value) orelse return error.DenseCatchUpSessionSuperseded;
+    if (!std.mem.eql(u8, current.index_name, index_name)) return error.DenseCatchUpSessionSuperseded;
+    const removed = ctx.dense_catch_up_sessions.fetchRemove(token.value) orelse unreachable;
     return removed.value;
-}
-
-fn cancelAsyncDenseCaptureLease(ctx: *AsyncContext, index_name: []const u8) void {
-    const lease = takeAsyncDenseCaptureLease(ctx, index_name) orelse return;
-    if (!lease.ownsLifecycle()) return;
-    ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
-}
-
-fn finishAsyncDenseCaptureLeaseOrEnsureCoverage(
-    ctx: *AsyncContext,
-    index_name: []const u8,
-    applied_sequence: u64,
-) !void {
-    if (takeAsyncDenseCaptureLease(ctx, index_name)) |lease| {
-        errdefer if (lease.ownsLifecycle())
-            ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
-        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, applied_sequence);
-        return;
-    }
-    // Generic checkpoint/status work never acquires ownership by observing an
-    // active source capture. It may only ensure an uncovered boundary after
-    // the owning replay session has already closed.
-    try ctx.index_manager.persistDensePostingSidecarByName(index_name, applied_sequence);
 }
 
 fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     ctx: *AsyncContext,
     index_ref: index_manager_mod.ManagedIndexRef,
-) !void {
+) !derived_executor_mod.CatchUpSessionToken {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     const capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
-    var capture_installed = false;
-    errdefer if (capture) |lease| {
-        if (capture_installed)
-            cancelAsyncDenseCaptureLease(ctx, index_ref.name)
-        else if (lease.ownsLifecycle())
-            ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
-    };
-    if (capture) |lease| {
-        try installAsyncDenseCaptureLease(ctx, index_ref.name, lease);
-        capture_installed = true;
-    }
+    const index_incarnation = if (capture) |lease|
+        lease.index_incarnation
+    else
+        try ctx.index_manager.denseIndexIncarnationByName(index_ref.name);
+    var capture_transferred = false;
+    errdefer if (!capture_transferred) if (capture) |lease| if (lease.ownsLifecycle())
+        ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
+    errdefer ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+    const token = try installAsyncDenseCatchUpSession(ctx, index_ref.name, index_incarnation, capture);
+    capture_transferred = true;
+    return token;
 }
 
-fn finishDenseStreamingReplaySessionForAsyncCatchUp(
+fn abortDenseStreamingReplaySessionForAsyncCatchUp(
     ctx: *AsyncContext,
     index_ref: index_manager_mod.ManagedIndexRef,
-    options: backend_types.BulkIngestFinishOptions,
-) !void {
-    var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
-    defer index_apply_guard.unlock();
-    try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, options);
-}
-
-fn abortDenseStreamingReplaySessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) void {
+    index_incarnation: u64,
+) void {
     var index_apply_guard = ctx.index_manager.lockManagedIndexApply(index_ref) catch return;
     defer index_apply_guard.unlock();
+    ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, index_incarnation) catch return;
     ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
 }
 
-fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
-    if (index_ref.kind != .dense_vector) return;
+fn beginDerivedCatchUpSessionAsync(
+    ctx_ptr: *anyopaque,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !derived_executor_mod.CatchUpSessionToken {
+    if (index_ref.kind != .dense_vector) return .{};
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
-    try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
-    errdefer cancelAsyncDenseCaptureLease(ctx, index_ref.name);
-    errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    const token = try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
+    return token;
 }
 
-fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+fn finishDerivedCatchUpSessionAsync(
+    ctx_ptr: *anyopaque,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    token: derived_executor_mod.CatchUpSessionToken,
+    applied_sequence: u64,
+    success: bool,
+) !void {
     if (index_ref.kind != .dense_vector) return;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
     if (!success) {
+        // A delayed close cannot act on a newer session. Its exact token has
+        // already been retired, so even coalescer cleanup must happen only
+        // after this callback proves ownership of the exact session.
+        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch return;
+        defer ctx.alloc.free(session.index_name);
+        defer if (session.lease) |lease| if (lease.ownsLifecycle())
+            ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
         _ = ctx.stats.dense_catch_up.abort_calls.fetchAdd(1, .monotonic);
         var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
-        cancelAsyncDenseCaptureLease(ctx, index_ref.name);
-        abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+        var catch_up_tracked = true;
+        defer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+        {
+            var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+            defer index_apply_guard.unlock();
+            ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, session.index_incarnation) catch |err| switch (err) {
+                error.PostingWalCaptureSuperseded, error.IndexNotFound => return,
+            };
+            if (session.lease) |lease| if (lease.ownsLifecycle()) {
+                ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
+                    error.PostingWalCaptureSuperseded => return,
+                    error.ExperimentalPostingCaptureNotActive => {},
+                    else => return err,
+                };
+                session.lease = null;
+            };
+            ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+        }
+        catch_up_tracked = false;
         const lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name);
         if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
         return;
     }
+    var session = try takeAsyncDenseCatchUpSession(ctx, index_ref.name, token);
+    defer ctx.alloc.free(session.index_name);
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
-    errdefer cancelAsyncDenseCaptureLease(ctx, index_ref.name);
+    errdefer if (session.lease) |lease| if (lease.ownsLifecycle())
+        ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     var streaming_session_finished = false;
-    errdefer if (!streaming_session_finished) abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    errdefer if (!streaming_session_finished)
+        abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref, session.index_incarnation);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -51259,8 +51323,18 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_ctx = ctx;
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
-    try finishDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref, finish_options);
-    streaming_session_finished = true;
+    {
+        var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+        defer index_apply_guard.unlock();
+        try ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, session.index_incarnation);
+        if (session.lease) |lease|
+            try ctx.index_manager.validateDensePostingCaptureLeaseByName(index_ref.name, lease);
+        try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, finish_options);
+        streaming_session_finished = true;
+        if (session.lease) |lease| if (lease.ownsLifecycle())
+            try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_ref.name, lease, applied_sequence);
+        session.lease = null;
+    }
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
     var lifecycle_completed = false;
@@ -52463,7 +52537,10 @@ fn flushFinishedDenseAppliedSequenceLocked(
             // generation, but do not rewrite the generic checkpoint or source
             // LSM status row for every replay window.
             const posting_started = monotonicTimeNs();
-            try finishAsyncDenseCaptureLeaseOrEnsureCoverage(ctx, pending.owned_name, pending.sequence);
+            // Applied-sequence/status work has no mutation authority. The
+            // owning catch-up callback publishes its exact capture token
+            // before reaching this coverage-only checkpoint.
+            try ctx.index_manager.persistDensePostingSidecarByName(pending.owned_name, pending.sequence);
             posting_publish_ns +|= elapsedSince(posting_started);
         } else {
             const metadata_started = monotonicTimeNs();
@@ -52547,7 +52624,7 @@ fn flushPendingAppliedSequencesLocked(
         for (enriched_updates) |update| {
             if (ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name)) {
                 const posting_started = monotonicTimeNs();
-                try finishAsyncDenseCaptureLeaseOrEnsureCoverage(ctx, update.index_name, update.sequence);
+                try ctx.index_manager.persistDensePostingSidecarByName(update.index_name, update.sequence);
                 posting_publish_ns +|= elapsedSince(posting_started);
             } else {
                 generic_updates.appendAssumeCapacity(update);

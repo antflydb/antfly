@@ -40,8 +40,15 @@ pub const VisibilityWait = struct {
 const ApplyFnType = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
 const PersistFnType = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
 const TruncateFnType = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
-const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
-const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
+const CatchUpSessionTokenType = struct {
+    value: u64 = 0,
+
+    pub fn isNone(self: @This()) bool {
+        return self.value == 0;
+    }
+};
+const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!CatchUpSessionTokenType;
+const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionTokenType, applied_sequence: u64, success: bool) anyerror!void;
 const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
@@ -50,6 +57,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const ApplyFn = ApplyFnType;
     pub const PersistFn = PersistFnType;
     pub const TruncateFn = TruncateFnType;
+    pub const CatchUpSessionToken = CatchUpSessionTokenType;
     pub const BeginCatchUpFn = BeginCatchUpFnType;
     pub const FinishCatchUpFn = FinishCatchUpFnType;
     pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
@@ -173,6 +181,7 @@ const io_threaded_runtime_mod = @import("io_threaded_runtime.zig");
 pub const ApplyFn = async_runtime_mod.ApplyFn;
 pub const PersistFn = async_runtime_mod.PersistFn;
 pub const TruncateFn = async_runtime_mod.TruncateFn;
+pub const CatchUpSessionToken = async_runtime_mod.CatchUpSessionToken;
 pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
 pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
@@ -432,8 +441,20 @@ const ManualRuntime = struct {
         return true;
     }
 
-    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !derived_worker.CatchUpStats {
-        return try derived_worker.catchUpIndexWithOptions(
+    const CatchUpResult = struct {
+        stats: derived_worker.CatchUpStats,
+        token: CatchUpSessionToken,
+    };
+
+    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+        const token = if (self.begin_catch_up_fn) |begin_catch_up|
+            try begin_catch_up(self.ctx, worker.kind)
+        else
+            CatchUpSessionToken{};
+        var catch_up_open = true;
+        errdefer if (catch_up_open) if (self.finish_catch_up_fn) |finish_catch_up|
+            finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
+        const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
             worker.kind,
@@ -442,11 +463,10 @@ const ManualRuntime = struct {
             self.apply_fn,
             .{
                 .resource_manager = self.backlog.resource_manager,
-                .catch_up_ctx = self.ctx,
-                .begin_catch_up_fn = self.begin_catch_up_fn,
-                .finish_catch_up_fn = self.finish_catch_up_fn,
             },
         );
+        catch_up_open = false;
+        return .{ .stats = stats, .token = token };
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
@@ -455,7 +475,11 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer if (session_open) if (self.finish_catch_up_fn) |finish_catch_up|
+                finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -464,6 +488,9 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true);
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
                     try wait.check();
@@ -489,7 +516,11 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer if (session_open) if (self.finish_catch_up_fn) |finish_catch_up|
+                finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -498,6 +529,9 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true);
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
                     try wait.check();

@@ -9107,15 +9107,23 @@ pub const IndexManager = struct {
     pub fn finalizeRetiredIndexStorage(self: *IndexManager, store: anytype, name: []const u8) !void {
         const canonical_path = try self.indexPath(name);
         defer self.alloc.free(canonical_path);
-        const active_path = try self.activeIndexPath(name);
-        defer self.alloc.free(active_path);
+        // Catalog absence and the durable cleanup tombstone authorize removal
+        // of the canonical namespace even when its publication pointer is
+        // corrupt. In that case the conservative shadow-root scanner retains
+        // every same-index candidate until this pointer disappears; a later
+        // cleanup pass can reclaim those roots normally.
+        const active_path = self.activeIndexPath(name) catch |err| switch (err) {
+            error.InvalidIndexRootPointer => null,
+            else => return err,
+        };
+        defer if (active_path) |path| self.alloc.free(path);
 
         self.catalog_mutex.lockExclusive();
         if (self.get(name) != null) {
             self.catalog_mutex.unlockExclusive();
             return error.IndexGenerationStillActive;
         }
-        self.invalidateIndexPathCaches(active_path);
+        if (active_path) |path| self.invalidateIndexPathCaches(path);
         self.invalidateIndexPathCaches(canonical_path);
         self.catalog_mutex.unlockExclusive();
 
@@ -9131,7 +9139,9 @@ pub const IndexManager = struct {
         );
         // Algebraic keyspaces are drained in bounded, cursor-backed outbox
         // phases before finalization reaches this filesystem-only tail.
-        if (!std.mem.eql(u8, active_path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
+        if (active_path) |path| {
+            if (!std.mem.eql(u8, path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(path);
+        }
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
     }
 
@@ -9762,7 +9772,12 @@ pub const IndexManager = struct {
     fn cleanupCanonicalAlgebraicGenerationAfterPointerPage(self: *IndexManager, name: []const u8) !bool {
         const target_path = try self.indexPath(name);
         defer self.alloc.free(target_path);
-        const pointer = try self.readActiveIndexRootPointer(target_path, name);
+        const pointer = self.readActiveIndexRootPointer(target_path, name) catch |err| switch (err) {
+            // Keep serving fail-closed, but isolate corrupt publication state
+            // to this index instead of retrying the global collector forever.
+            error.InvalidIndexRootPointer => return false,
+            else => return err,
+        };
         if (pointer) |value| {
             self.alloc.free(value);
             const storage_namespace = try std.fmt.allocPrint(
@@ -12002,6 +12017,24 @@ pub const IndexManager = struct {
         if (current.epoch != lease.capture.epoch or current.base_coverage != lease.capture.base_coverage)
             return error.PostingWalCaptureSuperseded;
         return entry;
+    }
+
+    pub fn validateDensePostingCaptureLeaseByName(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+    ) !void {
+        _ = try self.validateDensePostingCaptureLease(name, lease);
+    }
+
+    pub fn denseIndexIncarnationByName(self: *IndexManager, name: []const u8) !u64 {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        return entry.capture_incarnation;
+    }
+
+    pub fn validateDenseIndexIncarnationByName(self: *IndexManager, name: []const u8, incarnation: u64) !void {
+        if (try self.denseIndexIncarnationByName(name) != incarnation)
+            return error.PostingWalCaptureSuperseded;
     }
 
     pub fn recordDensePostingCaptureMutationSequence(
@@ -15299,6 +15332,9 @@ pub const IndexManager = struct {
         defer io_impl.deinit();
         const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096)) catch |err| switch (err) {
             error.FileNotFound => return null,
+            // A pointer larger than the complete framed format is corrupt
+            // publication state, not a transient filesystem failure.
+            error.StreamTooLong => return error.InvalidIndexRootPointer,
             else => return err,
         };
         defer self.alloc.free(raw);
@@ -15545,6 +15581,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(pointer_path);
             const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
                 error.FileNotFound => continue,
+                error.StreamTooLong => continue,
                 else => return err,
             };
             defer self.alloc.free(raw);
@@ -15554,19 +15591,42 @@ pub const IndexManager = struct {
             else if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v1))
                 active_index_root_pointer_magic_v1
             else
-                return error.InvalidIndexRootPointer;
+                continue;
             const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
-            if (!validRelativeRepairIndexRoot(entry.name, relative)) return error.InvalidIndexRootPointer;
-            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse return error.InvalidIndexRootPointer;
+            if (!validRelativeRepairIndexRoot(entry.name, relative)) continue;
+            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
             const root = relative[0..separator];
             if (active_roots.contains(root)) continue;
             try active_roots.put(self.alloc, try self.alloc.dupe(u8, root), {});
         }
     }
 
+    fn repairShadowRootContainsIndex(
+        self: *const IndexManager,
+        io: std.Io,
+        candidate_root: []const u8,
+        index_name: []const u8,
+    ) !bool {
+        const candidate_index_path = try std.fs.path.join(self.alloc, &.{
+            self.base_path,
+            candidate_root,
+            "indexes",
+            index_name,
+        });
+        defer self.alloc.free(candidate_index_path);
+        std.Io.Dir.cwd().access(io, candidate_index_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     /// Revalidate deletion authority for one candidate without requiring its
-    /// catalog row or pointed-to payload to be readable. Invalid pointers fail
-    /// closed: cleanup must never turn publication corruption into data loss.
+    /// catalog row or pointed-to payload to be readable. A malformed pointer
+    /// protects every candidate that contains that pointer owner's index, but
+    /// does not prevent unrelated generations from being reclaimed. This is
+    /// the narrowest fail-closed boundary available without trusting corrupt
+    /// pointer bytes.
     fn publishedRepairShadowRootSelected(self: *IndexManager, io: std.Io, candidate_root: []const u8) !bool {
         if (builtin.os.tag == .freestanding) return false;
         const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
@@ -15587,6 +15647,10 @@ pub const IndexManager = struct {
             defer self.alloc.free(pointer_path);
             const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
                 error.FileNotFound => continue,
+                error.StreamTooLong => {
+                    if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                    continue;
+                },
                 else => return err,
             };
             defer self.alloc.free(raw);
@@ -15595,11 +15659,19 @@ pub const IndexManager = struct {
                 active_index_root_pointer_magic_v2
             else if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v1))
                 active_index_root_pointer_magic_v1
-            else
-                return error.InvalidIndexRootPointer;
+            else {
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                continue;
+            };
             const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
-            if (!validRelativeRepairIndexRoot(entry.name, relative)) return error.InvalidIndexRootPointer;
-            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse return error.InvalidIndexRootPointer;
+            if (!validRelativeRepairIndexRoot(entry.name, relative)) {
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                continue;
+            }
+            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse {
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                continue;
+            };
             if (std.mem.eql(u8, relative[0..separator], candidate_root)) return true;
         }
         return false;
@@ -15612,7 +15684,13 @@ pub const IndexManager = struct {
     ) !void {
         const canonical_path = try self.indexPath(index_name);
         defer self.alloc.free(canonical_path);
-        const relative = (try self.readActiveIndexRootPointer(canonical_path, index_name)) orelse return;
+        const relative = (self.readActiveIndexRootPointer(canonical_path, index_name) catch |err| switch (err) {
+            // Candidate-specific revalidation below protects same-index roots
+            // conservatively. A corrupt canonical pointer must not turn the
+            // inventory optimization into a permanently failing global job.
+            error.InvalidIndexRootPointer => return,
+            else => return err,
+        }) orelse return;
         defer self.alloc.free(relative);
         var iter = std.mem.splitScalar(u8, relative, '/');
         const root = iter.next() orelse return;
@@ -26878,6 +26956,57 @@ test "repair shadow cleanup revalidates a pointer published after inventory" {
     _ = try cleaner.cleanupInactiveRepairShadowRootsPage();
     try std.Io.Dir.cwd().access(std.testing.io, sentinel_path, .{});
     try std.testing.expect(try cleaner.publishedRepairShadowRootSelected(std.testing.io, root_name));
+}
+
+test "repair shadow cleanup isolates malformed pointer ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base_path_z = try alloc.dupeZ(u8, base_path);
+    defer alloc.free(base_path_z);
+    var store = try docstore_mod.DocStore.open(alloc, base_path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, base_path);
+    defer manager.deinit();
+    manager.bindPrimaryStore(&store);
+
+    const corrupt_name = "dense_corrupt";
+    const protected_root = ".repair-shadow-protected";
+    const unrelated_root = ".repair-shadow-unrelated";
+    const protected_path = try std.fs.path.join(alloc, &.{ base_path, protected_root, "indexes", corrupt_name });
+    defer alloc.free(protected_path);
+    const unrelated_path = try std.fs.path.join(alloc, &.{ base_path, unrelated_root, "indexes", "other" });
+    defer alloc.free(unrelated_path);
+    try fs_paths.createDirPathPortable(std.testing.io, protected_path);
+    try fs_paths.createDirPathPortable(std.testing.io, unrelated_path);
+
+    const canonical_path = try manager.indexPath(corrupt_name);
+    defer alloc.free(canonical_path);
+    try ensureIndexDirDurable(alloc, null, base_path, canonical_path);
+    const pointer_path = try manager.activeIndexRootPointerPath(canonical_path);
+    defer alloc.free(pointer_path);
+    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, "not-an-index-root-pointer\n");
+
+    _ = try manager.cleanupInactiveRepairShadowRootsPage();
+    try std.Io.Dir.cwd().access(std.testing.io, protected_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, unrelated_path, .{}));
+
+    // Bounded pointer reads classify oversized files as the same isolated
+    // corruption instead of surfacing StreamTooLong on every cleanup pass.
+    const oversized_pointer = try alloc.alloc(u8, 4097);
+    defer alloc.free(oversized_pointer);
+    @memset(oversized_pointer, 'x');
+    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, oversized_pointer);
+    _ = try manager.cleanupInactiveRepairShadowRootsPage();
+    try std.Io.Dir.cwd().access(std.testing.io, protected_path, .{});
+
+    // Once catalog-owned retirement removes the corrupt canonical namespace,
+    // the formerly ambiguous generation is an ordinary orphan.
+    deleteIndexDirIfPresent(canonical_path);
+    _ = try manager.cleanupInactiveRepairShadowRootsPage();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, protected_path, .{}));
 }
 
 test "native physical generation pointer is versioned and fails closed without authority" {

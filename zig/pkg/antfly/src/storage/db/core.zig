@@ -835,6 +835,16 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
+        // A WAL-authoritative dense index carries replay durability in its
+        // posting generation even when an upgraded legacy projection has not
+        // yet acquired config-hash readiness metadata. Do not conflate that
+        // acceleration certificate with the source sequence: doing so reports
+        // zero after a successful native commit and replays published work.
+        if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+            const dense_checkpoint = self.index_manager.denseProjectionCheckpointMetadata(index_name) orelse
+                return error.InvalidDerivedApplyState;
+            return dense_checkpoint.applied_sequence;
+        }
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
         }
