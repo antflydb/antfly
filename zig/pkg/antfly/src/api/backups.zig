@@ -1244,17 +1244,43 @@ const RemoteBackupStore = struct {
         now_unix_ns: u64,
         replacement: []const u8,
     ) !BackupLeaseFenceClaim {
+        return self.claimExpiredLeaseWithFenceAndCancellation(
+            alloc,
+            suffix,
+            expected_owner,
+            cleanup_owner,
+            legacy_cleanup_owner,
+            now_unix_ns,
+            replacement,
+            .none,
+        );
+    }
+
+    fn claimExpiredLeaseWithFenceAndCancellation(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        expected_owner: []const u8,
+        cleanup_owner: []const u8,
+        legacy_cleanup_owner: ?[]const u8,
+        now_unix_ns: u64,
+        replacement: []const u8,
+        cancellation: CancellationToken,
+    ) !BackupLeaseFenceClaim {
+        try cancellation.check();
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
         var current = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = 0, .length = max_backup_attempt_lease_bytes },
             .skip_metadata_probe = true,
             .max_response_bytes = max_backup_attempt_lease_bytes,
+            .cancellation = objectCancellationToken(cancellation),
         }) catch |err| switch (err) {
             error.FileNotFound => {
                 var created = self.client.putObject(self.bucket, key, replacement, .{
                     .content_type = "text/plain",
                     .if_none_match = true,
+                    .cancellation = objectCancellationToken(cancellation),
                 }) catch |put_err| switch (put_err) {
                     error.PreconditionFailed => return .active,
                     else => return put_err,
@@ -1274,6 +1300,7 @@ const RemoteBackupStore = struct {
                 var migrated = self.client.putObject(self.bucket, key, replacement, .{
                     .content_type = "text/plain",
                     .if_match_etag = etag,
+                    .cancellation = objectCancellationToken(cancellation),
                 }) catch |err| switch (err) {
                     error.FileNotFound, error.PreconditionFailed => return .active,
                     else => return err,
@@ -1290,6 +1317,7 @@ const RemoteBackupStore = struct {
         var replaced = self.client.putObject(self.bucket, key, replacement, .{
             .content_type = "text/plain",
             .if_match_etag = etag,
+            .cancellation = objectCancellationToken(cancellation),
         }) catch |err| switch (err) {
             error.FileNotFound, error.PreconditionFailed => return .active,
             else => return err,
@@ -4099,13 +4127,14 @@ fn releaseTableBackupCleanupFenceWithBudget(
     artifact_backup_id: []const u8,
     operation_budget: *usize,
 ) !void {
-    return releaseTableBackupCleanupFenceWithRootBudget(
+    return releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
         alloc,
         io,
         location,
         artifact_backup_id,
         operation_budget,
         null,
+        .none,
     );
 }
 
@@ -4117,6 +4146,27 @@ fn releaseTableBackupCleanupFenceWithRootBudget(
     operation_budget: *usize,
     pinned_root: ?std.Io.Dir,
 ) !void {
+    return releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+        operation_budget,
+        pinned_root,
+        .none,
+    );
+}
+
+fn releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    artifact_backup_id: []const u8,
+    operation_budget: *usize,
+    pinned_root: ?std.Io.Dir,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
     const cost: usize = switch (location.*) {
         .file => 1,
         // Both cleanup-owner spellings share one mutable object, so one read
@@ -4139,7 +4189,7 @@ fn releaseTableBackupCleanupFenceWithRootBudget(
         artifact_backup_id,
         &.{ cleanup_owner, legacy_cleanup_owner },
         pinned_root,
-        .none,
+        cancellation,
     );
 }
 
@@ -4256,13 +4306,14 @@ fn claimExpiredTableBackupWriterLeaseAtLocation(
     artifact_backup_id: []const u8,
     now_unix_ns: u64,
 ) !BackupLeaseFenceClaim {
-    return claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
+    return claimExpiredTableBackupWriterLeaseAtLocationWithRootAndCancellation(
         alloc,
         io,
         location,
         artifact_backup_id,
         now_unix_ns,
         null,
+        .none,
     );
 }
 
@@ -4274,6 +4325,27 @@ fn claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
     now_unix_ns: u64,
     pinned_root: ?std.Io.Dir,
 ) !BackupLeaseFenceClaim {
+    return claimExpiredTableBackupWriterLeaseAtLocationWithRootAndCancellation(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+        now_unix_ns,
+        pinned_root,
+        .none,
+    );
+}
+
+fn claimExpiredTableBackupWriterLeaseAtLocationWithRootAndCancellation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    artifact_backup_id: []const u8,
+    now_unix_ns: u64,
+    pinned_root: ?std.Io.Dir,
+    cancellation: CancellationToken,
+) !BackupLeaseFenceClaim {
+    try cancellation.check();
     var cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 64]u8 = undefined;
     const cleanup_owner = backupCleanupLeaseOwner(artifact_backup_id, &cleanup_owner_buf);
     var legacy_cleanup_owner_buf: [legacy_backup_cleanup_lease_owner_prefix.len + 64]u8 = undefined;
@@ -4296,7 +4368,7 @@ fn claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
             defer alloc.free(lock_path);
             var lock_file = try openOrCreateBackupLockFile(io, backup_dir, lock_path);
             defer lock_file.close(io);
-            try lock_file.lock(io, .exclusive);
+            try lockFileExclusiveWithCancellation(io, lock_file, cancellation);
             defer lock_file.unlock(io);
             const body = readFileFromBackupRootAlloc(
                 alloc,
@@ -4306,6 +4378,7 @@ fn claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
                 max_backup_attempt_lease_bytes,
             ) catch |err| switch (err) {
                 error.FileNotFound => {
+                    try cancellation.check();
                     try replaceFileInBackupRootUnderHeldLock(
                         alloc,
                         io,
@@ -4321,16 +4394,18 @@ fn claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
             const lease = parseClusterBackupReservationLease(body) catch break :blk .active;
             if (std.mem.eql(u8, lease.attempt_id, cleanup_owner)) break :blk .claimed;
             if (std.mem.eql(u8, lease.attempt_id, legacy_cleanup_owner)) {
+                try cancellation.check();
                 try replaceFileInBackupRootUnderHeldLock(alloc, io, backup_dir, relative_path, cleanup_lease);
                 break :blk .claimed;
             }
             if (!std.mem.eql(u8, lease.attempt_id, artifact_backup_id) or
                 !clusterBackupLeaseReclaimable(lease.expires_at_unix_ns, now_unix_ns))
                 break :blk .active;
+            try cancellation.check();
             try replaceFileInBackupRootUnderHeldLock(alloc, io, backup_dir, relative_path, cleanup_lease);
             break :blk .claimed;
         },
-        .remote => |*store| try store.claimExpiredLeaseWithFence(
+        .remote => |*store| try store.claimExpiredLeaseWithFenceAndCancellation(
             alloc,
             trimLeftSlash(suffix),
             artifact_backup_id,
@@ -4338,33 +4413,70 @@ fn claimExpiredTableBackupWriterLeaseAtLocationWithRoot(
             legacy_cleanup_owner,
             now_unix_ns,
             cleanup_lease,
+            cancellation,
         ),
     };
 }
 
 pub const TableBackupAttemptReclaimResult = enum { active, committed, reclaimed };
 
-/// Returns the first wall-clock instant at which maintenance may attempt to
-/// fence this reservation. The reservation itself is the durable cleanup
-/// intent: a process-local supervisor may be rebuilt from it after restart
-/// without publishing a second record that could diverge from its artifact
-/// identity.
-pub fn tableBackupAttemptReclaimNotBeforeAtLocation(
+/// Immutable identity and timing fields from one reservation read. Callers use
+/// this same generation for the response receipt, admission decision, and
+/// reclamation attempt so a concurrently replaced reservation cannot splice
+/// together observations from two backup attempts.
+pub const TableBackupAttemptInspection = struct {
+    artifact_backup_id: []u8,
+    format: BackupFormat,
+    created_at_unix_ns: ?u64,
+    writer_not_after_unix_ns: ?u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.artifact_backup_id);
+        self.* = undefined;
+    }
+
+    pub fn reclaimNotBeforeUnixNs(self: *const @This()) ?u64 {
+        const created_at = self.created_at_unix_ns orelse return null;
+        return created_at +| backup_attempt_reclaim_age_ns +|
+            backup_attempt_lease_clock_skew_allowance_ns;
+    }
+};
+
+pub const TableBackupAttemptReclaimProgress = enum {
+    active,
+    committed,
+    reclaimed,
+    incomplete,
+    replaced,
+};
+
+/// Reads and owns one exact reservation generation. The read participates in
+/// the caller's complete operation quantum instead of hiding unbounded control
+/// I/O outside the cleanup budget.
+pub fn inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
     backup_id: []const u8,
-) !?u64 {
-    var parsed = (try readTableBackupAttemptReservation(
+    operation_budget: *usize,
+    cancellation: CancellationToken,
+) !?TableBackupAttemptInspection {
+    try cancellation.check();
+    try consumeBackupCleanupOperation(operation_budget);
+    var parsed = (try readTableBackupAttemptReservationWithCancellation(
         alloc,
         io,
         location,
         backup_id,
+        cancellation,
     )) orelse return null;
     defer parsed.deinit();
-    const created_at = parsed.value.created_at_unix_ns orelse return null;
-    return created_at +| backup_attempt_reclaim_age_ns +|
-        backup_attempt_lease_clock_skew_allowance_ns;
+    return .{
+        .artifact_backup_id = try alloc.dupe(u8, parsed.value.artifact_backup_id),
+        .format = parsed.value.format,
+        .created_at_unix_ns = parsed.value.created_at_unix_ns,
+        .writer_not_after_unix_ns = parsed.value.writer_not_after_unix_ns,
+    };
 }
 
 fn tableManifestRecordExistsForReconciliation(
@@ -4373,19 +4485,39 @@ fn tableManifestRecordExistsForReconciliation(
     location: *BackupLocation,
     backup_id: []const u8,
 ) !bool {
+    return tableManifestRecordExistsForReconciliationWithCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        .none,
+    );
+}
+
+fn tableManifestRecordExistsForReconciliationWithCancellation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    cancellation: CancellationToken,
+) !bool {
+    try cancellation.check();
     return switch (location.*) {
         .file => |backup_root| blk: {
             const path = try metadataPath(alloc, backup_root, backup_id);
             defer alloc.free(path);
-            break :blk try pathExistsWithIo(io, path);
+            const exists = try pathExistsWithIo(io, path);
+            try cancellation.check();
+            break :blk exists;
         },
         .remote => |*store| blk: {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = store.readBytesAllocLimited(
+            const body = store.readBytesAllocLimitedWithCancellation(
                 alloc,
                 trimLeftSlash(suffix),
                 1,
+                cancellation,
             ) catch |err| switch (err) {
                 error.FileNotFound => break :blk false,
                 // An oversized or corrupt commit record is still a commit
@@ -4397,6 +4529,129 @@ fn tableManifestRecordExistsForReconciliation(
             break :blk true;
         },
     };
+}
+
+fn reserveReclaimOperations(
+    location: *const BackupLocation,
+    operation_budget: *usize,
+) !void {
+    const cost: usize = switch (location.*) {
+        .file, .remote => 2,
+    };
+    if (operation_budget.* < cost) return error.BackupCleanupBudgetExceeded;
+    operation_budget.* -= cost;
+}
+
+/// Advances exactly the inspected reservation generation. Budget exhaustion is
+/// normal resumable progress; replacement is also explicit so a foreground
+/// caller can reread the new generation before reporting an artifact identity.
+pub fn advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    inspection: *const TableBackupAttemptInspection,
+    now_unix_ns: u64,
+    operation_budget: *usize,
+    cancellation: CancellationToken,
+) !TableBackupAttemptReclaimProgress {
+    try cancellation.check();
+    const eligible_at = inspection.reclaimNotBeforeUnixNs() orelse return .active;
+    if (now_unix_ns < eligible_at) return .active;
+
+    reserveReclaimOperations(location, operation_budget) catch return .incomplete;
+    const lease_claim = try claimExpiredTableBackupWriterLeaseAtLocationWithRootAndCancellation(
+        alloc,
+        io,
+        location,
+        inspection.artifact_backup_id,
+        now_unix_ns,
+        null,
+        cancellation,
+    );
+    if (lease_claim == .active) return .active;
+
+    // Revalidate the logical generation after fencing its artifact. Another
+    // reconciler may have completed A and admitted B while this worker waited.
+    consumeBackupCleanupOperation(operation_budget) catch return .incomplete;
+    if (!try tableBackupAttemptMatchesAtLocationWithCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        inspection.artifact_backup_id,
+        cancellation,
+    )) return .replaced;
+
+    try consumeBackupCleanupOperation(operation_budget);
+    if (try tableManifestRecordExistsForReconciliationWithCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        cancellation,
+    )) {
+        releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
+            alloc,
+            io,
+            location,
+            inspection.artifact_backup_id,
+            operation_budget,
+            null,
+            cancellation,
+        ) catch |err| switch (err) {
+            error.BackupCleanupBudgetExceeded => return .incomplete,
+            else => return err,
+        };
+        return .committed;
+    }
+
+    cleanupTableBackupAttemptAtLocationWithBudgetAndCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        inspection.artifact_backup_id,
+        inspection.format,
+        operation_budget,
+        false,
+        false,
+        cancellation,
+    ) catch |err| switch (err) {
+        error.BackupCleanupBudgetExceeded => return .incomplete,
+        else => return err,
+    };
+    if (inspection.writer_not_after_unix_ns) |writer_not_after_unix_ns| {
+        if (now_unix_ns >= writer_not_after_unix_ns) {
+            releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
+                alloc,
+                io,
+                location,
+                inspection.artifact_backup_id,
+                operation_budget,
+                null,
+                cancellation,
+            ) catch |err| switch (err) {
+                error.BackupCleanupBudgetExceeded => return .incomplete,
+                else => return err,
+            };
+        }
+    }
+    const reservation_cost: usize = switch (location.*) {
+        .file => 1,
+        .remote => 2,
+    };
+    if (operation_budget.* < reservation_cost) return .incomplete;
+    operation_budget.* -= reservation_cost;
+    const deleted = try deleteTableBackupReservationIfArtifactOwnedAtLocationWithCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        inspection.artifact_backup_id,
+        cancellation,
+    );
+    return if (deleted) .reclaimed else .replaced;
 }
 
 /// Reconciles one stale standalone attempt without racing a delayed current
@@ -4412,75 +4667,32 @@ pub fn reclaimExpiredTableBackupAttemptAtLocation(
     backup_id: []const u8,
     now_unix_ns: u64,
 ) !TableBackupAttemptReclaimResult {
-    var parsed = (try readTableBackupAttemptReservation(
-        alloc,
-        io,
-        location,
-        backup_id,
-    )) orelse return .active;
-    defer parsed.deinit();
-    const reservation = parsed.value;
-    const created_at = reservation.created_at_unix_ns orelse return .active;
-    if (created_at > now_unix_ns or
-        now_unix_ns - created_at < backup_attempt_reclaim_age_ns +|
-            backup_attempt_lease_clock_skew_allowance_ns)
-        return .active;
-    const lease_claim = try claimExpiredTableBackupWriterLeaseAtLocation(
-        alloc,
-        io,
-        location,
-        reservation.artifact_backup_id,
-        now_unix_ns,
-    );
-    if (lease_claim == .active) return .active;
-    // Publication is the commit point. Recheck after fencing the writer and
-    // preserve any canonical manifest that won the final lease race.
-    if (try tableManifestRecordExistsForReconciliation(alloc, io, location, backup_id)) {
-        var cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 64]u8 = undefined;
-        const cleanup_owner = backupCleanupLeaseOwner(reservation.artifact_backup_id, &cleanup_owner_buf);
-        _ = try releaseTableBackupLeaseIfOwnedAtLocation(
-            alloc,
-            io,
-            location,
-            reservation.artifact_backup_id,
-            cleanup_owner,
-        );
-        return .committed;
-    }
     var object_budget: usize = backup_attempt_request_reclaim_object_budget;
-    try cleanupTableBackupAttemptAtLocationWithBudget(
+    var inspection = (try inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
         alloc,
         io,
         location,
         backup_id,
-        reservation.artifact_backup_id,
-        reservation.format,
         &object_budget,
-        false,
-        false,
-    );
-    if (reservation.writer_not_after_unix_ns) |writer_not_after_unix_ns| {
-        if (now_unix_ns >= writer_not_after_unix_ns) {
-            try releaseTableBackupCleanupFenceWithBudget(
-                alloc,
-                io,
-                location,
-                reservation.artifact_backup_id,
-                &object_budget,
-            );
-        }
-    }
-    _ = try deleteTableBackupReservationIfArtifactOwnedAtLocation(
+        .none,
+    )) orelse return .active;
+    defer inspection.deinit(alloc);
+    const progress = try advanceExpiredTableBackupAttemptAtLocationWithCancellation(
         alloc,
         io,
         location,
         backup_id,
-        reservation.artifact_backup_id,
+        &inspection,
+        now_unix_ns,
+        &object_budget,
+        .none,
     );
-    // Legacy reservations omit an ingress deadline and retain their cleanup
-    // tombstone. Current attempts reject delivery after the persisted deadline
-    // and can retire the per-generation fence once exact cleanup completes.
-    return .reclaimed;
+    return switch (progress) {
+        .active => .active,
+        .committed => .committed,
+        .reclaimed, .replaced => .reclaimed,
+        .incomplete => error.BackupCleanupBudgetExceeded,
+    };
 }
 
 const ClusterAttemptCleanupPhase = enum {
@@ -15714,6 +15926,122 @@ test "table backup reservation durably binds logical and artifact ids" {
         "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id and artifact id before retrying\",\"retryable\":false,\"backup_id\":\"logical\",\"artifact_backup_id\":\"artifact-generation\"}",
         response_body,
     );
+}
+
+test "stale table reclaim reports a concurrently replaced generation" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const fence: TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+        .writer_not_after_unix_ns = 2,
+    };
+    try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact-a", .portable, fence);
+    var budget: usize = backup_attempt_reclaim_object_budget;
+    var inspection = (try inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        &budget,
+        .none,
+    )).?;
+    defer inspection.deinit(alloc);
+
+    try std.testing.expect(try deleteTableBackupReservationIfArtifactOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact-a",
+    ));
+    try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact-b", .portable, fence);
+
+    try std.testing.expectEqual(
+        TableBackupAttemptReclaimProgress.replaced,
+        try advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+            alloc,
+            io,
+            &location,
+            "logical",
+            &inspection,
+            std.math.maxInt(u64),
+            &budget,
+            .none,
+        ),
+    );
+    try std.testing.expect(try tableBackupAttemptMatchesAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact-b",
+    ));
+}
+
+test "stale table reclaim honors cancellation before storage mutation" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const fence: TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
+    var budget: usize = backup_attempt_reclaim_object_budget;
+    var inspection = (try inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        &budget,
+        .none,
+    )).?;
+    defer inspection.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+            alloc,
+            io,
+            &location,
+            "logical",
+            &inspection,
+            std.math.maxInt(u64),
+            &budget,
+            CancellationToken.fromAtomic(&cancelled),
+        ),
+    );
+    try std.testing.expect(try tableBackupAttemptMatchesAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact",
+    ));
 }
 
 test "table backup writer lease fences cleanup until the storage owner expires" {

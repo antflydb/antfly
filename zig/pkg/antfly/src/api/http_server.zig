@@ -541,6 +541,7 @@ const BackupRepositoryMaintenanceTarget = struct {
     cluster_maintenance_requested: bool = false,
     next_run_monotonic_ns: u64 = 0,
     last_scheduled_monotonic_ns: u64,
+    last_progress_monotonic_ns: u64,
 
     fn create(
         alloc: std.mem.Allocator,
@@ -557,6 +558,7 @@ const BackupRepositoryMaintenanceTarget = struct {
             .location_uri = owned_location,
             .connection = owned_connection,
             .last_scheduled_monotonic_ns = now_monotonic_ns,
+            .last_progress_monotonic_ns = now_monotonic_ns,
         };
         return target;
     }
@@ -633,6 +635,17 @@ const BackupRepositoryMaintenanceTarget = struct {
             return;
         }
     }
+
+    fn noteProgress(self: *@This(), now_monotonic_ns: u64) void {
+        self.last_progress_monotonic_ns = now_monotonic_ns;
+    }
+
+    fn lastActivityMonotonicNs(self: *const @This()) u64 {
+        return @max(
+            self.last_scheduled_monotonic_ns,
+            self.last_progress_monotonic_ns,
+        );
+    }
 };
 
 /// Bounded FIFO of distinct backup repositories. The queue owns every target
@@ -677,7 +690,7 @@ const BackupRepositoryMaintenanceQueue = struct {
         }
         var destination = destination_start;
         for (self.pending.items[self.pending_head..]) |target| {
-            if (now_monotonic_ns -| target.last_scheduled_monotonic_ns >=
+            if (now_monotonic_ns -| target.lastActivityMonotonicNs() >=
                 backup_maintenance_target_retention_ns)
             {
                 target.destroy(alloc);
@@ -852,6 +865,8 @@ test "backup maintenance target coalesces exact table reclaim intent" {
     try target.enqueueTableReclaim(alloc, "docs", 100);
     try target.enqueueTableReclaim(alloc, "docs", 80);
     try target.enqueueTableReclaim(alloc, "events", 120);
+    target.noteProgress(50);
+    try std.testing.expectEqual(@as(u64, 50), target.lastActivityMonotonicNs());
     try std.testing.expectEqual(@as(usize, 2), target.table_reclaims.items.len);
     try std.testing.expect(target.nextDueTableReclaim(79) == null);
     try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(80).?);
@@ -3768,6 +3783,23 @@ pub const ApiHttpServer = struct {
     }
 
     const BackupRepositoryMaintenanceWork = struct {
+        const reclaim_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+        const ReclaimControl = struct {
+            server: *ApiHttpServer,
+            deadline_monotonic_ns: u64,
+
+            fn isCancelled(raw: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return self.server.backup_maintenance_closing.load(.acquire) or
+                    platform_time.monotonicNs() >= self.deadline_monotonic_ns;
+            }
+
+            fn token(self: *const @This()) api_operation.CancellationToken {
+                return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            }
+        };
+
         server: *ApiHttpServer,
         target: ?*BackupRepositoryMaintenanceTarget,
 
@@ -3848,8 +3880,15 @@ pub const ApiHttpServer = struct {
             location: *backups_api.BackupLocation,
             now_unix_ns: u64,
         ) void {
+            var control: ReclaimControl = .{
+                .server = self.server,
+                .deadline_monotonic_ns = platform_time.monotonicNs() +|
+                    reclaim_deadline_ns,
+            };
+            const cancellation = control.token();
             var processed: usize = 0;
             while (processed < backups_api.backup_attempt_reclaim_batch_size) : (processed += 1) {
+                if (cancellation.isCancelled()) return;
                 const backup_id = blk: {
                     platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
                     defer self.server.backup_maintenance_mutex.unlock();
@@ -3862,28 +3901,87 @@ pub const ApiHttpServer = struct {
                 };
                 defer self.server.owner_alloc.free(backup_id);
 
-                const result = backups_api.reclaimExpiredTableBackupAttemptAtLocation(
-                    self.server.owner_alloc,
-                    io,
-                    location,
-                    backup_id,
-                    now_unix_ns,
-                ) catch |err| {
-                    std.log.warn("table backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
-                    self.finishTableReclaim(
+                generation: while (!cancellation.isCancelled()) {
+                    var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
+                    var inspection = (backups_api.inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
+                        self.server.owner_alloc,
+                        io,
+                        location,
                         backup_id,
-                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
-                    );
-                    continue;
-                };
-                switch (result) {
-                    .reclaimed, .committed => self.finishTableReclaim(backup_id, null),
-                    .active => self.finishTableReclaim(
-                        backup_id,
-                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
-                    ),
+                        &object_budget,
+                        cancellation,
+                    ) catch |err| {
+                        if (err == error.Canceled) return;
+                        std.log.warn("table backup stale-attempt inspection deferred class={s}", .{@errorName(err)});
+                        self.finishTableReclaim(
+                            backup_id,
+                            now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                        );
+                        break :generation;
+                    }) orelse {
+                        self.finishTableReclaim(backup_id, null);
+                        break :generation;
+                    };
+                    defer inspection.deinit(self.server.owner_alloc);
+
+                    page: while (!cancellation.isCancelled()) {
+                        const result = backups_api.advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+                            self.server.owner_alloc,
+                            io,
+                            location,
+                            backup_id,
+                            &inspection,
+                            now_unix_ns,
+                            &object_budget,
+                            cancellation,
+                        ) catch |err| {
+                            if (err == error.Canceled) return;
+                            std.log.warn("table backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                            self.finishTableReclaim(
+                                backup_id,
+                                now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                            );
+                            break :generation;
+                        };
+                        switch (result) {
+                            .reclaimed, .committed => {
+                                self.finishTableReclaim(backup_id, null);
+                                break :generation;
+                            },
+                            .active => {
+                                const retry_at = if (inspection.reclaimNotBeforeUnixNs()) |eligible_at|
+                                    @max(
+                                        eligible_at,
+                                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                                    )
+                                else
+                                    now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+                                self.finishTableReclaim(backup_id, retry_at);
+                                break :generation;
+                            },
+                            .replaced => {
+                                self.noteTableReclaimProgress();
+                                continue :generation;
+                            },
+                            .incomplete => {
+                                self.noteTableReclaimProgress();
+                                object_budget = backups_api.backup_attempt_reclaim_object_budget;
+                                continue :page;
+                            },
+                        }
+                    }
+                    // A deadline leaves the due task in place. The queue keeps
+                    // its progress timestamp and resumes it on the next turn.
+                    return;
                 }
             }
+        }
+
+        fn noteTableReclaimProgress(self: *@This()) void {
+            platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+            defer self.server.backup_maintenance_mutex.unlock();
+            const target = self.target orelse return;
+            target.noteProgress(platform_time.monotonicNs());
         }
 
         fn finishTableReclaim(
@@ -3906,7 +4004,7 @@ pub const ApiHttpServer = struct {
             const now_ns = platform_time.monotonicNs();
             platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
             if ((!target.cluster_maintenance_requested and target.table_reclaims.items.len == 0) or
-                now_ns -| target.last_scheduled_monotonic_ns >=
+                now_ns -| target.lastActivityMonotonicNs() >=
                     backup_maintenance_target_retention_ns)
             {
                 self.server.backup_maintenance_queue.completeActive(target);
@@ -8070,82 +8168,98 @@ pub const ApiHttpServer = struct {
                 operation_control.token(),
             ) catch |err| switch (err) {
                 error.BackupAlreadyExists => {
-                    const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAllocWithCancellation(
+                    var reclaim_budget: usize =
+                        backups_api.backup_attempt_request_reclaim_object_budget;
+                    var inspection = (backups_api.inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
                         self.alloc,
                         io,
                         backup_location,
                         backup_id,
+                        &reclaim_budget,
                         operation_control.token(),
                     ) catch |read_err| {
                         const normalized_err = operation_control.normalizeInterruption(read_err);
                         if (isBackupInterruption(normalized_err)) return normalized_err;
                         return error.BackupAlreadyExists;
+                    }) orelse {
+                        if (!reclaimed_reservation_retry) {
+                            reclaimed_reservation_retry = true;
+                            if (receipt) |execution_receipt|
+                                execution_receipt.recordArtifactBackupId(artifact_backup_id);
+                            continue :reservation_admission;
+                        }
+                        return error.BackupAlreadyExists;
                     };
-                    if (retained_artifact_id) |value| {
-                        defer self.alloc.free(value);
-                        if (receipt) |execution_receipt|
-                            execution_receipt.recordArtifactBackupId(value);
-                        const not_before = backups_api.tableBackupAttemptReclaimNotBeforeAtLocation(
+                    defer inspection.deinit(self.alloc);
+                    if (receipt) |execution_receipt|
+                        execution_receipt.recordArtifactBackupId(inspection.artifact_backup_id);
+                    const eligible_at_unix_ns = inspection.reclaimNotBeforeUnixNs() orelse
+                        return error.BackupOutcomeAmbiguous;
+                    const now_unix_ns: u64 = @intCast(
+                        std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                    );
+                    if (eligible_at_unix_ns <= now_unix_ns) {
+                        const reclaim_result = backups_api.advanceExpiredTableBackupAttemptAtLocationWithCancellation(
                             self.alloc,
                             io,
                             backup_location,
                             backup_id,
-                        ) catch |read_err| {
-                            const normalized_err = operation_control.normalizeInterruption(read_err);
-                            if (isBackupInterruption(normalized_err)) return normalized_err;
-                            return error.BackupOutcomeAmbiguous;
-                        };
-                        if (not_before) |eligible_at_unix_ns| {
-                            const now_unix_ns: u64 = @intCast(
-                                std.Io.Timestamp.now(io, .real).toNanoseconds(),
-                            );
-                            if (eligible_at_unix_ns <= now_unix_ns) {
-                                const reclaim_result = backups_api.reclaimExpiredTableBackupAttemptAtLocation(
-                                    self.alloc,
-                                    io,
-                                    backup_location,
-                                    backup_id,
-                                    now_unix_ns,
-                                ) catch |reclaim_err| {
-                                    const retry_at = now_unix_ns +|
-                                        backups_api.backup_attempt_lease_renew_interval_ns;
-                                    self.scheduleTableBackupReclamation(
-                                        location_uri,
-                                        connection,
-                                        backup_id,
-                                        retry_at,
-                                    ) catch |schedule_err| {
-                                        std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
-                                    };
-                                    const normalized_err = operation_control.normalizeInterruption(reclaim_err);
-                                    if (isBackupInterruption(normalized_err)) return normalized_err;
-                                    return error.BackupOutcomeAmbiguous;
-                                };
-                                switch (reclaim_result) {
-                                    .reclaimed => {
-                                        if (!reclaimed_reservation_retry) {
-                                            reclaimed_reservation_retry = true;
-                                            if (receipt) |execution_receipt|
-                                                execution_receipt.recordArtifactBackupId(artifact_backup_id);
-                                            continue :reservation_admission;
-                                        }
-                                    },
-                                    .committed => return error.BackupAlreadyExists,
-                                    .active => {},
-                                }
-                            }
+                            &inspection,
+                            now_unix_ns,
+                            &reclaim_budget,
+                            operation_control.token(),
+                        ) catch |reclaim_err| {
+                            const retry_at = now_unix_ns +|
+                                backups_api.backup_attempt_lease_renew_interval_ns;
                             self.scheduleTableBackupReclamation(
                                 location_uri,
                                 connection,
                                 backup_id,
-                                @max(eligible_at_unix_ns, now_unix_ns),
+                                retry_at,
                             ) catch |schedule_err| {
                                 std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
                             };
+                            const normalized_err = operation_control.normalizeInterruption(reclaim_err);
+                            if (isBackupInterruption(normalized_err)) return normalized_err;
+                            return error.BackupOutcomeAmbiguous;
+                        };
+                        switch (reclaim_result) {
+                            .reclaimed, .replaced => {
+                                if (!reclaimed_reservation_retry) {
+                                    reclaimed_reservation_retry = true;
+                                    if (receipt) |execution_receipt|
+                                        execution_receipt.recordArtifactBackupId(artifact_backup_id);
+                                    continue :reservation_admission;
+                                }
+                            },
+                            .committed => return error.BackupAlreadyExists,
+                            .active => {},
+                            .incomplete => {
+                                self.scheduleTableBackupReclamation(
+                                    location_uri,
+                                    connection,
+                                    backup_id,
+                                    now_unix_ns,
+                                ) catch |schedule_err| {
+                                    std.log.warn("stale table backup reclamation continuation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                                };
+                                return error.BackupOutcomeAmbiguous;
+                            },
                         }
-                        return error.BackupOutcomeAmbiguous;
                     }
-                    return error.BackupAlreadyExists;
+                    const retry_at = if (eligible_at_unix_ns > now_unix_ns)
+                        eligible_at_unix_ns
+                    else
+                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+                    self.scheduleTableBackupReclamation(
+                        location_uri,
+                        connection,
+                        backup_id,
+                        retry_at,
+                    ) catch |schedule_err| {
+                        std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                    };
+                    return error.BackupOutcomeAmbiguous;
                 },
                 else => return operation_control.normalizeInterruption(err),
             };
