@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -589,12 +590,24 @@ Solution: Delete and recreate the pool with GKE Autopilot configuration.`)
 	return nil
 }
 
-// hasGPUResources checks if GPU resources are present in spec.resources
-func (r *InferencePool) hasGPUResources() bool {
-	if r.Spec.Resources == nil || r.Spec.Resources.Limits == nil {
+// HasGPUResources reports whether resource requirements request or limit a GPU.
+// Admission and reconciliation share this helper so they apply the same backend
+// selection contract.
+func HasGPUResources(resources *corev1.ResourceRequirements) bool {
+	if resources == nil {
 		return false
 	}
-	_, hasNvidiaGPU := r.Spec.Resources.Limits["nvidia.com/gpu"]
-	_, hasGoogleGPU := r.Spec.Resources.Limits["cloud.google.com/gke-gpu"]
-	return hasNvidiaGPU || hasGoogleGPU
+	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
+		if _, ok := resources.Limits[resourceName]; ok {
+			return true
+		}
+		if _, ok := resources.Requests[resourceName]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *InferencePool) hasGPUResources() bool {
+	return HasGPUResources(r.Spec.Resources)
 }

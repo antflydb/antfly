@@ -12,9 +12,19 @@ on:
 permissions:
   contents: read
 
+# Release channel state is compare-and-swapped, and a single promotion controller
+# keeps external registries from racing between that preflight and commit.
+concurrency:
+  group: antfly-release-promotion
+  cancel-in-progress: false
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NPM_VERSION: 11.19.1
+  GCP_REGION: us-central1
+  GCP_PROJECT: antfly-image-artifacts
+  GCP_REPOSITORY: containers
+  GAR_REGISTRY: us-central1-docker.pkg.dev
 
 jobs:
   prepare-release-promotion:
@@ -325,7 +335,9 @@ jobs:
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm
-    needs: prepare-release-promotion
+    needs:
+      - prepare-release-promotion
+      - begin-release-channel
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -350,17 +362,16 @@ jobs:
       - name: Publish npm packages in dependency order
         env:
           VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
         run: |
           set -euo pipefail
-          npm_tag=latest
-          case "$VERSION" in *-*) npm_tag=next ;; esac
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-darwin-arm64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-darwin-arm64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-arm64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-linux-arm64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-x64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-linux-x64-${VERSION}.tgz"
-          sh scripts/packaging/publish_npm_package.sh @antfly/cli "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-darwin-arm64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-darwin-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-arm64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-linux-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-x64 "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-linux-x64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli "$VERSION" "$CHANNEL" "./dist/cli-snapshot/antfly-cli-${VERSION}.tgz"
 
-  publish-zig-homebrew:
-    name: Publish antfly Homebrew formula
+  prepare-zig-homebrew:
+    name: Prepare antfly Homebrew formula
     needs: prepare-release-promotion
     if: ${{ !contains(needs.prepare-release-promotion.outputs.version, '-') }}
     runs-on: arc-antfly-standard
@@ -383,39 +394,22 @@ jobs:
             --tag "$RELEASE_TAG" \
             --archive-dir dist/release-archives \
             --out "$RUNNER_TEMP/antfly.rb"
-      - uses: actions/checkout@v6
+      - uses: actions/upload-artifact@v6
         with:
-          repository: antflydb/homebrew-taps
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-taps
-          fetch-depth: 1
-      - name: Compare-or-publish formula
-        env:
-          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tap_dir="$GITHUB_WORKSPACE/homebrew-taps"
-          cp "$RUNNER_TEMP/antfly.rb" "$tap_dir/Formula/antfly.rb"
-          cd "$tap_dir"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/antfly.rb; then exit 0; fi
-          git add Formula/antfly.rb
-          git commit -m "Update antfly to ${RELEASE_TAG}"
-          git push origin HEAD:main
+          name: antfly-homebrew-formula
+          path: ${{ runner.temp }}/antfly.rb
+          if-no-files-found: error
 
   publish-container:
     needs:
       - prepare-release-promotion
       - publish-cli-pypi
-      - publish-cli-npm
-      - publish-zig-homebrew
+      - prepare-zig-homebrew
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.publish-cli-pypi.result == 'success' &&
-          needs.publish-cli-npm.result == 'success' &&
-          (needs.publish-zig-homebrew.result == 'success' || needs.publish-zig-homebrew.result == 'skipped') }}
+          (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') }}
     permissions:
       contents: read
       packages: write
@@ -427,24 +421,101 @@ jobs:
       ledger_sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
     secrets: inherit
 
-  promote-release-channel:
-    name: Commit mutable release channels last
+  begin-release-channel:
+    name: Begin mutable release channel transaction
     needs:
       - prepare-release-promotion
       - publish-cli-pypi
-      - publish-cli-npm
-      - publish-zig-homebrew
+      - prepare-zig-homebrew
       - publish-container
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.publish-cli-pypi.result == 'success' &&
-          needs.publish-cli-npm.result == 'success' &&
-          (needs.publish-zig-homebrew.result == 'success' || needs.publish-zig-homebrew.result == 'skipped') &&
+          (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
           needs.publish-container.result == 'success' }}
     runs-on: arc-antfly-standard
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      channel: ${{ steps.channel.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v6
+        if: ${{ contains(needs.prepare-release-promotion.outputs.version, '-') }}
+        with:
+          node-version-file: ts/package.json
+          registry-url: https://registry.npmjs.org/
+      - name: Install exact npm client for prerelease channel discovery
+        if: ${{ contains(needs.prepare-release-promotion.outputs.version, '-') }}
+        run: |
+          npm install -g "npm@$NPM_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+      - name: Install hash-locked object storage client
+        run: |
+          python -m pip install --require-hashes -r scripts/release/requirements.lock
+          python -m pip check
+      - name: Resolve current release channel
+        id: channel
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            channel=next
+            current_version="$(npm view @antfly/cli@next version 2>/dev/null || true)"
+            current_tag="${current_version:+v$current_version}"
+          else
+            channel=stable
+            current_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          fi
+          echo "name=$channel" >> "$GITHUB_OUTPUT"
+          echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
+      - name: Begin or resume the release channel transaction
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
+          LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          CHANNEL: ${{ steps.channel.outputs.name }}
+          CURRENT_TAG: ${{ steps.channel.outputs.current_tag }}
+        run: |
+          set -euo pipefail
+          bootstrap_args=()
+          if [ -n "$CURRENT_TAG" ]; then
+            bootstrap_args=(--bootstrap-current "$CURRENT_TAG")
+          fi
+          python scripts/release/release_channel_state.py begin \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --key "antfly/channels/${CHANNEL}.json" \
+            --channel "$CHANNEL" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256" \
+            "${bootstrap_args[@]}"
+
+  promote-stable-channels:
+    name: Commit stable Homebrew, container, and storage channels
+    needs:
+      - prepare-release-promotion
+      - begin-release-channel
+      - publish-cli-npm
+    if: ${{ needs.begin-release-channel.outputs.channel == 'stable' }}
+    runs-on: arc-antfly-standard
+    environment: container-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -456,10 +527,56 @@ jobs:
         with:
           name: antfly-release-payload
           path: dist/release-payload
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-homebrew-formula
+          path: dist/homebrew
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
+      - uses: actions/checkout@v6
+        with:
+          repository: antflydb/homebrew-taps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-taps
+          fetch-depth: 1
+      - name: Commit the stable Homebrew formula
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tap_dir="$GITHUB_WORKSPACE/homebrew-taps"
+          cp dist/homebrew/antfly.rb "$tap_dir/Formula/antfly.rb"
+          cd "$tap_dir"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/antfly.rb; then exit 0; fi
+          git add Formula/antfly.rb
+          git commit -m "Update antfly to ${RELEASE_TAG}"
+          git push origin HEAD:main
+      - name: Authenticate to Google Cloud for stable container aliases
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+      - name: Commit stable container aliases
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          crane copy \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${RELEASE_TAG}" \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:latest"
+          crane copy \
+            "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
+            "ghcr.io/antflydb/antfly:latest"
       - name: Commit object-storage channel aliases
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -474,8 +591,36 @@ jobs:
             --prefix "antfly/${RELEASE_TAG}" \
             --content-addressed-prefix antfly/artifacts \
             --latest-prefix antfly/latest \
-            --publish-latest-if-stable "$RELEASE_TAG" \
+            --publish-latest \
             dist/release-payload/*
+
+  complete-release-channel:
+    name: Publish release and commit channel transaction
+    needs:
+      - prepare-release-promotion
+      - begin-release-channel
+      - publish-cli-npm
+      - promote-stable-channels
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
+          needs.publish-cli-npm.result == 'success' &&
+          (needs.promote-stable-channels.result == 'success' || needs.promote-stable-channels.result == 'skipped') }}
+    runs-on: arc-antfly-standard
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install hash-locked object storage client
+        run: |
+          python -m pip install --require-hashes -r scripts/release/requirements.lock
+          python -m pip check
       - name: Publish the verified GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -486,3 +631,21 @@ jobs:
           else
             gh release edit "$RELEASE_TAG" --draft=false --latest
           fi
+      - name: Commit the release channel transaction
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
+          LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
+        run: |
+          python scripts/release/release_channel_state.py finish \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --key "antfly/channels/${CHANNEL}.json" \
+            --channel "$CHANNEL" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256"

@@ -94,6 +94,14 @@ jobs:
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
 
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Authenticate immutable container registries
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Upload verified runtime archives to immutable build inputs
         env:
           RELEASE_COMMIT: ${{ inputs.source_commit }}
@@ -110,7 +118,7 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ inputs.source_commit }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
-          VERSION: ${{ inputs.tag_name }}
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -132,12 +140,42 @@ jobs:
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${BUILD_TAG}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+          done
+
+      - name: Seal ledger-addressed architecture images
+        env:
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
+        run: |
+          set -euo pipefail
+          promote_ref() {
+            local source="$1" destination="$2" source_digest destination_digest actual_digest
+            source_digest="$(crane digest "$source")"
+            destination_digest="$(crane digest "$destination" 2>/dev/null || true)"
+            if [ -n "$destination_digest" ]; then
+              if [ "$destination_digest" != "$source_digest" ]; then
+                echo "immutable container tag differs: $destination" >&2
+                echo "existing: $destination_digest" >&2
+                echo "new:      $source_digest" >&2
+                return 1
+              fi
+              echo "immutable container tag already matches: $destination"
+              return 0
+            fi
+            crane copy "$source" "$destination"
+            actual_digest="$(crane digest "$destination")"
+            test "$actual_digest" = "$source_digest"
+          }
+          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          for arch in amd64 arm64; do
+            promote_ref "${image}:${BUILD_TAG}-${arch}" "${image}:${LEDGER_TAG}-${arch}"
           done
 
       - name: Create the multi-architecture manifest last
         env:
-          VERSION: ${{ inputs.tag_name }}
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -157,46 +195,57 @@ jobs:
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${BUILD_TAG},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${LEDGER_TAG}-amd64,_ARM64_TAG=${LEDGER_TAG}-arm64"
 
-      - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
-
-      - name: Mirror the immutable version from GAR to GHCR
+      - name: Seal ledger and version image tags
         env:
           VERSION: ${{ inputs.tag_name }}
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
-          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          crane copy \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}" \
-            "ghcr.io/antflydb/antfly:${VERSION}"
+          set -euo pipefail
+          promote_ref() {
+            local source="$1" destination="$2" source_digest destination_digest actual_digest
+            source_digest="$(crane digest "$source")"
+            destination_digest="$(crane digest "$destination" 2>/dev/null || true)"
+            if [ -n "$destination_digest" ]; then
+              if [ "$destination_digest" != "$source_digest" ]; then
+                echo "immutable container tag differs: $destination" >&2
+                echo "existing: $destination_digest" >&2
+                echo "new:      $source_digest" >&2
+                return 1
+              fi
+              echo "immutable container tag already matches: $destination"
+              return 0
+            fi
+            crane copy "$source" "$destination"
+            actual_digest="$(crane digest "$destination")"
+            test "$actual_digest" = "$source_digest"
+          }
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          promote_ref "${gar_image}:${BUILD_TAG}" "${gar_image}:${LEDGER_TAG}"
+          for arch in amd64 arm64; do
+            promote_ref "${gar_image}:${LEDGER_TAG}-${arch}" "${gar_image}:${VERSION}-${arch}"
+          done
+          promote_ref "${gar_image}:${LEDGER_TAG}" "${gar_image}:${VERSION}"
+          promote_ref "${gar_image}:${LEDGER_TAG}" "ghcr.io/antflydb/antfly:${VERSION}"
 
       - uses: sigstore/cosign-installer@v3
 
       - name: Sign the immutable GAR and GHCR image digests
         env:
           VERSION: ${{ inputs.tag_name }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
         run: |
           cosign sign --yes \
             -a "repo=${{ github.repository }}" \
             -a "workflow=${{ github.workflow }}" \
             -a "ref=${{ inputs.source_commit }}" \
+            -a "ledger_sha256=${LEDGER_SHA256}" \
             "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}"
           cosign sign --yes \
             -a "repo=${{ github.repository }}" \
             -a "workflow=${{ github.workflow }}" \
             -a "ref=${{ inputs.source_commit }}" \
+            -a "ledger_sha256=${LEDGER_SHA256}" \
             "ghcr.io/antflydb/antfly:${VERSION}"
-
-      - name: Commit stable container aliases last
-        if: ${{ !contains(inputs.tag_name, '-') && !startsWith(inputs.tag_name, 'v0.1.') }}
-        env:
-          VERSION: ${{ inputs.tag_name }}
-        run: |
-          crane copy \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}" \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:latest"
-          crane copy \
-            "ghcr.io/antflydb/antfly:${VERSION}" \
-            "ghcr.io/antflydb/antfly:latest"

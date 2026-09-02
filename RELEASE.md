@@ -65,19 +65,30 @@ untrusted tag never receives publication credentials.
 3. The promotion controller separates the complete payload into
    ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
    exact scope membership, and every digest.
-4. npm, PyPI, Homebrew, and the single multi-architecture container image
-   consume those verified scopes. The container publisher is callable only by
-   this controller and consumes the GNU runtime archives built in step 1.
-5. Stable container aliases move only after the registry and Homebrew versioned
-   publications succeed. `promote-release-channel` then updates object-storage
-   aliases and publishes the draft GitHub Release. RC releases skip stable
-   aliases and Homebrew.
+4. npm, PyPI, the Homebrew formula, and the single multi-architecture container
+   image consume those verified scopes. The container publisher is callable
+   only by this controller and consumes the GNU runtime archives built in step
+   1. It first builds run-scoped images, seals them under the release-ledger
+   digest, and then compare-or-creates the version tags. A retry can reuse an
+   identical image but cannot overwrite a released version with different
+   bytes.
+5. Mutable install channels are transactions. Compare-and-swap journals in R2
+   record `pending` and `current` release identities (tag, source commit, and
+   ledger digest) for both `stable` and `next`. Only after that preflight may
+   npm publish with its required `latest` or `next` dist-tag. Stable releases
+   then update Homebrew, container `latest`, object-storage `latest`, and GitHub
+   release visibility before committing the journal. RC releases publish the
+   GitHub prerelease and commit the `next` journal. A failed run must resume the
+   same pending identity; historical recovery cannot move either channel
+   backward.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
 publication is safe to retry without hiding content drift. Existing GitHub
 release assets are likewise accepted only when byte-identical; release
-automation never replaces a saved artifact.
+automation never replaces a saved artifact. GitHub release visibility is also
+one-way: a retry may add missing identical assets to a published release but
+never returns it to draft state.
 
 Normal registry promotion is triggered by `workflow_run`; the explicit
 `promote-cli-release` `repository_dispatch` event is only the recovery path.
@@ -97,6 +108,14 @@ digest, and consumes the verified GNU archives. Cloud Build uses an immutable
 source-commit-and-ledger-addressed artifact URI and has no mutable or
 ABI-ambiguous default input.
 
+Temporary run-scoped container tags are build staging only. The
+`sha256-<ledger digest>` and `<version>` tags are immutable publication
+records; registry retention may remove staging tags after the release. There
+is deliberately no automatic rollback entry point for mutable channels. A
+rollback requires a separately reviewed administrative change to the channel
+journal and aliases, rather than disguising an old-release recovery as a new
+promotion.
+
 The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
 in `scripts/release/platforms.json`. Release jobs, CLI packaging, and Homebrew
 read that policy instead of maintaining independent platform tables. Python
@@ -112,6 +131,9 @@ scripts under `scripts/release/`:
 - `create_github_release.py` creates or updates the draft GitHub Release,
   generates release notes through the GitHub API, and accepts existing assets
   only when their digest matches the local payload.
+- `release_channel_state.py` compare-and-swaps the stable and prerelease channel
+  journals, prevents backward promotion using SemVer precedence, and makes an
+  interrupted promotion resumable only by the same release identity.
 - `publish_objectstorage.py` first writes content-addressed and versioned keys
   with compare-or-fail semantics, then updates mutable channel aliases only
   after every immutable upload succeeds. The release workflow currently uses

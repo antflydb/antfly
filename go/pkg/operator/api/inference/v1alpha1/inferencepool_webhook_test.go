@@ -273,6 +273,24 @@ func TestValidateInferencePool_AcceleratorWithGPU(t *testing.T) {
 	}
 }
 
+func TestValidateInferencePool_AcceleratorWithRequestedGPU(t *testing.T) {
+	pool := validPool()
+	pool.Spec.GKE = &GKEConfig{
+		Autopilot:             true,
+		AutopilotComputeClass: "Accelerator",
+	}
+	pool.Spec.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		},
+	}
+	pool.Spec.Hardware.Accelerator = "nvidia-l4"
+
+	if err := pool.ValidateInferencePool(); err != nil {
+		t.Errorf("expected GPU requests to satisfy validation, got: %v", err)
+	}
+}
+
 func TestValidateInferencePool_AcceleratorRequiresGPUType(t *testing.T) {
 	pool := validPool()
 	pool.Spec.GKE = &GKEConfig{Autopilot: true, AutopilotComputeClass: "Accelerator"}

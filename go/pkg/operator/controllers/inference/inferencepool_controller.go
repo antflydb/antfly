@@ -432,25 +432,10 @@ func inferenceBackendPolicyForPool(pool *antflyaiv1alpha1.InferencePool) inferen
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		return inferenceBackendPolicy{preferred: "pjrt"}
 	}
-	if pool.Spec.Hardware.Accelerator != "" || hasInferenceGPUResources(pool.Spec.Resources) {
+	if pool.Spec.Hardware.Accelerator != "" || antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
 		return inferenceBackendPolicy{preferred: "cuda", required: "cuda"}
 	}
 	return inferenceBackendPolicy{}
-}
-
-func hasInferenceGPUResources(resources *corev1.ResourceRequirements) bool {
-	if resources == nil {
-		return false
-	}
-	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
-		if _, ok := resources.Limits[resourceName]; ok {
-			return true
-		}
-		if _, ok := resources.Requests[resourceName]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 func zigWarmModelKind(tasks []string) string {
@@ -1213,7 +1198,7 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 		// GPU workloads must select both the Accelerator compute class and the
 		// concrete GPU type. GKE reads these as node labels; annotations alone do
 		// not trigger L4 provisioning.
-		if pool.Spec.Hardware.Accelerator != "" && hasInferenceGPUResources(pool.Spec.Resources) {
+		if pool.Spec.Hardware.Accelerator != "" && antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
 			if podTemplate.Spec.NodeSelector == nil {
 				podTemplate.Spec.NodeSelector = make(map[string]string)
 			}
@@ -1240,7 +1225,7 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 	}
 
 	// Standard GKE mode (non-Autopilot): select the requested GPU type and spot nodes.
-	if pool.Spec.GKE != nil && pool.Spec.Hardware.Accelerator != "" && hasInferenceGPUResources(pool.Spec.Resources) {
+	if pool.Spec.GKE != nil && pool.Spec.Hardware.Accelerator != "" && antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
 		if podTemplate.Spec.NodeSelector == nil {
 			podTemplate.Spec.NodeSelector = make(map[string]string)
 		}

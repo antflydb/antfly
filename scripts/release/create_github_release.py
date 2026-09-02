@@ -115,6 +115,27 @@ def get_release_by_tag(repo: str, tag: str, token: str) -> dict | None:
     return release
 
 
+def create_or_update_release(repo: str, tag: str, token: str, payload: dict) -> dict:
+    release = get_release_by_tag(repo, tag, token)
+    if release is None:
+        created = github_api("POST", repo, "/releases", token, payload)
+        assert isinstance(created, dict)
+        print(f"created GitHub release draft for {tag}")
+        return created
+
+    # Publishing is a one-way state transition. Recovery may repair missing
+    # assets on an existing release, but must never hide it by returning it to
+    # draft state.
+    if not release.get("draft", False) and payload.get("draft", False):
+        print(f"preserving already-published GitHub release for {tag}")
+        return release
+
+    updated = github_api("PATCH", repo, f"/releases/{release['id']}", token, payload)
+    assert isinstance(updated, dict)
+    print(f"updated GitHub release for {tag}")
+    return updated
+
+
 def generate_notes(repo: str, tag: str, commit: str, token: str) -> str:
     try:
         generated = github_api(
@@ -277,19 +298,7 @@ def main() -> int:
         "prerelease": prerelease,
     }
 
-    release = get_release_by_tag(args.repo, args.tag, token)
-    if release is None:
-        created = github_api("POST", args.repo, "/releases", token, payload)
-        assert isinstance(created, dict)
-        release = created
-        print(f"created GitHub release draft for {args.tag}")
-    else:
-        updated = github_api(
-            "PATCH", args.repo, f"/releases/{release['id']}", token, payload
-        )
-        assert isinstance(updated, dict)
-        release = updated
-        print(f"updated GitHub release draft for {args.tag}")
+    release = create_or_update_release(args.repo, args.tag, token, payload)
 
     for asset in assets:
         upload_asset(

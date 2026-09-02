@@ -198,6 +198,7 @@ jobs:
             scripts/release/publish_objectstorage.py \
             scripts/release/platforms.json \
             scripts/release/release_platforms.py \
+            scripts/release/release_channel_state.py \
             scripts/release/requirements.lock \
             scripts/release/verify_cli_snapshot.py \
             scripts/release/verify_release_ledger.py \

@@ -173,7 +173,17 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("workflow_run|repository_dispatch", container_workflow)
         self.assertIn("antfly-release-runtime-archives", container_workflow)
         self.assertIn("consumer-matrix container", container_workflow)
+        self.assertIn("immutable container tag differs", container_workflow)
+        self.assertIn("sha256-${{ inputs.ledger_sha256 }}", container_workflow)
+        self.assertNotIn("Commit stable container aliases last", container_workflow)
         self.assertIn("needs: prepare-release-promotion", release_workflow)
+        self.assertIn("group: antfly-release-promotion", release_workflow)
+        self.assertIn("release_channel_state.py begin", release_workflow)
+        self.assertIn("release_channel_state.py finish", release_workflow)
+        self.assertIn("Commit stable container aliases", release_workflow)
+        self.assertIn("Commit the stable Homebrew formula", release_workflow)
+        self.assertIn('CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}', release_workflow)
+        self.assertNotIn("npm dist-tag add", release_workflow)
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()

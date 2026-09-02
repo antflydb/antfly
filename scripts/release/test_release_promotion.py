@@ -27,6 +27,196 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_release_channel_store_uses_atomic_create_and_update(self) -> None:
+        channel = load_module("release_channel_store_test", "release_channel_state.py")
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.requests: list[dict] = []
+
+            def put_object(self, **request) -> None:
+                self.requests.append(request)
+
+        store = channel.S3ChannelStore.__new__(channel.S3ChannelStore)
+        store.bucket = "releases"
+        store.key = "antfly/channels/stable.json"
+        store.client = FakeClient()
+        store.client_error = Exception
+        document = {"schema_version": 1, "current": None, "pending": None}
+
+        store.compare_and_swap(channel.StoredState(document, None), document)
+        self.assertEqual(store.client.requests[-1]["IfNoneMatch"], "*")
+        self.assertNotIn("IfMatch", store.client.requests[-1])
+
+        store.compare_and_swap(channel.StoredState(document, '"etag"'), document)
+        self.assertEqual(store.client.requests[-1]["IfMatch"], '"etag"')
+        self.assertNotIn("IfNoneMatch", store.client.requests[-1])
+
+    def test_published_github_release_never_returns_to_draft(self) -> None:
+        github = load_module(
+            "create_github_release_state_test", "create_github_release.py"
+        )
+        published = {"id": 1, "draft": False, "assets": []}
+        with (
+            mock.patch.object(github, "get_release_by_tag", return_value=published),
+            mock.patch.object(github, "github_api") as api,
+        ):
+            actual = github.create_or_update_release(
+                "antflydb/antfly", "v1.2.3", "token", {"draft": True}
+            )
+
+        self.assertIs(actual, published)
+        api.assert_not_called()
+
+    def test_stable_channel_transaction_is_monotonic_and_resumable(self) -> None:
+        channel = load_module("release_channel_state_test", "release_channel_state.py")
+
+        class MemoryStore:
+            def __init__(self, document: dict) -> None:
+                self.document = document
+                self.etag = "1"
+                self.writes = 0
+
+            def load(self):
+                return channel.StoredState(
+                    json.loads(json.dumps(self.document)), self.etag
+                )
+
+            def compare_and_swap(self, previous, document: dict) -> None:
+                self.assert_etag(previous.etag)
+                self.document = json.loads(json.dumps(document))
+                self.writes += 1
+                self.etag = str(self.writes + 1)
+
+            def assert_etag(self, etag: str) -> None:
+                if etag != self.etag:
+                    raise AssertionError("stale channel state")
+
+        previous = {
+            "tag": "v1.2.2",
+            "commit": "1" * 40,
+            "ledger_sha256": "2" * 64,
+        }
+        candidate = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        store = MemoryStore({"schema_version": 1, "current": previous, "pending": None})
+
+        channel.begin_promotion(store, candidate, None)
+        self.assertEqual(store.document["pending"], candidate)
+        self.assertEqual(store.writes, 1)
+        channel.begin_promotion(store, candidate, None)
+        self.assertEqual(store.writes, 1, "same transaction should resume")
+        channel.finish_promotion(store, candidate)
+        self.assertEqual(
+            store.document,
+            {"schema_version": 1, "current": candidate, "pending": None},
+        )
+        channel.finish_promotion(store, candidate)
+        self.assertEqual(store.writes, 2, "committed transaction should replay")
+
+        older = channel.release_identity("v1.2.1", "4" * 40, "5" * 64)
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            channel.begin_promotion(store, older, None)
+
+    def test_stable_channel_blocks_a_different_incomplete_promotion(self) -> None:
+        channel = load_module(
+            "release_channel_pending_test", "release_channel_state.py"
+        )
+
+        class MemoryStore:
+            def __init__(self, document: dict) -> None:
+                self.document = document
+
+            def load(self):
+                return channel.StoredState(self.document, "1")
+
+            def compare_and_swap(self, _previous, document: dict) -> None:
+                self.document = document
+
+        pending = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        store = MemoryStore({"schema_version": 1, "current": None, "pending": pending})
+        different = channel.release_identity("v1.2.4", "4" * 40, "5" * 64)
+        with self.assertRaisesRegex(SystemExit, "is incomplete"):
+            channel.begin_promotion(store, different, None)
+
+    def test_stable_channel_rejects_observed_alias_drift(self) -> None:
+        channel = load_module("release_channel_alias_test", "release_channel_state.py")
+
+        class MemoryStore:
+            def load(self):
+                return channel.StoredState(
+                    {
+                        "schema_version": 1,
+                        "current": {"tag": "v1.2.3"},
+                        "pending": None,
+                    },
+                    "1",
+                )
+
+            def compare_and_swap(self, _previous, _document: dict) -> None:
+                raise AssertionError("drifted aliases must not be promoted")
+
+        candidate = channel.release_identity("v1.2.5", COMMIT, "3" * 64)
+        with self.assertRaisesRegex(SystemExit, "observed alias is v1.2.4"):
+            channel.begin_promotion(MemoryStore(), candidate, "v1.2.4")
+
+    def test_stable_channel_rejects_identity_drift_for_current_tag(self) -> None:
+        channel = load_module(
+            "release_channel_identity_test", "release_channel_state.py"
+        )
+
+        class MemoryStore:
+            def load(self):
+                return channel.StoredState(
+                    {
+                        "schema_version": 1,
+                        "current": {
+                            "tag": "v1.2.3",
+                            "commit": COMMIT,
+                            "ledger_sha256": "3" * 64,
+                        },
+                        "pending": None,
+                    },
+                    "1",
+                )
+
+            def compare_and_swap(self, _previous, _document: dict) -> None:
+                raise AssertionError("identity drift must not be written")
+
+        drifted = channel.release_identity("v1.2.3", COMMIT, "4" * 64)
+        with self.assertRaisesRegex(SystemExit, "different ledger_sha256"):
+            channel.begin_promotion(MemoryStore(), drifted, None)
+
+    def test_next_channel_uses_semver_prerelease_precedence(self) -> None:
+        channel = load_module("release_channel_next_test", "release_channel_state.py")
+
+        class MemoryStore:
+            def __init__(self) -> None:
+                self.document = {
+                    "schema_version": 1,
+                    "current": {"tag": "v1.3.0-rc.2"},
+                    "pending": None,
+                }
+
+            def load(self):
+                return channel.StoredState(self.document, "1")
+
+            def compare_and_swap(self, _previous, document: dict) -> None:
+                self.document = document
+
+        candidate = channel.release_identity("v1.3.0-rc.10", COMMIT, "3" * 64, "next")
+        store = MemoryStore()
+        channel.begin_promotion(store, candidate, None, "next")
+        self.assertEqual(store.document["pending"], candidate)
+
+        store.document = {
+            "schema_version": 1,
+            "current": {"tag": "v1.3.0-rc.10"},
+            "pending": None,
+        }
+        older = channel.release_identity("v1.3.0-rc.3", "4" * 40, "5" * 64, "next")
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            channel.begin_promotion(store, older, None, "next")
+
     def test_github_asset_is_compare_or_fail(self) -> None:
         github = load_module("create_github_release_test", "create_github_release.py")
         with tempfile.TemporaryDirectory() as raw_tmp:
