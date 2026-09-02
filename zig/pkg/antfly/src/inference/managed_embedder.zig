@@ -2529,8 +2529,13 @@ fn validateCatalogOwnerSemanticIdentity(
         return error.InvalidEmbeddingArtifactProducer;
     if (multimodal != .bool or multimodal.bool != embedder_cfg.multimodal)
         return error.InvalidEmbeddingArtifactProducer;
-    if (embedder_cfg.region.len > 0 and
-        !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "region"), embedder_cfg.region))
+    // Region is part of the canonical v2 identity even for providers where it
+    // is empty. Runtime binding must not discover that an extension-installed
+    // owner omitted the field only after the catalog has committed.
+    const semantic_region = try semanticIdentityStringField(parsed_identity.value, "region");
+    if ((provider == .bedrock and semantic_region.len == 0) or
+        (provider != .bedrock and semantic_region.len != 0) or
+        (embedder_cfg.region.len > 0 and !std.mem.eql(u8, semantic_region, embedder_cfg.region)))
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
@@ -2612,6 +2617,45 @@ fn collectCatalogProducerOwners(
     }
 }
 
+fn addCatalogEmbeddingConsumer(
+    alloc: std.mem.Allocator,
+    consumers: *std.StringHashMapUnmanaged(void),
+    name: []const u8,
+) !void {
+    if (consumers.contains(name)) return;
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    try consumers.put(alloc, owned_name, {});
+}
+
+/// Collect durable artifact streams consumed by non-external embedding
+/// indexes. A producer-less enrichment may remain as an externally populated
+/// declaration when unconsumed, but every managed consumer needs an executable
+/// owner that survives the same catalog mutation.
+fn collectCatalogEmbeddingConsumers(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+    consumers: *std.StringHashMapUnmanaged(void),
+) !void {
+    if (root != .object) return error.InvalidManagedEmbeddingIndex;
+    var it = root.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const object = entry.value_ptr.object;
+        const type_value = object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) continue;
+
+        var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, entry.value_ptr.*);
+        defer parsed_cfg.deinit();
+        const cfg = parsed_cfg.value;
+        if (cfg.external orelse false) continue;
+        if (cfg.embedding_name) |name| try addCatalogEmbeddingConsumer(alloc, consumers, name);
+        if (cfg.sources) |sources| for (sources) |source| {
+            try addCatalogEmbeddingConsumer(alloc, consumers, source.artifact);
+        };
+    }
+}
+
 fn validateCatalogProducerShape(
     owner: CatalogProducerOwner,
     expected_dims: ?u32,
@@ -2680,6 +2724,7 @@ fn validateCatalogEmbeddingProducerOwnership(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     owners: *const std.StringHashMapUnmanaged(CatalogProducerOwner),
+    consumers: *const std.StringHashMapUnmanaged(void),
     options: EmbeddingProducerOwnershipOptions,
 ) !void {
     switch (value) {
@@ -2696,7 +2741,7 @@ fn validateCatalogEmbeddingProducerOwnership(
                     const expected_dims = try embeddingEnrichmentExpectedDimensionsOptional(enrichment);
                     const owner = owners.get(name.string);
                     const producer_json = enrichment.object.get("producer_json") orelse {
-                        if (!options.require_owner_for_missing_producer) continue;
+                        if (!options.require_owner_for_missing_producer and !consumers.contains(name.string)) continue;
                         try validateCatalogProducerShape(
                             owner orelse return error.MissingEmbeddingArtifactProducer,
                             expected_dims,
@@ -2740,21 +2785,22 @@ fn validateCatalogEmbeddingProducerOwnership(
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try validateCatalogEmbeddingProducerOwnership(alloc, entry.value_ptr.*, owners, options);
+                try validateCatalogEmbeddingProducerOwnership(alloc, entry.value_ptr.*, owners, consumers, options);
             }
         },
         .array => |array| for (array.items) |item|
-            try validateCatalogEmbeddingProducerOwnership(alloc, item, owners, options),
+            try validateCatalogEmbeddingProducerOwnership(alloc, item, owners, consumers, options),
         else => {},
     }
 }
 
 /// Context-free catalog invariant used at authoritative metadata boundaries.
 /// It proves that credential-free v2 provenance retains an executable index
-/// owner with the exact stable semantic identity admitted by the API. Callers
-/// admitting a managed extension catalog can additionally require ownership
-/// for producer-less inline enrichments. Provider availability remains an
-/// API/runtime concern.
+/// owner with the exact stable semantic identity admitted by the API, and that
+/// every consumed producer-less embedding enrichment retains an executable
+/// owner. Callers admitting a managed extension catalog can additionally
+/// require owners for unconsumed inline enrichments. Provider availability
+/// remains an API/runtime concern.
 pub fn validateEmbeddingProducerOwnershipValue(
     alloc: std.mem.Allocator,
     root: std.json.Value,
@@ -2773,8 +2819,15 @@ pub fn validateEmbeddingProducerOwnershipValueWithOptions(
         while (keys.next()) |key| alloc.free(@constCast(key.*));
         owners.deinit(alloc);
     }
+    var consumers = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var keys = consumers.keyIterator();
+        while (keys.next()) |key| alloc.free(@constCast(key.*));
+        consumers.deinit(alloc);
+    }
     try collectCatalogProducerOwners(alloc, root, &owners, options);
-    try validateCatalogEmbeddingProducerOwnership(alloc, root, &owners, options);
+    try collectCatalogEmbeddingConsumers(alloc, root, &consumers);
+    try validateCatalogEmbeddingProducerOwnership(alloc, root, &owners, &consumers, options);
 }
 
 pub fn validateEmbeddingProducerOwnershipJson(
@@ -2840,6 +2893,26 @@ test "managed embedder catalog ownership rejects orphaned semantic producers" {
             .{ .require_owner_for_missing_producer = true },
         ),
     );
+
+    const consumed_without_owner =
+        \\{"consumer":{"type":"embeddings","dimension":3,"sources":[{"artifact":"precomputed_dense_v1"}]},"enrichments":[{"name":"precomputed_dense_v1","kind":"embedding","field":"embedding","expected_dims":3}]}
+    ;
+    try std.testing.expectError(
+        error.MissingEmbeddingArtifactProducer,
+        validateEmbeddingProducerOwnershipJson(std.testing.allocator, consumed_without_owner),
+    );
+
+    const owner_missing_region =
+        \\{"owner":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"document_dense_v1","embedder":{"provider":"antfly","model":"test-model"},"semantic_producer":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"test-model\",\"endpoint\":\"antfly:embedded\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"enrichments":[{"name":"document_dense_v1","kind":"embedding","field":"body","expected_dims":3}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateEmbeddingProducerOwnershipJsonWithOptions(
+            std.testing.allocator,
+            owner_missing_region,
+            .{ .require_stable_owner_identity = true },
+        ),
+    );
 }
 
 test "catalog ownership rejects duplicate executable owners and endpoint mismatches" {
@@ -2873,6 +2946,39 @@ fn registerArtifactManagedEmbeddingLookup(
     options: InitOptions,
     entries: *std.ArrayListUnmanaged(ManagedEmbeddingEntry),
 ) !void {
+    // Inline embedding enrichments may omit producer_json when another managed
+    // index in the same catalog is the authoritative executable owner. Reuse
+    // that entry directly; requiring a duplicated producer document would make
+    // the durable owner ambiguous and prevent a second index from consuming the
+    // same artifact stream.
+    if (managedEntryIndexForArtifact(entries.items, artifact_name)) |entry_index| {
+        var enrichment: ?std.json.Value = null;
+        try findEmbeddingEnrichmentValue(root, artifact_name, &enrichment);
+        const enrichment_value = enrichment orelse return error.MissingEmbeddingArtifactEnrichment;
+        const enrichment_object = switch (enrichment_value) {
+            .object => |object| object,
+            else => return error.InvalidEmbeddingArtifactProducer,
+        };
+        if (enrichment_object.get("producer_json") == null) {
+            const existing = &entries.items[entry_index];
+            const sparse = cfg.sparse orelse false;
+            if (existing.sparse != sparse) return error.InvalidEmbeddingArtifactProducer;
+            const expected_dims = try embeddingEnrichmentExpectedDimensionsOptional(enrichment_value);
+            if (sparse) {
+                if (expected_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
+            } else {
+                const declared_dims = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+                if ((expected_dims orelse return error.EmbeddingArtifactDimensionRequired) != declared_dims or
+                    existing.dimensions != declared_dims)
+                {
+                    return error.ConflictingEmbeddingArtifactDimensions;
+                }
+            }
+            try appendManagedEntryLookupAlias(alloc, existing, index_name);
+            return;
+        }
+    }
+
     var built = try buildArtifactManagedEmbeddingEntry(
         alloc,
         root,
@@ -4508,6 +4614,25 @@ test "managed embedder binds execution to catalog semantic producer identity" {
             .{ .inference_api_url = "http://runtime-default.example/wrong-path" },
         ),
     );
+}
+
+test "managed embedder reuses an executable owner for producerless artifact consumers" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    const catalog =
+        \\{"consumer":{"type":"embeddings","dimension":3,"sources":[{"artifact":"dense_v1"}]},"owner":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"antfly","model":"model-a"},"semantic_producer":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"model-a\",\"endpoint\":\"antfly:embedded\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"enrichments":[{"name":"dense_v1","kind":"embedding","field":"body","expected_dims":3}]}
+    ;
+
+    try validateEmbeddingProducerOwnershipJson(std.testing.allocator, catalog);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(
+        std.testing.allocator,
+        catalog,
+        local.provider(),
+    );
+    defer managed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), managed.entries.len);
+    try std.testing.expect(managed.findEntry("owner") != null);
+    try std.testing.expect(managed.findEntry("consumer") != null);
+    try std.testing.expect(managed.findEntry("dense_v1") != null);
 }
 
 pub fn testMultiSourceEmbeddingContracts() !void {

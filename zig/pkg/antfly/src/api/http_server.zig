@@ -12433,11 +12433,14 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer,
             error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions,
-            => return error.Conflict,
+            => return error.DependencyConflict,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -12610,7 +12613,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(expected_indexes_json);
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
-            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.DependencyConflict,
             else => return error.InternalFailure,
         };
 
@@ -12621,7 +12624,15 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions,
+            => return error.DependencyConflict,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 return error.InternalFailure;
