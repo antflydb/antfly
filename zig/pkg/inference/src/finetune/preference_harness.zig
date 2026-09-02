@@ -378,8 +378,9 @@ pub fn grpoStep(
     rewarder: grpo.Rewarder,
     config: GRPOHarnessConfig,
 ) !GRPOStepResult {
+    try grpo.validateConfig(config.grpo);
     const group_size = config.grpo.group_size;
-    if (prompts.len == 0 or group_size == 0) return error.EmptyBatch;
+    if (prompts.len == 0) return error.EmptyBatch;
 
     // Per-prompt sampler buffers. We own these lists and their contained slices.
     const total_comps = prompts.len * group_size;
@@ -455,7 +456,7 @@ pub fn grpoStep(
 
     var ga = try grpo.scoreGroup(allocator, rewarder, completions);
     defer ga.deinit();
-    grpo.computeAdvantages(&ga, completions, config.grpo);
+    try grpo.computeAdvantages(&ga, completions, config.grpo);
 
     var mean_reward: f32 = 0;
     if (ga.rewards.len > 0) {

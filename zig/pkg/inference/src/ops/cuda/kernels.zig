@@ -2216,6 +2216,7 @@ pub const KernelModule = struct {
     embedding_lookup_bf16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_f16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
+    embedding_lookup_i32_bf16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f16_weight_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
     gemma4_a4b_topk_rows_f32: driver_mod.CUfunction = null,
@@ -2343,7 +2344,9 @@ pub const KernelModule = struct {
     primitive_broadcast_f32: driver_mod.CUfunction = null,
     layer_norm_backward_f32: driver_mod.CUfunction = null,
     primitive_softmax_f32: driver_mod.CUfunction = null,
+    selected_token_logprobs_f32: driver_mod.CUfunction = null,
     primitive_gather_f32: driver_mod.CUfunction = null,
+    primitive_gather_bf16_f32: driver_mod.CUfunction = null,
     primitive_scatter_add_axis0_f32: driver_mod.CUfunction = null,
     primitive_transpose_f32: driver_mod.CUfunction = null,
     primitive_transpose_2d_f32: driver_mod.CUfunction = null,
@@ -3306,6 +3309,7 @@ pub const KernelModule = struct {
         const embedding_lookup_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_f16_weight_f32");
         var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
+        const embedding_lookup_i32_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_bf16_weight_f32");
         const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
@@ -3495,7 +3499,9 @@ pub const KernelModule = struct {
         const primitive_broadcast_f32 = loadOptionalFunction(ctx, module, "termite_primitive_broadcast_f32");
         const layer_norm_backward_f32 = loadOptionalFunction(ctx, module, "termite_layer_norm_backward_f32");
         const primitive_softmax_f32 = loadOptionalFunction(ctx, module, "termite_primitive_softmax_f32");
+        const selected_token_logprobs_f32 = loadOptionalFunction(ctx, module, "termite_selected_token_logprobs_f32");
         const primitive_gather_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_f32");
+        const primitive_gather_bf16_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_bf16_f32");
         const primitive_scatter_add_axis0_f32 = loadOptionalFunction(ctx, module, "termite_primitive_scatter_add_axis0_f32");
         const primitive_transpose_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_f32");
         const primitive_transpose_2d_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_2d_f32");
@@ -3805,6 +3811,7 @@ pub const KernelModule = struct {
             .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
             .embedding_lookup_f16_weight_f32 = embedding_lookup_f16_weight_f32,
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
+            .embedding_lookup_i32_bf16_weight_f32 = embedding_lookup_i32_bf16_weight_f32,
             .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
             .take_rows_f32 = take_rows_f32,
             .gemma4_a4b_topk_rows_f32 = gemma4_a4b_topk_rows_f32,
@@ -3909,7 +3916,9 @@ pub const KernelModule = struct {
             .primitive_broadcast_f32 = primitive_broadcast_f32,
             .layer_norm_backward_f32 = layer_norm_backward_f32,
             .primitive_softmax_f32 = primitive_softmax_f32,
+            .selected_token_logprobs_f32 = selected_token_logprobs_f32,
             .primitive_gather_f32 = primitive_gather_f32,
+            .primitive_gather_bf16_f32 = primitive_gather_bf16_f32,
             .primitive_scatter_add_axis0_f32 = primitive_scatter_add_axis0_f32,
             .primitive_transpose_f32 = primitive_transpose_f32,
             .primitive_transpose_2d_f32 = primitive_transpose_2d_f32,
@@ -4167,6 +4176,7 @@ pub const KernelModule = struct {
             self.embedding_lookup_bf16_weight_f32 = null;
             self.embedding_lookup_f16_weight_f32 = null;
             self.embedding_lookup_i32_f32 = null;
+            self.embedding_lookup_i32_bf16_weight_f32 = null;
             self.embedding_lookup_i32_f16_weight_f32 = null;
             self.take_rows_f32 = null;
             self.gemma4_a4b_topk_rows_f32 = null;
@@ -4273,7 +4283,9 @@ pub const KernelModule = struct {
             self.primitive_broadcast_f32 = null;
             self.layer_norm_backward_f32 = null;
             self.primitive_softmax_f32 = null;
+            self.selected_token_logprobs_f32 = null;
             self.primitive_gather_f32 = null;
+            self.primitive_gather_bf16_f32 = null;
             self.primitive_scatter_add_axis0_f32 = null;
             self.primitive_transpose_f32 = null;
             self.primitive_transpose_2d_f32 = null;
@@ -4450,6 +4462,7 @@ pub const KernelModule = struct {
     pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
         return self.linear_bf16_weight_f32_tiled != null and
             self.embedding_lookup_bf16_weight_f32 != null and
+            self.embedding_lookup_i32_bf16_weight_f32 != null and
             self.linear_bf16_weight_f32_qkv_nobias_tiled != null;
     }
 
@@ -4502,25 +4515,20 @@ pub const KernelModule = struct {
             self.gliner_gru_combine_f32 != null;
     }
 
-    /// Fail closed before a GLiNER2 training run starts if an embedded CUDA
-    /// artifact predates any of the kernels needed by forward, autodiff, loss,
-    /// gradient accumulation, clipping, or the resident AdamW optimizer.
-    pub fn hasGliner2TrainingPrimitives(self: *const KernelModule) bool {
-        return self.hasGliner2Primitives() and
-            self.binary_scalar_f32 != null and
+    /// Backend-neutral primitives required by the compiled autodiff executor,
+    /// device gradient accumulation, clipping, and resident AdamW.  Keep this
+    /// separate from an architecture's forward kernels so a training profile
+    /// cannot accidentally pass merely because its inference path is present.
+    pub fn hasDeviceTrainingPrimitives(self: *const KernelModule) bool {
+        return self.binary_scalar_f32 != null and
             self.elementwise_broadcast_f32 != null and
             self.f32_to_i32 != null and
             self.round_f32 != null and
             self.primitive_where_f32 != null and
             self.primitive_batched_dot_f32 != null and
-            self.deberta_attention_backward_scores_f32 != null and
-            self.deberta_attention_backward_f32 != null and
             self.training_accumulate_f32 != null and
             self.training_adamw_f32 != null and
             self.training_sum_squares_f32 != null and
-            self.masked_bce_accumulate_f32 != null and
-            self.masked_bce_finalize_f32 != null and
-            self.masked_bce_backward_f32 != null and
             self.primitive_reduce_f32 != null and
             self.primitive_broadcast_f32 != null and
             self.layer_norm_backward_f32 != null and
@@ -4530,6 +4538,29 @@ pub const KernelModule = struct {
             self.primitive_transpose_f32 != null and
             self.primitive_concat_f32 != null and
             self.primitive_slice_f32 != null;
+    }
+
+    /// Fail closed before a Gemma 4 CUDA policy-training run.  Gemma uses the
+    /// decoder/BF16 forward surface and the generic autodiff/device-optimizer
+    /// surface; both must come from the same loaded artifact.
+    pub fn hasGemma4TrainingPrimitives(self: *const KernelModule) bool {
+        return self.hasGemma4DecoderPrimitives() and
+            self.hasBf16WeightPrimitives() and
+            self.primitive_gather_bf16_f32 != null and
+            self.hasDeviceTrainingPrimitives();
+    }
+
+    /// Fail closed before a GLiNER2 training run starts if an embedded CUDA
+    /// artifact predates any of the kernels needed by forward, autodiff, loss,
+    /// gradient accumulation, clipping, or the resident AdamW optimizer.
+    pub fn hasGliner2TrainingPrimitives(self: *const KernelModule) bool {
+        return self.hasGliner2Primitives() and
+            self.hasDeviceTrainingPrimitives() and
+            self.deberta_attention_backward_scores_f32 != null and
+            self.deberta_attention_backward_f32 != null and
+            self.masked_bce_accumulate_f32 != null and
+            self.masked_bce_finalize_f32 != null and
+            self.masked_bce_backward_f32 != null;
     }
 
     pub fn hasFlorence2Primitives(self: *const KernelModule) bool {
@@ -7266,6 +7297,7 @@ pub const KernelModule = struct {
         m: usize,
         n: usize,
         k: usize,
+        lhs_contract_last: bool,
         rhs_contract_last: bool,
     ) driver_mod.Error!void {
         const function = self.primitive_batched_dot_f32 orelse return error.CudaKernelUnavailable;
@@ -7284,6 +7316,7 @@ pub const KernelModule = struct {
         var m_u32 = try toU32(m);
         var n_u32 = try toU32(n);
         var k_u32 = try toU32(k);
+        var lhs_contract_last_u32: u32 = @intFromBool(lhs_contract_last);
         var rhs_contract_last_u32: u32 = @intFromBool(rhs_contract_last);
         var params = [_]?*anyopaque{
             @ptrCast(&output_ptr),
@@ -7293,6 +7326,7 @@ pub const KernelModule = struct {
             @ptrCast(&m_u32),
             @ptrCast(&n_u32),
             @ptrCast(&k_u32),
+            @ptrCast(&lhs_contract_last_u32),
             @ptrCast(&rhs_contract_last_u32),
         };
         try launch1d(function, ctx, output_count, &params);
@@ -7521,6 +7555,40 @@ pub const KernelModule = struct {
         scale: f32,
     ) driver_mod.Error!void {
         const function = self.embedding_lookup_i32_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupI32Bf16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_i32_bf16_weight_f32 orelse return error.CudaKernelUnavailable;
         const count = try checkedTensorElements(total, dim);
         try checkBytes(dst, count);
         try checkRawBytes(weight, dim * @sizeOf(u16));
@@ -11927,7 +11995,9 @@ pub const KernelModule = struct {
             @ptrCast(&input_ptr),
             @ptrCast(&count_u32),
         };
-        try launch1d(function, ctx, count, &params);
+        // The kernel intentionally uses one block so its clipping-norm
+        // reduction order is deterministic across launches and processes.
+        try launchBlocks(function, ctx, 1, 256, &params);
     }
 
     pub fn launchMaskedBceAccumulateF32(
@@ -12165,6 +12235,43 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, rows, &params);
     }
 
+    pub fn launchSelectedTokenLogprobsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        logits: buffer_mod.DeviceBuffer,
+        row_indices: buffer_mod.DeviceBuffer,
+        token_ids: buffer_mod.DeviceBuffer,
+        selected_count: usize,
+        rows: usize,
+        vocab_size: usize,
+    ) driver_mod.Error!void {
+        const function = self.selected_token_logprobs_f32 orelse return error.CudaKernelUnavailable;
+        const logits_count = try checkedTensorElements(rows, vocab_size);
+        try checkBytes(output, selected_count);
+        try checkBytes(logits, logits_count);
+        try checkRawBytes(row_indices, selected_count * @sizeOf(u32));
+        try checkRawBytes(token_ids, selected_count * @sizeOf(u32));
+        if (selected_count == 0) return;
+        var output_ptr = output.ptr;
+        var logits_ptr = logits.ptr;
+        var row_indices_ptr = row_indices.ptr;
+        var token_ids_ptr = token_ids.ptr;
+        var selected_count_u32 = try toU32(selected_count);
+        var rows_u32 = try toU32(rows);
+        var vocab_size_u32 = try toU32(vocab_size);
+        var params = [_]?*anyopaque{
+            @ptrCast(&output_ptr),
+            @ptrCast(&logits_ptr),
+            @ptrCast(&row_indices_ptr),
+            @ptrCast(&token_ids_ptr),
+            @ptrCast(&selected_count_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&vocab_size_u32),
+        };
+        try launchBlocks(function, ctx, selected_count, 256, &params);
+    }
+
     pub fn launchPrimitiveGatherF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -12180,6 +12287,39 @@ pub const KernelModule = struct {
         const function = self.primitive_gather_f32 orelse return error.CudaKernelUnavailable;
         try checkBytes(output, output_count);
         try checkBytes(input, input_count);
+        try checkBytes(indices, index_count);
+        if (output_count == 0) return;
+        if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
+        var output_ptr = output.ptr;
+        var input_ptr = input.ptr;
+        var indices_ptr = indices.ptr;
+        var output_count_u32 = try toU32(output_count);
+        var index_count_u32 = try toU32(index_count);
+        var axis_extent_u32 = try toU32(axis_extent);
+        var suffix_size_u32 = try toU32(suffix_size);
+        var params = [_]?*anyopaque{
+            @ptrCast(&output_ptr),       @ptrCast(&input_ptr),       @ptrCast(&indices_ptr),
+            @ptrCast(&output_count_u32), @ptrCast(&index_count_u32), @ptrCast(&axis_extent_u32),
+            @ptrCast(&suffix_size_u32),
+        };
+        try launch1d(function, ctx, output_count, &params);
+    }
+
+    pub fn launchPrimitiveGatherBf16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        indices: buffer_mod.DeviceBuffer,
+        output_count: usize,
+        input_count: usize,
+        index_count: usize,
+        axis_extent: usize,
+        suffix_size: usize,
+    ) driver_mod.Error!void {
+        const function = self.primitive_gather_bf16_f32 orelse return error.CudaKernelUnavailable;
+        try checkBytes(output, output_count);
+        try checkRawBytes(input, try checkedTensorElements(input_count, @sizeOf(u16)));
         try checkBytes(indices, index_count);
         if (output_count == 0) return;
         if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
@@ -19995,6 +20135,7 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     defer module.unload(&ctx);
 
     try module.requireGemma4DecoderPrimitives();
+    try smokePrimitiveBatchedDotF32(allocator, &ctx, &module);
     try smokeBf16WeightPrimitives(allocator, &ctx, &module);
     try smokeAddMulScalarF32(allocator, &ctx, &module);
     try smokeRmsNormAddMulScalarF32(allocator, &ctx, &module);
@@ -20010,6 +20151,99 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     try smokeGemma4A4BExactDown(allocator, &ctx, &module);
     try smokeGemma4A4BExactLmHead(allocator, &ctx, &module);
     try smokeGemma4A4BNormFusion(allocator, &ctx, &module);
+}
+
+fn smokePrimitiveBatchedDotF32(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    const batch_count: usize = 2;
+    const m: usize = 2;
+    const n: usize = 3;
+    const k: usize = 4;
+    const lhs_count = batch_count * m * k;
+    const rhs_count = batch_count * n * k;
+    const output_count = batch_count * m * n;
+
+    const lhs_host = try allocator.alloc(f32, lhs_count);
+    defer allocator.free(lhs_host);
+    const rhs_host = try allocator.alloc(f32, rhs_count);
+    defer allocator.free(rhs_host);
+    const expected = try allocator.alloc(f32, output_count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, output_count);
+    defer allocator.free(actual);
+
+    var lhs = try buffer_mod.DeviceBuffer.alloc(ctx, lhs_count * @sizeOf(f32));
+    defer lhs.free(ctx);
+    var rhs = try buffer_mod.DeviceBuffer.alloc(ctx, rhs_count * @sizeOf(f32));
+    defer rhs.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    inline for (.{ false, true }) |lhs_contract_last| {
+        inline for (.{ false, true }) |rhs_contract_last| {
+            for (0..batch_count) |batch| {
+                for (0..m) |row| {
+                    for (0..k) |inner| {
+                        const logical_value = @as(f32, @floatFromInt(1 + batch * 17 + row * 5 + inner)) * 0.125;
+                        const index = if (lhs_contract_last)
+                            (batch * m + row) * k + inner
+                        else
+                            (batch * k + inner) * m + row;
+                        lhs_host[index] = logical_value;
+                    }
+                }
+                for (0..k) |inner| {
+                    for (0..n) |col| {
+                        const logical_value = @as(f32, @floatFromInt(1 + batch * 13 + inner * 3 + col)) * -0.0625;
+                        const index = if (rhs_contract_last)
+                            (batch * n + col) * k + inner
+                        else
+                            (batch * k + inner) * n + col;
+                        rhs_host[index] = logical_value;
+                    }
+                }
+                for (0..m) |row| {
+                    for (0..n) |col| {
+                        var sum: f32 = 0.0;
+                        for (0..k) |inner| {
+                            const lhs_index = if (lhs_contract_last)
+                                (batch * m + row) * k + inner
+                            else
+                                (batch * k + inner) * m + row;
+                            const rhs_index = if (rhs_contract_last)
+                                (batch * n + col) * k + inner
+                            else
+                                (batch * k + inner) * n + col;
+                            sum += lhs_host[lhs_index] * rhs_host[rhs_index];
+                        }
+                        expected[(batch * m + row) * n + col] = sum;
+                    }
+                }
+            }
+
+            try lhs.copyFromHost(ctx, std.mem.sliceAsBytes(lhs_host));
+            try rhs.copyFromHost(ctx, std.mem.sliceAsBytes(rhs_host));
+            try module.launchPrimitiveBatchedDotF32(
+                ctx,
+                output,
+                lhs,
+                rhs,
+                batch_count,
+                m,
+                n,
+                k,
+                lhs_contract_last,
+                rhs_contract_last,
+            );
+            try ctx.synchronize();
+            try output.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            try expectApproxSlice(actual, expected, 0.00001);
+        }
+    }
 }
 
 fn smokeGemma4A4BResidentQ4_0(
@@ -20692,6 +20926,50 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
     try embed_output.copyToHost(ctx, std.mem.sliceAsBytes(embed_out));
     try ctx.synchronize();
     try expectApproxSlice(embed_out, &expected_embed, 0.0001);
+
+    const ids_i32_data = [_]i32{ 2, 0 };
+    var ids_i32 = try buffer_mod.DeviceBuffer.alloc(ctx, ids_i32_data.len * @sizeOf(i32));
+    defer ids_i32.free(ctx);
+    try ids_i32.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_i32_data));
+    try module.launchEmbeddingLookupI32Bf16WeightF32(ctx, embed_output, embed_weight, ids_i32, ids_i32_data.len, embed_dim, 1.0);
+    try ctx.synchronize();
+    try embed_output.copyToHost(ctx, std.mem.sliceAsBytes(embed_out));
+    try ctx.synchronize();
+    try expectApproxSlice(embed_out, &expected_embed, 0.0001);
+
+    const logits_data = [_]f32{ 0.0, 1.0, 2.0, 3.0, 1.0, 0.0, -1.0, -2.0 };
+    const selected_rows = [_]u32{ 0, 1 };
+    const selected_tokens = [_]u32{ 3, 0 };
+    var logits = try buffer_mod.DeviceBuffer.alloc(ctx, logits_data.len * @sizeOf(f32));
+    defer logits.free(ctx);
+    var selected_rows_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_rows.len * @sizeOf(u32));
+    defer selected_rows_device.free(ctx);
+    var selected_tokens_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(u32));
+    defer selected_tokens_device.free(ctx);
+    var selected_logps_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(f32));
+    defer selected_logps_device.free(ctx);
+    try logits.copyFromHost(ctx, std.mem.sliceAsBytes(&logits_data));
+    try selected_rows_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_rows));
+    try selected_tokens_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_tokens));
+    try module.launchSelectedTokenLogprobsF32(
+        ctx,
+        selected_logps_device,
+        logits,
+        selected_rows_device,
+        selected_tokens_device,
+        selected_tokens.len,
+        2,
+        4,
+    );
+    try ctx.synchronize();
+    var selected_logps: [2]f32 = undefined;
+    try selected_logps_device.copyToHost(ctx, std.mem.sliceAsBytes(&selected_logps));
+    try ctx.synchronize();
+    const expected_selected = [_]f32{
+        3.0 - @log(@exp(0.0) + @exp(1.0) + @exp(2.0) + @exp(3.0)),
+        1.0 - @log(@exp(1.0) + @exp(0.0) + @exp(-1.0) + @exp(-2.0)),
+    };
+    try expectApproxSlice(&selected_logps, &expected_selected, 0.0001);
 
     const q_out_dim: usize = 2;
     const kv_out_dim: usize = 1;

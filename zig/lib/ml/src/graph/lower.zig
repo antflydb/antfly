@@ -263,8 +263,8 @@ test "lower replaces fused linear with primitives" {
         try std.testing.expect(n.op.isPrimitive());
     }
 
-    // Should have: 3 params + transpose + matmul + add = 6 nodes
-    try std.testing.expectEqual(@as(u32, 6), lowered.graph.nodeCount());
+    // Should have: 3 params + direct dot_general + add = 5 nodes.
+    try std.testing.expectEqual(@as(u32, 5), lowered.graph.nodeCount());
 
     // Output should be the add node
     try std.testing.expectEqual(@as(usize, 1), lowered.graph.outputs.items.len);

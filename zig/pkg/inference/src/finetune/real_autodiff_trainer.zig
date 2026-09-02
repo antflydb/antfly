@@ -193,6 +193,11 @@ pub const TrainerConfig = struct {
     /// When true, fail instead of silently falling back to interpreter if the
     /// requested compiled engine cannot be prepared.
     compiled_required: bool = false,
+    /// Require a fully device-resident CUDA graph step. Runtime inputs may be
+    /// uploaded only by declared trainer binders, graph execution may read
+    /// back only the scalar loss, and gradients plus optimizer state must
+    /// remain on the GPU. Any fallback is an error.
+    strict_cuda_execution: bool = false,
     /// Activation (gradient) checkpointing. When set, the backward graph
     /// recomputes non-checkpoint forward activations from the nearest
     /// checkpoint boundary instead of keeping them live, bounding peak
@@ -323,6 +328,8 @@ pub const StepProfile = struct {
     runtime_input_ns: u64 = 0,
     train_step_ns: u64 = 0,
     compile_ns: u64 = 0,
+    compiled_session_built: bool = false,
+    compiled_session_backend_prepared: bool = false,
     autodiff_ns: u64 = 0,
     execute_ns: u64 = 0,
     extract_ns: u64 = 0,
@@ -337,6 +344,8 @@ pub const StepProfile = struct {
     /// but the step fell back to the regular compiled path.
     graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
     graph_executor_interpreter_fallbacks: u64 = 0,
@@ -499,6 +508,97 @@ pub const StepProfile = struct {
     cuda_exact_gelu_backward_calls: u64 = 0,
     cuda_training_input_uploads: u64 = 0,
     cuda_training_input_upload_bytes: u64 = 0,
+    runtime_input_uploads: u64 = 0,
+    runtime_input_upload_bytes: u64 = 0,
+    runtime_input_h2d_bytes: u64 = 0,
+    runtime_input_d2h_bytes: u64 = 0,
+    declared_runtime_input_uploads: u64 = 0,
+    declared_runtime_input_upload_bytes: u64 = 0,
+    declared_runtime_input_h2d_bytes: u64 = 0,
+    compiled_session_setup_input_uploads: u64 = 0,
+    compiled_session_setup_input_upload_bytes: u64 = 0,
+    compiled_session_setup_h2d_bytes: u64 = 0,
+    compiled_session_setup_d2h_bytes: u64 = 0,
+    graph_execution_input_uploads: u64 = 0,
+    graph_execution_input_upload_bytes: u64 = 0,
+    graph_execution_h2d_bytes: u64 = 0,
+    graph_execution_d2h_bytes: u64 = 0,
+    training_runtime_h2d_bytes: u64 = 0,
+    training_runtime_d2h_bytes: u64 = 0,
+    host_gradient_tensors: u64 = 0,
+};
+
+/// Serialization-safe cumulative evidence for all successful compiled steps
+/// executed by one trainer. The strict CUDA validator runs before a step is
+/// recorded, so this is evidence of enforced behavior rather than telemetry
+/// that can describe a silently-fallen-back step.
+pub const TrainingExecutionEvidence = struct {
+    schema_version: []const u8 = "antfly_training_execution_evidence/v1",
+    train_steps: u64 = 0,
+    eval_steps: u64 = 0,
+    compiled_session_builds: u64 = 0,
+    compiled_session_backend_preparations: u64 = 0,
+    graph_executor_fallback_steps: u64 = 0,
+    graph_executor_partitions: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
+    graph_executor_planned_dispatches: u64 = 0,
+    graph_executor_interpreter_fallbacks: u64 = 0,
+    graph_executor_true_host_outputs: u64 = 0,
+    runtime_input_uploads: u64 = 0,
+    runtime_input_upload_bytes: u64 = 0,
+    runtime_input_h2d_bytes: u64 = 0,
+    runtime_input_d2h_bytes: u64 = 0,
+    declared_runtime_input_uploads: u64 = 0,
+    declared_runtime_input_upload_bytes: u64 = 0,
+    declared_runtime_input_h2d_bytes: u64 = 0,
+    compiled_session_setup_h2d_bytes: u64 = 0,
+    compiled_session_setup_d2h_bytes: u64 = 0,
+    graph_execution_h2d_bytes: u64 = 0,
+    graph_execution_d2h_bytes: u64 = 0,
+    training_runtime_h2d_bytes: u64 = 0,
+    training_runtime_d2h_bytes: u64 = 0,
+    host_gradient_tensors: u64 = 0,
+    cuda_kernel_launches: u64 = 0,
+    cuda_h2d_bytes: u64 = 0,
+    cuda_d2h_bytes: u64 = 0,
+    cuda_largest_d2h_transfer_bytes: u64 = 0,
+    peak_resident_bytes: usize = 0,
+
+    fn record(self: *TrainingExecutionEvidence, profile: StepProfile, mode: ExecutionMode) void {
+        switch (mode) {
+            .train => self.train_steps += 1,
+            .eval => self.eval_steps += 1,
+        }
+        self.compiled_session_builds += @intFromBool(profile.compiled_session_built);
+        self.compiled_session_backend_preparations += @intFromBool(profile.compiled_session_backend_prepared);
+        self.graph_executor_fallback_steps += @intFromBool(profile.graph_executor_fallback_reason != null);
+        self.graph_executor_partitions += profile.graph_executor_partitions;
+        self.graph_executor_native_partitions += profile.graph_executor_native_partitions;
+        self.graph_executor_unsupported_ops += profile.graph_executor_unsupported_ops;
+        self.graph_executor_planned_dispatches += profile.graph_executor_planned_dispatches;
+        self.graph_executor_interpreter_fallbacks += profile.graph_executor_interpreter_fallbacks;
+        self.graph_executor_true_host_outputs += profile.graph_executor_true_host_outputs;
+        self.runtime_input_uploads += profile.runtime_input_uploads;
+        self.runtime_input_upload_bytes += profile.runtime_input_upload_bytes;
+        self.runtime_input_h2d_bytes += profile.runtime_input_h2d_bytes;
+        self.runtime_input_d2h_bytes += profile.runtime_input_d2h_bytes;
+        self.declared_runtime_input_uploads += profile.declared_runtime_input_uploads;
+        self.declared_runtime_input_upload_bytes += profile.declared_runtime_input_upload_bytes;
+        self.declared_runtime_input_h2d_bytes += profile.declared_runtime_input_h2d_bytes;
+        self.compiled_session_setup_h2d_bytes += profile.compiled_session_setup_h2d_bytes;
+        self.compiled_session_setup_d2h_bytes += profile.compiled_session_setup_d2h_bytes;
+        self.graph_execution_h2d_bytes += profile.graph_execution_h2d_bytes;
+        self.graph_execution_d2h_bytes += profile.graph_execution_d2h_bytes;
+        self.training_runtime_h2d_bytes += profile.training_runtime_h2d_bytes;
+        self.training_runtime_d2h_bytes += profile.training_runtime_d2h_bytes;
+        self.host_gradient_tensors += profile.host_gradient_tensors;
+        self.cuda_kernel_launches += profile.cuda_kernel_launches;
+        self.cuda_h2d_bytes += profile.cuda_h2d_bytes;
+        self.cuda_d2h_bytes += profile.cuda_d2h_bytes;
+        self.cuda_largest_d2h_transfer_bytes = @max(self.cuda_largest_d2h_transfer_bytes, profile.cuda_largest_d2h_transfer_bytes);
+        self.peak_resident_bytes = @max(self.peak_resident_bytes, profile.peak_resident_bytes);
+    }
 };
 
 pub const OptimizerBackend = enum { host, metal, cuda };
@@ -507,6 +607,57 @@ const ExecutionMode = enum {
     train,
     eval,
 };
+
+pub const StrictCudaStepMode = enum { train, eval };
+
+pub fn validateStrictCudaStepEvidence(
+    profile: StepProfile,
+    host_gradient_count: usize,
+    device_gradient_count: usize,
+    expected_gradient_count: usize,
+    mode: StrictCudaStepMode,
+) !void {
+    if (profile.graph_executor_fallback_reason != null) return error.StrictCudaGraphExecutorFallback;
+    if (profile.graph_executor_partitions == 0) return error.StrictCudaGraphExecutorDidNotRun;
+    if (profile.graph_executor_planned_dispatches == 0) return error.StrictCudaGraphExecutorDidNotDispatch;
+    if (profile.graph_executor_native_partitions != 0) return error.StrictCudaNativePartition;
+    if (profile.graph_executor_unsupported_ops != 0) return error.StrictCudaUnsupportedOperation;
+    if (profile.graph_executor_interpreter_fallbacks != 0) return error.StrictCudaInterpreterFallback;
+    if (profile.graph_executor_true_host_outputs != 0) return error.StrictCudaHostOutput;
+    if (profile.runtime_input_uploads != profile.declared_runtime_input_uploads or
+        profile.runtime_input_upload_bytes != profile.declared_runtime_input_upload_bytes or
+        profile.runtime_input_h2d_bytes != profile.declared_runtime_input_h2d_bytes or
+        profile.runtime_input_d2h_bytes != 0)
+    {
+        return error.StrictCudaUndeclaredRuntimeInputUpload;
+    }
+    if (profile.graph_execution_input_uploads != 0 or
+        profile.graph_execution_input_upload_bytes != 0 or
+        profile.graph_execution_h2d_bytes != 0)
+    {
+        return error.StrictCudaGraphExecutionUpload;
+    }
+    if (profile.compiled_session_setup_input_uploads != 0 or
+        profile.compiled_session_setup_input_upload_bytes != 0 or
+        profile.compiled_session_setup_d2h_bytes != 0 or
+        (!profile.compiled_session_built and
+            !profile.compiled_session_backend_prepared and
+            profile.compiled_session_setup_h2d_bytes != 0))
+    {
+        return error.StrictCudaInvalidSessionSetupTransfer;
+    }
+    if (profile.graph_execution_d2h_bytes > @sizeOf(f32) or
+        profile.cuda_largest_d2h_transfer_bytes > @sizeOf(f32) or
+        profile.cuda_to_float32_calls > 1 or
+        profile.cuda_download_alloc_calls > 1)
+    {
+        return error.StrictCudaUnexpectedReadback;
+    }
+    if (host_gradient_count != 0 or device_gradient_count != expected_gradient_count) {
+        return error.StrictCudaGradientNotDeviceResident;
+    }
+    if (mode == .train and profile.optimizer_backend != .cuda) return error.StrictCudaOptimizerRequired;
+}
 
 // ── Trainer ──────────────────────────────────────────────────────────────────
 
@@ -548,6 +699,7 @@ pub const RealAutodiffTrainer = struct {
     graph_cache_active_reuses: u64 = 0,
     graph_cache_evictions: u64 = 0,
     graph_cache_peak_entries: usize = 0,
+    training_execution_evidence: TrainingExecutionEvidence = .{},
     /// Per-LoRA-parameter state. Indices match `graph_state.lora_adapter.adapters`:
     /// `lora_params[i*2]` = A matrix, `lora_params[i*2+1]` = B matrix.
     /// Optimizer families whose parameters only receive gradients when the
@@ -952,6 +1104,10 @@ pub const RealAutodiffTrainer = struct {
         return self.step_count;
     }
 
+    pub fn trainingExecutionEvidence(self: *const RealAutodiffTrainer) TrainingExecutionEvidence {
+        return self.training_execution_evidence;
+    }
+
     /// Save trainable weights plus Adam moments at an accumulation boundary.
     /// Higher-level trainers pair this with their deterministic epoch index so
     /// data ordering can be reconstructed exactly on resume.
@@ -1207,6 +1363,17 @@ pub const RealAutodiffTrainer = struct {
 
     fn runStep(self: *RealAutodiffTrainer, input: TrainerInput, mode: ExecutionMode) !StepResult {
         const total_start_ns = monotonicNowNs();
+        const strict_cuda = self.config.strict_cuda_execution;
+        if (strict_cuda) {
+            if (self.compute_backend.kind() != .cuda) return error.StrictCudaBackendRequired;
+            if (self.config.execution_engine != .compiled_device or !self.config.compiled_required) {
+                return error.StrictCudaCompiledDeviceRequired;
+            }
+            // This trainer currently compiles the backward graph for evaluate().
+            // Reject strict eval rather than downloading those gradients under
+            // an API that promises a loss-only device evaluation.
+            if (mode == .eval) return error.StrictCudaEvalUnsupported;
+        }
         // Sample before graph selection and runtime-input staging. The
         // executor also records a narrower internal profile, but the public
         // step contract must include all H2D/D2H and synchronization work
@@ -1225,8 +1392,9 @@ pub const RealAutodiffTrainer = struct {
         profile.graph_build_ns = elapsedNs(graph_build_start_ns, monotonicNowNs());
         const gs = &self.graph_state.?;
         const use_device_optimizer = mode == .train and self.deviceOptimizerRequested();
-        const use_cached_runtime_inputs = use_device_optimizer and
+        const use_cached_runtime_inputs = (use_device_optimizer or strict_cuda) and
             (self.compute_backend.kind() == .metal or self.compute_backend.kind() == .cuda);
+        if (strict_cuda and !use_device_optimizer) return error.StrictCudaDeviceOptimizerRequired;
         if (use_device_optimizer) {
             compiledDiag(
                 "device optimizer slots begin lora_slots={} regular_slots={} rss={}",
@@ -1256,6 +1424,8 @@ pub const RealAutodiffTrainer = struct {
         //    LoRA parameter tensors. The underlying interpreter will free the
         //    CT handles after execution — we re-upload them on every step.
         const runtime_input_start_ns = monotonicNowNs();
+        const runtime_transfer_before = self.compute_backend.trainingRuntimeStats();
+        var declared_runtime_inputs = RuntimeInputUploadDeclaration{};
         var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
         var borrowed_rt = std.AutoHashMapUnmanaged(NodeId, void).empty;
         defer {
@@ -1276,8 +1446,8 @@ pub const RealAutodiffTrainer = struct {
 
         const ids_dims = [_]i32{ @intCast(input.batch), @intCast(input.seq_len) };
         if (use_cached_runtime_inputs) {
-            try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.input_ids, gs.input_ids_node, input_ids_f32, &ids_dims);
-            try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.attention_mask, gs.attention_mask_node, input.attention_mask, &ids_dims);
+            declared_runtime_inputs.add(try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.input_ids, gs.input_ids_node, input_ids_f32, &ids_dims));
+            declared_runtime_inputs.add(try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.attention_mask, gs.attention_mask_node, input.attention_mask, &ids_dims));
         } else {
             try putRuntimeInput(self.allocator, self.compute_backend, &rt, gs.input_ids_node, input_ids_f32, &ids_dims);
             try putRuntimeInput(self.allocator, self.compute_backend, &rt, gs.attention_mask_node, input.attention_mask, &ids_dims);
@@ -1286,7 +1456,7 @@ pub const RealAutodiffTrainer = struct {
         const target_dims = try shapeToDims(self.allocator, input.targets_shape);
         defer self.allocator.free(target_dims);
         if (use_cached_runtime_inputs) {
-            try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.targets, gs.targets_node, input.targets, target_dims);
+            declared_runtime_inputs.add(try self.putCachedRuntimeInput(&rt, &borrowed_rt, &self.runtime_input_cache.targets, gs.targets_node, input.targets, target_dims));
         } else {
             try putRuntimeInput(self.allocator, self.compute_backend, &rt, gs.targets_node, input.targets, target_dims);
         }
@@ -1320,7 +1490,11 @@ pub const RealAutodiffTrainer = struct {
                 } else {
                     @memset(mask, 1.0);
                 }
-                try putRuntimeInput(self.allocator, self.compute_backend, &rt, info.dropout_mask_id, mask, mask_dims);
+                if (use_cached_runtime_inputs) {
+                    declared_runtime_inputs.add(try self.putDeviceRuntimeInput(&rt, info.dropout_mask_id, mask, mask_dims));
+                } else {
+                    try putRuntimeInput(self.allocator, self.compute_backend, &rt, info.dropout_mask_id, mask, mask_dims);
+                }
             }
         }
 
@@ -1343,7 +1517,7 @@ pub const RealAutodiffTrainer = struct {
         }
 
         if (use_cached_runtime_inputs) {
-            try self.putKnownCachedArchInputs(&rt, &borrowed_rt, &gs.graph, input.batch, input.seq_len, input.attention_mask);
+            declared_runtime_inputs.add(try self.putKnownCachedArchInputs(&rt, &borrowed_rt, &gs.graph, input.batch, input.seq_len, input.attention_mask));
         }
 
         // 3b. Architecture-specific input binding. This is how BERT
@@ -1355,6 +1529,14 @@ pub const RealAutodiffTrainer = struct {
                 try bind_fn(input.ctx, self.compute_backend, self.allocator, &gs.graph, &rt, input.batch, input.seq_len, input.attention_mask);
             }
         }
+        const runtime_transfer_after = self.compute_backend.trainingRuntimeStats();
+        profile.runtime_input_uploads = runtime_transfer_after.training_input_uploads -| runtime_transfer_before.training_input_uploads;
+        profile.runtime_input_upload_bytes = runtime_transfer_after.training_input_upload_bytes -| runtime_transfer_before.training_input_upload_bytes;
+        profile.runtime_input_h2d_bytes = runtime_transfer_after.h2d_bytes -| runtime_transfer_before.h2d_bytes;
+        profile.runtime_input_d2h_bytes = runtime_transfer_after.d2h_bytes -| runtime_transfer_before.d2h_bytes;
+        profile.declared_runtime_input_uploads = declared_runtime_inputs.uploads;
+        profile.declared_runtime_input_upload_bytes = declared_runtime_inputs.bytes;
+        profile.declared_runtime_input_h2d_bytes = declared_runtime_inputs.h2d_bytes;
         profile.runtime_input_ns = elapsedNs(runtime_input_start_ns, monotonicNowNs());
         if (use_device_optimizer) {
             compiledDiag(
@@ -1387,13 +1569,27 @@ pub const RealAutodiffTrainer = struct {
         const train_step_start_ns = monotonicNowNs();
         const had_compiled_session = self.compiled_session != null;
         const use_compiled = try self.ensureCompiledSessionBuilt(trainable);
+        profile.compiled_session_built = use_compiled and !had_compiled_session;
+        var compiled_session_backend_prepared = false;
+        if (use_compiled) {
+            compiled_session_backend_prepared = !self.compiled_session.?.backendPrepared(self.compute_backend);
+            try self.compiled_session.?.prepareBackend(self.compute_backend);
+        }
+        profile.compiled_session_backend_prepared = compiled_session_backend_prepared;
+        const graph_execution_transfer_before = self.compute_backend.trainingRuntimeStats();
+        profile.compiled_session_setup_input_uploads = graph_execution_transfer_before.training_input_uploads -| runtime_transfer_after.training_input_uploads;
+        profile.compiled_session_setup_input_upload_bytes = graph_execution_transfer_before.training_input_upload_bytes -| runtime_transfer_after.training_input_upload_bytes;
+        profile.compiled_session_setup_h2d_bytes = graph_execution_transfer_before.h2d_bytes -| runtime_transfer_after.h2d_bytes;
+        profile.compiled_session_setup_d2h_bytes = graph_execution_transfer_before.d2h_bytes -| runtime_transfer_after.d2h_bytes;
         if (use_compiled) {
             compiledDiag(
                 "compiled execute dispatch device_optimizer={} trainable={} runtime_inputs={} rss={}",
                 .{ use_device_optimizer, trainable.len, rt.count(), currentResidentBytes() },
             );
         }
-        var step_result = if (use_compiled and use_device_optimizer)
+        var step_result = if (use_compiled and strict_cuda)
+            try self.compiled_session.?.executeDeviceGradientsStrictCuda(self.compute_backend, rt)
+        else if (use_compiled and use_device_optimizer)
             try self.compiled_session.?.executeDeviceGradients(self.compute_backend, rt)
         else if (use_compiled)
             try self.compiled_session.?.execute(self.compute_backend, rt)
@@ -1423,6 +1619,8 @@ pub const RealAutodiffTrainer = struct {
         profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
         profile.graph_executor_fallback_reason = step_result.profile.graph_executor_fallback_reason;
         profile.graph_executor_partitions = step_result.profile.graph_executor_partitions;
+        profile.graph_executor_native_partitions = step_result.profile.graph_executor_native_partitions;
+        profile.graph_executor_unsupported_ops = step_result.profile.graph_executor_unsupported_ops;
         profile.graph_executor_command_dispatches = step_result.profile.graph_executor_command_dispatches;
         profile.graph_executor_planned_dispatches = step_result.profile.graph_executor_planned_dispatches;
         profile.graph_executor_interpreter_fallbacks = step_result.profile.graph_executor_interpreter_fallbacks;
@@ -1585,8 +1783,34 @@ pub const RealAutodiffTrainer = struct {
         profile.cuda_exact_gelu_backward_calls = step_result.profile.cuda_exact_gelu_backward_calls;
         profile.cuda_training_input_uploads = step_result.profile.cuda_training_input_uploads;
         profile.cuda_training_input_upload_bytes = step_result.profile.cuda_training_input_upload_bytes;
+        const graph_execution_transfer_after = self.compute_backend.trainingRuntimeStats();
+        profile.graph_execution_input_uploads = graph_execution_transfer_after.training_input_uploads -| graph_execution_transfer_before.training_input_uploads;
+        profile.graph_execution_input_upload_bytes = graph_execution_transfer_after.training_input_upload_bytes -| graph_execution_transfer_before.training_input_upload_bytes;
+        profile.graph_execution_h2d_bytes = graph_execution_transfer_after.h2d_bytes -| graph_execution_transfer_before.h2d_bytes;
+        profile.graph_execution_d2h_bytes = graph_execution_transfer_after.d2h_bytes -| graph_execution_transfer_before.d2h_bytes;
         var step_result_live = true;
         defer if (step_result_live) step_result.deinit();
+        profile.host_gradient_tensors = @intCast(step_result.gradients.count());
+        if (strict_cuda) {
+            if (step_result.gradients.count() != 0 or step_result.device_gradients.count() != trainable.len) {
+                std.log.err(
+                    "strict CUDA gradient contract mismatch: host={} device={} expected={}",
+                    .{ step_result.gradients.count(), step_result.device_gradients.count(), trainable.len },
+                );
+                for (trainable) |name| {
+                    if (!step_result.device_gradients.contains(name)) {
+                        std.log.err("strict CUDA missing device gradient: {s}", .{name});
+                    }
+                }
+            }
+            try validateStrictCudaStepEvidence(
+                profile,
+                step_result.gradients.count(),
+                step_result.device_gradients.count(),
+                trainable.len,
+                .train,
+            );
+        }
         const loss_value = step_result.loss;
         if (!std.math.isFinite(loss_value)) return error.NonFiniteTrainingLoss;
 
@@ -1716,7 +1940,10 @@ pub const RealAutodiffTrainer = struct {
             training_runtime_before,
             self.compute_backend.trainingRuntimeStats(),
         );
+        profile.training_runtime_h2d_bytes = profile.cuda_h2d_bytes;
+        profile.training_runtime_d2h_bytes = profile.cuda_d2h_bytes;
         profile.total_ns = elapsedNs(total_start_ns, monotonicNowNs());
+        self.training_execution_evidence.record(profile, mode);
         return .{
             .loss = loss_value,
             .grad_norm = grad_norm,
@@ -1956,11 +2183,28 @@ pub const RealAutodiffTrainer = struct {
         node_id: NodeId,
         data: []const f32,
         dims: []const i32,
-    ) !void {
+    ) !RuntimeInputUploadDeclaration {
         const ct = try self.ensureCachedRuntimeTensor(cache, data, dims);
         try rt.put(self.allocator, node_id, ct);
         errdefer _ = rt.remove(node_id);
         try borrowed_rt.put(self.allocator, node_id, {});
+        const bytes: u64 = @intCast(data.len * @sizeOf(f32));
+        return .{ .uploads = 1, .bytes = bytes, .h2d_bytes = bytes };
+    }
+
+    fn putDeviceRuntimeInput(
+        self: *RealAutodiffTrainer,
+        rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+        node_id: NodeId,
+        data: []const f32,
+        dims: []const i32,
+    ) !RuntimeInputUploadDeclaration {
+        const tensor = try self.compute_backend.trainingZeroF32(data.len, dims);
+        errdefer self.compute_backend.free(tensor);
+        try self.compute_backend.trainingOverwriteF32(tensor, data, dims);
+        try rt.put(self.allocator, node_id, tensor);
+        const bytes: u64 = @intCast(data.len * @sizeOf(f32));
+        return .{ .uploads = 1, .bytes = bytes, .h2d_bytes = bytes };
     }
 
     fn ensureCachedRuntimeTensor(
@@ -2013,6 +2257,18 @@ pub const RealAutodiffTrainer = struct {
         cache.* = .{};
     }
 
+    const RuntimeInputUploadDeclaration = struct {
+        uploads: u64 = 0,
+        bytes: u64 = 0,
+        h2d_bytes: u64 = 0,
+
+        fn add(self: *RuntimeInputUploadDeclaration, other: RuntimeInputUploadDeclaration) void {
+            self.uploads +|= other.uploads;
+            self.bytes +|= other.bytes;
+            self.h2d_bytes +|= other.h2d_bytes;
+        }
+    };
+
     fn putKnownCachedArchInputs(
         self: *RealAutodiffTrainer,
         rt: *std.AutoHashMapUnmanaged(NodeId, CT),
@@ -2021,9 +2277,10 @@ pub const RealAutodiffTrainer = struct {
         batch: u32,
         seq_len: u32,
         attention_mask: []const f32,
-    ) !void {
+    ) !RuntimeInputUploadDeclaration {
+        var declaration = RuntimeInputUploadDeclaration{};
         if (graph_weight_bridge.findParameterByName(graph, "__gliner2_attn_bias")) |node_id| {
-            if (rt.contains(node_id)) return;
+            if (rt.contains(node_id)) return declaration;
             const node = graph.node(node_id);
             if (node.output_shape.rank() != 3) return error.InvalidTensorShape;
             const dim0 = node.output_shape.dim(0);
@@ -2042,15 +2299,16 @@ pub const RealAutodiffTrainer = struct {
             );
             defer self.allocator.free(bias);
             var dims = [_]i32{ @intCast(dim0), @intCast(dim1), @intCast(dim2) };
-            try self.putCachedRuntimeInput(
+            declaration.add(try self.putCachedRuntimeInput(
                 rt,
                 borrowed_rt,
                 &self.runtime_input_cache.gliner2_attn_bias,
                 node_id,
                 bias,
                 &dims,
-            );
+            ));
         }
+        return declaration;
     }
 
     fn hasUnboundRuntimePlaceholders(
@@ -3652,6 +3910,71 @@ test "RealAutodiffTrainer: conditional optimizer families gate absent-task steps
         error.TooManyConditionalOptimizerFamilies,
         trainer.registerConditionalOptimizerFamily("one_too_many."),
     );
+}
+
+test "strict CUDA evidence permits only declared uploads and scalar loss readback" {
+    var profile = StepProfile{
+        .graph_executor_partitions = 1,
+        .graph_executor_planned_dispatches = 7,
+        .optimizer_backend = .cuda,
+        .runtime_input_uploads = 3,
+        .runtime_input_upload_bytes = 48,
+        .runtime_input_h2d_bytes = 48,
+        .declared_runtime_input_uploads = 3,
+        .declared_runtime_input_upload_bytes = 48,
+        .declared_runtime_input_h2d_bytes = 48,
+        .graph_execution_d2h_bytes = @sizeOf(f32),
+        .cuda_largest_d2h_transfer_bytes = @sizeOf(f32),
+        .cuda_to_float32_calls = 1,
+        .cuda_download_alloc_calls = 1,
+    };
+    try validateStrictCudaStepEvidence(profile, 0, 2, 2, .train);
+
+    profile.runtime_input_uploads += 1;
+    try testing.expectError(
+        error.StrictCudaUndeclaredRuntimeInputUpload,
+        validateStrictCudaStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.runtime_input_uploads -= 1;
+
+    profile.graph_execution_h2d_bytes = 4;
+    try testing.expectError(
+        error.StrictCudaGraphExecutionUpload,
+        validateStrictCudaStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.graph_execution_h2d_bytes = 0;
+
+    profile.graph_execution_d2h_bytes += @sizeOf(f32);
+    try testing.expectError(
+        error.StrictCudaUnexpectedReadback,
+        validateStrictCudaStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.graph_execution_d2h_bytes = @sizeOf(f32);
+
+    try testing.expectError(
+        error.StrictCudaGradientNotDeviceResident,
+        validateStrictCudaStepEvidence(profile, 1, 1, 2, .train),
+    );
+}
+
+test "training execution evidence records only validated successful profiles" {
+    const profile = StepProfile{
+        .compiled_session_built = true,
+        .graph_executor_partitions = 1,
+        .graph_executor_planned_dispatches = 4,
+        .optimizer_backend = .cuda,
+        .graph_execution_d2h_bytes = @sizeOf(f32),
+        .cuda_kernel_launches = 4,
+        .cuda_d2h_bytes = @sizeOf(f32),
+        .cuda_largest_d2h_transfer_bytes = @sizeOf(f32),
+    };
+    try validateStrictCudaStepEvidence(profile, 0, 1, 1, .train);
+    var evidence = TrainingExecutionEvidence{};
+    evidence.record(profile, .train);
+    try testing.expectEqual(@as(u64, 1), evidence.train_steps);
+    try testing.expectEqual(@as(u64, 1), evidence.compiled_session_builds);
+    try testing.expectEqual(@as(u64, 4), evidence.graph_executor_planned_dispatches);
+    try testing.expectEqual(@as(u64, @sizeOf(f32)), evidence.graph_execution_d2h_bytes);
 }
 
 /// Enroll a one-element trainable whose device handles are unique opaque

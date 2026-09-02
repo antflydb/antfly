@@ -5722,18 +5722,22 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
     ) ![]u8 {
-        const prefix = if (policy.a4b_request) |request|
+        const a4b_identity = if (policy.a4b_request) |request|
+            try a4bRequestCacheIdentity(self.allocator, request)
+        else
+            null;
+        defer if (a4b_identity) |identity| self.allocator.free(identity);
+        const prefix = if (a4b_identity) |identity|
             try std.fmt.allocPrint(
                 self.allocator,
-                "{d}:{s}:{d}:{d}:{d}:a4b={s}:{d}:",
+                "{d}:{s}:{d}:{d}:{d}:a4b={s}:",
                 .{
                     model_dir.len,
                     model_dir,
                     @intFromBool(cache_default_alias),
                     @intFromBool(policy.accept_default_alias),
                     @intFromBool(policy.require_default_alias_backend_match),
-                    @tagName(request.residency_mode),
-                    request.memory_budget_mb,
+                    identity,
                 },
             )
         else
@@ -6329,6 +6333,25 @@ fn loadedModelUsesPreferredBackend(
     return false;
 }
 
+fn a4bRequestCacheIdentity(
+    allocator: std.mem.Allocator,
+    request: backend_contracts.A4bInferenceRequest,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "residency={s};memory_mb={d};load_strategy={s};load_workers={d};load_staging_mb={d};prepared_pack={s};drop_host_cache={d}",
+        .{
+            @tagName(request.residency_mode),
+            request.memory_budget_mb,
+            @tagName(request.load_strategy),
+            request.load_workers,
+            request.load_staging_mb,
+            @tagName(request.prepared_pack),
+            @intFromBool(request.drop_host_cache_after_load),
+        },
+    );
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -6336,14 +6359,15 @@ fn backendVariantCacheKey(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) ![]u8 {
     if (a4b_request) |request| {
+        const identity = try a4bRequestCacheIdentity(allocator, request);
+        defer allocator.free(identity);
         return std.fmt.allocPrint(
             allocator,
-            "{s}\nbackend={s}\na4b={s}:{d}",
+            "{s}\nbackend={s}\na4b={s}",
             .{
                 model_dir,
                 @tagName(backend),
-                @tagName(request.residency_mode),
-                request.memory_budget_mb,
+                identity,
             },
         );
     }
@@ -6357,28 +6381,56 @@ test "model prewarm defers while max-loaded eviction is pending" {
     try std.testing.expect(!modelCacheHasPublicationCapacity(2, 1));
 }
 
-test "A4B model cache keys isolate residency policies" {
+test "A4B model and load-flight cache keys isolate every load policy field" {
     const allocator = std.testing.allocator;
     const default_key = try backendVariantCacheKey(allocator, "model", .metal, null);
     defer allocator.free(default_key);
-    const streamed_key = try backendVariantCacheKey(
-        allocator,
-        "model",
-        .metal,
-        .{ .residency_mode = .streamed, .memory_budget_mb = 4096 },
-    );
-    defer allocator.free(streamed_key);
-    const resident_key = try backendVariantCacheKey(
-        allocator,
-        "model",
-        .metal,
-        .{ .residency_mode = .resident, .memory_budget_mb = 16384 },
-    );
-    defer allocator.free(resident_key);
+    const request = backend_contracts.A4bInferenceRequest{
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+        .load_strategy = .pipeline,
+        .load_workers = 4,
+        .load_staging_mb = 256,
+        .prepared_pack = .required,
+        .drop_host_cache_after_load = true,
+    };
+    const variants = [_]backend_contracts.A4bInferenceRequest{
+        .{ .residency_mode = .streamed, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 4096, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .legacy, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 6, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 384, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .off, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = false },
+    };
 
-    try std.testing.expect(!std.mem.eql(u8, default_key, streamed_key));
-    try std.testing.expect(!std.mem.eql(u8, streamed_key, resident_key));
-    try std.testing.expect(std.mem.endsWith(u8, streamed_key, "a4b=streamed:4096"));
+    const model_key = try backendVariantCacheKey(allocator, "model", .cuda, request);
+    defer allocator.free(model_key);
+    try std.testing.expect(!std.mem.eql(u8, default_key, model_key));
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    const flight_key = try manager.loadFlightKey(
+        "model",
+        &.{.cuda},
+        false,
+        inheritedA4bCachePolicy(request, true),
+    );
+    defer allocator.free(flight_key);
+
+    for (variants) |variant| {
+        const variant_model_key = try backendVariantCacheKey(allocator, "model", .cuda, variant);
+        defer allocator.free(variant_model_key);
+        try std.testing.expect(!std.mem.eql(u8, model_key, variant_model_key));
+
+        const variant_flight_key = try manager.loadFlightKey(
+            "model",
+            &.{.cuda},
+            false,
+            inheritedA4bCachePolicy(variant, true),
+        );
+        defer allocator.free(variant_flight_key);
+        try std.testing.expect(!std.mem.eql(u8, flight_key, variant_flight_key));
+    }
 }
 
 test "inherited A4B policy isolates explicit loads but reuses policy-free aliases" {

@@ -458,10 +458,11 @@ fn makeTrainerInputForExampleWeighted(
     for (0..@min(example.labels.len, rows)) |i| {
         const label = example.labels[i];
         if (label < 0) continue;
+        if (i == 0) return error.InvalidCausalLabelPosition;
         const idx: usize = @intCast(label);
         if (idx >= vocab_size) return error.LabelOutOfRange;
         const row_scale = if (token_scales) |scales| scales[supervised_idx] else default_row_scale;
-        targets[i * vocab_size + idx] = row_scale;
+        targets[(i - 1) * vocab_size + idx] = row_scale;
         supervised_idx += 1;
     }
 
@@ -594,6 +595,42 @@ pub fn sampleCompletionRanked(
         const token_logp = logProbAtToken(row, token_id);
         try out_tokens.append(allocator, @intCast(token_id));
         try out_logps.append(allocator, token_logp);
+        try seq.append(allocator, @intCast(token_id));
+        if (eos_token_id) |eos_id| if (token_id == @as(usize, @intCast(eos_id))) break;
+    }
+    if (out_tokens.items.len == 0) return error.EmptyCompletion;
+}
+
+/// Draw a completion from the policy softmax and record the exact behavior
+/// log-probability used by GRPO's importance ratio.
+pub fn sampleCompletion(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *Qwen2AutodiffCtx,
+    prompt: []const i32,
+    seq_len: u32,
+    max_completion_tokens: usize,
+    seed: u64,
+    eos_token_id: ?i32,
+    out_tokens: *std.ArrayList(i32),
+    out_logps: *std.ArrayList(f32),
+) !void {
+    if (prompt.len == 0) return error.EmptyPrompt;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    var seq = std.ArrayList(i32).empty;
+    defer seq.deinit(allocator);
+    try seq.appendSlice(allocator, prompt);
+
+    var step: usize = 0;
+    while (step < max_completion_tokens and seq.items.len < seq_len) : (step += 1) {
+        const logits = try executeLogitsForInputIds(allocator, trainer, ctx, seq.items, seq_len);
+        defer allocator.free(logits);
+        const vocab_size: usize = @intCast(ctx.graph_config.arch.vocab_size);
+        const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
+        const token_id = try sampleToken(row, random);
+        try out_tokens.append(allocator, @intCast(token_id));
+        try out_logps.append(allocator, logProbAtToken(row, token_id));
         try seq.append(allocator, @intCast(token_id));
         if (eos_token_id) |eos_id| if (token_id == @as(usize, @intCast(eos_id))) break;
     }
@@ -794,6 +831,25 @@ fn selectRankedToken(allocator: std.mem.Allocator, row: []const f32, rank: usize
         }
     }.lessThan);
     return ranked[@min(rank, ranked.len - 1)].token_id;
+}
+
+fn sampleToken(logits: []const f32, random: std.Random) !usize {
+    if (logits.len == 0) return error.InvalidLogits;
+    var max_logit = logits[0];
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidLogits;
+        max_logit = @max(max_logit, value);
+    }
+    var total: f64 = 0.0;
+    for (logits) |value| total += @exp(@as(f64, value - max_logit));
+    if (!std.math.isFinite(total) or total <= 0.0) return error.InvalidLogits;
+    const threshold = random.float(f64) * total;
+    var cumulative: f64 = 0.0;
+    for (logits, 0..) |value, idx| {
+        cumulative += @exp(@as(f64, value - max_logit));
+        if (cumulative >= threshold) return idx;
+    }
+    return logits.len - 1;
 }
 
 const WriteTensorF32 = struct {

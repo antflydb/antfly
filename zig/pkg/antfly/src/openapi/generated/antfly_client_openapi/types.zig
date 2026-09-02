@@ -17092,6 +17092,64 @@ pub const IndexType = enum {
     }
 };
 
+/// Loader implementation for qualified Gemma 4 26B-A4B Q4_0 loads. Auto selects the production default, pipeline requires the bounded pinned-host pipeline, and legacy selects the single-threaded loader.
+pub const InferenceA4bLoadStrategy = enum {
+    auto,
+    pipeline,
+    legacy,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .pipeline => "pipeline",
+            .legacy => "legacy",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "pipeline", .pipeline },
+            .{ "legacy", .legacy },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Prepared-pack policy for qualified A4B CUDA loads. Required fails closed unless a valid pack is installed.
+pub const InferenceA4bPreparedPackMode = enum {
+    auto,
+    off,
+    required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .off => "off",
+            .required => "required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "off", .off },
+            .{ "required", .required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
 pub const InferenceA4bResidencyMode = enum {
     auto,
@@ -19524,6 +19582,15 @@ pub const InferenceModelRef = struct {
     residency_mode: ?InferenceA4bResidencyMode = null,
     /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
     memory_budget_mb: ?i64 = null,
+    load_strategy: ?InferenceA4bLoadStrategy = null,
+    /// Bounded loader worker count for qualified A4B loads. Zero selects the runtime default.
+    load_workers: ?i64 = null,
+    /// Aggregate pinned-host staging budget in MiB. Zero selects the runtime default; explicit values must be between 64 and 1024.
+    load_staging_mb: ?i64 = null,
+    prepared_pack: ?InferenceA4bPreparedPackMode = null,
+    /// Drop clean GGUF pages from the host page cache after a successful A4B load.
+    drop_host_cache_after_load: ?bool = null,
+    startup_strategy: ?InferenceWarmModelStartupStrategy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -19534,6 +19601,12 @@ pub const InferenceModelRef = struct {
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
         .{ "memory_budget_mb", "memory_budget_mb", true },
+        .{ "load_strategy", "load_strategy", true },
+        .{ "load_workers", "load_workers", true },
+        .{ "load_staging_mb", "load_staging_mb", true },
+        .{ "prepared_pack", "prepared_pack", true },
+        .{ "drop_host_cache_after_load", "drop_host_cache_after_load", true },
+        .{ "startup_strategy", "startup_strategy", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -19568,6 +19641,30 @@ pub const InferenceModelRef = struct {
         }
         if (self.memory_budget_mb) |value| {
             try jw.objectField("memory_budget_mb");
+            try jw.write(value);
+        }
+        if (self.load_strategy) |value| {
+            try jw.objectField("load_strategy");
+            try jw.write(value);
+        }
+        if (self.load_workers) |value| {
+            try jw.objectField("load_workers");
+            try jw.write(value);
+        }
+        if (self.load_staging_mb) |value| {
+            try jw.objectField("load_staging_mb");
+            try jw.write(value);
+        }
+        if (self.prepared_pack) |value| {
+            try jw.objectField("prepared_pack");
+            try jw.write(value);
+        }
+        if (self.drop_host_cache_after_load) |value| {
+            try jw.objectField("drop_host_cache_after_load");
+            try jw.write(value);
+        }
+        if (self.startup_strategy) |value| {
+            try jw.objectField("startup_strategy");
             try jw.write(value);
         }
         try jw.endObject();
@@ -20518,6 +20615,32 @@ pub const InferenceTransientCapacityError = struct {
     retryable: bool,
     /// Minimum retry delay in milliseconds
     retry_after_ms: i64,
+};
+
+/// Eager loads and publishes a reusable session. Prefetch only reads A4B CUDA artifact pages into the host page cache and does not publish a session.
+pub const InferenceWarmModelStartupStrategy = enum {
+    eager,
+    prefetch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eager => "eager",
+            .prefetch => "prefetch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eager", .eager },
+            .{ "prefetch", .prefetch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.

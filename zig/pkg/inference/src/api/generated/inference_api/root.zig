@@ -5,6 +5,8 @@ pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
+pub const A4bLoadStrategy = types.A4bLoadStrategy;
+pub const A4bPreparedPackMode = types.A4bPreparedPackMode;
 pub const A4bResidencyMode = types.A4bResidencyMode;
 pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
@@ -115,4 +117,5 @@ pub const TranscribeRequest = types.TranscribeRequest;
 pub const TranscribeResponse = types.TranscribeResponse;
 pub const TransientCapacityError = types.TransientCapacityError;
 pub const VADOptions = types.VADOptions;
+pub const WarmModelStartupStrategy = types.WarmModelStartupStrategy;
 pub const SchemasConfig = types.SchemasConfig;

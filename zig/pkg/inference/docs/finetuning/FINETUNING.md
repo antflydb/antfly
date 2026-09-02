@@ -61,6 +61,7 @@ All recipes use the same top-level sections:
     "group_size": 8,
     "clip_epsilon": 0.2,
     "kl_coef": 0.04,
+    "advantage_eps": 0.0001,
     "normalize_advantage": true
   },
   "eval": {
@@ -76,7 +77,7 @@ All recipes use the same top-level sections:
 }
 ```
 
-Supported recipe names are `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo`, `reranker`, and `vlm-retrieval`. The parser accepts unknown future fields so recipe files can grow without breaking older runners.
+Supported recipe names are `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo`, `reranker`, and `vlm-retrieval`. The parser rejects unknown fields so misspelled or unsupported training settings cannot be silently ignored.
 
 ### LoRA Defaults
 
@@ -91,7 +92,9 @@ Recipe-level LoRA defaults are intentionally PEFT-like:
   `encoder,span_rep,classifier,count_embed,count_pred`. The encoder group
   expands to query/key/value plus dense encoder projections.
 - Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
-- `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
+- `init_lora_weights` and `use_dora` are currently Gemma4 artifact/SFT knobs.
+  Gemma4 DPO/GRPO rejects them explicitly because the preference optimizer
+  currently owns standard LoRA A/B state only.
 
 For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA sweeps around `1e-4`, `3e-4`, and `1e-3` with the real target metric, then keep the smallest rank/target set that passes. Smaller micro-batches plus gradient accumulation are usually a better first move than shrinking rank below the defaults.
 
@@ -108,6 +111,149 @@ antfly inference finetune smoke-fast
 ```
 
 `smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/antfly-inference-finetune-smoke-fast/fast_smoke_summary.json` by default.
+
+### Gemma4 CUDA DPO/GRPO qualification
+
+Use `scripts/run_gemma4_cuda_preference_smoke.py` for a bounded real-checkpoint
+CUDA policy-training gate. It accepts mounted Gemma4 BF16 SafeTensors model
+directories and never downloads or converts weights. GGUF deployment bundles,
+including 26B-A4B Q4_0, fail preflight because this gate qualifies the
+SafeTensors autodiff trainer rather than the separate quantized inference path.
+
+The runner does not accept a successful process as proof of GPU training. Each
+DPO and GRPO report must attest all of the following:
+
+- the policy and optimizer both used CUDA, with the expected nonzero number of
+  CUDA optimizer steps;
+- loss, mean gradient norm, and the maximum persisted trainable-tensor delta
+  are finite, with at least one changed adapter tensor;
+- compiled graph partitions, planned dispatches, kernels, and peak resident
+  bytes are nonzero;
+- graph fallback, native partitions, unsupported operations, interpreter
+  fallback, host gradients, undeclared transfers, and oversized readback are
+  all zero;
+- the bootstrap and trained adapter checkpoints have different SHA-256 values;
+- `nvidia-smi` produced at least one positive process-memory sample and the
+  measured end-to-end optimizer throughput is finite and positive.
+
+A Gemma4 `text-preference` DPO recipe or `text-grpo` GRPO recipe always selects
+policy training, even when `adapter` and explicit adapter output paths are
+omitted; the trainer bootstraps the default LoRA bundle and artifact paths.
+Use the scalar-logprob formats for loss-only algorithm checks. Recipe JSON is
+strict: unknown fields fail parsing. Gemma4 preference recipes also reject
+currently unimplemented evaluation, checkpoint/resume, runtime-policy,
+dataset-cache, adapter-quantization, and cross-objective settings instead of
+silently ignoring them.
+
+When `model.reference_path` is omitted or equals `model.path`, Gemma4 DPO and
+GRPO use a frozen, adapter-free reference graph over the policy's resident base
+weights. DPO reference scores are cached once per preference pair. This avoids
+a second CUDA checkpoint and repeated CPU reference forwards. An external
+reference remains supported, must have a compatible vocabulary, and is scored
+through its own frozen model session.
+
+Gemma4 preference backward passes are physically batched: DPO places the
+chosen and rejected sequences in one graph execution, while GRPO places every
+completion in a rollout group in one execution. Sparse token coefficients are
+scaled against the full `batch * sequence` reduction, so this preserves the
+logical DPO/GRPO gradient while eliminating per-component backward launches.
+`dataset.max_seq_len` is a truncation ceiling, not an unconditional padding
+length. DPO specializes to the longest tokenized chosen/rejected example in
+the run; GRPO specializes to the longest prompt plus the configured completion
+bound. Both choices are stable for the run and avoid allocating transformer
+activations and full-vocabulary rows that would contain padding for every
+example.
+
+Run a one-update DPO/GRPO smoke with:
+
+```sh
+cd zig/pkg/inference
+python3 scripts/run_gemma4_cuda_preference_smoke.py \
+  --model e2b=/models/gemma-4-E2B-it-bf16 \
+  --grpo-target e2b=qualification-sequence-hash-v1 \
+  --antfly-bin zig-out/bin/antfly-inference \
+  --out /runs/gemma4-cuda-preference-smoke
+```
+
+Use `--objective dpo` or `--objective grpo` for a single algorithm. Add
+`--preflight-only` to inspect the model contract without starting CUDA. The
+output directory must not already exist; `summary.json` is atomically updated
+after every case and retains failure evidence and per-case logs.
+
+Benchmark mode locks each fresh-process case to rank 16, alpha 32, sequence cap
+128, and 25 optimizer updates. It requires at least three repetitions plus a
+model-fingerprint-bound Python/Unsloth baseline; GRPO also locks every target
+to `qualification-sequence-hash-v1` and uses the deterministic `sequence-hash` systems-qualification
+reward so distinct seeded rollouts produce a non-degenerate, reproducible
+gradient. Real training should select a semantic reward mode or the Rewarder
+API; the hash reward is only for matched execution benchmarking:
+
+GRPO group reward scaling follows stock TRL/Unsloth semantics: sample standard
+deviation (`correction = 1`) with an additive `1e-4` denominator epsilon, and
+the loss averages token losses within each completion before averaging the
+completion batch.
+
+```sh
+python3 scripts/run_gemma4_cuda_preference_smoke.py \
+  --model e2b=/models/gemma-4-E2B-it-bf16 \
+  --grpo-target e2b=qualification-sequence-hash-v1 \
+  --benchmark \
+  --repetitions 3 \
+  --unsloth-baseline /runs/unsloth-gemma4-preference.json \
+  --out /runs/gemma4-cuda-preference-benchmark
+```
+
+The comparison is deliberately end-to-end: every Zig and Unsloth sample must
+be a fresh objective process, and wall time includes model load and adapter
+publication. The pinned Unsloth runner must emit this standard-library JSON
+contract using the `config.json` SHA-256 printed by `--preflight-only` and the
+exact protocol below:
+
+```json
+{
+  "schema_version": "antfly_gemma4_unsloth_preference_benchmark/v1",
+  "protocol": {
+    "process_scope": "fresh-process-per-objective-repetition",
+    "duration_scope": "process-wall-including-model-load-and-adapter-publication",
+    "updates": 25,
+    "max_examples": 1,
+    "max_seq_len": 128,
+    "rank": 16,
+    "alpha": 32.0,
+    "learning_rate": 0.0001,
+    "gradient_accumulation_steps": 1,
+    "dpo_fixture": {
+      "prompt": "Answer briefly: what is the capital of France?",
+      "chosen": "The capital is Paris.",
+      "rejected": "The capital is Berlin."
+    },
+    "grpo_fixture": {
+      "prompt": "The",
+      "target": "qualification-sequence-hash-v1"
+    },
+    "grpo_reward_mode": "sequence-hash",
+    "grpo_max_completion_tokens": 4
+  },
+  "cases": [
+    {
+      "label": "e2b",
+      "objective": "dpo",
+      "model_config_sha256": "<sha256>",
+      "optimizer_steps": 25,
+      "median_wall_seconds": 10.0,
+      "median_optimizer_steps_per_second": 2.5,
+      "median_peak_gpu_memory_mib": 9000,
+      "loss": 0.5,
+      "mean_grad_norm": 0.2
+    }
+  ]
+}
+```
+
+Provide one baseline case for every requested model/objective pair. The summary
+reports Zig-to-Unsloth wall-time, optimizer-throughput, and peak-memory ratios;
+protocol, model fingerprint, missing metric, NaN/Inf, and duplicate-case
+mismatches fail closed.
 
 ### GLiNER2 Entity-Training Checks and Release Readiness
 
@@ -594,7 +740,7 @@ Use `dataset.format = "text-grpo"` to treat `prompt` as user content and apply t
 
 `exact-match-ci` is trimmed ASCII case-insensitive equality.
 
-For Gemma4 multimodal GRPO, add `model.projector_path` and use prompt rows with media placeholders plus `image_paths` / `audio_paths`. The current optimizer-backed multimodal route reuses the Gemma projector-backed autodiff path and requires the reference path to stay on the same base model directory.
+For Gemma4 multimodal GRPO, add `model.projector_path` and use prompt rows with media placeholders plus `image_paths` / `audio_paths`. The current optimizer-backed multimodal route reuses the Gemma projector-backed autodiff path, requires the reference path to stay on the same base model directory, and is native-only; strict CUDA multimodal preference training fails explicitly until projector backward execution is device-resident.
 
 ### Remaining Task List
 

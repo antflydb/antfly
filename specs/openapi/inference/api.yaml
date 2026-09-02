@@ -3006,6 +3006,26 @@ components:
         - auto
         - streamed
         - resident
+    A4bLoadStrategy:
+      type: string
+      description: Loader implementation for qualified Gemma 4 26B-A4B Q4_0 loads. Auto selects the production default, pipeline requires the bounded pinned-host pipeline, and legacy selects the single-threaded loader.
+      enum:
+        - auto
+        - pipeline
+        - legacy
+    A4bPreparedPackMode:
+      type: string
+      description: Prepared-pack policy for qualified A4B CUDA loads. Required fails closed unless a valid pack is installed.
+      enum:
+        - auto
+        - "off"
+        - required
+    WarmModelStartupStrategy:
+      type: string
+      description: Eager loads and publishes a reusable session. Prefetch only reads A4B CUDA artifact pages into the host page cache and does not publish a session.
+      enum:
+        - eager
+        - prefetch
     BackendPriorityEntry:
       type: string
       description: |
@@ -3028,6 +3048,7 @@ components:
       pattern: '^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
     ModelRef:
       type: object
+      additionalProperties: false
       description: Model reference used by startup preload and model-loading configuration.
       required:
         - kind
@@ -3056,6 +3077,33 @@ components:
           maximum: 1048576
           default: 0
           description: Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
+        load_strategy:
+          $ref: '#/components/schemas/A4bLoadStrategy'
+          default: auto
+        load_workers:
+          type: integer
+          format: uint8
+          minimum: 0
+          maximum: 8
+          default: 0
+          description: Bounded loader worker count for qualified A4B loads. Zero selects the runtime default.
+        load_staging_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1024
+          default: 0
+          description: Aggregate pinned-host staging budget in MiB. Zero selects the runtime default; explicit values must be between 64 and 1024.
+        prepared_pack:
+          $ref: '#/components/schemas/A4bPreparedPackMode'
+          default: auto
+        drop_host_cache_after_load:
+          type: boolean
+          default: false
+          description: Drop clean GGUF pages from the host page cache after a successful A4B load.
+        startup_strategy:
+          $ref: '#/components/schemas/WarmModelStartupStrategy'
+          default: eager
     PromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

@@ -19,9 +19,10 @@
 //! validates the canonical GGUF catalog and matches every source by exact name
 //! and byte length before using a pack. The manifest binds the pack to the
 //! canonical artifact's stable sampled identity and records shard SHA-256
-//! values for offline verification. The hot admission path samples sixteen
-//! evenly distributed 64 KiB regions plus immutable bounds instead of hashing
-//! 12+ GiB on every worker start.
+//! values. Early metadata preflight samples sixteen evenly distributed 64 KiB
+//! regions plus immutable bounds. The hot loader then hashes each exact mapped
+//! shard before exposing expert slices, so an admitted pack cannot turn silent
+//! bit rot or an unsampled modification into model output drift.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -418,10 +419,20 @@ pub fn load(
     for (parsed.value.shards, 0..) |shard, index| {
         const path = try std.fs.path.join(allocator, &.{ pack_path, shard.path });
         defer allocator.free(path);
-        const identity = try c_file.fileIdentity(allocator, path);
-        if (!shard.identity.eql(identity)) return error.A4bPreparedPackShardIdentityMismatch;
-        regions[index] = try c_file.MmapRegion.init(allocator, path);
-        regions[index].adviseRandom();
+        var opened = try c_file.mmapFileWithIdentity(allocator, path);
+        var opened_live = true;
+        defer if (opened_live) opened.region.deinit();
+        if (!shard.identity.eql(opened.identity)) return error.A4bPreparedPackShardIdentityMismatch;
+
+        // Hash the same mapping that the CUDA load plan will consume. Besides
+        // checking every byte, this avoids the identity-open / mmap-open race
+        // that exists when a pathname is reopened after validation.
+        c_file.MmapRegion.adviseBytesSequential(opened.region.data);
+        const actual = digestHex(opened.region.data);
+        if (!std.ascii.eqlIgnoreCase(&actual, shard.sha256))
+            return error.A4bPreparedPackChecksumMismatch;
+        regions[index] = opened.region;
+        opened_live = false;
         mapped += 1;
     }
 
@@ -445,9 +456,8 @@ pub fn load(
     };
 }
 
-/// Full offline integrity verification. Admission intentionally uses stable
-/// identities and structural validation so it does not double-read the model;
-/// deployment pipelines should run this once after copying a pack.
+/// Full integrity verification. `load` already hashes the exact mapped shard
+/// bytes, so this entry point reports that result without hashing them twice.
 pub fn verify(
     allocator: std.mem.Allocator,
     model_path: []const u8,
@@ -457,10 +467,6 @@ pub fn verify(
     var loaded = (try load(allocator, model_path, source_artifact_path, expected_geometry)) orelse
         return error.A4bPreparedPackRequired;
     defer loaded.deinit();
-    for (loaded.regions, loaded.parsed.value.shards) |region, shard| {
-        const actual = digestHex(region.data);
-        if (!std.ascii.eqlIgnoreCase(&actual, shard.sha256)) return error.A4bPreparedPackChecksumMismatch;
-    }
     return .{
         .shard_count = loaded.regions.len,
         .source_count = loaded.sources.len,
@@ -613,5 +619,51 @@ test "prepared pack digest helper is stable" {
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         &digestHex("abc"),
+    );
+}
+
+test "prepared pack hot load rejects corruption outside sampled identity windows" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const source_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" });
+    defer allocator.free(source_path);
+    try compat.cwd().writeFile(std.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
+    const output_path = try std.fs.path.join(allocator, &.{ root, default_directory_name });
+    defer allocator.free(output_path);
+    const geometry = GeometryIdentity{
+        .moe_layer_count = 2,
+        .expert_count = 4,
+        .top_k = 2,
+        .hidden_size = 8,
+        .expert_intermediate_size = 4,
+        .encoded_expert_bytes = 16,
+    };
+    const payload = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 0x5a);
+    _ = try write(allocator, std.testing.io, source_path, output_path, geometry, &.{.{
+        .name = "large-packed-source",
+        .bytes = payload,
+    }}, 1);
+    _ = try verify(allocator, root, source_path, geometry);
+
+    const shard_path = try std.fs.path.join(allocator, &.{ output_path, "experts-00.bin" });
+    defer allocator.free(shard_path);
+    var shard_file = try compat.cwd().openFile(std.testing.io, shard_path, .{ .mode = .read_write });
+    defer shard_file.close(std.testing.io);
+    // For a 2 MiB shard the first sampled window ends at 64 KiB and the
+    // second starts above 128 KiB. This byte is deliberately invisible to the
+    // quick identity while remaining covered by the manifest's full digest.
+    try shard_file.writePositionalAll(std.testing.io, &.{0xa5}, 96 * 1024);
+    try shard_file.sync(std.testing.io);
+
+    try std.testing.expect(try preflightInstalled(allocator, root, source_path, geometry));
+    try std.testing.expectError(
+        error.A4bPreparedPackChecksumMismatch,
+        load(allocator, root, source_path, geometry),
     );
 }

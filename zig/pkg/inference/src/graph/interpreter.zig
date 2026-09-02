@@ -294,6 +294,31 @@ fn nullCtAliases(values: []?CT, needle: CT) void {
     }
 }
 
+/// Return true when another graph value aliases `needle` and is still needed
+/// after `current_node`. Backends may return one stable borrowed handle for
+/// multiple parameter nodes (CUDA resident/tied weights do this). Releasing
+/// one node's last use must not clear that later alias merely because the
+/// opaque CT pointers compare equal.
+fn hasFutureParameterCtAlias(
+    graph: *const Graph,
+    values: []const ?CT,
+    last_use: []const u32,
+    needle: CT,
+    releasing_id: NodeId,
+    current_node: usize,
+) bool {
+    if (graph.node(releasing_id).op != .parameter) return false;
+    // Search only graph parameters. A whole-values scan at every release is
+    // quadratic in the full Gemma graph; the aliasing contract at issue is
+    // specifically backend weight handles, while view/output aliases are
+    // handled by cloneOutputIfAliasedInputWouldBeFreedFast above.
+    for (graph.parameters.items) |other_id| {
+        if (other_id == releasing_id or values[other_id] != needle) continue;
+        if (last_use[other_id] > current_node) return true;
+    }
+    return false;
+}
+
 fn graphExecTraceEnabled() bool {
     const value = platform.env.getenv("TERMITE_GRAPH_EXEC_TRACE") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
@@ -803,6 +828,17 @@ pub fn execute(
                             values[input_id] = null;
                             continue;
                         }
+                    }
+                    // `getWeight` may return a stable backend-owned handle for
+                    // duplicate parameter nodes (notably Gemma's tied input
+                    // embedding and LM head on CUDA). Topological sorting puts
+                    // both parameters before their consumers, so clearing all
+                    // equal CTs at the embedding's last use used to erase the
+                    // still-live LM-head binding. Defer the backend release to
+                    // the final live alias instead.
+                    if (hasFutureParameterCtAlias(graph, values, last_use, ct, input_id, i)) {
+                        values[input_id] = null;
+                        continue;
                     }
                     // Clear every alias before releasing the handle. Keeping
                     // raw addresses of already-freed handles is ABA-unsafe:
@@ -2446,6 +2482,36 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_selected_tied_head_logits => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.selectedTiedHeadLogits(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .token_ids = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
+        .fused_selected_tied_head_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, node_id, &hidden_shape_buf);
+            return cb.selectedTiedHeadBackward(&.{
+                .weight = V.get(ins[0]),
+                .token_ids = V.get(ins[1]),
+                .upstream = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
         },
 
         .fused_masked_bce_with_logits_loss => |attrs| {
@@ -4176,6 +4242,7 @@ const TestBuf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    destroy_header: bool = true,
 };
 
 fn testToBuf(ct: CT) *TestBuf {
@@ -4189,6 +4256,10 @@ fn testGetData(ct: CT) []f32 {
 const TestCompute = struct {
     allocator: std.mem.Allocator,
     weights: std.StringHashMapUnmanaged([]f32),
+    /// Model CUDA resident weights expose stable backend-owned CT handles.
+    /// Tests opt into the same aliasing contract with this embedded header.
+    return_shared_weight_handle: bool = false,
+    shared_weight_handle: ?TestBuf = null,
 
     /// Attention layer indices received via gqaPagedAttention dispatch.
     /// Used to verify the interpreter auto-increments layer_index.
@@ -4245,6 +4316,7 @@ const TestCompute = struct {
 
     fn freeTensor(_: *anyopaque, tensor: CT) void {
         const b = testToBuf(tensor);
+        if (!b.destroy_header) return;
         if (b.owned) b.allocator.free(b.data);
         b.allocator.destroy(b);
     }
@@ -4252,6 +4324,18 @@ const TestCompute = struct {
     fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         const self = fromCtx(ctx);
         const data = self.weights.get(name) orelse return error.MissingWeight;
+        if (self.return_shared_weight_handle) {
+            if (self.shared_weight_handle == null) {
+                self.shared_weight_handle = .{
+                    .data = data,
+                    .allocator = self.allocator,
+                    .owned = false,
+                    .destroy_header = false,
+                };
+            }
+            if (self.shared_weight_handle) |*shared| return @ptrCast(shared);
+            unreachable;
+        }
         return self.makeBuf(data, false); // borrowed
     }
 
@@ -5629,6 +5713,38 @@ test "native interpreter does not donate a reshape view before a future sibling 
     const original_data = try cb_val.toFloat32(x_ct, allocator);
     defer allocator.free(original_data);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
+
+test "execute preserves a tied resident weight handle until its final parameter use" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = ml.graph.Builder.init(&g);
+
+    // Topological graph sorting places all parameter nodes before compute.
+    // CUDA returns the same backend-owned CT for these tied names, matching
+    // Gemma's input embedding and LM-head relationship.
+    const embed_weight = try bld.parameter("model.embed_tokens.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const lm_head_weight = try bld.parameter("lm_head.tied.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const x = try bld.tensorConst(&.{ 3.0, 4.0 }, Shape.init(.f32, &.{ 1, 2 }));
+    const embedded = try bld.linearNoBias(x, embed_weight, 1, 2, 2);
+    const logits = try bld.linearNoBias(embedded, lm_head_weight, 1, 2, 2);
+    try g.markOutput(logits);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    try tc_backend.addWeight("model.embed_tokens.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    try tc_backend.addWeight("lm_head.tied.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    tc_backend.return_shared_weight_handle = true;
+    var cb = tc_backend.backend();
+
+    var result = try execute(allocator, &g, &cb, .{});
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, actual);
 }
 
 test "execute lowered graph through native backend" {

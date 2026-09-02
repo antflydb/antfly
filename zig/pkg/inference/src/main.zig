@@ -110,6 +110,17 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parse
     return try parseRunConfig(allocator, raw);
 }
 
+fn validateKnownObjectFields(comptime T: type, object: std.json.ObjectMap) !void {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        var known = false;
+        inline for (std.meta.fields(T)) |field| {
+            if (std.mem.eql(u8, entry.key_ptr.*, field.name)) known = true;
+        }
+        if (!known) return error.InvalidInferenceConfig;
+    }
+}
+
 fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(RunConfig) {
     var raw_tree = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer raw_tree.deinit();
@@ -117,6 +128,19 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         .object => |object| object,
         else => return error.InvalidInferenceConfig,
     };
+    if (root.get("preload")) |preload_value| {
+        const preload = switch (preload_value) {
+            .array => |array| array,
+            else => return error.InvalidInferenceConfig,
+        };
+        for (preload.items) |model_value| {
+            const model = switch (model_value) {
+                .object => |object| object,
+                else => return error.InvalidInferenceConfig,
+            };
+            try validateKnownObjectFields(RunConfig.WarmModelConfig, model);
+        }
+    }
     if (root.get("admission")) |admission_value| {
         const admission = switch (admission_value) {
             .object => |object| object,
@@ -938,6 +962,21 @@ test "run config preserves A4B CUDA load and prefetch policy" {
     try std.testing.expectEqual(inference.ops.A4bPreparedPackMode.required, models[0].prepared_pack.?);
     try std.testing.expect(models[0].drop_host_cache_after_load);
     try std.testing.expectEqual(inference.server.WarmModelStartupStrategy.prefetch, models[0].startup_strategy);
+}
+
+test "run config rejects unknown preload policy fields" {
+    try std.testing.expectError(
+        error.InvalidInferenceConfig,
+        parseRunConfig(std.testing.allocator,
+            \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","prepared_pak":"required"}]}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceConfig,
+        parseRunConfig(std.testing.allocator,
+            \\{"preload":[{"kind":"generator","name":"gemma-a4b","load_worker":6}]}
+        ),
+    );
 }
 
 test "run config rejects unrepresentable prompt cache values" {

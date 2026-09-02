@@ -92,6 +92,8 @@ pub const TrainStepProfile = struct {
     /// step fell back to the regular compiled path. Always a static string.
     graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
     graph_executor_interpreter_fallbacks: u64 = 0,
@@ -265,12 +267,30 @@ pub fn recordTrainingRuntimeProfile(
     profile.cuda_device_frees = after.device_frees -| before.device_frees;
     profile.cuda_h2d_bytes = after.h2d_bytes -| before.h2d_bytes;
     profile.cuda_d2h_bytes = after.d2h_bytes -| before.d2h_bytes;
-    // The backend retains a lifetime maximum. Clamp it to this step's total
-    // so a checkpoint download between steps cannot poison later hot-step
-    // telemetry with a stale large transfer.
-    profile.cuda_largest_d2h_transfer_bytes = @min(after.largest_d2h_transfer_bytes, profile.cuda_d2h_bytes);
     profile.cuda_to_float32_calls = after.to_float32_calls -| before.to_float32_calls;
     profile.cuda_download_alloc_calls = after.download_alloc_calls -| before.download_alloc_calls;
+    const download_events = after.download_events -| before.download_events;
+    const download_event_bytes = after.download_event_bytes -| before.download_event_bytes;
+    // The backend's largest-transfer counter is lifetime-scoped, so simply
+    // clamping it to this step's total conflates two independent scalar
+    // readbacks (loss and gradient norm) into one 8-byte transfer. The strict
+    // training path performs at most two scalar downloads per step. When the
+    // backend's two-event ring accounts for every byte, it gives the exact
+    // per-step maximum. Retain the conservative lifetime fallback for
+    // non-standard or repeated download paths.
+    const exact_download_max = if (download_events == 2)
+        @max(after.download_previous_bytes, after.download_last_bytes)
+    else if (download_events == 1)
+        after.download_last_bytes
+    else
+        0;
+    const exact_download_accounting =
+        download_events <= 2 and
+        download_event_bytes == profile.cuda_d2h_bytes;
+    profile.cuda_largest_d2h_transfer_bytes = if (exact_download_accounting)
+        exact_download_max
+    else
+        @min(after.largest_d2h_transfer_bytes, profile.cuda_d2h_bytes);
     profile.cuda_stream_synchronizations = after.stream_synchronizations -| before.stream_synchronizations;
     profile.cuda_upload_synchronizations = after.upload_synchronizations -| before.upload_synchronizations;
     profile.cuda_temp_cache_hits = after.temp_cache_hits -| before.temp_cache_hits;
@@ -282,6 +302,52 @@ pub fn recordTrainingRuntimeProfile(
     profile.cuda_exact_gelu_backward_calls = after.exact_gelu_backward_calls -| before.exact_gelu_backward_calls;
     profile.cuda_training_input_uploads = after.training_input_uploads -| before.training_input_uploads;
     profile.cuda_training_input_upload_bytes = after.training_input_upload_bytes -| before.training_input_upload_bytes;
+}
+
+test "runtime profile keeps independent scalar downloads separate" {
+    const before = ops_mod.TrainingRuntimeStats{
+        .d2h_bytes = 1024,
+        .largest_d2h_transfer_bytes = 1024,
+        .download_events = 10,
+        .download_event_bytes = 40,
+        .download_last_bytes = 4,
+        .download_previous_bytes = 4,
+        .to_float32_calls = 3,
+        .download_alloc_calls = 7,
+    };
+    const after = ops_mod.TrainingRuntimeStats{
+        .d2h_bytes = 1032,
+        .largest_d2h_transfer_bytes = 1024,
+        .download_events = 12,
+        .download_event_bytes = 48,
+        .download_last_bytes = 4,
+        .download_previous_bytes = 4,
+        .to_float32_calls = 4,
+        .download_alloc_calls = 8,
+    };
+    var profile = TrainStepProfile{};
+    recordTrainingRuntimeProfile(&profile, before, after);
+    try std.testing.expectEqual(@as(u64, 8), profile.cuda_d2h_bytes);
+    try std.testing.expectEqual(@as(u64, 4), profile.cuda_largest_d2h_transfer_bytes);
+}
+
+test "runtime profile conservatively bounds unaccounted downloads" {
+    const before = ops_mod.TrainingRuntimeStats{};
+    const after = ops_mod.TrainingRuntimeStats{
+        .d2h_bytes = 24,
+        .largest_d2h_transfer_bytes = 64,
+    };
+    var profile = TrainStepProfile{};
+    recordTrainingRuntimeProfile(&profile, before, after);
+    try std.testing.expectEqual(@as(u64, 24), profile.cuda_largest_d2h_transfer_bytes);
+}
+
+fn selectCudaTrainingGraphExecutor(strict: bool, enabled: bool, disabled: bool) !bool {
+    if (disabled) {
+        if (strict) return error.StrictCudaGraphExecutorDisabled;
+        return false;
+    }
+    return strict or enabled;
 }
 
 pub const CheckpointSummary = struct {
@@ -553,7 +619,18 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, false);
+        return self.executeInternal(cb, runtime_inputs, false, false);
+    }
+
+    /// Materialize backend-owned immutable graph state before the measured
+    /// execution interval. Strict CUDA uses this boundary to distinguish the
+    /// one-time constant upload from hidden hot-step staging.
+    pub fn prepareBackend(self: *CompiledTrainSession, cb: *const ComputeBackend) !void {
+        if (cb.kind() == .cuda) try self.ensureCachedCudaConstants(cb);
+    }
+
+    pub fn backendPrepared(self: *const CompiledTrainSession, cb: *const ComputeBackend) bool {
+        return cb.kind() != .cuda or self.cached_cuda_constants_backend == cb;
     }
 
     pub fn executeDeviceGradients(
@@ -561,7 +638,23 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, true);
+        return self.executeInternal(cb, runtime_inputs, true, false);
+    }
+
+    /// Execute a strict CUDA training step without requiring the opt-in graph
+    /// executor environment variable. The explicit disable switch remains a
+    /// hard operational kill switch, and this entry point never falls through
+    /// to the direct interpreter path.
+    pub fn executeDeviceGradientsStrictCuda(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !TrainStepResult {
+        if (cb.kind() != .cuda) return error.StrictCudaBackendRequired;
+        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) {
+            return error.StrictCudaGraphExecutorDisabled;
+        }
+        return self.executeInternal(cb, runtime_inputs, true, true);
     }
 
     fn executeInternal(
@@ -569,6 +662,7 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
         retain_device_gradients: bool,
+        strict_cuda_execution: bool,
     ) !TrainStepResult {
         const total_start = nowNs();
         var profile: TrainStepProfile = .{};
@@ -633,9 +727,10 @@ pub const CompiledTrainSession = struct {
             return result;
         }
 
-        if (try self.executeWithSingleCudaGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile)) |result| {
+        if (try self.executeWithSingleCudaGraphExecutor(cb, rt_slice, retain_device_gradients, strict_cuda_execution, total_start, execute_start, &profile)) |result| {
             return result;
         }
+        if (strict_cuda_execution) return error.StrictCudaGraphExecutorUnavailable;
 
         // Keep the partial profile (plan cache counters, fallback reason) so
         // step rows still report why the graph executor was not used.
@@ -1130,13 +1225,18 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?[]const RuntimeInput,
         retain_device_gradients: bool,
+        strict_cuda_execution: bool,
         total_start: u64,
         execute_start: u64,
         profile: *TrainStepProfile,
     ) !?TrainStepResult {
         if (cb.kind() != .cuda) return null;
-        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
-        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+        const graph_executor_selected = try selectCudaTrainingGraphExecutor(
+            strict_cuda_execution,
+            platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false),
+            platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false),
+        );
+        if (!graph_executor_selected) return null;
 
         const runtime_before = cb.trainingRuntimeStats();
         const cached = try self.cachedCudaGraphExecutorPlan(profile);
@@ -2616,6 +2716,17 @@ test "trainStep computes loss and gradients for linear model" {
     try std.testing.expectEqual(@as(usize, 12), result.gradients.get("w").?.len);
     // bias gradient should have 3 elements
     try std.testing.expectEqual(@as(usize, 3), result.gradients.get("bias").?.len);
+}
+
+test "strict CUDA execution forces graph executor while preserving ordinary opt-in policy" {
+    try std.testing.expect(!try selectCudaTrainingGraphExecutor(false, false, false));
+    try std.testing.expect(try selectCudaTrainingGraphExecutor(false, true, false));
+    try std.testing.expect(try selectCudaTrainingGraphExecutor(true, false, false));
+    try std.testing.expectError(
+        error.StrictCudaGraphExecutorDisabled,
+        selectCudaTrainingGraphExecutor(true, true, true),
+    );
+    try std.testing.expect(!try selectCudaTrainingGraphExecutor(false, true, true));
 }
 
 test "CompiledTrainSession can retain gradient tensors without host extraction" {

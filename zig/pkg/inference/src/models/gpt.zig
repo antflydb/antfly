@@ -901,7 +901,14 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("attention_k_eq_v")) |v| if (jsonBool(v)) |val| {
         config.attention_k_eq_v = val;
     };
-    if (config.family == .gemma and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
+    // Gemma 4 only widens the MLPs in the shared-KV tail when the checkpoint
+    // explicitly opts into that topology. The HF default is false (E4B uses
+    // uniform-width MLPs), while E2B sets the flag to true.
+    const use_double_wide_mlp = if (text_obj.get("use_double_wide_mlp")) |v|
+        jsonBool(v) orelse false
+    else
+        false;
+    if (config.family == .gemma and use_double_wide_mlp and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
         config.shared_layer_intermediate_size = config.intermediate_size * 2;
     }
 
@@ -2912,6 +2919,7 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
         \\    "intermediate_size": 6144,
         \\    "sliding_window": 512,
         \\    "num_kv_shared_layers": 20,
+        \\    "use_double_wide_mlp": true,
         \\    "layer_types": [
         \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
         \\      "full_attention",
@@ -2958,6 +2966,55 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
     try std.testing.expectEqual(@as(u32, 1), config.maxKvHeads());
     try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
     try std.testing.expectEqual(@as(usize, 512), config.maxKvWidthPerToken());
+
+    // E2B doubles the MLP width exactly at the shared-KV tail boundary.
+    try std.testing.expectEqual(@as(u32, 6144), config.intermediateSize(14));
+    try std.testing.expectEqual(@as(u32, 12288), config.intermediateSize(15));
+    try std.testing.expectEqual(@as(u32, 12288), config.intermediateSize(34));
+}
+
+test "parse gemma4 e4b uniform-width shared tail" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 2560,
+        \\    "num_hidden_layers": 42,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 2,
+        \\    "intermediate_size": 10240,
+        \\    "num_kv_shared_layers": 18,
+        \\    "use_double_wide_mlp": false
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.layerSharesKv(23));
+    try std.testing.expect(config.layerSharesKv(24));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(23));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(24));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(41));
+}
+
+test "parse gemma4 defaults to uniform-width shared tail" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 2560,
+        \\    "num_hidden_layers": 42,
+        \\    "num_attention_heads": 8,
+        \\    "intermediate_size": 10240,
+        \\    "num_kv_shared_layers": 18
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(@as(u32, 0), config.shared_layer_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(41));
 }
 
 test "parse gguf metadata for gemma4 shared kv config" {

@@ -2044,7 +2044,7 @@ extern "C" __global__ void termite_primitive_where_f32(
 
 // Dense dot_general specialization used by training attention gradients.
 // Batch dimensions are flattened ahead of the final matrix dimensions:
-//   lhs [batch, m, k]
+//   lhs [batch, m, k] when lhs_contract_last != 0, otherwise [batch, k, m]
 //   rhs [batch, n, k] when rhs_contract_last != 0, otherwise [batch, k, n]
 //   out [batch, m, n]
 extern "C" __global__ void termite_primitive_batched_dot_f32(
@@ -2055,6 +2055,7 @@ extern "C" __global__ void termite_primitive_batched_dot_f32(
     unsigned int m,
     unsigned int n,
     unsigned int k,
+    unsigned int lhs_contract_last,
     unsigned int rhs_contract_last
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2065,17 +2066,21 @@ extern "C" __global__ void termite_primitive_batched_dot_f32(
     unsigned int row_batch = idx / n;
     unsigned int row = row_batch % m;
     unsigned int batch = row_batch / m;
-    unsigned int lhs_base = (batch * m + row) * k;
+    unsigned int lhs_base = lhs_contract_last != 0u
+        ? (batch * m + row) * k
+        : batch * k * m + row;
     float acc = 0.0f;
     if (rhs_contract_last != 0u) {
         unsigned int rhs_base = (batch * n + col) * k;
         for (unsigned int inner = 0; inner < k; ++inner) {
-            acc += lhs[lhs_base + inner] * rhs[rhs_base + inner];
+            unsigned int lhs_idx = lhs_contract_last != 0u ? lhs_base + inner : lhs_base + inner * m;
+            acc += lhs[lhs_idx] * rhs[rhs_base + inner];
         }
     } else {
         unsigned int rhs_base = batch * k * n + col;
         for (unsigned int inner = 0; inner < k; ++inner) {
-            acc += lhs[lhs_base + inner] * rhs[rhs_base + inner * n];
+            unsigned int lhs_idx = lhs_contract_last != 0u ? lhs_base + inner : lhs_base + inner * m;
+            acc += lhs[lhs_idx] * rhs[rhs_base + inner * n];
         }
     }
     output[idx] = acc;
@@ -2245,6 +2250,23 @@ extern "C" __global__ void termite_embedding_lookup_i32_f32(
     unsigned int col = idx - row * dim;
     int id = ids[row];
     dst[idx] = weight[(unsigned long long)((unsigned int)id) * dim + col] * scale;
+}
+
+extern "C" __global__ void termite_embedding_lookup_i32_bf16_weight_f32(
+    float* dst,
+    const unsigned short* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim,
+    float scale
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    int id = ids[row];
+    dst[idx] = termite_bf16_to_f32(weight[(unsigned long long)((unsigned int)id) * dim + col]) * scale;
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
@@ -20066,11 +20088,16 @@ extern "C" __global__ void termite_training_sum_squares_f32(
     unsigned int count
 ) {
     __shared__ float partial[256];
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Training uses this sum to derive the global clipping scale.  A
+    // multi-block atomic reduction makes the add order scheduler-dependent;
+    // tiny differences then compound across AdamW steps.  One block owns the
+    // whole tensor and reduces fixed per-thread grid-stride sums in a fixed
+    // tree.  Successive tensor launches share the same stream, so the final
+    // output accumulation is ordered as well.
     float value = 0.0f;
-    if (i < count) {
+    for (unsigned int i = threadIdx.x; i < count; i += blockDim.x) {
         float x = input[i];
-        value = x * x;
+        value += x * x;
     }
     partial[threadIdx.x] = value;
     __syncthreads();
@@ -20078,7 +20105,7 @@ extern "C" __global__ void termite_training_sum_squares_f32(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0u) atomicAdd(output, partial[0]);
+    if (threadIdx.x == 0u) output[0] += partial[0];
 }
 
 extern "C" __global__ void termite_masked_bce_accumulate_f32(
@@ -20278,6 +20305,51 @@ extern "C" __global__ void termite_primitive_softmax_f32(
     }
 }
 
+// One block per selected (row, token) pair. Parallel reductions across the
+// vocabulary avoid both the full log-softmax output and the one-thread-per-row
+// serial scan used by the generic primitive.
+extern "C" __global__ void termite_selected_token_logprobs_f32(
+    float* output,
+    const float* logits,
+    const unsigned int* row_indices,
+    const unsigned int* token_ids,
+    unsigned int selected_count,
+    unsigned int rows,
+    unsigned int vocab_size
+) {
+    unsigned int selected = blockIdx.x;
+    if (selected >= selected_count) return;
+    unsigned int row = row_indices[selected];
+    unsigned int token = token_ids[selected];
+    if (row >= rows || token >= vocab_size) return;
+    const float* row_logits = logits + (size_t)row * vocab_size;
+
+    __shared__ float reduction[256];
+    float local_max = -3.402823466e+38f;
+    for (unsigned int col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+        local_max = fmaxf(local_max, row_logits[col]);
+    }
+    reduction[threadIdx.x] = local_max;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduction[threadIdx.x] = fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    float row_max = reduction[0];
+
+    float local_sum = 0.0f;
+    for (unsigned int col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+        local_sum += expf(row_logits[col] - row_max);
+    }
+    reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) output[selected] = row_logits[token] - row_max - logf(reduction[0]);
+}
+
 extern "C" __global__ void termite_primitive_gather_f32(
     float* output,
     const float* input,
@@ -20301,6 +20373,31 @@ extern "C" __global__ void termite_primitive_gather_f32(
     }
     unsigned int input_idx = (prefix * axis_extent + (unsigned int)gather_index) * suffix_size + suffix_coord;
     output[out_idx] = input[input_idx];
+}
+
+extern "C" __global__ void termite_primitive_gather_bf16_f32(
+    float* output,
+    const unsigned short* input,
+    const float* indices,
+    unsigned int output_count,
+    unsigned int index_count,
+    unsigned int axis_extent,
+    unsigned int suffix_size
+) {
+    unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= output_count) return;
+    unsigned int suffix_coord = out_idx % suffix_size;
+    unsigned int outer = out_idx / suffix_size;
+    unsigned int index_pos = outer % index_count;
+    unsigned int prefix = outer / index_count;
+    int gather_index = (int)indices[index_pos];
+    if (gather_index < 0) gather_index += (int)axis_extent;
+    if (gather_index < 0 || (unsigned int)gather_index >= axis_extent) {
+        output[out_idx] = NAN;
+        return;
+    }
+    unsigned int input_idx = (prefix * axis_extent + (unsigned int)gather_index) * suffix_size + suffix_coord;
+    output[out_idx] = termite_bf16_to_f32(input[input_idx]);
 }
 
 extern "C" __global__ void termite_primitive_scatter_add_axis0_f32(

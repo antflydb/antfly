@@ -398,6 +398,7 @@ pub const CapabilityProfile = enum {
     gliner2_training,
     florence2,
     gemma4,
+    gemma4_training,
 };
 
 pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
@@ -409,7 +410,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .deberta_reranker => .deberta_reranker,
         .gliner2, .gliner2_training => .gliner2,
         .florence2 => .florence2,
-        .gemma4 => .gemma4,
+        .gemma4, .gemma4_training => .gemma4,
     };
 }
 
@@ -1073,6 +1074,10 @@ pub const RuntimeStats = struct {
     quant_kernel_fallback_unsupported: usize = 0,
     h2d_bytes: usize = 0,
     d2h_bytes: usize = 0,
+    download_events: usize = 0,
+    download_event_bytes: usize = 0,
+    download_last_bytes: usize = 0,
+    download_previous_bytes: usize = 0,
     d2d_bytes: usize = 0,
     resident_weight_bytes: usize = 0,
     a4b_resident_source_bytes: usize = 0,
@@ -1353,6 +1358,10 @@ pub const RuntimeStats = struct {
     lm_head_argmax_generated_q6_k_q8_1_fallbacks: usize = 0,
     lm_head_argmax_fallbacks: usize = 0,
     bf16_cublaslt_linear_calls: usize = 0,
+    bf16_cublaslt_input_gradient_calls: usize = 0,
+    bf16_cublaslt_input_gradient_rejections: usize = 0,
+    selected_tied_head_forward_calls: usize = 0,
+    selected_tied_head_backward_calls: usize = 0,
     bf16_cublaslt_qkv_calls: usize = 0,
     bf16_cublaslt_activation_staging_calls: usize = 0,
     bf16_cublaslt_activation_mirror_hits: usize = 0,
@@ -1616,6 +1625,10 @@ fn noteUploadBucket(stats: *RuntimeStats, bytes: usize) void {
 }
 
 fn noteDownloadBucket(stats: *RuntimeStats, bytes: usize) void {
+    stats.download_events += 1;
+    stats.download_event_bytes += bytes;
+    stats.download_previous_bytes = stats.download_last_bytes;
+    stats.download_last_bytes = bytes;
     if (bytes <= 16) {
         stats.download_bucket_le_16 += 1;
     } else if (bytes <= 1024) {
@@ -2464,6 +2477,11 @@ pub const CudaCompute = struct {
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
+            .gemma4_training => self.kernels.hasGemma4TrainingPrimitives() and
+                cudaCublasLtEnabled() and
+                cudaFrozenBf16InputGradientCublasLtEnabled() and
+                self.ctx.info.compute_major >= 8 and
+                self.cublaslt != null,
         };
     }
 
@@ -4163,6 +4181,13 @@ fn cudaPleModelProjectionBf16OnUpload() bool {
 
 fn cudaCublasLtEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true);
+}
+
+fn cudaFrozenBf16InputGradientCublasLtEnabled() bool {
+    return platform.env.getenvBoolDefault(
+        "ANTFLY_INFERENCE_CUDA_FROZEN_BF16_DX_CUBLASLT",
+        true,
+    );
 }
 
 /// FP16 dense residency is an all-or-nothing route. If either the runtime
@@ -7089,6 +7114,69 @@ fn runCublasLtBf16Matmul(
         .heuristic => self.stats.bf16_cublaslt_tuning_heuristic_calls += 1,
     };
     return true;
+}
+
+fn runCublasLtBf16InputGradient(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    grad_output_bf16: buffer_mod.DeviceBuffer,
+    weight_bf16: buffer_mod.DeviceBuffer,
+    workspace: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    if (!cudaFrozenBf16InputGradientCublasLtEnabled()) return false;
+    const blas = &(self.cublaslt orelse return false);
+    const tuning = self.cublaslt_bf16_tuning_profile.tuningForRows(rows);
+    const selection = blas.matmulBf16WeightInputGradientF32OutWithTuning(
+        &self.ctx,
+        dst,
+        grad_output_bf16,
+        weight_bf16,
+        workspace,
+        rows,
+        in_dim,
+        out_dim,
+        tuning,
+    ) catch {
+        if (tuning.enabled) self.stats.bf16_cublaslt_tuning_api_fallbacks += 1;
+        return false;
+    };
+    if (tuning.enabled) switch (selection) {
+        .tuned => self.stats.bf16_cublaslt_tuning_tuned_calls += 1,
+        .heuristic => self.stats.bf16_cublaslt_tuning_heuristic_calls += 1,
+    };
+    self.stats.bf16_cublaslt_input_gradient_calls += 1;
+    return true;
+}
+
+fn tryCublasLtBf16InputGradient(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    grad_output: *const CudaTensor,
+    weight_bf16: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (!cudaFrozenBf16InputGradientCublasLtEnabled()) return false;
+    const grad_output_bf16 = try stageBf16ActivationForCublasLt(
+        self,
+        grad_output,
+        rows,
+        out_dim,
+    ) orelse return false;
+    return runCublasLtBf16InputGradient(
+        self,
+        dst,
+        grad_output_bf16,
+        weight_bf16,
+        cublasLtWorkspace(self),
+        rows,
+        in_dim,
+        out_dim,
+    );
 }
 
 fn tryCublasLtBf16Linear(
@@ -10616,6 +10704,23 @@ fn createTensorWithDTypeAndBf16Mirror(
 fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const tensor = tensorFromCt(tensor_ct);
+    if (tensor.quant_type == null and tensor.dtype == .i32 and (target == .i32 or target == .i64)) {
+        // CUDA has no native i64 graph tensor representation. Exact i32 token
+        // IDs are already a lossless representation for the i64 values used by
+        // embedding lookup (and cover the complete supported vocabulary range),
+        // so retain them on device instead of converting through host/f32.
+        // This must be an owning copy rather than a view: the interpreter frees
+        // the converted input handle at its last use and tracks handle aliases,
+        // not distinct handles that happen to share one device buffer.
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        const byte_len = try checkedMul(tensor.elem_count, @sizeOf(i32));
+        if (byte_len > tensor.buffer.len) return error.InvalidShape;
+        var device = try allocDeviceBuffer(self, byte_len);
+        errdefer device.free(&self.ctx);
+        try copyFromDeviceTracked(self, device, tensor.buffer, byte_len);
+        return createTensorWithDType(self, device, shape, tensor.elem_count, .i32);
+    }
     try ensureF32(tensor);
     const shape = try dupeShape(self.allocator, tensor.shape);
     errdefer self.allocator.free(shape);
@@ -10762,6 +10867,122 @@ fn trainingSumSquaresManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingSumS
 fn trainingSynchronizeOp(ctx: *anyopaque) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     try synchronizeAndDrainDeferredDeviceFrees(self);
+}
+
+const SelectedTiedHeadRows = struct {
+    f32_rows: buffer_mod.DeviceBuffer,
+    bf16_rows: buffer_mod.DeviceBuffer,
+
+    fn deinit(self: *SelectedTiedHeadRows, compute: *CudaCompute) void {
+        releaseDeviceBuffer(compute, &self.bf16_rows);
+        releaseDeviceBuffer(compute, &self.f32_rows);
+        self.* = undefined;
+    }
+};
+
+fn gatherSelectedTiedHeadRows(
+    self: *CudaCompute,
+    weight: *const CudaTensor,
+    token_ids: *const CudaTensor,
+    in_dim: usize,
+    vocab_size: usize,
+) !SelectedTiedHeadRows {
+    if (!isBf16Weight(weight) or weight.elem_count != try checkedMul(vocab_size, in_dim)) {
+        return error.UnsupportedTensorType;
+    }
+    try ensureF32(token_ids);
+    if (token_ids.elem_count != 2) return error.InvalidShape;
+    const selected_count = try checkedMul(2, in_dim);
+    var f32_rows = try allocDeviceBuffer(self, try checkedMul(selected_count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &f32_rows);
+    var bf16_rows = try allocDeviceBuffer(self, try checkedMul(selected_count, @sizeOf(u16)));
+    errdefer releaseDeviceBuffer(self, &bf16_rows);
+    try self.kernels.launchPrimitiveGatherBf16F32(
+        &self.ctx,
+        f32_rows,
+        weight.buffer,
+        token_ids.buffer,
+        selected_count,
+        weight.elem_count,
+        2,
+        vocab_size,
+        in_dim,
+    );
+    // Every BF16 value is exactly representable in F32, so this round trip
+    // reconstructs byte-identical selected rows while reusing the canonical
+    // conversion primitive used by the dense BF16 path.
+    try self.kernels.launchF32ToBf16(&self.ctx, bf16_rows, f32_rows, selected_count);
+    return .{ .f32_rows = f32_rows, .bf16_rows = bf16_rows };
+}
+
+fn selectedTiedHeadLogitsOp(ctx: *anyopaque, request: *const ops.SelectedTiedHeadLogitsRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!request.frozen_weight or request.in_dim == 0 or request.vocab_size == 0 or
+        try elementCountFromShape(request.output_shape) != 2)
+    {
+        return error.InvalidShape;
+    }
+    const hidden = tensorFromCt(request.hidden);
+    const weight = tensorFromCt(request.weight);
+    const token_ids = tensorFromCt(request.token_ids);
+    try ensureF32(hidden);
+    if (hidden.elem_count != request.in_dim) return error.InvalidShape;
+
+    var selected_rows = try gatherSelectedTiedHeadRows(self, weight, token_ids, request.in_dim, request.vocab_size);
+    defer selected_rows.deinit(self);
+    const hidden_bf16 = try stageBf16ActivationForCublasLt(self, hidden, 1, request.in_dim) orelse
+        return error.CublasLtUnsupported;
+    var output = try allocDeviceBuffer(self, 2 * @sizeOf(f32));
+    errdefer releaseDeviceBuffer(self, &output);
+    if (!runCublasLtBf16Matmul(
+        self,
+        output,
+        hidden_bf16,
+        selected_rows.bf16_rows,
+        cublasLtWorkspace(self),
+        1,
+        request.in_dim,
+        2,
+    )) return error.CublasLtUnsupported;
+    const output_shape = try self.allocator.dupe(i64, request.output_shape);
+    errdefer self.allocator.free(output_shape);
+    self.stats.selected_tied_head_forward_calls += 1;
+    return createTensor(self, output, output_shape, 2);
+}
+
+fn selectedTiedHeadBackwardOp(ctx: *anyopaque, request: *const ops.SelectedTiedHeadBackwardRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!request.frozen_weight or request.in_dim == 0 or request.vocab_size == 0 or
+        try elementCountFromShape(request.hidden_shape) != request.in_dim)
+    {
+        return error.InvalidShape;
+    }
+    const weight = tensorFromCt(request.weight);
+    const token_ids = tensorFromCt(request.token_ids);
+    const upstream = tensorFromCt(request.upstream);
+    try ensureF32(upstream);
+    if (upstream.elem_count != 2) return error.InvalidShape;
+
+    var selected_rows = try gatherSelectedTiedHeadRows(self, weight, token_ids, request.in_dim, request.vocab_size);
+    defer selected_rows.deinit(self);
+    const upstream_bf16 = try stageBf16ActivationForCublasLt(self, upstream, 1, 2) orelse
+        return error.CublasLtUnsupported;
+    var output = try allocDeviceBuffer(self, try checkedMul(request.in_dim, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &output);
+    if (!runCublasLtBf16InputGradient(
+        self,
+        output,
+        upstream_bf16,
+        selected_rows.bf16_rows,
+        cublasLtWorkspace(self),
+        1,
+        request.in_dim,
+        2,
+    )) return error.CublasLtUnsupported;
+    const output_shape = try self.allocator.dupe(i64, request.hidden_shape);
+    errdefer self.allocator.free(output_shape);
+    self.stats.selected_tied_head_backward_calls += 1;
+    return createTensor(self, output, output_shape, request.in_dim);
 }
 
 fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
@@ -10990,6 +11211,66 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input_ct: CT, target_shape: []const i64
     return createTensor(self, device, output_shape, output_count);
 }
 
+const BatchedDotGeneralPlan = struct {
+    batch_count: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_contract_last: bool,
+    rhs_contract_last: bool,
+};
+
+fn planBatchedDotGeneral(
+    lhs_shape: []const i64,
+    rhs_shape: []const i64,
+    lhs_contracting: []const u8,
+    rhs_contracting: []const u8,
+    lhs_batch: []const u8,
+    rhs_batch: []const u8,
+) !BatchedDotGeneralPlan {
+    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return error.UnsupportedShape;
+    if (lhs_batch.len == 0 or lhs_batch.len != rhs_batch.len) return error.UnsupportedShape;
+    if (lhs_shape.len != rhs_shape.len or lhs_shape.len != lhs_batch.len + 2 or lhs_shape.len > 8) {
+        return error.UnsupportedShape;
+    }
+
+    const rank = lhs_shape.len;
+    const matrix_axis0 = rank - 2;
+    const matrix_axis1 = rank - 1;
+    const lhs_contract_axis: usize = lhs_contracting[0];
+    const rhs_contract_axis: usize = rhs_contracting[0];
+    if ((lhs_contract_axis != matrix_axis0 and lhs_contract_axis != matrix_axis1) or
+        (rhs_contract_axis != matrix_axis0 and rhs_contract_axis != matrix_axis1))
+    {
+        return error.UnsupportedShape;
+    }
+    const lhs_free_axis = if (lhs_contract_axis == matrix_axis0) matrix_axis1 else matrix_axis0;
+    const rhs_free_axis = if (rhs_contract_axis == matrix_axis0) matrix_axis1 else matrix_axis0;
+
+    var batch_count: usize = 1;
+    for (lhs_batch, 0..) |lhs_axis, idx| {
+        const rhs_axis = rhs_batch[idx];
+        if (lhs_axis != idx or rhs_axis != idx) return error.UnsupportedShape;
+        const batch_dim = lhs_shape[idx];
+        if (batch_dim <= 0 or rhs_shape[idx] != batch_dim) return error.InvalidShape;
+        batch_count = try checkedMul(batch_count, @intCast(batch_dim));
+    }
+
+    const m_i64 = lhs_shape[lhs_free_axis];
+    const k_i64 = lhs_shape[lhs_contract_axis];
+    const rhs_k_i64 = rhs_shape[rhs_contract_axis];
+    const n_i64 = rhs_shape[rhs_free_axis];
+    if (m_i64 <= 0 or k_i64 <= 0 or n_i64 <= 0 or rhs_k_i64 != k_i64) return error.InvalidShape;
+    return .{
+        .batch_count = batch_count,
+        .m = @intCast(m_i64),
+        .n = @intCast(n_i64),
+        .k = @intCast(k_i64),
+        .lhs_contract_last = lhs_contract_axis == matrix_axis1,
+        .rhs_contract_last = rhs_contract_axis == matrix_axis1,
+    };
+}
+
 fn primDotGeneralOp(
     ctx: *anyopaque,
     lhs_ct: CT,
@@ -11005,47 +11286,29 @@ fn primDotGeneralOp(
     const lhs = tensorFromCt(lhs_ct);
     const rhs = tensorFromCt(rhs_ct);
     try ensureF32(lhs);
-    try ensureF32(rhs);
     if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return error.UnsupportedShape;
+    const rhs_bf16 = isBf16Weight(rhs);
 
     if (lhs_batch.len != 0 or rhs_batch.len != 0) {
-        if (lhs_batch.len == 0 or lhs_batch.len != rhs_batch.len) return error.UnsupportedShape;
-        if (lhs.shape.len != rhs.shape.len or lhs.shape.len != lhs_batch.len + 2) return error.UnsupportedShape;
+        try ensureF32(rhs);
         if (lhs_shape.len != lhs.shape.len or rhs_shape.len != rhs.shape.len or lhs.shape.len > 8) return error.UnsupportedShape;
-
-        const rank = lhs.shape.len;
-        const m_axis = rank - 2;
-        const k_axis = rank - 1;
-        if (lhs_contracting[0] != k_axis) return error.UnsupportedShape;
-        const rhs_contract_axis: usize = rhs_contracting[0];
-        if (rhs_contract_axis != m_axis and rhs_contract_axis != k_axis) return error.UnsupportedShape;
-
-        var batch_count: usize = 1;
-        for (lhs_batch, 0..) |lhs_axis, idx| {
-            const rhs_axis = rhs_batch[idx];
-            if (lhs_axis != idx or rhs_axis != idx) return error.UnsupportedShape;
-            const batch_dim = lhs.shape[idx];
-            if (batch_dim <= 0 or rhs.shape[idx] != batch_dim) return error.InvalidShape;
-            batch_count = try checkedMul(batch_count, @intCast(batch_dim));
-        }
-
-        const m_i64 = lhs.shape[m_axis];
-        const k_i64 = lhs.shape[k_axis];
-        const rhs_k_i64 = rhs.shape[rhs_contract_axis];
-        const rhs_free_axis = if (rhs_contract_axis == k_axis) m_axis else k_axis;
-        const n_i64 = rhs.shape[rhs_free_axis];
-        if (m_i64 <= 0 or k_i64 <= 0 or n_i64 <= 0 or rhs_k_i64 != k_i64) return error.InvalidShape;
-        const m: usize = @intCast(m_i64);
-        const k: usize = @intCast(k_i64);
-        const n: usize = @intCast(n_i64);
-        const lhs_count = try checkedMul(try checkedMul(batch_count, m), k);
-        const rhs_count = try checkedMul(try checkedMul(batch_count, n), k);
+        const plan = try planBatchedDotGeneral(
+            lhs.shape,
+            rhs.shape,
+            lhs_contracting,
+            rhs_contracting,
+            lhs_batch,
+            rhs_batch,
+        );
+        const lhs_count = try checkedMul(try checkedMul(plan.batch_count, plan.m), plan.k);
+        const rhs_count = try checkedMul(try checkedMul(plan.batch_count, plan.n), plan.k);
         if (lhs.elem_count != lhs_count or rhs.elem_count != rhs_count) return error.InvalidShape;
-        const output_count = try checkedMul(try checkedMul(batch_count, m), n);
+        const output_count = try checkedMul(try checkedMul(plan.batch_count, plan.m), plan.n);
 
         const output_shape = try dupeShape(self.allocator, lhs.shape);
         errdefer self.allocator.free(output_shape);
-        output_shape[k_axis] = n_i64;
+        output_shape[output_shape.len - 2] = @intCast(plan.m);
+        output_shape[output_shape.len - 1] = @intCast(plan.n);
         var output_device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
         errdefer output_device.free(&self.ctx);
         try self.kernels.launchPrimitiveBatchedDotF32(
@@ -11053,11 +11316,12 @@ fn primDotGeneralOp(
             output_device,
             lhs.buffer,
             rhs.buffer,
-            batch_count,
-            m,
-            n,
-            k,
-            rhs_contract_axis == k_axis,
+            plan.batch_count,
+            plan.m,
+            plan.n,
+            plan.k,
+            plan.lhs_contract_last,
+            plan.rhs_contract_last,
         );
         self.stats.launch_linear += 1;
         return createTensor(self, output_device, output_shape, output_count);
@@ -11066,18 +11330,76 @@ fn primDotGeneralOp(
     if (lhs.shape.len < 2 or lhs.shape.len > 8 or rhs.shape.len != 2 or lhs_shape.len != lhs.shape.len or rhs_shape.len != 2) return error.UnsupportedShape;
     const lhs_axis = lhs_contracting[0];
     const rhs_axis = rhs_contracting[0];
-    if (lhs_axis != lhs.shape.len - 1 or rhs_axis > 1) return error.UnsupportedShape;
+    if (lhs_axis >= lhs.shape.len or rhs_axis > 1) return error.UnsupportedShape;
     const k_i64 = lhs.shape[lhs_axis];
     if (k_i64 <= 0 or rhs.shape[rhs_axis] != k_i64) return error.InvalidShape;
     const k: usize = @intCast(k_i64);
     const n_i64 = rhs.shape[1 - rhs_axis];
     if (n_i64 <= 0) return error.InvalidShape;
     const n: usize = @intCast(n_i64);
+
+    // Weight VJPs naturally contract the first axis of rank-2 tensors:
+    // dW = dY^T @ X. Route that physical layout through the same generic
+    // batched-dot kernel instead of materializing two transposes.
+    if (lhs_axis != lhs.shape.len - 1) {
+        if (lhs.shape.len != 2 or lhs_axis != 0 or rhs_bf16) return error.UnsupportedShape;
+        try ensureF32(rhs);
+        const m_i64 = lhs.shape[1];
+        if (m_i64 <= 0) return error.InvalidShape;
+        const m: usize = @intCast(m_i64);
+        if (lhs.elem_count != try checkedMul(k, m) or rhs.elem_count != try checkedMul(k, n)) return error.InvalidShape;
+        const output_count = try checkedMul(m, n);
+        const output_shape = try self.allocator.dupe(i64, &.{ m_i64, n_i64 });
+        errdefer self.allocator.free(output_shape);
+        var output_device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
+        errdefer output_device.free(&self.ctx);
+        try self.kernels.launchPrimitiveBatchedDotF32(
+            &self.ctx,
+            output_device,
+            lhs.buffer,
+            rhs.buffer,
+            1,
+            m,
+            n,
+            k,
+            false,
+            rhs_axis == 1,
+        );
+        self.stats.launch_linear += 1;
+        return createTensor(self, output_device, output_shape, output_count);
+    }
     var rows: usize = 1;
     for (lhs.shape[0..lhs_axis]) |dim| {
         if (dim <= 0) return error.InvalidShape;
         rows = try checkedMul(rows, @intCast(dim));
     }
+
+    if (rhs_bf16 and rhs_axis == 0) {
+        if (lhs.elem_count != try checkedMul(rows, k) or
+            rhs.elem_count != try checkedMul(k, n)) return error.InvalidShape;
+        const output_count = try checkedMul(rows, n);
+        const output_shape = try self.allocator.alloc(i64, lhs_axis + 1);
+        errdefer self.allocator.free(output_shape);
+        for (lhs.shape[0..lhs_axis], 0..) |dim, idx| output_shape[idx] = dim;
+        output_shape[lhs_axis] = n_i64;
+        var output_device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
+        errdefer output_device.free(&self.ctx);
+        if (!try tryCublasLtBf16InputGradient(
+            self,
+            output_device,
+            lhs,
+            rhs.buffer,
+            rows,
+            n,
+            k,
+        )) {
+            self.stats.bf16_cublaslt_input_gradient_rejections += 1;
+            return error.CublasLtUnsupported;
+        }
+        self.stats.launch_linear += 1;
+        return createTensor(self, output_device, output_shape, output_count);
+    }
+    if (!rhs_bf16) try ensureF32(rhs);
 
     var transposed_rhs: ?CT = null;
     defer if (transposed_rhs) |tensor| freeTensor(ctx, tensor);
@@ -11122,6 +11444,45 @@ fn primLogSoftmaxOp(ctx: *anyopaque, input: CT, last_dim: u32) anyerror!CT {
     return primitiveSoftmaxOp(ctx, input, last_dim, true);
 }
 
+fn selectedTokenLogprobsOp(
+    ctx: *anyopaque,
+    logits_ct: CT,
+    row_indices: []const u32,
+    token_ids: []const u32,
+    rows: usize,
+    vocab_size: usize,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const logits = tensorFromCt(logits_ct);
+    try ensureF32(logits);
+    if (row_indices.len == 0 or row_indices.len != token_ids.len or rows == 0 or vocab_size == 0) return error.InvalidShape;
+    if (logits.shape.len != 2 or logits.shape[0] != @as(i64, @intCast(rows)) or logits.shape[1] != @as(i64, @intCast(vocab_size))) {
+        return error.InvalidShape;
+    }
+    if (logits.elem_count != try checkedMul(rows, vocab_size)) return error.InvalidShape;
+    for (row_indices, token_ids) |row, token| {
+        if (@as(usize, row) >= rows or @as(usize, token) >= vocab_size) return error.InvalidTensorIndex;
+    }
+
+    const index_buffers = try uploadTempU32Pair(self, row_indices, token_ids);
+    const shape = try self.allocator.alloc(i64, 1);
+    errdefer self.allocator.free(shape);
+    shape[0] = @intCast(row_indices.len);
+    var device = try allocDeviceBuffer(self, row_indices.len * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchSelectedTokenLogprobsF32(
+        &self.ctx,
+        device,
+        logits.buffer,
+        index_buffers.first,
+        index_buffers.second,
+        row_indices.len,
+        rows,
+        vocab_size,
+    );
+    return createTensor(self, device, shape, row_indices.len);
+}
+
 fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT {
     errdefer self.allocator.free(data);
     const elem_count = data.len;
@@ -11149,7 +11510,6 @@ fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT 
 fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
-    try ensureF32(input_tensor);
 
     var elem_count: usize = 1;
     for (new_shape) |dim| {
@@ -11163,10 +11523,17 @@ fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
 
     const shape = try self.allocator.dupe(i64, new_shape);
     errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    // Graph values use independent tensor handles and the interpreter may free
+    // an owned input at its last use. Preserve that ownership contract with an
+    // exact device copy, but retain the source dtype: token IDs are native i32
+    // on CUDA and BF16 activations must not be reinterpreted as four-byte f32.
+    if (input_tensor.quant_type != null) return error.UnsupportedTensorType;
+    const byte_len = try checkedMul(input_tensor.elem_count, input_tensor.dtype.byteSize());
+    if (byte_len > input_tensor.buffer.len) return error.InvalidShape;
+    var device = try allocDeviceBuffer(self, byte_len);
     errdefer device.free(&self.ctx);
-    try copyFromDeviceTracked(self, device, input_tensor.buffer, input_tensor.elem_count * @sizeOf(f32));
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    try copyFromDeviceTracked(self, device, input_tensor.buffer, byte_len);
+    return createTensorWithDType(self, device, shape, input_tensor.elem_count, input_tensor.dtype);
 }
 
 fn reshape2DOp(
@@ -11179,7 +11546,6 @@ fn reshape2DOp(
 ) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
-    try ensureF32(input_tensor);
     const new_count = try std.math.mul(usize, new_rows, new_cols);
     if (new_count != input_tensor.elem_count) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=reshape2D input_elems={d} new_rows={d} new_cols={d}", .{ input_tensor.elem_count, new_rows, new_cols });
@@ -11202,6 +11568,8 @@ fn reshape2DOp(
         .elem_count = input_tensor.elem_count,
         .quant_type = input_tensor.quant_type,
         .owns_buffer = false,
+        .owns_bf16_mirror = false,
+        .owns_training_upload_host = false,
         .owns_shape = true,
     };
     return tensor;
@@ -11627,7 +11995,7 @@ fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_s
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input = tensorFromCt(input_ct);
     const indices = tensorFromCt(indices_ct);
-    try ensureF32(input);
+    const input_route = try primitiveGatherInputRoute(input);
     try ensureF32(indices);
     const rank = input.shape.len;
     const axis_index: usize = axis;
@@ -11686,18 +12054,35 @@ fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_s
     const output_count = try checkedMul(try checkedMul(prefix_count, indices.elem_count), suffix_size);
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchPrimitiveGatherF32(
-        &self.ctx,
-        device,
-        input.buffer,
-        indices.buffer,
-        output_count,
-        input.elem_count,
-        indices.elem_count,
-        axis_extent,
-        suffix_size,
-    );
-    return createTensor(self, device, output_shape, output_count);
+    switch (input_route) {
+        .f32 => try self.kernels.launchPrimitiveGatherF32(
+            &self.ctx,
+            device,
+            input.buffer,
+            indices.buffer,
+            output_count,
+            input.elem_count,
+            indices.elem_count,
+            axis_extent,
+            suffix_size,
+        ),
+        .bf16_to_f32 => try self.kernels.launchPrimitiveGatherBf16F32(
+            &self.ctx,
+            device,
+            input.buffer,
+            indices.buffer,
+            output_count,
+            input.elem_count,
+            indices.elem_count,
+            axis_extent,
+            suffix_size,
+        ),
+    }
+    // Primitive graph activations and all gather/scatter VJPs are F32 even
+    // when a frozen resident table is stored as BF16. The BF16 kernel widens
+    // each selected value exactly while gathering; do not tag this output as
+    // BF16 merely because its source table is BF16.
+    return createTensorWithDType(self, device, output_shape, output_count, primitiveGatherOutputDType(input_route));
 }
 
 fn primScatterAddOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, input_shape: []const i64, output_shape_declared: []const i64, axis: u8) anyerror!CT {
@@ -11859,6 +12244,24 @@ fn ensureF32(tensor: *const CudaTensor) !void {
     }
 }
 
+const PrimitiveGatherInputRoute = enum {
+    f32,
+    bf16_to_f32,
+};
+
+fn primitiveGatherInputRoute(tensor: *const CudaTensor) !PrimitiveGatherInputRoute {
+    if (tensor.quant_type != null) return error.UnsupportedTensorType;
+    return switch (tensor.dtype) {
+        .f32 => .f32,
+        .bf16 => .bf16_to_f32,
+        else => error.UnsupportedTensorType,
+    };
+}
+
+fn primitiveGatherOutputDType(_: PrimitiveGatherInputRoute) tensor_mod.DType {
+    return .f32;
+}
+
 fn florenceTailWeightDTypeCode(tensor: *const CudaTensor) !u32 {
     if (tensor.quant_type != null) return error.UnsupportedTensorType;
     return switch (tensor.dtype) {
@@ -11943,6 +12346,26 @@ test "cuda quant plan format mirrors graph quant tensor mapping" {
         };
         try std.testing.expectEqual(case.format, quantPlanFormatForTensor(&tensor));
     }
+}
+
+test "CUDA primitive gather widens BF16 tables to F32 activations" {
+    var shape = [_]i64{ 4, 8 };
+    var tensor = CudaTensor{
+        .buffer = .{},
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 32,
+    };
+    try std.testing.expectEqual(PrimitiveGatherInputRoute.f32, try primitiveGatherInputRoute(&tensor));
+    try std.testing.expectEqual(tensor_mod.DType.f32, primitiveGatherOutputDType(.f32));
+    tensor.dtype = .bf16;
+    try std.testing.expectEqual(PrimitiveGatherInputRoute.bf16_to_f32, try primitiveGatherInputRoute(&tensor));
+    try std.testing.expectEqual(tensor_mod.DType.f32, primitiveGatherOutputDType(.bf16_to_f32));
+    tensor.dtype = .f16;
+    try std.testing.expectError(error.UnsupportedTensorType, primitiveGatherInputRoute(&tensor));
+    tensor.dtype = .f32;
+    tensor.quant_type = .{ .known = .Q4_0 };
+    try std.testing.expectError(error.UnsupportedTensorType, primitiveGatherInputRoute(&tensor));
 }
 
 fn cudaAllowPlannedFallback() bool {
@@ -12265,8 +12688,7 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
     const ids_tensor = tensorFromCt(ids);
-    if (isBf16Weight(weight_tensor)) return null;
-    try ensureF32F16OrQuantized(weight_tensor);
+    try ensureF32F16Bf16OrQuantized(weight_tensor);
     if (ids_tensor.dtype != .i32 or ids_tensor.quant_type != null) return null;
     if (ids_tensor.elem_count != total) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding_tensor ids_elems={d} total={d}", .{ ids_tensor.elem_count, total });
@@ -12295,6 +12717,8 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
             },
             else => return error.UnsupportedTensorType,
         }
+    } else if (isBf16Weight(weight_tensor)) {
+        try self.kernels.launchEmbeddingLookupI32Bf16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     } else if (isF16Weight(weight_tensor)) {
         try self.kernels.launchEmbeddingLookupI32F16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     } else {
@@ -19327,6 +19751,10 @@ fn trainingRuntimeStatsOp(ctx: *anyopaque) ops.TrainingRuntimeStats {
         .h2d_bytes = @intCast(stats.h2d_bytes),
         .d2h_bytes = @intCast(stats.d2h_bytes),
         .largest_d2h_transfer_bytes = @intCast(largest_d2h_transfer),
+        .download_events = @intCast(stats.download_events),
+        .download_event_bytes = @intCast(stats.download_event_bytes),
+        .download_last_bytes = @intCast(stats.download_last_bytes),
+        .download_previous_bytes = @intCast(stats.download_previous_bytes),
         .to_float32_calls = @intCast(stats.to_float32_calls),
         .download_alloc_calls = @intCast(stats.download_alloc_calls),
         .stream_synchronizations = @intCast(stats.stream_syncs),
@@ -22390,6 +22818,9 @@ const vtable = ops.ComputeBackend.VTable{
     .concatPrimOp = &primConcatPrimOp,
     .softmaxOp = &primSoftmaxOp,
     .logSoftmaxOp = &primLogSoftmaxOp,
+    .selectedTokenLogprobs = &selectedTokenLogprobsOp,
+    .selectedTiedHeadLogits = &selectedTiedHeadLogitsOp,
+    .selectedTiedHeadBackward = &selectedTiedHeadBackwardOp,
     .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
     .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
     .debugCudaDeviceWarmup = &debugCudaDeviceWarmup,
@@ -22426,6 +22857,90 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+}
+
+test "cuda batched dot plan supports every attention matrix-axis layout" {
+    const last_last = try planBatchedDotGeneral(
+        &.{ 1, 8, 32, 256 },
+        &.{ 1, 8, 32, 256 },
+        &.{3},
+        &.{3},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    try std.testing.expectEqual(@as(usize, 8), last_last.batch_count);
+    try std.testing.expectEqual(@as(usize, 32), last_last.m);
+    try std.testing.expectEqual(@as(usize, 32), last_last.n);
+    try std.testing.expectEqual(@as(usize, 256), last_last.k);
+    try std.testing.expect(last_last.lhs_contract_last);
+    try std.testing.expect(last_last.rhs_contract_last);
+
+    const last_first = try planBatchedDotGeneral(
+        &.{ 1, 8, 32, 32 },
+        &.{ 1, 8, 32, 512 },
+        &.{3},
+        &.{2},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    try std.testing.expectEqual(@as(usize, 32), last_first.m);
+    try std.testing.expectEqual(@as(usize, 512), last_first.n);
+    try std.testing.expectEqual(@as(usize, 32), last_first.k);
+    try std.testing.expect(last_first.lhs_contract_last);
+    try std.testing.expect(!last_first.rhs_contract_last);
+
+    const first_last = try planBatchedDotGeneral(
+        &.{ 1, 8, 32, 512 },
+        &.{ 1, 8, 256, 32 },
+        &.{2},
+        &.{3},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    try std.testing.expectEqual(@as(usize, 512), first_last.m);
+    try std.testing.expectEqual(@as(usize, 256), first_last.n);
+    try std.testing.expectEqual(@as(usize, 32), first_last.k);
+    try std.testing.expect(!first_last.lhs_contract_last);
+    try std.testing.expect(first_last.rhs_contract_last);
+
+    // dV = probabilities^T @ dOut contracts the sequence axis in physical
+    // matrix-axis 0 on both operands and must not materialize transposes.
+    const first_first = try planBatchedDotGeneral(
+        &.{ 1, 8, 32, 32 },
+        &.{ 1, 8, 32, 512 },
+        &.{2},
+        &.{2},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    try std.testing.expectEqual(@as(usize, 32), first_first.m);
+    try std.testing.expectEqual(@as(usize, 512), first_first.n);
+    try std.testing.expectEqual(@as(usize, 32), first_first.k);
+    try std.testing.expect(!first_first.lhs_contract_last);
+    try std.testing.expect(!first_first.rhs_contract_last);
+
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        planBatchedDotGeneral(
+            &.{ 1, 8, 32, 32 },
+            &.{ 1, 8, 32, 512 },
+            &.{2},
+            &.{2},
+            &.{ 1, 0 },
+            &.{ 0, 1 },
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidShape,
+        planBatchedDotGeneral(
+            &.{ 1, 8, 31, 32 },
+            &.{ 1, 8, 32, 512 },
+            &.{2},
+            &.{2},
+            &.{ 0, 1 },
+            &.{ 0, 1 },
+        ),
+    );
 }
 
 test "cuda A4B resident workspace is bounded for the qualified geometry" {
