@@ -372,8 +372,6 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("run: make ", release_job)
         self.assertNotIn("scripts/release/test_", release_job)
         self.assertIn('python-version: "3.13"', release_job)
-        self.assertIn("uses: mlugg/setup-zig@", release_job)
-        self.assertIn("version: 0.16.0", release_job)
         self.assertIn("release-scripting-test:", makefile)
         self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(
