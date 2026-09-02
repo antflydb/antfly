@@ -29,10 +29,22 @@ const reallocation_request = @import("reallocation_request.zig");
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
+/// Allocation-free subset of `/status` used by rolling-upgrade admission
+/// probes. Keeping this separate from MetadataStatus avoids parsing and
+/// retaining unrelated status strings on every table DDL operation.
+pub const TableTopologyProtocolStatus = struct {
+    metadata_group_id: u64,
+    table_topology_protocol_version: u16 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    metadata_raft_local_node_id: u64 = 0,
+};
+
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
     /// Zero means the peer predates the causal reallocation barrier.
     reallocation_barrier_protocol_version: u16 = 0,
+    /// Zero means the peer cannot decode atomic table-topology transitions.
+    table_topology_protocol_version: u16 = 0,
     /// Maximum embedded runtime-status record version this replica can apply;
     /// zero means the peer predates rolling-safe format negotiation.
     runtime_status_record_version: u16 = 0,
@@ -158,6 +170,11 @@ pub const MetadataHead = struct {
     metadata_group_id: u64,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
+};
+
+pub const CatalogIdentity = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
 };
 
 pub const catalog_routing_protocol_current: u16 = 2;
@@ -472,6 +489,22 @@ pub const CatalogPublicationContract = struct {
     }
 };
 
+/// Exact authorization request for deleting local storage paths left behind by
+/// a committed table drop. Group ownership is the destructive-action fence;
+/// table-name presence is returned separately so a replacement incarnation can
+/// coexist while cleanup reclaims only the old groups.
+pub const CatalogGroupRetirementContract = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
+    table_name: []const u8,
+    group_ids: []const u64,
+};
+
+pub const CatalogGroupRetirementValidation = struct {
+    group_ids_unowned: bool,
+    table_name_absent: bool,
+};
+
 pub const CatalogTableTopology = struct {
     range_count: u64,
     digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
@@ -481,6 +514,7 @@ pub const CatalogTableTopology = struct {
 /// linear in the projection size; publication checks are constant time.
 pub const CatalogProjectionIndex = struct {
     table_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    table_name_indexes: std.StringHashMapUnmanaged(usize) = .empty,
     range_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     table_topologies: std.AutoHashMapUnmanaged(u64, CatalogTableTopology) = .empty,
 
@@ -502,6 +536,7 @@ pub const CatalogProjectionIndex = struct {
         var self: CatalogProjectionIndex = .{};
         errdefer self.deinit(alloc);
         try self.table_indexes.ensureTotalCapacity(alloc, @intCast(tables.len));
+        try self.table_name_indexes.ensureTotalCapacity(alloc, @intCast(tables.len));
         try self.range_indexes.ensureTotalCapacity(alloc, @intCast(ranges.len));
         try self.table_topologies.ensureTotalCapacity(alloc, @intCast(tables.len));
 
@@ -509,6 +544,7 @@ pub const CatalogProjectionIndex = struct {
             try catalogProjectionCheckpoint(deadline_ns, index);
             if (self.table_indexes.contains(table.table_id)) return error.InvalidCatalogProjection;
             self.table_indexes.putAssumeCapacity(table.table_id, index);
+            self.table_name_indexes.putAssumeCapacity(table.name, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
                 .range_count = 0,
                 .digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
@@ -541,6 +577,7 @@ pub const CatalogProjectionIndex = struct {
 
     pub fn deinit(self: *CatalogProjectionIndex, alloc: std.mem.Allocator) void {
         self.table_indexes.deinit(alloc);
+        self.table_name_indexes.deinit(alloc);
         self.range_indexes.deinit(alloc);
         self.table_topologies.deinit(alloc);
         self.* = .{};
@@ -576,6 +613,33 @@ pub const CatalogProjectionIndex = struct {
         const topology = self.table_topologies.get(contract.table_id) orelse return false;
         return topology.range_count == contract.topology.range_count and
             std.crypto.timing_safe.eql(@TypeOf(topology.digest), topology.digest, contract.topology.digest);
+    }
+
+    pub fn validateGroupRetirement(
+        self: *const CatalogProjectionIndex,
+        contract: CatalogGroupRetirementContract,
+        metadata_group_id: u64,
+        incarnation_value: ?MetadataClusterIncarnation,
+    ) CatalogGroupRetirementValidation {
+        if (!catalogIdentityMatches(
+            contract.metadata_group_id,
+            contract.metadata_incarnation,
+            metadata_group_id,
+            incarnation_value,
+        )) return .{ .group_ids_unowned = false, .table_name_absent = false };
+
+        for (contract.group_ids) |group_id| {
+            if (self.range_indexes.contains(group_id)) {
+                return .{
+                    .group_ids_unowned = false,
+                    .table_name_absent = !self.table_name_indexes.contains(contract.table_name),
+                };
+            }
+        }
+        return .{
+            .group_ids_unowned = true,
+            .table_name_absent = !self.table_name_indexes.contains(contract.table_name),
+        };
     }
 };
 
@@ -825,6 +889,37 @@ test "catalog table topology is order independent and detects range mutation" {
         .indexes_json = "{}",
         .range = ranges[1],
     }, snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation, snapshot.tables, snapshot.ranges));
+
+    const retirement_contract = CatalogGroupRetirementContract{
+        .metadata_group_id = 1,
+        .metadata_incarnation = incarnation,
+        .table_name = "retired-docs",
+        .group_ids = &.{ 41, 12 },
+    };
+    const owned_validation = projection_index.validateGroupRetirement(
+        retirement_contract,
+        snapshot.status.metadata_group_id,
+        snapshot.status.metadata_incarnation,
+    );
+    try std.testing.expect(!owned_validation.group_ids_unowned);
+    try std.testing.expect(owned_validation.table_name_absent);
+
+    const retired_validation = projection_index.validateGroupRetirement(.{
+        .metadata_group_id = 1,
+        .metadata_incarnation = incarnation,
+        .table_name = "docs",
+        .group_ids = &.{41},
+    }, snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation);
+    try std.testing.expect(retired_validation.group_ids_unowned);
+    try std.testing.expect(!retired_validation.table_name_absent);
+
+    const wrong_cluster = projection_index.validateGroupRetirement(
+        retirement_contract,
+        2,
+        snapshot.status.metadata_incarnation,
+    );
+    try std.testing.expect(!wrong_cluster.group_ids_unowned);
+    try std.testing.expect(!wrong_cluster.table_name_absent);
 
     snapshot.ranges = @constCast(changed[0..]);
     try std.testing.expect(!contract.matches(&snapshot));

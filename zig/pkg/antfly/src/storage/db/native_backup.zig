@@ -1873,6 +1873,8 @@ test "native generation validation honors restore cancellation before materializ
 }
 
 test "native generated pin rejects in-place artifact mutation" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
     const alloc = std.testing.allocator;
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();

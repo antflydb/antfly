@@ -102448,6 +102448,8 @@ test "db native snapshot exports self-contained generation" {
 }
 
 test "db native snapshot rejects projections without immutable checkpoints" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -102481,6 +102483,8 @@ test "db native snapshot rejects projections without immutable checkpoints" {
 }
 
 test "db native snapshot rejects storage without atomic host generation publication" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -103066,6 +103070,8 @@ test "db native deferred restore preserves generated dense generation without em
 }
 
 test "db native restore rejects a primary revision outside the manifest generation" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
     const alloc = std.testing.allocator;
     var source_buf: [256]u8 = undefined;
     const source_path = tempPath(&source_buf);

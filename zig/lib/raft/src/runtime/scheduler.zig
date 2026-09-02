@@ -25,6 +25,26 @@ pub const VirtualTime = struct {
     now_ms: u64 = 0,
 };
 
+pub const QuarantineReason = enum {
+    outbound_ready_too_large,
+    apply_ready_too_large,
+};
+
+/// Operator-visible state for a group stopped by a non-retryable host safety
+/// invariant. The payload is allocation-free and remains available until an
+/// explicit operator resume or group removal.
+pub const GroupQuarantine = struct {
+    /// Monotonic process-local incident identity used to fence operator
+    /// acknowledgements. Zero is never issued.
+    incident_id: u64,
+    reason: QuarantineReason,
+    observed_bytes: usize,
+    configured_limit: usize,
+    first_observed_round: u64,
+    last_observed_round: u64,
+    occurrences: u64 = 1,
+};
+
 pub const Scheduler = struct {
     const QueueLinks = struct {
         prev: ?core.types.GroupId = null,
@@ -34,6 +54,7 @@ pub const Scheduler = struct {
 
     const GroupState = struct {
         quiesced: bool = false,
+        quarantine: ?GroupQuarantine = null,
         ready_visit_epoch: u64 = 0,
         fair_ready: QueueLinks = .{},
         continuation_ready: QueueLinks = .{},
@@ -67,6 +88,8 @@ pub const Scheduler = struct {
     fair_ready: ReadyQueue = .{},
     continuation_ready: ReadyQueue = .{},
     active_group_count: usize = 0,
+    quarantined_group_count: usize = 0,
+    next_quarantine_incident_id: u64 = 1,
     ready_epoch: u64 = 0,
     ready_pass_active: bool = false,
     cursor: usize = 0,
@@ -104,6 +127,7 @@ pub const Scheduler = struct {
             _ = self.group_ids.orderedRemove(i);
             _ = self.groups.remove(group_id);
             if (!state.quiesced) self.active_group_count -= 1;
+            if (state.quarantine != null) self.quarantined_group_count -= 1;
             if (self.group_ids.items.len == 0) {
                 self.cursor = 0;
                 self.ready_cursor = 0;
@@ -194,10 +218,94 @@ pub const Scheduler = struct {
         self.removeQueuedGroup(group_id);
     }
 
+    /// Quarantine a group whose Ready output violated a host safety limit.
+    /// Unlike ordinary quiescence, traffic must not implicitly resume it: the
+    /// offending Ready remains present until an operator explicitly resumes or
+    /// removes the group after correcting the underlying condition.
+    pub fn quarantineGroup(
+        self: *Scheduler,
+        group_id: core.types.GroupId,
+        reason: QuarantineReason,
+        observed_bytes: usize,
+        configured_limit: usize,
+    ) !void {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return error.UnknownGroup;
+        if (state.quarantine) |*existing| {
+            if (existing.reason != reason) {
+                const incident_id = self.takeQuarantineIncidentId();
+                existing.* = .{
+                    .incident_id = incident_id,
+                    .reason = reason,
+                    .observed_bytes = observed_bytes,
+                    .configured_limit = configured_limit,
+                    .first_observed_round = self.time.round,
+                    .last_observed_round = self.time.round,
+                };
+            } else {
+                existing.observed_bytes = observed_bytes;
+                existing.configured_limit = configured_limit;
+                existing.last_observed_round = self.time.round;
+                existing.occurrences +|= 1;
+            }
+        } else {
+            const incident_id = self.takeQuarantineIncidentId();
+            self.quarantined_group_count += 1;
+            state.quarantine = .{
+                .incident_id = incident_id,
+                .reason = reason,
+                .observed_bytes = observed_bytes,
+                .configured_limit = configured_limit,
+                .first_observed_round = self.time.round,
+                .last_observed_round = self.time.round,
+            };
+        }
+        if (state.quiesced) return;
+        state.quiesced = true;
+        self.active_group_count -= 1;
+        self.removeQueuedGroup(group_id);
+    }
+
+    fn takeQuarantineIncidentId(self: *Scheduler) u64 {
+        const incident_id = self.next_quarantine_incident_id;
+        self.next_quarantine_incident_id +%= 1;
+        if (self.next_quarantine_incident_id == 0) self.next_quarantine_incident_id = 1;
+        return incident_id;
+    }
+
     pub fn resumeGroup(self: *Scheduler, group_id: core.types.GroupId) bool {
         std.debug.assert(!self.ready_pass_active);
         const state = self.groups.getPtr(group_id) orelse return false;
+        if (state.quarantine != null) self.quarantined_group_count -= 1;
+        state.quarantine = null;
         if (!state.quiesced) return false;
+        state.quiesced = false;
+        self.active_group_count += 1;
+        return true;
+    }
+
+    /// Clears a quarantine only when the caller acknowledges the currently
+    /// observed incident. This makes retries idempotent without allowing a
+    /// delayed operator request to clear a newer safety violation.
+    pub fn resumeQuarantinedGroup(
+        self: *Scheduler,
+        group_id: core.types.GroupId,
+        expected_incident_id: u64,
+    ) !bool {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return error.UnknownGroup;
+        const quarantine = state.quarantine orelse return error.GroupNotQuarantined;
+        if (quarantine.incident_id != expected_incident_id)
+            return error.QuarantineIncidentChanged;
+        return self.resumeGroup(group_id);
+    }
+
+    /// Resume ordinary idle quiescence in response to traffic. Hard-limit
+    /// quarantines require the explicit resumeGroup path instead.
+    pub fn resumeGroupOnActivity(self: *Scheduler, group_id: core.types.GroupId) bool {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return false;
+        if (state.quarantine != null or !state.quiesced) return false;
         state.quiesced = false;
         self.active_group_count += 1;
         return true;
@@ -208,8 +316,21 @@ pub const Scheduler = struct {
         return state.quiesced;
     }
 
+    pub fn isHardQuarantined(self: *const Scheduler, group_id: core.types.GroupId) bool {
+        return self.groupQuarantine(group_id) != null;
+    }
+
+    pub fn groupQuarantine(self: *const Scheduler, group_id: core.types.GroupId) ?GroupQuarantine {
+        const state = self.groups.get(group_id) orelse return null;
+        return state.quarantine;
+    }
+
     pub fn activeGroupCount(self: *const Scheduler) usize {
         return self.active_group_count;
+    }
+
+    pub fn quarantinedGroupCount(self: *const Scheduler) usize {
+        return self.quarantined_group_count;
     }
 
     pub fn nowMs(self: *const Scheduler) u64 {
@@ -384,6 +505,41 @@ test "scheduler skips quiesced groups" {
     try std.testing.expect(scheduler.resumeGroup(2));
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextTickGroup());
+}
+
+test "scheduler hard quarantine records cause and requires explicit resume" {
+    var scheduler = Scheduler.init(std.testing.allocator, .{});
+    defer scheduler.deinit();
+
+    try scheduler.registerGroup(1);
+    try scheduler.quarantineGroup(1, .apply_ready_too_large, 2048, 1024);
+    try std.testing.expect(scheduler.isQuiesced(1));
+    try std.testing.expect(scheduler.isHardQuarantined(1));
+    const quarantine = scheduler.groupQuarantine(1).?;
+    try std.testing.expect(quarantine.incident_id != 0);
+    try std.testing.expectEqual(QuarantineReason.apply_ready_too_large, quarantine.reason);
+    try std.testing.expectEqual(@as(usize, 2048), quarantine.observed_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), quarantine.configured_limit);
+    try std.testing.expect(!scheduler.resumeGroupOnActivity(1));
+    try std.testing.expect(scheduler.isQuiesced(1));
+
+    try std.testing.expectError(
+        error.QuarantineIncidentChanged,
+        scheduler.resumeQuarantinedGroup(1, quarantine.incident_id + 1),
+    );
+    try std.testing.expect(scheduler.isHardQuarantined(1));
+
+    try std.testing.expect(try scheduler.resumeQuarantinedGroup(1, quarantine.incident_id));
+    try std.testing.expect(!scheduler.isHardQuarantined(1));
+
+    try scheduler.quarantineGroup(1, .outbound_ready_too_large, 4096, 1024);
+    const next_incident = scheduler.groupQuarantine(1).?;
+    try std.testing.expect(next_incident.incident_id != quarantine.incident_id);
+
+    try std.testing.expect(scheduler.resumeGroup(1));
+    try std.testing.expect(!scheduler.isQuiesced(1));
+    try std.testing.expect(!scheduler.isHardQuarantined(1));
+    try std.testing.expectEqual(@as(?GroupQuarantine, null), scheduler.groupQuarantine(1));
 }
 
 test "scheduler prioritizes each ready group once per pass" {

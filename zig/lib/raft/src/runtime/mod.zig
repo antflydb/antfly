@@ -40,6 +40,8 @@ pub const local_snapshot_transport = @import("local_snapshot_transport.zig");
 
 pub const RuntimeConfig = multi_raft.RuntimeConfig;
 pub const VirtualTime = scheduler.VirtualTime;
+pub const QuarantineReason = scheduler.QuarantineReason;
+pub const GroupQuarantine = scheduler.GroupQuarantine;
 pub const GroupConfig = group.GroupConfig;
 pub const MultiRaft = multi_raft.MultiRaft;
 pub const RuntimeHooks = multi_raft.RuntimeHooks;

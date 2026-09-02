@@ -37,6 +37,7 @@ pub const CreateTableRequestErrorDisposition = enum {
 pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDisposition {
     return switch (err) {
         error.InvalidCreateTableRequest,
+        error.CreateTableShardCountOutOfRange,
         error.InvalidCreateTableSchemaRequest,
         error.SchemaVersionManagedByBackend,
         error.InvalidSchemaUpdateRequest,
@@ -140,6 +141,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
+        if (num_shards > tables_api.max_table_initial_ranges)
+            return error.CreateTableShardCountOutOfRange;
     }
     return req;
 }
@@ -266,6 +269,9 @@ pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const 
 }
 
 pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
+    if (err == error.CreateTableShardCountOutOfRange) {
+        return tables_api.table_initial_ranges_error_message;
+    }
     if (err == error.SchemaVersionManagedByBackend) {
         return "schema.version is managed by Antfly; omit it";
     }
@@ -936,6 +942,17 @@ test "table contract rejects zero shard create table requests" {
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
         parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":0}"),
+    );
+}
+
+test "table contract reports the bounded initial shard range" {
+    try std.testing.expectError(
+        error.CreateTableShardCountOutOfRange,
+        parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":1025}"),
+    );
+    try std.testing.expectEqualStrings(
+        tables_api.table_initial_ranges_error_message,
+        createTableRequestErrorMessage(error.CreateTableShardCountOutOfRange, ""),
     );
 }
 

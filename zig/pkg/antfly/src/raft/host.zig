@@ -22,6 +22,7 @@ const backup_restore = @import("storage/backup_restore.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const peer_resolver = @import("peer_resolver.zig");
 const transport = @import("transport/mod.zig");
+const snapshot_transfer = @import("transport/snapshot_transfer.zig");
 
 pub const default_max_inbound_messages_per_round: usize = 1024;
 pub const default_http_listener_max_connection_threads: u32 = 32;
@@ -56,9 +57,16 @@ pub const HostConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     replica_state_backend: ReplicaStateBackend = .file_image,
     trace_logger: ?raft_engine.core.TraceLogger = null,
+    /// Aggregate ownership retained by HTTP snapshot materialization and the
+    /// inbound Raft queue. This is a byte-weighted admission limit, not a
+    /// per-request ceiling.
+    max_pending_inbound_snapshot_bytes: usize = 1 << 30,
 };
 
 pub const RuntimeHooks = raft_engine.runtime.multi_raft.RuntimeHooks;
+pub const GroupQuarantineStatus = raft_engine.runtime.multi_raft.GroupQuarantineStatus;
+pub const ResumeQuarantineOptions = raft_engine.runtime.multi_raft.ResumeQuarantineOptions;
+pub const QuarantineReason = raft_engine.runtime.QuarantineReason;
 
 pub const ReplicaDescriptorFactory = struct {
     ptr: *anyopaque,
@@ -125,6 +133,7 @@ pub const HostedReplicaStatus = enum {
     starting,
     active,
     quiesced,
+    quarantined,
     snapshotting,
     failed,
 };
@@ -135,6 +144,37 @@ pub const PreparedReplica = struct {
     bootstrap_prepared: bool,
 
     pub fn deinit(self: *PreparedReplica, alloc: std.mem.Allocator) void {
+        self.factory.freeDescriptor(alloc, &self.descriptor);
+        self.* = undefined;
+    }
+};
+
+/// Resolver-owned endpoint snapshot prepared without the Raft owner lock and
+/// published only after the caller re-enters the serialized runtime phase.
+pub const PreparedPeerEndpoints = struct {
+    group_id: u64,
+    node_id: u64,
+    resolver_generation: ?u64,
+    endpoints: []peer_resolver.PeerEndpoint,
+
+    pub fn deinit(self: *PreparedPeerEndpoints, alloc: std.mem.Allocator) void {
+        for (self.endpoints) |endpoint| {
+            alloc.free(endpoint.address);
+            alloc.free(endpoint.metadata);
+        }
+        alloc.free(self.endpoints);
+        self.* = undefined;
+    }
+};
+
+/// A lightweight admission observation prepared outside the Raft owner lock.
+/// Descriptor ownership remains with the factory until commit/deinit.
+pub const PreparedAdmissionValidation = struct {
+    record: catalog.ReplicaRecord,
+    factory: ReplicaDescriptorFactory,
+    descriptor: raft_engine.runtime.ReplicaDescriptor,
+
+    pub fn deinit(self: *PreparedAdmissionValidation, alloc: std.mem.Allocator) void {
         self.factory.freeDescriptor(alloc, &self.descriptor);
         self.* = undefined;
     }
@@ -164,24 +204,50 @@ pub const BootstrapStatus = struct {
 
 pub const HostMetrics = struct {
     hosted_groups: usize = 0,
+    quarantined_groups: usize = 0,
     reconcile_rounds: usize = 0,
     ensure_replica_calls: usize = 0,
     remove_replica_calls: usize = 0,
     endpoint_refreshes: usize = 0,
     endpoint_removals: usize = 0,
+    replica_admission_conflicts: usize = 0,
+    replica_admission_conflicts_active: usize = 0,
+    membership_converged: usize = 0,
+    membership_waiting_for_replica: usize = 0,
+    membership_waiting_for_leader: usize = 0,
+    membership_waiting_for_local_voter: usize = 0,
+    membership_waiting_for_pending_change: usize = 0,
+    membership_waiting_for_policy: usize = 0,
+    route_retrying_groups: usize = 0,
+    reconcile_failed_groups: usize = 0,
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
+    quarantined_inbound_message_drops: usize = 0,
     pending_inbound_messages: usize = 0,
+    pending_inbound_snapshot_bytes: usize = 0,
+    inbound_snapshot_admission_denials: usize = 0,
     runtime_rounds: usize = 0,
     runtime_ticked_groups: usize = 0,
     runtime_processed_groups: usize = 0,
     runtime_transport_message_sends: usize = 0,
+    runtime_snapshot_submission_deferrals: usize = 0,
+    runtime_snapshot_backoff_skips: usize = 0,
+    runtime_snapshot_completions: usize = 0,
+    runtime_snapshot_completion_failures: usize = 0,
+    runtime_snapshot_stale_completions: usize = 0,
     runtime_pending_outbound_messages: usize = 0,
     runtime_pending_outbound_bytes: usize = 0,
+    runtime_pending_control_messages: usize = 0,
+    runtime_pending_snapshot_submissions: usize = 0,
     runtime_pending_apply_tasks: usize = 0,
     runtime_pending_apply_bytes: usize = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
+    runtime_oversized_outbound_ready_rejections: usize = 0,
+    runtime_oversized_apply_ready_rejections: usize = 0,
+    runtime_quarantine_resume_attempts: usize = 0,
+    runtime_quarantine_resume_successes: usize = 0,
+    runtime_quarantine_resume_conflicts: usize = 0,
     runtime_snapshot_compaction_completions: usize = 0,
     runtime_snapshot_compaction_failures: usize = 0,
     runtime_snapshot_compaction_candidates: usize = 0,
@@ -196,6 +262,22 @@ pub const HostMetrics = struct {
     async_send_queue_full: u64 = 0,
     async_send_peer_queue_full: u64 = 0,
     async_send_pending: usize = 0,
+    async_snapshot_send_enqueued: u64 = 0,
+    async_snapshot_send_failed: u64 = 0,
+    async_snapshot_send_retried: u64 = 0,
+    async_snapshot_send_dropped: u64 = 0,
+    async_snapshot_send_deduplicated: u64 = 0,
+    async_snapshot_send_queue_full: u64 = 0,
+    async_snapshot_send_peer_queue_full: u64 = 0,
+    async_snapshot_send_admission_deferred: u64 = 0,
+    async_snapshot_send_reservation_rollbacks: u64 = 0,
+    async_snapshot_send_completions_delivered: u64 = 0,
+    async_snapshot_send_completions_failed: u64 = 0,
+    async_snapshot_send_pending: usize = 0,
+    async_snapshot_send_pending_bytes: usize = 0,
+    async_snapshot_send_reserved: usize = 0,
+    async_snapshot_send_reserved_bytes: usize = 0,
+    async_snapshot_send_pending_completions: usize = 0,
 };
 
 pub const HttpHostConfig = struct {
@@ -203,6 +285,8 @@ pub const HttpHostConfig = struct {
     executor: transport.StdHttpExecutorConfig = .{},
     transport: transport.HttpTransportStackConfig,
     listener: transport.StdHttpListenerConfig = .{},
+    max_snapshot_bytes: usize = 1 << 30,
+    snapshot_artifact_policy: transport.SnapshotArtifactPolicy = .{},
 };
 
 pub const HttpHostDeps = struct {
@@ -221,6 +305,7 @@ const PeerSnapshotTargetResolver = struct {
             .ptr = self,
             .vtable = &.{
                 .resolve_upload_uri = resolveUploadUri,
+                .resolve_base_uri = resolveBaseUri,
             },
         };
     }
@@ -251,6 +336,28 @@ const PeerSnapshotTargetResolver = struct {
                 .quic => {},
             }
         }
+        return error.NoHttpSnapshotEndpoint;
+    }
+
+    fn resolveBaseUri(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        node_id: u64,
+    ) ![]u8 {
+        const self: *PeerSnapshotTargetResolver = @ptrCast(@alignCast(ptr));
+        const endpoints = try self.peer_resolver.resolveGroupPeer(alloc, group_id, node_id);
+        defer {
+            for (endpoints) |endpoint| {
+                alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(endpoints);
+        }
+        for (endpoints) |endpoint| switch (endpoint.protocol) {
+            .http, .https, .http2, .http3 => return try alloc.dupe(u8, endpoint.address),
+            .quic => {},
+        };
         return error.NoHttpSnapshotEndpoint;
     }
 };
@@ -289,26 +396,36 @@ pub const Host = struct {
     metrics: HostMetrics = .{},
     runtime_host: raft_engine.runtime.MultiRaft,
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
+    admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
     inbound_mutex: std.atomic.Mutex = .unlocked,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
+        var runtime_cfg = cfg.runtime;
+        runtime_cfg.max_pending_snapshot_bytes = @min(
+            runtime_cfg.max_pending_snapshot_bytes,
+            cfg.max_pending_inbound_snapshot_bytes,
+        );
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .deps = deps,
-            .runtime_host = raft_engine.runtime.MultiRaft.init(alloc, cfg.runtime, deps.runtime_hooks),
+            .runtime_host = raft_engine.runtime.MultiRaft.init(alloc, runtime_cfg, deps.runtime_hooks),
         };
     }
 
     pub fn deinit(self: *Host) void {
         self.lockInbound();
-        for (self.pending_inbound.items) |*pending| pending.deinit(self.alloc);
-        self.pending_inbound.deinit(self.alloc);
+        var pending = self.pending_inbound;
+        self.pending_inbound = .empty;
+        self.metrics.pending_inbound_messages = 0;
         self.inbound_mutex.unlock();
+        for (pending.items) |*item| item.deinit(self.alloc);
+        pending.deinit(self.alloc);
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
         while (bootstrap_it.next()) |bootstrap_status| bootstrap_status.deinit(self.alloc);
         self.bootstrap_statuses.deinit(self.alloc);
+        self.admission_conflicts.deinit(self.alloc);
         self.runtime_host.deinit();
         self.* = undefined;
     }
@@ -373,6 +490,12 @@ pub const Host = struct {
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
         descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        descriptor.validateForAdmission() catch |err| return err;
+        // Unpublished descriptors are prepared outside the single-owner Raft
+        // lock. They must remain completely independent from live runtime
+        // state; the reconciler classifies them after re-entering the owner.
+        if (persist_catalog)
+            try self.requirePreparedReplicaAdmission(record, descriptor);
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
@@ -386,6 +509,113 @@ pub const Host = struct {
         };
     }
 
+    fn requirePreparedReplicaAdmission(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        descriptor: raft_engine.runtime.ReplicaDescriptor,
+    ) !void {
+        if (try self.observeReplicaAdmissionConflict(record, descriptor)) |conflict| {
+            return switch (conflict) {
+                .local_node_id => error.LocalNodeIdMismatch,
+                .runtime_policy => error.ReplicaRuntimePolicyMismatch,
+            };
+        }
+    }
+
+    /// Classifies an immutable prepared descriptor against the current live
+    /// owner. Callers must hold the same serialization lock used for Raft
+    /// progress and topology mutation.
+    pub fn classifyPreparedReplicaAdmission(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepared: *const PreparedReplica,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return try self.observeReplicaAdmissionConflict(record, prepared.descriptor);
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *Host,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.admission_conflicts.get(group_id);
+    }
+
+    pub fn prepareReplicaAdmissionValidation(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+    ) !PreparedAdmissionValidation {
+        const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
+        var descriptor = try factory.buildDescriptor(record);
+        errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+            if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        try descriptor.validateForAdmission();
+        return .{
+            .record = record,
+            .factory = factory,
+            .descriptor = descriptor,
+        };
+    }
+
+    /// Commits only the in-memory observation. Callers must serialize this
+    /// with other runtime-owner mutations and may discard a stale preparation.
+    pub fn commitReplicaAdmissionValidation(
+        self: *Host,
+        prepared: *PreparedAdmissionValidation,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return try self.observeReplicaAdmissionConflict(prepared.record, prepared.descriptor);
+    }
+
+    /// Rechecks a previously blocked restart-scoped policy without touching
+    /// the durable catalog or live runtime. Stable control rounds use this to
+    /// observe configuration rollback and clear stale restart requirements.
+    pub fn revalidateReplicaAdmissionConflict(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        var prepared = try self.prepareReplicaAdmissionValidation(record);
+        defer prepared.deinit(self.alloc);
+        return try self.commitReplicaAdmissionValidation(&prepared);
+    }
+
+    fn observeReplicaAdmissionConflict(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        descriptor: raft_engine.runtime.ReplicaDescriptor,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        if (self.runtime_host.replicaAdmissionConflict(descriptor)) |conflict| {
+            const previous = self.admission_conflicts.get(record.group_id);
+            if (previous == null or !std.meta.eql(previous.?, conflict)) {
+                try self.admission_conflicts.put(self.alloc, record.group_id, conflict);
+                self.metrics.replica_admission_conflicts +|= 1;
+                switch (conflict) {
+                    .local_node_id => std.log.warn(
+                        "replica admission blocked group_id={d} local_node_id={d} field={s}",
+                        .{ record.group_id, record.local_node_id, conflict.fieldName() },
+                    ),
+                    .runtime_policy => |policy_conflict| std.log.warn(
+                        "replica admission requires restart group_id={d} local_node_id={d} field={s} installed_policy={x} desired_policy={x}",
+                        .{
+                            record.group_id,
+                            record.local_node_id,
+                            conflict.fieldName(),
+                            policy_conflict.installed_fingerprint,
+                            policy_conflict.desired_fingerprint,
+                        },
+                    ),
+                }
+            }
+            return conflict;
+        }
+        if (self.admission_conflicts.remove(record.group_id)) {
+            std.log.info(
+                "replica admission conflict cleared group_id={d} local_node_id={d}",
+                .{ record.group_id, record.local_node_id },
+            );
+        }
+        return null;
+    }
+
     /// Publishes a fully prepared descriptor into the single-owner runtime.
     /// This method must execute under the runtime owner's serialization lock.
     pub fn installPreparedReplica(
@@ -393,7 +623,7 @@ pub const Host = struct {
         record: catalog.ReplicaRecord,
         prepared: *PreparedReplica,
     ) !raft_engine.runtime.EnsureReplicaResult {
-        const result = self.runtime_host.ensureReplica(prepared.descriptor) catch |err| {
+        const result = self.runtime_host.installDurableReplica(prepared.descriptor) catch |err| {
             if (prepared.bootstrap_prepared) {
                 self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
             }
@@ -425,20 +655,44 @@ pub const Host = struct {
         self.clearBootstrapStatus(record.group_id);
     }
 
-    pub fn replicaCatalogRevision(self: *Host) ?u64 {
+    pub fn snapshotReplicaCatalog(
+        self: *Host,
+        alloc: std.mem.Allocator,
+    ) !?catalog.ReplicaCatalogSnapshot {
         const replica_catalog = self.deps.replica_catalog orelse return null;
-        return replica_catalog.revision();
+        return try replica_catalog.snapshotReplicas(alloc);
+    }
+
+    /// Returns the durable admission decision, independently of whether the
+    /// live runtime has finished installing or removing the replica.
+    pub fn replicaCatalogContains(self: *Host, group_id: u64) ?bool {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return replica_catalog.containsReplica(group_id);
     }
 
     pub fn commitReplicaCatalog(
         self: *Host,
-        expected_revision: ?u64,
+        expected_token: ?catalog.ReplicaCatalogToken,
         upserts: []const catalog.ReplicaRecord,
         removals: []const u64,
-    ) !void {
-        const replica_catalog = self.deps.replica_catalog orelse return;
-        try replica_catalog.applyBatch(
-            expected_revision orelse return error.MissingReplicaCatalogRevision,
+    ) !?catalog.ReplicaCatalogToken {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.applyBatch(
+            expected_token orelse return error.MissingReplicaCatalogRevision,
+            upserts,
+            removals,
+        );
+    }
+
+    pub fn prepareReplicaCatalog(
+        self: *Host,
+        expected_token: ?catalog.ReplicaCatalogToken,
+        upserts: []const catalog.ReplicaRecord,
+        removals: []const u64,
+    ) !?catalog.PreparedReplicaCatalogBatch {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.prepareBatch(
+            expected_token orelse return error.MissingReplicaCatalogRevision,
             upserts,
             removals,
         );
@@ -449,6 +703,7 @@ pub const Host = struct {
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
         self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *Host, alloc: std.mem.Allocator) !usize {
@@ -468,7 +723,15 @@ pub const Host = struct {
                 );
                 continue;
             }
-            const result = try self.ensureReplica(record);
+            const prepare_bootstrap = record.backup_restore_bootstrap != null;
+            if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
+            var prepared = self.prepareReplicaWithCatalog(record, prepare_bootstrap, false) catch |err| {
+                if (prepare_bootstrap) self.noteReplicaBootstrapPreparationFailure(record, err);
+                return err;
+            };
+            defer prepared.deinit(self.alloc);
+            try self.requirePreparedReplicaAdmission(record, prepared.descriptor);
+            const result = try self.installPreparedReplica(record, &prepared);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }
         return restored;
@@ -489,20 +752,52 @@ pub const Host = struct {
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
         self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {
-        const resolver = self.deps.peer_resolver orelse return 0;
-        const endpoints = try resolver.resolveGroupPeer(self.alloc, group_id, node_id);
-        defer {
-            for (endpoints) |endpoint| {
-                self.alloc.free(endpoint.address);
-                self.alloc.free(endpoint.metadata);
-            }
-            self.alloc.free(endpoints);
-        }
+        var prepared = self.preparePeerEndpoints(group_id, node_id) catch |err| switch (err) {
+            error.MissingPeerResolver => return 0,
+            else => return err,
+        };
+        defer prepared.deinit(self.alloc);
+        return try self.commitPreparedPeerEndpoints(&prepared);
+    }
 
-        return try self.upsertResolvedPeerEndpoints(group_id, node_id, endpoints);
+    pub fn preparePeerEndpoints(
+        self: *Host,
+        group_id: u64,
+        node_id: u64,
+    ) !PreparedPeerEndpoints {
+        const resolver = self.deps.peer_resolver orelse return error.MissingPeerResolver;
+        const generation_before = resolver.routeGeneration(group_id, node_id);
+        var prepared = PreparedPeerEndpoints{
+            .group_id = group_id,
+            .node_id = node_id,
+            .resolver_generation = null,
+            .endpoints = try resolver.resolveGroupPeer(self.alloc, group_id, node_id),
+        };
+        errdefer prepared.deinit(self.alloc);
+        const generation_after = resolver.routeGeneration(group_id, node_id);
+        if (generation_before != generation_after) return error.PeerRouteChanged;
+        prepared.resolver_generation = generation_after;
+        return prepared;
+    }
+
+    pub fn commitPreparedPeerEndpoints(
+        self: *Host,
+        prepared: *const PreparedPeerEndpoints,
+    ) !usize {
+        if (prepared.resolver_generation) |generation| {
+            const resolver = self.deps.peer_resolver orelse return error.PeerRouteChanged;
+            if (resolver.routeGeneration(prepared.group_id, prepared.node_id) != generation)
+                return error.PeerRouteChanged;
+        }
+        return try self.upsertResolvedPeerEndpoints(
+            prepared.group_id,
+            prepared.node_id,
+            prepared.endpoints,
+        );
     }
 
     pub fn upsertResolvedPeerEndpoints(self: *Host, group_id: u64, node_id: u64, endpoints: []const peer_resolver.PeerEndpoint) !usize {
@@ -542,12 +837,36 @@ pub const Host = struct {
             return switch (bootstrap_status.phase) {
                 .preparing, .durability_pending => .starting,
                 .failed => .failed,
-                .succeeded => if (self.runtime_host.group(group_id) == null) .absent else if (self.runtime_host.isGroupQuiesced(group_id)) .quiesced else .active,
+                .succeeded => self.runtimeReplicaStatus(group_id),
             };
         }
+        return self.runtimeReplicaStatus(group_id);
+    }
+
+    fn runtimeReplicaStatus(self: *Host, group_id: u64) HostedReplicaStatus {
         if (self.runtime_host.group(group_id) == null) return .absent;
+        if (self.runtime_host.groupQuarantine(group_id) != null) return .quarantined;
         if (self.runtime_host.isGroupQuiesced(group_id)) return .quiesced;
         return .active;
+    }
+
+    pub fn quarantineStatus(self: *const Host, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.runtime_host.groupQuarantine(group_id);
+    }
+
+    pub fn listQuarantines(
+        self: *const Host,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.runtime_host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *Host,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.runtime_host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const Host, group_id: u64) ?BootstrapStatus {
@@ -599,17 +918,34 @@ pub const Host = struct {
     pub fn metricsSnapshot(self: *const Host) HostMetrics {
         const runtime_metrics = self.runtime_host.metricsSnapshot();
         var snapshot = self.metrics;
+        snapshot.replica_admission_conflicts_active = self.admission_conflicts.count();
         snapshot.hosted_groups = runtime_metrics.group_count;
+        snapshot.quarantined_groups = runtime_metrics.quarantined_group_count;
+        snapshot.quarantined_inbound_message_drops = runtime_metrics.quarantined_inbound_messages;
         snapshot.runtime_rounds = runtime_metrics.rounds;
         snapshot.runtime_ticked_groups = runtime_metrics.ticked_groups;
         snapshot.runtime_processed_groups = runtime_metrics.processed_groups;
         snapshot.runtime_transport_message_sends = runtime_metrics.transport_message_sends;
+        snapshot.runtime_snapshot_submission_deferrals = runtime_metrics.transport_snapshot_submission_deferrals;
+        snapshot.runtime_snapshot_backoff_skips = runtime_metrics.transport_snapshot_backoff_skips;
+        snapshot.runtime_snapshot_completions = runtime_metrics.transport_snapshot_completions;
+        snapshot.runtime_snapshot_completion_failures = runtime_metrics.transport_snapshot_completion_failures;
+        snapshot.runtime_snapshot_stale_completions = runtime_metrics.transport_snapshot_stale_completions;
         snapshot.runtime_pending_outbound_messages = runtime_metrics.pending_outbound_messages;
         snapshot.runtime_pending_outbound_bytes = runtime_metrics.pending_outbound_bytes;
+        snapshot.runtime_pending_control_messages = runtime_metrics.pending_control_messages;
+        snapshot.runtime_pending_snapshot_submissions = runtime_metrics.pending_snapshot_submissions;
         snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
+        snapshot.pending_inbound_snapshot_bytes = runtime_metrics.pending_snapshot_bytes;
+        snapshot.inbound_snapshot_admission_denials = runtime_metrics.snapshot_admission_denials;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
+        snapshot.runtime_oversized_outbound_ready_rejections = runtime_metrics.oversized_outbound_ready_rejections;
+        snapshot.runtime_oversized_apply_ready_rejections = runtime_metrics.oversized_apply_ready_rejections;
+        snapshot.runtime_quarantine_resume_attempts = runtime_metrics.quarantine_resume_attempts;
+        snapshot.runtime_quarantine_resume_successes = runtime_metrics.quarantine_resume_successes;
+        snapshot.runtime_quarantine_resume_conflicts = runtime_metrics.quarantine_resume_conflicts;
         snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
         snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
         snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
@@ -691,7 +1027,7 @@ pub const Host = struct {
     fn drainInboundMessages(self: *Host, max_messages: usize) !usize {
         if (max_messages == 0) return 0;
         var pending = std.ArrayListUnmanaged(PendingInboundMessage).empty;
-        errdefer {
+        defer {
             for (pending.items) |*item| item.deinit(self.alloc);
             pending.deinit(self.alloc);
         }
@@ -718,17 +1054,15 @@ pub const Host = struct {
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
         self.inbound_mutex.unlock();
-        defer {
-            for (pending.items) |*item| item.deinit(self.alloc);
-            pending.deinit(self.alloc);
-        }
 
         var drained: usize = 0;
         for (pending.items) |item| {
-            self.runtime_host.step(item.group_id, item.message) catch |err| switch (err) {
-                error.UnknownGroup => {},
+            const disposition = self.runtime_host.stepWithDisposition(item.group_id, item.message) catch |err| switch (err) {
+                error.UnknownGroup => null,
                 else => return err,
             };
+            if (disposition == .quarantined)
+                self.metrics.quarantined_inbound_message_drops +|= 1;
             drained += 1;
         }
         self.metrics.inbound_message_drains += drained;
@@ -741,16 +1075,38 @@ pub const Host = struct {
         }
     }
 
+    fn mapGroupActivityError(err: anyerror) anyerror {
+        return if (err == error.GroupHardQuarantined)
+            error.GroupLeaderUnavailable
+        else
+            err;
+    }
+
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
-        try self.runtime_host.campaignGroup(group_id);
+        self.runtime_host.campaignGroup(group_id) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn propose(self: *Host, group_id: u64, data: []const u8) !void {
-        try self.runtime_host.propose(group_id, data);
+        self.runtime_host.propose(group_id, data) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
-        try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
+        self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
+    }
+
+    pub fn proposeBatchWithReceipt(
+        self: *Host,
+        group_id: u64,
+        payloads: []const []const u8,
+        accepted_first_index: *?u64,
+        accepted_last_index: *?u64,
+    ) !void {
+        self.runtime_host.proposeBatchWithReceipt(
+            group_id,
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        ) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
@@ -770,14 +1126,33 @@ pub const Host = struct {
     }
 
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
-        try self.runtime_host.transferLeader(group_id, transferee);
+        self.runtime_host.transferLeader(group_id, transferee) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn handleSnapshotUpload(self: *Host, upload: transport.http_server.SnapshotUpload) !void {
         var owned = upload;
         errdefer owned.snapshot.deinit(self.alloc);
+        const snapshot_bytes = owned.snapshot.data.len;
+        var admission_reserved = owned.admission_reserved;
+        if (!admission_reserved) {
+            try self.admitSnapshotUpload(.{
+                .group_id = upload.group_id,
+                .to = upload.to,
+                .data_len = snapshot_bytes,
+            });
+            admission_reserved = true;
+        }
+        errdefer if (admission_reserved) self.cancelSnapshotUpload(.{
+            .group_id = upload.group_id,
+            .to = upload.to,
+            .data_len = snapshot_bytes,
+        });
         const grp = self.runtime_host.group(upload.group_id) orelse return error.UnknownGroup;
         if (upload.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        try self.runtime_host.attachSnapshotAdmission(&owned.snapshot);
+        // The shared payload now owns the reservation and returns it only after
+        // Raft persistence and state-machine apply release their final clone.
+        admission_reserved = false;
         var msg: raft_engine.core.Message = .{
             .msg_type = .snapshot,
             .from = upload.from,
@@ -798,20 +1173,30 @@ pub const Host = struct {
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
     }
 
+    pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
+        const data_len = std.math.cast(usize, admission.data_len) orelse return error.SnapshotTooLarge;
+        try self.runtime_host.admitInboundSnapshot(admission.group_id, admission.to, data_len);
+    }
+
+    pub fn cancelSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) void {
+        const data_len = std.math.cast(usize, admission.data_len) orelse return;
+        self.runtime_host.cancelSnapshotAdmission(data_len);
+    }
+
     pub fn forgetLeader(self: *Host, group_id: u64) !void {
-        try self.runtime_host.forgetLeader(group_id);
+        self.runtime_host.forgetLeader(group_id) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn readIndex(self: *Host, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime_host.readIndex(group_id, request_ctx);
+        self.runtime_host.readIndex(group_id, request_ctx) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeConfChange(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChange) !void {
-        try self.runtime_host.proposeConfChange(group_id, conf_change);
+        self.runtime_host.proposeConfChange(group_id, conf_change) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeConfChangeV2(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
-        try self.runtime_host.proposeConfChangeV2(group_id, conf_change);
+        self.runtime_host.proposeConfChangeV2(group_id, conf_change) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn raftStatus(self: *Host, group_id: u64) ?raft_engine.core.Status {
@@ -987,6 +1372,27 @@ pub const HttpHost = struct {
             null;
         const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
         var transport_config = cfg.transport;
+        // V1 snapshots are one HTTP body in both directions. Bound publication
+        // by the stricter listener/executor ceiling so a default-compatible
+        // host cannot accept an artifact that another host cannot fetch.
+        transport_config.snapshot.legacy_fallback_max_request_bytes = @min(
+            transport_config.snapshot.legacy_fallback_max_request_bytes,
+            @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+        );
+        if (transport_config.snapshot.legacy_fallback_max_request_bytes == 0)
+            return error.InvalidSnapshotTransferLimits;
+        // V2 chunks cross the same request/response boundary. Preserve the
+        // operator's requested size when valid and otherwise reduce it to the
+        // largest end-to-end safe chunk instead of failing only during fetch.
+        transport_config.snapshot.chunk_size = @min(
+            transport_config.snapshot.chunk_size,
+            @min(
+                snapshot_transfer.max_chunk_bytes,
+                @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+            ),
+        );
+        if (transport_config.snapshot.chunk_size < snapshot_transfer.min_chunk_bytes)
+            return error.InvalidSnapshotTransferLimits;
         // The std Threaded timeout path uses process signals for cancellation.
         // Keep each asynchronous peer lane on an independent I/O pool so one
         // canceled request cannot interrupt another lane's connect syscall.
@@ -1006,6 +1412,12 @@ pub const HttpHost = struct {
             errdefer alloc.destroy(snapshot_store);
             snapshot_store.* = try transport.FileSnapshotStore.init(alloc, .{
                 .root_dir = cfg.transport.snapshot.root_dir,
+                .max_snapshot_bytes = @min(cfg.max_snapshot_bytes, transport_config.snapshot.max_snapshot_bytes),
+                // Inbound acceptance is a protocol/listener property, not the
+                // local client's outbound chunk preference. Peers negotiate
+                // this independently through the capability endpoint.
+                .max_chunk_bytes = @min(snapshot_transfer.max_chunk_bytes, cfg.listener.max_request_bytes),
+                .artifact_policy = cfg.snapshot_artifact_policy,
             });
             break :blk snapshot_store;
         } else null;
@@ -1092,6 +1504,12 @@ pub const HttpHost = struct {
         return try self.listener.baseUri(alloc);
     }
 
+    /// Shared bounded outbound I/O used for small control-plane fan-outs.
+    /// Callers must still provide request-level deadlines.
+    pub fn outboundIo(self: *const HttpHost) std.Io {
+        return self.transport_stack.driver.io;
+    }
+
     pub fn metricsSnapshot(self: *const HttpHost) HostMetrics {
         var snapshot = self.host.metricsSnapshot();
         const async_send = self.transport_stack.asyncSendMetricsSnapshot();
@@ -1102,11 +1520,47 @@ pub const HttpHost = struct {
         snapshot.async_send_queue_full = async_send.queue_full;
         snapshot.async_send_peer_queue_full = async_send.peer_queue_full;
         snapshot.async_send_pending = async_send.pending;
+        const async_snapshot_send = self.transport_stack.asyncSnapshotSendMetricsSnapshot();
+        snapshot.async_snapshot_send_enqueued = async_snapshot_send.enqueued;
+        snapshot.async_snapshot_send_failed = async_snapshot_send.failed;
+        snapshot.async_snapshot_send_retried = async_snapshot_send.retried;
+        snapshot.async_snapshot_send_dropped = async_snapshot_send.dropped;
+        snapshot.async_snapshot_send_deduplicated = async_snapshot_send.deduplicated;
+        snapshot.async_snapshot_send_queue_full = async_snapshot_send.queue_full;
+        snapshot.async_snapshot_send_peer_queue_full = async_snapshot_send.peer_queue_full;
+        snapshot.async_snapshot_send_admission_deferred = async_snapshot_send.admission_deferred;
+        snapshot.async_snapshot_send_reservation_rollbacks = async_snapshot_send.reservation_rollbacks;
+        snapshot.async_snapshot_send_completions_delivered = async_snapshot_send.completions_delivered;
+        snapshot.async_snapshot_send_completions_failed = async_snapshot_send.completions_failed;
+        snapshot.async_snapshot_send_pending = async_snapshot_send.pending;
+        snapshot.async_snapshot_send_pending_bytes = async_snapshot_send.pending_bytes;
+        snapshot.async_snapshot_send_reserved = async_snapshot_send.reserved;
+        snapshot.async_snapshot_send_reserved_bytes = async_snapshot_send.reserved_bytes;
+        snapshot.async_snapshot_send_pending_completions = async_snapshot_send.pending_completions;
         return snapshot;
     }
 
     pub fn status(self: *HttpHost, group_id: u64) HostedReplicaStatus {
         return self.host.status(group_id);
+    }
+
+    pub fn quarantineStatus(self: *const HttpHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.host.quarantineStatus(group_id);
+    }
+
+    pub fn listQuarantines(
+        self: *const HttpHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *HttpHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const HttpHost, group_id: u64) ?BootstrapStatus {
@@ -1170,6 +1624,21 @@ pub const HttpHost = struct {
         try self.host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *HttpHost,
+        group_id: u64,
+        payloads: []const []const u8,
+        accepted_first_index: *?u64,
+        accepted_last_index: *?u64,
+    ) !void {
+        try self.host.proposeBatchWithReceipt(
+            group_id,
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     pub fn transferLeader(self: *HttpHost, group_id: u64, transferee: u64) !void {
         try self.host.transferLeader(group_id, transferee);
     }
@@ -1222,6 +1691,27 @@ pub fn mergeRuntimeHooks(base: RuntimeHooks, overlay: RuntimeHooks) RuntimeHooks
     return merged;
 }
 
+test "host rejects stale prepared peer endpoints" {
+    var resolver = peer_resolver.MemoryPeerResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    try resolver.upsert(9, 2, &.{.{
+        .protocol = .http,
+        .address = "http://old",
+    }});
+    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .peer_resolver = resolver.resolver(),
+    });
+    defer host.deinit();
+
+    var prepared = try host.preparePeerEndpoints(9, 2);
+    defer prepared.deinit(std.testing.allocator);
+    try resolver.upsert(9, 2, &.{.{
+        .protocol = .http,
+        .address = "http://new",
+    }});
+    try std.testing.expectError(error.PeerRouteChanged, host.commitPreparedPeerEndpoints(&prepared));
+}
+
 test "host can ensure and remove a replica" {
     const Factory = struct {
         alloc: std.mem.Allocator,
@@ -1272,6 +1762,7 @@ test "host can ensure and remove a replica" {
     const RemovalCatalog = struct {
         fail_remove: bool = true,
         remove_calls: usize = 0,
+        prepared_active: bool = false,
 
         fn iface(self: *@This()) catalog.ReplicaCatalog {
             return .{
@@ -1279,9 +1770,12 @@ test "host can ensure and remove a replica" {
                 .vtable = &.{
                     .upsert_replica = upsertReplica,
                     .remove_replica = removeReplica,
+                    .contains_replica = containsReplica,
                     .list_replicas = listReplicas,
+                    .snapshot_replicas = snapshotReplicas,
                     .revision = revision,
                     .apply_batch = applyBatch,
+                    .prepare_batch = prepareBatch,
                 },
             };
         }
@@ -1295,20 +1789,63 @@ test "host can ensure and remove a replica" {
             return true;
         }
 
+        fn containsReplica(_: *anyopaque, _: u64) bool {
+            return true;
+        }
+
         fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
             return try alloc.alloc(catalog.ReplicaRecord, 0);
         }
 
-        fn revision(_: *anyopaque) u64 {
-            return 1;
+        fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !catalog.ReplicaCatalogSnapshot {
+            return .{
+                .token = revision(ptr),
+                .records = try listReplicas(ptr, alloc),
+            };
+        }
+
+        fn revision(_: *anyopaque) catalog.ReplicaCatalogToken {
+            return .{ .revision = 1 };
         }
 
         fn applyBatch(
             _: *anyopaque,
-            _: u64,
+            _: catalog.ReplicaCatalogToken,
             _: []const catalog.ReplicaRecord,
             _: []const u64,
-        ) !void {}
+        ) !catalog.ReplicaCatalogToken {
+            return .{ .revision = 1 };
+        }
+
+        fn prepareBatch(
+            ptr: *anyopaque,
+            _: catalog.ReplicaCatalogToken,
+            _: []const catalog.ReplicaRecord,
+            _: []const u64,
+        ) !catalog.PreparedReplicaCatalogBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.prepared_active) return error.PreparedCatalogBatchInUse;
+            self.prepared_active = true;
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .commit = commitPrepared,
+                    .deinit = deinitPrepared,
+                },
+            };
+        }
+
+        fn commitPrepared(ptr: *anyopaque) !catalog.ReplicaCatalogToken {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.prepared_active) return error.InvalidPreparedCatalogBatch;
+            self.prepared_active = false;
+            return .{ .revision = 1 };
+        }
+
+        fn deinitPrepared(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepared_active = false;
+        }
     };
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -1459,7 +1996,10 @@ test "host queues live snapshot uploads for runtime round" {
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+    var host = Host.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .max_pending_inbound_snapshot_bytes = "queued-snapshot".len,
+    }, .{
         .descriptor_factory = factory.iface(),
     });
     defer host.deinit();
@@ -1489,11 +2029,19 @@ test "host queues live snapshot uploads for runtime round" {
 
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metricsSnapshot().pending_inbound_snapshot_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.admitSnapshotUpload(.{
+        .group_id = 41,
+        .to = 1,
+        .data_len = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().inbound_snapshot_admission_denials);
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_inbound_snapshot_bytes);
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {
@@ -1542,7 +2090,10 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+    var host = Host.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .runtime = .{ .max_single_apply_ready_bytes = 1 },
+    }, .{
         .descriptor_factory = factory.iface(),
     });
     defer host.deinit();
@@ -1594,6 +2145,23 @@ test "host drops stale inbound peer batch groups without leaking pending storage
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_drains);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+
+    // A single poisoned group must not terminate the shared progress driver.
+    try host.campaignGroup(41);
+    _ = try host.runRoundBounded(0, 1, 1);
+    try std.testing.expectEqual(.quarantined, host.status(41));
+    try std.testing.expectError(error.GroupLeaderUnavailable, host.campaignGroup(41));
+
+    try host.enqueueInboundBatch(.{
+        .peer_id = 1,
+        .groups = (&[_]raft_engine.runtime.transport_iface.GroupMessageBatch{.{
+            .group_id = 41,
+            .messages = (&[_]raft_engine.core.Message{known_msg_a})[0..],
+        }})[0..],
+    });
+    _ = try host.runRoundBounded(1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.quarantined_inbound_message_drops);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
 }
 
@@ -2090,7 +2658,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
         },
         &.{.{
             .group_id = 91,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/91",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -2270,7 +2838,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         },
         &.{.{
             .group_id = 92,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/92",
             .artifact_size_bytes = artifact_integrity.size_bytes,

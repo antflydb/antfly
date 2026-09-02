@@ -273,6 +273,7 @@ test {
     _ = raft;
     _ = @import("raft/reconciler.zig");
     _ = extensions;
+    _ = @import("extensions/lifecycle.zig");
     _ = metadata;
     _ = metadata_api;
     _ = metadata_admin;

@@ -87,6 +87,7 @@ pub const Routes = struct {
     pub const routed_batch_suffix = "/batch-routed-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
+    pub const backup_shard_suffix = "/backup-shard";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";

@@ -33,6 +33,7 @@ pub const reallocation_request = @import("reallocation_request.zig");
 pub const reconciler = @import("reconciler.zig");
 pub const control_loop = @import("control_loop.zig");
 pub const transition_state = @import("transition_state.zig");
+pub const topology_protocol = @import("topology_protocol.zig");
 pub const transition_actions = @import("transition_actions.zig");
 pub const transition_controller = @import("transition_controller.zig");
 pub const transition_driver = @import("transition_driver.zig");
