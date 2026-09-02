@@ -1237,7 +1237,7 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert orphan_error.value.response.status_code == 400
-    assert "invalid_embedding_artifact_producer" in orphan_error.value.response.text
+    assert "embedding enrichment producer is not runnable" in orphan_error.value.response.text
 
     owner_table = f"embedding_owned_producer_{time.time_ns()}"
     stateful_api.post(
@@ -1282,7 +1282,7 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert mismatch_error.value.response.status_code == 400
-    assert "invalid_embedding_artifact_producer" in mismatch_error.value.response.text
+    assert "embedding enrichment producer is not runnable" in mismatch_error.value.response.text
 
     # Failed replacement is atomic: the original owner and its artifact remain.
     detail = stateful_api.get_index(owner_table, "document_vectors")

@@ -1984,7 +1984,10 @@ fn semanticProducerV2Sparse(value: std.json.Value) !?bool {
     };
 }
 
-fn semanticProducerExecutionJsonAlloc(
+/// Adapt a v2 semantic identity into the parser's configuration shape solely
+/// to construct a temporary comparison entry. The result must never be added
+/// to the executable registry because it deliberately contains no credentials.
+fn semanticProducerComparisonConfigJsonAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) !?[]u8 {
@@ -1993,6 +1996,20 @@ fn semanticProducerExecutionJsonAlloc(
         else => return null,
     };
     _ = (try semanticProducerV2Sparse(value)) orelse return null;
+    var fields = object.iterator();
+    while (fields.next()) |field| {
+        const allowed = std.mem.eql(u8, field.key_ptr.*, "version") or
+            std.mem.eql(u8, field.key_ptr.*, "provider") or
+            std.mem.eql(u8, field.key_ptr.*, "model") or
+            std.mem.eql(u8, field.key_ptr.*, "endpoint") or
+            std.mem.eql(u8, field.key_ptr.*, "region") or
+            std.mem.eql(u8, field.key_ptr.*, "request_format") or
+            std.mem.eql(u8, field.key_ptr.*, "sparse") or
+            std.mem.eql(u8, field.key_ptr.*, "multimodal") or
+            std.mem.eql(u8, field.key_ptr.*, "input_type") or
+            std.mem.eql(u8, field.key_ptr.*, "truncate");
+        if (!allowed) return error.InvalidEmbeddingArtifactProducer;
+    }
     if (object.get("url") != null or object.get("api_url") != null or object.get("base_url") != null)
         return error.InvalidEmbeddingArtifactProducer;
 
@@ -2063,21 +2080,21 @@ fn buildArtifactManagedEmbeddingEntryFromProducerValue(
         if (producer_sparse != sparse) return error.InvalidEmbeddingArtifactProducer;
     }
     const dims = if (sparse) 0 else try resolveDeclaredEmbeddingDimensionsRequired(artifact_cfg);
-    const semantic_execution_json = try semanticProducerExecutionJsonAlloc(alloc, producer);
-    defer if (semantic_execution_json) |raw| alloc.free(raw);
-    var semantic_execution = if (semantic_execution_json) |raw|
+    const semantic_comparison_json = try semanticProducerComparisonConfigJsonAlloc(alloc, producer);
+    defer if (semantic_comparison_json) |raw| alloc.free(raw);
+    var semantic_comparison = if (semantic_comparison_json) |raw|
         try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})
     else
         null;
-    defer if (semantic_execution) |*parsed| parsed.deinit();
-    const execution_producer = if (semantic_execution) |parsed| parsed.value else producer;
-    const entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, execution_producer, options, dims) catch |err| switch (err) {
+    defer if (semantic_comparison) |*parsed| parsed.deinit();
+    const parser_input = if (semantic_comparison) |parsed| parsed.value else producer;
+    const entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, parser_input, options, dims) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidEmbeddingArtifactProducer,
     };
     return .{
         .entry = entry,
-        .semantic_identity_only = semantic_execution_json != null,
+        .semantic_identity_only = semantic_comparison_json != null,
     };
 }
 
@@ -2195,8 +2212,24 @@ fn validateEmbeddingEnrichmentProducer(
 
     const name = object.get("name") orelse return error.InvalidEmbeddingArtifactProducer;
     if (name != .string or name.string.len == 0) return error.InvalidEmbeddingArtifactProducer;
-    const producer_json = object.get("producer_json") orelse return error.MissingEmbeddingArtifactProducer;
     const expected_dims = try embeddingEnrichmentExpectedDimensionsOptional(enrichment);
+    const producer_json = object.get("producer_json") orelse {
+        // Inline create-table enrichments may omit producer_json when the
+        // embeddings index that owns this artifact carries the executable
+        // embedder. Only the complete-catalog pass can prove that ownership;
+        // standalone enrichment admission must still require a producer.
+        const entries = executable_entries orelse return error.MissingEmbeddingArtifactProducer;
+        const owner_index = managedEntryIndexForArtifact(entries, name.string) orelse
+            return error.MissingEmbeddingArtifactProducer;
+        const owner = &entries[owner_index];
+        if (owner.sparse) {
+            if (expected_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
+        } else {
+            const dims = expected_dims orelse return error.EmbeddingArtifactDimensionRequired;
+            if (dims != owner.dimensions) return error.ConflictingEmbeddingArtifactDimensions;
+        }
+        return;
+    };
 
     switch (producer_json) {
         .string => |raw| {
@@ -4176,6 +4209,14 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
             .{ .antfly_provider = local.provider() },
         ),
     );
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateEmbeddingEnrichmentProducerJsonWithOptions(
+            std.testing.allocator,
+            "{\"name\":\"credential_bearing_identity\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"dense-model\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"sparse\\\":false,\\\"api_key\\\":\\\"must-not-be-provenance\\\"}\"}",
+            .{ .antfly_provider = local.provider() },
+        ),
+    );
 
     try std.testing.expectError(
         error.MissingEmbeddingArtifactProducer,
@@ -4183,6 +4224,12 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
             \\{"enrichments":[{"name":"missing_producer","kind":"embedding","field":"body","expected_dims":384}],"vectors":{"type":"embeddings","dimension":384,"embedding_name":"missing_producer"}}
         , .{ .antfly_provider = local.provider() }),
     );
+
+    var owned = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{"vectors":{"type":"embeddings","dimension":384,"embedding_name":"owned_producer","embedder":{"provider":"antfly","model":"dense-model"},"enrichments":[{"name":"owned_producer","kind":"embedding","field":"body","expected_dims":384}]}}
+    , .{ .antfly_provider = local.provider() });
+    defer owned.deinit();
+    try std.testing.expect(owned.findEntry("owned_producer") != null);
 }
 
 pub fn testArtifactBackedEmbeddingTranslation() !void {
