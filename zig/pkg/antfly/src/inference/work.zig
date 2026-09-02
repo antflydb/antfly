@@ -309,6 +309,7 @@ pub const AttachmentTransport = enum {
 pub const InlineDataUri = struct {
     mime_type: []const u8,
     decoded_size: usize,
+    encoding: enum { base64, percent },
 };
 
 fn standardBase64Index(byte: u8) ?u8 {
@@ -343,18 +344,45 @@ pub fn validateCanonicalStandardBase64(data: []const u8) !usize {
     return decoded_size;
 }
 
-/// Parse an inline base64 data URI. Non-data URLs return null and remain owned
-/// by the remote provider's download admission path.
+fn percentEncodedDataSize(data: []const u8) !usize {
+    var size: usize = 0;
+    var index: usize = 0;
+    while (index < data.len) {
+        if (data[index] == '%') {
+            if (index + 2 >= data.len or
+                !std.ascii.isHex(data[index + 1]) or
+                !std.ascii.isHex(data[index + 2]))
+                return error.InvalidDataURI;
+            index += 3;
+        } else {
+            index += 1;
+        }
+        size = std.math.add(usize, size, 1) catch return error.InvalidDataURI;
+    }
+    return size;
+}
+
+/// Parse an inline data URI without materializing its decoded bytes. Both
+/// standard base64 and RFC 2397 percent-encoded payloads are accepted because
+/// the inference-node downloader supports both forms. Capability checks use
+/// the media-type essence rather than parameters such as `charset`.
 pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
     const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
     const metadata = uri["data:".len..comma];
-    if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
-    const mime_type = metadata[0 .. metadata.len - ";base64".len];
+    const base64 = std.ascii.endsWithIgnoreCase(metadata, ";base64");
+    const media_metadata = if (base64) metadata[0 .. metadata.len - ";base64".len] else metadata;
+    const parameter = std.mem.indexOfScalar(u8, media_metadata, ';') orelse media_metadata.len;
+    const mime_type = std.mem.trim(u8, media_metadata[0..parameter], &std.ascii.whitespace);
     if (mime_type.len == 0) return error.InvalidDataURI;
+    const payload = uri[comma + 1 ..];
     return .{
         .mime_type = mime_type,
-        .decoded_size = try validateCanonicalStandardBase64(uri[comma + 1 ..]),
+        .decoded_size = if (base64)
+            try validateCanonicalStandardBase64(payload)
+        else
+            try percentEncodedDataSize(payload),
+        .encoding = if (base64) .base64 else .percent,
     };
 }
 
@@ -616,9 +644,16 @@ test "inline data URI parser validates canonical metadata" {
     const parsed = (try parseInlineDataUri("data:image/png;base64,AQID")).?;
     try std.testing.expectEqualStrings("image/png", parsed.mime_type);
     try std.testing.expectEqual(@as(usize, 3), parsed.decoded_size);
+    try std.testing.expectEqual(.base64, parsed.encoding);
+    const parameterized = (try parseInlineDataUri("data:image/png;charset=binary;base64,AQID")).?;
+    try std.testing.expectEqualStrings("image/png", parameterized.mime_type);
+    const percent = (try parseInlineDataUri("data:image/png,%89PNG")).?;
+    try std.testing.expectEqual(@as(usize, 4), percent.decoded_size);
+    try std.testing.expectEqual(.percent, percent.encoding);
     try std.testing.expect((try parseInlineDataUri("https://example.invalid/image.png")) == null);
     try std.testing.expectError(error.InvalidDataURI, parseInlineDataUri("data:;base64,AQID"));
     try std.testing.expectError(error.InvalidDataURI, parseInlineDataUri("data:image/png;base64,YR=="));
+    try std.testing.expectError(error.InvalidDataURI, parseInlineDataUri("data:image/png,%8"));
 }
 
 test "inference capabilities keep every model family output typed" {

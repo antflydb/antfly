@@ -723,13 +723,15 @@ document. They are architectural requirements, not Florence-specific cleanup:
 69. **The PDF image-embedding render budget confused wire bytes with peak
     memory.** The planner used `max_encoded_media_bytes` directly as a raw PNG
     retention allowance and retained the complete page window while the remote
-    adapter created base64 and JSON buffers. Dense embedders now expose the
-    concrete attachment transport and a worst-case request-envelope size. The
-    planner inverses the wire and resident ceilings, including per-item padding,
-    before rendering. Remote multimodal embedding encodes base64 directly into
-    one final request allocation owned by the operation allocator, so raw pages
-    coexist with one admitted body rather than an intermediate encoding and a
-    second JSON copy.
+    adapter created base64 and JSON buffers. Dense embedders now expose one
+    route-specific invocation-memory plan: the concrete attachment transport
+    plus the complete fixed peak for request envelopes, bounded response bodies,
+    parser state, typed vector outputs, and transport/control storage. The
+    planner subtracts that fixed peak and then inverses both wire and resident
+    ceilings, including per-item padding, before rendering. Remote multimodal
+    embedding encodes base64 directly into one final request allocation owned by
+    the operation allocator, so raw pages coexist with one admitted body rather
+    than an intermediate encoding and a second JSON copy.
 70. **The scoped TestServer regression could pass on a 404.** Client fibers
     swallowed failed response assertions and the owner swallowed their group
     result, so an unmatched route never ran the server assertion yet still
@@ -739,7 +741,40 @@ document. They are architectural requirements, not Florence-specific cleanup:
     rejected empty bytes, while `data:image/png;base64,` and empty inline base64
     crossed the remote boundary and failed later. The shared canonical parser
     still permits callers to validate generic empty base64, but every media
-    boundary now requires a nonzero decoded size before batching or transport.
+    boundary now requires a nonzero decoded size before batching or transport,
+    including generator, extractor, embedder, and direct inference-node binary
+    attachment entry points.
+72. **Embedding admission omitted allocations that coexist with rendered
+    pages.** Reserving only raw PNGs, the encoded request body, and its JSON
+    envelope still allowed the HTTP response, JSON parse tree, copied vectors,
+    result arrays, and client control storage to exceed the operation grant.
+    The resolved dense-embedder route now publishes all of those fixed classes
+    in one checked invocation plan. Local linked execution publishes borrowed
+    attachments plus its vector/result peak; remote execution additionally
+    reserves its response ceiling, parser copy, request envelope, and bounded
+    transport control allowance. Allocation arithmetic is overflow checked and
+    a plan that does not fit fails before rendering a page.
+73. **The host accepted fewer data URIs than the inference node.** The shared
+    preflight parser required a bare MIME followed by canonical `;base64`, while
+    the node's remote-content RFC 2397 decoder also accepts MIME parameters and
+    percent-encoded payloads. The common non-materializing parser now accepts
+    both encodings,
+    extracts the media-type essence for capability checks, validates every
+    percent escape or canonical base64 quantum, and reports decoded size.
+    Reader and embedder admission use that same parser, so distributed and
+    linked routes no longer disagree before invocation.
+74. **Remote generator batching retained several full attachment copies.** The
+    previous adapter allocated base64 for each image, formatted another complete
+    content part, accumulated a per-item content array, formatted each request,
+    and finally copied all requests into the batch body. The adapter now prepares
+    only small non-media metadata, computes the exact final JSON size with
+    overflow checks, allocates that body once, and streams base64 directly into
+    it. A final length assertion makes serializer drift fail closed. Allocation-
+    failure coverage exercises every preparation and final-body allocation.
+75. **Dense JSON response cleanup leaked earlier vectors after a later
+    allocation failed.** The parser now tracks the initialized vector prefix and
+    releases it together with the outer vector array on every error. Exhaustive
+    allocation-failure testing covers both parsing and per-vector duplication.
 
 ### Post-review implementation contract
 
@@ -761,8 +796,9 @@ The hardening above follows four long-term rules:
   bytes, remote generator/embedder/extractor payloads charge exact base64
   expansion, and remote reader adapters charge the complete data URI. Provider
   wire ceilings and process resident ceilings are distinct: render planning
-  reserves retained raw media, one concrete transport body, and its bounded
-  request envelope against the same operation-owned allocator.
+  reserves retained raw media, one concrete transport body, and the complete
+  route-specific fixed peak for envelopes, responses, parsing, typed results,
+  and bounded control storage against the same operation grant.
 - Every logical result carries the request identity. Remote indexed responses
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.

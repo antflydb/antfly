@@ -35,6 +35,36 @@ const EmbedWireRequest = struct {
     encoding_format: []const u8 = "float",
 };
 
+const DenseJsonEmbeddingObject = struct {
+    embedding: []const f32,
+};
+
+const JsonEmbeddingResponse = struct {
+    data: []const DenseJsonEmbeddingObject,
+};
+
+fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8) !inference.EmbedResult {
+    var parsed = try std.json.parseFromSlice(JsonEmbeddingResponse, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.data.len == 0) return error.EmptyResponse;
+
+    const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(@constCast(vector));
+        alloc.free(vectors);
+    }
+    for (parsed.value.data, 0..) |item, i| {
+        vectors[i] = try alloc.dupe(f32, item.embedding);
+        initialized += 1;
+    }
+    return .{
+        .vectors = vectors,
+        .dimension = parsed.value.data[0].embedding.len,
+        .allocator = alloc,
+    };
+}
+
 fn jsonStringEncodedSize(value: []const u8) !usize {
     if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
     var size: usize = 2;
@@ -376,26 +406,7 @@ pub const Provider = struct {
             }
         }
 
-        const JsonEmbeddingObject = struct {
-            embedding: []const f32,
-        };
-        const JsonResponse = struct {
-            data: []const JsonEmbeddingObject,
-        };
-        var parsed = try std.json.parseFromSlice(JsonResponse, alloc, body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        if (parsed.value.data.len == 0) return error.EmptyResponse;
-
-        const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
-        errdefer alloc.free(vectors);
-        for (parsed.value.data, 0..) |item, i| {
-            vectors[i] = try alloc.dupe(f32, item.embedding);
-        }
-        return .{
-            .vectors = vectors,
-            .dimension = parsed.value.data[0].embedding.len,
-            .allocator = alloc,
-        };
+        return try parseDenseJsonResponseAlloc(alloc, body);
     }
 
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
@@ -573,6 +584,19 @@ test "antfly embed parts request sizing is exact for escaped strings" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
+}
+
+test "antfly dense JSON response cleanup is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseDenseJsonResponseAlloc(
+                alloc,
+                "{\"data\":[{\"embedding\":[1,2,3]},{\"embedding\":[4,5,6]}]}",
+            );
+            result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "antfly embed parts streams binary base64 into one request body" {

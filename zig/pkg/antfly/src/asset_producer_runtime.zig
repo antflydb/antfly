@@ -722,6 +722,7 @@ pub const Runtime = struct {
             };
             inputs_filled += 1;
             for (request.media) |media| {
+                try validateEncodedMedia(media);
                 attachments[attachment_index] = .{
                     .input_index = i,
                     .bytes = media.bytes,
@@ -758,6 +759,7 @@ pub const Runtime = struct {
             if (request.producer_type != .generator) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
             if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+            for (request.media) |media| try validateEncodedMedia(media);
         }
 
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
@@ -1090,6 +1092,7 @@ pub const Runtime = struct {
         defer parsed_cfg.deinit(alloc);
         const cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        for (request.media) |media| try validateEncodedMedia(media);
         const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
             self.antfly_provider.?.generate_messages_with_attachments != null and
@@ -1250,15 +1253,9 @@ pub const Runtime = struct {
     ) !ReaderUriInvocationShape {
         var shape = ReaderUriInvocationShape{};
         for (request.images) |url| {
-            if (!std.ascii.startsWithIgnoreCase(url, "data:")) continue;
-            const comma = std.mem.indexOfScalar(u8, url, ',') orelse return error.InvalidDataURI;
-            const metadata = url["data:".len..comma];
-            if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
-            const mime_type = metadata[0 .. metadata.len - ";base64".len];
-            if (mime_type.len == 0) return error.InvalidDataURI;
-            try capabilities.validateMimeType(mime_type);
-            const decoded_size = try validateStandardBase64(url[comma + 1 ..]);
-            if (decoded_size == 0) return error.InvalidDataURI;
+            const parsed = (try inference_work.parseInlineDataUri(url)) orelse continue;
+            try capabilities.validateMimeType(parsed.mime_type);
+            if (parsed.decoded_size == 0) return error.InvalidDataURI;
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
                 return error.InferenceEncodedBytesExceeded;
         }
@@ -1400,6 +1397,7 @@ pub const Runtime = struct {
 
     fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        for (request.media) |media| try validateEncodedMedia(media);
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
         defer cfg.deinit(alloc);
 
@@ -1668,18 +1666,30 @@ fn modalityForGeneratorMime(mime_type: []const u8) !inference_work.Modalities {
     return error.UnsupportedInferenceMimeType;
 }
 
+fn validateEncodedMedia(media: asset_producer.EncodedMedia) !void {
+    if (media.bytes.len == 0) return error.InvalidInferenceMedia;
+    if (media.mime_type.len == 0) return error.UnsupportedInferenceMimeType;
+}
+
+test "asset producer runtime rejects empty borrowed media" {
+    try std.testing.expectError(
+        error.InvalidInferenceMedia,
+        validateEncodedMedia(.{ .bytes = &.{}, .mime_type = "image/png" }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        validateEncodedMedia(.{ .bytes = "png", .mime_type = "" }),
+    );
+}
+
 fn dataUriMimeType(uri: []const u8) ?[]const u8 {
-    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
-    const end = std.mem.indexOfAny(u8, uri[5..], ";,") orelse return null;
-    return uri[5 .. 5 + end];
+    const parsed = inference_work.parseInlineDataUri(uri) catch return null;
+    return if (parsed) |value| value.mime_type else null;
 }
 
 fn dataUriDecodedSize(uri: []const u8) !?usize {
-    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
-    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
-    const metadata = uri["data:".len..comma];
-    if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
-    return validateStandardBase64(uri[comma + 1 ..]) catch error.InvalidDataURI;
+    const parsed = (try inference_work.parseInlineDataUri(uri)) orelse return null;
+    return parsed.decoded_size;
 }
 
 /// Validate the complete padded standard-base64 representation without
@@ -1752,6 +1762,7 @@ fn generatorRequestShape(
         try capabilities.validateMimeType("text/plain");
     }
     for (request.media) |media| {
+        try validateEncodedMedia(media);
         try capabilities.validateMimeType(media.mime_type);
         mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
         shape.media_parts += 1;
@@ -1903,14 +1914,17 @@ fn extractorRequestShape(
         try prompt.appendSlice(alloc, request.source_text);
     }
 
-    for (request.media) |media| try addExtractorMediaShape(
-        capabilities,
-        request,
-        &shape,
-        media.mime_type,
-        try attachment_transport.wireSize(media.bytes.len, media.mime_type.len),
-        true,
-    );
+    for (request.media) |media| {
+        try validateEncodedMedia(media);
+        try addExtractorMediaShape(
+            capabilities,
+            request,
+            &shape,
+            media.mime_type,
+            try attachment_transport.wireSize(media.bytes.len, media.mime_type.len),
+            true,
+        );
+    }
 
     if (shape.media_parts == 0) {
         if (parsed_parts_array and (!saw_text_part or prompt.items.len == 0)) return error.InvalidExtractionContent;
@@ -2098,6 +2112,14 @@ test "asset producer runtime validates the complete base64 representation" {
     try std.testing.expectError(error.InvalidDataURI, dataUriResidentSize("data:image/png;base64,!!!!"));
     try std.testing.expectError(error.InvalidDataURI, dataUriResidentSize("data:image/png;base64,"));
     try std.testing.expectError(error.InvalidDataURI, inlineBase64ResidentSize(""));
+    try std.testing.expectEqual(
+        @as(?usize, "data:image/png,%89PNG".len),
+        try dataUriResidentSize("data:image/png,%89PNG"),
+    );
+    try std.testing.expectEqualStrings(
+        "image/png",
+        dataUriMimeType("data:image/png;charset=binary;base64,AQID").?,
+    );
 }
 
 test "asset producer runtime reader URI admission measures data payloads before execution" {
@@ -2681,84 +2703,183 @@ fn antflyGenerateBatchRequestJsonAlloc(
     cfg: generating_runtime.GeneratorConfig,
     requests: []const asset_producer.Request,
 ) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
+    const ContentMetadata = struct {
+        elements_json: []u8,
+        element_count: usize,
 
-    try out.appendSlice(alloc, "{\"mode\":\"sync\",\"requests\":[");
-    for (requests, 0..) |request, i| {
-        if (i > 0) try out.append(alloc, ',');
-        const content_json = try generatorRequestContentJsonAlloc(alloc, request);
-        defer alloc.free(content_json);
-        const item = try std.fmt.allocPrint(
-            alloc,
-            "{{\"custom_id\":\"{d}\",\"body\":{{\"model\":{f},\"messages\":[{{\"role\":\"user\",\"content\":{s}}}],\"mode\":\"eager\"",
-            .{
-                i,
-                std.json.fmt(cfg.model, .{}),
-                content_json,
-            },
-        );
-        defer alloc.free(item);
-        try out.appendSlice(alloc, item);
-        try appendBatchI64Field(alloc, &out, "max_tokens", cfg.max_tokens);
-        if (cfg.temperature) |temperature| try appendBatchFloatField(alloc, &out, "temperature", temperature);
-        if (cfg.top_p) |top_p| try appendBatchFloatField(alloc, &out, "top_p", top_p);
-        if (cfg.top_k) |top_k| try appendBatchI64Field(alloc, &out, "top_k", top_k);
-        if (cfg.frequency_penalty) |frequency_penalty| try appendBatchFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
-        if (cfg.presence_penalty) |presence_penalty| try appendBatchFloatField(alloc, &out, "presence_penalty", presence_penalty);
-        try out.appendSlice(alloc, "}}");
-    }
-    try out.appendSlice(alloc, "]}");
-    return try out.toOwnedSlice(alloc);
-}
-
-/// Materialize provider JSON only at the remote HTTP boundary. The durable PDF
-/// path and embedded provider path keep renderer bytes borrowed.
-fn generatorRequestContentJsonAlloc(alloc: Allocator, request: asset_producer.Request) ![]u8 {
-    if (request.source_parts_json == null and request.media.len == 0)
-        return try std.json.Stringify.valueAlloc(alloc, request.source_text, .{});
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.append(alloc, '[');
-    var emitted = false;
-    if (request.source_parts_json) |raw_parts| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
-        defer parsed.deinit();
-        if (parsed.value != .array) return error.InvalidGeneratorContentParts;
-        for (parsed.value.array.items) |part| {
-            if (part != .object) continue;
-            const type_value = part.object.get("type") orelse continue;
-            if (type_value != .string or std.mem.eql(u8, type_value.string, "metadata")) continue;
-            if (emitted) try out.append(alloc, ',');
-            const encoded = try std.json.Stringify.valueAlloc(alloc, part, .{});
-            defer alloc.free(encoded);
-            try out.appendSlice(alloc, encoded);
-            emitted = true;
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            allocator.free(self.elements_json);
+            self.* = undefined;
         }
+    };
+    const Helper = struct {
+        fn metadata(allocator: Allocator, request: asset_producer.Request) !ContentMetadata {
+            var out = std.ArrayListUnmanaged(u8).empty;
+            errdefer out.deinit(allocator);
+            var count: usize = 0;
+            if (request.source_parts_json) |raw_parts| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_parts, .{});
+                defer parsed.deinit();
+                if (parsed.value != .array) return error.InvalidGeneratorContentParts;
+                for (parsed.value.array.items) |part| {
+                    if (part != .object) continue;
+                    const type_value = part.object.get("type") orelse continue;
+                    if (type_value != .string or std.mem.eql(u8, type_value.string, "metadata")) continue;
+                    if (count > 0) try out.append(allocator, ',');
+                    const encoded = try std.json.Stringify.valueAlloc(allocator, part, .{});
+                    defer allocator.free(encoded);
+                    try out.appendSlice(allocator, encoded);
+                    count += 1;
+                }
+            }
+            if (count == 0 and request.media.len == 0 and request.source_parts_json != null and request.source_text.len > 0) {
+                const encoded = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"type\":\"text\",\"text\":{f}}}",
+                    .{std.json.fmt(request.source_text, .{})},
+                );
+                defer allocator.free(encoded);
+                try out.appendSlice(allocator, encoded);
+                count = 1;
+            }
+            return .{ .elements_json = try out.toOwnedSlice(allocator), .element_count = count };
+        }
+
+        fn jsonStringSize(value: []const u8) !usize {
+            if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidGeneratorContentParts;
+            var size: usize = 2;
+            for (value) |byte| {
+                const encoded: usize = switch (byte) {
+                    '\\', '"', 0x08, 0x0c, '\n', '\r', '\t' => 2,
+                    0x00...0x07, 0x0b, 0x0e...0x1f => 6,
+                    else => 1,
+                };
+                size = std.math.add(usize, size, encoded) catch return error.OutOfMemory;
+            }
+            return size;
+        }
+
+        fn addSize(total: *usize, amount: usize) !void {
+            total.* = std.math.add(usize, total.*, amount) catch return error.OutOfMemory;
+        }
+
+        fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+            const hex = "0123456789abcdef";
+            try writer.writeByte('"');
+            for (value) |byte| switch (byte) {
+                '\\' => try writer.writeAll("\\\\"),
+                '"' => try writer.writeAll("\\\""),
+                0x08 => try writer.writeAll("\\b"),
+                0x0c => try writer.writeAll("\\f"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                0x00...0x07, 0x0b, 0x0e...0x1f => {
+                    try writer.writeAll("\\u00");
+                    try writer.writeByte(hex[byte >> 4]);
+                    try writer.writeByte(hex[byte & 0x0f]);
+                },
+                else => try writer.writeByte(byte),
+            };
+            try writer.writeByte('"');
+        }
+
+        fn writeBase64String(writer: *std.Io.Writer, bytes: []const u8) !void {
+            try writer.writeByte('"');
+            const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+            const encoded = try writer.writableSlice(encoded_len);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try writer.writeByte('"');
+        }
+    };
+
+    const metadata = try alloc.alloc(ContentMetadata, requests.len);
+    var metadata_count: usize = 0;
+    defer {
+        for (metadata[0..metadata_count]) |*item| item.deinit(alloc);
+        alloc.free(metadata);
     }
-    for (request.media) |media| {
-        if (emitted) try out.append(alloc, ',');
-        const encoded_len = std.base64.standard.Encoder.calcSize(media.bytes.len);
-        const encoded = try alloc.alloc(u8, encoded_len);
-        defer alloc.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, media.bytes);
-        const part = try std.fmt.allocPrint(
-            alloc,
-            "{{\"type\":\"media\",\"mime_type\":{f},\"data\":{f}}}",
-            .{ std.json.fmt(media.mime_type, .{}), std.json.fmt(encoded, .{}) },
-        );
-        defer alloc.free(part);
-        try out.appendSlice(alloc, part);
-        emitted = true;
+    for (requests, 0..) |request, i| {
+        metadata[i] = try Helper.metadata(alloc, request);
+        metadata_count += 1;
     }
-    if (!emitted and request.source_text.len > 0) {
-        const part = try std.fmt.allocPrint(alloc, "{{\"type\":\"text\",\"text\":{f}}}", .{std.json.fmt(request.source_text, .{})});
-        defer alloc.free(part);
-        try out.appendSlice(alloc, part);
+
+    const model_json = try std.json.Stringify.valueAlloc(alloc, cfg.model, .{});
+    defer alloc.free(model_json);
+    var options = std.ArrayListUnmanaged(u8).empty;
+    defer options.deinit(alloc);
+    try options.appendSlice(alloc, ",\"mode\":\"eager\"");
+    try appendBatchI64Field(alloc, &options, "max_tokens", cfg.max_tokens);
+    if (cfg.temperature) |temperature| try appendBatchFloatField(alloc, &options, "temperature", temperature);
+    if (cfg.top_p) |top_p| try appendBatchFloatField(alloc, &options, "top_p", top_p);
+    if (cfg.top_k) |top_k| try appendBatchI64Field(alloc, &options, "top_k", top_k);
+    if (cfg.frequency_penalty) |frequency_penalty| try appendBatchFloatField(alloc, &options, "frequency_penalty", frequency_penalty);
+    if (cfg.presence_penalty) |presence_penalty| try appendBatchFloatField(alloc, &options, "presence_penalty", presence_penalty);
+
+    const outer_prefix = "{\"mode\":\"sync\",\"requests\":[";
+    const item_prefix = "{\"custom_id\":\"";
+    const body_prefix = "\",\"body\":{\"model\":";
+    const messages_prefix = ",\"messages\":[{\"role\":\"user\",\"content\":";
+    const item_suffix = "}]";
+    var exact_size: usize = outer_prefix.len + "]}".len;
+    for (requests, metadata, 0..) |request, item_metadata, i| {
+        if (i > 0) try Helper.addSize(&exact_size, 1);
+        try Helper.addSize(&exact_size, item_prefix.len + std.fmt.count("{d}", .{i}) + body_prefix.len);
+        try Helper.addSize(&exact_size, model_json.len + messages_prefix.len);
+        if (request.source_parts_json == null and request.media.len == 0) {
+            try Helper.addSize(&exact_size, try Helper.jsonStringSize(request.source_text));
+        } else {
+            try Helper.addSize(&exact_size, 2 + item_metadata.elements_json.len);
+            var emitted = item_metadata.element_count;
+            for (request.media) |media| {
+                if (emitted > 0) try Helper.addSize(&exact_size, 1);
+                try Helper.addSize(&exact_size, "{\"type\":\"media\",\"mime_type\":".len);
+                try Helper.addSize(&exact_size, try Helper.jsonStringSize(media.mime_type));
+                try Helper.addSize(&exact_size, ",\"data\":\"".len + "\"}".len);
+                try Helper.addSize(&exact_size, std.base64.standard.Encoder.calcSize(media.bytes.len));
+                emitted += 1;
+            }
+        }
+        try Helper.addSize(&exact_size, item_suffix.len + options.items.len + "}}".len);
     }
-    try out.append(alloc, ']');
-    return try out.toOwnedSlice(alloc);
+
+    var output: std.Io.Writer.Allocating = try .initCapacity(alloc, exact_size);
+    defer output.deinit();
+    try output.writer.writeAll(outer_prefix);
+    for (requests, metadata, 0..) |request, item_metadata, i| {
+        if (i > 0) try output.writer.writeByte(',');
+        try output.writer.writeAll(item_prefix);
+        try output.writer.print("{d}", .{i});
+        try output.writer.writeAll(body_prefix);
+        try output.writer.writeAll(model_json);
+        try output.writer.writeAll(messages_prefix);
+        if (request.source_parts_json == null and request.media.len == 0) {
+            try Helper.writeJsonString(&output.writer, request.source_text);
+        } else {
+            try output.writer.writeByte('[');
+            if (item_metadata.element_count > 0) {
+                try output.writer.writeAll(item_metadata.elements_json);
+            }
+            for (request.media, 0..) |media, media_index| {
+                if (item_metadata.element_count > 0 or media_index > 0) try output.writer.writeByte(',');
+                try output.writer.writeAll("{\"type\":\"media\",\"mime_type\":");
+                try Helper.writeJsonString(&output.writer, media.mime_type);
+                try output.writer.writeAll(",\"data\":");
+                try Helper.writeBase64String(&output.writer, media.bytes);
+                try output.writer.writeByte('}');
+            }
+            try output.writer.writeByte(']');
+        }
+        try output.writer.writeAll(item_suffix);
+        try output.writer.writeAll(options.items);
+        try output.writer.writeAll("}}");
+    }
+    try output.writer.writeAll("]}");
+    if (output.writer.end != exact_size) return error.InvalidGeneratorRequestSize;
+    const body = output.writer.buffer;
+    output.writer.buffer = &.{};
+    output.writer.end = 0;
+    return body;
 }
 
 fn appendBatchI64Field(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
@@ -2771,6 +2892,48 @@ fn appendBatchFloatField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), nam
     const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
     defer alloc.free(fragment);
     try out.appendSlice(alloc, fragment);
+}
+
+test "remote generator batch streams attachments into one exact JSON body" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const media = [_]asset_producer.EncodedMedia{.{
+                .bytes = &.{ 1, 2, 3 },
+                .mime_type = "image/png",
+            }};
+            const requests = [_]asset_producer.Request{
+                .{
+                    .producer_type = .generator,
+                    .config_json = "{}",
+                    .source_text = "",
+                    .source_parts_json = "[{\"type\":\"metadata\",\"page\":1},{\"type\":\"text\",\"text\":\"inspect\"}]",
+                    .inline_media_trusted = true,
+                    .media = &media,
+                },
+                .{
+                    .producer_type = .generator,
+                    .config_json = "{}",
+                    .source_text = "line\nquoted \"text\"",
+                },
+            };
+            const body = try antflyGenerateBatchRequestJsonAlloc(alloc, .{
+                .provider = .antfly,
+                .model = "gemma\"4",
+                .url = "http://inference.invalid",
+                .max_tokens = 32,
+                .temperature = 0.25,
+            }, &requests);
+            defer alloc.free(body);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            const batch = parsed.value.object.get("requests").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), batch.len);
+            const content = batch[0].object.get("body").?.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), content.len);
+            try std.testing.expectEqualStrings("AQID", content[1].object.get("data").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 const ParsedGenerateBatchResponse = struct {

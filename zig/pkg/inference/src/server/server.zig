@@ -15765,6 +15765,10 @@ test "direct dense embed admission counts borrowed media once" {
     try std.testing.expectEqual(@as(usize, 2), preflight.shape.image_count);
     try std.testing.expect(preflight.has_audio);
     try std.testing.expectEqual(@as(usize, 5 + inline_url.len), preflight.known_media_bytes);
+    try std.testing.expectError(
+        error.InvalidMediaBase64,
+        directDenseEmbedPreflight(&.{.{ .media = .{ .mime_type = "image/png", .data = &.{} } }}),
+    );
 
     const unlimited = requestMediaAdmissionForLimits(
         preflight.shape,
@@ -19017,6 +19021,7 @@ fn appendDenseEmbedBinary(
     index: usize,
     owned: bool,
 ) !void {
+    if (bytes.len == 0) return error.InvalidMediaBase64;
     if (std.mem.startsWith(u8, mime_type, "image/")) {
         if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
         try parsed.images.append(allocator, .{
@@ -20772,6 +20777,7 @@ fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDe
         .text => {},
         .image_url => |url| shape.addImageUrlSlice(url),
         .media => |media| {
+            if (media.data.len == 0) return error.InvalidMediaBase64;
             const is_image = std.mem.startsWith(u8, media.mime_type, "image/");
             const is_audio = std.mem.startsWith(u8, media.mime_type, "audio/");
             if (!is_image and !is_audio) return error.UnsupportedMediaMimeType;

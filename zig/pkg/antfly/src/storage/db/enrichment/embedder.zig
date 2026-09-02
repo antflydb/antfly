@@ -32,8 +32,20 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
-pub const DenseAttachmentTransportFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) inference_work.AttachmentTransport;
-pub const DenseAttachmentEnvelopeFn = *const fn (ptr: *anyopaque, embedding_name: []const u8, item_count: usize, mime_type: []const u8) anyerror!usize;
+pub const DensePartInvocationMemory = struct {
+    attachment_transport: inference_work.AttachmentTransport,
+    /// Peak bytes other than retained raw attachments and their encoded media
+    /// representation. This includes request envelopes, transport/control
+    /// scratch, bounded response bodies, parser state, and typed outputs.
+    fixed_bytes: usize,
+};
+pub const DensePartInvocationMemoryFn = *const fn (
+    ptr: *anyopaque,
+    embedding_name: []const u8,
+    item_count: usize,
+    mime_type: []const u8,
+    dims: u32,
+) anyerror!DensePartInvocationMemory;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
@@ -58,8 +70,7 @@ pub const DenseEmbedder = struct {
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     capabilities_fn: ?DenseCapabilitiesFn = null,
-    attachment_transport_fn: ?DenseAttachmentTransportFn = null,
-    attachment_envelope_fn: ?DenseAttachmentEnvelopeFn = null,
+    part_invocation_memory_fn: ?DensePartInvocationMemoryFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
@@ -108,25 +119,30 @@ pub const DenseEmbedder = struct {
         return result;
     }
 
-    /// In-process embedders borrow the supplied content parts by default. An
-    /// adapter that materializes another representation (for example HTTP
-    /// base64) must expose it so document preparation can reserve that peak.
-    pub fn attachmentTransport(self: DenseEmbedder, embedding_name: []const u8) inference_work.AttachmentTransport {
-        const transport_fn = self.attachment_transport_fn orelse return .borrowed_binary;
-        return transport_fn(self.ptr, embedding_name);
-    }
-
-    /// Worst-case non-media bytes in the concrete part-item request body.
-    /// The PDF planner subtracts this from its operation grant before deriving
-    /// the largest transport-safe retained render window.
-    pub fn attachmentEnvelopeBytes(
+    /// Return the concrete route's complete non-media peak and attachment
+    /// representation. In-process implementations default to borrowed input
+    /// plus the exact vector output and small bounded control storage.
+    pub fn partInvocationMemory(
         self: DenseEmbedder,
         embedding_name: []const u8,
         item_count: usize,
         mime_type: []const u8,
-    ) !usize {
-        const envelope_fn = self.attachment_envelope_fn orelse return 0;
-        return try envelope_fn(self.ptr, embedding_name, item_count, mime_type);
+        dims: u32,
+    ) !DensePartInvocationMemory {
+        const memory_fn = self.part_invocation_memory_fn orelse {
+            const vector_values = std.math.mul(usize, item_count, @as(usize, dims)) catch
+                return error.InferenceEncodedBytesExceeded;
+            const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
+                return error.InferenceEncodedBytesExceeded;
+            const item_bytes = std.math.mul(usize, item_count, 256) catch
+                return error.InferenceEncodedBytesExceeded;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = std.math.add(usize, vector_bytes, item_bytes) catch
+                    return error.InferenceEncodedBytesExceeded,
+            };
+        };
+        return try memory_fn(self.ptr, embedding_name, item_count, mime_type, dims);
     }
 
     pub fn embedDenseParts(

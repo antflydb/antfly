@@ -869,8 +869,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_part_items_fn = embedDensePartItems,
             .media_part_limit_fn = denseMediaPartLimit,
             .capabilities_fn = denseCapabilities,
-            .attachment_transport_fn = denseAttachmentTransport,
-            .attachment_envelope_fn = denseAttachmentEnvelopeBytes,
+            .part_invocation_memory_fn = densePartInvocationMemory,
             .deinit_fn = deinitDenseEmbedder,
             .foreground_bounded = self.denseForegroundBounded(),
         };
@@ -1185,26 +1184,31 @@ pub const ManagedEmbedder = struct {
         return if (entry.multimodal and isAntflyProvider(entry.provider)) 1 else null;
     }
 
-    fn denseAttachmentTransport(ptr: *anyopaque, embedding_name: []const u8) inference_work.AttachmentTransport {
-        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
-        const entry = self.findEntry(embedding_name) orelse return .borrowed_binary;
-        return if (entry.antfly_provider != null) .borrowed_binary else .base64_payload;
-    }
-
     fn jsonStringUpperBound(value: []const u8) !usize {
         const escaped = std.math.mul(usize, value.len, 6) catch return error.InferenceEncodedBytesExceeded;
         return std.math.add(usize, escaped, 2) catch return error.InferenceEncodedBytesExceeded;
     }
 
-    fn denseAttachmentEnvelopeBytes(
+    fn densePartInvocationMemory(
         ptr: *anyopaque,
         embedding_name: []const u8,
         item_count: usize,
         mime_type: []const u8,
-    ) !usize {
+        dims: u32,
+    ) !db_embedder.DensePartInvocationMemory {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
-        if (entry.antfly_provider != null) return 0;
+        const vector_values = std.math.mul(usize, item_count, @as(usize, dims)) catch
+            return error.InferenceEncodedBytesExceeded;
+        const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
+            return error.InferenceEncodedBytesExceeded;
+        const item_control_bytes = std.math.mul(usize, item_count, 256) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (entry.antfly_provider != null) return .{
+            .attachment_transport = .borrowed_binary,
+            .fixed_bytes = std.math.add(usize, vector_bytes, item_control_bytes) catch
+                return error.InferenceEncodedBytesExceeded,
+        };
 
         const outer = std.math.add(
             usize,
@@ -1219,11 +1223,32 @@ pub const ManagedEmbedder = struct {
         const items = std.math.mul(usize, item_count, per_item) catch
             return error.InferenceEncodedBytesExceeded;
         const commas = if (item_count == 0) 0 else item_count - 1;
-        return std.math.add(
+        const request_envelope = std.math.add(
             usize,
             outer,
             std.math.add(usize, items, commas) catch return error.InferenceEncodedBytesExceeded,
         ) catch return error.InferenceEncodedBytesExceeded;
+        // The HTTP response is capped at 4 MiB. Typed JSON float arrays can be
+        // denser than their source text and the arena retains geometric-growth
+        // allocations until parsing finishes. Reserve a conservative complete
+        // response/parser peak in addition to the expected parsed/final vector
+        // copies. A bounded allowance covers URL/header/TLS/client control.
+        const response_and_parser = std.math.mul(
+            usize,
+            remote_embedding_max_response_bytes,
+            remote_embedding_response_resident_multiplier,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        const vector_copies = std.math.mul(usize, vector_bytes, 2) catch
+            return error.InferenceEncodedBytesExceeded;
+        var fixed = std.math.add(usize, request_envelope, response_and_parser) catch
+            return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, vector_copies) catch
+            return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, item_control_bytes) catch
+            return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, remote_embedding_transport_control_bytes) catch
+            return error.InferenceEncodedBytesExceeded;
+        return .{ .attachment_transport = .base64_payload, .fixed_bytes = fixed };
     }
 
     fn denseCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
@@ -1372,6 +1397,10 @@ fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
     return entry.deadline_ns orelse monotonicNowNs() +| max_embedding_request_timeout_ns;
 }
 
+const remote_embedding_max_response_bytes: usize = 4 << 20;
+const remote_embedding_response_resident_multiplier: usize = 8;
+const remote_embedding_transport_control_bytes: usize = 256 << 10;
+
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     if (entry.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
     const deadline = entry.deadline_ns orelse return;
@@ -1381,7 +1410,7 @@ fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
 fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientConfig {
     var config = httpx.ClientConfig{
         .keep_alive = false,
-        .max_response_size = 4 << 20,
+        .max_response_size = remote_embedding_max_response_bytes,
     };
     const deadline = embeddingOperationDeadline(entry);
     const now_ns = monotonicNowNs();
@@ -4191,6 +4220,7 @@ fn validateDensePartItemInvocation(
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
         .binary => |media| {
+            if (media.data.len == 0) return error.InvalidInferenceMedia;
             mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
             try capabilities.validateMimeType(media.mime_type);
             const resident = try attachment_transport.wireSize(media.data.len, media.mime_type.len);
@@ -4215,7 +4245,10 @@ fn densePartBatchEnd(
     while (end < items.len and end - start < max_items) : (end += 1) {
         const item_bytes: usize = switch (items[end]) {
             .text => 0,
-            .binary => |value| try attachment_transport.wireSize(value.data.len, value.mime_type.len),
+            .binary => |value| if (value.data.len == 0)
+                return error.InvalidInferenceMedia
+            else
+                try attachment_transport.wireSize(value.data.len, value.mime_type.len),
             .media_url => |url| try denseMediaUrlWireBytes(capabilities, url),
         };
         const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
@@ -4300,6 +4333,12 @@ test "managed embedder partitions and validates inline image data URIs" {
     try std.testing.expectError(
         error.UnsupportedInferenceMimeType,
         denseMediaUrlWireBytes(capabilities, "data:audio/wav;base64,AQID"),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceMedia,
+        validateDensePartItemInvocation(capabilities, .borrowed_binary, &.{.{
+            .binary = .{ .mime_type = "image/png", .data = &.{} },
+        }}),
     );
 }
 
