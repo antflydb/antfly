@@ -1326,13 +1326,13 @@ class AntflyClient:
         sync_level: SyncLevel | str | None = None,
     ) -> IdempotentBatchResponse:
         """Perform a durably idempotent batch and return its reconciliation receipt."""
-        batch_sync_level = SyncLevel(sync_level) if isinstance(sync_level, str) else sync_level or UNSET
+        batch_sync_level = SyncLevel(sync_level) if isinstance(sync_level, str) else sync_level
         request_data: dict[str, Any] = {"deletes": deletes or []}
         if inserts is not None:
             request_data["inserts"] = inserts
         if transforms is not None:
             request_data["transforms"] = transforms
-        if batch_sync_level is not UNSET:
+        if batch_sync_level is not None:
             request_data["sync_level"] = batch_sync_level.value
         request = BatchRequest.from_dict(request_data)
         encoded = self._encode_write_request("Idempotent batch", request.to_dict())
