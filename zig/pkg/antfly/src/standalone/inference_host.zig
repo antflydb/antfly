@@ -852,6 +852,18 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .max_tokens = decoded.metadata.value.max_tokens,
                 .source_fingerprint = decoded.metadata.value.source_fingerprint,
             };
+            // The override is an injected test executor with no model catalog.
+            // Every production path resolves and enforces the concrete model
+            // contract inside this ABI boundary.
+            if (state.read_encoded_images_override == null) {
+                const read_capabilities = try localModelCapabilities(
+                    &state.node,
+                    state.io,
+                    decoded.metadata.value.model,
+                    .read,
+                );
+                try validateEncodedReadCapabilities(read_capabilities, encoded_request);
+            }
             if (operation == .read_encoded_images_reported and state.read_encoded_images_override == null) {
                 var batch = try state.node.readEncodedImagesReportedDirect(alloc, decoded.metadata.value.model, encoded_request);
                 defer batch.deinit(alloc);
@@ -1690,6 +1702,77 @@ fn validateLocalGenerateCapabilities(
         .max_text_bytes_per_item = preflight.text_bytes,
         .requested_output_tokens_per_item = 256,
     });
+}
+
+/// The provider ABI is an executor boundary, not a trusted shortcut around
+/// model admission. Callers normally preflight through Runtime, but plugins and
+/// future linked clients may invoke the stable ABI directly.
+fn validateEncodedReadCapabilities(
+    capabilities: antfly.inference.work.InferenceCapabilities,
+    request: antfly.readers.EncodedRequest,
+) !void {
+    var encoded_media_bytes: usize = 0;
+    for (request.images) |image| {
+        try capabilities.validateMimeType(image.mime_type);
+        const resident = try antfly.inference.work.AttachmentTransport.borrowed_binary.wireSize(
+            image.bytes.len,
+            image.mime_type.len,
+        );
+        encoded_media_bytes = std.math.add(usize, encoded_media_bytes, resident) catch
+            return error.InferenceEncodedBytesExceeded;
+    }
+    const output_tokens: usize = if (request.max_tokens) |tokens|
+        if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+    else
+        0;
+    const prompt_bytes = if (request.prompt) |prompt| prompt.len else 0;
+    try capabilities.validateInvocation(.read, .{
+        .item_count = request.images.len,
+        .modalities = if (request.images.len > 0) .{ .image = true } else .{},
+        .encoded_media_bytes = encoded_media_bytes,
+        .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
+        .text_bytes = prompt_bytes,
+        .max_text_bytes_per_item = prompt_bytes,
+        .requested_output_tokens_per_item = output_tokens,
+    });
+}
+
+test "encoded reader ABI enforces resolved model capabilities" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const image = antfly.readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
+    const capabilities = antfly.inference.work.InferenceCapabilities{
+        .task = .read,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .none,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = bytes.len,
+            .max_media_parts_per_item = 1,
+        },
+        .task_limits = .{ .max_output_tokens_per_item = 4 },
+        .output = .read_result,
+    };
+    try validateEncodedReadCapabilities(capabilities, .{ .images = &.{image}, .max_tokens = 4 });
+    try std.testing.expectError(
+        error.InferenceBatchTooLarge,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{ image, image } }),
+    );
+    const oversized = [_]u8{ 1, 2, 3, 4 };
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &oversized, .mime_type = "image/png" }} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/jpeg" }} }),
+    );
+    try std.testing.expectError(
+        error.InferenceOutputTokensExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{image}, .max_tokens = 5 }),
+    );
 }
 
 fn validateLinkedTextInvocation(

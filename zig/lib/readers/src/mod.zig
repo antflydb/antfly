@@ -85,9 +85,9 @@ pub fn validateEncodedRequest(request: EncodedRequest) !void {
     for (request.images) |image| {
         if (image.bytes.len == 0) return error.InvalidImageInput;
         const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
-        if (mime_type.len != image.mime_type.len or mime_type.len <= "image/".len or
-            !std.ascii.startsWithIgnoreCase(mime_type, "image/"))
-        {
+        if (mime_type.len != image.mime_type.len) return error.InvalidArguments;
+        const parsed = data_uri.parseMediaType(mime_type) catch return error.InvalidArguments;
+        if (!std.ascii.startsWithIgnoreCase(parsed.essence, "image/")) {
             return error.InvalidArguments;
         }
     }
@@ -97,6 +97,7 @@ test "encoded reader validation is execution-mode independent" {
     const bytes = [_]u8{1};
     try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} });
     try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "IMAGE/PNG" }} });
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png; charset=binary" }} });
     try std.testing.expectError(
         error.InvalidImageInput,
         validateEncodedRequest(.{ .images = &.{.{ .bytes = &.{}, .mime_type = "image/png" }} }),
@@ -108,6 +109,14 @@ test "encoded reader validation is execution-mode independent" {
     try std.testing.expectError(
         error.InvalidArguments,
         validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "application/octet-stream" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png;" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png; codecs=\"unterminated" }} }),
     );
 }
 

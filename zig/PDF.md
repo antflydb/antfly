@@ -1000,6 +1000,30 @@ document. They are architectural requirements, not Florence-specific cleanup:
     model work. Request-scoped limits such as schema and encoded bytes remain
     active even for a malformed zero-item invocation. Exact tokenizer-dependent
     counts remain executor-owned when a planner cannot compute them.
+102. **Render-window byte pressure could silently reduce visual quality.** OCR
+    and page-embedding windows previously selected their item count first and
+    divided retained PNG bytes afterward. A large batch could therefore render
+    each page at a lower resolution than the same page would receive alone;
+    visual embedding then persisted the degraded vector as a successful durable
+    artifact. Window formation now computes each page's singleton encoded-output
+    allowance, admits only the largest prefix whose combined render/inference
+    budget preserves those allowances, and shortens the window when fixed or
+    retained memory cannot fit. Page embedding also enforces the same minimum
+    render dimension and bounded retry count as OCR. Memory pressure changes
+    throughput, not semantic input quality.
+103. **HTTP media adapters retained a weaker MIME comparison than linked
+    execution.** Generation, embedding, chunking, and extraction decoded data
+    URIs with the shared parser but compared only MIME essences afterward. They
+    now use the same declaration-compatibility relation as borrowed attachments:
+    an essence-only declaration may accept physical parameters, while every
+    explicitly declared parameter must match the physical media value.
+104. **The encoded-reader ABI trusted its runtime wrapper to enforce model
+    capabilities.** Direct linked callers could bypass the resolved model's MIME,
+    item, encoded-byte, prompt, and output-token ceilings, and the reader-level
+    validator accepted malformed `image/*` parameter syntax. The reader contract
+    now parses the complete MIME type, and the production host resolves and
+    validates the concrete read invocation before dispatch. The only exemption
+    is the explicit test executor override, which has no model catalog.
 
 ### Post-review implementation contract
 
@@ -1016,6 +1040,10 @@ The hardening above follows these long-term rules:
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
+- Render planners preserve a singleton quality invariant. The retained-output
+  allowance for an item in a batch is never smaller than its admitted singleton
+  allowance. If that invariant does not fit, the planner reduces the window;
+  it does not spend page resolution to preserve batch cardinality.
 - Admission receives a route-owned `InvocationMemoryPlan`, containing the
   selected attachment representation, allocator owner, complete host-boundary
   peak, and independent per-item and aggregate result limits. Media-capable

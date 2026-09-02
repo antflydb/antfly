@@ -21825,9 +21825,14 @@ fn decodeMediaDataWithBudget(
 fn mediaMimeMatches(declared: ?[]const u8, embedded: ?[]const u8) bool {
     const embedded_mime = embedded orelse return true;
     const declared_mime = declared orelse return true;
-    const declared_essence = scraping.data_uri.mediaTypeEssence(declared_mime) catch return false;
-    const embedded_essence = scraping.data_uri.mediaTypeEssence(embedded_mime) catch return false;
-    return std.ascii.eqlIgnoreCase(declared_essence, embedded_essence);
+    return scraping.data_uri.mediaTypesCompatible(declared_mime, embedded_mime);
+}
+
+test "HTTP media declarations preserve codec parameters" {
+    try std.testing.expect(mediaMimeMatches("audio/webm", "audio/webm;codecs=opus"));
+    try std.testing.expect(mediaMimeMatches("audio/webm;codecs=opus", "audio/webm; codecs=\"opus\""));
+    try std.testing.expect(!mediaMimeMatches("audio/webm;codecs=opus", "audio/webm;codecs=vorbis"));
+    try std.testing.expect(!mediaMimeMatches("image/png;", "image/png"));
 }
 
 fn unsupportedAudioResponse(ctx: *httpx.Context, message: []const u8) !httpx.Response {

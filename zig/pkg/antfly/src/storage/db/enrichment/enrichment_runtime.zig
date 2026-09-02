@@ -262,9 +262,9 @@ const generated_pdf_default_max_document_pages: usize = 2048;
 const generated_pdf_absolute_max_document_pages: usize = 16_384;
 const generated_pdf_artifact_scan_work_max_keys: usize = generated_pdf_absolute_max_document_pages * 8;
 const generated_pdf_stage_cleanup_page_keys: usize = 512;
-const maximum_ocr_inline_png_bytes: usize = 8 * 1024 * 1024;
-const minimum_ocr_inline_render_dimension: u32 = 512;
-const maximum_ocr_inline_render_attempts: u8 = 4;
+const maximum_pdf_page_inline_png_bytes: usize = 8 * 1024 * 1024;
+const minimum_pdf_page_render_dimension: u32 = 512;
+const maximum_pdf_page_render_attempts: u8 = 4;
 const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
@@ -5860,7 +5860,7 @@ const RuntimePdfOcrCoordinator = struct {
         // the bytes left after one minimum OCR raster and conservative
         // per-worker metadata allowance are guaranteed.
         const available = self.reservation.max_live_bytes -| self.reservation.live_bytes;
-        const minimum_dimension = @min(config.ocr_max_rendered_dimension, minimum_ocr_inline_render_dimension);
+        const minimum_dimension = @min(config.ocr_max_rendered_dimension, minimum_pdf_page_render_dimension);
         const minimum_pixels = @min(
             config.ocr_max_rendered_pixels,
             std.math.mul(u64, minimum_dimension, minimum_dimension) catch
@@ -6257,6 +6257,18 @@ fn splitPdfInvocationRenderMemoryBudget(
     return splitPdfRenderMemoryBudget(available_bytes, retained_limit);
 }
 
+/// A render batch must not give any page less encoded-output headroom than the
+/// same page would receive as a singleton invocation. Batch pressure is
+/// resolved by shortening the window, never by silently lowering page quality.
+fn pdfOutputAllowancesFit(retained_bytes: usize, allowances: []const usize) bool {
+    var required: usize = 0;
+    for (allowances) |allowance| {
+        required = std.math.add(usize, required, allowance) catch return false;
+        if (required > retained_bytes) return false;
+    }
+    return true;
+}
+
 test "PDF render memory budget jointly bounds scratch and retained output" {
     const small_output = try splitPdfRenderMemoryBudget(100, 20);
     try std.testing.expectEqual(@as(usize, 80), small_output.scratch_bytes);
@@ -6293,6 +6305,12 @@ test "PDF render budget reserves the complete invocation peak" {
     );
 }
 
+test "PDF output allowance makes window size quality neutral" {
+    try std.testing.expect(pdfOutputAllowancesFit(16, &.{ 8, 8 }));
+    try std.testing.expect(!pdfOutputAllowancesFit(15, &.{ 8, 8 }));
+    try std.testing.expect(!pdfOutputAllowancesFit(std.math.maxInt(usize), &.{ std.math.maxInt(usize), 1 }));
+}
+
 fn renderRuntimePdfWindow(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -6325,9 +6343,9 @@ fn renderRuntimePdfWindow(
             .requested_dpi = config.ocr_render_dpi,
             .max_pixels = @min(config.ocr_max_rendered_pixels, dimension_pixels),
             .max_dimension = config.ocr_max_rendered_dimension,
-            .max_output_bytes = maximum_ocr_inline_png_bytes,
-            .min_output_dimension = minimum_ocr_inline_render_dimension,
-            .max_output_attempts = maximum_ocr_inline_render_attempts,
+            .max_output_bytes = maximum_pdf_page_inline_png_bytes,
+            .min_output_dimension = minimum_pdf_page_render_dimension,
+            .max_output_attempts = maximum_pdf_page_render_attempts,
         });
         try unit_indices.append(alloc, idx);
     }
@@ -6337,7 +6355,7 @@ fn renderRuntimePdfWindow(
     // independent, while the transport enum tells the planner how to account
     // for the real PNGs. Keep these temporary request descriptions out of the
     // render/inference peak they describe.
-    const invocation_memory = blk: {
+    const memory_budget = blk: {
         const prototype_parts = try alloc.alloc([]u8, requests.items.len);
         var initialized_parts: usize = 0;
         defer {
@@ -6348,6 +6366,8 @@ fn renderRuntimePdfWindow(
         defer alloc.free(prototype_media);
         const prototype_requests = try alloc.alloc(asset_producer_mod.Request, requests.items.len);
         defer alloc.free(prototype_requests);
+        const singleton_allowances = try alloc.alloc(usize, requests.items.len);
+        defer alloc.free(singleton_allowances);
         const dummy_png = [_]u8{0};
         for (unit_indices.items, 0..) |unit_index, i| {
             prototype_parts[i] = try document_extraction_mod.ocrPagePartsMetadataJsonAlloc(
@@ -6371,23 +6391,56 @@ fn renderRuntimePdfWindow(
                 .page_number = units[unit_index].page_number,
                 .media = prototype_media[i .. i + 1],
             };
+            const singleton_memory = try producer.invocationMemoryForRequests(
+                alloc,
+                prototype_requests[i .. i + 1],
+            );
+            const singleton_budget = try splitPdfInvocationRenderMemoryBudget(
+                max_inflight_bytes,
+                batch_policy.max_bytes,
+                singleton_memory.fixed_bytes,
+                singleton_memory.attachment_transport,
+                "image/png".len,
+                1,
+            );
+            singleton_allowances[i] = @min(maximum_pdf_page_inline_png_bytes, singleton_budget.retained_bytes);
         }
-        break :blk try producer.invocationMemoryForRequests(alloc, prototype_requests);
+
+        var planned_count = requests.items.len;
+        while (true) {
+            const invocation_memory = try producer.invocationMemoryForRequests(
+                alloc,
+                prototype_requests[0..planned_count],
+            );
+            const candidate_budget = splitPdfInvocationRenderMemoryBudget(
+                max_inflight_bytes,
+                batch_policy.max_bytes,
+                invocation_memory.fixed_bytes,
+                invocation_memory.attachment_transport,
+                "image/png".len,
+                planned_count,
+            ) catch |err| {
+                if (err == error.DocumentExtractionWorkingSetTooLarge and planned_count > 1) {
+                    planned_count -= 1;
+                    continue;
+                }
+                return err;
+            };
+            if (pdfOutputAllowancesFit(candidate_budget.retained_bytes, singleton_allowances[0..planned_count])) {
+                requests.items.len = planned_count;
+                unit_indices.items.len = planned_count;
+                for (requests.items, singleton_allowances[0..planned_count]) |*request, allowance|
+                    request.max_output_bytes = @min(request.max_output_bytes.?, allowance);
+                break :blk candidate_budget;
+            }
+            std.debug.assert(planned_count > 1);
+            planned_count -= 1;
+        }
     };
-    const memory_budget = try splitPdfInvocationRenderMemoryBudget(
-        max_inflight_bytes,
-        batch_policy.max_bytes,
-        invocation_memory.fixed_bytes,
-        invocation_memory.attachment_transport,
-        "image/png".len,
-        requests.items.len,
-    );
-    const per_page_output_bytes = @max(@as(usize, 1), memory_budget.retained_bytes / requests.items.len);
-    for (requests.items) |*request| request.max_output_bytes = @min(request.max_output_bytes.?, per_page_output_bytes);
 
     const parallel_pages = @max(@as(usize, 1), @min(config.pdf_render_max_parallel_pages, requests.items.len));
     const waves = (requests.items.len + parallel_pages - 1) / parallel_pages;
-    const retry_waves = std.math.mul(usize, waves, maximum_ocr_inline_render_attempts) catch std.math.maxInt(usize);
+    const retry_waves = std.math.mul(usize, waves, maximum_pdf_page_render_attempts) catch std.math.maxInt(usize);
     const timeout_ms = std.math.mul(u64, runtime.syncWaitTimeoutMs(), retry_waves) catch std.math.maxInt(u64);
     var deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
     var batch = try session.renderPagesBatchAlloc(alloc, requests.items, .{
@@ -10983,29 +11036,60 @@ fn processPdfPageImageEmbedding(
         try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
         coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
-        const count = @min(batch_items, page_count - first_page + 1);
-        const requests = try runtime.alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
-        defer runtime.alloc.free(requests);
+        var count = @min(batch_items, page_count - first_page + 1);
         const available_bytes = @min(try coordinator.availableRenderBytes(), render_config.pdf_render_max_inflight_bytes);
-        const invocation_memory = try dense_embedder.partInvocationMemoryForMime(
+        const singleton_memory = try dense_embedder.partInvocationMemoryForMime(
             embedding_name,
-            count,
+            1,
             "image/png",
             request.expected_dims,
         );
-        const memory_budget = try splitPdfInvocationRenderMemoryBudget(
+        const singleton_budget = try splitPdfInvocationRenderMemoryBudget(
             available_bytes,
             batch_bytes,
-            invocation_memory.fixed_bytes,
-            invocation_memory.attachment_transport,
+            singleton_memory.fixed_bytes,
+            singleton_memory.attachment_transport,
             "image/png".len,
-            count,
+            1,
         );
-        const per_page_bytes = @max(@as(usize, 1), memory_budget.retained_bytes / count);
+        const per_page_bytes = @min(maximum_pdf_page_inline_png_bytes, singleton_budget.retained_bytes);
+        const memory_budget = while (true) {
+            const invocation_memory = try dense_embedder.partInvocationMemoryForMime(
+                embedding_name,
+                count,
+                "image/png",
+                request.expected_dims,
+            );
+            const candidate_budget = splitPdfInvocationRenderMemoryBudget(
+                available_bytes,
+                batch_bytes,
+                invocation_memory.fixed_bytes,
+                invocation_memory.attachment_transport,
+                "image/png".len,
+                count,
+            ) catch |err| {
+                if (err == error.DocumentExtractionWorkingSetTooLarge and count > 1) {
+                    count -= 1;
+                    continue;
+                }
+                return err;
+            };
+            if (per_page_bytes <= candidate_budget.retained_bytes / count)
+                break candidate_budget;
+            std.debug.assert(count > 1);
+            count -= 1;
+        };
+        const requests = try runtime.alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
+        defer runtime.alloc.free(requests);
+        const minimum_dimension = @min(render_config.ocr_max_rendered_dimension, minimum_pdf_page_render_dimension);
         for (requests, 0..) |*page_request, i| page_request.* = .{
             .page_number = first_page + i,
             .requested_dpi = render_config.ocr_render_dpi,
+            .max_pixels = render_config.ocr_max_rendered_pixels,
+            .max_dimension = render_config.ocr_max_rendered_dimension,
             .max_output_bytes = per_page_bytes,
+            .min_output_dimension = minimum_dimension,
+            .max_output_attempts = maximum_pdf_page_render_attempts,
         };
         const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse render_config.pdf_render_max_inflight_pixels;
         var rendered = try coordinator.session.renderPagesBatchAlloc(download_alloc, requests, .{
