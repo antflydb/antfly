@@ -2255,7 +2255,7 @@ fn buildArtifactManagedEmbeddingEntryFromProducerValue(
         null;
     defer if (semantic_comparison) |*parsed| parsed.deinit();
     const parser_input = if (semantic_comparison) |parsed| parsed.value else producer;
-    const entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, parser_input, options, dims) catch |err| switch (err) {
+    const entry = buildManagedEmbeddingEntry(alloc, index_name, artifact_cfg, parser_input, options, dims, null) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidEmbeddingArtifactProducer,
     };
@@ -2975,36 +2975,65 @@ fn parseManagedEmbeddingEntry(
     const sparse = cfg.sparse orelse false;
 
     const embedder = root.get("embedder") orelse return null;
-    const dims = if (sparse) 0 else try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
-    var managed = try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims);
-    errdefer managed.deinit(alloc);
-    try bindManagedEntryToCatalogSemanticIdentity(alloc, value, options, &managed);
-    return managed;
+    const declared_dims = if (sparse) null else try resolveDeclaredEmbeddingDimensions(cfg);
+    var semantic_binding = try catalogSemanticExecutionBindingAlloc(
+        alloc,
+        value,
+        options,
+        sparse,
+        declared_dims,
+    );
+    defer if (semantic_binding) |*binding| binding.deinit(alloc);
+    const dims = if (sparse)
+        0
+    else if (declared_dims) |declared|
+        declared
+    else
+        try resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
+            alloc,
+            index_name,
+            cfg,
+            embedder,
+            options,
+            semantic_binding,
+        );
+    return try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims, semantic_binding);
 }
 
-/// Bind execution to the endpoint and deployment mode admitted into the
-/// catalog. The raw embedder remains authoritative for credentials and pacing,
-/// while semantic identity prevents each runtime process from re-resolving an
-/// omitted endpoint or Bedrock region from its own environment.
-fn bindManagedEntryToCatalogSemanticIdentity(
+const CatalogSemanticExecutionBinding = struct {
+    endpoint: []u8,
+    region: []u8,
+    embedded: bool,
+
+    fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
+        alloc.free(self.endpoint);
+        if (self.region.len > 0) alloc.free(self.region);
+        self.* = undefined;
+    }
+};
+
+/// Resolve the durable endpoint and deployment mode before constructing an
+/// executable entry. The raw embedder remains authoritative for credentials
+/// and pacing, but a runtime loading admitted catalog state must never consult
+/// its own endpoint or region defaults first and then overwrite the result.
+fn catalogSemanticExecutionBindingAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     options: InitOptions,
-    entry: *ManagedEmbeddingEntry,
-) !void {
+    sparse: bool,
+    dimensions: ?u32,
+) !?CatalogSemanticExecutionBinding {
     const root = switch (value) {
         .object => |object| object,
         else => return error.InvalidEmbeddingArtifactProducer,
     };
-    const semantic = root.get("semantic_producer") orelse return;
+    const semantic = root.get("semantic_producer") orelse return null;
     if (semantic != .string or semantic.string.len == 0)
         return error.InvalidEmbeddingArtifactProducer;
 
-    var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
-    defer parsed_cfg.deinit();
     try validateCatalogOwnerSemanticIdentity(alloc, .{
-        .sparse = parsed_cfg.value.sparse orelse false,
-        .dimensions = if (parsed_cfg.value.sparse orelse false) null else entry.dimensions,
+        .sparse = sparse,
+        .dimensions = dimensions,
         .semantic_producer_json = semantic.string,
         .index_value = value,
     });
@@ -3017,19 +3046,18 @@ fn bindManagedEntryToCatalogSemanticIdentity(
     const endpoint = try semanticIdentityStringField(identity.value, "endpoint");
     const region = try semanticIdentityStringField(identity.value, "region");
     const embedded = std.mem.eql(u8, endpoint, "antfly:embedded");
-    if (embedded and (entry.provider != .antfly or options.antfly_provider == null))
+    if (embedded and options.antfly_provider == null)
         return error.InvalidEmbeddingArtifactProducer;
 
-    const bound_base_url = try alloc.dupe(u8, if (embedded) "" else endpoint);
-    errdefer alloc.free(bound_base_url);
-    const bound_region: []u8 = if (region.len > 0) try alloc.dupe(u8, region) else @constCast("");
-    errdefer if (bound_region.len > 0) alloc.free(bound_region);
-
-    alloc.free(entry.base_url);
-    if (entry.region.len > 0) alloc.free(entry.region);
-    entry.base_url = bound_base_url;
-    entry.region = bound_region;
-    entry.antfly_provider = if (embedded) options.antfly_provider else null;
+    const owned_endpoint = try alloc.dupe(u8, endpoint);
+    errdefer alloc.free(owned_endpoint);
+    const owned_region: []u8 = if (region.len > 0) try alloc.dupe(u8, region) else @constCast("");
+    errdefer if (owned_region.len > 0) alloc.free(owned_region);
+    return .{
+        .endpoint = owned_endpoint,
+        .region = owned_region,
+        .embedded = embedded,
+    };
 }
 
 fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
@@ -3051,6 +3079,7 @@ fn buildManagedEmbeddingEntry(
     embedder: std.json.Value,
     options: InitOptions,
     dimensions: u32,
+    semantic_binding: ?CatalogSemanticExecutionBinding,
 ) !ManagedEmbeddingEntry {
     const sparse = cfg.sparse orelse false;
     var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder);
@@ -3067,7 +3096,12 @@ fn buildManagedEmbeddingEntry(
         bedrock_provider.RequestFormat.auto;
     const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
     const burst = try resolveEmbedderBurst(embedder, provider);
-    const antfly_provider = if (isAntflyProvider(provider) and shouldUseAntflyProvider(embedder_cfg, options))
+    const antfly_provider = if (semantic_binding) |binding|
+        if (binding.embedded)
+            options.antfly_provider orelse return error.InvalidEmbeddingArtifactProducer
+        else
+            null
+    else if (isAntflyProvider(provider) and shouldUseAntflyProvider(embedder_cfg, options))
         options.antfly_provider
     else
         null;
@@ -3089,9 +3123,16 @@ fn buildManagedEmbeddingEntry(
     const owned_model = try alloc.dupe(u8, embedder_cfg.model);
     errdefer alloc.free(owned_model);
 
-    const bedrock_region: []u8 = if (provider == .bedrock) try resolveBedrockRegion(alloc, embedder_cfg) else @constCast("");
+    const bedrock_region: []u8 = if (semantic_binding) |binding|
+        if (binding.region.len > 0) try alloc.dupe(u8, binding.region) else @constCast("")
+    else if (provider == .bedrock)
+        try resolveBedrockRegion(alloc, embedder_cfg)
+    else
+        @constCast("");
     errdefer if (bedrock_region.len > 0) alloc.free(bedrock_region);
-    const base_url = switch (provider) {
+    const base_url = if (semantic_binding) |binding|
+        try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
+    else switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region),
@@ -3182,8 +3223,26 @@ fn resolveEmbeddingDimensionsForManagedConfig(
     embedder: std.json.Value,
     options: InitOptions,
 ) !u32 {
+    return try resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
+        alloc,
+        index_name,
+        cfg,
+        embedder,
+        options,
+        null,
+    );
+}
+
+fn resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    cfg: indexes_openapi.EmbeddingsIndexConfig,
+    embedder: std.json.Value,
+    options: InitOptions,
+    semantic_binding: ?CatalogSemanticExecutionBinding,
+) !u32 {
     if (try resolveDeclaredEmbeddingDimensions(cfg)) |declared| return declared;
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, semantic_binding) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -3201,7 +3260,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     validation: DimensionProbeValidation,
 ) !u32 {
     const declared = try resolveDeclaredEmbeddingDimensions(cfg);
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -3219,7 +3278,7 @@ fn validateSparseEmbeddingForManagedConfig(
     embedder: std.json.Value,
     options: InitOptions,
 ) !void {
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -4418,7 +4477,9 @@ test "managed embedder binds execution to catalog semantic producer identity" {
         \\{"semantic":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"model-a"},"semantic_producer":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"model-a\",\"endpoint\":\"http://identity.example/ai/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}}
     , .{
         .antfly_provider = local.provider(),
-        .inference_api_url = "http://runtime-default.example",
+        // Catalog loading must not parse this node-local default before it
+        // selects the already-admitted durable endpoint.
+        .inference_api_url = "http://runtime-default.example/wrong-path",
     });
     defer remote.deinit();
     try std.testing.expectEqualStrings("http://identity.example/ai/v1", remote.entries[0].base_url);
@@ -4432,7 +4493,7 @@ test "managed embedder binds execution to catalog semantic producer identity" {
         embedded_catalog,
         .{
             .antfly_provider = local.provider(),
-            .inference_api_url = "http://runtime-default.example",
+            .inference_api_url = "http://runtime-default.example/wrong-path",
         },
     );
     defer embedded.deinit();
@@ -4444,7 +4505,7 @@ test "managed embedder binds execution to catalog semantic producer identity" {
         ManagedEmbedder.initFromIndexesJsonWithOptions(
             std.testing.allocator,
             embedded_catalog,
-            .{ .inference_api_url = "http://runtime-default.example" },
+            .{ .inference_api_url = "http://runtime-default.example/wrong-path" },
         ),
     );
 }
