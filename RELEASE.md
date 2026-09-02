@@ -85,12 +85,12 @@ replaces a saved artifact.
 Registry promotion is triggered only by the `promote-cli-release`
 `repository_dispatch` event, so GitHub loads the workflow from the default
 branch rather than an operator-selected ref. The `pypi` and `npm` environments
-admit this CLI workflow only from `main`; separate typed tag rules preserve the
-existing SDK publishers without allowing similarly named branches. Both
-environments require review with self-approval disabled. Recovery requests
-include the exact `artifacts.json` SHA-256; the promotion verifies that digest,
-its attestation, tag and source commit before granting either registry job
-access.
+admit this CLI promotion from `main`; typed tag rules preserve pre-transition
+`v*` releases and the existing SDK publishers without allowing similarly named
+branches. Both environments require review with self-approval disabled.
+Recovery requests include the exact `artifacts.json` SHA-256; the promotion
+verifies that digest, its attestation, tag and source commit before granting
+either registry job access.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the GNU Linux archives on native Linux

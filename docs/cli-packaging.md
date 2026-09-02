@@ -76,10 +76,12 @@ The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub
 environments admit the CLI promotion only from the `main` branch, which is the
-ref used by `repository_dispatch` runs. Their other allow rules are typed tag
-rules for the existing Python and TypeScript SDK publishers, not branch globs;
-both environments require approval from a repository administrator and prevent
-the triggering administrator from approving their own deployment.
+ref used by `repository_dispatch` runs. Typed `v*` tag rules preserve releases
+made before this transition, and separate typed tag rules preserve the existing
+Python and TypeScript SDK publishers. None of those tag patterns admits a
+similarly named branch. Both environments require approval from a repository
+administrator and prevent the triggering administrator from approving their
+own deployment.
 
 Linux releases have two libc variants. The unsuffixed archive is the portable,
 CPU-only musl build used by musl hosts and direct portable downloads. The
