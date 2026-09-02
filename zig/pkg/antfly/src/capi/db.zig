@@ -2739,6 +2739,12 @@ fn metadataProjectionJson(
     return .ok;
 }
 
+fn metadataProjectionStatusFromError(err: anyerror) kernel_owner_abi.Status {
+    if (err == error.InvalidDerivedCatalogIndex)
+        return storageOwnerStatusFromError(error.InvalidArgument);
+    return storageOwnerStatusFromError(err);
+}
+
 pub fn metadataApplyStoreOpen(
     request: *const kernel_owner_abi.MetadataApplyOpenRequest,
     out_store: *?*anyopaque,
@@ -3002,6 +3008,66 @@ pub fn metadataApplyStoreProjection(
             defer if (value) |record| metadata_table_manager.freeTable(alloc, record);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .range => blk: {
+            const value = handle.store.getRange(alloc, request.group_id, request.arg0) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |record| metadata_table_manager.freeRange(alloc, record);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_drop_projection => blk: {
+            var value = handle.store.captureTableDropProjection(
+                alloc,
+                request.group_id,
+                request.key.slice(),
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            defer if (value) |*projection| projection.deinit(alloc);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_create_generation => blk: {
+            const value = handle.store.captureTableCreateGeneration(
+                alloc,
+                request.group_id,
+                request.arg0,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .table_restore_admission => blk: {
+            var parsed = std.json.parseFromSlice(
+                metadata_table_manager.TableRecord,
+                alloc,
+                request.key.slice(),
+                .{},
+            ) catch |err| break :blk switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .invalid_argument,
+            };
+            defer parsed.deinit();
+            const value = handle.store.captureTableRestoreAdmission(
+                alloc,
+                request.group_id,
+                parsed.value,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .verify_table_create_projection => blk: {
+            const Payload = struct {
+                table: metadata_table_manager.TableRecord,
+                ranges: []const metadata_table_manager.RangeRecord,
+            };
+            var parsed = std.json.parseFromSlice(Payload, alloc, request.key.slice(), .{}) catch |err|
+                break :blk switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    else => .invalid_argument,
+                };
+            defer parsed.deinit();
+            handle.store.verifyTableCreateProjectionExact(
+                alloc,
+                request.group_id,
+                parsed.value.table,
+                parsed.value.ranges,
+            ) catch |err| break :blk metadataProjectionStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .table_transition_fence => blk: {
             const value = handle.store.getTableTransitionFence(request.group_id, request.arg0) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -3018,6 +3084,22 @@ pub fn metadataApplyStoreProjection(
                 break :blk storageOwnerStatusFromError(err);
             defer handle.store.freeRestoreProgress(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .active_restore_ranges => blk: {
+            const value = handle.store.listActiveRestoreRanges(alloc, request.group_id) catch |err|
+                break :blk metadataProjectionStatusFromError(err);
+            defer handle.store.freeRanges(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .ensure_derived_catalog_indexes => blk: {
+            handle.store.ensureDerivedCatalogIndexes(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .rebuild_derived_catalog_indexes => blk: {
+            handle.store.rebuildDerivedCatalogIndexes(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .replication_source_statuses => blk: {
             const value = handle.store.listReplicationSourceStatuses(alloc, request.group_id) catch |err|
@@ -3055,6 +3137,24 @@ pub fn metadataApplyStoreProjection(
                 break :blk storageOwnerStatusFromError(err);
             defer handle.store.freeExtensionDependencies(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .extension_lifecycle_delta_applied => blk: {
+            var parsed = std.json.parseFromSlice(
+                metadata_raft_apply.ExtensionLifecycleDelta,
+                alloc,
+                request.key.slice(),
+                .{},
+            ) catch |err| break :blk switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .invalid_argument,
+            };
+            defer parsed.deinit();
+            const applied = handle.store.extensionLifecycleDeltaApplied(
+                alloc,
+                request.group_id,
+                parsed.value,
+            ) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, applied);
         },
         .shuffle_join_leases => blk: {
             const value = handle.store.listShuffleJoinLeases(alloc, request.group_id) catch |err|
@@ -4116,6 +4216,7 @@ pub fn storageOwnerReconcile(
             .repair_pending => .repair_pending,
             .busy => .busy,
             .degraded => .degraded,
+            .restore_repair_pending => .restore_repair_pending,
         },
         .indexes_added = @intCast(reconciled.indexes_added),
         .indexes_removed = @intCast(reconciled.indexes_removed),
@@ -4128,6 +4229,9 @@ pub fn storageOwnerReconcile(
         .repair_busy = @intCast(reconciled.repair_busy),
         .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
         .next_retry_at_ms = reconciled.next_retry_at_ms,
+        .restore_repair_attempted = @intCast(reconciled.restore_repair_attempted),
+        .restore_repair_progressed = @intCast(reconciled.restore_repair_progressed),
+        .restore_repair_pending = @intCast(reconciled.restore_repair_pending),
     };
     return .ok;
 }

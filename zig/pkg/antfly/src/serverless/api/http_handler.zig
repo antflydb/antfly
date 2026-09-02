@@ -5057,6 +5057,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: *public_table_http.TableApi.BackupExecutionReceipt,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;

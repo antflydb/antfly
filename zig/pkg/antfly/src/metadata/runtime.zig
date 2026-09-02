@@ -89,15 +89,27 @@ fn isExpectedControlRoundError(err: anyerror) bool {
     return antfly.metadata.authority.isRetryableError(err);
 }
 
+const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
+const metadata_raft_max_regular_ready_bytes: usize = 64 * 1024 * 1024;
+const metadata_raft_max_single_ready_bytes: usize =
+    metadata_raft_max_snapshot_transfer_bytes + metadata_raft_max_regular_ready_bytes;
+
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
         .max_tick_batch = 32,
         .max_pending_outbound_messages = 4096,
         .max_pending_outbound_bytes = 16 * 1024 * 1024,
+        // One Ready may exceed the queue budget for liveness, but never the
+        // configured snapshot ceiling plus one bounded regular batch.
+        .max_single_outbound_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_transport_messages_per_round = 64,
         .max_transport_bytes_per_round = 512 * 1024,
+        .max_snapshot_submissions_per_round = 2,
+        .max_snapshot_submission_scans_per_round = 32,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
+        .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
+        .max_pending_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
@@ -181,6 +193,8 @@ const Factory = struct {
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    .max_size_per_msg = metadata_raft_max_regular_ready_bytes,
+                    .max_committed_size_per_ready = metadata_raft_max_regular_ready_bytes,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = self.store.storage(),
@@ -284,6 +298,21 @@ pub const HealthSource = struct {
         }
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
+        try append(writer, "antfly_raft_quarantined_groups", "gauge", "Number of raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", @intCast(host_metrics.quarantined_groups));
+        try append(writer, "antfly_raft_replica_admission_conflicts_active", "gauge", "Replicas whose desired restart-scoped policy differs from the live runtime", host_metrics.replica_admission_conflicts_active);
+        try append(writer, "antfly_raft_replica_admission_conflicts_total", "counter", "Distinct replica admission conflicts observed", host_metrics.replica_admission_conflicts);
+        try append(writer, "antfly_raft_membership_converged_groups", "gauge", "Local replica intents whose observed Raft membership is converged", host_metrics.membership_converged);
+        try append(writer, "antfly_raft_membership_waiting_for_replica_groups", "gauge", "Local replica intents awaiting runtime admission", host_metrics.membership_waiting_for_replica);
+        try append(writer, "antfly_raft_membership_waiting_for_leader_groups", "gauge", "Local replica intents awaiting a Raft leader for membership convergence", host_metrics.membership_waiting_for_leader);
+        try append(writer, "antfly_raft_membership_waiting_for_local_voter_groups", "gauge", "Local replica intents whose local node cannot yet propose membership", host_metrics.membership_waiting_for_local_voter);
+        try append(writer, "antfly_raft_membership_waiting_for_pending_change_groups", "gauge", "Local replica intents awaiting an in-flight configuration change", host_metrics.membership_waiting_for_pending_change);
+        try append(writer, "antfly_raft_membership_waiting_for_policy_groups", "gauge", "Local replica intents fenced by membership policy", host_metrics.membership_waiting_for_policy);
+        try append(writer, "antfly_raft_route_retrying_groups", "gauge", "Local Raft groups retrying peer endpoint convergence", host_metrics.route_retrying_groups);
+        try append(writer, "antfly_raft_reconcile_failed_groups", "gauge", "Local Raft groups with a failed reconciliation phase", host_metrics.reconcile_failed_groups);
+        try append(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", host_metrics.quarantined_inbound_message_drops);
+        try append(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", host_metrics.runtime_quarantine_resume_attempts);
+        try append(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", host_metrics.runtime_quarantine_resume_successes);
+        try append(writer, "antfly_raft_quarantine_resume_conflicts_total", "counter", "Rejected stale quarantine incident acknowledgements", host_metrics.runtime_quarantine_resume_conflicts);
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
         try append(writer, "antfly_raft_ensure_replica_calls_total", "counter", "Total ensure_replica calls", @intCast(host_metrics.ensure_replica_calls));
         try append(writer, "antfly_raft_remove_replica_calls_total", "counter", "Total remove_replica calls", @intCast(host_metrics.remove_replica_calls));
@@ -297,6 +326,8 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
+        try append(writer, "antfly_raft_runtime_oversized_outbound_ready_rejections_total", "counter", "Raft Ready batches rejected because outbound bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_outbound_ready_rejections));
+        try append(writer, "antfly_raft_runtime_oversized_apply_ready_rejections_total", "counter", "Raft Ready batches rejected because apply bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_apply_ready_rejections));
         try append(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", @intCast(host_metrics.runtime_snapshot_compaction_completions));
         try append(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", @intCast(host_metrics.runtime_snapshot_compaction_failures));
         try append(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", @intCast(host_metrics.runtime_snapshot_compaction_candidates));
@@ -311,6 +342,15 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
         try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
         try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
+        try append(writer, "antfly_raft_async_snapshot_send_enqueued_total", "counter", "Total raft snapshots admitted to the bounded async HTTP send lane", host_metrics.async_snapshot_send_enqueued);
+        try append(writer, "antfly_raft_async_snapshot_send_failed_total", "counter", "Total async raft snapshot HTTP send failures", host_metrics.async_snapshot_send_failed);
+        try append(writer, "antfly_raft_async_snapshot_send_retried_total", "counter", "Total async raft snapshot sends requeued for retry", host_metrics.async_snapshot_send_retried);
+        try append(writer, "antfly_raft_async_snapshot_send_dropped_total", "counter", "Total async raft snapshot sends dropped after permanent failure or retry exhaustion", host_metrics.async_snapshot_send_dropped);
+        try append(writer, "antfly_raft_async_snapshot_send_deduplicated_total", "counter", "Total duplicate raft snapshot sends coalesced into an existing job", host_metrics.async_snapshot_send_deduplicated);
+        try append(writer, "antfly_raft_async_snapshot_send_queue_full_total", "counter", "Total async raft snapshot global queue or byte-budget denials", host_metrics.async_snapshot_send_queue_full);
+        try append(writer, "antfly_raft_async_snapshot_send_peer_queue_full_total", "counter", "Total async raft snapshot per-peer queue denials", host_metrics.async_snapshot_send_peer_queue_full);
+        try append(writer, "antfly_raft_async_snapshot_send_pending", "gauge", "Queued and active async raft snapshot sends", @intCast(host_metrics.async_snapshot_send_pending));
+        try append(writer, "antfly_raft_async_snapshot_send_pending_bytes", "gauge", "Logical snapshot payload bytes retained by the async send lane", @intCast(host_metrics.async_snapshot_send_pending_bytes));
 
         try append(writer, "antfly_service_queued_updates", "gauge", "Pending metadata updates waiting to apply", @intCast(svc_metrics.queued_updates));
         try append(writer, "antfly_service_applied_updates_total", "counter", "Total applied metadata updates", @intCast(svc_metrics.applied_updates));
@@ -554,6 +594,7 @@ pub const Server = struct {
                         .trace_logger = if (build_options.with_tla) tracing.stderrRaftTraceLogger() else null,
                     },
                     .listener = antfly.raft.httpListenerConfig(result.bind_host, cfg.bind_port),
+                    .max_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
                     .transport = .{
                         .snapshot = .{
                             .root_dir = result.snapshot_root_dir,
@@ -1145,6 +1186,7 @@ pub fn runFromIterator(
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
         .storage_context = storageKernelContextHandle(storage_kernel_context),
@@ -2077,6 +2119,10 @@ test "metadata runtime legacy multi-node cluster config does not require orchest
 
 test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
     const runtime_cfg = metadataRaftRuntimeConfig();
+    try std.testing.expectEqual(metadata_raft_max_single_ready_bytes, runtime_cfg.max_single_outbound_ready_bytes);
+    try std.testing.expectEqual(metadata_raft_max_single_ready_bytes, runtime_cfg.max_single_apply_ready_bytes);
+    try std.testing.expect(runtime_cfg.max_single_outbound_ready_bytes != std.math.maxInt(usize));
+    try std.testing.expect(runtime_cfg.max_single_apply_ready_bytes != std.math.maxInt(usize));
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);

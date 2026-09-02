@@ -46,6 +46,7 @@ pub const indexes = @import("indexes.zig");
 const openapi_contract = @import("openapi_contract.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+pub const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");

@@ -54,6 +54,7 @@ pub const restore_jobs = @import("restore_jobs.zig");
 pub const internal_group_operations = @import("internal_group_operations.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
+pub const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 pub const operation = @import("operation.zig");
 pub const http_server = @import("http_server.zig");

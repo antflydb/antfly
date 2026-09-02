@@ -39,6 +39,8 @@ pub const RaftApplyStoreConfig = struct {
 
 pub const AppliedMetadataBatch = contract.AppliedMetadataBatch;
 pub const TableTransitionFence = contract.TableTransitionFence;
+pub const TableRestoreAdmission = contract.TableRestoreAdmission;
+pub const TableDropProjection = contract.TableDropProjection;
 pub const ProjectionSignalKind = contract.ProjectionSignalKind;
 pub const ProjectionSignal = contract.ProjectionSignal;
 pub const ProjectionListener = contract.ProjectionListener;
@@ -337,6 +339,87 @@ pub const RaftApplyStore = struct {
         return try self.projectionWithAllocator(?metadata.TableRecord, alloc, .{ .kind = .table, .group_id = group_id, .arg0 = table_id });
     }
 
+    pub fn getRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, range_group_id: u64) !?metadata.RangeRecord {
+        return try self.projectionWithAllocator(?metadata.RangeRecord, alloc, .{
+            .kind = .range,
+            .group_id = group_id,
+            .arg0 = range_group_id,
+        });
+    }
+
+    pub fn captureTableDropProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?TableDropProjection {
+        return self.projectionWithAllocator(?TableDropProjection, alloc, .{
+            .kind = .table_drop_projection,
+            .group_id = group_id,
+            .key = .fromSlice(table_name),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn captureTableCreateGeneration(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_id: u64,
+    ) !u64 {
+        _ = alloc;
+        return self.projection(u64, .{
+            .kind = .table_create_generation,
+            .group_id = group_id,
+            .arg0 = table_id,
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn captureTableRestoreAdmission(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected_table: metadata.TableRecord,
+    ) !TableRestoreAdmission {
+        const request_json = try std.json.Stringify.valueAlloc(alloc, expected_table, .{});
+        defer alloc.free(request_json);
+        return self.projection(TableRestoreAdmission, .{
+            .kind = .table_restore_admission,
+            .group_id = group_id,
+            .key = .fromSlice(request_json),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn verifyTableCreateProjectionExact(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected_table: metadata.TableRecord,
+        expected_ranges: []const metadata.RangeRecord,
+    ) !void {
+        const request_json = try std.json.Stringify.valueAlloc(alloc, .{
+            .table = expected_table,
+            .ranges = expected_ranges,
+        }, .{});
+        defer alloc.free(request_json);
+        _ = self.projection(bool, .{
+            .kind = .verify_table_create_projection,
+            .group_id = group_id,
+            .key = .fromSlice(request_json),
+        }) catch |err| switch (err) {
+            error.InvalidArgument => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+    }
+
     pub fn getTableTransitionFence(self: *RaftApplyStore, group_id: u64, table_id: u64) !TableTransitionFence {
         return try self.projection(TableTransitionFence, .{ .kind = .table_transition_fence, .group_id = group_id, .arg0 = table_id });
     }
@@ -351,6 +434,25 @@ pub const RaftApplyStore = struct {
 
     pub fn listRestoreProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.RestoreProgressRecord {
         return try self.projectionWithAllocator([]metadata.RestoreProgressRecord, alloc, .{ .kind = .restore_progress, .group_id = group_id });
+    }
+
+    pub fn listActiveRestoreRanges(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.RangeRecord {
+        return self.projectionWithAllocator(
+            []metadata.RangeRecord,
+            alloc,
+            .{ .kind = .active_restore_ranges, .group_id = group_id },
+        ) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn ensureDerivedCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
+        _ = try self.projection(bool, .{ .kind = .ensure_derived_catalog_indexes, .group_id = group_id });
+    }
+
+    pub fn rebuildDerivedCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
+        _ = try self.projection(bool, .{ .kind = .rebuild_derived_catalog_indexes, .group_id = group_id });
     }
 
     pub fn freeRestoreProgress(_: *RaftApplyStore, alloc: std.mem.Allocator, values: []metadata.RestoreProgressRecord) void {
@@ -400,6 +502,21 @@ pub const RaftApplyStore = struct {
 
     pub fn listExtensionDependencies(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.ExtensionDependency {
         return try self.projectionWithAllocator([]extension_domain.ExtensionDependency, alloc, .{ .kind = .extension_dependencies, .group_id = group_id });
+    }
+
+    pub fn extensionLifecycleDeltaApplied(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        delta: anytype,
+    ) !bool {
+        const request_json = try std.json.Stringify.valueAlloc(alloc, delta, .{});
+        defer alloc.free(request_json);
+        return try self.projection(bool, .{
+            .kind = .extension_lifecycle_delta_applied,
+            .group_id = group_id,
+            .key = .fromSlice(request_json),
+        });
     }
 
     pub fn freeExtensionDependencies(_: *RaftApplyStore, alloc: std.mem.Allocator, values: []extension_domain.ExtensionDependency) void {

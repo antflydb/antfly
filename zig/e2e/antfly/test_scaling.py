@@ -418,6 +418,68 @@ def test_reallocation_wait_does_not_replace_an_observed_active_generation():
     assert cluster.submissions == 1
 
 
+def test_reallocation_wait_submits_successor_after_completed_noop_generation():
+    class FakeCluster:
+        def __init__(self) -> None:
+            self.submissions = 0
+
+        def metadata_snapshot(self) -> dict[str, Any]:
+            snapshot: dict[str, Any] = {
+                "tables": [{"name": "docs", "table_id": 1}],
+                "ranges": [{"table_id": 1, "group_id": 7}],
+                "placement_intents": [],
+            }
+            if self.submissions >= 2:
+                snapshot["placement_intents"] = [
+                    {"record": {"group_id": 7, "local_node_id": 9}}
+                ]
+            return snapshot
+
+        def trigger_reallocate_once(self) -> None:
+            self.submissions += 1
+
+    cluster = FakeCluster()
+    assigned, error = _wait_node_owns_group(
+        cluster,  # type: ignore[arg-type]
+        "docs",
+        9,
+        timeout_s=1.0,
+        active_reallocation_poll_interval_s=0.0,
+    )
+    assert assigned is not None
+    assert error is None
+    assert cluster.submissions == 2
+
+
+def test_reallocation_wait_does_not_retry_ambiguous_submission():
+    class FakeCluster:
+        def __init__(self) -> None:
+            self.submissions = 0
+
+        def metadata_snapshot(self) -> dict[str, Any]:
+            return {
+                "tables": [{"name": "docs", "table_id": 1}],
+                "ranges": [{"table_id": 1, "group_id": 7}],
+                "placement_intents": [],
+            }
+
+        def trigger_reallocate_once(self) -> None:
+            self.submissions += 1
+            raise requests.Timeout("outcome unknown")
+
+    cluster = FakeCluster()
+    assigned, error = _wait_node_owns_group(
+        cluster,  # type: ignore[arg-type]
+        "docs",
+        9,
+        timeout_s=0.01,
+        active_reallocation_poll_interval_s=0.0,
+    )
+    assert assigned is None
+    assert error is not None and "outcome unknown" in error
+    assert cluster.submissions == 1
+
+
 class _ClusterStartupDeadline:
     def __init__(self, expires_at: float):
         self.expires_at = expires_at
@@ -2075,10 +2137,15 @@ def _wait_node_owns_group(
         if error is not None:
             submission_error = error
         if observed is None:
-            # This call may have been admitted (including an ambiguous lost
-            # response), so all remaining work must be read-only convergence.
-            remaining = max(0.0, deadline - time.monotonic())
-            return wait_until(owns_group, timeout_s=remaining, interval_s=0.5), submission_error
+            if error is not None:
+                # A lost response has an unknown outcome, so all remaining
+                # work must be read-only convergence. A successful response,
+                # however, proves that generation was admitted. If it already
+                # completed without the desired placement, the next outer
+                # observation may safely establish a successor generation.
+                remaining = max(0.0, deadline - time.monotonic())
+                return wait_until(owns_group, timeout_s=remaining, interval_s=0.5), submission_error
+            continue
         if snapshot_owns_group(observed):
             return observed, submission_error
 

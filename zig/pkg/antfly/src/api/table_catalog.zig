@@ -74,6 +74,7 @@ pub const CatalogSource = struct {
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         /// First-class table/range routing capability. First-party sources must
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
@@ -107,6 +108,10 @@ pub const CatalogSource = struct {
         /// Compares a compact contract after a Raft linearizable-read barrier.
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
+        validate_group_retirement: ?*const fn (
+            ptr: *anyopaque,
+            contract: metadata_api.CatalogGroupRetirementContract,
+        ) anyerror!metadata_api.CatalogGroupRetirementValidation = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -115,6 +120,12 @@ pub const CatalogSource = struct {
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn catalogIdentity(self: CatalogSource) !metadata_api.CatalogIdentity {
+        const identity = self.vtable.catalog_identity orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try identity(self.ptr);
     }
 
     /// Produce the complete routing capability carried by this catalog. A
@@ -154,12 +165,22 @@ pub const CatalogSource = struct {
         return try validate(self.ptr, contract);
     }
 
+    pub fn validateGroupRetirement(
+        self: CatalogSource,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const validate = self.vtable.validate_group_retirement orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
         return .{
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .catalog_identity = metadataServiceCatalogIdentity,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -169,6 +190,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
+                .validate_group_retirement = metadataServiceValidateGroupRetirement,
             },
         };
     }
@@ -179,6 +201,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .catalog_identity = metadataHttpServiceCatalogIdentity,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -188,6 +211,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
+                .validate_group_retirement = metadataHttpServiceValidateGroupRetirement,
             },
         };
     }
@@ -198,6 +222,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
+                .catalog_identity = metadataServerCatalogIdentity,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
@@ -207,6 +232,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServerValidatePublication,
                 .validate_table_publication = metadataServerValidateTablePublication,
+                .validate_group_retirement = metadataServerValidateGroupRetirement,
             },
         };
     }
@@ -2723,6 +2749,11 @@ fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     return try svc.adminSnapshot();
 }
 
+fn metadataServiceCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogIdentity();
+}
+
 fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     svc.freeAdminSnapshot(snapshot);
@@ -2780,9 +2811,22 @@ fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_a
     return try svc.validateTablePublication(contract);
 }
 
+fn metadataServiceValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.validateGroupRetirement(contract);
+}
+
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
+}
+
+fn metadataHttpServiceCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogIdentity();
 }
 
 fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -2842,9 +2886,22 @@ fn metadataHttpServiceValidateTablePublication(ptr: *anyopaque, contract: metada
     return try svc.validateTablePublication(contract);
 }
 
+fn metadataHttpServiceValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.validateGroupRetirement(contract);
+}
+
 fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.adminSnapshot();
+}
+
+fn metadataServerCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.catalogIdentity();
 }
 
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -2902,6 +2959,14 @@ fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.Cat
 fn metadataServerValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.validateTablePublication(contract);
+}
+
+fn metadataServerValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.validateGroupRetirement(contract);
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {

@@ -194,7 +194,7 @@ pub const MemoryStorage = struct {
         self.entries_state.clearRetainingCapacity();
         try self.setConfState(snapshot.metadata.conf_state);
         self.snapshot_state.deinit(self.alloc);
-        self.snapshot_state = try snapshot.clone(self.alloc);
+        self.snapshot_state = try snapshot.cloneDetached(self.alloc);
         self.compacted_index = snapshot.metadata.index;
         self.compacted_term = snapshot.metadata.term;
     }
@@ -213,7 +213,7 @@ pub const MemoryStorage = struct {
         else
             try termImpl(self, compact_index);
 
-        var owned_snapshot = try snapshot.clone(self.alloc);
+        var owned_snapshot = try snapshot.cloneDetached(self.alloc);
         errdefer owned_snapshot.deinit(self.alloc);
         try self.setConfState(snapshot.metadata.conf_state);
 

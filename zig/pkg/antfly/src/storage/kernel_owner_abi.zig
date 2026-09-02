@@ -528,6 +528,15 @@ pub const MetadataProjectionKind = enum(u32) {
     catalog_projection = 29,
     /// Durable metadata authority and applied catalog revision.
     catalog_cursor = 30,
+    active_restore_ranges = 31,
+    ensure_derived_catalog_indexes = 32,
+    rebuild_derived_catalog_indexes = 33,
+    extension_lifecycle_delta_applied = 34,
+    range = 35,
+    table_drop_projection = 36,
+    table_create_generation = 37,
+    table_restore_admission = 38,
+    verify_table_create_projection = 39,
 };
 
 pub const MetadataProjectionRequest = extern struct {
@@ -1042,10 +1051,11 @@ pub const ReconcileState = enum(u32) {
     repair_pending = 1,
     busy = 2,
     degraded = 3,
+    restore_repair_pending = 4,
 };
 
-/// Advance one bounded schema/index desired-state quantum. The target index is
-/// optional; an empty slice reconciles the complete table contract.
+/// Advance one bounded schema/index/restore desired-state quantum. The target
+/// index is optional; an empty slice reconciles the complete table contract.
 pub const ReconcileRequest = extern struct {
     version: u32 = abi_version,
     advance_index_repair: u8 = 0,
@@ -1070,6 +1080,9 @@ pub const ReconcileResult = extern struct {
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
+    restore_repair_attempted: u64 = 0,
+    restore_repair_progressed: u64 = 0,
+    restore_repair_pending: u64 = 0,
 };
 
 pub const TableRequest = extern struct {

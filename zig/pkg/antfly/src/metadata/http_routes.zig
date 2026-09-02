@@ -14,6 +14,18 @@
 
 const std = @import("std");
 
+pub const TableMutationKind = enum {
+    create_table,
+    drop_table,
+};
+
+pub const ForwardedTableMutation = struct {
+    protocol_version: u16 = Routes.table_mutation_protocol_version,
+    kind: TableMutationKind,
+    table_name: []const u8,
+    definition_json: ?[]const u8 = null,
+};
+
 /// Relative budget forwarded by routing clients. Absolute monotonic deadlines
 /// are process-local and must never be sent across hosts.
 pub const routing_remaining_ms_header = "X-Antfly-Routing-Remaining-Ms";
@@ -36,6 +48,7 @@ pub const Routes = struct {
     pub const routing_snapshot = "/metadata/v1/catalog/routing-snapshot";
     pub const internal_catalog_publication_check = "/internal/v1/catalog/publication-check";
     pub const internal_catalog_table_publication_check = "/internal/v1/catalog/table-publication-check";
+    pub const internal_catalog_group_retirement_check = "/internal/v1/catalog/group-retirement-check";
     pub const active_transitions = "/metadata/v1/transitions/active";
     pub const table_ranges_prefix = "/metadata/v1/tables/";
     pub const table_ranges_suffix = "/ranges";
@@ -47,6 +60,9 @@ pub const Routes = struct {
     pub const internal_node_shutdown_suffix = "/shutdown";
     pub const internal_node_status_suffix = "/status";
     pub const internal_schema_progress = "/internal/v1/schema-progress";
+    pub const internal_restore_progress = "/internal/v1/restore-progress";
+    pub const internal_restore_progress_sync = "/internal/v1/restore-progress/sync";
+    pub const internal_restore_progress_remove = "/internal/v1/restore-progress/remove";
     pub const internal_extensions_prefix = "/internal/v1/extensions/";
     pub const internal_extension_restore = "/internal/v1/extensions/restore";
     pub const internal_extension_update_suffix = "/update";
@@ -54,6 +70,23 @@ pub const Routes = struct {
     pub const internal_extension_enable_suffix = "/enable";
     pub const internal_extension_disable_suffix = "/disable";
     pub const internal_extension_config_suffix = "/config";
+    pub const table_mutation_protocol_version: u16 = 3;
+    pub const raft_mutation_remaining_ms_header = "X-Antfly-Raft-Mutation-Remaining-Ms";
+    pub const raft_mutation_forwards_remaining_header = "X-Antfly-Raft-Mutation-Forwards-Remaining";
+    pub const raft_mutation_campaign_allowed_header = "X-Antfly-Raft-Mutation-Campaign-Allowed";
+    pub const raft_mutation_outcome_header = "X-Antfly-Raft-Mutation-Outcome";
+    pub const raft_mutation_outcome_not_proposed = "not-proposed-v1";
+    pub const raft_mutation_outcome_unknown = "unknown-v1";
+    pub const raft_mutation_outcome_committed = "committed-v1";
+    pub const raft_mutation_outcome_committed_visibility_pending = "committed-visibility-pending-v1";
+    pub const raft_mutation_outcome_committed_repair_required = "committed-repair-required-v1";
+    pub const table_mutation_error_header = "X-Antfly-Table-Mutation-Error";
+    pub const table_mutation_error_extension_owned = "extension-owned-v1";
+    pub const table_restore_error_already_exists = "restore-already-exists-v1";
+    pub const table_restore_error_transition_active = "restore-transition-active-v1";
+    pub const extension_lifecycle_error_header = "X-Antfly-Extension-Lifecycle-Error";
+    pub const extension_lifecycle_error_conflict = "conflict-v1";
+    pub const internal_forwarded_table_mutation = "/internal/v1/raft-mutations/table-topology";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_definition_suffix = "/definition";

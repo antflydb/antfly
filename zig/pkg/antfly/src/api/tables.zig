@@ -18,6 +18,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -35,6 +36,82 @@ const table_create_contract = @import("table_create_contract.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+pub const max_table_name_bytes: usize = 255;
+pub const max_table_initial_ranges: u32 = metadata_topology_protocol.max_initial_ranges;
+pub const table_initial_ranges_error_message = std.fmt.comptimePrint(
+    "num_shards must be between 1 and {d}",
+    .{max_table_initial_ranges},
+);
+pub const max_table_create_body_bytes: usize = metadata_topology_protocol.max_create_definition_bytes;
+// Exact serialized size of an empty create envelope. The name and canonical
+// definition can each at most double when embedded as JSON strings because
+// both have already rejected raw control bytes or been parsed as valid JSON.
+const forwarded_table_create_envelope_bytes: usize =
+    "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"\",\"definition_json\":\"\"}".len;
+pub const max_table_create_transport_bytes: usize = forwarded_table_create_envelope_bytes +
+    2 * max_table_name_bytes + 2 * max_table_create_body_bytes;
+
+pub fn validateTableCreateBodySize(body_len: usize) !void {
+    if (body_len > max_table_create_body_bytes)
+        return error.CreateTableRequestTooLarge;
+}
+
+test "forwarded create body limit includes the exact worst-case JSON envelope" {
+    const worst_case_encoded_bytes = forwarded_table_create_envelope_bytes +
+        2 * max_table_name_bytes + 2 * max_table_create_body_bytes;
+    try std.testing.expectEqual(max_table_create_transport_bytes, worst_case_encoded_bytes);
+}
+
+pub fn validateTableMutationName(table_name: []const u8) !void {
+    if (table_name.len == 0 or table_name.len > max_table_name_bytes)
+        return error.InvalidTableName;
+    for (table_name) |byte| {
+        if (std.ascii.isControl(byte)) return error.InvalidTableName;
+    }
+}
+
+test "table mutation names preserve the public contract" {
+    try validateTableMutationName("vmp_media_item_embedding-v0.2~candidate");
+    try validateTableMutationName("sales/archive");
+    try validateTableMutationName("sales%2Farchive");
+    try validateTableMutationName("sales archive");
+    try validateTableMutationName(".hidden");
+    try validateTableMutationName("..");
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(""));
+
+    const too_long: [max_table_name_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(&too_long));
+
+    for (0..32) |control| {
+        const name = [_]u8{ 'a', @intCast(control), 'b' };
+        try std.testing.expectError(error.InvalidTableName, validateTableMutationName(&name));
+    }
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName("a\x7fb"));
+}
+
+test "create table rejects unbounded initial shard fanout" {
+    const topology_protocol = @import("../metadata/topology_protocol.zig");
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"num_shards\":{d}}}",
+        .{topology_protocol.max_initial_ranges + 1},
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectError(
+        error.CreateTableShardCountOutOfRange,
+        parseCreateTableRequest(std.testing.allocator, body),
+    );
+
+    const invalid_table = metadata_table_manager.TableRecord{
+        .table_id = 7,
+        .name = "docs",
+        .min_ranges = topology_protocol.max_initial_ranges + 1,
+    };
+    try std.testing.expectError(
+        error.CreateTableShardCountOutOfRange,
+        deriveInitialRanges(std.testing.allocator, invalid_table),
+    );
+}
 
 fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: bool) !void {
     if (value != .object) return error.InvalidCreateTableRequest;
@@ -63,12 +140,30 @@ pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const
     try validateIndexesValue(parsed.value, true);
 }
 
-fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+fn normalizeRawCreateTableIndexesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    comptime preserve_canonical_default: bool,
+) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, default_indexes_json);
+    if (preserve_canonical_default) {
+        if (value.object.get(default_full_text_index_name)) |canonical_default| {
+            const encoded = try stringifyJsonValue(alloc, canonical_default);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, "{\"");
+            try out.appendSlice(alloc, default_full_text_index_name);
+            try out.appendSlice(alloc, "\":");
+            try out.appendSlice(alloc, encoded);
+            try out.append(alloc, '}');
+        } else {
+            try out.appendSlice(alloc, default_indexes_json);
+        }
+    } else {
+        try out.appendSlice(alloc, default_indexes_json);
+    }
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
@@ -693,6 +788,33 @@ pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8)
     return parseCreateTableRequestWithOptions(alloc, body, true);
 }
 
+/// Encodes an already-normalized request for the trusted internal metadata
+/// hop. The output must round-trip through `parseStoredCreateTableRequest`;
+/// the stricter public parser intentionally rejects normalized artifacts such
+/// as private index fields and the backend-managed schema version.
+pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: CreateTableRequest) ![]u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    if (req.num_shards) |num_shards| {
+        try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
+    }
+    if (req.description) |description| {
+        try root.object.put(arena, "description", .{ .string = description });
+    }
+    if (req.schema_json) |schema_json| {
+        try root.object.put(arena, "schema", try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_json, .{}));
+    }
+    if (req.indexes_json) |indexes_json| {
+        try root.object.put(arena, "indexes", try std.json.parseFromSliceLeaky(std.json.Value, arena, indexes_json, .{}));
+    }
+    if (req.replication_sources_json) |replication_sources_json| {
+        try root.object.put(arena, "replication_sources", try std.json.parseFromSliceLeaky(std.json.Value, arena, replication_sources_json, .{}));
+    }
+    return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
 pub fn validateCreateSchemaVersion(value: std.json.Value, comptime allow_normalized_version_zero: bool) !void {
     if (value != .object) return error.InvalidCreateTableRequest;
     const version = value.object.get("version") orelse return;
@@ -734,7 +856,11 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (root.get("indexes")) |value| {
         if (value != .null) {
             try validateIndexesValue(value, allow_private_index_fields);
-            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
+            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(
+                alloc,
+                value,
+                allow_private_index_fields,
+            );
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
         } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
@@ -775,6 +901,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
+        if (num_shards > max_table_initial_ranges)
+            return error.CreateTableShardCountOutOfRange;
     }
     return req;
 }
@@ -1065,7 +1193,23 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
-    const group_id = deriveDataGroupId(table.name, 0x47525031);
+    return deriveInitialRangeForGeneration(table, 0);
+}
+
+/// Derives the initial data-group identity for one catalog incarnation.
+/// Generation zero intentionally preserves the historical identity so an
+/// in-place upgrade does not move existing tables. A recreate observes the
+/// durable transition-fence generation left by the preceding drop and gets a
+/// fresh group path, preventing delayed cleanup from touching the new table.
+pub fn deriveInitialRangeForGeneration(
+    table: metadata_table_manager.TableRecord,
+    transition_generation: u64,
+) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupIdForGeneration(
+        table.name,
+        0x47525031,
+        transition_generation,
+    );
     return .{
         .group_id = group_id,
         .range_id = group_id,
@@ -1079,8 +1223,19 @@ pub fn deriveInitialRanges(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
+    return deriveInitialRangesForGeneration(alloc, table, 0);
+}
+
+pub fn deriveInitialRangesForGeneration(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    transition_generation: u64,
+) ![]metadata_table_manager.RangeRecord {
+    if (table.min_ranges == 0) return error.InvalidCreateTableRequest;
+    if (table.min_ranges > max_table_initial_ranges)
+        return error.CreateTableShardCountOutOfRange;
     if (table.min_ranges <= 1) {
-        const initial_range = deriveInitialRange(table);
+        const initial_range = deriveInitialRangeForGeneration(table, transition_generation);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
             .group_id = initial_range.group_id,
@@ -1116,7 +1271,7 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
-        const group_id = deriveShardGroupId(table.name, i);
+        const group_id = deriveShardGroupIdForGeneration(table.name, i, transition_generation);
         out[i] = .{
             .group_id = group_id,
             .range_id = group_id,
@@ -1127,6 +1282,25 @@ pub fn deriveInitialRanges(
     }
 
     return out;
+}
+
+/// Returns the physical Raft group for one initial table range incarnation.
+/// Restore preserves the backup's logical range/document identity, but must
+/// allocate physical groups exactly as a normal create would for the current
+/// catalog generation. Reusing an artifact's source group would also reuse
+/// the destination node's persisted Raft apply history after delete/recreate.
+pub fn deriveInitialRangeGroupIdForGeneration(
+    table_name: []const u8,
+    shard_index: u32,
+    shard_count: u32,
+    transition_generation: u64,
+) !u64 {
+    if (shard_count == 0 or shard_count > max_table_initial_ranges or shard_index >= shard_count)
+        return error.InvalidCreateTableRequest;
+    return if (shard_count == 1)
+        deriveDataGroupIdForGeneration(table_name, 0x47525031, transition_generation)
+    else
+        deriveShardGroupIdForGeneration(table_name, shard_index, transition_generation);
 }
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -3383,11 +3557,40 @@ fn deriveDataGroupId(name: []const u8, seed: u64) u64 {
     return group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(seed, name));
 }
 
+fn deriveDataGroupIdForGeneration(name: []const u8, seed: u64, transition_generation: u64) u64 {
+    if (transition_generation == 0) return deriveDataGroupId(name, seed);
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update("antfly-table-incarnation-v1");
+    hasher.update(name);
+    var encoded_generation: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_generation, transition_generation, .little);
+    hasher.update(&encoded_generation);
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
 fn deriveShardGroupId(table_name: []const u8, shard_index: u32) u64 {
     var hasher = std.hash.Wyhash.init(0x47525031);
     hasher.update(table_name);
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&shard_index));
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
+fn deriveShardGroupIdForGeneration(
+    table_name: []const u8,
+    shard_index: u32,
+    transition_generation: u64,
+) u64 {
+    if (transition_generation == 0) return deriveShardGroupId(table_name, shard_index);
+    var hasher = std.hash.Wyhash.init(0x47525031);
+    hasher.update("antfly-table-shard-incarnation-v1");
+    hasher.update(table_name);
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, transition_generation, .little);
+    hasher.update(&encoded);
+    var encoded_shard: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_shard, shard_index, .little);
+    hasher.update(&encoded_shard);
     return group_ids.dataGroupIdFromHash(hasher.final());
 }
 
@@ -4450,6 +4653,39 @@ test "create table raw parser accepts its canonical full text output" {
     try std.testing.expect(std.mem.indexOf(u8, second.indexes_json.?, "\"title_body\"") != null);
 }
 
+test "stored create table encoding round-trips a normalized public request" {
+    var parsed = try parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":2,\"description\":\"docs \\\"quoted\\\" table\",\"schema\":{\"kind\":\"demo\"},\"indexes\":{\"title_body\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}},\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]}");
+    defer parsed.deinit(std.testing.allocator);
+
+    const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, encoded),
+    );
+    var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(parsed.num_shards, decoded.num_shards);
+    try std.testing.expectEqualStrings(parsed.description.?, decoded.description.?);
+    try std.testing.expectEqualStrings(parsed.schema_json.?, decoded.schema_json.?);
+    try std.testing.expectEqualStrings(parsed.indexes_json.?, decoded.indexes_json.?);
+    try std.testing.expectEqualStrings(parsed.replication_sources_json.?, decoded.replication_sources_json.?);
+}
+
+test "stored create table encoding preserves empty requests" {
+    const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("{}", encoded);
+
+    var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
+    try std.testing.expect(decoded.description == null);
+    try std.testing.expect(decoded.schema_json == null);
+}
+
 test "create table parser rejects schemas that cannot derive runtime mappings" {
     const invalid_index_sort =
         \\{
@@ -4608,6 +4844,53 @@ test "derive initial ranges honors shard count" {
     try std.testing.expectEqualStrings("c0", ranges[2].end_key.?);
     try std.testing.expectEqualStrings("c0", ranges[3].start_key);
     try std.testing.expect(ranges[3].end_key == null);
+}
+
+test "table recreation derives incarnation-specific data groups" {
+    const table = deriveTableRecord("docs", .{ .num_shards = 4 });
+    const original = try deriveInitialRangesForGeneration(std.testing.allocator, table, 0);
+    defer {
+        for (original) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(original);
+    }
+    const recreated = try deriveInitialRangesForGeneration(std.testing.allocator, table, 2);
+    defer {
+        for (recreated) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(recreated);
+    }
+    const replay = try deriveInitialRangesForGeneration(std.testing.allocator, table, 2);
+    defer {
+        for (replay) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(replay);
+    }
+
+    for (original, recreated, replay) |old_range, new_range, replay_range| {
+        try std.testing.expect(old_range.group_id != new_range.group_id);
+        try std.testing.expectEqual(new_range.group_id, replay_range.group_id);
+    }
+}
+
+test "restore group derivation matches create and validates its shard coordinate" {
+    const table = deriveTableRecord("docs", .{ .num_shards = 4 });
+    const ranges = try deriveInitialRangesForGeneration(std.testing.allocator, table, 9);
+    defer {
+        for (ranges) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(ranges);
+    }
+    for (ranges, 0..) |range, index| {
+        try std.testing.expectEqual(
+            range.group_id,
+            try deriveInitialRangeGroupIdForGeneration("docs", @intCast(index), 4, 9),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        deriveInitialRangeGroupIdForGeneration("docs", 4, 4, 9),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        deriveInitialRangeGroupIdForGeneration("docs", 0, 0, 9),
+    );
 }
 
 test "create table parser rejects zero shards" {

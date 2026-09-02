@@ -22,6 +22,7 @@ pub const FileReplicaCatalog = catalog.FileReplicaCatalog;
 pub const file_snapshot_store = @import("file_snapshot_store.zig");
 pub const FileSnapshotStore = file_snapshot_store.FileSnapshotStore;
 pub const FileSnapshotStoreConfig = file_snapshot_store.FileSnapshotStoreConfig;
+pub const SnapshotArtifactPolicy = file_snapshot_store.SnapshotArtifactPolicy;
 pub const wal_replica_state = @import("wal_replica_state.zig");
 pub const snapshot_payload_store = @import("snapshot_payload_store.zig");
 pub const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
@@ -101,6 +102,7 @@ test "raft storage module compiles" {
     _ = FileReplicaCatalog;
     _ = FileSnapshotStore;
     _ = FileSnapshotStoreConfig;
+    _ = SnapshotArtifactPolicy;
     _ = WalReplicaState;
     _ = WalReplicaStateConfig;
     _ = PersistentReplicaState;

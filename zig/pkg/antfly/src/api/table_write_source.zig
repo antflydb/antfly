@@ -25,6 +25,7 @@ const backend_types = @import("../storage/backend_types.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const runtime_error_abi = @import("../runtime_error_abi.zig");
@@ -35,6 +36,7 @@ pub const LocalStructuralReconcileState = enum {
     repair_pending,
     busy,
     degraded,
+    restore_repair_pending,
 };
 
 pub const LocalStructuralReconcileResult = struct {
@@ -50,6 +52,9 @@ pub const LocalStructuralReconcileResult = struct {
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
+    restore_repair_attempted: u64 = 0,
+    restore_repair_progressed: u64 = 0,
+    restore_repair_pending: u64 = 0,
 };
 
 /// One exact structural observation captured before a transient compiled
@@ -113,7 +118,7 @@ pub const TableWriteSource = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
-            group_ids: []const u64,
+            contract: metadata_topology_protocol.DropCleanupContract,
         ) anyerror!?void = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
@@ -138,6 +143,7 @@ pub const TableWriteSource = struct {
             location_uri: []const u8,
             connection: []const u8,
             location: *anyopaque,
+            control: backup_contract.BackupOperationControl,
         ) anyerror!?[]backup_contract.ShardSnapshot = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
@@ -520,6 +526,41 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatus = null,
+        /// Routes a transaction decision observation to the current Raft
+        /// leader and orders it behind a quorum read barrier.
+        txn_status_group_linearizable: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_status_group_linearizable_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        /// Leader-local half of the linearizable status protocol. Internal
+        /// RPC handlers use this callback so they fail closed on a follower
+        /// instead of recursively forwarding.
+        txn_status_group_authoritative_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_status_group_authoritative_local_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!?db_mod.types.TxnStatus = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -646,10 +687,10 @@ pub const TableWriteSource = struct {
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        group_ids: []const u64,
+        contract: metadata_topology_protocol.DropCleanupContract,
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
-        return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, group_ids });
+        return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });
     }
 
     pub fn backupTable(
@@ -687,9 +728,10 @@ pub const TableWriteSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *anyopaque,
+        control: backup_contract.BackupOperationControl,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try BoundaryAbi.call("backup_table_to_location", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location });
+        return try BoundaryAbi.call("backup_table_to_location", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location, control });
     }
 
     pub fn restoreTable(
@@ -926,6 +968,56 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupLinearizable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_linearizable orelse
+            return try self.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        return try BoundaryAbi.call("txn_status_group_linearizable", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupLinearizableUntil(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_linearizable_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_linearizable_until", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
+    }
+
+    pub fn txnStatusGroupAuthoritativeLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_authoritative_local orelse
+            return try self.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        return try BoundaryAbi.call("txn_status_group_authoritative_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupAuthoritativeLocalUntil(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_authoritative_local_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_authoritative_local_until", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
     }
 
     pub fn txnAcknowledgeGroupLocal(

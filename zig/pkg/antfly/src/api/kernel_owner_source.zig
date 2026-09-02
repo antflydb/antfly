@@ -891,6 +891,10 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const BackupShardWire = struct {
         group_id: u64,
+        range_id: u64 = 0,
+        doc_identity_shard_id: u64 = 0,
+        doc_identity_range_id: u64 = 0,
+        split_attempt_epoch: u64 = 0,
         start_key: []const u8,
         end_key: ?[]const u8 = null,
         snapshot_path: []const u8,
@@ -954,6 +958,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             errdefer if (native_manifest_sha256.len > 0) alloc.free(@constCast(native_manifest_sha256));
             shards[i] = .{
                 .group_id = shard.group_id,
+                .range_id = shard.range_id,
+                .doc_identity_shard_id = shard.doc_identity_shard_id,
+                .doc_identity_range_id = shard.doc_identity_range_id,
+                .split_attempt_epoch = shard.split_attempt_epoch,
                 .start_key = start_key,
                 .end_key = end_key,
                 .snapshot_path = snapshot_path,
@@ -1082,6 +1090,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .repair_pending => .repair_pending,
                 .busy => .busy,
                 .degraded => .degraded,
+                .restore_repair_pending => .restore_repair_pending,
             },
             .indexes_added = result.indexes_added,
             .indexes_removed = result.indexes_removed,
@@ -1094,6 +1103,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .repair_busy = result.repair_busy,
             .repair_disk_waits = result.repair_disk_waits,
             .next_retry_at_ms = result.next_retry_at_ms,
+            .restore_repair_attempted = result.restore_repair_attempted,
+            .restore_repair_progressed = result.restore_repair_progressed,
+            .restore_repair_pending = result.restore_repair_pending,
         };
     }
 
@@ -1144,25 +1156,42 @@ pub const ProvisionedKernelOwnerSource = struct {
             target_index_name,
             advance_index_repair,
         );
-        var response = try lease.owner().runtimeStatusJson(table_name);
-        defer response.deinit();
-        var parsed = try std.json.parseFromSlice(
-            runtime_status.LocalTableRuntimeStatus,
-            alloc,
-            response.bytes(),
-            .{},
-        );
-        defer parsed.deinit();
-        var observed = try parsed.value.clone(alloc);
-        errdefer observed.deinit(alloc);
-        observed.group_id = group_id;
-        observed.metadata = .{
-            .updated_at_ns = platform_time.monotonicNs(),
-            .source = .live_writer_publish,
-            .freshness = .fresh,
-            .lsm_root_generation = lease.entry.generation,
+        var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
+            // Runtime status is deliberately best effort and returns busy
+            // rather than waiting behind a concurrent Raft apply writer. The
+            // structural reconcile above is already authoritative, so retain
+            // its result and let the periodic status refresher observe the
+            // owner after apply releases its writer guard.
+            error.StorageBusy => null,
+            else => return err,
         };
-        const retain_for_background_work = runtimeStatusNeedsResidentOwner(observed);
+        defer if (response) |*value| value.deinit();
+        var observed: ?runtime_status.LocalTableRuntimeStatus = if (response) |*value| observed: {
+            var parsed = try std.json.parseFromSlice(
+                runtime_status.LocalTableRuntimeStatus,
+                alloc,
+                value.bytes(),
+                .{},
+            );
+            defer parsed.deinit();
+            var status = try parsed.value.clone(alloc);
+            status.group_id = group_id;
+            status.metadata = .{
+                .updated_at_ns = platform_time.monotonicNs(),
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = lease.entry.generation,
+            };
+            break :observed status;
+        } else null;
+        errdefer if (observed) |*status| status.deinit(alloc);
+        const retain_for_background_work = if (observed) |status|
+            runtimeStatusNeedsResidentOwner(status)
+        else
+            // The status probe lost a best-effort race with Raft apply. Keep
+            // this otherwise-cold owner resident so the periodic refresher can
+            // publish the exact generation proof once the writer guard drains.
+            true;
 
         lease.deinit();
         lease_active = false;

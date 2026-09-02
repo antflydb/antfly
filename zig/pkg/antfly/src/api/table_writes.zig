@@ -30,6 +30,7 @@ const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
@@ -937,7 +938,9 @@ const TestRestoreRepairStepHook = struct {
 };
 
 var test_before_batch_execution_hook: ?TestExecutionHook = null;
+var test_before_drop_table_structural_activity_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
+var test_dropped_table_recovery_pass_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_native_backup_copy_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
@@ -950,6 +953,44 @@ var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = nu
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
+var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
+var test_dropped_table_job_submit_failures_remaining: std.atomic.Value(u32) = .init(0);
+
+fn consumeTestDroppedTableJobSubmitFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_dropped_table_job_submit_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_dropped_table_job_submit_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn consumeTestRecoveryIntentReadFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_recovery_intent_read_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_recovery_intent_read_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
 
 fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
     if (!builtin.is_test) return false;
@@ -970,6 +1011,39 @@ fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
 }
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
+const dropped_table_repair_dir_name = ".antfly-drop-repair";
+const replica_retirement_dir_name = ".antfly-replica-retirement";
+const recovery_quarantine_dir_name = ".antfly-recovery-quarantine";
+const dropped_table_repair_magic_v1 = "AFDROP1\x00";
+const dropped_table_repair_magic = "AFDROP2\x00";
+const replica_retirement_magic_v1 = "AFRTRM1\x00";
+const replica_retirement_magic_v2 = "AFRTRM2\x00";
+const replica_retirement_magic = "AFRTRM3\x00";
+const replica_retirement_batch_magic = "AFRTBT1\x00";
+const replica_retirement_batch_prefix = "batch-";
+const max_replica_retirement_table_name_bytes: usize = 64 * 1024;
+const max_replica_retirement_batch_entries: usize = 64 * 1024;
+const max_replica_retirement_batch_bytes: usize = 16 * 1024 * 1024;
+const max_dropped_table_repair_bytes: usize = 256 * 1024 * 1024;
+const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
+
+const replica_retirement_batch_base_encoded_len: usize =
+    replica_retirement_batch_magic.len + 1 + 4 + std.crypto.hash.sha2.Sha256.digest_length;
+
+fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8) !usize {
+    const name_len = if (table_name) |name| blk: {
+        if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
+            return error.InvalidReplicaRetirementTableName;
+        break :blk name.len;
+    } else 0;
+    var encoded_len = std.math.add(usize, current, 8 + 4) catch
+        return error.ReplicaRetirementBatchTooLarge;
+    encoded_len = std.math.add(usize, encoded_len, name_len) catch
+        return error.ReplicaRetirementBatchTooLarge;
+    if (encoded_len > max_replica_retirement_batch_bytes)
+        return error.ReplicaRetirementBatchTooLarge;
+    return encoded_len;
+}
 
 fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
     dst.accumulate(src);
@@ -1001,6 +1075,12 @@ fn runTestBeforeBatchExecutionHook() void {
 fn runTestBeforeDropTableDeleteHook() void {
     if (comptime builtin.is_test) {
         if (test_before_drop_table_delete_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeDropTableStructuralActivityHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_drop_table_structural_activity_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -1525,23 +1605,39 @@ pub fn parseStorageKernelSequenceResponse(alloc: std.mem.Allocator, body: []cons
 
 const DroppedTableDeleteWork = struct {
     path: []u8,
+    recovery_source: ?*ProvisionedTableWriteSource = null,
 
-    fn deletePath(path: []const u8, log_failure: bool) !void {
+    fn deletePath(path: []const u8) !void {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        runTestBeforeDropTableDeleteHook();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch |err| {
-            if (!log_failure) return err;
-            std.log.warn("background dropped-table delete failed path={s} err={s}", .{
-                path,
-                @errorName(err),
-            });
-        };
+        var attempt: u8 = 0;
+        while (attempt < 6) : (attempt += 1) {
+            runTestBeforeDropTableDeleteHook();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch |err| {
+                if (err == error.FileNotFound) return;
+                if (attempt == 5) return err;
+                const delay_ms: u64 = @as(u64, 25) << @intCast(attempt);
+                io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
+                continue;
+            };
+            return;
+        }
     }
 
     fn run(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try deletePath(self.path, true);
+        deletePath(self.path) catch |err| {
+            // The path remains under the durable trash root. A later recovery
+            // sweep or process restart retries it without blocking DDL.
+            std.log.warn("background dropped-table delete deferred path={s} err={s}", .{
+                self.path,
+                @errorName(err),
+            });
+            if (self.recovery_source) |source| source.scheduleDroppedTableRecoveryRetry();
+            return;
+        };
+        if (self.recovery_source) |source|
+            source.dropped_table_recovery_retry_failures.store(0, .release);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -1555,19 +1651,684 @@ fn droppedTableTrashDirPath(alloc: std.mem.Allocator, replica_root_dir: []const 
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_trash_dir_name });
 }
 
+fn droppedTableRepairDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_repair_dir_name });
+}
+
+fn replicaRetirementDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, replica_retirement_dir_name });
+}
+
+fn recoveryQuarantineDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, recovery_quarantine_dir_name });
+}
+
+fn quarantineRecoveryIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    path: []const u8,
+    kind: []const u8,
+) !void {
+    const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
+    defer alloc.free(quarantine_dir);
+    try fs_paths.createDirPathPortable(io, quarantine_dir);
+    const destination = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}-{d}-{s}",
+        .{ quarantine_dir, kind, platform_time.monotonicNs(), std.fs.path.basename(path) },
+    );
+    defer alloc.free(destination);
+    std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), destination, io) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    // Persist removal from the active queue and insertion into quarantine
+    // before allowing the scanner to report the malformed record as handled.
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse replica_root_dir);
+    try fs_paths.syncDirPortable(io, quarantine_dir);
+}
+
+fn countRecoveryQuarantineIntents(alloc: std.mem.Allocator, replica_root_dir: []const u8) !u64 {
+    const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
+    defer alloc.free(quarantine_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var dir = std.Io.Dir.cwd().openDir(io, quarantine_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+    var count: u64 = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .file) count +|= 1;
+    }
+    return count;
+}
+
+fn replicaRetirementIntentPath(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/group-{d}.bin", .{
+        replica_root_dir,
+        replica_retirement_dir_name,
+        group_id,
+    });
+}
+
+const PersistedReplicaRetirementIntent = struct {
+    group_id: u64,
+    table_name: ?[]u8,
+    path: []u8,
+    created: bool,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.table_name) |table_name| alloc.free(table_name);
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const ReplicaRetirementIntentPhase = enum(u8) {
+    prepared = 1,
+    committed = 2,
+};
+
+const LoadedReplicaRetirementIntent = struct {
+    group_id: u64,
+    phase: ReplicaRetirementIntentPhase,
+    legacy: bool = false,
+    table_name: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.table_name) |table_name| alloc.free(table_name);
+        self.* = undefined;
+    }
+};
+
+const LoadedReplicaRetirementBatch = struct {
+    phase: ReplicaRetirementIntentPhase,
+    intents: []PersistedReplicaRetirementIntent,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.intents) |*intent| intent.deinit(alloc);
+        alloc.free(self.intents);
+        self.* = undefined;
+    }
+};
+
+fn replicaRetirementIntentLessThan(_: void, lhs: PersistedReplicaRetirementIntent, rhs: PersistedReplicaRetirementIntent) bool {
+    return lhs.group_id < rhs.group_id;
+}
+
+fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn replicaRetirementBatchPath(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    intents: []const PersistedReplicaRetirementIntent,
+) ![]u8 {
+    var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+    checksum.update(replica_retirement_batch_magic);
+    var encoded_count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
+    checksum.update(&encoded_count);
+    for (intents) |intent| {
+        var encoded_group_id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_group_id, intent.group_id, .little);
+        checksum.update(&encoded_group_id);
+        var encoded_name_len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded_name_len, @intCast(if (intent.table_name) |name| name.len else 0), .little);
+        checksum.update(&encoded_name_len);
+        if (intent.table_name) |name| checksum.update(name);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    checksum.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/{s}{s}.bin", .{
+        replica_root_dir,
+        replica_retirement_dir_name,
+        replica_retirement_batch_prefix,
+        &digest_hex,
+    });
+}
+
+fn writeReplicaRetirementBatch(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    path: []const u8,
+    intents: []const PersistedReplicaRetirementIntent,
+    phase: ReplicaRetirementIntentPhase,
+) !void {
+    if (intents.len == 0 or intents.len > max_replica_retirement_batch_entries)
+        return error.ReplicaRetirementBatchTooLarge;
+    var encoded_len: usize = replica_retirement_batch_base_encoded_len;
+    var previous_group_id: ?u64 = null;
+    for (intents) |intent| {
+        if (previous_group_id != null and previous_group_id.? >= intent.group_id)
+            return error.InvalidReplicaRetirementIntent;
+        previous_group_id = intent.group_id;
+        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name);
+    }
+
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [16 * 1024]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        const encoded_phase = [_]u8{@intFromEnum(phase)};
+        var encoded_count: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
+        checksum.update(replica_retirement_batch_magic);
+        checksum.update(&encoded_phase);
+        checksum.update(&encoded_count);
+        try writer.interface.writeAll(replica_retirement_batch_magic);
+        try writer.interface.writeAll(&encoded_phase);
+        try writer.interface.writeAll(&encoded_count);
+        for (intents) |intent| {
+            var encoded_group_id: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded_group_id, intent.group_id, .little);
+            var encoded_name_len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &encoded_name_len, @intCast(if (intent.table_name) |name| name.len else 0), .little);
+            checksum.update(&encoded_group_id);
+            checksum.update(&encoded_name_len);
+            if (intent.table_name) |name| checksum.update(name);
+            try writer.interface.writeAll(&encoded_group_id);
+            try writer.interface.writeAll(&encoded_name_len);
+            if (intent.table_name) |name| try writer.interface.writeAll(name);
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, dir_path);
+}
+
+fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedReplicaRetirementBatch {
+    if (consumeTestRecoveryIntentReadFailure()) return error.InputOutput;
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_replica_retirement_batch_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidReplicaRetirementIntent,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+    const header_len = replica_retirement_batch_magic.len + 1 + 4;
+    if (encoded.len < header_len + std.crypto.hash.sha2.Sha256.digest_length or
+        !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
+        return error.InvalidReplicaRetirementIntent;
+    const phase: ReplicaRetirementIntentPhase = switch (encoded[replica_retirement_batch_magic.len]) {
+        @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
+        @intFromEnum(ReplicaRetirementIntentPhase.committed) => .committed,
+        else => return error.InvalidReplicaRetirementIntent,
+    };
+    var encoded_count: [4]u8 = undefined;
+    @memcpy(&encoded_count, encoded[replica_retirement_batch_magic.len + 1 .. header_len]);
+    const count: usize = std.mem.readInt(u32, &encoded_count, .little);
+    if (count == 0 or count > max_replica_retirement_batch_entries)
+        return error.InvalidReplicaRetirementIntent;
+    const payload_end = encoded.len - std.crypto.hash.sha2.Sha256.digest_length;
+    var expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &expected_digest, .{});
+    if (!std.mem.eql(u8, &expected_digest, encoded[payload_end..]))
+        return error.InvalidReplicaRetirementIntent;
+
+    const intents = try alloc.alloc(PersistedReplicaRetirementIntent, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (intents[0..initialized]) |*intent| intent.deinit(alloc);
+        alloc.free(intents);
+    }
+    var offset = header_len;
+    var previous_group_id: ?u64 = null;
+    while (initialized < count) : (initialized += 1) {
+        if (offset + 12 > payload_end) return error.InvalidReplicaRetirementIntent;
+        var encoded_group_id: [8]u8 = undefined;
+        @memcpy(&encoded_group_id, encoded[offset .. offset + 8]);
+        offset += 8;
+        var encoded_name_len: [4]u8 = undefined;
+        @memcpy(&encoded_name_len, encoded[offset .. offset + 4]);
+        offset += 4;
+        const group_id = std.mem.readInt(u64, &encoded_group_id, .little);
+        const name_len: usize = std.mem.readInt(u32, &encoded_name_len, .little);
+        if ((previous_group_id != null and previous_group_id.? >= group_id) or
+            name_len > max_replica_retirement_table_name_bytes or offset + name_len > payload_end)
+            return error.InvalidReplicaRetirementIntent;
+        previous_group_id = group_id;
+        const table_name = if (name_len == 0) null else try alloc.dupe(u8, encoded[offset .. offset + name_len]);
+        errdefer if (table_name) |name| alloc.free(name);
+        // The batch owns its path once; entries retain only the cleanup
+        // identity and avoid O(entries * path length) recovery memory.
+        const owned_path = try alloc.alloc(u8, 0);
+        intents[initialized] = .{
+            .group_id = group_id,
+            .table_name = table_name,
+            .path = owned_path,
+            .created = false,
+        };
+        offset += name_len;
+    }
+    if (offset != payload_end) return error.InvalidReplicaRetirementIntent;
+    return .{ .phase = phase, .intents = intents };
+}
+
+fn writeReplicaRetirementIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    path: []const u8,
+    group_id: u64,
+    table_name: ?[]const u8,
+    phase: ReplicaRetirementIntentPhase,
+    sync_directory: bool,
+) !void {
+    if (table_name) |name| {
+        if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
+            return error.InvalidReplicaRetirementTableName;
+    }
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [128]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        var encoded_group_id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_group_id, group_id, .little);
+        const encoded_phase = [_]u8{@intFromEnum(phase)};
+        var encoded_table_name_len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded_table_name_len, @intCast(if (table_name) |name| name.len else 0), .little);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        checksum.update(replica_retirement_magic);
+        checksum.update(&encoded_group_id);
+        checksum.update(&encoded_phase);
+        checksum.update(&encoded_table_name_len);
+        if (table_name) |name| checksum.update(name);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(replica_retirement_magic);
+        try writer.interface.writeAll(&encoded_group_id);
+        try writer.interface.writeAll(&encoded_phase);
+        try writer.interface.writeAll(&encoded_table_name_len);
+        if (table_name) |name| try writer.interface.writeAll(name);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    if (sync_directory) try fs_paths.syncDirPortable(io, dir_path);
+}
+
+fn persistReplicaRetirementIntentWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    table_name: ?[]const u8,
+    sync_directory: bool,
+) !PersistedReplicaRetirementIntent {
+    const path = try replicaRetirementIntentPath(alloc, replica_root_dir, group_id);
+    errdefer alloc.free(path);
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
+        var persisted = try loadReplicaRetirementIntent(alloc, io, path);
+        defer persisted.deinit(alloc);
+        if (persisted.group_id != group_id) return error.InvalidReplicaRetirementIntent;
+        if (table_name != null and persisted.table_name != null and
+            !std.mem.eql(u8, table_name.?, persisted.table_name.?))
+        {
+            return error.InvalidReplicaRetirementIntent;
+        }
+        const effective_table_name = table_name orelse persisted.table_name;
+        return .{
+            .group_id = group_id,
+            .table_name = if (effective_table_name) |name| try alloc.dupe(u8, name) else null,
+            .path = path,
+            .created = false,
+        };
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    try writeReplicaRetirementIntent(
+        alloc,
+        io,
+        dir_path,
+        path,
+        group_id,
+        table_name,
+        .prepared,
+        sync_directory,
+    );
+    return .{
+        .group_id = group_id,
+        .table_name = if (table_name) |name| try alloc.dupe(u8, name) else null,
+        .path = path,
+        .created = true,
+    };
+}
+
+fn persistReplicaRetirementIntent(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+) !PersistedReplicaRetirementIntent {
+    const dir_path = try replicaRetirementDirPath(alloc, replica_root_dir);
+    defer alloc.free(dir_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, dir_path);
+    return try persistReplicaRetirementIntentWithIo(
+        alloc,
+        io,
+        dir_path,
+        replica_root_dir,
+        group_id,
+        null,
+        true,
+    );
+}
+
+fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedReplicaRetirementIntent {
+    if (consumeTestRecoveryIntentReadFailure()) return error.InputOutput;
+    const encoded_len_v1 = replica_retirement_magic_v1.len + @sizeOf(u64) + std.crypto.hash.sha2.Sha256.digest_length;
+    const encoded_len_v2 = replica_retirement_magic_v2.len + @sizeOf(u64) + @sizeOf(u8) + std.crypto.hash.sha2.Sha256.digest_length;
+    const max_encoded_len = replica_retirement_magic.len + @sizeOf(u64) + @sizeOf(u8) + @sizeOf(u32) +
+        max_replica_retirement_table_name_bytes + std.crypto.hash.sha2.Sha256.digest_length;
+    // readFileAlloc's limit is an EOF-detection ceiling, so leave one byte of
+    // headroom and reject both truncated and oversized records below.
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_encoded_len + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidReplicaRetirementIntent,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+    const v1 = encoded.len == encoded_len_v1 and
+        std.mem.eql(u8, encoded[0..replica_retirement_magic_v1.len], replica_retirement_magic_v1);
+    const v2 = encoded.len == encoded_len_v2 and
+        std.mem.eql(u8, encoded[0..replica_retirement_magic_v2.len], replica_retirement_magic_v2);
+    const v3 = encoded.len >= replica_retirement_magic.len + @sizeOf(u64) + @sizeOf(u8) + @sizeOf(u32) +
+        std.crypto.hash.sha2.Sha256.digest_length and
+        std.mem.eql(u8, encoded[0..replica_retirement_magic.len], replica_retirement_magic);
+    if (!v1 and !v2 and !v3) return error.InvalidReplicaRetirementIntent;
+    const magic_len = if (v1) replica_retirement_magic_v1.len else if (v2) replica_retirement_magic_v2.len else replica_retirement_magic.len;
+    const phase_len: usize = if (v1) 0 else @sizeOf(u8);
+    const table_name_len_offset = magic_len + @sizeOf(u64) + phase_len;
+    var table_name: ?[]u8 = null;
+    errdefer if (table_name) |name| alloc.free(name);
+    const payload_end = if (v3) blk: {
+        var encoded_name_len: [@sizeOf(u32)]u8 = undefined;
+        @memcpy(&encoded_name_len, encoded[table_name_len_offset .. table_name_len_offset + @sizeOf(u32)]);
+        const name_len: usize = std.mem.readInt(u32, &encoded_name_len, .little);
+        if (name_len > max_replica_retirement_table_name_bytes) return error.InvalidReplicaRetirementIntent;
+        const name_start = table_name_len_offset + @sizeOf(u32);
+        const end = name_start + name_len;
+        if (end + std.crypto.hash.sha2.Sha256.digest_length != encoded.len)
+            return error.InvalidReplicaRetirementIntent;
+        if (name_len > 0) table_name = try alloc.dupe(u8, encoded[name_start..end]);
+        break :blk end;
+    } else magic_len + @sizeOf(u64) + phase_len;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &digest, .{});
+    if (!std.mem.eql(u8, &digest, encoded[payload_end..]))
+        return error.InvalidReplicaRetirementIntent;
+    const group_id_end = magic_len + @sizeOf(u64);
+    const phase: ReplicaRetirementIntentPhase = if (v1)
+        .prepared
+    else switch (encoded[group_id_end]) {
+        @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
+        @intFromEnum(ReplicaRetirementIntentPhase.committed) => .committed,
+        else => return error.InvalidReplicaRetirementIntent,
+    };
+    var encoded_group_id: [@sizeOf(u64)]u8 = undefined;
+    @memcpy(&encoded_group_id, encoded[magic_len..group_id_end]);
+    return .{
+        .group_id = std.mem.readInt(u64, &encoded_group_id, .little),
+        .phase = phase,
+        .legacy = !v3,
+        .table_name = table_name,
+    };
+}
+
+fn droppedTableRepairIntentPath(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    table_name: []const u8,
+    contract: metadata_topology_protocol.DropCleanupContract,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, table_name.len, .little);
+    hasher.update(&encoded_len);
+    hasher.update(table_name);
+    std.mem.writeInt(u64, &encoded_len, contract.table_id, .little);
+    hasher.update(&encoded_len);
+    std.mem.writeInt(u64, &encoded_len, contract.expected_transition_generation, .little);
+    hasher.update(&encoded_len);
+    std.mem.writeInt(u64, &encoded_len, contract.group_ids.len, .little);
+    hasher.update(&encoded_len);
+    for (contract.group_ids) |group_id| {
+        std.mem.writeInt(u64, &encoded_len, group_id, .little);
+        hasher.update(&encoded_len);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/drop-{s}.bin", .{
+        replica_root_dir,
+        dropped_table_repair_dir_name,
+        &digest_hex,
+    });
+}
+
+const DroppedTableRepairIntent = struct {
+    table_name: []u8,
+    table_id: u64,
+    expected_transition_generation: u64,
+    group_ids: []u64,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.group_ids);
+        self.* = undefined;
+    }
+};
+
+fn persistDroppedTableRepairIntent(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    table_name: []const u8,
+    contract: metadata_topology_protocol.DropCleanupContract,
+) ![]u8 {
+    const group_ids = contract.group_ids;
+    if (table_name.len > max_dropped_table_repair_name_bytes) return error.NameTooLong;
+    const payload_bytes = std.math.add(usize, table_name.len, std.math.mul(usize, group_ids.len, @sizeOf(u64)) catch return error.DropRepairIntentTooLarge) catch return error.DropRepairIntentTooLarge;
+    const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
+    if (payload_bytes > max_dropped_table_repair_bytes - 36 - checksum_len) return error.DropRepairIntentTooLarge;
+
+    const repair_dir = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir);
+    const path = try droppedTableRepairIntentPath(alloc, replica_root_dir, table_name, contract);
+    errdefer alloc.free(path);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, repair_dir);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [16 * 1024]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        try writer.interface.writeAll(dropped_table_repair_magic);
+        checksum.update(dropped_table_repair_magic);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u32, encoded[0..4], @intCast(table_name.len), .little);
+        try writer.interface.writeAll(encoded[0..4]);
+        checksum.update(encoded[0..4]);
+        std.mem.writeInt(u64, &encoded, @intCast(group_ids.len), .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        std.mem.writeInt(u64, &encoded, contract.table_id, .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        std.mem.writeInt(u64, &encoded, contract.expected_transition_generation, .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        try writer.interface.writeAll(table_name);
+        checksum.update(table_name);
+        for (group_ids) |group_id| {
+            std.mem.writeInt(u64, &encoded, group_id, .little);
+            try writer.interface.writeAll(&encoded);
+            checksum.update(&encoded);
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, repair_dir);
+    return path;
+}
+
+fn loadDroppedTableRepairIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !DroppedTableRepairIntent {
+    if (consumeTestRecoveryIntentReadFailure()) return error.InputOutput;
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_dropped_table_repair_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidDropRepairIntent,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+    const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
+    if (encoded.len < 20 + checksum_len) return error.InvalidDropRepairIntent;
+    const is_v2 = std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic);
+    const is_v1 = std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic_v1);
+    if (!is_v2 and !is_v1) return error.InvalidDropRepairIntent;
+    const name_len: usize = std.mem.readInt(u32, encoded[8..12], .little);
+    const group_count_u64 = std.mem.readInt(u64, encoded[12..20], .little);
+    const header_len: usize = if (is_v2) 36 else 20;
+    if (encoded.len < header_len + checksum_len) return error.InvalidDropRepairIntent;
+    const table_id = if (is_v2) std.mem.readInt(u64, encoded[20..28], .little) else 0;
+    const expected_transition_generation = if (is_v2) std.mem.readInt(u64, encoded[28..36], .little) else 0;
+    const group_count = std.math.cast(usize, group_count_u64) orelse return error.InvalidDropRepairIntent;
+    if (name_len > max_dropped_table_repair_name_bytes) return error.InvalidDropRepairIntent;
+    const group_bytes = std.math.mul(usize, group_count, @sizeOf(u64)) catch return error.InvalidDropRepairIntent;
+    const payload_end = std.math.add(usize, header_len + name_len, group_bytes) catch return error.InvalidDropRepairIntent;
+    const expected_len = std.math.add(usize, payload_end, checksum_len) catch return error.InvalidDropRepairIntent;
+    if (expected_len != encoded.len) return error.InvalidDropRepairIntent;
+    var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &actual_digest, .{});
+    if (!std.mem.eql(u8, &actual_digest, encoded[payload_end..])) return error.InvalidDropRepairIntent;
+    const table_name = try alloc.dupe(u8, encoded[header_len .. header_len + name_len]);
+    errdefer alloc.free(table_name);
+    const group_ids = try alloc.alloc(u64, group_count);
+    errdefer alloc.free(group_ids);
+    var offset = header_len + name_len;
+    for (group_ids) |*group_id| {
+        group_id.* = std.mem.readInt(u64, encoded[offset..][0..8], .little);
+        offset += 8;
+    }
+    return .{
+        .table_name = table_name,
+        .table_id = table_id,
+        .expected_transition_generation = expected_transition_generation,
+        .group_ids = group_ids,
+    };
+}
+
 fn droppedTableTrashPath(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     table_name: []const u8,
     group_id: u64,
 ) ![]u8 {
+    // Table names are API identifiers, not path components: valid names may
+    // contain separators, dot components, spaces, or platform-reserved bytes.
+    // Keep quarantine entries flat and portable while retaining a stable
+    // diagnostic correlation token that does not disclose the raw name.
+    var name_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(table_name, &name_digest, .{});
+    const name_digest_hex = std.fmt.bytesToHex(name_digest, .lower);
     return try std.fmt.allocPrint(alloc, "{s}/{s}/table-{s}-group-{d}-{d}", .{
         replica_root_dir,
         dropped_table_trash_dir_name,
-        table_name,
+        &name_digest_hex,
         group_id,
         platform_time.monotonicNs(),
     });
+}
+
+fn retiredReplicaTrashPath(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/retired-replica-group-{d}-{d}", .{
+        replica_root_dir,
+        dropped_table_trash_dir_name,
+        group_id,
+        platform_time.monotonicNs(),
+    });
+}
+
+fn moveRetiredReplicaPathToTrash(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+) !?[]u8 {
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(db_path);
+    // Replica placement owns the entire group directory: table-db plus the
+    // stable node-<id> Raft WAL/snapshot tree. Once durable ownership is gone
+    // neither subtree can be reused, and retaining the consensus state leaks
+    // substantially more disk than the visible table DB alone.
+    const path = std.fs.path.dirname(db_path) orelse return error.InvalidReplicaGroupPath;
+    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
+    defer alloc.free(trash_dir_path);
+    const trash_path = try retiredReplicaTrashPath(alloc, replica_root_dir, group_id);
+    errdefer alloc.free(trash_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, trash_dir_path);
+    std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io) catch |err| switch (err) {
+        error.FileNotFound => {
+            alloc.free(trash_path);
+            return null;
+        },
+        else => return err,
+    };
+    // Make the live-root removal and trash insertion durable before the
+    // retirement intent can be acknowledged.
+    try fs_paths.syncDirPortable(io, replica_root_dir);
+    try fs_paths.syncDirPortable(io, trash_dir_path);
+    return trash_path;
 }
 
 fn moveDroppedGroupPathToTrash(
@@ -1594,6 +2355,9 @@ fn moveDroppedGroupPathToTrash(
         },
         else => return err,
     };
+    // Persist removal from the live group immediately. The caller batches the
+    // shared trash-directory sync once after every group rename.
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(path) orelse replica_root_dir);
     return trash_path;
 }
 
@@ -1785,6 +2549,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finishing: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
+            if (comptime control_only_storage_sources) return;
             self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
             self.db.setEntitySink(null);
@@ -1841,6 +2606,12 @@ pub const ProvisionedTableWriteCache = struct {
             alloc: std.mem.Allocator,
             backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
         ) void {
+            if (comptime control_only_storage_sources) {
+                alloc.free(self.table_name);
+                if (self.schema_json) |value| alloc.free(value);
+                self.* = undefined;
+                return;
+            }
             // Callback contexts are borrowed from the attached write source.
             // Establish the callback barrier before finish/close can drain any
             // worker that publishes a final visibility transition.
@@ -3230,6 +4001,24 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn invalidateGroup(self: *ProvisionedTableWriteCache, group_id: u64) !void {
+        var matching_entries: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id) matching_entries += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(matching_entries);
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.orderedRemove(i);
+            self.retireEntryLocked(entry);
+        }
+    }
+
     fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var matching_entries: usize = 0;
         for (self.entries.items) |entry| {
@@ -4216,6 +5005,35 @@ pub const ProvisionedTableWriteCache = struct {
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
     }
 
+    fn drainPendingClosesForGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        while (true) {
+            var entry_to_close: ?*Entry = null;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            var i: usize = 0;
+            while (i < self.retired_entries.items.len) : (i += 1) {
+                const entry = self.retired_entries.items[i];
+                if (entry.group_id != group_id or entry.active_leases != 0) continue;
+                entry_to_close = self.retired_entries.orderedRemove(i);
+                break;
+            }
+            if (entry_to_close == null) {
+                i = 0;
+                while (i < self.closing_entries.items.len) : (i += 1) {
+                    const entry = self.closing_entries.items[i];
+                    if (entry.group_id != group_id) continue;
+                    entry_to_close = self.closing_entries.orderedRemove(i);
+                    break;
+                }
+            }
+            self.entry_lifecycle_mutex.unlock();
+
+            const entry = entry_to_close orelse return;
+            self.closeEntryNow(entry);
+        }
+    }
+
     fn drainPendingClosesAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache) void {
         while (true) {
             var entry_to_close: ?*Entry = null;
@@ -4249,6 +5067,7 @@ const HostedManagedDbCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
+    drop_cleanup_source: ?*ProvisionedTableWriteSource = null,
 
     fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !*HostedManagedDbCache {
         const cache = try alloc.create(HostedManagedDbCache);
@@ -4282,6 +5101,8 @@ pub const HostedManagedDbCacheDiagnostics = struct {
     lsm_active_readers: u64 = 0,
     lsm_obsolete_paths: u64 = 0,
     lsm_bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+    quarantined_recovery_intents: u64 = 0,
+    recovery_retry_failures: u64 = 0,
 };
 
 var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
@@ -4304,6 +5125,14 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     }
 
     const cache = removed orelse return;
+    // The persistent hosted cleanup owner may have durable jobs waiting for
+    // cache exclusion. Quiesce it before taking the cache mutex so those jobs
+    // can finish without a shutdown deadlock, then retire the borrowed caches.
+    if (cache.drop_cleanup_source) |cleanup| {
+        cleanup.deinit();
+        alloc.destroy(cleanup);
+        cache.drop_cleanup_source = null;
+    }
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
     cache.runtime_status_cache.deinit();
@@ -4379,6 +5208,14 @@ pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) Host
             .lsm_active_readers = write_cache.lsm_active_readers,
             .lsm_obsolete_paths = write_cache.lsm_obsolete_paths,
             .lsm_bulk_ingest_current_scan_clone_active_bytes = write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes,
+            .quarantined_recovery_intents = if (selected.drop_cleanup_source) |source|
+                source.quarantined_recovery_intents.load(.acquire)
+            else
+                0,
+            .recovery_retry_failures = if (selected.drop_cleanup_source) |source|
+                source.dropped_table_recovery_retry_failures.load(.acquire)
+            else
+                0,
         };
     }
     return .{ .cached_roots = cached_roots };
@@ -4415,6 +5252,809 @@ const TestEmbeddingRequest = struct {
 };
 
 pub const TableWriteSource = table_write_source.TableWriteSource;
+pub const DropCleanupContract = metadata_topology_protocol.DropCleanupContract;
+
+const LegacyTableWriteSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        create_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: tables_api.CreateTableRequest,
+        ) anyerror!?void = null,
+        update_schema: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            schema_json: []const u8,
+        ) anyerror!?void = null,
+        create_index: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            index_json: []const u8,
+        ) anyerror!?void = null,
+        put_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            enrichment_json: []const u8,
+        ) anyerror!?void = null,
+        delete_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?void = null,
+        drop_index: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
+        drop_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            contract: metadata_topology_protocol.DropCleanupContract,
+        ) anyerror!?void = null,
+        backup_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            plan: backups_api.TableBackupPlan,
+        ) anyerror!?[]backups_api.ShardSnapshot = null,
+        backup_table_to_location: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            backup_id: []const u8,
+            format: backups_api.BackupFormat,
+            fence: backups_api.TableBackupFence,
+            location_uri: []const u8,
+            connection: []const u8,
+            location: *backups_api.BackupLocation,
+        ) anyerror!?[]backups_api.ShardSnapshot = null,
+        restore_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            plan: backups_api.TableRestorePlan,
+        ) anyerror!?void = null,
+        begin_restore_lifecycle: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) anyerror!void = null,
+        finish_restore_lifecycle: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) void = null,
+        commit_transaction: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_transaction_with_id: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        acknowledge_transaction_commit: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            coordinator_group_id: u64,
+            coordinator_table_name: []const u8,
+        ) anyerror!?void = null,
+        batch: *const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!?void,
+        begin_bulk_ingest: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        finish_bulk_ingest: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            options: backend_types.BulkIngestFinishOptions,
+        ) anyerror!?void = null,
+        abort_bulk_ingest: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) void = null,
+        batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!?void = null,
+        txn_begin_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            topology_epoch: u64,
+            retain_terminal: bool,
+            participants: []const []const u8,
+        ) anyerror!?void = null,
+        txn_prepare_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            topology_epoch: u64,
+            req: db_mod.types.TransactionIntentRequest,
+        ) anyerror!?void = null,
+        txn_resolve_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            status: db_mod.types.TxnStatus,
+            commit_version: u64,
+            topology_epoch: u64,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?void = null,
+        txn_status_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_acknowledge_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            participant: []const u8,
+        ) anyerror!?void = null,
+        corrupt_embedding_artifact: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
+        reprocess_document_artifact: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
+        reprocess_document_artifact_range: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        list_artifact_repair_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        update_document_artifact_child_range_placement: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
+        apply_document_artifact_child_range_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
+        reprocess_document_artifact_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
+        reprocess_document_artifact_range_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        list_artifact_repair_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_group_local_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        update_document_artifact_child_range_placement_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
+        apply_document_artifact_child_range_batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
+        local_runtime_statuses: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        request_table_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        request_table_index_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
+    };
+
+    pub fn batch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+    ) !?void {
+        return try self.vtable.batch(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
+        const fn_ptr = self.vtable.begin_bulk_ingest orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn finishBulkIngest(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !?void {
+        const fn_ptr = self.vtable.finish_bulk_ingest orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, options);
+    }
+
+    pub fn abortBulkIngest(self: TableWriteSource, table_name: []const u8) void {
+        const fn_ptr = self.vtable.abort_bulk_ingest orelse return;
+        fn_ptr(self.ptr, table_name);
+    }
+
+    pub fn createTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: tables_api.CreateTableRequest,
+    ) !?void {
+        const fn_ptr = self.vtable.create_table orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn updateSchema(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.update_schema orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn createIndex(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.create_index orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
+    }
+
+    pub fn putArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+    }
+
+    pub fn dropIndex(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.drop_index orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn dropTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        contract: metadata_topology_protocol.DropCleanupContract,
+    ) !?void {
+        const fn_ptr = self.vtable.drop_table orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, contract);
+    }
+
+    pub fn backupTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableBackupPlan,
+    ) !?[]backups_api.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn backupTableToLocation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
+        location_uri: []const u8,
+        connection: []const u8,
+        location: *backups_api.BackupLocation,
+    ) !?[]backups_api.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table_to_location orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location);
+    }
+
+    pub fn restoreTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const lifecycle_active = try self.beginRestoreLifecycle(table_name);
+        defer if (lifecycle_active) self.finishRestoreLifecycle(table_name);
+        return try self.restoreTableReserved(alloc, table_name, plan);
+    }
+
+    /// Executes restore work under a lifecycle reservation already held by the
+    /// caller. Coordinators use this when the reservation must span metadata
+    /// replacement or remote snapshot staging; ordinary callers should use
+    /// restoreTable so write fencing cannot be omitted.
+    pub fn restoreTableReserved(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const fn_ptr = self.vtable.restore_table orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn beginRestoreLifecycle(self: TableWriteSource, table_name: []const u8) !bool {
+        const fn_ptr = self.vtable.begin_restore_lifecycle orelse return false;
+        try fn_ptr(self.ptr, table_name);
+        return true;
+    }
+
+    pub fn finishRestoreLifecycle(self: TableWriteSource, table_name: []const u8) void {
+        const fn_ptr = self.vtable.finish_restore_lifecycle orelse return;
+        fn_ptr(self.ptr, table_name);
+    }
+
+    pub fn commitTransaction(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_transaction orelse return null;
+        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+    }
+
+    pub fn commitBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
+        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+    }
+
+    pub fn commitTransactionWithId(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
+        return try fn_ptr(self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level);
+    }
+
+    pub fn acknowledgeTransactionCommit(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.acknowledge_transaction_commit orelse return null;
+        return try fn_ptr(self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name);
+    }
+
+    pub fn batchGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+    ) !?void {
+        const fn_ptr = self.vtable.batch_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn txnBeginGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_begin_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+    }
+
+    pub fn txnPrepareGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        topology_epoch: u64,
+        req: db_mod.types.TransactionIntentRequest,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_prepare_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req);
+    }
+
+    pub fn txnResolveGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+    }
+
+    pub fn txnStatusGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnAcknowledgeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_acknowledge_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, participant);
+    }
+
+    pub fn corruptEmbeddingArtifact(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.corrupt_embedding_artifact orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, index_name);
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
+    }
+
+    pub fn listArtifactRepairIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn repairArtifactIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_controlled orelse {
+            if (options.cancelled()) return error.Canceled;
+            return try self.repairArtifactIssues(alloc, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, table_name, req, options);
+    }
+
+    pub fn listArtifactRepairIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocalControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local_controlled orelse {
+            if (options.cancelled()) return error.Canceled;
+            return try self.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, options);
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, update);
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
+    pub fn reprocessDocumentArtifactRangeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        const fn_ptr = self.vtable.reprocess_document_artifact_range_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, artifact_name, req);
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
+    pub fn localRuntimeStatuses(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn requestTableStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn requestTableIndexStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
+        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+};
 
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
@@ -4470,6 +6110,36 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!void = null,
+        txn_status_group: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+        ) anyerror!db_mod.types.TxnStatus = null,
+        txn_status_group_local_until: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            deadline_ns: u64,
+        ) anyerror!db_mod.types.TxnStatus = null,
     };
 
     pub fn batchGroup(
@@ -4543,6 +6213,54 @@ pub const RaftBatcher = struct {
         const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse
             return try self.batchGroupLocalWithCancellation(alloc, group_id, table_name, req, context.cancellation);
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req, context);
+    }
+
+    pub fn txnStatusGroup(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnStatusGroupUntil(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    pub fn txnStatusGroupLocal(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnStatusGroupLocalUntil(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !db_mod.types.TxnStatus {
+        const fn_ptr = self.vtable.txn_status_group_local_until orelse
+            return error.DeadlineAwareTxnStatusUnsupported;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
     }
 };
 
@@ -4917,7 +6635,10 @@ pub const BoundTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        if (plan.cancellation.isCancelled()) return error.Canceled;
+        if (plan.target_group_id) |group_id| {
+            if (group_id != 0) return error.NotFound;
+        }
+        try plan.ensureActive();
         const db = try self.activeDb();
         if (plan.format == .portable) {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
@@ -4984,7 +6705,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateSingleRangeRestoreManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
         const db = try self.activeDb();
@@ -5621,6 +7342,15 @@ pub const BoundTableWriteSource = struct {
 };
 
 pub const ProvisionedTableWriteSource = struct {
+    pub const DroppedTableRecoveryStatus = struct {
+        pending_epochs: u64,
+        worker_scheduled: bool,
+        retry_scheduled: bool,
+        consecutive_recovery_failures: u32,
+        consecutive_enqueue_failures: u32,
+        enqueue_failures: u64,
+    };
+
     pub const StartupCatchUpResult = struct {
         had_debt: bool = false,
         cleared_debt: bool = false,
@@ -5630,6 +7360,9 @@ pub const ProvisionedTableWriteSource = struct {
         quarantined: bool = false,
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
+        restore_repair_pending: bool = false,
+        restore_repair_attempted: bool = false,
+        restore_repair_progressed: bool = false,
         index_repair_pending: bool = false,
         // Automatic load failures still exist whose exact incarnations have
         // not all been classified into durable repair or terminal debt. This
@@ -5687,6 +7420,59 @@ pub const ProvisionedTableWriteSource = struct {
             action: LocalIndexRepairDebtAction,
         ) void,
     };
+
+    /// Durable and live recovery proof for a staged local replica retirement.
+    /// The catalog distinguishes an aborted removal from a committed one;
+    /// live ownership then fences filesystem deletion until runtime teardown.
+    pub const ReplicaRetirementOwnership = struct {
+        pub const State = enum {
+            retained,
+            retiring,
+            retired,
+        };
+
+        ptr: *anyopaque,
+        classify: *const fn (ptr: *anyopaque, group_id: u64) anyerror!State,
+
+        fn state(self: @This(), group_id: u64) !State {
+            return try self.classify(self.ptr, group_id);
+        }
+    };
+
+    pub const PreparedReplicaRetirements = struct {
+        alloc: std.mem.Allocator,
+        intents: []PersistedReplicaRetirementIntent,
+        /// New reconciliations share one checksummed journal and therefore
+        /// pay one file sync plus one directory barrier per phase.
+        batch_path: ?[]u8 = null,
+        batch_created: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.intents) |*intent| intent.deinit(self.alloc);
+            self.alloc.free(self.intents);
+            if (self.batch_path) |path| self.alloc.free(path);
+            self.* = undefined;
+        }
+    };
+
+    pub const ReplicaRetirementTarget = struct {
+        group_id: u64,
+        /// Stable table identity captured from the same catalog snapshot that
+        /// produced the placement removal. Null is reserved for legacy repair
+        /// records and deliberately falls back to conservative coordination.
+        table_name: ?[]const u8 = null,
+    };
+
+    fn preflightReplicaRetirementBatch(targets: []const ReplicaRetirementTarget) !void {
+        if (targets.len == 0) return;
+        if (targets.len > max_replica_retirement_batch_entries)
+            return error.ReplicaRetirementBatchTooLarge;
+
+        var encoded_len: usize = replica_retirement_batch_base_encoded_len;
+        for (targets) |target| {
+            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name);
+        }
+    }
 
     const StructuralReconcileRequest = struct {
         table_name: []u8,
@@ -5891,10 +7677,47 @@ pub const ProvisionedTableWriteSource = struct {
     write_coalesce_ready: Io.Condition = .init,
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
     read_cache: ?*table_reads.ProvisionedTableReadCache = null,
+    /// Dropped-table cleanup is post-commit convergence backed by a durable
+    /// repair intent. Bound foreground lease draining so an abandoned reader
+    /// cannot pin the user request; recovery resumes the idempotent cleanup.
+    drop_cleanup_read_drain_timeout_ns: u64 = 5 * std.time.ns_per_s,
     write_cache: ?*ProvisionedTableWriteCache = null,
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    // Hosted storage shares a process-wide cache whose mutex must fence both
+    // foreground opens and persistent dropped-table recovery jobs.
+    dropped_table_cleanup_outer_mutex: ?*std.atomic.Mutex = null,
+    dropped_table_job_owner_mutex: std.atomic.Mutex = .unlocked,
     dropped_table_delete_owner_id: u64 = 0,
+    dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
+    dropped_table_recovery_scheduled: std.atomic.Value(bool) = .init(false),
+    // Every wake increments an epoch. The active scanner releases ownership
+    // only after observing the same epoch before and after clearing the
+    // scheduled bit, closing the classic coalesced-work lost-wakeup race.
+    dropped_table_recovery_requested: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_completed: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_retry_scheduled: std.atomic.Value(bool) = .init(false),
+    dropped_table_recovery_retry_failures: std.atomic.Value(u32) = .init(0),
+    dropped_table_recovery_enqueue_failures: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_enqueue_failure_streak: std.atomic.Value(u32) = .init(0),
+    quarantined_recovery_intents: std.atomic.Value(u64) = .init(0),
+    replica_retirement_ownership_mutex: std.atomic.Mutex = .unlocked,
+    replica_retirement_ownership: ?ReplicaRetirementOwnership = null,
+    // Serializes journal publication/recovery and tracks in-flight plans so a
+    // scanner cannot classify a just-prepared record before its catalog CAS.
+    replica_retirement_intent_mutex: std.atomic.Mutex = .unlocked,
+    // Journal I/O is serialized only for the same deterministic batch stripe;
+    // unrelated topology changes never hold the ownership mutex across disk
+    // access or fsync.
+    replica_retirement_journal_locks: [256]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 256,
+    active_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    // A recovery lease is group-scoped. Directory scans and ownership probes
+    // never hold the intent mutex, so a slow replica cannot convoy unrelated
+    // topology commits while duplicate recovery of the same group is fenced.
+    recovering_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    // Protected by table_activity_mutex. A retirement is rare topology work;
+    // this set fences new group activity while current leases drain.
+    retiring_replica_groups: std.AutoHashMapUnmanaged(u64, ?[]u8) = .empty,
     restore_repair_work_group: Io.Group = .init,
     restore_repair_shutdown: std.atomic.Value(bool) = .init(false),
     restore_repair_completion_mutex: Io.Mutex = .init,
@@ -5935,7 +7758,7 @@ pub const ProvisionedTableWriteSource = struct {
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
     startup_catch_up_backoff_alloc: std.mem.Allocator = std.heap.page_allocator,
-    quiesced: bool = false,
+    lifecycle: std.atomic.Value(Lifecycle) = .init(.open),
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
     kernel_bulk_sessions: std.ArrayListUnmanaged(KernelBulkSession) = .empty,
@@ -5943,6 +7766,12 @@ pub const ProvisionedTableWriteSource = struct {
     // this node-local generation before observing status and may retire only
     // that exact edge, including across activity-entry prune/recreate (ABA).
     next_repair_handoff_generation: u64 = 1,
+
+    const Lifecycle = enum(u8) {
+        open,
+        closing,
+        closed,
+    };
 
     const TableActivity = struct {
         // Owned by active_table_activities; entries must be created via activityEntryLocked.
@@ -6603,7 +8432,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) StorageOwnerTransactionRecoveryOptions {
         if (comptime control_only_storage_sources) {
             const backend_runtime = self.backend_runtime orelse return .{};
-            if (backend_runtime.io() == null or self.quiesced) return .{};
+            if (backend_runtime.io() == null or !self.isOpen()) return .{};
             const replicated = self.raft_batcher != null;
             return .{
                 .enabled = true,
@@ -6666,7 +8495,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
         const backend_runtime = self.backend_runtime orelse return .{};
-        if (backend_runtime.io() == null or self.quiesced) return .{};
+        if (backend_runtime.io() == null or !self.isOpen()) return .{};
         const replicated = self.raft_batcher != null;
         return .{
             .enabled = true,
@@ -6699,7 +8528,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const ref = distributed_txn.parseParticipantRef(participant) orelse return error.InvalidParticipant;
-        if (self.quiesced) return error.Canceled;
+        if (!self.isOpen()) return error.Canceled;
         const alloc = std.heap.page_allocator;
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
@@ -6798,6 +8627,36 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withReplicaRetirementOwnership(
+        self: *ProvisionedTableWriteSource,
+        ownership: ?ReplicaRetirementOwnership,
+    ) *ProvisionedTableWriteSource {
+        lockAtomic(&self.replica_retirement_ownership_mutex);
+        self.replica_retirement_ownership = ownership;
+        self.replica_retirement_ownership_mutex.unlock();
+        // The general cleanup worker can race source construction and scan
+        // before the live Raft host is attached. Scan synchronously when the
+        // fail-closed proof becomes available; merely scheduling could coalesce
+        // with the proof-less scan and strand an intent until another event.
+        if (ownership != null) {
+            const retry_required = self.recoverReplicaRetirementIntents(std.heap.page_allocator) catch |err| blk: {
+                std.log.warn("replica-retirement ownership attachment recovery deferred root={s} err={s}", .{
+                    self.replica_root_dir,
+                    @errorName(err),
+                });
+                break :blk true;
+            };
+            if (retry_required) self.scheduleDroppedTableRecoveryRetry();
+        }
+        return self;
+    }
+
+    fn replicaRetirementOwnershipSnapshot(self: *ProvisionedTableWriteSource) ?ReplicaRetirementOwnership {
+        lockAtomic(&self.replica_retirement_ownership_mutex);
+        defer self.replica_retirement_ownership_mutex.unlock();
+        return self.replica_retirement_ownership;
+    }
+
     pub fn withCreateTableWriterSeeding(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
         self.seed_create_table_writers = enabled;
         return self;
@@ -6841,7 +8700,7 @@ pub const ProvisionedTableWriteSource = struct {
             )) orelse return error.StorageKernelOwnerUnavailable;
             switch (result.state) {
                 .complete => {},
-                .repair_pending, .busy => return error.StorageKernelReconcilePending,
+                .repair_pending, .restore_repair_pending, .busy => return error.StorageKernelReconcilePending,
                 .degraded => return error.StorageKernelReconcileDegraded,
             }
         }
@@ -6853,9 +8712,22 @@ pub const ProvisionedTableWriteSource = struct {
     /// pointers are borrowed, so a standalone source must remain safe to
     /// destroy after its optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
-        if (self.quiesced) return;
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        if (self.lifecycle.load(.acquire) != .open) {
+            self.dropped_table_job_owner_mutex.unlock();
+            return;
+        }
+        // Close admission before observing the owner id. A scheduler either
+        // completes its submission under this mutex and is drained below, or
+        // observes `.closing` and cannot retain `self` in a new job.
+        self.lifecycle.store(.closing, .release);
+        const dropped_table_owner_id = self.dropped_table_delete_owner_id;
+        self.dropped_table_job_owner_mutex.unlock();
+        if (dropped_table_owner_id != 0) {
+            if (self.backend_runtime) |runtime|
+                runtime.durable_jobs.closeOwner(dropped_table_owner_id);
+        }
         self.abortAllKernelBulkSessions();
-        self.closeDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
@@ -6871,8 +8743,20 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |*entry| entry.deinit();
         self.active_table_activities.deinit(std.heap.page_allocator);
         self.active_table_activities = .empty;
+        var retiring_groups = self.retiring_replica_groups.valueIterator();
+        while (retiring_groups.next()) |table_name| {
+            if (table_name.*) |name| std.heap.page_allocator.free(name);
+        }
+        self.retiring_replica_groups.deinit(std.heap.page_allocator);
+        self.retiring_replica_groups = .empty;
         self.table_activity_mutex.unlock(io);
-        self.quiesced = true;
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        self.active_replica_retirement_intents.deinit(std.heap.page_allocator);
+        self.active_replica_retirement_intents = .empty;
+        self.recovering_replica_retirement_intents.deinit(std.heap.page_allocator);
+        self.recovering_replica_retirement_intents = .empty;
+        self.replica_retirement_intent_mutex.unlock();
+        self.lifecycle.store(.closed, .release);
     }
 
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
@@ -7036,7 +8920,29 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
+    fn isOpen(self: *const ProvisionedTableWriteSource) bool {
+        return self.lifecycle.load(.acquire) == .open;
+    }
+
+    /// The lifecycle mutex is an admission gate, not just owner-id storage.
+    /// Holding it through `submit` establishes a total order with quiesce:
+    /// every accepted job belongs to the owner quiesce closes and drains.
+    fn submitDroppedTableJob(
+        self: *ProvisionedTableWriteSource,
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        input_job: db_mod.background_runtime.Job,
+    ) !void {
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        defer self.dropped_table_job_owner_mutex.unlock();
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        if (consumeTestDroppedTableJobSubmitFailure()) return error.TestDroppedTableJobSubmitFailure;
+        const owner_id = try self.droppedTableDeleteOwnerIdLocked(runtime);
+        var job = input_job;
+        job.owner_id = owner_id;
+        try runtime.durable_jobs.submit(job);
+    }
+
+    fn droppedTableDeleteOwnerIdLocked(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
             self.dropped_table_delete_owner_id = try runtime.allocOwnerId();
         }
@@ -7044,17 +8950,884 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn drainDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
-        if (self.dropped_table_delete_owner_id == 0) return;
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        const owner_id = self.dropped_table_delete_owner_id;
+        self.dropped_table_job_owner_mutex.unlock();
+        if (owner_id == 0) return;
         if (self.backend_runtime) |runtime| {
-            runtime.durable_jobs.drainOwner(self.dropped_table_delete_owner_id);
+            runtime.durable_jobs.drainOwner(owner_id);
         }
     }
 
-    fn closeDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
-        if (self.dropped_table_delete_owner_id == 0) return;
-        if (self.backend_runtime) |runtime| {
-            runtime.durable_jobs.closeOwner(self.dropped_table_delete_owner_id);
+    fn removeDroppedTableRepairIntent(path: []const u8) !void {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        try removeDroppedTableRepairIntentWithIo(io_impl.io(), path);
+    }
+
+    fn removeDroppedTableRepairIntentWithIo(io: std.Io, path: []const u8) !void {
+        std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+    }
+
+    fn recoverDroppedTableTrash(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
+        const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(trash_dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trash_dir_path, entry.name });
+            if (self.scheduleDroppedGroupDelete(path) catch false) {
+                alloc.free(path);
+            } else {
+                defer alloc.free(path);
+                DroppedTableDeleteWork.deletePath(path) catch |delete_err| {
+                    std.log.warn("dropped-table trash recovery deferred path={s} err={s}", .{ path, @errorName(delete_err) });
+                    retry_required = true;
+                };
+            }
         }
+        return retry_required;
+    }
+
+    fn recoverDroppedTableRepairIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
+        const repair_dir_path = try droppedTableRepairDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(repair_dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, repair_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repair_dir_path, entry.name });
+            defer alloc.free(path);
+            var intent = loadDroppedTableRepairIntent(alloc, io, path) catch |err| {
+                if (err == error.InvalidDropRepairIntent) {
+                    quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "drop-repair") catch |quarantine_err| {
+                        std.log.err("invalid dropped-table repair intent quarantine deferred path={s} err={s}", .{ path, @errorName(quarantine_err) });
+                        retry_required = true;
+                        continue;
+                    };
+                    // The corrupt input is no longer on the live recovery
+                    // path and remains visible through the quarantine metric.
+                    // Reserve error severity for a quarantine that failed.
+                    std.log.warn("invalid dropped-table repair intent quarantined path={s}", .{path});
+                    continue;
+                }
+                std.log.warn("dropped-table repair intent read deferred path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            defer intent.deinit(alloc);
+            self.executeDroppedTableCleanup(alloc, intent.table_name, .{
+                .table_id = intent.table_id,
+                .expected_transition_generation = intent.expected_transition_generation,
+                .group_ids = intent.group_ids,
+            }, true) catch |err| {
+                std.log.warn("dropped-table repair deferred table={s} path={s} err={s}", .{ intent.table_name, path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            removeDroppedTableRepairIntent(path) catch |err| {
+                std.log.warn("completed dropped-table repair intent retained path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
+            };
+        }
+        return retry_required;
+    }
+
+    fn executeReplicaRetirementCleanup(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: ?[]const u8,
+    ) !void {
+        try self.beginReplicaRetirementActivity(group_id, table_name);
+        var retirement_active = true;
+        errdefer if (retirement_active) self.endReplicaRetirementActivity(group_id);
+
+        var read_cache_exclusive = try self.beginReadCacheGroupExclusive(group_id);
+        var read_cache_exclusive_active = read_cache_exclusive != null;
+        errdefer if (read_cache_exclusive_active) if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+
+        lockAtomic(&self.local_db_mutex);
+        var local_db_mutex_held = true;
+        errdefer {
+            if (local_db_mutex_held) self.local_db_mutex.unlock();
+            self.drainWriteCachePendingClosesForGroup(group_id);
+        }
+        if (self.write_cache) |cache| try cache.invalidateGroup(group_id);
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache == null or cache != self.write_cache.?) {
+                try cache.invalidateGroup(group_id);
+            }
+        }
+        self.local_db_mutex.unlock();
+        local_db_mutex_held = false;
+        self.drainWriteCachePendingClosesForGroup(group_id);
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        self.invalidateSharedPathCaches(path);
+        const trash_path = try moveRetiredReplicaPathToTrash(alloc, self.replica_root_dir, group_id);
+
+        // The atomic rename is the logical deletion boundary. Release cache
+        // and activity reservations before potentially slow recursive I/O;
+        // background deletion is idempotent and recovery scans the trash dir.
+        if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        read_cache_exclusive_active = false;
+        self.endReplicaRetirementActivity(group_id);
+        retirement_active = false;
+        if (trash_path) |owned_path| try self.deleteDroppedGroupPath(alloc, owned_path);
+    }
+
+    fn recoverReplicaRetirementBatch(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        dir_path: []const u8,
+        path: []const u8,
+        ownership: ReplicaRetirementOwnership,
+    ) !bool {
+        var loaded_batch = try loadReplicaRetirementBatch(alloc, io, path);
+        defer loaded_batch.deinit(alloc);
+
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        var claimed: usize = 0;
+        const recovery_claimed = claimed_batch: {
+            for (loaded_batch.intents) |intent| {
+                if (self.active_replica_retirement_intents.contains(intent.group_id) or
+                    self.recovering_replica_retirement_intents.contains(intent.group_id))
+                {
+                    break :claimed_batch false;
+                }
+            }
+            self.recovering_replica_retirement_intents.ensureUnusedCapacity(
+                std.heap.page_allocator,
+                std.math.cast(u32, loaded_batch.intents.len) orelse {
+                    self.replica_retirement_intent_mutex.unlock();
+                    return error.ReplicaRetirementBatchTooLarge;
+                },
+            ) catch |err| {
+                self.replica_retirement_intent_mutex.unlock();
+                return err;
+            };
+            for (loaded_batch.intents) |intent| {
+                self.recovering_replica_retirement_intents.putAssumeCapacity(intent.group_id, {});
+                claimed += 1;
+            }
+            break :claimed_batch true;
+        };
+        self.replica_retirement_intent_mutex.unlock();
+        if (!recovery_claimed) return false;
+        defer {
+            lockAtomic(&self.replica_retirement_intent_mutex);
+            for (loaded_batch.intents[0..claimed]) |intent| {
+                const removed = self.recovering_replica_retirement_intents.remove(intent.group_id);
+                std.debug.assert(removed);
+            }
+            self.replica_retirement_intent_mutex.unlock();
+        }
+
+        const states = try alloc.alloc(ReplicaRetirementOwnership.State, loaded_batch.intents.len);
+        defer alloc.free(states);
+        var has_committed_removal = false;
+        for (loaded_batch.intents, states) |intent, *state| {
+            state.* = ownership.state(intent.group_id) catch |err| {
+                std.log.warn("replica-retirement batch ownership classification deferred group_id={d} path={s} err={s}", .{
+                    intent.group_id,
+                    path,
+                    @errorName(err),
+                });
+                return true;
+            };
+            has_committed_removal = has_committed_removal or state.* != .retained;
+        }
+
+        // Catalog ownership is authoritative for the commit crash window.
+        // Promote the complete batch once, never one sidecar per replica.
+        if (has_committed_removal and loaded_batch.phase != .committed) {
+            writeReplicaRetirementBatch(alloc, io, dir_path, path, loaded_batch.intents, .committed) catch |err| {
+                std.log.warn("replica-retirement batch commit marker deferred path={s} err={s}", .{ path, @errorName(err) });
+                return true;
+            };
+            loaded_batch.phase = .committed;
+        }
+
+        var retry_required = false;
+        for (loaded_batch.intents, states) |intent, state| switch (state) {
+            .retained => {},
+            .retiring => retry_required = true,
+            .retired => self.executeReplicaRetirementCleanup(alloc, intent.group_id, intent.table_name) catch |err| {
+                std.log.warn("replica retirement batch cleanup deferred group_id={d} path={s} err={s}", .{
+                    intent.group_id,
+                    path,
+                    @errorName(err),
+                });
+                retry_required = true;
+            },
+        };
+        if (retry_required) return true;
+        removeDroppedTableRepairIntent(path) catch |err| {
+            std.log.warn("completed replica-retirement batch retained path={s} err={s}", .{ path, @errorName(err) });
+            return true;
+        };
+        return false;
+    }
+
+    fn recoverReplicaRetirementIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
+        const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
+        const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name });
+            defer alloc.free(path);
+            if (std.mem.startsWith(u8, entry.name, replica_retirement_batch_prefix)) {
+                // The journal stripe is the per-batch coordinator. Recovery,
+                // preparation, cancellation, and completion all acquire it
+                // before changing holder state, so no operation can act on a
+                // holder observation from an earlier journal epoch.
+                const journal_lock = self.replicaRetirementJournalLock(path);
+                lockAtomic(journal_lock);
+                defer journal_lock.unlock();
+                const batch_retry = self.recoverReplicaRetirementBatch(alloc, io, dir_path, path, ownership) catch |err| {
+                    if (err == error.InvalidReplicaRetirementIntent) {
+                        quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "replica-retirement-batch") catch |quarantine_err| {
+                            std.log.err("invalid replica-retirement batch quarantine deferred path={s} err={s}", .{ path, @errorName(quarantine_err) });
+                            retry_required = true;
+                            continue;
+                        };
+                        std.log.warn("invalid replica-retirement batch quarantined path={s}", .{path});
+                        continue;
+                    }
+                    std.log.warn("replica-retirement batch recovery deferred path={s} err={s}", .{ path, @errorName(err) });
+                    retry_required = true;
+                    continue;
+                };
+                retry_required = retry_required or batch_retry;
+                continue;
+            }
+            var intent = loadReplicaRetirementIntent(alloc, io, path) catch |err| {
+                if (err == error.InvalidReplicaRetirementIntent) {
+                    quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "replica-retirement") catch |quarantine_err| {
+                        std.log.err("invalid replica-retirement intent quarantine deferred path={s} err={s}", .{ path, @errorName(quarantine_err) });
+                        retry_required = true;
+                        continue;
+                    };
+                    std.log.warn("invalid replica-retirement intent quarantined path={s}", .{path});
+                    continue;
+                }
+                std.log.warn("replica-retirement intent read deferred path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            defer intent.deinit(alloc);
+            const group_id = intent.group_id;
+            lockAtomic(&self.replica_retirement_intent_mutex);
+            const recovery_claimed = claimed: {
+                if (self.active_replica_retirement_intents.contains(group_id) or
+                    self.recovering_replica_retirement_intents.contains(group_id))
+                {
+                    break :claimed false;
+                }
+                self.recovering_replica_retirement_intents.put(
+                    std.heap.page_allocator,
+                    group_id,
+                    {},
+                ) catch |err| {
+                    self.replica_retirement_intent_mutex.unlock();
+                    return err;
+                };
+                break :claimed true;
+            };
+            self.replica_retirement_intent_mutex.unlock();
+            if (!recovery_claimed) continue;
+            defer {
+                lockAtomic(&self.replica_retirement_intent_mutex);
+                const removed = self.recovering_replica_retirement_intents.remove(group_id);
+                std.debug.assert(removed);
+                self.replica_retirement_intent_mutex.unlock();
+            }
+            const state = ownership.state(group_id) catch |err| {
+                std.log.warn("replica-retirement ownership classification deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            // A retained catalog record proves that the removal CAS never
+            // committed. Retire only the orphaned journal, never the replica.
+            if (state == .retained) {
+                removeDroppedTableRepairIntent(path) catch |err| {
+                    std.log.warn("aborted replica-retirement intent retained group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                    retry_required = true;
+                };
+                continue;
+            }
+            // Promotion repairs the crash window between the atomic catalog
+            // commit and journal phase update. V1 records are upgraded here.
+            if (intent.phase != .committed or intent.legacy) {
+                writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, intent.table_name, .committed, true) catch |err| {
+                    std.log.warn("replica-retirement commit marker deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                    retry_required = true;
+                    continue;
+                };
+            }
+            if (state == .retiring) {
+                retry_required = true;
+                continue;
+            }
+            self.executeReplicaRetirementCleanup(alloc, group_id, intent.table_name) catch |err| {
+                std.log.warn("replica retirement deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            removeDroppedTableRepairIntent(path) catch |err| {
+                std.log.warn("completed replica-retirement intent retained group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
+            };
+        }
+        return retry_required;
+    }
+
+    fn replicaRetirementJournalLock(self: *ProvisionedTableWriteSource, path: []const u8) *std.atomic.Mutex {
+        const index: usize = @intCast(std.hash.Wyhash.hash(0, path) % self.replica_retirement_journal_locks.len);
+        return &self.replica_retirement_journal_locks[index];
+    }
+
+    fn releaseActiveReplicaRetirementIntents(
+        self: *ProvisionedTableWriteSource,
+        intents: []const PersistedReplicaRetirementIntent,
+    ) bool {
+        var any_active = false;
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        defer self.replica_retirement_intent_mutex.unlock();
+        for (intents) |intent| {
+            const active = self.active_replica_retirement_intents.getPtr(intent.group_id) orelse continue;
+            std.debug.assert(active.* > 0);
+            active.* -= 1;
+            if (active.* == 0) {
+                _ = self.active_replica_retirement_intents.remove(intent.group_id);
+            } else {
+                any_active = true;
+            }
+        }
+        return any_active;
+    }
+
+    pub fn prepareReplicaRetirements(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        targets: []const ReplicaRetirementTarget,
+    ) !PreparedReplicaRetirements {
+        try preflightReplicaRetirementBatch(targets);
+        if (targets.len == 0) return .{
+            .alloc = alloc,
+            .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
+        };
+
+        // Clone and canonicalize caller memory before reserving any shared
+        // state. The short ownership phase below contains no filesystem work.
+        const intents = try alloc.alloc(PersistedReplicaRetirementIntent, targets.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (intents[0..initialized]) |intent| {
+                var owned_intent = intent;
+                owned_intent.deinit(alloc);
+            }
+            alloc.free(intents);
+        }
+        for (targets, intents) |target, *intent| {
+            const name = if (target.table_name) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (name) |value| alloc.free(value);
+            intent.* = .{
+                .group_id = target.group_id,
+                .table_name = name,
+                // The shared path is owned once by PreparedReplicaRetirements.
+                .path = try alloc.alloc(u8, 0),
+                .created = false,
+            };
+            initialized += 1;
+        }
+        std.mem.sort(PersistedReplicaRetirementIntent, intents, {}, replicaRetirementIntentLessThan);
+        for (intents[1..], intents[0 .. intents.len - 1]) |intent, previous| {
+            if (intent.group_id == previous.group_id)
+                return error.DuplicateReplicaRetirementTarget;
+        }
+
+        const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(dir_path);
+        const batch_path = try replicaRetirementBatchPath(alloc, self.replica_root_dir, intents);
+        errdefer alloc.free(batch_path);
+
+        // Lock hierarchy: journal stripe -> ownership mutex. The stripe is a
+        // keyed lease for this canonical batch; holder admission and durable
+        // phase publication are one serializable operation without imposing a
+        // process-wide filesystem lock on unrelated batches.
+        const journal_lock = self.replicaRetirementJournalLock(batch_path);
+        lockAtomic(journal_lock);
+        defer journal_lock.unlock();
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        for (intents) |intent| {
+            if (self.recovering_replica_retirement_intents.contains(intent.group_id)) {
+                self.replica_retirement_intent_mutex.unlock();
+                return error.ReplicaRetirementRecoveryInProgress;
+            }
+        }
+        self.active_replica_retirement_intents.ensureUnusedCapacity(
+            std.heap.page_allocator,
+            std.math.cast(u32, intents.len) orelse {
+                self.replica_retirement_intent_mutex.unlock();
+                return error.ReplicaRetirementBatchTooLarge;
+            },
+        ) catch |err| {
+            self.replica_retirement_intent_mutex.unlock();
+            return err;
+        };
+        for (intents) |intent| {
+            const active = self.active_replica_retirement_intents.getOrPutAssumeCapacity(intent.group_id);
+            if (!active.found_existing) active.value_ptr.* = 0;
+            active.value_ptr.* += 1;
+        }
+        self.replica_retirement_intent_mutex.unlock();
+        errdefer _ = self.releaseActiveReplicaRetirementIntents(intents);
+
+        // Active claims keep recovery from classifying the record. The keyed
+        // lease remains held until the prepared phase is fully durable.
+        const io = self.table_activity_threaded.io();
+        try fs_paths.createDirPathPortable(io, dir_path);
+        var batch_created = false;
+        if (std.Io.Dir.cwd().access(io, batch_path, .{})) |_| {
+            var persisted = try loadReplicaRetirementBatch(alloc, io, batch_path);
+            defer persisted.deinit(alloc);
+            if (persisted.intents.len != intents.len)
+                return error.InvalidReplicaRetirementIntent;
+            for (persisted.intents, intents) |stored, requested| {
+                if (stored.group_id != requested.group_id or
+                    !optionalBytesEqual(stored.table_name, requested.table_name))
+                    return error.InvalidReplicaRetirementIntent;
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                try writeReplicaRetirementBatch(alloc, io, dir_path, batch_path, intents, .prepared);
+                batch_created = true;
+            },
+            else => return err,
+        }
+        return .{
+            .alloc = alloc,
+            .intents = intents,
+            .batch_path = batch_path,
+            .batch_created = batch_created,
+        };
+    }
+
+    pub fn cancelPreparedReplicaRetirements(
+        self: *ProvisionedTableWriteSource,
+        prepared: *const PreparedReplicaRetirements,
+    ) void {
+        var recovery_required = false;
+        const io = self.table_activity_threaded.io();
+        if (prepared.batch_path == null) {
+            _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+        }
+        if (prepared.batch_path == null) for (prepared.intents) |intent| {
+            // A pre-existing record may belong to an earlier committed
+            // retirement. This failed preparation did not create it and must
+            // not cancel its recovery ownership.
+            if (!intent.created) {
+                recovery_required = true;
+                continue;
+            }
+            removeDroppedTableRepairIntentWithIo(io, intent.path) catch |err| {
+                std.log.warn("uncommitted replica-retirement intent retained path={s} err={s}", .{ intent.path, @errorName(err) });
+                recovery_required = true;
+            };
+        };
+        if (prepared.batch_path) |path| batch_cancel: {
+            // Release the holder and decide journal ownership under the same
+            // keyed lease. A new prepare cannot reserve this batch between the
+            // observation and deletion.
+            const journal_lock = self.replicaRetirementJournalLock(path);
+            lockAtomic(journal_lock);
+            defer journal_lock.unlock();
+            const any_active = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+            if (any_active) break :batch_cancel;
+            if (!prepared.batch_created) {
+                recovery_required = true;
+                break :batch_cancel;
+            }
+            // Another holder may have committed this shared batch before the
+            // creator cancelled. Never erase a committed recovery proof.
+            var loaded_batch = loadReplicaRetirementBatch(prepared.alloc, io, path) catch |err| {
+                std.log.warn("uncommitted replica-retirement batch inspection deferred path={s} err={s}", .{ path, @errorName(err) });
+                recovery_required = true;
+                break :batch_cancel;
+            };
+            defer loaded_batch.deinit(prepared.alloc);
+            if (loaded_batch.phase == .committed) {
+                recovery_required = true;
+                break :batch_cancel;
+            }
+            removeDroppedTableRepairIntentWithIo(io, path) catch |err| {
+                std.log.warn("uncommitted replica-retirement batch retained path={s} err={s}", .{ path, @errorName(err) });
+                recovery_required = true;
+            };
+        }
+        if (recovery_required and self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+    }
+
+    pub fn completePreparedReplicaRetirements(
+        self: *ProvisionedTableWriteSource,
+        prepared: *const PreparedReplicaRetirements,
+    ) !void {
+        var first_error: ?anyerror = null;
+
+        // Keep the batch epoch stable through both durable phase publication
+        // and holder release. A waiter may begin immediately after unlock, but
+        // it can only observe the new committed phase and post-release holder
+        // state together.
+        const batch_journal_lock = if (prepared.batch_path) |path|
+            self.replicaRetirementJournalLock(path)
+        else
+            null;
+        var batch_journal_lock_held = false;
+        if (batch_journal_lock) |journal_lock| {
+            lockAtomic(journal_lock);
+            batch_journal_lock_held = true;
+        }
+        defer if (batch_journal_lock_held) batch_journal_lock.?.unlock();
+
+        // Publish the committed phase while the active claims still fence
+        // recovery, but never hold the ownership mutex across allocation,
+        // filesystem access, or fsync.
+        const dir_path = replicaRetirementDirPath(prepared.alloc, self.replica_root_dir) catch |err| blk: {
+            first_error = err;
+            break :blk null;
+        };
+        defer if (dir_path) |path| prepared.alloc.free(path);
+        const io = self.table_activity_threaded.io();
+        var directory_dirty = false;
+        if (prepared.batch_path) |path| {
+            if (dir_path) |directory| {
+                writeReplicaRetirementBatch(
+                    prepared.alloc,
+                    io,
+                    directory,
+                    path,
+                    prepared.intents,
+                    .committed,
+                ) catch |err| {
+                    first_error = first_error orelse err;
+                };
+            }
+        }
+        for (prepared.intents) |intent| {
+            if (prepared.batch_path == null) if (dir_path) |path| {
+                const wrote = wrote: {
+                    const journal_lock = self.replicaRetirementJournalLock(intent.path);
+                    lockAtomic(journal_lock);
+                    defer journal_lock.unlock();
+                    writeReplicaRetirementIntent(
+                        prepared.alloc,
+                        io,
+                        path,
+                        intent.path,
+                        intent.group_id,
+                        intent.table_name,
+                        .committed,
+                        false,
+                    ) catch |err| {
+                        first_error = first_error orelse err;
+                        break :wrote false;
+                    };
+                    break :wrote true;
+                };
+                directory_dirty = directory_dirty or wrote;
+            };
+        }
+        if (directory_dirty) {
+            if (dir_path) |path| fs_paths.syncDirPortable(io, path) catch |err| {
+                first_error = first_error orelse err;
+            };
+        }
+        _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+        // Recovery may execute inline for standalone/manual runtimes and
+        // reacquire this batch lease. Publish holder release before dropping
+        // the lease, then schedule only after the coordinator is unlocked.
+        if (batch_journal_lock_held) {
+            batch_journal_lock.?.unlock();
+            batch_journal_lock_held = false;
+        }
+
+        // Catalog removal and the committed sidecar are the synchronous
+        // durability boundary. Cache drains, exclusive read-cache waits,
+        // renames, and recursive deletion belong to the source-owned durable
+        // cleanup lane so metadata reconciliation latency is O(1) in the
+        // number of removed replicas. Standalone/test sources intentionally
+        // retain the existing inline fallback when no runtime is attached.
+        self.scheduleDroppedTableRecovery();
+        if (first_error) |err| return err;
+    }
+
+    pub fn requestReplicaRetirementRecovery(self: *ProvisionedTableWriteSource) void {
+        self.scheduleDroppedTableRecovery();
+    }
+
+    /// Start the one-time recovery scan only after this source has reached a
+    /// stable owner address. `source()` is also used to publish short-lived
+    /// adapters (for example by metadata CDC workers), so it must remain a
+    /// side-effect-free ABI conversion and must never enqueue work that
+    /// captures the adapter's backing pointer.
+    pub fn startDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (self.local_write_owner) |owner| return owner.startDroppedTableRecovery();
+        if (!self.dropped_table_recovery_started.swap(true, .acq_rel)) {
+            self.scheduleDroppedTableRecovery();
+            return;
+        }
+        self.maintainDroppedTableRecovery();
+    }
+
+    /// Re-establishes the worker invariant for durable cleanup debt. This is
+    /// safe to call from a periodic control loop and performs no allocation
+    /// when there is no pending epoch or another worker owns the lane.
+    pub fn maintainDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (self.local_write_owner) |owner| return owner.maintainDroppedTableRecovery();
+        if (!self.isOpen()) return;
+        const requested = self.dropped_table_recovery_requested.load(.acquire);
+        const completed = self.dropped_table_recovery_completed.load(.acquire);
+        if (requested == completed) return;
+        if (self.dropped_table_recovery_retry_scheduled.load(.acquire)) return;
+        self.ensureDroppedTableRecoveryScheduled();
+    }
+
+    pub fn droppedTableRecoveryStatus(self: *const ProvisionedTableWriteSource) DroppedTableRecoveryStatus {
+        const requested = self.dropped_table_recovery_requested.load(.acquire);
+        const completed = self.dropped_table_recovery_completed.load(.acquire);
+        return .{
+            .pending_epochs = requested -| completed,
+            .worker_scheduled = self.dropped_table_recovery_scheduled.load(.acquire),
+            .retry_scheduled = self.dropped_table_recovery_retry_scheduled.load(.acquire),
+            .consecutive_recovery_failures = self.dropped_table_recovery_retry_failures.load(.acquire),
+            .consecutive_enqueue_failures = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire),
+            .enqueue_failures = self.dropped_table_recovery_enqueue_failures.load(.acquire),
+        };
+    }
+
+    fn recordDroppedTableRecoveryEnqueueFailure(
+        self: *ProvisionedTableWriteSource,
+        operation: []const u8,
+        err: ?anyerror,
+    ) void {
+        _ = self.dropped_table_recovery_enqueue_failures.fetchAdd(1, .monotonic);
+        const streak = self.dropped_table_recovery_enqueue_failure_streak.fetchAdd(1, .monotonic) +| 1;
+        // The control-loop watchdog deliberately retries persistent resource
+        // failures. Log the first and powers of two so operators retain a
+        // useful signal without a 100 ms failure turning into a log storm.
+        if (streak != 1 and (streak & (streak - 1)) != 0) return;
+        if (err) |cause| {
+            std.log.warn("dropped-table recovery {s} deferred root={s} consecutive_failures={d} err={s}", .{ operation, self.replica_root_dir, streak, @errorName(cause) });
+        } else {
+            std.log.warn("dropped-table recovery {s} deferred root={s} consecutive_failures={d}", .{ operation, self.replica_root_dir, streak });
+        }
+    }
+
+    fn runDroppedTableRecovery(self: *ProvisionedTableWriteSource) bool {
+        const alloc = std.heap.page_allocator;
+        var retry_required = self.recoverDroppedTableRepairIntents(alloc) catch |err| blk: {
+            std.log.warn("dropped-table intent recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            break :blk true;
+        };
+        retry_required = (self.recoverDroppedTableTrash(alloc) catch |err| blk: {
+            std.log.warn("dropped-table trash recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            break :blk true;
+        }) or retry_required;
+        retry_required = (self.recoverReplicaRetirementIntents(alloc) catch |err| blk: {
+            std.log.warn("replica-retirement recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            break :blk true;
+        }) or retry_required;
+        const quarantined = countRecoveryQuarantineIntents(alloc, self.replica_root_dir) catch |err| blk: {
+            std.log.warn("recovery quarantine scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            retry_required = true;
+            break :blk self.quarantined_recovery_intents.load(.acquire);
+        };
+        self.quarantined_recovery_intents.store(quarantined, .release);
+        if (builtin.is_test) {
+            if (test_dropped_table_recovery_pass_hook) |hook| hook.run(hook.ptr);
+        }
+        return retry_required;
+    }
+
+    fn drainDroppedTableRecoveryRequests(self: *ProvisionedTableWriteSource) void {
+        while (true) {
+            const observed_epoch = self.dropped_table_recovery_requested.load(.acquire);
+            const retry_required = self.runDroppedTableRecovery();
+            if (self.dropped_table_recovery_requested.load(.acquire) != observed_epoch)
+                continue;
+
+            // Publish completion while this worker still owns the scheduled
+            // bit. A successor can then only advance this monotonic watermark;
+            // an older worker can never overwrite newer completion.
+            if (!retry_required) {
+                self.dropped_table_recovery_completed.store(observed_epoch, .release);
+            }
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            if (self.dropped_table_recovery_requested.load(.acquire) == observed_epoch) {
+                if (retry_required) {
+                    self.scheduleDroppedTableRecoveryRetry();
+                } else {
+                    self.dropped_table_recovery_retry_failures.store(0, .release);
+                }
+                return;
+            }
+            // A requester can race between the equality check and ownership
+            // release. It either installed a successor or left the lane for
+            // this worker to reclaim; both cases have exactly one owner.
+            if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel))
+                return;
+        }
+    }
+
+    fn scheduleDroppedTableRecoveryRetry(self: *ProvisionedTableWriteSource) void {
+        if (!self.isOpen()) return;
+        if (self.dropped_table_recovery_retry_scheduled.swap(true, .acq_rel)) return;
+        const runtime = self.backend_runtime orelse {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            return;
+        };
+        // Manual runtimes execute durable submissions recursively on the
+        // caller's stack. A persistent filesystem failure must remain as
+        // durable trash for the next explicit poll/reopen instead of turning
+        // the retry chain into unbounded recursion.
+        if (runtime.durable_jobs.executesInline()) {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            return;
+        }
+        const RetryWork = struct {
+            source: *ProvisionedTableWriteSource,
+
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                const failure = work.source.dropped_table_recovery_retry_failures.fetchAdd(1, .acq_rel);
+                const shift: u5 = @intCast(@min(failure, 4));
+                const delay_ms: u64 = @as(u64, 100) << shift;
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
+                work.source.dropped_table_recovery_retry_scheduled.store(false, .release);
+                work.source.maintainDroppedTableRecovery();
+            }
+
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = std.heap.page_allocator.create(RetryWork) catch {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("retry allocation", null);
+            return;
+        };
+        work.* = .{ .source = self };
+        const enqueue_streak = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire);
+        self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
+            .class = .cleanup,
+            .ptr = work,
+            .run = RetryWork.run,
+            .deinit = RetryWork.deinit,
+        }) catch |err| {
+            std.heap.page_allocator.destroy(work);
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("retry enqueue", err);
+            return;
+        };
+        _ = self.dropped_table_recovery_enqueue_failure_streak.cmpxchgStrong(
+            enqueue_streak,
+            0,
+            .release,
+            .monotonic,
+        );
+    }
+
+    fn scheduleDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (!self.isOpen()) return;
+        _ = self.dropped_table_recovery_requested.fetchAdd(1, .release);
+        self.ensureDroppedTableRecoveryScheduled();
+    }
+
+    fn ensureDroppedTableRecoveryScheduled(self: *ProvisionedTableWriteSource) void {
+        if (!self.isOpen()) return;
+        if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel)) return;
+        const runtime = self.backend_runtime orelse {
+            self.drainDroppedTableRecoveryRequests();
+            return;
+        };
+        const Work = struct {
+            source: *ProvisionedTableWriteSource,
+
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                work.source.drainDroppedTableRecoveryRequests();
+            }
+
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = std.heap.page_allocator.create(Work) catch {
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("allocation", null);
+            return;
+        };
+        work.* = .{ .source = self };
+        const enqueue_streak = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire);
+        self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
+            .class = .cleanup,
+            .ptr = work,
+            .run = Work.run,
+            .deinit = Work.deinit,
+        }) catch |err| {
+            std.heap.page_allocator.destroy(work);
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("enqueue", err);
+            return;
+        };
+        _ = self.dropped_table_recovery_enqueue_failure_streak.cmpxchgStrong(
+            enqueue_streak,
+            0,
+            .release,
+            .monotonic,
+        );
     }
 
     fn scheduleDroppedGroupDelete(self: *ProvisionedTableWriteSource, path: []const u8) !bool {
@@ -7063,9 +9836,9 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer std.heap.page_allocator.destroy(work);
         const owned_path = try std.heap.page_allocator.dupe(u8, path);
         errdefer std.heap.page_allocator.free(owned_path);
-        work.* = .{ .path = owned_path };
-        try runtime.durable_jobs.submit(.{
-            .owner_id = try self.droppedTableDeleteOwnerId(runtime),
+        work.* = .{ .path = owned_path, .recovery_source = self };
+        try self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = DroppedTableDeleteWork.run,
@@ -7077,7 +9850,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn deleteDroppedGroupPath(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, path: []u8) !void {
         defer alloc.free(path);
         if (self.scheduleDroppedGroupDelete(path) catch false) return;
-        try DroppedTableDeleteWork.deletePath(path, false);
+        try DroppedTableDeleteWork.deletePath(path);
     }
 
     fn findTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) ?usize {
@@ -7087,6 +9860,71 @@ pub const ProvisionedTableWriteSource = struct {
             return i;
         }
         return null;
+    }
+
+    fn replicaRetirementConflictsLocked(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: ?[]const u8,
+    ) bool {
+        for (self.active_table_activities.items) |entry| {
+            if (entry.group_id == null) {
+                if (table_name) |name| {
+                    if (!std.mem.eql(u8, entry.table_name, name)) continue;
+                }
+                if (entry.structural_active or
+                    entry.structural_waiters > 0 or
+                    entry.structural_reconcile_active or
+                    entry.restore_preparations > 0)
+                {
+                    return true;
+                }
+                continue;
+            }
+            if (entry.group_id.? != group_id) continue;
+            if (entry.operation_active or entry.generation_preparation_active) return true;
+        }
+        return false;
+    }
+
+    fn beginReplicaRetirementActivity(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: ?[]const u8,
+    ) !void {
+        const io = self.table_activity_threaded.io();
+        const owned_table_name = if (table_name) |name| try std.heap.page_allocator.dupe(u8, name) else null;
+        errdefer if (owned_table_name) |name| std.heap.page_allocator.free(name);
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        while (self.retiring_replica_groups.contains(group_id)) {
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
+        try self.retiring_replica_groups.put(std.heap.page_allocator, group_id, owned_table_name);
+        while (self.replicaRetirementConflictsLocked(group_id, table_name)) {
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
+    }
+
+    fn endReplicaRetirementActivity(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const removed = self.retiring_replica_groups.fetchRemove(group_id) orelse return;
+        if (removed.value) |table_name| std.heap.page_allocator.free(table_name);
+        self.table_activity_ready.broadcast(io);
+    }
+
+    fn structuralRetirementConflictsLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) bool {
+        var retiring = self.retiring_replica_groups.valueIterator();
+        while (retiring.next()) |retiring_table| {
+            const scoped = retiring_table.* orelse return true;
+            if (std.mem.eql(u8, scoped, table_name)) return true;
+        }
+        return false;
     }
 
     fn activityEntryLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) *TableActivity {
@@ -7912,8 +10750,15 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
+        while (self.retiring_replica_groups.contains(group_id)) {
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
         self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
         while (true) {
+            if (self.retiring_replica_groups.contains(group_id)) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0 or entry.status_request_active > 0) {
@@ -7948,6 +10793,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn tryBeginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         const io = self.table_activity_threaded.io();
+        if (self.retiring_replica_groups.contains(group_id)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0) return false;
@@ -7984,6 +10830,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        if (self.retiring_replica_groups.contains(group_id)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.restore_preparations > 0) return false;
@@ -8007,8 +10854,15 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginGroupTransitionOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
+        while (self.retiring_replica_groups.contains(group_id)) {
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
         self.activityEntryLocked(table_name, group_id).transition_waiters += 1;
         while (true) {
+            if (self.retiring_replica_groups.contains(group_id)) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0 or entry.status_request_active > 0) {
@@ -8047,6 +10901,10 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         while (true) {
+            if (self.retiring_replica_groups.contains(group_id)) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
@@ -8079,6 +10937,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         const io = self.table_activity_threaded.io();
+        if (self.structuralRetirementConflictsLocked(table_name)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
@@ -8110,6 +10969,10 @@ pub const ProvisionedTableWriteSource = struct {
         // snapshot, while already-admitted table requests may finish their
         // group work without a lock cycle.
         while (true) {
+            if (self.structuralRetirementConflictsLocked(table_name)) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
@@ -8643,6 +11506,66 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn drainWriteCachePendingClosesForGroupsWithOpenFence(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        for (group_ids) |group_id| {
+            if (self.write_cache) |cache| {
+                if (open_fence != null and open_fence.? == &cache.open_mutex)
+                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
+                else
+                    cache.drainPendingClosesForGroupTable(group_id, table_name);
+            }
+            if (self.startup_write_cache) |cache| {
+                if (self.write_cache != null and cache == self.write_cache.?) continue;
+                if (open_fence != null and open_fence.? == &cache.open_mutex)
+                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
+                else
+                    cache.drainPendingClosesForGroupTable(group_id, table_name);
+            }
+        }
+    }
+
+    fn finishDroppedTableCleanupMutation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
+        self.endStructuralTableActivity(table_name);
+    }
+
+    fn abortDroppedTableCleanupMutation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
+        self.endStructuralTableActivity(table_name);
+    }
+
+    fn drainWriteCachePendingClosesForGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        if (self.write_cache) |cache| cache.drainPendingClosesForGroup(group_id);
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache == null or cache != self.write_cache.?) {
+                cache.drainPendingClosesForGroup(group_id);
+            }
+        }
+    }
+
     fn finishLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();
@@ -8994,13 +11917,17 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
+    const EmptyReadCacheExclusiveAccess = struct {
+        pub fn deinit(_: *@This()) void {}
+    };
+
     const ReadCacheExclusiveGroupAccess = if (control_only_storage_sources)
-        struct {}
+        EmptyReadCacheExclusiveAccess
     else
         table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess;
 
     const ReadCacheExclusiveTableAccess = if (control_only_storage_sources)
-        struct {}
+        EmptyReadCacheExclusiveAccess
     else
         table_reads.ProvisionedTableReadCache.ExclusiveTableAccess;
 
@@ -9814,6 +12741,15 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) return null;
         const cache = self.read_cache orelse return null;
         return try cache.beginExclusiveTableAccess(table_name);
+    }
+
+    fn beginReadCacheExclusiveWithDeadline(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
+        const cache = self.read_cache orelse return null;
+        return try cache.beginExclusiveTableAccessWithDeadline(table_name, deadline_ns);
     }
 
     fn beginReadCacheGroupExclusive(
@@ -10896,13 +13832,17 @@ pub const ProvisionedTableWriteSource = struct {
             const progressed = result.indexes_added != 0 or
                 result.indexes_removed != 0 or
                 result.repair_attempted != 0 or
-                result.repair_repaired != 0;
+                result.repair_repaired != 0 or
+                result.restore_repair_progressed != 0;
             return .{
                 .had_debt = result.state != .complete or progressed,
                 .cleared_debt = result.state == .complete and progressed,
                 .terminal_degraded = result.state == .degraded,
                 .busy = result.state == .busy,
                 .made_progress = progressed,
+                .restore_repair_pending = result.restore_repair_pending != 0,
+                .restore_repair_attempted = result.restore_repair_attempted != 0,
+                .restore_repair_progressed = result.restore_repair_progressed != 0,
                 .index_repair_pending = result.state == .repair_pending or result.repair_remaining != 0,
                 .index_repair_attempted = result.repair_attempted != 0,
                 .index_repair_repaired = result.repair_repaired != 0,
@@ -14753,6 +17693,7 @@ pub const ProvisionedTableWriteSource = struct {
             return switch (result.state) {
                 .complete => .complete,
                 .repair_pending => .repair_pending,
+                .restore_repair_pending => .repair_pending,
                 .busy => .busy,
                 .degraded => error.StorageKernelReconcileDegraded,
             };
@@ -15717,6 +18658,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_linearizable = txnStatusGroupLinearizable,
+                .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
+                .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
+                .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
@@ -16272,21 +19217,104 @@ pub const ProvisionedTableWriteSource = struct {
         self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, index_name, managed_visibility_changed);
     }
 
-    fn dropTable(
-        ptr: *anyopaque,
+    fn executeDroppedTableCleanup(
+        self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        group_ids: []const u64,
-    ) !?void {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        contract: metadata_topology_protocol.DropCleanupContract,
+        retire_publication_authority: bool,
+    ) !void {
+        const open_fence = self.dropped_table_cleanup_outer_mutex;
+        var open_fence_held = false;
+        defer if (open_fence_held) open_fence.?.unlock();
+        const group_ids = contract.group_ids;
+        // A durable index repair owns group admission while it advances one
+        // bounded build slice. Publish cancellation before waiting for the
+        // table-wide structural barrier so dropping a table cannot sit behind
+        // corpus work until the request itself times out.
+        for (group_ids) |group_id| {
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
+        }
+        errdefer for (group_ids) |group_id| {
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+        };
+
+        runTestBeforeDropTableStructuralActivityHook();
+        self.beginStructuralTableActivity(table_name);
+        var structural_mutation_active = true;
+        errdefer if (structural_mutation_active) {
+            self.abortDroppedTableCleanupMutation(
+                table_name,
+                group_ids,
+                if (open_fence_held) open_fence else null,
+            );
+        };
+        // Ask the metadata leader for an exact linearizable ownership proof.
+        // The destructive decision must never depend on a process-local
+        // snapshot cache: a restored table may intentionally reclaim a
+        // historical group id while that cache is still within its TTL.
+        const validation = if (self.catalog.vtable.requires_linearizable_publication_fence) exact_validation: {
+            const identity = try self.catalog.catalogIdentity();
+            break :exact_validation try self.catalog.validateGroupRetirement(.{
+                .metadata_group_id = identity.metadata_group_id,
+                .metadata_incarnation = identity.metadata_incarnation,
+                .table_name = table_name,
+                .group_ids = group_ids,
+            });
+        } else local_validation: {
+            // Lightweight embedded/test catalog adapters are synchronous and
+            // non-caching. Preserve their local exact scan without imposing a
+            // production transport capability on embedders.
+            var current_catalog = try self.catalog.adminSnapshot();
+            defer self.catalog.freeAdminSnapshot(&current_catalog);
+            if (current_catalog.status.metadata_incarnation) |metadata_incarnation| {
+                const exact = self.catalog.validateGroupRetirement(.{
+                    .metadata_group_id = current_catalog.status.metadata_group_id,
+                    .metadata_incarnation = metadata_incarnation,
+                    .table_name = table_name,
+                    .group_ids = group_ids,
+                }) catch |err| {
+                    if (err != error.CatalogPublicationFenceUnavailable) return err;
+                    break :local_validation localCatalogGroupRetirementValidation(
+                        &current_catalog,
+                        table_name,
+                        group_ids,
+                    );
+                };
+                break :local_validation exact;
+            }
+            break :local_validation localCatalogGroupRetirementValidation(
+                &current_catalog,
+                table_name,
+                group_ids,
+            );
+        };
+        if (!validation.group_ids_unowned) {
+            // Catalog ownership is a safety fence, not a successful cleanup.
+            // In particular, a follower may not have applied the drop yet.
+            // Retain the durable intent and retry after its projection catches
+            // up instead of silently converting a stale read into leaked data.
+            std.log.info(
+                "dropped-table cleanup deferred by linearizable catalog ownership table={s} table_id={d} generation={d}",
+                .{ table_name, contract.table_id, contract.expected_transition_generation },
+            );
+            for (group_ids) |owned_group_id| {
+                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .clear_cancel);
+                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .enqueue_runnable);
+            }
+            return error.DropCleanupOwnershipInconclusive;
+        }
+        // Publication handoffs are name-scoped process state. Retire them only
+        // while the committed catalog still confirms absence; a delayed
+        // initial cleanup must not revoke authority from a replacement table.
+        if (retire_publication_authority and validation.table_name_absent) {
+            self.retireDroppedTablePublicationAuthority(table_name);
+        }
+
         if (comptime control_only_storage_sources) {
-            try enforceHAWriteGateOptional(self.ha_write_gate);
-            if (group_ids.len == 0) return null;
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            self.beginLocalStructuralMutation(table_name);
-            var mutation_active = true;
-            errdefer if (mutation_active) self.abortLocalStructuralMutation(table_name);
+            var moved_any_group = false;
             for (group_ids) |group_id| {
                 if ((try local_source.retireTableGroupLocal(group_id, table_name)) == null)
                     return error.StorageKernelOwnerUnavailable;
@@ -16296,62 +19324,127 @@ pub const ProvisionedTableWriteSource = struct {
                     table_name,
                     group_id,
                 );
-                if (trash_path) |dropped_path| try self.deleteDroppedGroupPath(alloc, dropped_path);
+                if (trash_path) |dropped_path| {
+                    moved_any_group = true;
+                    try self.deleteDroppedGroupPath(alloc, dropped_path);
+                }
             }
-            self.finishLocalStructuralMutation(table_name);
-            mutation_active = false;
+            if (moved_any_group) {
+                const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
+                defer alloc.free(trash_dir_path);
+                var io_impl = std.Io.Threaded.init(alloc, .{});
+                defer io_impl.deinit();
+                try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
+            }
+            self.finishDroppedTableCleanupMutation(table_name, group_ids, null);
+            structural_mutation_active = false;
+            for (group_ids) |group_id| {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+            }
             self.notifyLocalChange(table_name, .structural);
-            return {};
+            return;
         }
-        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
-        try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (group_ids.len == 0) return null;
 
-        // A durable index repair owns group admission while it advances one
-        // bounded build slice. Publish cancellation before waiting for the
-        // table-wide structural barrier so dropping a table cannot sit behind
-        // corpus work until the request itself times out.
-        for (group_ids) |group_id| {
-            self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
+        // The keyed structural reservation above prevents new opens for this
+        // table and has drained every already-admitted group/status operation.
+        // Take the process-wide cache-open mutex only for the physical cache
+        // transition; holding it while waiting for activity or metadata would
+        // invert the normal activity->open order and convoy unrelated tables.
+        if (open_fence) |mutex| {
+            lockAtomic(mutex);
+            open_fence_held = true;
         }
-        defer for (group_ids) |group_id| {
-            self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        const read_drain_deadline_ns = platform_time.monotonicNs() +|
+            self.drop_cleanup_read_drain_timeout_ns;
+        var read_cache_exclusive = self.beginReadCacheExclusiveWithDeadline(
+            table_name,
+            read_drain_deadline_ns,
+        ) catch |err| {
+            self.local_db_mutex.unlock();
+            return err;
         };
-
-        self.beginLocalStructuralMutation(table_name);
-        var structural_mutation_active = true;
-        var local_db_mutex_held = true;
-        errdefer if (structural_mutation_active) {
-            if (local_db_mutex_held) {
-                self.abortLocalStructuralMutation(table_name);
-            } else {
-                self.abortLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
-            }
-        };
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        defer {
-            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
-        }
+        defer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         self.local_db_mutex.unlock();
-        local_db_mutex_held = false;
-        self.drainWriteCachePendingClosesForGroups(table_name, group_ids);
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
 
+        var moved_any_group = false;
         for (group_ids) |group_id| {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
             self.invalidateSharedPathCaches(path);
             const trash_path = try moveDroppedGroupPathToTrash(alloc, self.replica_root_dir, table_name, group_id);
             if (trash_path) |dropped_path| {
+                moved_any_group = true;
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
             }
         }
-        self.retireDroppedTablePublicationAuthority(table_name);
-        self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
+        if (moved_any_group) {
+            const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
+            defer alloc.free(trash_dir_path);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            // The repair intent is removed only after both sides of every
+            // rename are durable. One shared-directory sync avoids an fsync
+            // per range while preserving crash recovery.
+            try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
+        }
+        self.finishDroppedTableCleanupMutation(table_name, group_ids, open_fence);
         structural_mutation_active = false;
+        // Lifecycle callbacks are allowed to reconcile metadata and open
+        // status-only DB handles. Release every physical publication guard
+        // before dispatch so callback behavior can never re-enter a lock held
+        // by its caller.
+        if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        read_cache_exclusive = null;
+        if (open_fence_held) {
+            open_fence.?.unlock();
+            open_fence_held = false;
+        }
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         }
         self.notifyLocalChange(table_name, .structural);
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        contract: metadata_topology_protocol.DropCleanupContract,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, contract);
+        const group_ids = contract.group_ids;
+        if (group_ids.len == 0) return null;
+
+        // Metadata has already committed. Persist the exact cleanup contract
+        // before any fallible cache/filesystem operation so every later
+        // failure has a restart-safe, idempotent recovery owner.
+        const intent_path = persistDroppedTableRepairIntent(
+            alloc,
+            self.replica_root_dir,
+            table_name,
+            contract,
+        ) catch return error.DropCleanupIntentNotDurable;
+        defer alloc.free(intent_path);
+
+        // This is convergence for a metadata mutation that has already
+        // committed, not admission of a new user write. It must run on a
+        // standby as well as the active writer owner.
+        self.executeDroppedTableCleanup(alloc, table_name, contract, true) catch |err| {
+            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+            return err;
+        };
+        removeDroppedTableRepairIntent(intent_path) catch |err| {
+            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+            return err;
+        };
     }
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
@@ -16911,13 +20004,23 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (plan.cancellation.isCancelled()) return error.Canceled;
-        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
+        try plan.ensureActive();
+        const group_id = (try resolveFencedBackupGroup(
+            self.catalog,
+            table_name,
+            plan.fence,
+            plan.target_group_id,
+        )) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
             self.endGroupOperation(table_name, group_id);
         }
-        const guarded_group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return error.CatalogChanged;
+        const guarded_group_id = (try resolveFencedBackupGroup(
+            self.catalog,
+            table_name,
+            plan.fence,
+            plan.target_group_id,
+        )) orelse return error.CatalogChanged;
         if (guarded_group_id != group_id) return error.CatalogChanged;
 
         if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
@@ -17129,7 +20232,7 @@ pub const ProvisionedTableWriteSource = struct {
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (comptime control_only_storage_sources)
             return try self.restoreTableKernel(alloc, table_name, plan);
-        try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateSingleRangeRestoreManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
         const restore_io = plan.io orelse self.table_activity_threaded.io();
@@ -17579,7 +20682,11 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_id = nextTxnId();
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        return commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation) catch |err| {
+            if (err == error.CommitDecisionUnknown)
+                public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
+            return err;
+        };
     }
 
     /// A transaction with one participant is already atomic at the shard DB
@@ -18603,7 +21710,12 @@ pub const ProvisionedTableWriteSource = struct {
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocalWithCancellation(alloc, group_id, table_name, .{
+            // Resolution is idempotent and may arrive through a stale hosted
+            // route after leadership changes. Use the same leader-aware Raft
+            // dispatcher as begin/prepare; the transaction ID and replicated
+            // decision make retries safe, while the forwarded batch hop remains
+            // cache-only and bounded inside the data runtime.
+            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
@@ -18714,6 +21826,68 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             return try db.getTransactionStatus(txn_id);
         }
+    }
+
+    fn txnStatusGroupLinearizable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse
+            return try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        return try batcher.txnStatusGroup(alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupLinearizableUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse {
+            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            return status;
+        };
+        return try batcher.txnStatusGroupUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn txnStatusGroupAuthoritativeLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse
+            return try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        return try batcher.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupAuthoritativeLocalUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        deadline_ns: u64,
+    ) !?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const batcher = self.raft_batcher orelse {
+            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            return status;
+        };
+        return try batcher.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -20067,13 +23241,48 @@ test "backup storage resolution rejects a reused table name from another incarna
     var admitted = try catalog.iface().adminSnapshot();
     const fence = backups_api.tableBackupFence(&admitted, &admitted.tables[0]);
     catalog.iface().freeAdminSnapshot(&admitted);
-    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
 
     catalog.metadata_incarnation = "fedcba9876543210fedcba9876543210".*;
-    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
     catalog.metadata_incarnation = "0123456789abcdef0123456789abcdef".*;
     catalog.table_id = 8;
-    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
+}
+
+fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype, await_err: ?anyerror) ?anyerror {
+    // A may-have-committed sibling must dominate a deterministic pre-send
+    // failure, otherwise the coordinator could delete an attempt whose remote
+    // publisher is still authoritative.
+    for (result_slots) |slot| if (slot.err) |err| {
+        if (err == error.BackupOutcomeAmbiguous) return err;
+    };
+    for (result_slots) |slot| if (slot.err) |err| return err;
+    for (workers) |worker| if (worker.err) |err| return err;
+    return await_err;
+}
+
+test "hosted backup fanout makes ambiguous publication dominate ordered failures" {
+    const Slot = struct { err: ?anyerror = null };
+    const slots = [_]Slot{
+        .{ .err = error.ConnectionRefused },
+        .{ .err = error.BackupOutcomeAmbiguous },
+    };
+    const workers = [_]Slot{.{ .err = error.Canceled }};
+    try std.testing.expectEqual(
+        error.BackupOutcomeAmbiguous,
+        selectHostedBackupFanoutError(&slots, &workers, error.Canceled).?,
+    );
+}
+
+test "hosted backup fanout reports drain failure after worker outcomes" {
+    const Slot = struct { err: ?anyerror = null };
+    const slots = [_]Slot{.{}};
+    const workers = [_]Slot{.{}};
+    try std.testing.expectEqual(
+        error.Canceled,
+        selectHostedBackupFanoutError(&slots, &workers, error.Canceled).?,
+    );
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
@@ -20274,7 +23483,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             )) orelse return error.StorageKernelOwnerUnavailable;
             switch (result.state) {
                 .complete => {},
-                .repair_pending, .busy => return error.StorageKernelReconcilePending,
+                .repair_pending, .restore_repair_pending, .busy => return error.StorageKernelReconcilePending,
                 .degraded => return error.StorageKernelReconcileDegraded,
             }
         }
@@ -20351,6 +23560,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.write_cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = identity_namespace;
         if (mode == .status_only) {
+            // Status-only handles are intentionally uncached, but their open
+            // still participates in the publication fence. Take the same
+            // open->state order as every structural cache transition so a
+            // dropped path cannot be reopened between invalidation and rename.
+            lockAtomic(&cache.write_cache.open_mutex);
+            defer cache.write_cache.open_mutex.unlock();
             while (true) {
                 lockAtomic(&cache.mutex);
                 var cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
@@ -20360,7 +23575,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             return err;
                         }
                         cache.mutex.unlock();
-                        cache.write_cache.drainPendingClosesForGroupTable(group_id, table_name);
+                        cache.write_cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
                         continue;
                     },
                     else => {
@@ -20613,9 +23828,28 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     pub fn source(self: *HostedProvisionedTableWriteSource) TableWriteSource {
+        // Source publication is the hosted process startup boundary. Create
+        // the persistent cleanup owner here so intents left by a crash are
+        // recovered even when no subsequent table drop happens.
+        if (hostedManagedDbCacheForRoot(self.replica_root_dir)) |cache| {
+            if (self.persistentDropCleanupSource(cache)) |cleanup| {
+                cleanup.startDroppedTableRecovery();
+            } else |err| {
+                std.log.warn(
+                    "hosted dropped-table recovery owner unavailable root={s} err={s}",
+                    .{ self.replica_root_dir, @errorName(err) },
+                );
+            }
+        } else |err| {
+            std.log.warn(
+                "hosted dropped-table cache unavailable root={s} err={s}",
+                .{ self.replica_root_dir, @errorName(err) },
+            );
+        }
         return .{
             .ptr = self,
             .vtable = &.{
+                .drop_table = dropTable,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
@@ -20658,6 +23892,50 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    fn persistentDropCleanupSource(
+        self: *HostedProvisionedTableWriteSource,
+        cache: *HostedManagedDbCache,
+    ) !*ProvisionedTableWriteSource {
+        lockAtomic(&cache.mutex);
+        defer cache.mutex.unlock();
+        if (cache.drop_cleanup_source == null) {
+            const cleanup = try std.heap.page_allocator.create(ProvisionedTableWriteSource);
+            errdefer std.heap.page_allocator.destroy(cleanup);
+            cleanup.* = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
+            cleanup.write_cache = &cache.write_cache;
+            cleanup.runtime_status_cache = &cache.runtime_status_cache;
+            cleanup.local_db_mutex.bind(&cache.mutex);
+            cleanup.dropped_table_cleanup_outer_mutex = &cache.write_cache.open_mutex;
+            cleanup.backend_runtime = self.backend_runtime;
+            cache.drop_cleanup_source = cleanup;
+        } else if (self.backend_runtime) |runtime| {
+            // Runtime attachment may happen after the process-wide hosted
+            // cache was first opened. Publish it before recovery scheduling.
+            cache.drop_cleanup_source.?.backend_runtime = runtime;
+        }
+        return cache.drop_cleanup_source.?;
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        contract: metadata_topology_protocol.DropCleanupContract,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (contract.group_ids.len == 0) return null;
+
+        // Hosted reads and writes share this process-wide cache. A persistent
+        // cleanup source owns startup scans and durable retry jobs; unlike a
+        // request-scoped adapter it remains valid until the cache is closed.
+        const cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        const cleanup = try self.persistentDropCleanupSource(cache);
+        cleanup.startDroppedTableRecovery();
+        // Later failures schedule additional runs through the same persistent
+        // owner, and every run takes cache.mutex inside the cleanup path.
+        return try cleanup.source().dropTable(alloc, table_name, contract);
     }
 
     fn createIndex(
@@ -21029,6 +24307,73 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.UnsupportedOperation;
     }
 
+    fn fetchHostedBackupRangeFromRoute(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        route: table_router.GroupRoute,
+        range: FencedBackupRange,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backups_api.TableBackupFence,
+        control: backups_api.BackupOperationControl,
+    ) !backups_api.ShardSnapshot {
+        try control.ensureActive();
+        const group_id = range.group_id;
+        switch (route) {
+            .local => return error.UnsupportedOperation,
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                var response = try client.fetchBackupShardFenced(remote.base_uri, group_id, table_name, body, fence, control);
+                defer response.deinit(alloc);
+                var parsed = try std.json.parseFromSlice(
+                    struct { shards: []backups_api.ShardSnapshot },
+                    alloc,
+                    response.body,
+                    .{ .allocate = .alloc_always },
+                );
+                defer parsed.deinit();
+                if (parsed.value.shards.len != 1 or parsed.value.shards[0].group_id != group_id)
+                    return error.CatalogChanged;
+                const owned = try cloneShardSnapshots(alloc, parsed.value.shards);
+                defer alloc.free(owned);
+                var shard = owned[0];
+                errdefer shard.deinit(alloc);
+                const catalog_start = try alloc.dupe(u8, range.start_key);
+                errdefer alloc.free(catalog_start);
+                const catalog_end = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
+                errdefer if (catalog_end) |value| alloc.free(value);
+                alloc.free(@constCast(shard.start_key));
+                if (shard.end_key) |value| alloc.free(@constCast(value));
+                shard.start_key = catalog_start;
+                shard.end_key = catalog_end;
+                shard.range_id = range.range_id;
+                // Initial catalog rows encode the historical identity as zero
+                // and resolve it through the physical group. The fenced range
+                // snapshot has already materialized that effective namespace
+                // for the portable manifest.
+                shard.doc_identity_shard_id = range.doc_identity_shard_id;
+                shard.doc_identity_range_id = range.doc_identity_range_id;
+                shard.split_attempt_epoch = range.split_attempt_epoch;
+                return shard;
+            },
+        }
+    }
+
+    fn fetchHostedBackupRange(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        range: FencedBackupRange,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backups_api.TableBackupFence,
+        control: backups_api.BackupOperationControl,
+    ) !backups_api.ShardSnapshot {
+        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
+        var route = resolved_route orelse return error.GroupLeaderUnavailable;
+        defer route.deinit(alloc);
+        return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
+    }
+
     fn backupTableToLocation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -21039,28 +24384,168 @@ pub const HostedProvisionedTableWriteSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         location_ptr: *anyopaque,
+        control: backups_api.BackupOperationControl,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const location: *backups_api.BackupLocation = @ptrCast(@alignCast(location_ptr));
-        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, fence)) orelse return null;
-        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        var route = resolved_route orelse return null;
-        defer route.deinit(alloc);
-        switch (route) {
-            .local => return error.UnsupportedOperation,
-            .remote => |remote| {
-                const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
-                defer alloc.free(body);
+        try control.ensureActive();
+        _ = location_ptr;
+        const ranges = (try resolveFencedBackupRangesAlloc(alloc, self.catalog, table_name, fence)) orelse return null;
+        defer freeFencedBackupRanges(alloc, ranges);
+        const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
+        defer alloc.free(body);
 
-                var client = self.httpClient(alloc);
-                var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
-                response.deinit(alloc);
-
-                var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
-                defer manifest.deinit(alloc);
-                return try cloneShardSnapshots(alloc, manifest.shards);
-            },
+        const shards = try alloc.alloc(backups_api.ShardSnapshot, ranges.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (shards[0..initialized]) |shard| shard.deinit(alloc);
+            alloc.free(shards);
         }
+
+        const group_ids = try alloc.alloc(u64, ranges.len);
+        defer alloc.free(group_ids);
+        for (ranges, 0..) |range, index| group_ids[index] = range.group_id;
+        const resolved_routes = try table_router.resolveGroupRoutes(
+            alloc,
+            self.catalog,
+            self.router,
+            group_ids,
+            .prefer_leader,
+        );
+        const routes = resolved_routes orelse return error.GroupLeaderUnavailable;
+        defer table_router.freeGroupRoutes(alloc, routes);
+
+        const io_impl = if (self.backend_runtime) |runtime| runtime.apiIoImpl() else null;
+        if (io_impl == null or ranges.len <= 1) {
+            for (ranges, routes, 0..) |range, route, i| {
+                shards[i] = try self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
+                initialized += 1;
+            }
+        } else {
+            const ResultSlot = struct {
+                shard: ?backups_api.ShardSnapshot = null,
+                err: ?anyerror = null,
+            };
+            const Worker = struct {
+                err: ?anyerror = null,
+            };
+            const WorkQueue = struct {
+                next_index: std.atomic.Value(usize) = .init(0),
+                stopped: std.atomic.Value(bool) = .init(false),
+                parent_control: backups_api.BackupOperationControl,
+
+                fn isCancelled(raw: *const anyopaque) bool {
+                    const queue: *const @This() = @ptrCast(@alignCast(raw));
+                    return queue.stopped.load(.acquire) or
+                        queue.parent_control.cancellation.isCancelled();
+                }
+
+                fn childControl(queue: *@This()) backups_api.BackupOperationControl {
+                    return .{
+                        .deadline_ns = queue.parent_control.deadline_ns,
+                        .cancellation = .{ .ptr = queue, .is_cancelled_fn = isCancelled },
+                    };
+                }
+            };
+            const WorkerFiber = struct {
+                fn run(
+                    hosted_source: *HostedProvisionedTableWriteSource,
+                    queue: *WorkQueue,
+                    worker: *Worker,
+                    result_slots: []ResultSlot,
+                    routes_inner: []const table_router.GroupRoute,
+                    ranges_inner: []const FencedBackupRange,
+                    table_name_inner: []const u8,
+                    body_inner: []const u8,
+                    fence_inner: backups_api.TableBackupFence,
+                ) void {
+                    const worker_control = queue.childControl();
+                    while (!queue.stopped.load(.acquire)) {
+                        worker_control.ensureActive() catch |err| {
+                            worker.err = err;
+                            queue.stopped.store(true, .release);
+                            return;
+                        };
+                        const index = queue.next_index.fetchAdd(1, .monotonic);
+                        if (index >= ranges_inner.len) return;
+                        result_slots[index].shard = hosted_source.fetchHostedBackupRangeFromRoute(
+                            std.heap.page_allocator,
+                            routes_inner[index],
+                            ranges_inner[index],
+                            table_name_inner,
+                            body_inner,
+                            fence_inner,
+                            worker_control,
+                        ) catch |err| {
+                            result_slots[index].err = err;
+                            queue.stopped.store(true, .release);
+                            return;
+                        };
+                    }
+                }
+            };
+
+            const async_limit = @intFromEnum(io_impl.?.async_limit);
+            const scheduler_width = if (async_limit == 0)
+                @as(usize, 1)
+            else if (async_limit == std.math.maxInt(usize))
+                ranges.len
+            else
+                @min(ranges.len, async_limit);
+            const width = @max(@as(usize, 1), @min(scheduler_width, @as(usize, 4)));
+            const result_slots = try alloc.alloc(ResultSlot, ranges.len);
+            @memset(result_slots, .{});
+            defer {
+                for (result_slots) |slot| if (slot.shard) |shard|
+                    shard.deinit(std.heap.page_allocator);
+                alloc.free(result_slots);
+            }
+            const workers = try alloc.alloc(Worker, width);
+            defer alloc.free(workers);
+            @memset(workers, .{});
+            var queue = WorkQueue{ .parent_control = control };
+            var group: std.Io.Group = .init;
+            for (workers) |*worker| group.async(io_impl.?.io(), WorkerFiber.run, .{
+                self,
+                &queue,
+                worker,
+                result_slots,
+                routes,
+                ranges,
+                table_name,
+                body,
+                fence,
+            });
+            // Always drain the bounded worker set before borrowed routing and
+            // request state leaves scope. The first failure stops admission;
+            // in-flight requests observe the shared cancellation token.
+            var await_err: ?anyerror = null;
+            group.await(io_impl.?.io()) catch |err| {
+                await_err = err;
+            };
+            // Ambiguity dominates deterministic ordering: a lower-index
+            // pre-send failure must never authorize cleanup when a sibling
+            // may already have published its shard after transport delivery.
+            if (selectHostedBackupFanoutError(result_slots, workers, await_err)) |err| return err;
+
+            // Clone in catalog order on the request thread. Workers allocate
+            // only their compact returned manifests from the page allocator,
+            // so parser memory is released per request and caller allocation
+            // never crosses concurrent fibers.
+            for (result_slots, 0..) |slot, index| {
+                const remote_shard = slot.shard orelse return error.BackupFailed;
+                const owned = try cloneShardSnapshots(alloc, &.{remote_shard});
+                shards[index] = owned[0];
+                alloc.free(owned);
+                initialized += 1;
+            }
+        }
+        std.mem.sort(backups_api.ShardSnapshot, shards, {}, struct {
+            fn lessThan(_: void, lhs: backups_api.ShardSnapshot, rhs: backups_api.ShardSnapshot) bool {
+                const order = std.mem.order(u8, lhs.start_key, rhs.start_key);
+                return order == .lt or (order == .eq and lhs.group_id < rhs.group_id);
+            }
+        }.lessThan);
+        return shards;
     }
 
     fn restoreTable(
@@ -26906,6 +30391,14 @@ fn catchUpManagedDb(
     index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
+    // Restore repair is deliberately expressed as durable, restartable steps,
+    // but reopening a shard and waiting for the global maintenance scheduler
+    // between every cheap phase turns a small restore into seconds of control-
+    // plane latency. Drain consecutive successful steps while the existing DB
+    // lease is warm, with both step and wall-clock bounds so a large shard
+    // still yields fairly to foreground work.
+    const max_restore_repair_steps_per_pass: usize = 8;
+    const restore_repair_pass_budget_ns: u64 = 250 * std.time.ns_per_ms;
 
     const before = db.listDerivedReplayDebt(alloc) catch |err| {
         std.log.warn("managed startup catch-up list debt failed table={s} err={}", .{ table_name, err });
@@ -27038,33 +30531,43 @@ fn catchUpManagedDb(
         std.log.info("managed restore repair begin group_id={d}", .{group_id});
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        repaired_restore_runtime = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
-            if (owner == .live_writer and isPendingRestoreRuntimeRepairError(err)) {
-                // A resident writer keeps its managed workers enabled. Some
-                // restore proof phases must wait for those workers rather than
-                // rebuilding the same coverage inline. Retain the exact route
-                // and yield this bounded quantum; never turn ordinary async
-                // convergence into an operator-visible repair failure.
-                std.log.info("managed restore repair waiting for resident worker convergence group_id={d} class={s}", .{ group_id, @errorName(err) });
-                // An unavailable index generation is not resolved by waiting
-                // for replay workers. The caller must release this exclusive
-                // phase and admit one bounded generation-repair quantum.
-                if (err == error.RestoreIndexAvailabilityIncomplete) return err;
-                return .{
-                    .had_debt = true,
-                    .busy = true,
-                    .index_repair_pending = advance_index_repairs,
-                };
-            }
-            std.log.warn("managed startup restore repair failed phase=execution class={s}", .{@errorName(err)});
-            return err;
-        };
-        made_progress = repaired_restore_runtime;
+        const repair_started_ns = platform_time.monotonicNs();
+        var repair_steps: usize = 0;
+        while (repair_steps < max_restore_repair_steps_per_pass) {
+            const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
+                if (owner == .live_writer and isPendingRestoreRuntimeRepairError(err)) {
+                    // A resident writer keeps its managed workers enabled. Some
+                    // restore proof phases must wait for those workers rather than
+                    // rebuilding the same coverage inline. Retain the exact route
+                    // and yield this bounded quantum; never turn ordinary async
+                    // convergence into an operator-visible repair failure.
+                    std.log.info("managed restore repair waiting for resident worker convergence group_id={d} class={s}", .{ group_id, @errorName(err) });
+                    // An unavailable index generation is not resolved by waiting
+                    // for replay workers. The caller must release this exclusive
+                    // phase and admit one bounded generation-repair quantum.
+                    if (err == error.RestoreIndexAvailabilityIncomplete) return err;
+                    if (repaired_restore_runtime) break;
+                    return .{
+                        .had_debt = true,
+                        .busy = true,
+                        .index_repair_pending = advance_index_repairs,
+                    };
+                }
+                std.log.warn("managed startup restore repair failed phase=execution class={s}", .{@errorName(err)});
+                return err;
+            };
+            if (!repaired) break;
+            repaired_restore_runtime = true;
+            made_progress = true;
+            repair_steps += 1;
+            if (!try db.restoreRuntimeRepairNeeded()) break;
+            if (platform_time.monotonicNs() -| repair_started_ns >= restore_repair_pass_budget_ns) break;
+        }
         // Dense mutation phases retire their own HBC state inside DB repair.
         // Keep the resident writer's warm cache across watermark, graph, and
         // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
+        std.log.info("managed restore repair quantum complete group_id={d} repaired={} steps={d}", .{ group_id, repaired_restore_runtime, repair_steps });
     } else if (runs_broad_debt and had_debt) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
@@ -27428,6 +30931,25 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
+fn localCatalogGroupRetirementValidation(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    group_ids: []const u64,
+) metadata_api.CatalogGroupRetirementValidation {
+    for (snapshot.ranges) |range| {
+        for (group_ids) |group_id| {
+            if (range.group_id == group_id) return .{
+                .group_ids_unowned = false,
+                .table_name_absent = tables_api.findTableByName(snapshot, table_name) == null,
+            };
+        }
+    }
+    return .{
+        .group_ids_unowned = true,
+        .table_name_absent = tables_api.findTableByName(snapshot, table_name) == null,
+    };
+}
+
 const SourceStateMutex = struct {
     owned: std.atomic.Mutex = .unlocked,
     shared: ?*std.atomic.Mutex = null,
@@ -27632,8 +31154,9 @@ const SchemaValidationWriteState = struct {
     }
 };
 
-fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}.afb", .{backup_id});
+fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8, group_id: u64) ![]u8 {
+    if (group_id == 0) return try std.fmt.allocPrint(alloc, "{s}.afb", .{backup_id});
+    return try std.fmt.allocPrint(alloc, "{s}/groups/{d}.afb", .{ backup_id, group_id });
 }
 
 fn exportPortableBackupShard(
@@ -27644,7 +31167,7 @@ fn exportPortableBackupShard(
     group_id: u64,
     shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
-    const rel_path = try portableBackupShardRelPath(alloc, backup_id);
+    const rel_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
     errdefer alloc.free(rel_path);
 
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
@@ -27781,6 +31304,10 @@ fn cloneShardSnapshots(
     for (shards, 0..) |shard, i| {
         out[i] = .{
             .group_id = shard.group_id,
+            .range_id = shard.range_id,
+            .doc_identity_shard_id = shard.doc_identity_shard_id,
+            .doc_identity_range_id = shard.doc_identity_range_id,
+            .split_attempt_epoch = shard.split_attempt_epoch,
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
@@ -28037,6 +31564,7 @@ pub const StorageKernelReconcileState = enum {
     repair_pending,
     busy,
     degraded,
+    restore_repair_pending,
 };
 
 pub const StorageKernelReconcileResult = struct {
@@ -28052,6 +31580,9 @@ pub const StorageKernelReconcileResult = struct {
     repair_busy: usize = 0,
     repair_disk_waits: usize = 0,
     next_retry_at_ms: u64 = 0,
+    restore_repair_attempted: usize = 0,
+    restore_repair_progressed: usize = 0,
+    restore_repair_pending: usize = 0,
 };
 
 /// Advance one bounded desired-state/repair quantum on a resident compiled
@@ -28094,6 +31625,36 @@ pub fn reconcileStorageKernelOwnerDb(
         _ = try db.advanceGeneratedArtifactCleanupPage(target_index_name);
     }
 
+    // A published restore generation carries a durable phase marker whose
+    // completion is part of table visibility. Advance exactly one phase per
+    // structural pass so graph/artifact reconstruction remains bounded and
+    // observable through the same compiled owner that serves the generation.
+    // This work is independent of operator-controlled index-repair scheduling.
+    if (try db.restoreRuntimeRepairNeeded()) {
+        result.restore_repair_attempted = 1;
+        const progressed = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
+            error.RestoreRuntimeRepairIncomplete,
+            error.RestoreDenseArtifactRebuildIncomplete,
+            error.RestoreDenseConfigProofIncomplete,
+            error.RestoreDenseCounterProofIncomplete,
+            error.RestoreDenseIndexProofIncomplete,
+            error.RestoreDenseCoverageProofIncomplete,
+            error.RestoreDenseCheckpointIncomplete,
+            error.RestoreIndexAvailabilityIncomplete,
+            => false,
+            else => return err,
+        };
+        if (progressed) {
+            result.restore_repair_progressed = 1;
+            db.clearDenseHbcCaches();
+        }
+        result.restore_repair_pending = @intFromBool(try db.restoreRuntimeRepairNeeded());
+        if (result.restore_repair_pending == 0) {
+            try db.sync(true);
+            try db.syncIndexes(true);
+        }
+    }
+
     var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
         error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
@@ -28119,6 +31680,8 @@ pub fn reconcileStorageKernelOwnerDb(
         .degraded
     else if (result.repair_busy != 0)
         .busy
+    else if (result.restore_repair_pending != 0)
+        .restore_repair_pending
     else if (repair_summary.runnable != 0 or repair_summary.paused != 0)
         .repair_pending
     else if (provisioned.indexes_pending != 0)
@@ -28156,7 +31719,75 @@ fn loadTableManagedMetadata(
     };
 }
 
-/// Resolves the single storage group while checking the complete table
+/// Resolves every storage group while checking the complete table incarnation
+/// carried by backup admission. The returned group IDs are owned by `alloc`.
+const FencedBackupRange = struct {
+    group_id: u64,
+    range_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    split_attempt_epoch: u64,
+    start_key: []u8,
+    end_key: ?[]u8,
+};
+
+fn freeFencedBackupRanges(alloc: std.mem.Allocator, ranges: []const FencedBackupRange) void {
+    for (ranges) |range| {
+        alloc.free(range.start_key);
+        if (range.end_key) |value| alloc.free(value);
+    }
+    alloc.free(@constCast(ranges));
+}
+
+fn resolveFencedBackupRangesAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    expected_fence: backups_api.TableBackupFence,
+) !?[]FencedBackupRange {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const resolution = metadata_api.catalogTableTopologyResolution(table.table_id, snapshot.ranges);
+    const actual = backups_api.tableBackupFenceWithTopology(&snapshot, table, resolution.topology);
+    if (!expected_fence.matches(actual)) return error.CatalogChanged;
+    if (resolution.topology.range_count == 0) return null;
+
+    const ranges = try alloc.alloc(FencedBackupRange, @intCast(resolution.topology.range_count));
+    var initialized: usize = 0;
+    errdefer {
+        for (ranges[0..initialized]) |range| {
+            alloc.free(range.start_key);
+            if (range.end_key) |value| alloc.free(value);
+        }
+        alloc.free(ranges);
+    }
+    var index: usize = 0;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        ranges[index] = .{
+            .group_id = range.group_id,
+            .range_id = if (range.range_id == 0) range.group_id else range.range_id,
+            .doc_identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+            .doc_identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+            .split_attempt_epoch = range.split_attempt_epoch,
+            .start_key = try alloc.dupe(u8, range.start_key),
+            .end_key = if (range.end_key) |value| try alloc.dupe(u8, value) else null,
+        };
+        initialized += 1;
+        index += 1;
+    }
+    if (index != ranges.len) return error.CatalogChanged;
+    std.mem.sort(FencedBackupRange, ranges, {}, struct {
+        fn lessThan(_: void, lhs: FencedBackupRange, rhs: FencedBackupRange) bool {
+            const order = std.mem.order(u8, lhs.start_key, rhs.start_key);
+            return order == .lt or (order == .eq and lhs.group_id < rhs.group_id);
+        }
+    }.lessThan);
+    return ranges;
+}
+
+/// Resolves one storage group while checking the complete table
 /// incarnation carried by backup admission. Callers repeat this after taking
 /// their structural-operation guard so catalog replacement cannot redirect a
 /// snapshot by reusing the same table name.
@@ -28164,6 +31795,7 @@ fn resolveFencedBackupGroup(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     expected_fence: ?backups_api.TableBackupFence,
+    target_group_id: ?u64,
 ) !?u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
@@ -28175,6 +31807,13 @@ fn resolveFencedBackupGroup(
     }
 
     if (resolution.topology.range_count == 0) return null;
+    if (target_group_id) |expected_group_id| {
+        for (snapshot.ranges) |range| {
+            if (range.table_id == table.table_id and range.group_id == expected_group_id)
+                return expected_group_id;
+        }
+        return error.CatalogChanged;
+    }
     if (resolution.topology.range_count != 1) return error.UnsupportedMultiRangeTable;
     return resolution.single_group_id orelse error.CatalogChanged;
 }
@@ -30521,7 +34160,7 @@ test "provisioned table write source backs up a portable local table" {
     })).?;
     defer freeBackupShards(alloc, shards);
     try std.testing.expectEqual(@as(usize, 1), shards.len);
-    try std.testing.expectEqualStrings("portable-snap.afb", shards[0].snapshot_path);
+    try std.testing.expectEqualStrings("portable-snap/groups/7001.afb", shards[0].snapshot_path);
 
     const afb_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, shards[0].snapshot_path });
     defer alloc.free(afb_path);
@@ -30853,9 +34492,9 @@ test "provisioned native backup restore repeats through shared read and write ow
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
 
     const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        fn iface(active: *bool) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = active,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -30866,7 +34505,19 @@ test "provisioned native backup restore repeats through shared read and write ow
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const active: *bool = @ptrCast(@alignCast(ptr));
+            if (!active.*) {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                    .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                    .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                    .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                    .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                };
+            }
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -30896,9 +34547,9 @@ test "provisioned native backup restore repeats through shared read and write ow
     };
 
     const FakeStatusSource = struct {
-        fn iface() http_server.StatusSource {
+        fn iface(active: *bool) http_server.StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = active,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -30914,8 +34565,8 @@ test "provisioned native backup restore repeats through shared read and write ow
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return try FakeCatalog.adminSnapshot(undefined);
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return try FakeCatalog.adminSnapshot(ptr);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -30933,7 +34584,8 @@ test "provisioned native backup restore repeats through shared read and write ow
     defer read_cache.deinit();
     read_cache.backend_runtime = backend_runtime.ptr();
 
-    var source = ProvisionedTableWriteSource.init(root, FakeCatalog.iface());
+    var catalog_active = true;
+    var source = ProvisionedTableWriteSource.init(root, FakeCatalog.iface(&catalog_active));
     defer source.deinit();
     source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
@@ -30941,7 +34593,7 @@ test "provisioned native backup restore repeats through shared read and write ow
 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         root,
-        FakeCatalog.iface(),
+        FakeCatalog.iface(&catalog_active),
         raft_mod.read_gate.noopReadableLeaseRequester(),
     );
     read_source.backend_runtime = backend_runtime.ptr();
@@ -30950,7 +34602,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     var server = http_server.ApiHttpServer.init(
         alloc,
         .{},
-        FakeStatusSource.iface(),
+        FakeStatusSource.iface(&catalog_active),
         read_source.source(),
         source.source(),
     );
@@ -31028,7 +34680,9 @@ test "provisioned native backup restore repeats through shared read and write ow
             .sync_level = .full_text,
         });
 
-        _ = try source.source().dropTable(alloc, "docs", &.{7001});
+        catalog_active = false;
+        _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
+        catalog_active = true;
         _ = try source.source().createTable(alloc, "docs", .{});
 
         _ = try source.source().restoreTable(alloc, "docs", .{
@@ -40603,6 +44257,21 @@ test "provisioned schema reconcile keeps reads and status available" {
     source.endStatusRequest("docs", status);
 }
 
+test "replica retirement fences only its owning table structural lane" {
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-scoped-replica-retirement",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    try source.beginReplicaRetirementActivity(7001, "docs");
+    defer source.endReplicaRetirementActivity(7001);
+
+    try std.testing.expect(!source.tryBeginStructuralTableActivity("docs"));
+    try std.testing.expect(source.tryBeginStructuralTableActivity("unrelated"));
+    source.endStructuralTableActivity("unrelated");
+    try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+}
+
 test "provisioned runtime status inspection remains available during structural transition" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -47023,7 +50692,7 @@ test "provisioned table write source drop table cancels index repair before stru
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -47062,6 +50731,696 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(probe.remove_seen.isSet());
     try std.testing.expect(probe.clear_seen.isSet());
     try std.testing.expect(!probe.invalid_sequence.isSet());
+}
+
+test "dropped table quarantine path keeps valid API names in one portable component" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = "replicas";
+    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
+    defer alloc.free(trash_dir_path);
+
+    for ([_][]const u8{ "sales/archive", "..", "sales%2Farchive", "quarterly reports" }) |table_name| {
+        const path = try droppedTableTrashPath(alloc, replica_root_dir, table_name, 7001);
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings(trash_dir_path, std.fs.path.dirname(path).?);
+        const basename = std.fs.path.basename(path);
+        try std.testing.expect(std.mem.startsWith(u8, basename, "table-"));
+        try std.testing.expect(std.mem.indexOf(u8, basename, table_name) == null);
+    }
+}
+
+test "malformed recovery intent is durably removed from the active queue and counted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/recovery-intent-quarantine",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const repair_dir = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir);
+    const intent_path = try std.fmt.allocPrint(alloc, "{s}/invalid.bin", .{repair_dir});
+    defer alloc.free(intent_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, repair_dir);
+    {
+        var file = try fs_paths.createFilePortable(io, intent_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [32]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll("malformed");
+        try writer.end();
+        try file.sync(io);
+    }
+    try fs_paths.syncDirPortable(io, repair_dir);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    try std.testing.expect(!source.runDroppedTableRecovery());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, intent_path, .{}));
+    try std.testing.expectEqual(@as(u64, 1), source.quarantined_recovery_intents.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), try countRecoveryQuarantineIntents(alloc, replica_root_dir));
+}
+
+test "transient recovery intent read failure retains active work and retries successfully" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/recovery-intent-transient-read",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const intent_path = try persistDroppedTableRepairIntent(
+        alloc,
+        replica_root_dir,
+        "docs",
+        .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{} },
+    );
+    defer alloc.free(intent_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    test_recovery_intent_read_failures_remaining.store(1, .release);
+    defer test_recovery_intent_read_failures_remaining.store(0, .release);
+    try std.testing.expect(try source.recoverDroppedTableRepairIntents(alloc));
+    try std.Io.Dir.cwd().access(io, intent_path, .{});
+
+    try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, intent_path, .{}));
+}
+
+test "dropped table recovery drains a wake coalesced during the active scan" {
+    const Probe = struct {
+        source: *ProvisionedTableWriteSource,
+        passes: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.passes += 1;
+            if (self.passes == 1) self.source.scheduleDroppedTableRecovery();
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/drop-recovery-coalesced-wake",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(replica_root_dir);
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var probe = Probe{ .source = &source };
+    test_dropped_table_recovery_pass_hook = .{ .ptr = &probe, .run = Probe.run };
+    defer test_dropped_table_recovery_pass_hook = null;
+
+    source.scheduleDroppedTableRecovery();
+    try std.testing.expectEqual(@as(usize, 2), probe.passes);
+    try std.testing.expectEqual(@as(u64, 2), source.dropped_table_recovery_requested.load(.acquire));
+    try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
+}
+
+test "dropped table recovery watchdog repairs a failed durable enqueue" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/drop-recovery-enqueue-failure",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(replica_root_dir);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(
+        std.testing.allocator,
+        .{ .backend = .manual },
+    );
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.backend_runtime = runtime.ptr();
+
+    test_dropped_table_job_submit_failures_remaining.store(1, .release);
+    defer test_dropped_table_job_submit_failures_remaining.store(0, .release);
+    source.startDroppedTableRecovery();
+
+    var status = source.droppedTableRecoveryStatus();
+    try std.testing.expectEqual(@as(u64, 1), status.pending_epochs);
+    try std.testing.expectEqual(@as(u64, 1), status.enqueue_failures);
+    try std.testing.expectEqual(@as(u32, 1), status.consecutive_enqueue_failures);
+    try std.testing.expect(!status.worker_scheduled);
+
+    source.maintainDroppedTableRecovery();
+    status = source.droppedTableRecoveryStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.pending_epochs);
+    try std.testing.expectEqual(@as(u32, 0), status.consecutive_enqueue_failures);
+    try std.testing.expect(!status.worker_scheduled);
+}
+
+test "provisioned source quiesce closes cleanup admission and drains accepted owner jobs" {
+    if (builtin.os.tag == .freestanding) return;
+
+    const JobProbe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        deinits: std.atomic.Value(u32) = .init(0),
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.deinits.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Quiesce = struct {
+        source: *ProvisionedTableWriteSource,
+        complete: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.quiesce();
+            self.complete.store(true, .release);
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(
+        std.testing.allocator,
+        .{ .backend = .io_threaded },
+    );
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.backend_runtime = runtime.ptr();
+    var probe = JobProbe{};
+    try source.submitDroppedTableJob(runtime.ptr(), .{
+        .owner_id = 0,
+        .class = .cleanup,
+        .ptr = &probe,
+        .run = JobProbe.run,
+        .deinit = JobProbe.deinit,
+    });
+    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    var quiesce = Quiesce{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        probe.release.store(true, .release);
+        thread.join();
+    };
+    while (source.lifecycle.load(.acquire) == .open) std.Thread.yield() catch {};
+    try std.testing.expect(!quiesce.complete.load(.acquire));
+    probe.release.store(true, .release);
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expect(quiesce.complete.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), probe.deinits.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.submitDroppedTableJob(runtime.ptr(), .{
+        .owner_id = 0,
+        .class = .cleanup,
+        .ptr = &probe,
+        .run = JobProbe.run,
+        .deinit = JobProbe.deinit,
+    }));
+}
+
+test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-durable-repair",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(group_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), group_path);
+    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
+    defer alloc.free(trash_dir_path);
+    {
+        var obstruction = try fs_paths.createFilePortable(io_impl.io(), trash_dir_path, .{ .truncate = true });
+        obstruction.close(io_impl.io());
+    }
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+        defer source.deinit();
+        var cleanup_failed = false;
+        _ = source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch blk: {
+            cleanup_failed = true;
+            break :blk null;
+        };
+        try std.testing.expect(cleanup_failed);
+        try std.Io.Dir.cwd().access(io_impl.io(), group_path, .{});
+
+        const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+        defer alloc.free(repair_dir_path);
+        var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+        defer repair_dir.close(io_impl.io());
+        var iterator = repair_dir.iterate();
+        const entry = (try iterator.next(io_impl.io())) orelse return error.MissingDropRepairIntent;
+        try std.testing.expect(std.mem.endsWith(u8, entry.name, ".bin"));
+        const intent_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repair_dir_path, entry.name });
+        defer alloc.free(intent_path);
+        var intent = try loadDroppedTableRepairIntent(alloc, io_impl.io(), intent_path);
+        defer intent.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), intent.table_id);
+        try std.testing.expectEqual(@as(u64, 1), intent.expected_transition_generation);
+        try std.testing.expectEqualSlices(u64, &.{7001}, intent.group_ids);
+    }
+    try std.Io.Dir.cwd().deleteFile(io_impl.io(), trash_dir_path);
+
+    {
+        var recovered = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+        defer recovered.deinit();
+        _ = recovered.runDroppedTableRecovery();
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), group_path, .{}));
+
+    const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir_path);
+    var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+    defer repair_dir.close(io_impl.io());
+    var iterator = repair_dir.iterate();
+    try std.testing.expect((try iterator.next(io_impl.io())) == null);
+}
+
+test "provisioned table drop retains repair intent until catalog ownership clears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-ownership-fence",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        active: bool = true,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = if (self.active)
+                    @constCast((&[_]metadata_table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = if (self.active)
+                    @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.ensureStructuralPublicationHandoffStatus("docs", 7001, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 9,
+        .coverage_config_hash = 10,
+        .producer_target_sequence = 11,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("docs");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expectError(
+        error.DropCleanupOwnershipInconclusive,
+        source.source().dropTable(alloc, "docs", .{
+            .table_id = 7,
+            .expected_transition_generation = 1,
+            .group_ids = &.{7001},
+        }),
+    );
+    try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+    try std.testing.expect(try source.recoverDroppedTableRepairIntents(alloc));
+
+    catalog.active = false;
+    try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir_path);
+    var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+    defer repair_dir.close(io_impl.io());
+    var iterator = repair_dir.iterate();
+    try std.testing.expect((try iterator.next(io_impl.io())) == null);
+}
+
+test "replica retirement journal distinguishes active retained and committed removal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-ownership-fence",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+    const raft_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/node-42/raft-log", .{replica_root_dir});
+    defer alloc.free(raft_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), raft_path);
+
+    const Ownership = struct {
+        state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retained,
+        source: ?*ProvisionedTableWriteSource = null,
+
+        fn classify(ptr: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(group_id == 7001);
+            // Ownership may involve a remote metadata read. Recovery must not
+            // hold the process-wide intent lock across that callback.
+            if (self.source) |source| {
+                try std.testing.expect(source.replica_retirement_intent_mutex.tryLock());
+                source.replica_retirement_intent_mutex.unlock();
+            }
+            return self.state;
+        }
+    };
+
+    var ownership = Ownership{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    ownership.source = &source;
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+    var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
+    defer prepared.deinit();
+    try std.testing.expect(prepared.batch_created);
+    var loaded_prepared = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
+    defer loaded_prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded_prepared.intents.len);
+    try std.testing.expectEqual(@as(u64, 7001), loaded_prepared.intents[0].group_id);
+    try std.testing.expectEqualStrings("docs", loaded_prepared.intents[0].table_name.?);
+    var duplicate = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
+    defer duplicate.deinit();
+    try std.testing.expect(!duplicate.batch_created);
+    source.cancelPreparedReplicaRetirements(&duplicate);
+    try std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{});
+
+    // The in-process preparation fence suppresses premature classification
+    // without scheduling a retry loop; its owner will complete or cancel it.
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+    try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+    try std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{});
+    try std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{});
+
+    ownership.state = .retiring;
+    try source.completePreparedReplicaRetirements(&prepared);
+    var committed_intent = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
+    defer committed_intent.deinit(alloc);
+    try std.testing.expectEqual(ReplicaRetirementIntentPhase.committed, committed_intent.phase);
+    try std.testing.expect(try source.recoverReplicaRetirementIntents(alloc));
+
+    ownership.state = .retired;
+    // Reattaching a now-authoritative host proof must rescan synchronously;
+    // an earlier generic startup scan may have run before that proof existed.
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
+}
+
+test "replica retirement journal batches preserve every group phase" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-batch",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const Ownership = struct {
+        state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retiring,
+
+        fn classify(ptr: *anyopaque, _: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.state;
+        }
+    };
+
+    const group_ids = [_]u64{ 7001, 7002, 7003 };
+    const targets = [_]ProvisionedTableWriteSource.ReplicaRetirementTarget{
+        .{ .group_id = 7001, .table_name = "docs" },
+        .{ .group_id = 7002, .table_name = "docs" },
+        .{ .group_id = 7003, .table_name = "other" },
+    };
+    var ownership = Ownership{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+    var prepared = try source.prepareReplicaRetirements(alloc, &targets);
+    defer prepared.deinit();
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.testing.expect(prepared.batch_created);
+    var persisted_prepared = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
+    defer persisted_prepared.deinit(alloc);
+    try std.testing.expectEqual(ReplicaRetirementIntentPhase.prepared, persisted_prepared.phase);
+    for (persisted_prepared.intents, group_ids) |intent, group_id| {
+        try std.testing.expectEqual(group_id, intent.group_id);
+    }
+
+    try source.completePreparedReplicaRetirements(&prepared);
+    var persisted_committed = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
+    defer persisted_committed.deinit(alloc);
+    try std.testing.expectEqual(ReplicaRetirementIntentPhase.committed, persisted_committed.phase);
+    for (persisted_committed.intents, group_ids) |intent, group_id| {
+        try std.testing.expectEqual(group_id, intent.group_id);
+    }
+
+    ownership.state = .retired;
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
+}
+
+test "replica retirement batch size is rejected before target cloning" {
+    const alloc = std.testing.allocator;
+    const table_name = try alloc.alloc(u8, max_replica_retirement_table_name_bytes);
+    defer alloc.free(table_name);
+    @memset(table_name, 'x');
+    const target_count = max_replica_retirement_batch_bytes /
+        (max_replica_retirement_table_name_bytes + 8 + 4) + 1;
+    const targets = try alloc.alloc(ProvisionedTableWriteSource.ReplicaRetirementTarget, target_count);
+    defer alloc.free(targets);
+    for (targets, 0..) |*target, index| target.* = .{
+        .group_id = index + 1,
+        // Every target aliases one caller-owned buffer. The preflight must
+        // reject this without cloning roughly 16 MiB under the journal lock.
+        .table_name = table_name,
+    };
+
+    try std.testing.expectError(
+        error.ReplicaRetirementBatchTooLarge,
+        ProvisionedTableWriteSource.preflightReplicaRetirementBatch(targets),
+    );
+}
+
+test "replica retirement batch identity is canonical and rejects duplicate groups" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-canonical-batch",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    const forward = [_]ProvisionedTableWriteSource.ReplicaRetirementTarget{
+        .{ .group_id = 7001, .table_name = "docs" },
+        .{ .group_id = 7002, .table_name = "other" },
+    };
+    const reverse = [_]ProvisionedTableWriteSource.ReplicaRetirementTarget{
+        .{ .group_id = 7002, .table_name = "other" },
+        .{ .group_id = 7001, .table_name = "docs" },
+    };
+    var first = try source.prepareReplicaRetirements(alloc, &forward);
+    defer first.deinit();
+    var second = try source.prepareReplicaRetirements(alloc, &reverse);
+    defer second.deinit();
+    try std.testing.expect(first.batch_created);
+    try std.testing.expect(!second.batch_created);
+    try std.testing.expectEqualStrings(first.batch_path.?, second.batch_path.?);
+    source.cancelPreparedReplicaRetirements(&second);
+    source.cancelPreparedReplicaRetirements(&first);
+
+    try std.testing.expectError(
+        error.DuplicateReplicaRetirementTarget,
+        source.prepareReplicaRetirements(alloc, &.{
+            .{ .group_id = 7001, .table_name = "docs" },
+            .{ .group_id = 7001, .table_name = "docs" },
+        }),
+    );
+}
+
+test "replica retirement recovery discards a legacy orphan whose catalog removal aborted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-aborted",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+    var persisted = try persistReplicaRetirementIntent(alloc, replica_root_dir, 7001);
+    defer persisted.deinit(alloc);
+    // Simulate a sidecar left by a rolling-upgrade predecessor.
+    {
+        var file = try fs_paths.createFilePortable(io_impl.io(), persisted.path, .{ .truncate = true });
+        defer file.close(io_impl.io());
+        var buffer: [128]u8 = undefined;
+        var writer = file.writer(io_impl.io(), &buffer);
+        var encoded_group_id: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_group_id, 7001, .little);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        checksum.update(replica_retirement_magic_v1);
+        checksum.update(&encoded_group_id);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(replica_retirement_magic_v1);
+        try writer.interface.writeAll(&encoded_group_id);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io_impl.io());
+    }
+    var loaded_legacy = try loadReplicaRetirementIntent(alloc, io_impl.io(), persisted.path);
+    defer loaded_legacy.deinit(alloc);
+    try std.testing.expect(loaded_legacy.legacy);
+
+    const Ownership = struct {
+        fn classify(_: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+            std.debug.assert(group_id == 7001);
+            return .retained;
+        }
+    };
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &source, .classify = Ownership.classify });
+
+    try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), persisted.path, .{}));
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+}
+
+test "hosted source publication recovers durable dropped-table intent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/hosted-drop-table-startup-recovery",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    defer closeHostedManagedDbCacheForRoot(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+    const intent_path = try persistDroppedTableRepairIntent(
+        alloc,
+        replica_root_dir,
+        "docs",
+        .{
+            .table_id = 7,
+            .expected_transition_generation = 1,
+            .group_ids = &.{7001},
+        },
+    );
+    defer alloc.free(intent_path);
+
+    // Router and executor are never consulted by cleanup recovery. Keeping
+    // them undefined makes the test fail immediately if that contract drifts.
+    var source = HostedProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+        undefined,
+        undefined,
+    );
+    _ = source.source();
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), intent_path, .{}));
+    const cache = hostedManagedDbCacheForRootIfPresent(replica_root_dir) orelse
+        return error.TestExpectedHostedCache;
+    try std.testing.expect(cache.drop_cleanup_source != null);
 }
 
 test "provisioned table write source drop table retires old publication authority" {
@@ -47103,7 +51462,7 @@ test "provisioned table write source drop table retires old publication authorit
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 
-    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+    _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
 
     // A same-name table with a different group incarnation must immediately be
     // eligible for live status; no deleted group can publish another release.
@@ -47125,27 +51484,6 @@ test "provisioned table write source drop table does not hold local db mutex dur
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
 
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
-                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
-                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
     const DropProbe = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
@@ -47162,7 +51500,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -47179,7 +51517,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
 
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
     source.backend_runtime = runtime.ptr();
     var probe = DropProbe{};
     test_before_drop_table_delete_hook = .{
@@ -47202,6 +51540,68 @@ test "provisioned table write source drop table does not hold local db mutex dur
     source.drainDroppedTableDeletes();
 
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path, .{}));
+}
+
+test "provisioned table drop scopes cache-open fence after activity drain and before callbacks" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-open-fence-scope",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.dropped_table_cleanup_outer_mutex = &write_cache.open_mutex;
+
+    const Probe = struct {
+        cache: *ProvisionedTableWriteCache,
+        before_structural_open_available: bool = false,
+        callback_open_available: bool = false,
+
+        fn beforeStructural(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.before_structural_open_available = self.cache.open_mutex.tryLock();
+            if (self.before_structural_open_available) self.cache.open_mutex.unlock();
+        }
+
+        fn onChange(
+            ptr: *anyopaque,
+            _: []const u8,
+            kind: ProvisionedTableWriteSource.LocalChangeKind,
+        ) void {
+            if (kind != .structural) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.callback_open_available = self.cache.open_mutex.tryLock();
+            if (self.callback_open_available) self.cache.open_mutex.unlock();
+        }
+    };
+    var probe = Probe{ .cache = &write_cache };
+    test_before_drop_table_structural_activity_hook = .{
+        .ptr = &probe,
+        .run = Probe.beforeStructural,
+    };
+    defer test_before_drop_table_structural_activity_hook = null;
+    source.setLocalChangeHook(.{ .ptr = &probe, .on_change = Probe.onChange });
+
+    _ = try source.source().dropTable(alloc, "docs", .{
+        .table_id = 7,
+        .expected_transition_generation = 1,
+        .group_ids = &.{7001},
+    });
+
+    try std.testing.expect(probe.before_structural_open_available);
+    try std.testing.expect(probe.callback_open_available);
 }
 
 test "provisioned table write source drop table waits for in-flight group batch on same table" {
@@ -47281,7 +51681,7 @@ test "provisioned table write source drop table waits for in-flight group batch 
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -47332,10 +51732,11 @@ test "provisioned table write source drop table closes schema-bearing cached wri
 
     const Catalog = struct {
         const schema = schema_json;
+        dropped: std.atomic.Value(bool) = .init(false),
 
-        fn iface() table_catalog.CatalogSource {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -47346,7 +51747,17 @@ test "provisioned table write source drop table closes schema-bearing cached wri
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.dropped.load(.acquire)) return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -47374,7 +51785,8 @@ test "provisioned table write source drop table closes schema-bearing cached wri
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.write_cache = &write_cache;
 
     var req = tables_api.CreateTableRequest{
@@ -47389,7 +51801,8 @@ test "provisioned table write source drop table closes schema-bearing cached wri
         .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"content\":\"body\"}" }},
         .sync_level = .write,
     });
-    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+    catalog.dropped.store(true, .release);
+    _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
@@ -47406,9 +51819,11 @@ test "provisioned table write source drop table waits for active read cache leas
     defer alloc.free(path);
 
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        dropped: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -47419,7 +51834,17 @@ test "provisioned table write source drop table waits for active read cache leas
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.dropped.load(.acquire)) return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -47458,18 +51883,21 @@ test "provisioned table write source drop table waits for active read cache leas
     defer read_cache.deinit();
     read_cache.lsm_cache = &lsm_cache;
 
-    var read_lease = try read_cache.getOrOpen(path, Catalog.iface(), 7001, 1, "docs");
+    var catalog = Catalog{};
+    var read_lease = try read_cache.getOrOpen(path, catalog.iface(), 7001, 1, "docs");
     var read_lease_active = true;
     defer if (read_lease_active) read_lease.release();
+    // Cleanup is admitted only after the committed catalog no longer owns the
+    // table or group. Keep the already-open read lease alive while advancing
+    // the fake projection to the post-drop state.
+    catalog.dropped.store(true, .release);
 
     const Probe = struct {
         entered: std.atomic.Value(bool) = .init(false),
-        release: std.atomic.Value(bool) = .init(false),
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
 
@@ -47478,14 +51906,15 @@ test "provisioned table write source drop table waits for active read cache leas
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
     };
 
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.read_cache = &read_cache;
+    source.drop_cleanup_read_drain_timeout_ns = 3 * std.time.ns_per_s;
 
     var probe = Probe{};
     test_before_drop_table_delete_hook = .{ .ptr = &probe, .run = Probe.run };
@@ -47493,18 +51922,37 @@ test "provisioned table write source drop table waits for active read cache leas
 
     var worker = DropWorker{ .source = &source };
     const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
 
-    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    // Observe the actual exclusive-cache barrier before checking deletion.
+    // A fixed sleep can false-pass when the worker has not been scheduled.
+    const barrier_deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    var barrier_observed = false;
+    while (platform_time.monotonicNs() < barrier_deadline_ns) {
+        barrier_observed = read_cache.testingExclusiveTableAccessActive("docs");
+        if (barrier_observed) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    if (!barrier_observed) {
+        read_lease.release();
+        read_lease_active = false;
+        thread.join();
+        thread_joined = true;
+        if (worker.err) |err| return err;
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expect(!probe.entered.load(.acquire));
 
     read_lease.release();
     read_lease_active = false;
-    while (!probe.entered.load(.acquire)) {
-        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    probe.release.store(true, .release);
+    // The production drain contract bounds this join even if lease retirement
+    // regresses. The hook is observation-only, so the test itself cannot
+    // manufacture an unbounded worker lifetime.
     thread.join();
+    thread_joined = true;
     if (worker.err) |err| return err;
+    try std.testing.expect(probe.entered.load(.acquire));
 }
 
 test "provisioned table write source backup releases read cache exclusive before native snapshot copy" {
@@ -49509,6 +53957,7 @@ test "hosted status-only open drains stale pending close before retry" {
 
     var generation: u64 = 0;
     var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    try std.testing.expect(source.source().vtable.drop_table != null);
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
@@ -50560,6 +55009,9 @@ test "HA seed preflight drains writer released after promotion cache clear befor
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -51690,4 +56142,16 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
     try std.testing.expectEqual(@as(usize, 2), legacy_executor.requests);
     try std.testing.expectEqual(@as(usize, 1), legacy_executor.routed_requests);
     try std.testing.expectEqual(@as(usize, 1), legacy_executor.legacy_requests);
+}
+
+test "publishing a provisioned write adapter does not start pointer-capturing recovery work" {
+    var source = ProvisionedTableWriteSource.init(
+        ".zig-cache/tmp/source-publication-must-be-side-effect-free",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+
+    _ = source.source();
+    try std.testing.expect(!source.dropped_table_recovery_started.load(.acquire));
+    try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
 }

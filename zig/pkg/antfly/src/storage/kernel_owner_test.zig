@@ -781,7 +781,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     defer portable_backup.deinit();
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"group_id\":7001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner.afb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner/groups/7001.afb") != null);
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"artifact_sha256\"") != null);
 
     var native_backup = try owner.backupJson(

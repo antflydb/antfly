@@ -16,8 +16,11 @@
 //! owner and its opaque client. Keep backend types and implementation tests out
 //! of this module so consumers do not regain the physical storage graph.
 
+const std = @import("std");
 const metadata = @import("../domain.zig");
 const metadata_incarnation = @import("../incarnation.zig");
+const metadata_table_manager = @import("../table_manager.zig");
+const topology_protocol = @import("../topology_protocol.zig");
 
 pub const AppliedMetadataBatch = struct {
     commit_index: u64,
@@ -27,9 +30,33 @@ pub const AppliedMetadataBatch = struct {
 pub const TableTransitionFence = struct {
     generation: u64 = 0,
     active_count: u32 = 0,
+    range_membership: topology_protocol.RangeMembershipAccumulator = .{},
 
     pub fn active(self: @This()) bool {
         return self.active_count != 0;
+    }
+
+    pub fn membership(self: @This(), table_id: u64) topology_protocol.RangeMembership {
+        return self.range_membership.finish(table_id);
+    }
+};
+
+pub const TableRestoreAdmission = struct {
+    expected_transition_generation: u64,
+    incarnation_generation: u64,
+    already_applied: bool,
+};
+
+pub const TableDropProjection = struct {
+    table: metadata.TableRecord,
+    fence: TableTransitionFence,
+    extension_owned: bool,
+    range_group_ids: []u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.range_group_ids);
+        metadata_table_manager.freeTable(alloc, self.table);
+        self.* = undefined;
     }
 };
 
@@ -74,13 +101,36 @@ pub const ProjectionSignal = struct {
 pub const ProjectionListener = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// When set, the apply store brackets the durable commit and synchronous
+    /// notification for matching projection changes with this listener's
+    /// barrier callbacks. Correctness-sensitive consumers use this to
+    /// serialize a short external publication step with the authoritative
+    /// projection commit; ordinary listeners remain notification-only.
+    commit_barrier_kind: ?ProjectionSignalKind = null,
 
     pub const VTable = struct {
         on_projection_signal: *const fn (ptr: *anyopaque, signal: ProjectionSignal) void,
+        before_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
+        after_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn onProjectionSignal(self: ProjectionListener, signal: ProjectionSignal) void {
         self.vtable.on_projection_signal(self.ptr, signal);
+    }
+
+    pub fn beginCommitBarrier(self: ProjectionListener) void {
+        if (self.vtable.before_projection_commit) |begin| begin(self.ptr);
+    }
+
+    pub fn endCommitBarrier(self: ProjectionListener) void {
+        if (self.vtable.after_projection_commit) |end| end(self.ptr);
+    }
+
+    pub fn validate(self: ProjectionListener) !void {
+        const configured = self.commit_barrier_kind != null;
+        if ((self.vtable.before_projection_commit != null) != configured or
+            (self.vtable.after_projection_commit != null) != configured)
+            return error.InvalidProjectionCommitBarrier;
     }
 };
 

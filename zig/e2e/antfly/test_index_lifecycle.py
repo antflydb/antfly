@@ -24,7 +24,7 @@ from urllib.parse import quote
 import pytest
 import requests
 
-from conftest import ready_index_status
+from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -218,6 +218,68 @@ def test_ready_index_status_requires_current_coverage_observation():
     }
     assert ready_index_status(ready_status) is ready_status["status"]
 
+    canonical_ready = json.loads(json.dumps(ready_status))
+    canonical_ready["status"]["backfill_state"] = "ready"
+    canonical_ready["status"]["readiness"] = {
+        "state": "ready",
+        "queryable": True,
+        "complete": True,
+        "incarnation": "g-0000000000000001",
+        "published_revision": 12,
+        "target_revision": 12,
+        "pending_reasons": [],
+    }
+    assert ready_index_status(canonical_ready) is canonical_ready["status"]
+
+    canonical_without_receipt = json.loads(json.dumps(canonical_ready))
+    canonical_without_receipt["status"]["readiness"].pop("published_revision")
+    canonical_without_receipt["status"]["readiness"].pop("target_revision")
+    assert (
+        ready_index_status(canonical_without_receipt)
+        is canonical_without_receipt["status"]
+    )
+
+    for state, queryable in (
+        ("pending", False),
+        ("queryable_partial", True),
+        ("failed", False),
+    ):
+        incomplete = json.loads(json.dumps(canonical_ready))
+        incomplete["status"]["readiness"].update(
+            state=state, queryable=queryable, complete=False
+        )
+        assert ready_index_status(incomplete) is None
+
+    stale_receipt = json.loads(json.dumps(canonical_ready))
+    stale_receipt["status"]["readiness"]["published_revision"] = 11
+    assert ready_index_status(stale_receipt) is None
+
+    for malformed in (None, "ready", [], True):
+        invalid = json.loads(json.dumps(ready_status))
+        invalid["status"]["backfill_state"] = "ready"
+        invalid["status"]["readiness"] = malformed
+        with pytest.raises(IndexReadinessProtocolError, match="status.readiness"):
+            ready_index_status(invalid)
+
+    for field, value in (
+        ("state", "future_state"),
+        ("queryable", 1),
+        ("complete", None),
+        ("pending_reasons", "none"),
+        ("published_revision", True),
+        ("target_revision", "12"),
+    ):
+        invalid = json.loads(json.dumps(canonical_ready))
+        invalid["status"]["readiness"][field] = value
+        with pytest.raises(IndexReadinessProtocolError, match=field):
+            ready_index_status(invalid)
+
+    for missing_field in ("published_revision", "target_revision"):
+        invalid = json.loads(json.dumps(canonical_ready))
+        invalid["status"]["readiness"].pop(missing_field)
+        with pytest.raises(IndexReadinessProtocolError, match="provided together"):
+            ready_index_status(invalid)
+
     stale_incarnation = json.loads(json.dumps(ready_status))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False
     stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
@@ -238,6 +300,9 @@ def test_ready_index_status_requires_current_coverage_observation():
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
+        ("backfill_state", "failed"),
+        ("backfill_state", "running"),
+        ("backfill_state", "retrying"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),
@@ -2509,12 +2574,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
         reason=f"serverless republish did not reach head version {target_head_version}",
     )
 
-    semantic_b = serverless_api.get_index(table_name, "semantic_b")
-    sparse_a = serverless_api.get_index(table_name, "sparse_a")
-    sparse_b = serverless_api.get_index(table_name, "sparse_b")
-    assert ready_index_status(semantic_b) is not None
-    assert ready_index_status(sparse_a) is not None
-    assert ready_index_status(sparse_b) is not None
+    serverless_api.wait_index_ready(table_name, "semantic_b")
+    serverless_api.wait_index_ready(table_name, "sparse_a")
+    serverless_api.wait_index_ready(table_name, "sparse_b")
 
 
 def test_serverless_same_name_dense_index_update_republishes_head(serverless_api):
@@ -2642,7 +2704,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(detail) is not None
+    serverless_api.wait_index_ready(table_name, "semantic_idx")
 
 
 def test_serverless_build_status_reports_head_actions_for_text_only_updates(
@@ -2900,5 +2962,5 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
     assert active_index["status"]["head_publication_action"] == "reuse"
     assert next_index["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(active_index) is not None
-    assert ready_index_status(next_index) is not None
+    serverless_api.wait_index_ready(table_name, "full_text_index_v0")
+    serverless_api.wait_index_ready(table_name, "full_text_index_v1")

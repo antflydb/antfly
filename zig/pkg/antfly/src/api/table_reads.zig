@@ -758,6 +758,17 @@ const PhysicalProvisionedTableReadCache = struct {
     }
 
     pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
+        return self.beginExclusiveTableAccessWithDeadline(
+            table_name,
+            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+        );
+    }
+
+    pub fn beginExclusiveTableAccessWithDeadline(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !ExclusiveTableAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         errdefer self.mutex.unlock(io);
@@ -780,14 +791,20 @@ const PhysicalProvisionedTableReadCache = struct {
             self.hasTableLocked(table_name) or
             self.hasRetiredEntryForTableLocked(table_name))
         {
-            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
-            if (waited_ns >= exclusive_wait_timeout_ns) {
+            const now_ns = platform_time.monotonicNs();
+            const waited_ns = now_ns -| drain_started_ns;
+            if (now_ns >= deadline_ns) {
                 const pending_opens = self.pendingOpenCountForTableLocked(table_name);
                 const retired_entries = self.retiredEntryCountForTableLocked(table_name);
                 const active_leases = self.activeLeaseCountForTableLocked(table_name);
                 self.releaseExclusiveTableAccessLocked(table_name);
                 self.ready.broadcast(io);
-                std.log.err("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
+                // The caller retains durable convergence ownership and may
+                // retry this bounded drain. Treat timeout as actionable
+                // repair pressure, not process corruption: strict test and
+                // production error-log gates reserve `err` for invariants
+                // that cannot recover without operator intervention.
+                std.log.warn("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
                     table_name,
                     pending_opens,
                     retired_entries,
@@ -797,7 +814,7 @@ const PhysicalProvisionedTableReadCache = struct {
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
             self.mutex.lockUncancelable(io);
         }
         self.mutex.unlock(io);
@@ -809,6 +826,17 @@ const PhysicalProvisionedTableReadCache = struct {
     }
 
     pub fn beginExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) !ExclusiveGroupAccess {
+        return self.beginExclusiveGroupAccessWithDeadline(
+            group_id,
+            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+        );
+    }
+
+    pub fn beginExclusiveGroupAccessWithDeadline(
+        self: *ProvisionedTableReadCache,
+        group_id: u64,
+        deadline_ns: u64,
+    ) !ExclusiveGroupAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         errdefer self.mutex.unlock(io);
@@ -822,16 +850,15 @@ const PhysicalProvisionedTableReadCache = struct {
         self.removeEntriesForGroupLocked(group_id);
         self.ready.broadcast(io);
 
-        const drain_started_ns = platform_time.monotonicNs();
         while (self.hasPendingOpenForGroupLocked(group_id) or self.hasGroupLocked(group_id) or self.hasRetiredEntryForGroupLocked(group_id)) {
-            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
-            if (waited_ns >= exclusive_wait_timeout_ns) {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) {
                 self.releaseExclusiveGroupAccessLocked(group_id);
                 self.ready.broadcast(io);
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
             self.mutex.lockUncancelable(io);
         }
         self.mutex.unlock(io);
@@ -939,6 +966,17 @@ const PhysicalProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) bool {
         return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    pub fn testingExclusiveTableAccessActive(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        if (!builtin.is_test) @compileError("testingExclusiveTableAccessActive is test-only");
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.hasExclusiveTableAccessLocked(table_name);
     }
 
     fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
@@ -31135,6 +31173,15 @@ test "provisioned read cache exclusive access drains active read leases" {
 
     var lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs");
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    try std.testing.expectError(
+        error.TableReadDrainTimeout,
+        cache.beginExclusiveTableAccessWithDeadline(
+            "docs",
+            platform_time.monotonicNs() + 5 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 
     var ctx = ExclusiveThread{ .cache = &cache };
     const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
