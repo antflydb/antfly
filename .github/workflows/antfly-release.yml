@@ -51,6 +51,7 @@ jobs:
       channel: ${{ steps.identity.outputs.channel }}
       journal_key: ${{ steps.identity.outputs.journal_key }}
       npm_tag: ${{ steps.identity.outputs.npm_tag }}
+      publish_npm: ${{ steps.identity.outputs.publish_npm }}
       publish_pypi: ${{ steps.identity.outputs.publish_pypi }}
       publish_homebrew: ${{ steps.identity.outputs.publish_homebrew }}
       container_alias: ${{ steps.identity.outputs.container_alias }}
@@ -512,6 +513,7 @@ jobs:
     needs:
       - prepare-release-promotion
       - begin-release-channel
+    if: ${{ needs.prepare-release-promotion.outputs.publish_npm == 'true' }}
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -703,6 +705,7 @@ jobs:
             --expected-version "$PYTHON_PACKAGE_VERSION" \
             --out-dir "$RUNNER_TEMP/pypi-preflight"
       - name: Preflight every immutable npm package
+        if: ${{ needs.prepare-release-promotion.outputs.publish_npm == 'true' }}
         env:
           NPM_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}
           NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
@@ -833,7 +836,7 @@ jobs:
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
-          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-cli-npm.result == 'success' || needs.publish-cli-npm.result == 'skipped') &&
           (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
           needs.stage-container.result == 'success' }}
@@ -971,7 +974,7 @@ jobs:
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
-          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-cli-npm.result == 'success' || needs.publish-cli-npm.result == 'skipped') &&
           needs.promote-channel-aliases.result == 'success' &&
           needs.prepare-release-promotion.outputs.github_release != 'none' }}
     runs-on: arc-antfly-standard
@@ -1007,7 +1010,7 @@ jobs:
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
-          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-cli-npm.result == 'success' || needs.publish-cli-npm.result == 'skipped') &&
           (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           needs.promote-channel-aliases.result == 'success' &&
           needs.stage-container.result == 'success' &&
@@ -1064,6 +1067,7 @@ jobs:
             --ledger-sha256 "$LEDGER_SHA256")"
           test "$observed" = "$CONTAINER_DIGEST"
       - name: Verify npm channel aliases before committing the journal
+        if: ${{ needs.prepare-release-promotion.outputs.publish_npm == 'true' }}
         env:
           NPM_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}
           NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}

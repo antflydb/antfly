@@ -64,7 +64,8 @@ consumers.
    controller that built the artifacts. Promotion records a second, distinct
    `promotion_controller_commit`; every privileged job checks out that one
    workflow revision. The controller then verifies the
-   complete release bundle before promoting its CLI scope to PyPI and npm, its
+   complete release bundle before promoting its CLI scope to policy-selected
+   package registries, its
    GNU runtime scope to the single container image, and stable archives to
    Homebrew. The controller first performs a read-only channel precedence
    preflight. Container images are built under run-scoped staging tags,
@@ -81,9 +82,9 @@ consumers.
    to the digest-verified ledger, and every downstream check and publisher
    consumes those sealed projections, including legacy recovery, rather than
    parsing the release tag again.
-   npm `latest`, `next`, or `nightly`, plus the channel's container and R2
+   npm `latest` or `next` when enabled, plus the channel's container and R2
    aliases and policy-selected GitHub visibility, are committed through
-   compare-and-swap channel transactions. PyPI and Homebrew are omitted for
+   compare-and-swap channel transactions. npm, PyPI, and Homebrew are omitted for
    nightlies. Immediately before committing the journal, the controller reads
    back every configured projection: all npm dist-tags, the exact PyPI file set
    when enabled, Homebrew when enabled, the R2 alias, GitHub publication mode,
@@ -94,7 +95,7 @@ consumers.
    bootstrap at `latest/install.sh` that resolves the pointer and delegates to
    the immutable, versioned installer. Legacy alias objects are removed before
    the metadata pointer moves.
-   npm additionally verifies the requested dist-tag, so retries cannot conceal
+   When enabled, npm additionally verifies the requested dist-tag, so retries cannot conceal
    content or channel drift. Recovery restores the permanently recorded digest
    from either retention registry and fails if both copies are gone. It never
    rebuilds a permanently recorded container identity.
@@ -103,6 +104,21 @@ consumers.
    tooling from `source_commit`.
    Native archives remain available under
    `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
+
+Stable and RC releases publish the verified CLI packages to npm and PyPI.
+Nightlies build and ledger-verify those same packages, but publish only the R2
+release payload and container image; package registries are not used as
+snapshot storage.
+
+Release-object retention is journal-aware. Stable releases are permanent;
+nightlies are retained for 30 days or for the newest 10 snapshots, whichever
+keeps more; and RC/alpha/beta artifacts remain until 90 days after the matching
+stable release is published. Channel `current` and `pending` identities always
+override those windows. `Release object retention` emits a read-only plan every
+Monday. A manual dispatch with `apply=true`, protected by the
+`container-publish` environment, recomputes the plan, verifies that channel
+journals and aliases did not change, and then removes version objects,
+unshared content-addressed objects, and their R2 container-identity record.
 
 For recovery, send the same repository dispatch with an existing release tag
 and the SHA-256 of its `artifacts.json` asset:
@@ -145,7 +161,8 @@ gh api --method POST repos/antflydb/antfly/dispatches \
 ```
 
 The channel contract is centralized in `scripts/release/channels.json` rather
-than encoded as version-string tests throughout the workflows.
+than encoded as version-string tests throughout the workflows. The same policy
+owns each channel's publication destinations and object-retention rule.
 `scripts/release/test.sh` is the canonical local and CI suite for packaging,
 installer, registry, recovery, and release-workflow contracts; it discovers all
 `test_*.py` modules under both `scripts/packaging` and `scripts/release`.
@@ -205,12 +222,12 @@ musl, and unknown Linux libc environments use the portable musl archive. Set
 preparing an installation for a different host. In automatic mode it also
 falls back to musl when an older release does not provide a GNU archive.
 
-For prerelease tags, npm uses the release version directly. Python wheels use
-PEP 440 equivalents, for example `v0.2.0-dev10` becomes `0.2.0.dev10`.
+For published prerelease tags, npm uses the release version directly. Python
+wheels use PEP 440 equivalents, for example `v0.2.0-rc.1` becomes `0.2.0rc1`.
 Stable npm releases publish with the `latest` dist-tag. Prerelease npm versions
 publish with the `next` dist-tag, so `npm install -g @antfly/cli` stays on the
-latest stable release and `npm install -g @antfly/cli@next` can install RC/dev
-builds.
+latest stable release and `npm install -g @antfly/cli@next` can install RC
+builds. Nightly package artifacts remain in R2 and have no npm dist-tag.
 
 It creates:
 

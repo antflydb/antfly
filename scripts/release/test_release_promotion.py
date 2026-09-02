@@ -95,6 +95,8 @@ class ReleasePromotionTests(unittest.TestCase):
         )
 
         self.assertEqual((stable_name, stable["npm_tag"]), ("stable", "latest"))
+        self.assertTrue(stable["publish_npm"])
+        self.assertEqual(stable["retention"], {"mode": "forever"})
         self.assertEqual(
             stable["bootstrap_sources"],
             ["github-latest", "npm", "object-storage", "homebrew"],
@@ -103,9 +105,17 @@ class ReleasePromotionTests(unittest.TestCase):
             stable["recovery_sources"], ["github-release", "object-storage"]
         )
         self.assertEqual((next_name, next_channel["npm_tag"]), ("next", "next"))
+        self.assertTrue(next_channel["publish_npm"])
+        self.assertEqual(next_channel["retention"]["grace_days"], 90)
         self.assertEqual(
             (nightly_name, nightly["npm_tag"], nightly["github_release"]),
-            ("nightly", "nightly", "none"),
+            ("nightly", None, "none"),
+        )
+        self.assertFalse(nightly["publish_npm"])
+        self.assertEqual(nightly["bootstrap_sources"], ["object-storage"])
+        self.assertEqual(
+            nightly["retention"],
+            {"mode": "age-and-count", "days": 30, "minimum_count": 10},
         )
         self.assertGreater(
             channels.compare_channel_tags(

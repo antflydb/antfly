@@ -86,8 +86,11 @@ credentials.
 4. The promotion controller separates the complete payload into
    ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
    exact scope membership, and every digest.
-5. npm, PyPI, the Homebrew formula, and the single multi-architecture container
-   image consume those verified scopes. The container publisher is callable
+5. Policy-selected package registries, the Homebrew formula, and the single
+   multi-architecture container image consume those verified scopes. Stable
+   and RC releases publish npm and PyPI packages; nightly builds verify the same
+   package snapshot but publish it only to R2 and the container registries. The
+   container publisher is callable
    only by this controller, checks out the recorded controller commit, and
    consumes the GNU runtime archives built from the source commit in step 2.
    Its Dockerfile, Cloud Build configuration, platform policy, and registry
@@ -101,7 +104,7 @@ credentials.
    rebuilds a recorded OCI identity. Semantic version tags are create-or-verify
    identities, while only channel tags are mutable aliases.
 6. Mutable install channels are transactions. After the build, a single
-   read-only gate verifies the complete PyPI file set, every npm package version
+   read-only gate verifies the configured PyPI file set, npm package versions
    and dist-tag, and every OCI version and architecture tag; it also requires
    the Homebrew input to be prepared successfully. The compare-and-swap
    transaction then reserves the complete ledger-and-container identity before
@@ -117,7 +120,7 @@ credentials.
    failed run must resume the same complete pending identity, and recovery
    cannot move a channel backward. Immediately before journal commit, the
    controller reads every policy-selected channel projection again and requires
-   npm, PyPI, Homebrew, R2, GitHub release state, GAR, and GHCR to agree with the
+   the enabled npm, PyPI, Homebrew, R2, GitHub release, GAR, and GHCR state to agree with the
    reserved identity. The journal is therefore a record of observed convergence,
    not merely an assertion that the publication steps ran.
 
@@ -130,7 +133,7 @@ they do not independently reinterpret canonical or legacy version spellings.
 
 Channel bootstrap is fail-closed and happens exactly once. Before creating a
 journal, the discovery controller reconciles every policy-selected,
-version-bearing projection: all four npm packages, the R2 object alias, stable
+version-bearing projection: all four npm packages when enabled, the R2 object alias, stable
 GitHub `latest`, and the stable Homebrew formula. Missing projections may be
 initialized, but present projections must name one identical release. After a
 journal exists it is the channel authority and every present completed
@@ -151,7 +154,7 @@ The permanent ledger-addressed record and OCI digest form the immutable
 container identity. Final convergence is stricter than bootstrap: a missing
 configured projection is a failed promotion, not empty state.
 
-npm platform packages publish before the top-level selector. Existing npm or
+When enabled, npm platform packages publish before the top-level selector. Existing npm or
 PyPI files are skipped only when their registry digest matches, and PyPI must
 contain exactly the ledger-defined filename-to-digest set before channel
 promotion can continue, so a partial publication is safe to retry without
@@ -205,8 +208,8 @@ promotion.
 The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
 in `scripts/release/platforms.json`; channel behavior lives in
 `scripts/release/channels.json`. Release jobs, CLI packaging, Homebrew, and
-promotion read those policies instead of maintaining independent conditionals
-or platform tables. Python
+promotion and retention read those policies instead of maintaining independent
+conditionals or platform tables. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
 Every workflow declares an explicit `GITHUB_TOKEN` permission baseline, and all
@@ -265,6 +268,15 @@ a local convenience.
   channel payload. The release workflow
   currently uses the S3-compatible path for Cloudflare R2, but the script also
   has GCS and local modes for future storage backends and dry-run smoke tests.
+- `release_gc.py` plans retention from immutable ledgers plus channel journals.
+  It fails closed on malformed state, permanently marks stable and channel
+  `current`/`pending` releases, retains nightlies for 30 days or the newest 10,
+  and retains prereleases until 90 days after their matching stable release.
+  Its sweep removes only expired version objects, content-addressed objects not
+  shared by a retained ledger, and the corresponding R2 container-identity
+  record. The weekly workflow stores a dry-run plan; an explicitly approved
+  manual run recomputes and applies it inside the release-promotion concurrency
+  boundary.
 
 ## Version Behavior
 
@@ -310,11 +322,31 @@ container `latest` tag.
 Nightly snapshots publish:
 
 - immutable R2 release artifacts and the `nightly` R2 metadata pointer
-- npm CLI packages with dist-tag `nightly`
 - container tags `<version>` and `nightly`
 
-Nightlies do not publish to PyPI or Homebrew and do not create GitHub Releases.
-Their immutable recovery source is R2.
+Nightlies do not publish to npm, PyPI, or Homebrew and do not create GitHub
+Releases. Their immutable recovery source is R2. npm tarballs and Python wheels
+are still produced and ledger-verified by the common build, but are retained as
+release artifacts rather than published package-registry versions.
+
+## Object Retention
+
+Stable R2 releases are retained forever. A nightly remains recoverable for at
+least 30 days and the newest 10 nightlies are retained regardless of age.
+Prereleases remain until a matching stable release exists and has aged 90 days.
+The current and pending identities in every channel journal, plus each mutable
+R2 metadata alias, are always protected.
+
+`.github/workflows/antfly-release-gc.yml` computes and archives a plan weekly
+without deleting anything. To inspect a plan immediately, dispatch `Release
+object retention` with its default `apply=false`. To apply retention, dispatch
+it with `apply=true`; the protected `container-publish` environment gates the
+operation. Application recomputes rather than trusting an uploaded plan and
+checks the journal and alias ETags immediately before deleting. The GC never
+deletes stable releases, shared content-addressed objects, npm/PyPI versions, or
+OCI registry tags. Registry-native lifecycle policies may independently remove
+temporary run-scoped container staging tags, while permanent ledger tags remain
+the container recovery roots.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.

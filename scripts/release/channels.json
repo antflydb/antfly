@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "channels": {
     "stable": {
       "tag_kind": "stable",
@@ -7,6 +7,7 @@
       "journal_key": "antfly/channels/stable.json",
       "bootstrap_sources": ["github-latest", "npm", "object-storage", "homebrew"],
       "npm_tag": "latest",
+      "publish_npm": true,
       "publish_pypi": true,
       "publish_homebrew": true,
       "container_alias": "latest",
@@ -15,7 +16,8 @@
         "install.sh": "scripts/release/install_bootstrap.sh"
       },
       "github_release": "latest",
-      "recovery_sources": ["github-release", "object-storage"]
+      "recovery_sources": ["github-release", "object-storage"],
+      "retention": {"mode": "forever"}
     },
     "next": {
       "tag_kind": "prerelease",
@@ -23,27 +25,31 @@
       "journal_key": "antfly/channels/next.json",
       "bootstrap_sources": ["npm", "object-storage"],
       "npm_tag": "next",
+      "publish_npm": true,
       "publish_pypi": true,
       "publish_homebrew": false,
       "container_alias": "next",
       "object_alias": "next",
       "object_static_files": {},
       "github_release": "prerelease",
-      "recovery_sources": ["github-release", "object-storage"]
+      "recovery_sources": ["github-release", "object-storage"],
+      "retention": {"mode": "after-stable", "grace_days": 90}
     },
     "nightly": {
       "tag_kind": "nightly",
       "ordering": "sequence",
       "journal_key": "antfly/channels/nightly.json",
-      "bootstrap_sources": ["npm", "object-storage"],
-      "npm_tag": "nightly",
+      "bootstrap_sources": ["object-storage"],
+      "npm_tag": null,
+      "publish_npm": false,
       "publish_pypi": false,
       "publish_homebrew": false,
       "container_alias": "nightly",
       "object_alias": "nightly",
       "object_static_files": {},
       "github_release": "none",
-      "recovery_sources": ["object-storage"]
+      "recovery_sources": ["object-storage"],
+      "retention": {"mode": "age-and-count", "days": 30, "minimum_count": 10}
     }
   }
 }

@@ -19,6 +19,7 @@ REQUIRED_FIELDS = {
     "journal_key",
     "bootstrap_sources",
     "npm_tag",
+    "publish_npm",
     "publish_pypi",
     "publish_homebrew",
     "container_alias",
@@ -26,6 +27,7 @@ REQUIRED_FIELDS = {
     "object_static_files",
     "github_release",
     "recovery_sources",
+    "retention",
 }
 TAG_PATTERN = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\."
@@ -200,7 +202,7 @@ def compare_version_precedence(left: str, right: str) -> int:
 
 def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     policy = json.loads(path.read_text(encoding="utf-8"))
-    if policy.get("schema_version") != 3:
+    if policy.get("schema_version") != 4:
         raise SystemExit(f"unsupported release-channel schema in {path}")
     channels = policy.get("channels")
     if not isinstance(channels, dict) or set(channels) != CHANNEL_NAMES:
@@ -226,7 +228,9 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             raise SystemExit(f"release channel {name} has invalid bootstrap_sources")
         if channel["github_release"] not in {"latest", "prerelease", "none"}:
             raise SystemExit(f"release channel {name} has invalid GitHub mode")
-        expected_bootstrap_sources = {"npm", "object-storage"}
+        expected_bootstrap_sources = {"object-storage"}
+        if channel["publish_npm"]:
+            expected_bootstrap_sources.add("npm")
         if channel["github_release"] == "latest":
             expected_bootstrap_sources.add("github-latest")
         if channel["publish_homebrew"]:
@@ -260,7 +264,7 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
                 f"release channel {name} has invalid or duplicate journal_key"
             )
         journal_keys.add(journal_key)
-        for flag in ("publish_pypi", "publish_homebrew"):
+        for flag in ("publish_npm", "publish_pypi", "publish_homebrew"):
             if not isinstance(channel[flag], bool):
                 raise SystemExit(f"release channel {name} has invalid {flag}")
         static_files = channel["object_static_files"]
@@ -284,6 +288,12 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             ("object-storage", "object_alias"),
         ):
             alias = channel[field]
+            if sink == "npm" and not channel["publish_npm"]:
+                if alias is not None:
+                    raise SystemExit(
+                        f"release channel {name} has an npm_tag while npm is disabled"
+                    )
+                continue
             if not isinstance(alias, str) or not re.fullmatch(
                 r"[a-z][a-z0-9-]*", alias
             ):
@@ -306,12 +316,39 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     nightly = channels["nightly"]
     if (
         nightly["ordering"] != "sequence"
+        or nightly["publish_npm"]
         or nightly["publish_pypi"]
         or nightly["publish_homebrew"]
         or nightly["github_release"] != "none"
         or nightly["recovery_sources"] != ["object-storage"]
     ):
         raise SystemExit("nightly channel must be snapshot-only")
+    stable_retention = channels["stable"]["retention"]
+    next_retention = channels["next"]["retention"]
+    nightly_retention = nightly["retention"]
+    if stable_retention != {"mode": "forever"}:
+        raise SystemExit("stable channel must be retained forever")
+    if (
+        not isinstance(next_retention, dict)
+        or set(next_retention) != {"mode", "grace_days"}
+        or next_retention["mode"] != "after-stable"
+        or isinstance(next_retention["grace_days"], bool)
+        or not isinstance(next_retention["grace_days"], int)
+        or next_retention["grace_days"] < 0
+    ):
+        raise SystemExit("next channel has invalid retention")
+    if (
+        not isinstance(nightly_retention, dict)
+        or set(nightly_retention) != {"mode", "days", "minimum_count"}
+        or nightly_retention["mode"] != "age-and-count"
+        or isinstance(nightly_retention["days"], bool)
+        or not isinstance(nightly_retention["days"], int)
+        or nightly_retention["days"] < 0
+        or isinstance(nightly_retention["minimum_count"], bool)
+        or not isinstance(nightly_retention["minimum_count"], int)
+        or nightly_retention["minimum_count"] < 1
+    ):
+        raise SystemExit("nightly channel has invalid retention")
     if channels["stable"]["object_static_files"] != {
         "install.sh": "scripts/release/install_bootstrap.sh"
     } or any(channels[name]["object_static_files"] for name in ("next", "nightly")):
@@ -401,6 +438,8 @@ def github_outputs(
     for key, value in channel.items():
         if isinstance(value, bool):
             result[key] = str(value).lower()
+        elif value is None:
+            result[key] = ""
         elif isinstance(value, list):
             result[key] = json.dumps(value, separators=(",", ":"))
         else:

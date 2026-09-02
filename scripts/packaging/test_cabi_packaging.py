@@ -114,6 +114,9 @@ class CAbiPackagingTests(unittest.TestCase):
         nightly_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-nightly.yml"
         ).read_text()
+        release_gc_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-release-gc.yml"
+        ).read_text()
         release_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-release.yml").read_text()
         container_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-container.yml").read_text()
         dev_publish = (REPO_ROOT / "scripts" / "publish-zig-runtime-dev.sh").read_text()
@@ -301,8 +304,13 @@ class CAbiPackagingTests(unittest.TestCase):
         channels = channel_policy["channels"]
         self.assertEqual(set(channels), {"stable", "next", "nightly"})
         self.assertEqual(channels["stable"]["npm_tag"], "latest")
+        self.assertTrue(channels["stable"]["publish_npm"])
         self.assertEqual(channels["next"]["container_alias"], "next")
+        self.assertTrue(channels["next"]["publish_npm"])
         self.assertEqual(channels["nightly"]["object_alias"], "nightly")
+        self.assertFalse(channels["nightly"]["publish_npm"])
+        self.assertEqual(channels["nightly"]["bootstrap_sources"], ["object-storage"])
+        self.assertEqual(channels["nightly"]["retention"]["minimum_count"], 10)
         self.assertFalse(channels["nightly"]["publish_pypi"])
         self.assertFalse(channels["nightly"]["publish_homebrew"])
         self.assertEqual(channels["nightly"]["github_release"], "none")
@@ -318,6 +326,10 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("v0.0.0-dev.${GITHUB_RUN_ID}", nightly_workflow)
         self.assertIn("name: antfly-build-request", nightly_workflow)
         self.assertIn('test "$channel" = nightly', build_controller_workflow)
+        self.assertIn("schedule:", release_gc_workflow)
+        self.assertEqual(release_gc_workflow.count("--apply"), 1)
+        self.assertIn("environment: container-publish", release_gc_workflow)
+        self.assertIn("group: antfly-release-promotion", release_gc_workflow)
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
