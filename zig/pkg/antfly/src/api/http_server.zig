@@ -36153,7 +36153,7 @@ test "api http server reports exhausted table mutation authority consistently" {
             return .{ .ptr = self, .vtable = &.{
                 .status = status,
                 .create_table = createTable,
-                .drop_table = dropTable,
+                .drop_table_exact = dropTableExact,
             } };
         }
 
@@ -36167,9 +36167,15 @@ test "api http server reports exhausted table mutation authority consistently" {
             return error.NotLeader;
         }
 
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+        fn dropTableExact(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !metadata_table_topology_mutations.DropResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.drop_calls += 1;
+            // This fixture models an exact backend rejection before Raft
+            // admission, so callers may safely retry it.
             return error.NotLeader;
         }
     };
