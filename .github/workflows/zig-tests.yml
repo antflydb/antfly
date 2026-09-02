@@ -183,49 +183,23 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob).github/workflows/*.yml' \
+            ':(glob).github/workflows/*.yaml' \
+            .github/dependabot.yml \
             scripts/install.sh \
             scripts/publish-zig-runtime-dev.sh \
             scripts/test_install_download_markers.sh \
             scripts/test_quickstart_docs.py \
-            scripts/packaging/package_cli_release.py \
-            scripts/packaging/render_homebrew_antfly_formula.py \
-            scripts/packaging/test_cabi_packaging.py \
-            scripts/packaging/build_zig_release_archive.sh \
-            scripts/release/build_cli_snapshot.py \
-            scripts/release/build_release_payload.py \
-            scripts/release/create_github_release.py \
-            scripts/release/discover_channel_tag.py \
-            scripts/release/download_objectstorage.py \
-            scripts/release/prepare_pypi_promotion.py \
-            scripts/release/publish_objectstorage.py \
-            scripts/release/channels.json \
-            scripts/release/platforms.json \
-            scripts/release/release_channels.py \
-            scripts/release/release_platforms.py \
-            scripts/release/release_channel_state.py \
-            scripts/release/registryctl.py \
-            ':(glob)scripts/release/registry/**' \
-            scripts/release/requirements.lock \
-            scripts/release/stage_release_source.py \
-            scripts/release/verify_cli_snapshot.py \
-            scripts/release/verify_release_ledger.py \
-            scripts/release/test_cli_snapshot.py \
-            scripts/release/test_pypi_promotion.py \
-            scripts/release/test_release_promotion.py \
-            scripts/release/test_registry.py \
+            ':(glob)scripts/packaging/**' \
+            ':(glob)scripts/release/**' \
             py/packages/cli/pyproject.toml \
             ':(glob)ts/packages/cli*/**' \
             docs/cli-packaging.md \
             docs/guides/quickstart.mdx \
             RELEASE.md \
+            zig/Dockerfile.runtime \
+            zig/cloudbuild.manifest.yaml \
             zig/cloudbuild.runtime.yaml \
-            .github/workflows/antfly-artifact-build.yml \
-            .github/workflows/antfly-container.yml \
-            .github/workflows/antfly-nightly.yml \
-            .github/workflows/antfly-release-build-controller.yml \
-            .github/workflows/antfly-release-build.yml \
-            .github/workflows/antfly-release.yml \
-            .github/workflows/cli-package.yml \
             .github/workflows/zig-tests.yml
           then
             echo "release_tooling=false" >> "$GITHUB_OUTPUT"
@@ -253,6 +227,8 @@ jobs:
           python3 scripts/release/test_pypi_promotion.py
           python3 scripts/release/test_release_promotion.py
           python3 scripts/release/test_registry.py
+          python3 scripts/release/test_workflow_actions.py
+          python3 scripts/release/validate_workflow_actions.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 

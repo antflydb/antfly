@@ -39,7 +39,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.build_controller_commit }}
           fetch-depth: 0
@@ -88,7 +88,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.source_commit }}
           submodules: true
@@ -156,7 +156,7 @@ jobs:
             --metal "${{ matrix.metal }}" \
             --system-blas "${{ matrix.system_blas }}"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/release-archives/*.tar.gz
@@ -177,7 +177,7 @@ jobs:
     needs: release-plan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.release-plan.outputs.build_controller_commit }}
           fetch-depth: 0
@@ -187,7 +187,7 @@ jobs:
           python scripts/release/stage_release_source.py \
             --commit "${{ inputs.source_commit }}" \
             --out-dir dist/release-source
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-release-source
           path: dist/release-source/
@@ -202,7 +202,7 @@ jobs:
       - package-release-source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.release-plan.outputs.build_controller_commit }}
       - name: Write request
@@ -219,7 +219,7 @@ jobs:
             --source-commit "$SOURCE_COMMIT" \
             --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
             > dist/release-request/release-request.json
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-release-request
           path: dist/release-request/release-request.json

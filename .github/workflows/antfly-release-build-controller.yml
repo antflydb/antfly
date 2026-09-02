@@ -26,11 +26,11 @@ jobs:
       channel: ${{ steps.request.outputs.channel }}
       build_controller_commit: ${{ steps.request.outputs.build_controller_commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: antfly-build-request
           path: dist/build-request

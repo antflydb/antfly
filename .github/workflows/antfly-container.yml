@@ -1,8 +1,8 @@
 name: Container build staging
 
-# This workflow is deliberately callable only. It creates run-scoped staging
-# images and returns their content digests; the release controller owns every
-# durable version and channel alias.
+# This workflow is deliberately callable only. It builds each OCI identity
+# once, retains it by ledger in two registries, and returns its content digest;
+# the release controller owns every public version and channel alias.
 on:
   workflow_call:
     inputs:
@@ -23,7 +23,7 @@ on:
         required: true
         type: string
       expected_digest:
-        description: "Journaled OCI digest that a recovery must reproduce"
+        description: "Journaled OCI digest that recovery must find in a retention registry"
         required: false
         default: ""
         type: string
@@ -54,8 +54,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.promotion_controller_commit }}
           fetch-depth: 0
@@ -84,7 +85,7 @@ jobs:
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
           git merge-base --is-ancestor "$PROMOTION_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: antfly-release-runtime-archives
           path: dist/release-archives
@@ -106,37 +107,54 @@ jobs:
 
       - name: Authenticate to Google Cloud
         id: auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
       - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
       - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
 
       - name: Authenticate staging container registry
         run: |
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
 
-      - name: Resolve an existing journaled candidate
+      - name: Authenticate secondary retention registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Recover an existing journaled candidate
         id: existing
         env:
           EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          mirror_image="ghcr.io/antflydb/antfly"
           reuse=false
           if [ -n "$EXPECTED_DIGEST" ]; then
             observed="$(python3 scripts/release/registryctl.py container-lookup \
-              --ref "${image}@${EXPECTED_DIGEST}")"
-            if [ -n "$observed" ]; then
-              test "$observed" = "$EXPECTED_DIGEST"
-              reuse=true
+              --ref "${gar_image}@${EXPECTED_DIGEST}")"
+            if [ -z "$observed" ]; then
+              mirror_observed="$(python3 scripts/release/registryctl.py container-lookup \
+                --ref "${mirror_image}@${EXPECTED_DIGEST}")"
+              if [ -z "$mirror_observed" ]; then
+                echo "journaled container digest is missing from both retention registries" >&2
+                echo "digest: $EXPECTED_DIGEST" >&2
+                exit 1
+              fi
+              test "$mirror_observed" = "$EXPECTED_DIGEST"
+              observed="$(python3 scripts/release/registryctl.py container-alias \
+                --source "${mirror_image}@${EXPECTED_DIGEST}" \
+                --destination "${gar_image}:release-ledger-${LEDGER_SHA256}")"
             fi
+            test "$observed" = "$EXPECTED_DIGEST"
+            reuse=true
           fi
           echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
 
@@ -223,7 +241,7 @@ jobs:
           fi
           image_digest="$(python3 scripts/release/registryctl.py container-digest --ref "$image_ref")"
           if [ -n "$EXPECTED_DIGEST" ] && [ "$image_digest" != "$EXPECTED_DIGEST" ]; then
-            echo "rebuilt container differs from journaled identity" >&2
+            echo "recovered container differs from journaled identity" >&2
             echo "expected: $EXPECTED_DIGEST" >&2
             echo "actual:   $image_digest" >&2
             exit 1
@@ -233,15 +251,21 @@ jobs:
             echo "image_digest=$image_digest"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Retain the digest-addressed candidate for recovery
+      - name: Retain the digest-addressed candidate in both registries
         env:
           IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
           IMAGE_DIGEST: ${{ steps.identity.outputs.image_digest }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
-          observed="$(python3 scripts/release/registryctl.py container-alias \
-            --source "$IMAGE_REF" \
-            --destination "${image}:release-ledger-${LEDGER_SHA256}")"
-          test "$observed" = "$IMAGE_DIGEST"
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          mirror_image="ghcr.io/antflydb/antfly"
+          for destination in \
+            "${gar_image}:release-ledger-${LEDGER_SHA256}" \
+            "${mirror_image}:release-ledger-${LEDGER_SHA256}"
+          do
+            observed="$(python3 scripts/release/registryctl.py container-alias \
+              --source "$IMAGE_REF" \
+              --destination "$destination")"
+            test "$observed" = "$IMAGE_DIGEST"
+          done

@@ -11,7 +11,7 @@
 #   _DESCRIPTION: OCI image description
 
 steps:
-  - name: gcr.io/cloud-builders/gsutil
+  - name: gcr.io/cloud-builders/gsutil@sha256:64abf8f7c7dec0b9806a9e4ff944b106dc3fd5c04cc4f7e67201abe7c3983e53
     id: fetch-runtime-artifact
     entrypoint: bash
     args:
@@ -29,7 +29,7 @@ steps:
         test -x "${_CONTEXT}/antfly"
         test -d "${_CONTEXT}/share/antfly"
 
-  - name: gcr.io/cloud-builders/docker
+  - name: gcr.io/cloud-builders/docker@sha256:e85f8f20f7b533e74a4b1be279b9ff2b45dcc20ab97de9b302c26715a9d9ffc8
     id: setup-buildx
     args:
       - buildx
@@ -37,8 +37,9 @@ steps:
       - --use
       - --name=runtime
       - --driver=docker-container
+      - --driver-opt=image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
 
-  - name: gcr.io/cloud-builders/docker
+  - name: gcr.io/cloud-builders/docker@sha256:e85f8f20f7b533e74a4b1be279b9ff2b45dcc20ab97de9b302c26715a9d9ffc8
     id: build-push
     entrypoint: bash
     args:

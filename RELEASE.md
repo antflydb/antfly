@@ -92,11 +92,12 @@ credentials.
    consumes the GNU runtime archives built from the source commit in step 2.
    Its Dockerfile, Cloud Build configuration, platform policy, and registry
    code are therefore controller-owned rather than source-provided. It first
-   builds run-scoped images, resolves the multi-platform OCI digest, and keeps
-   a ledger-addressed retention alias. If recovery already has a journaled
-   digest, staging first verifies that content still exists and otherwise
-   rebuilds it, rejecting any different result. Version and channel tags are
-   transaction-controlled aliases of the digest, not immutable records.
+   builds a run-scoped image once, resolves the multi-platform OCI digest, and
+   copies a ledger-addressed retention alias to both GAR and GHCR. Recovery
+   restores the journaled digest from either registry and fails if both copies
+   are gone; it never rebuilds an already-journaled OCI identity. Version and
+   channel tags are transaction-controlled aliases of the digest, not
+   immutable records.
 6. Mutable install channels are transactions. The compare-and-swap transaction
    begins before PyPI, npm, or public container publication, so a precedence
    or identity collision cannot be discovered after publishing a registry
@@ -149,10 +150,13 @@ digest, and consumes the verified GNU archives. Cloud Build uses an immutable
 source-commit-and-ledger-addressed artifact URI and has no mutable or
 ABI-ambiguous default input.
 
-Temporary run-scoped container tags are build staging only. The
-`release-ledger-<ledger digest>` tag retains the journaled content for recovery;
-`<version>` and channel tags remain transaction-controlled aliases. Registry
-retention may remove run-scoped staging tags after the release. There
+Temporary run-scoped container tags are build staging only. A
+`release-ledger-<ledger digest>` tag in both GAR and GHCR retains the journaled
+content for recovery; either copy can repair the other by digest. If both are
+lost, recovery fails explicitly instead of trying to reproduce bytes from
+mutable package repositories or build tools. `<version>` and channel tags
+remain transaction-controlled aliases. Registry retention may remove
+run-scoped staging tags after the release. There
 is deliberately no automatic rollback entry point for mutable channels. A
 rollback requires a separately reviewed administrative change to the channel
 journal and aliases, rather than disguising an old-release recovery as a new
@@ -165,6 +169,8 @@ promotion read those policies instead of maintaining independent conditionals
 or platform tables. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
+External GitHub Actions in the release trust boundary are pinned to full commit
+SHAs, enforced in CI, and advanced by reviewed Dependabot pull requests.
 
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:

@@ -32,7 +32,7 @@ jobs:
             --arg source_commit "$REQUESTED_COMMIT" \
             '{schema_version: 1, request_kind: "nightly", tag: $tag, source_commit: $source_commit, channel: "nightly"}' \
             > dist/build-request/build-request.json
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-build-request
           path: dist/build-request/build-request.json

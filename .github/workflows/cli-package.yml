@@ -25,7 +25,7 @@ jobs:
     name: Build CLI package artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.source_commit }}
 
@@ -40,17 +40,17 @@ jobs:
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Download native Zig runtime archives
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           pattern: antfly-zig-*
           merge-multiple: true
           path: dist/release-archives
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
@@ -106,7 +106,7 @@ jobs:
             --commit "${{ inputs.source_commit }}"
 
       - name: Upload immutable CLI snapshot
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot/

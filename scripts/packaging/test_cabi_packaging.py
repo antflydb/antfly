@@ -192,7 +192,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("--scope cli", release_workflow)
         self.assertIn("--scope runtime", release_workflow)
         self.assertIn("gh attestation verify", release_workflow)
-        self.assertIn("actions/attest-build-provenance@v3", release_workflow)
+        self.assertIn("actions/attest-build-provenance@", release_workflow)
         self.assertIn("--immutable-assets", release_workflow)
         self.assertIn("--content-addressed-prefix", release_workflow)
         self.assertIn("--signer-workflow", release_workflow)
@@ -209,6 +209,11 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("registryctl.py container-digest", container_workflow)
         self.assertIn("registryctl.py container-lookup", container_workflow)
         self.assertIn("release-ledger-${LEDGER_SHA256}", container_workflow)
+        self.assertIn('mirror_image="ghcr.io/antflydb/antfly"', container_workflow)
+        self.assertIn(
+            "journaled container digest is missing from both retention registries",
+            container_workflow,
+        )
         self.assertIn("expected_digest:", container_workflow)
         self.assertNotIn("registryctl.py container-ensure", container_workflow)
         self.assertNotIn('crane digest "$destination" 2>/dev/null || true', container_workflow)
@@ -216,6 +221,12 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("ref: ${{ inputs.source_commit }}", container_workflow)
         self.assertIn("release-build-${{ github.run_id }}", container_workflow)
         self.assertNotIn("Commit stable container aliases last", container_workflow)
+        runtime_cloudbuild = (REPO_ROOT / "zig" / "cloudbuild.runtime.yaml").read_text()
+        manifest_cloudbuild = (REPO_ROOT / "zig" / "cloudbuild.manifest.yaml").read_text()
+        self.assertIn("moby/buildkit@sha256:", runtime_cloudbuild)
+        self.assertIn("gcr.io/cloud-builders/gsutil@sha256:", runtime_cloudbuild)
+        self.assertIn("gcr.io/cloud-builders/docker@sha256:", runtime_cloudbuild)
+        self.assertIn("gcr.io/cloud-builders/docker@sha256:", manifest_cloudbuild)
         self.assertIn("needs: prepare-release-promotion", release_workflow)
         self.assertIn("group: antfly-release-promotion", release_workflow)
         self.assertIn("release_channel_state.py begin", release_workflow)
