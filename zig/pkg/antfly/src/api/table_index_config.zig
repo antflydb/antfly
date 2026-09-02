@@ -313,6 +313,50 @@ test "runtime index config strips catalog-only lifecycle metadata" {
     }
 }
 
+test "managed embedding catalog normalization persists stable producer identity" {
+    const alloc = std.testing.allocator;
+    const original =
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"validation\":\"defer_probe\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-a\"}}}";
+    const normalized = try normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        original,
+        .{ .inference_api_url = "http://127.0.0.1:1" },
+    );
+    defer alloc.free(normalized);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const semantic = parsed.value.object.get("semantic").?.object.get("semantic_producer").?;
+    try std.testing.expect(semantic == .string);
+    try std.testing.expect(std.mem.indexOf(u8, semantic.string, "http://127.0.0.1:1/ai/v1") != null);
+
+    const renormalized = try normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        normalized,
+        .{ .inference_api_url = "http://127.0.0.1:2" },
+    );
+    defer alloc.free(renormalized);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, alloc, renormalized, .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings(
+        semantic.string,
+        reparsed.value.object.get("semantic").?.object.get("semantic_producer").?.string,
+    );
+
+    const runtime_json = try extractIndexConfigJsonWithOptions(
+        alloc,
+        "semantic",
+        reparsed.value.object.get("semantic").?,
+        .{ .inference_api_url = "http://127.0.0.1:3" },
+    );
+    defer alloc.free(runtime_json);
+    var runtime = try std.json.parseFromSlice(std.json.Value, alloc, runtime_json, .{});
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings(
+        semantic.string,
+        runtime.value.object.get("semantic_producer").?.string,
+    );
+}
+
 test "graph index validation runs the runtime parser before catalog admission" {
     const alloc = std.testing.allocator;
 

@@ -611,7 +611,7 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                 const type_value = object.get("type") orelse break :blk null;
                 if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) break :blk null;
                 if (object.get("embedder") == null) break :blk null;
-                break :blk managed_embedder.embeddingSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options) catch |err| switch (err) {
+                break :blk managed_embedder.embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidEnrichmentConfig,
                 };

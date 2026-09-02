@@ -695,6 +695,8 @@ pub const AdminSource = struct {
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
         if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
         if (try extension_table_ownership.definitionMutationTouchesOwnedState(
             std.heap.page_allocator,
             &snapshot,
@@ -784,6 +786,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -816,6 +819,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -1205,6 +1209,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -1237,6 +1242,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }

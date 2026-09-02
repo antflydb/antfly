@@ -796,7 +796,10 @@ fn planStorageMemberDeltaAlloc(
         try managed_embedder.validateEmbeddingProducerOwnershipJsonWithOptions(
             alloc,
             owned_indexes_json.?,
-            .{ .require_owner_for_missing_producer = true },
+            .{
+                .require_owner_for_missing_producer = true,
+                .require_stable_owner_identity = true,
+            },
         );
         var updated_record = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, updated_record);
@@ -1097,6 +1100,96 @@ test "extension lifecycle rejects artifact embedding consumers without executabl
 
     try std.testing.expectError(
         error.MissingEmbeddingArtifactProducer,
+        planStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, &.{}, new_members[0..]),
+    );
+}
+
+test "extension lifecycle rejects duplicate executable artifact owners" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const new_members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "semantic",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .index,
+            .object_name = "owner_a",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedding_name\":\"dense_v1\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-a\"},\"semantic_producer\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-a\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}",
+        },
+        .{
+            .extension_name = "semantic",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .index,
+            .object_name = "owner_b",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedding_name\":\"dense_v1\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-b\"},\"semantic_producer\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-b\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}",
+        },
+        .{
+            .extension_name = "semantic",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "dense_v1",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}",
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        planStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, &.{}, new_members[0..]),
+    );
+}
+
+test "extension lifecycle requires stable identity for executable artifact owners" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const new_members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "semantic",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .index,
+            .object_name = "owner",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedding_name\":\"dense_v1\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"model-a\"}}",
+        },
+        .{
+            .extension_name = "semantic",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "dense_v1",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}",
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
         planStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, &.{}, new_members[0..]),
     );
 }
