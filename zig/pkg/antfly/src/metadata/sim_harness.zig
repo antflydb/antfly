@@ -2585,15 +2585,21 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn runRound(self: MetadataHttpNodeSimulation) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         _ = try self.sim().stepOnce();
         try self.cluster.refreshOwnedMetadataRuntimes(self.index);
     }
 
     pub fn serviceMetrics(self: MetadataHttpNodeSimulation) @TypeOf(self.sim().serviceMetrics()) {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return self.sim().serviceMetrics();
     }
 
     pub fn metadataStatus(self: MetadataHttpNodeSimulation) !metadata_service.MetadataStatus {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return try metadata_service.snapshotStatus(
             self.cluster.alloc,
             self.cluster.metadata_group_id,
@@ -2603,6 +2609,8 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn adminSnapshot(self: MetadataHttpNodeSimulation) !metadata_api.AdminSnapshot {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return try metadata_api.captureSnapshot(self.cluster.alloc, self);
     }
 
@@ -2610,6 +2618,8 @@ pub const MetadataHttpNodeSimulation = struct {
         self: MetadataHttpNodeSimulation,
         deadline_ns: ?u64,
     ) !metadata_api.CatalogRoutingSnapshot {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
         const projection = try store.captureCatalogProjection(
@@ -2701,10 +2711,14 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn status(self: MetadataHttpNodeSimulation, group_id: u64) raft_host.HostedReplicaStatus {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return self.sim().status(group_id);
     }
 
     pub fn campaignMetadataGroup(self: MetadataHttpNodeSimulation) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         if (self.sim().raftStatus(self.cluster.metadata_group_id)) |raft_status| {
             if (raft_status.soft.role == .leader) return;
         }
@@ -2712,6 +2726,8 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn campaignGroup(self: MetadataHttpNodeSimulation, group_id: u64) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         try self.sim().campaignGroup(group_id);
     }
 
@@ -3087,6 +3103,9 @@ pub const MetadataHttpNodeSimulation = struct {
     fn proposeTransitionCommands(self: MetadataHttpNodeSimulation, commands: []const metadata_storage.TransitionCommand) anyerror!void {
         if (commands.len == 0) return;
 
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
+
         self.cluster.metadata_proposal_in_flight += 1;
         defer self.cluster.metadata_proposal_in_flight -= 1;
 
@@ -3251,6 +3270,51 @@ const MetadataMergeTransitionFinalizedProgressContext = struct {
     fallback_index: usize,
 };
 
+/// Serializes every mutation of the deterministic cluster scheduler while
+/// allowing the scheduler's reconcile path to advance itself recursively on
+/// the same OS thread. A plain mutex cannot be used here: `stepAll` may renew a
+/// reconcile lease, whose proposal waits for another scheduler round.
+const SimulationSchedulerGate = struct {
+    mutex: std.Io.Mutex = .init,
+    owner_thread_id: std.atomic.Value(u64) = .init(0),
+    owner_valid: std.atomic.Value(bool) = .init(false),
+    contentions: std.atomic.Value(u64) = .init(0),
+    depth: usize = 0,
+
+    fn currentThreadId() u64 {
+        return @intCast(std.Thread.getCurrentId());
+    }
+
+    fn lock(self: *@This()) void {
+        const thread_id = currentThreadId();
+        if (self.owner_valid.load(.acquire)) {
+            if (self.owner_thread_id.load(.monotonic) == thread_id) {
+                self.depth += 1;
+                return;
+            }
+            _ = self.contentions.fetchAdd(1, .monotonic);
+        }
+
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        std.debug.assert(!self.owner_valid.load(.acquire));
+        self.owner_thread_id.store(thread_id, .monotonic);
+        self.depth = 1;
+        self.owner_valid.store(true, .release);
+    }
+
+    fn unlock(self: *@This()) void {
+        const thread_id = currentThreadId();
+        std.debug.assert(self.owner_valid.load(.acquire));
+        std.debug.assert(self.owner_thread_id.load(.monotonic) == thread_id);
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+        if (self.depth != 0) return;
+
+        self.owner_valid.store(false, .release);
+        self.mutex.unlock(std.Options.debug_io);
+    }
+};
+
 pub const MetadataHttpClusterSimulation = struct {
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
@@ -3268,6 +3332,7 @@ pub const MetadataHttpClusterSimulation = struct {
     backend_runtimes: []db_mod.background_runtime.BackendRuntimeHandle,
     linearizable_read_drivers: []PublicApiLinearizableReadDriver,
     manual_clock: *platform_clock.ManualClock,
+    scheduler_gate: SimulationSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
     next_reallocation_request_id: u128 = 1,
@@ -3451,11 +3516,15 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn startAll(self: *MetadataHttpClusterSimulation) !void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         for (self.linearizable_read_drivers) |*driver| driver.cluster = self;
         try self.registerVirtualNodes();
     }
 
     pub fn stopAll(self: *MetadataHttpClusterSimulation) void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         self.cluster.stopAll();
     }
 
@@ -3468,6 +3537,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn stepAll(self: *MetadataHttpClusterSimulation) anyerror!void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
         for (0..self.cluster.nodes.len) |i| {
@@ -3485,6 +3556,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         std.debug.assert(stalled_index < self.cluster.nodes.len);
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
@@ -3532,6 +3605,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn restartNode(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         const was_started = self.cluster.started;
         if (was_started) self.cluster.node(index).stop();
         self.cluster.nodes[index].deinit();
@@ -3767,6 +3842,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataHttpClusterSimulation, index: usize) anyerror!bool {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         const sim = self.cluster.node(index);
         const store = sim.runtime.svc.host.owned_metadata_store orelse return false;
         const now_ms = self.reconcile_leases[index].nowMs();
@@ -4277,6 +4354,8 @@ fn currentMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
 }
 
 fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
     var best_support: usize = 0;
     var best_term: u64 = 0;
@@ -4307,6 +4386,8 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
 }
 
 fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
     var best_last_index: u64 = 0;
     var best_commit: u64 = 0;
@@ -4331,6 +4412,8 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?
 }
 
 fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterSimulation, group_id: u64) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (sim.raftStatus(group_id)) |status| {
             if (status.soft.role == .leader) return index;
@@ -4747,8 +4830,11 @@ const PublicApiLinearizableReadProof = struct {
         self: @This(),
         expected_cluster: *MetadataHttpClusterSimulation,
     ) !MetadataHttpNodeSimulation {
-        if (self.cluster != expected_cluster or
-            self.node_index >= self.cluster.cluster.nodes.len or
+        if (self.cluster != expected_cluster)
+            return error.MetadataLinearizableReadTimeout;
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
+        if (self.node_index >= self.cluster.cluster.nodes.len or
             self.group_id != self.cluster.metadata_group_id)
             return error.MetadataLinearizableReadTimeout;
         const leader_index = self.cluster.currentMetadataLeaderIndex() orelse
@@ -4782,8 +4868,8 @@ const PublicApiLinearizableReadDriver = struct {
     fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
         return try std.fmt.bufPrint(
             buf,
-            "public-api-linearizable-read/{d}/{d}",
-            .{ self.node_index, sequence },
+            "public-api-linearizable-read/{x}/{d}/{d}",
+            .{ @intFromPtr(self), self.node_index, sequence },
         );
     }
 
@@ -4852,6 +4938,8 @@ const PublicApiLinearizableReadDriver = struct {
         self.ensure_mutex.lockUncancelable(std.Options.debug_io);
         defer self.ensure_mutex.unlock(std.Options.debug_io);
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
+        cluster.scheduler_gate.lock();
+        defer cluster.scheduler_gate.unlock();
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
@@ -4898,11 +4986,16 @@ const PublicApiLinearizableReadDriver = struct {
 
 test "public api linearizable read driver ignores a delayed earlier generation" {
     var driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    var peer_driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
     const group_id: u64 = 91;
 
     const earlier_sequence = try driver.activateRequest(group_id);
     var earlier_context_buf: [96]u8 = undefined;
     const earlier_context = try driver.requestContext(&earlier_context_buf, earlier_sequence);
+    const peer_sequence = try peer_driver.activateRequest(group_id);
+    var peer_context_buf: [96]u8 = undefined;
+    const peer_context = try peer_driver.requestContext(&peer_context_buf, peer_sequence);
+    try std.testing.expect(!std.mem.eql(u8, earlier_context, peer_context));
     try driver.observer().onReadStates(group_id, &.{.{
         .index = 7,
         .request_ctx = earlier_context,
@@ -11859,8 +11952,89 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     });
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try cluster.stepAll();
-    const initial_barrier_proof = try read_drivers[initial_leader].ensure();
+    const ConcurrentBarrierWorker = struct {
+        driver: *PublicApiLinearizableReadDriver,
+        start: *std.Io.Event,
+        entered: *std.atomic.Value(u32),
+        completed: *std.atomic.Value(u32),
+        proof: ?PublicApiLinearizableReadProof = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.start.waitUncancelable(std.Options.debug_io);
+            _ = self.entered.fetchAdd(1, .acq_rel);
+            self.proof = self.driver.ensure() catch |err| {
+                self.failure = err;
+                _ = self.completed.fetchAdd(1, .acq_rel);
+                return;
+            };
+            _ = self.completed.fetchAdd(1, .acq_rel);
+        }
+    };
+    var start: std.Io.Event = .unset;
+    var entered = std.atomic.Value(u32).init(0);
+    var completed = std.atomic.Value(u32).init(0);
+    var external_barrier = ConcurrentBarrierWorker{
+        .driver = &read_drivers[initial_leader],
+        .start = &start,
+        .entered = &entered,
+        .completed = &completed,
+    };
+    var internal_barrier = ConcurrentBarrierWorker{
+        .driver = &cluster.linearizable_read_drivers[initial_leader],
+        .start = &start,
+        .entered = &entered,
+        .completed = &completed,
+    };
+
+    // Hold the cluster lane until both independent drivers attempt their
+    // barriers. This deterministically proves that per-driver mutexes cannot
+    // bypass the shared scheduler gate, then lets both requests complete.
+    cluster.scheduler_gate.lock();
+    var scheduler_locked = true;
+    defer if (scheduler_locked) cluster.scheduler_gate.unlock();
+    const baseline_contentions = cluster.scheduler_gate.contentions.load(.acquire);
+    var external_thread = try std.Thread.spawn(
+        .{ .stack_size = lean_sim_thread_stack_size },
+        ConcurrentBarrierWorker.run,
+        .{&external_barrier},
+    );
+    var internal_thread = std.Thread.spawn(
+        .{ .stack_size = lean_sim_thread_stack_size },
+        ConcurrentBarrierWorker.run,
+        .{&internal_barrier},
+    ) catch |err| {
+        start.set(std.Options.debug_io);
+        cluster.scheduler_gate.unlock();
+        scheduler_locked = false;
+        external_thread.join();
+        return err;
+    };
+    start.set(std.Options.debug_io);
+    const concurrent_barrier_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while ((entered.load(.acquire) != 2 or
+        cluster.scheduler_gate.contentions.load(.acquire) < baseline_contentions + 2) and
+        platform_time.monotonicNs() < concurrent_barrier_deadline)
+    {
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    const both_barriers_entered = entered.load(.acquire) == 2;
+    const both_barriers_contended = cluster.scheduler_gate.contentions.load(.acquire) >= baseline_contentions + 2;
+    const both_barriers_blocked = completed.load(.acquire) == 0;
+    cluster.scheduler_gate.unlock();
+    scheduler_locked = false;
+    external_thread.join();
+    internal_thread.join();
+
+    try std.testing.expect(both_barriers_entered);
+    try std.testing.expect(both_barriers_contended);
+    try std.testing.expect(both_barriers_blocked);
+    try std.testing.expect(external_barrier.failure == null);
+    try std.testing.expect(internal_barrier.failure == null);
+    const initial_barrier_proof = external_barrier.proof orelse return error.TestUnexpectedResult;
+    const internal_barrier_proof = internal_barrier.proof orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(initial_leader, initial_barrier_proof.node_index);
+    try std.testing.expectEqual(initial_leader, internal_barrier_proof.node_index);
     try std.testing.expectEqual(
         initial_leader,
         (try initial_barrier_proof.authoritativeNode(&cluster)).index,
