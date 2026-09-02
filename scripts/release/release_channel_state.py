@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Begin or finish a compare-and-swap release-channel promotion."""
+"""Preflight, begin, or finish a compare-and-swap channel promotion."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from typing import Any
 from release_channels import (
     compare_channel_tags,
     load_policy,
-    validate_observed_channel_tag,
     validate_channel_tag,
+    validate_observed_channel_tag,
 )
 
 
@@ -123,26 +123,11 @@ def begin_promotion(
     bootstrap_current: str | None,
     channel: str = "stable",
 ) -> None:
-    policy = load_policy()
-    # The candidate was validated when its identity was created. Journal and
-    # registry state may contain legacy spellings and are observation-only.
-    validate_observed_channel_tag(identity["tag"], channel, policy)
     stored = store.load()
-    state = stored.document
-    stored_channel = state.get("channel")
-    if stored_channel not in {None, channel}:
-        raise SystemExit(
-            f"release channel journal belongs to {stored_channel}, not {channel}"
-        )
-    current = state.get("current")
-    pending = state.get("pending")
-    if current is not None and not (
-        isinstance(current, dict) and isinstance(current.get("tag"), str)
-    ):
-        raise SystemExit("release channel has malformed current identity")
-    if current is None and bootstrap_current:
-        validate_observed_channel_tag(bootstrap_current, channel, policy)
-        current = {"tag": bootstrap_current}
+    current = validate_promotion_state(
+        stored.document, identity, bootstrap_current, channel
+    )
+    pending = stored.document.get("pending")
     if pending is not None:
         if same_identity(pending, identity):
             print(f"resuming release channel promotion for {identity['tag']}")
@@ -167,6 +152,55 @@ def begin_promotion(
                 f"bound container digest to release channel promotion for {identity['tag']}"
             )
             return
+        raise AssertionError("validated pending promotion was not resumable")
+    next_state = {
+        "schema_version": 1,
+        "channel": channel,
+        "current": current,
+        "pending": identity,
+    }
+    store.compare_and_swap(stored, next_state)
+    print(f"began release channel promotion for {identity['tag']}")
+
+
+def validate_promotion_state(
+    state: dict[str, Any],
+    identity: dict[str, str],
+    bootstrap_current: str | None,
+    channel: str,
+) -> dict[str, Any] | None:
+    """Validate a candidate without reserving or changing channel state."""
+    policy = load_policy()
+    # The candidate was validated when its identity was created. Journal and
+    # registry state may contain legacy spellings and are observation-only.
+    validate_observed_channel_tag(identity["tag"], channel, policy)
+    stored_channel = state.get("channel")
+    if stored_channel not in {None, channel}:
+        raise SystemExit(
+            f"release channel journal belongs to {stored_channel}, not {channel}"
+        )
+    current = state.get("current")
+    pending = state.get("pending")
+    if current is not None and not (
+        isinstance(current, dict) and isinstance(current.get("tag"), str)
+    ):
+        raise SystemExit("release channel has malformed current identity")
+    if current is None and bootstrap_current:
+        validate_observed_channel_tag(bootstrap_current, channel, policy)
+        current = {"tag": bootstrap_current}
+    if pending is not None:
+        if same_identity(pending, identity):
+            return current
+        core_identity = {
+            key: value for key, value in identity.items() if key != "container_digest"
+        }
+        if (
+            "container_digest" in identity
+            and same_identity(pending, core_identity)
+            and isinstance(pending, dict)
+            and pending.get("container_digest") is None
+        ):
+            return current
         pending_tag = pending.get("tag") if isinstance(pending, dict) else pending
         raise SystemExit(
             f"release channel promotion for {pending_tag} is incomplete; resume it before {identity['tag']}"
@@ -199,14 +233,19 @@ def begin_promotion(
                 raise SystemExit(
                     f"release channel {identity['tag']} has a different {field}"
                 )
-    next_state = {
-        "schema_version": 1,
-        "channel": channel,
-        "current": current,
-        "pending": identity,
-    }
-    store.compare_and_swap(stored, next_state)
-    print(f"began release channel promotion for {identity['tag']}")
+    return current
+
+
+def preflight_promotion(
+    store: S3ChannelStore,
+    identity: dict[str, str],
+    bootstrap_current: str | None,
+    channel: str = "stable",
+) -> None:
+    validate_promotion_state(
+        store.load().document, identity, bootstrap_current, channel
+    )
+    print(f"release channel preflight passed for {identity['tag']}")
 
 
 def finish_promotion(
@@ -262,7 +301,9 @@ def journaled_container_digest(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("begin", "finish", "resolve-container"))
+    parser.add_argument(
+        "command", choices=("preflight", "begin", "finish", "resolve-container")
+    )
     parser.add_argument("--endpoint")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--key", default="antfly/channels/stable.json")
@@ -296,6 +337,8 @@ def main() -> int:
         if args.bootstrap_current:
             parser.error("resolve-container does not accept --bootstrap-current")
         print(journaled_container_digest(store, identity, args.channel) or "")
+    elif args.command == "preflight":
+        preflight_promotion(store, identity, args.bootstrap_current, args.channel)
     elif args.command == "begin":
         begin_promotion(store, identity, args.bootstrap_current, args.channel)
     else:

@@ -66,11 +66,13 @@ consumers.
    workflow revision. The controller then verifies the
    complete release bundle before promoting its CLI scope to PyPI and npm, its
    GNU runtime scope to the single container image, and stable archives to
-   Homebrew. The controller first reserves the compare-and-swap channel
-   transaction. Container images are built under run-scoped staging tags,
+   Homebrew. The controller first performs a read-only channel precedence
+   preflight. Container images are built under run-scoped staging tags,
    resolved to OCI digests, bound once to permanent ledger-addressed records,
-   retained by ledger aliases in GAR and GHCR, and then added to the pending
-   channel identity before any package or public alias is published. Semantic
+   and retained by ledger aliases in GAR and GHCR. A single read-only gate then
+   checks all immutable PyPI, npm, and OCI destinations and requires a
+   successfully prepared Homebrew input before the complete digest-bound
+   identity is reserved in the channel journal. Semantic
    version tags are create-or-verify and cannot move to another digest; only
    channel tags are mutable. Every copy reads from a digest-pinned source and
    is verified afterward.
@@ -81,7 +83,7 @@ consumers.
    npm additionally verifies the requested dist-tag, so retries cannot conceal
    content or channel drift. Recovery restores the permanently recorded digest
    from either retention registry and fails if both copies are gone. It never
-   rebuilds a journaled container identity.
+   rebuilds a permanently recorded container identity.
    Container assembly uses promotion-controller-owned Docker and
    Cloud Build inputs plus the verified GNU archives; it never executes release
    tooling from `source_commit`.

@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from registry.container import (
+    check_version,
     ensure_version,
     lookup_digest,
     optional_digest,
@@ -123,6 +124,24 @@ class ContainerRegistryTests(unittest.TestCase):
         ):
             ensure_version("registry/source:tag", "registry/dest:v1.2.3", runner)
         self.assertFalse(any(call[1] == "copy" for call in runner.calls))
+
+    def test_version_preflight_never_copies(self) -> None:
+        missing = FakeRunner(
+            [(0, f"{DIGEST}\n", ""), (1, "", "MANIFEST_UNKNOWN: manifest unknown")]
+        )
+        self.assertEqual(
+            check_version("registry/source:tag", "registry/dest:v1.2.3", missing),
+            DIGEST,
+        )
+        self.assertFalse(any(call[1] == "copy" for call in missing.calls))
+
+        different = f"sha256:{'b' * 64}"
+        conflict = FakeRunner([(0, f"{DIGEST}\n", ""), (0, f"{different}\n", "")])
+        with self.assertRaisesRegex(
+            RegistryError, "immutable container version differs"
+        ):
+            check_version("registry/source:tag", "registry/dest:v1.2.3", conflict)
+        self.assertFalse(any(call[1] == "copy" for call in conflict.calls))
 
     def test_expected_digest_is_checked_without_copying(self) -> None:
         runner = FakeRunner([(0, f"{DIGEST}\n", "")])

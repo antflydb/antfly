@@ -101,14 +101,29 @@ def ensure_version(
     source: str, destination: str, runner: Runner = subprocess.run
 ) -> str:
     """Create a version tag once, or verify an identical prior publication."""
-    expected = require_digest(source, runner)
-    existing = optional_digest(destination, runner)
+    expected, existing = _version_state(source, destination, runner)
     if existing is not None:
-        if existing != expected:
-            raise RegistryError(
-                f"immutable container version differs for {destination}: "
-                f"expected={expected} actual={existing}"
-            )
         return expected
     _copy(digest_reference(source, expected), destination, runner)
     return verify_digest(destination, expected, runner)
+
+
+def check_version(
+    source: str, destination: str, runner: Runner = subprocess.run
+) -> str:
+    """Verify that a version tag is absent or already has the intended digest."""
+    expected, _ = _version_state(source, destination, runner)
+    return expected
+
+
+def _version_state(
+    source: str, destination: str, runner: Runner
+) -> tuple[str, str | None]:
+    expected = require_digest(source, runner)
+    existing = optional_digest(destination, runner)
+    if existing is not None and existing != expected:
+        raise RegistryError(
+            f"immutable container version differs for {destination}: "
+            f"expected={expected} actual={existing}"
+        )
+    return expected, existing

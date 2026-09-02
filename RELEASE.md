@@ -92,25 +92,30 @@ credentials.
    consumes the GNU runtime archives built from the source commit in step 2.
    Its Dockerfile, Cloud Build configuration, platform policy, and registry
    code are therefore controller-owned rather than source-provided. The
-   controller reserves the channel transaction before building, resolves the
-   multi-platform OCI digest, and atomically creates a permanent
+   controller read-only preflights channel precedence before building, resolves
+   the multi-platform OCI digest, and atomically creates a permanent
    `antfly/container-identities/<ledger>.json` record before copying
    ledger-addressed retention aliases to GAR and GHCR. Recovery resolves that
    per-release record independently of the channel's current version, restores
    its digest from either registry, and fails if both copies are gone; it never
    rebuilds a recorded OCI identity. Semantic version tags are create-or-verify
    identities, while only channel tags are mutable aliases.
-6. Mutable install channels are transactions. The compare-and-swap transaction
-   begins before PyPI, npm, or public container publication, so a precedence
-   or identity collision cannot be discovered after publishing a registry
-   version. `scripts/release/channels.json`
+6. Mutable install channels are transactions. After the build, a single
+   read-only gate verifies the complete PyPI file set, every npm package version
+   and dist-tag, and every OCI version and architecture tag; it also requires
+   the Homebrew input to be prepared successfully. The compare-and-swap
+   transaction then reserves the complete ledger-and-container identity before
+   any PyPI, npm, Homebrew, or public container-tag write, so a known precedence or
+   immutable-identity collision cannot be discovered after publishing a
+   registry version. `scripts/release/channels.json`
    is the canonical policy for `stable`, `next`, and `nightly`: tag class,
    ordering rule, journal, package-registry eligibility, mutable aliases,
    GitHub visibility, and recovery source. Compare-and-swap journals in R2
    record each channel's `pending` and `current` release identity (tag, source
-   commit, release-ledger digest, and OCI image digest). A failed run must
-   resume the same pending identity, and recovery cannot move a channel
-   backward.
+   commit, release-ledger digest, and OCI image digest). Build and preflight
+   failures never create a pending transaction. After the commit boundary, a
+   failed run must resume the same complete pending identity, and recovery
+   cannot move a channel backward.
 
 Channel bootstrap is fail-closed. The discovery controller treats only an
 explicit missing release, package, or dist-tag as empty state; authentication,
@@ -199,8 +204,8 @@ scripts under `scripts/release/`:
   Stable and next use version precedence; nightly uses its monotonically
   increasing workflow-run sequence.
 - `release_channel_state.py` compare-and-swaps each channel journal, prevents
-  backward promotion, and makes an interrupted promotion resumable only by the
-  same release identity.
+  backward promotion, provides a read-only preflight, and makes an interrupted
+  commit resumable only by the same complete release identity.
 - `release_container_state.py` create-once binds each release ledger to its OCI
   digest independently of mutable channel history, so later recovery can find
   the original container without rebuilding it.
@@ -208,6 +213,8 @@ scripts under `scripts/release/`:
   container adapters. Provider behavior is tested with injected responses for
   missing objects, content drift, authentication and network failures, and
   post-copy verification.
+- `prepare_npm_promotion.py` read-only verifies every ledger-defined npm
+  package and required channel tag as part of the global publication gate.
 - `download_objectstorage.py` restores a nightly's exact ledger members from
   immutable object storage for recovery; the normal ledger and attestation
   verification still runs before promotion.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 
 from registry.container import (
+    check_version,
     ensure_version,
     optional_digest,
     promote_alias,
@@ -36,6 +37,10 @@ def main() -> int:
     command.add_argument("--source", required=True)
     command.add_argument("--destination", required=True)
 
+    command = subparsers.add_parser("container-version-check")
+    command.add_argument("--source", required=True)
+    command.add_argument("--destination", required=True)
+
     command = subparsers.add_parser("container-digest")
     command.add_argument("--ref", required=True)
 
@@ -56,6 +61,8 @@ def main() -> int:
             print(promote_alias(args.source, args.destination))
         elif args.command == "container-version":
             print(ensure_version(args.source, args.destination))
+        elif args.command == "container-version-check":
+            print(check_version(args.source, args.destination))
         elif args.command == "container-digest":
             print(require_digest(args.ref))
         elif args.command == "container-lookup":

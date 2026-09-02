@@ -333,6 +333,62 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
             channel.begin_promotion(store, older, None)
 
+    def test_channel_preflight_is_read_only_and_enforces_precedence(self) -> None:
+        channel = load_module(
+            "release_channel_preflight_test", "release_channel_state.py"
+        )
+
+        class MemoryStore:
+            def __init__(self) -> None:
+                self.document = {
+                    "schema_version": 1,
+                    "channel": "stable",
+                    "current": {"tag": "v1.2.2"},
+                    "pending": None,
+                }
+                self.writes = 0
+
+            def load(self):
+                return channel.StoredState(self.document, "1")
+
+            def compare_and_swap(self, _previous, _document: dict) -> None:
+                self.writes += 1
+
+        store = MemoryStore()
+        candidate = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        channel.preflight_promotion(store, candidate, "v1.2.2")
+        self.assertEqual(store.writes, 0)
+        older = channel.release_identity("v1.2.1", "4" * 40, "5" * 64)
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            channel.preflight_promotion(store, older, "v1.2.2")
+        self.assertEqual(store.writes, 0)
+
+    def test_channel_preflight_allows_an_exact_pending_resume(self) -> None:
+        channel = load_module(
+            "release_channel_preflight_pending_test", "release_channel_state.py"
+        )
+        pending = channel.release_identity(
+            "v1.2.3",
+            COMMIT,
+            "3" * 64,
+            container_digest=f"sha256:{'a' * 64}",
+        )
+
+        class MemoryStore:
+            def load(self):
+                return channel.StoredState(
+                    {
+                        "schema_version": 1,
+                        "channel": "stable",
+                        "current": {"tag": "v1.2.2"},
+                        "pending": pending,
+                    },
+                    "1",
+                )
+
+        core = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        channel.preflight_promotion(MemoryStore(), core, "v1.2.2")
+
     def test_stable_channel_blocks_a_different_incomplete_promotion(self) -> None:
         channel = load_module(
             "release_channel_pending_test", "release_channel_state.py"

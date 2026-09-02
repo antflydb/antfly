@@ -235,12 +235,32 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("needs: prepare-release-promotion", release_workflow)
         self.assertIn("group: antfly-release-promotion", release_workflow)
         self.assertIn("release_channel_state.py begin", release_workflow)
+        self.assertIn("release_channel_state.py preflight", release_workflow)
         self.assertIn("release_channel_state.py finish", release_workflow)
         self.assertIn("release_container_state.py resolve", release_workflow)
-        self.assertIn("bind-release-container:", release_workflow)
+        self.assertIn("preflight-release-channel:", release_workflow)
+        self.assertIn("preflight-publication:", release_workflow)
+        self.assertIn("prepare_npm_promotion.py", release_workflow)
         self.assertEqual(
-            release_workflow.count("registryctl.py container-version"), 4
+            release_workflow.count("registryctl.py container-version-check"), 4
         )
+        self.assertEqual(
+            release_workflow.count("registryctl.py container-version \\"), 4
+        )
+        stage_job = release_workflow.split("  stage-container:", 1)[1].split(
+            "\n  preflight-release-channel:", 1
+        )[0]
+        channel_preflight_job = release_workflow.split(
+            "  preflight-release-channel:", 1
+        )[1].split("\n  preflight-publication:", 1)[0]
+        begin_job = release_workflow.split("  begin-release-channel:", 1)[1].split(
+            "\n  promote-channel-aliases:", 1
+        )[0]
+        self.assertIn("- preflight-release-channel", stage_job)
+        self.assertIn("release_channel_state.py preflight", channel_preflight_job)
+        self.assertNotIn('--container-digest "$CONTAINER_DIGEST"', channel_preflight_job)
+        self.assertIn("- preflight-publication", begin_job)
+        self.assertIn('--container-digest "$CONTAINER_DIGEST"', begin_job)
         self.assertIn("Commit digest-pinned container version", release_workflow)
         self.assertIn('--container-digest "$CONTAINER_DIGEST"', release_workflow)
         self.assertIn("Commit the stable Homebrew formula", release_workflow)
