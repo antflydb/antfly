@@ -51,6 +51,7 @@ const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
+const extension_table_ownership = @import("../extensions/table_ownership.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
@@ -2136,7 +2137,14 @@ fn replaceTableDefinitionOnService(
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
     if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
-    if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
+    if (try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.heap.page_allocator,
+        &snapshot,
+        expected,
+        replacement,
+    )) return error.ExtensionOwnedObject;
 
     try svc.replaceTableDefinition(expected, replacement);
     try runPostMutationRound(svc);
@@ -2180,6 +2188,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
     try runPostMutationRound(svc);
 }
@@ -2192,6 +2201,8 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
@@ -2208,6 +2219,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
     try runPostMutationRound(svc);
 }
@@ -2221,6 +2233,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
     defer alloc.free(indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
@@ -9407,6 +9420,7 @@ pub const ApiHttpServer = struct {
             table_name,
             destination_authorizer,
         );
+        try self.validateRestoredManagedEmbeddingCatalog(self.alloc, manifest.indexes_json);
         const target_exists = try self.tableExists(table_name);
         if (replace_existing and !target_exists) return error.TableNotFound;
 
@@ -9551,6 +9565,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
+        try self.validateRestoredManagedEmbeddingCatalog(alloc, manifest.indexes_json);
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             return self.source.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, manifest) catch |err| {
@@ -9596,6 +9611,36 @@ pub const ApiHttpServer = struct {
             };
         }
         return false;
+    }
+
+    fn validateRestoredManagedEmbeddingCatalog(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+    ) !void {
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
     }
 
     const DistributedRestoreIntentState = enum { missing, pending, completed, conflicting };
@@ -12122,10 +12167,11 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
-        const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
             alloc,
             index_name,
             expanded_index_json,
+            table_before.indexes_json,
             .{
                 .antfly_provider = self.antfly_provider,
                 .io = self.inferenceIo(),
@@ -12136,6 +12182,11 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -12189,11 +12240,58 @@ pub const ApiHttpServer = struct {
         // Materialize catalog-owned fields once. The same exact config is sent
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
-        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+        const assembled_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
+        defer alloc.free(assembled_indexes_json);
+        // Opportunistically stamp stable producer identities onto legacy
+        // executable owners while the API still has the deployment context
+        // needed to resolve implicit endpoints.
+        const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
+            alloc,
+            assembled_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound => return error.ModelNotFound,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InvalidIndexRequest,
+        };
         defer alloc.free(expected_indexes_json);
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            expected_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound => return error.ModelNotFound,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
             error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -12215,13 +12313,25 @@ pub const ApiHttpServer = struct {
         // after all potentially expensive validation, but never claim a
         // canceled result once consensus may have committed the mutation.
         try ensureTableOperationActive(request);
-        self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
+        var replacement = table_before;
+        replacement.indexes_json = expected_indexes_json;
+        // Full-catalog validation above is meaningful only for the exact
+        // generation it inspected. Inline enrichments can depend on producers
+        // even when this index is not itself an artifact consumer, so every
+        // create-index mutation uses whole-definition compare-and-swap.
+        const mutation_result = self.source.replaceTableDefinition(table_before, replacement);
+        mutation_result catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public create index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -12323,6 +12433,14 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions,
+            => return error.DependencyConflict,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -12372,25 +12490,90 @@ pub const ApiHttpServer = struct {
             return error.InvalidEnrichmentRequest;
         };
         defer alloc.free(enrichment_json);
+        managed_embedder.validateEmbeddingEnrichmentProducerJsonWithOptions(
+            alloc,
+            enrichment_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
 
-        const expected_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
+        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
             else => return error.InternalFailure,
         };
+        defer alloc.free(assembled_indexes_json);
+        const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
+            alloc,
+            assembled_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InvalidEnrichmentRequest,
+        };
         defer alloc.free(expected_indexes_json);
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            expected_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound, error.EmbeddingProbeUnavailable, error.InvalidCreateTableRequest => return error.InvalidEnrichmentRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
             error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
             else => return error.InternalFailure,
         };
 
         try ensureTableOperationActive(request);
-        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+        var replacement = table_before;
+        replacement.indexes_json = expected_indexes_json;
+        self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
@@ -12430,7 +12613,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(expected_indexes_json);
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
-            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.DependencyConflict,
             else => return error.InternalFailure,
         };
 
@@ -12441,7 +12624,15 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions,
+            => return error.DependencyConflict,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 return error.InternalFailure;
@@ -13881,12 +14072,38 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
             else => return err,
         };
         if (request.indexes_json) |old| self.alloc.free(old);
         request.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
             return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| return switch (err) {
+            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment has no producer configuration"),
+            error.InvalidEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment producer is not runnable"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
+            else => return err,
+        };
 
         const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
             self.alloc,
@@ -16330,6 +16547,151 @@ fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
         \\    }
         \\  }
         \\}
+    );
+}
+
+test "restore admission rejects an embedding artifact catalog without an executable producer" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        server.validateRestoredManagedEmbeddingCatalog(
+            std.testing.allocator,
+            "{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}]},\"enrichments\":[{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]}",
+        ),
+    );
+
+    const duplicate_owner_catalog =
+        \\{"owner_a":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"openai","model":"model-a","url":"http://127.0.0.1:1"},"semantic_producer":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"owner_b":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"openai","model":"model-a","url":"http://127.0.0.1:1"},"semantic_producer":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"enrichments":[{"name":"dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        server.validateRestoredManagedEmbeddingCatalog(
+            std.testing.allocator,
+            duplicate_owner_catalog,
+        ),
+    );
+}
+
+test "exact replacement protects only changed extension-owned state" {
+    var members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "memory",
+            .object_kind = .table_schema,
+            .object_name = "docs_schema",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+        },
+        .{
+            .extension_name = "memory",
+            .object_kind = .index,
+            .object_name = "managed_text",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+        },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+        .extension_members = members[0..],
+    };
+    const expected = metadata_table_manager.TableRecord{
+        .table_id = 1,
+        .name = "docs",
+        .indexes_json = "{\"managed_text\":{\"type\":\"full_text\"}}",
+    };
+    var user_replacement = expected;
+    user_replacement.indexes_json = "{\"managed_text\":{\"type\":\"full_text\"},\"vectors\":{\"type\":\"embeddings\"}}";
+    try std.testing.expect(!try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.testing.allocator,
+        &snapshot,
+        expected,
+        user_replacement,
+    ));
+
+    var owned_replacement = expected;
+    owned_replacement.indexes_json = "{\"managed_text\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+    try std.testing.expect(try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.testing.allocator,
+        &snapshot,
+        expected,
+        owned_replacement,
+    ));
+}
+
+test "authoritative catalog mutation boundaries reject orphaned semantic producers" {
+    const orphan_enrichment =
+        "{\"name\":\"orphan_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-a\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}";
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{}",
+            .placement_role = "data",
+        },
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn replaceTableDefinition(_: *@This(), _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedCatalogCommit;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedCatalogCommit;
+        }
+    };
+
+    var service = FakeService{};
+    const index_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"type\":\"full_text\",\"enrichments\":[{s}]}}",
+        .{orphan_enrichment},
+    );
+    defer std.testing.allocator.free(index_json);
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        createIndexOnService(&service, std.testing.allocator, "docs", "text", index_json),
+    );
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        putArtifactEnrichmentOnService(&service, std.testing.allocator, "docs", "orphan_dense_v1", orphan_enrichment),
+    );
+
+    const replacement_indexes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"enrichments\":[{s}]}}",
+        .{orphan_enrichment},
+    );
+    defer std.testing.allocator.free(replacement_indexes);
+    var replacement = service.table;
+    replacement.indexes_json = replacement_indexes;
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        replaceTableDefinitionOnService(&service, service.table, replacement),
     );
 }
 
@@ -34045,6 +34407,9 @@ test "api http server create index installs exact visible config and defers lagg
         project_create: bool = true,
         mutex: std.atomic.Mutex = .unlocked,
         projection_wait_calls: std.atomic.Value(usize) = .init(0),
+        put_enrichment_calls: usize = 0,
+        replace_definition_calls: usize = 0,
+        force_replace_conflict: bool = false,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -34055,7 +34420,9 @@ test "api http server create index installs exact visible config and defers lagg
                     .linearizable_snapshot = linearizableSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
+                    .put_artifact_enrichment = putArtifactEnrichment,
                     .wait_table_projection = waitTableProjection,
                 },
             };
@@ -34130,6 +34497,28 @@ test "api http server create index installs exact visible config and defers lagg
             self.replaceIndexesJson(allocator, concurrent, true);
         }
 
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            self.replace_definition_calls += 1;
+            if (self.force_replace_conflict) return error.TableGenerationChanged;
+            const current: metadata_table_manager.TableRecord = .{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = self.indexes_json,
+                .placement_role = "data",
+            };
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            if (!self.project_create) {
+                if (self.pending_indexes_json) |pending| std.testing.allocator.free(pending);
+                self.pending_indexes_json = next;
+                return;
+            }
+            self.replaceIndexesJson(std.testing.allocator, next, true);
+        }
+
         fn dropIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             platform_sync.lockYielding(&self.mutex);
@@ -34145,6 +34534,17 @@ test "api http server create index installs exact visible config and defers lagg
             } else {
                 self.replaceIndexesJson(allocator, next, true);
             }
+        }
+
+        fn putArtifactEnrichment(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.put_enrichment_calls += 1;
         }
 
         fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
@@ -34204,6 +34604,152 @@ test "api http server create index installs exact visible config and defers lagg
             if (self.enqueue_error) |err| return err;
         }
     };
+
+    // Artifact-backed embedding indexes consume the output owned by the
+    // matching enrichment. They must not require a duplicate index-local
+    // embedder or a document field/template before reaching catalog admission.
+    {
+        var artifact_source = FakeSource{
+            .indexes_json =
+            \\{"enrichments":[{"name":"p1_chunks_v1","kind":"chunk","field":"content","chunk_size":128,"chunk_overlap":16},{"name":"p1_chunkvec_v1","kind":"embedding","field":"content","source_artifact_name":"p1_chunks_v1","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\",\"url\":\"http://127.0.0.1:1/ai/v1\"}"}]}
+            ,
+        };
+        defer artifact_source.deinit(alloc);
+        var artifact_writes = FakeWrites{};
+        var artifact_server = ApiHttpServer.init(
+            alloc,
+            .{ .deployment_mode = .standalone },
+            artifact_source.iface(),
+            null,
+            artifact_writes.source(),
+        );
+        defer artifact_server.deinit();
+
+        const cases = [_]struct {
+            name: []const u8,
+            body: []const u8,
+        }{
+            .{
+                .name = "artifact_sources_idx",
+                .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+            },
+            .{
+                .name = "artifact_compat_idx",
+                .body = "{\"type\":\"embeddings\",\"embedding_name\":\"p1_chunkvec_v1\",\"dimension\":384,\"distance_metric\":\"cosine\"}",
+            },
+            .{
+                .name = "artifact_sources_inferred_idx",
+                .body = "{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+            },
+            .{
+                .name = "artifact_compat_inferred_idx",
+                .body = "{\"type\":\"embeddings\",\"embedding_name\":\"p1_chunkvec_v1\"}",
+            },
+        };
+        for (cases) |case| {
+            const uri = try std.fmt.allocPrint(alloc, "/tables/docs/indexes/{s}", .{case.name});
+            defer alloc.free(uri);
+            var response = try executeHttpxTestRequest(&artifact_server, .{
+                .method = .POST,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = case.body,
+            });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 201), response.status);
+            var stored = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, case.name);
+            defer if (stored) |*found| found.deinit();
+            try std.testing.expect(stored != null);
+            try std.testing.expectEqual(@as(i64, 384), stored.?.config.object.get("dimension").?.integer);
+        }
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_source.replace_definition_calls);
+
+        // Artifact validation is tied to the exact catalog generation it read.
+        // A concurrent producer/catalog change must conflict instead of
+        // committing a mutation validated against stale ownership.
+        artifact_source.force_replace_conflict = true;
+        var conflicted = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/concurrent_artifact_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+        });
+        defer conflicted.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), conflicted.status);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        artifact_source.force_replace_conflict = false;
+
+        // Inline enrichments are catalog-coupled even when their enclosing
+        // index does not consume an artifact. They must use the same exact
+        // generation fence rather than the old merge-on-latest create path.
+        artifact_source.force_replace_conflict = true;
+        var inline_enrichment_conflict = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/inline_enrichment_conflict",
+            .content_type = "application/json",
+            .body = "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"inline_chunks_v1\",\"kind\":\"chunk\",\"field\":\"content\",\"chunk_size\":128}]}",
+        });
+        defer inline_enrichment_conflict.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), inline_enrichment_conflict.status);
+        artifact_source.force_replace_conflict = false;
+
+        var missing_enrichment = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/missing_enrichment_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"does_not_exist\"}]}",
+        });
+        defer missing_enrichment.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), missing_enrichment.status);
+        try std.testing.expect(std.mem.indexOf(u8, missing_enrichment.body, "missing_embedding_artifact_enrichment") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+
+        var conflicting_dimension = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/conflicting_dimension_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":768,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+        });
+        defer conflicting_dimension.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), conflicting_dimension.status);
+        try std.testing.expect(std.mem.indexOf(u8, conflicting_dimension.body, "conflicting_embedding_artifact_dimensions") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+
+        const missing_producer = try indexes_api.addEnrichmentToTableIndexesJson(
+            alloc,
+            artifact_source.indexes_json,
+            "missing_producer_v1",
+            "{\"name\":\"missing_producer_v1\",\"kind\":\"embedding\",\"field\":\"content\",\"expected_dims\":384}",
+        );
+        artifact_source.replaceIndexesJson(alloc, missing_producer, true);
+        var rejected = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/missing_producer_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"missing_producer_v1\"}]}",
+        });
+        defer rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected.status);
+        try std.testing.expect(std.mem.indexOf(u8, rejected.body, "missing_embedding_artifact_producer") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        var absent = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, "missing_producer_idx");
+        defer if (absent) |*found| found.deinit();
+        try std.testing.expect(absent == null);
+
+        // Replacing a producer used by an existing index is validated against
+        // the complete post-update catalog before the metadata mutation.
+        var rejected_replacement = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .PUT,
+            .uri = "/tables/docs/artifacts/p1_chunkvec_v1/enrichment",
+            .content_type = "application/json",
+            .body = "{\"kind\":\"embedding\",\"field\":\"content\",\"source_artifact_name\":\"p1_chunks_v1\",\"expected_dims\":384}",
+        });
+        defer rejected_replacement.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected_replacement.status);
+        try std.testing.expect(std.mem.indexOf(u8, rejected_replacement.body, "producer") != null);
+        try std.testing.expectEqual(@as(usize, 0), artifact_source.put_enrichment_calls);
+    }
 
     var source = FakeSource{};
     defer source.deinit(alloc);
@@ -34625,7 +35171,7 @@ test "api http server create index expands schema-derived algebraic config" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                 },
             };
         }
@@ -34693,6 +35239,28 @@ test "api http server create index expands schema-derived algebraic config" {
             try std.testing.expect(parsed.value.object.get("measure_fields") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const current: metadata_table_manager.TableRecord = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = schema_json,
+                .indexes_json = self.indexes_json,
+                .placement_role = "data",
+            };
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            const stored = (try indexes_api.storedIndexConfigJsonAlloc(std.testing.allocator, replacement.indexes_json, "sales_rollup")) orelse
+                return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(stored);
+            try ant_json.testing.expectSubsetJsonText(
+                std.testing.allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                stored,
+            );
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            self.replaceIndexesJson(std.testing.allocator, next, true);
         }
     };
 
@@ -35086,7 +35654,7 @@ test "api http server serves table create and drop" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                     .wait_table_projection = waitTableProjection,
                 },
@@ -35156,6 +35724,14 @@ test "api http server serves table create and drop" {
             try std.testing.expectEqualStrings("docs", table_name);
             const next = try indexes_api.addIndexToTableIndexesJson(inner_alloc, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(inner_alloc, next, true);
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.created or !metadata_table_manager.tableDefinitionsEqual(self.table_record, expected))
+                return error.TableGenerationChanged;
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            self.replaceIndexesJson(std.testing.allocator, next, true);
         }
 
         fn dropIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -35466,6 +36042,20 @@ test "api http server create table with local writes waits for projected presenc
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expect(!source.created);
+    try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+
+    var invalid_producer_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body =
+        \\{"indexes":{"artifact_vectors":{"type":"embeddings","sources":[{"artifact":"body_dense_v1"}],"enrichments":[{"name":"body_dense_v1","kind":"embedding","field":"body","expected_dims":384}]}}}
+        ,
+    });
+    defer invalid_producer_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_producer_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_producer_resp.body, "producer") != null);
     try std.testing.expect(!source.created);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
 
@@ -38386,7 +38976,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
 test "api http server returns retryable not leader through public table adapter mutation" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        create_index_calls: usize = 0,
+        replace_definition_calls: usize = 0,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -38395,7 +38985,7 @@ test "api http server returns retryable not leader through public table adapter 
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                 },
             };
         }
@@ -38433,7 +39023,15 @@ test "api http server returns retryable not leader through public table adapter 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("body", index_name);
-            self.create_index_calls += 1;
+            self.replace_definition_calls += 1;
+            return error.LeaderTransferInProgress;
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", expected.name);
+            try std.testing.expectEqualStrings("docs", replacement.name);
+            self.replace_definition_calls += 1;
             return error.LeaderTransferInProgress;
         }
     };
@@ -38452,7 +39050,7 @@ test "api http server returns retryable not leader through public table adapter 
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), source.create_index_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.replace_definition_calls);
 }
 
 test "api http server returns retryable not leader when cluster backup read barrier times out" {

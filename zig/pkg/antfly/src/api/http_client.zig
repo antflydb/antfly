@@ -4672,7 +4672,7 @@ test "api http client round-trips public table management routes" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
-                    .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                 },
             };
@@ -4747,6 +4747,17 @@ test "api http client round-trips public table management routes" {
             if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
             self.indexes_json = next;
             if (self.created_table) |*table| table.indexes_json = self.indexes_json;
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const current = self.created_table orelse return error.TableNotFound;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            const next = try metadata_table_manager.cloneTable(std.heap.page_allocator, replacement);
+            if (self.owns_created_table) metadata_table_manager.freeTable(std.heap.page_allocator, current);
+            self.created_table = next;
+            self.indexes_json = next.indexes_json;
+            self.owns_created_table = true;
         }
 
         fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
