@@ -199,7 +199,6 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
 
     for (batch.documents) |doc| {
         if (doc.action == .upsert) try appendUniqueString(alloc, &changed_doc_keys, doc.key);
-        if (doc.action == .delete) try appendUniqueString(alloc, &deleted_doc_keys, doc.key);
         if (doc.action == .upsert) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);

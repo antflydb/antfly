@@ -1897,11 +1897,9 @@ fn requestUsesMaterializedChunkArtifact(
 }
 
 const StaleEmbeddingDeletes = struct {
-    vector_keys: [][]u8 = &.{},
     artifact_delete_keys: [][]u8 = &.{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        freeKeyList(alloc, self.vector_keys);
         freeKeyList(alloc, self.artifact_delete_keys);
         self.* = .{};
     }
@@ -9025,10 +9023,6 @@ fn processMaterializedChunkDenseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            defer runtime.alloc.free(base_key);
-            try appendTargetedDeleteDocumentToWindow(runtime, window, base_key, .dense_vector, consumer_indexes);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -9245,10 +9239,6 @@ fn processMaterializedChunkSparseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            defer runtime.alloc.free(base_key);
-            try appendTargetedDeleteDocumentToWindow(runtime, window, base_key, .sparse_vector, consumer_indexes);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -9489,7 +9479,7 @@ fn processChunkedDenseWindow(
             const request_stale = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
             var stale_deletes = request_stale;
             errdefer stale_deletes.deinit(runtime.alloc);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .dense_vector, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
             if (source_set.sources.len == 0) {
                 try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
@@ -9679,37 +9669,20 @@ fn appendFullTextDeleteDocumentToWindow(
     key: []const u8,
     text_indexes: []const []const u8,
 ) !void {
-    return try appendTargetedDeleteDocumentToWindow(runtime, window, key, .full_text, text_indexes);
-}
-
-fn appendTargetedDeleteDocumentToWindow(
-    runtime: *EnrichmentRuntime,
-    window: *GeneratedReplayWindow,
-    key: []const u8,
-    kind: derived_types.DerivedTarget,
-    indexes: []const []const u8,
-) !void {
-    // Targeted document mutations survive journal encoding as a delete on
-    // only the named index-kind replay lanes. `deleted_keys` is intentionally
-    // reserved for source deletions that must fan out to every projection.
-    if (indexes.len == 0) return;
-    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, indexes.len);
-    var initialized_targets: usize = 0;
+    if (text_indexes.len == 0) return;
+    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
     errdefer {
-        for (targets[0..initialized_targets]) |target| runtime.alloc.free(@constCast(target.index_name));
+        for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
         runtime.alloc.free(targets);
     }
-    for (indexes, 0..) |index_name, i| {
+    for (text_indexes, 0..) |index_name, i| {
         targets[i] = .{
-            .kind = kind,
+            .kind = .full_text,
             .index_name = try runtime.alloc.dupe(u8, index_name),
         };
-        initialized_targets += 1;
     }
-    const owned_key = try runtime.alloc.dupe(u8, key);
-    errdefer runtime.alloc.free(owned_key);
     try window.documents.append(runtime.alloc, .{
-        .key = owned_key,
+        .key = try runtime.alloc.dupe(u8, key),
         .action = .delete,
         .targets = targets,
     });
@@ -9789,16 +9762,8 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
     stale: *StaleEmbeddingDeletes,
-    kind: derived_types.DerivedTarget,
-    consumer_indexes: []const []const u8,
 ) !void {
     errdefer stale.deinit(runtime.alloc);
-    for (stale.vector_keys) |key| {
-        try appendTargetedDeleteDocumentToWindow(runtime, window, key, kind, consumer_indexes);
-    }
-    for (stale.vector_keys) |key| runtime.alloc.free(key);
-    runtime.alloc.free(stale.vector_keys);
-    stale.vector_keys = &.{};
     try mergeOwnedArtifactDeleteKeysIntoWindow(runtime, window, stale.artifact_delete_keys);
     stale.artifact_delete_keys = &.{};
 }
@@ -9982,7 +9947,7 @@ fn processDenseEmbedding(
         errdefer stale_deletes.deinit(runtime.alloc);
         if (source_set.sources.len == 0) {
             try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .dense_vector, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
@@ -9994,7 +9959,7 @@ fn processDenseEmbedding(
 
         if (chunk_embeddings.len == 0) {
             try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .dense_vector, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
@@ -10005,7 +9970,7 @@ fn processDenseEmbedding(
             for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
             if (expanded.len > 0) runtime.alloc.free(expanded);
         }
-        try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .dense_vector, consumer_indexes);
+        try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
         try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
         return;
     }
@@ -10123,7 +10088,7 @@ fn processSparseEmbedding(
         errdefer stale_deletes.deinit(runtime.alloc);
         if (source_set.sources.len == 0) {
             try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .sparse_vector, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
@@ -10135,7 +10100,7 @@ fn processSparseEmbedding(
 
         if (chunk_embeddings.len == 0) {
             try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .sparse_vector, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
@@ -10145,7 +10110,7 @@ fn processSparseEmbedding(
             for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
             if (expanded.len > 0) runtime.alloc.free(expanded);
         }
-        try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, .sparse_vector, consumer_indexes);
+        try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
         try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded);
         return;
     }
@@ -12246,8 +12211,6 @@ fn deleteStaleChunkEmbeddingArtifacts(
     defer backend_scan.freeResults(runtime.alloc, existing);
     if (existing.len == 0) return .{};
 
-    var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
-    errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
 
@@ -12255,13 +12218,9 @@ fn deleteStaleChunkEmbeddingArtifacts(
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
         if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
         if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
     }
     return .{
-        .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),
         .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(runtime.alloc),
     };
 }
