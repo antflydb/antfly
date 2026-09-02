@@ -1,44 +1,44 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "channels": {
     "stable": {
       "tag_kind": "stable",
       "ordering": "semver",
       "journal_key": "antfly/channels/stable.json",
-      "bootstrap": "github-latest",
+      "bootstrap_sources": ["github-latest", "npm", "object-storage", "homebrew"],
       "npm_tag": "latest",
       "publish_pypi": true,
       "publish_homebrew": true,
       "container_alias": "latest",
       "object_alias": "latest",
       "github_release": "latest",
-      "recovery_source": "github-release"
+      "recovery_sources": ["github-release", "object-storage"]
     },
     "next": {
       "tag_kind": "prerelease",
       "ordering": "semver",
       "journal_key": "antfly/channels/next.json",
-      "bootstrap": "npm",
+      "bootstrap_sources": ["npm", "object-storage"],
       "npm_tag": "next",
       "publish_pypi": true,
       "publish_homebrew": false,
       "container_alias": "next",
       "object_alias": "next",
       "github_release": "prerelease",
-      "recovery_source": "github-release"
+      "recovery_sources": ["github-release", "object-storage"]
     },
     "nightly": {
       "tag_kind": "nightly",
       "ordering": "sequence",
       "journal_key": "antfly/channels/nightly.json",
-      "bootstrap": "npm",
+      "bootstrap_sources": ["npm", "object-storage"],
       "npm_tag": "nightly",
       "publish_pypi": false,
       "publish_homebrew": false,
       "container_alias": "nightly",
       "object_alias": "nightly",
       "github_release": "none",
-      "recovery_source": "object-storage"
+      "recovery_sources": ["object-storage"]
     }
   }
 }

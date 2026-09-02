@@ -105,14 +105,17 @@ gh api --method POST repos/antflydb/antfly/dispatches \
   -f 'client_payload[ledger_sha256]=<64-character-sha256>'
 ```
 
-Recovery downloads the complete saved payload from the GitHub release;
-verifies every GitHub attestation against the expected release-workflow signer,
-tag ref, repository, and source-commit digest; binds the promotion to the
-supplied ledger digest; verifies every typed scope and artifact hash; and
-promotes those exact bytes. It never checks out operator-selected source to
-rebuild or publish registry artifacts. Recovery may repair immutable
-object-storage, PyPI, and GitHub assets plus container version aliases for a
-saved release, but npm `latest`/`next` and stable Homebrew, container, object-storage,
+Recovery tries the channel's policy-ordered immutable mirrors (GitHub Release,
+then R2 for stable and next; R2 for nightly) and accepts one only after the
+supplied ledger digest and every ledger member verify. It then verifies every
+GitHub attestation against the expected release-workflow signer, tag ref,
+repository, and source-commit digest and promotes those exact bytes. It never
+checks out operator-selected source to rebuild or publish registry artifacts.
+When R2 supplies a stable or next payload, recovery restores missing or corrupt
+GitHub assets only after the supplied ledger, complete payload, and provenance
+attestations verify. Recovery may also repair object-storage, PyPI, and
+container version aliases for a saved release, but npm `latest`/`next` and
+stable Homebrew, container, object-storage,
 and GitHub `latest` channels move only forward. An interrupted promotion leaves
 a journaled pending identity and only that exact tag, source commit,
 release-ledger digest, and container digest may resume it. A published GitHub

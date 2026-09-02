@@ -26,7 +26,10 @@ class S3Reader:
             raise SystemExit(
                 "boto3 is required; install scripts/release/requirements.lock"
             ) from exc
+        from botocore.exceptions import ClientError
+
         self.bucket = bucket
+        self.client_error = ClientError
         self.client = boto3.client(
             "s3",
             endpoint_url=endpoint,
@@ -40,6 +43,16 @@ class S3Reader:
         response = self.client.get_object(Bucket=self.bucket, Key=key)
         return bytes(response["Body"].read())
 
+    def read_optional(self, key: str) -> bytes | None:
+        try:
+            return self.read(key)
+        except self.client_error as exc:
+            code = str(exc.response.get("Error", {}).get("Code"))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+                return None
+            raise
+
 
 class LocalReader:
     def __init__(self, root: Path, bucket: str) -> None:
@@ -48,6 +61,10 @@ class LocalReader:
 
     def read(self, key: str) -> bytes:
         return (self.root / self.bucket / key).read_bytes()
+
+    def read_optional(self, key: str) -> bytes | None:
+        path = self.root / self.bucket / key
+        return path.read_bytes() if path.exists() else None
 
 
 def payload_names(ledger_bytes: bytes) -> list[str]:

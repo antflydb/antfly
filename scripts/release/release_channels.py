@@ -17,14 +17,14 @@ REQUIRED_FIELDS = {
     "tag_kind",
     "ordering",
     "journal_key",
-    "bootstrap",
+    "bootstrap_sources",
     "npm_tag",
     "publish_pypi",
     "publish_homebrew",
     "container_alias",
     "object_alias",
     "github_release",
-    "recovery_source",
+    "recovery_sources",
 }
 TAG_PATTERN = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\."
@@ -199,7 +199,7 @@ def compare_version_precedence(left: str, right: str) -> int:
 
 def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     policy = json.loads(path.read_text(encoding="utf-8"))
-    if policy.get("schema_version") != 1:
+    if policy.get("schema_version") != 2:
         raise SystemExit(f"unsupported release-channel schema in {path}")
     channels = policy.get("channels")
     if not isinstance(channels, dict) or set(channels) != CHANNEL_NAMES:
@@ -214,12 +214,41 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             raise SystemExit(f"release channel {name} has invalid tag_kind")
         if channel["ordering"] not in {"semver", "sequence"}:
             raise SystemExit(f"release channel {name} has invalid ordering")
-        if channel["bootstrap"] not in {"github-latest", "npm"}:
-            raise SystemExit(f"release channel {name} has invalid bootstrap")
+        bootstrap_sources = channel["bootstrap_sources"]
+        if (
+            not isinstance(bootstrap_sources, list)
+            or not bootstrap_sources
+            or len(set(bootstrap_sources)) != len(bootstrap_sources)
+            or not set(bootstrap_sources)
+            <= {"github-latest", "npm", "object-storage", "homebrew"}
+        ):
+            raise SystemExit(f"release channel {name} has invalid bootstrap_sources")
         if channel["github_release"] not in {"latest", "prerelease", "none"}:
             raise SystemExit(f"release channel {name} has invalid GitHub mode")
-        if channel["recovery_source"] not in {"github-release", "object-storage"}:
-            raise SystemExit(f"release channel {name} has invalid recovery source")
+        expected_bootstrap_sources = {"npm", "object-storage"}
+        if channel["github_release"] == "latest":
+            expected_bootstrap_sources.add("github-latest")
+        if channel["publish_homebrew"]:
+            expected_bootstrap_sources.add("homebrew")
+        if set(bootstrap_sources) != expected_bootstrap_sources:
+            raise SystemExit(
+                f"release channel {name} does not bootstrap every version-bearing destination"
+            )
+        recovery_sources = channel["recovery_sources"]
+        if (
+            not isinstance(recovery_sources, list)
+            or not recovery_sources
+            or len(set(recovery_sources)) != len(recovery_sources)
+            or not set(recovery_sources) <= {"github-release", "object-storage"}
+        ):
+            raise SystemExit(f"release channel {name} has invalid recovery_sources")
+        expected_recovery_sources = ["object-storage"]
+        if channel["github_release"] != "none":
+            expected_recovery_sources.insert(0, "github-release")
+        if recovery_sources != expected_recovery_sources:
+            raise SystemExit(
+                f"release channel {name} has incomplete or unordered recovery_sources"
+            )
         journal_key = channel["journal_key"]
         if (
             not isinstance(journal_key, str)
@@ -264,7 +293,7 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         or nightly["publish_pypi"]
         or nightly["publish_homebrew"]
         or nightly["github_release"] != "none"
-        or nightly["recovery_source"] != "object-storage"
+        or nightly["recovery_sources"] != ["object-storage"]
     ):
         raise SystemExit("nightly channel must be snapshot-only")
     return policy
@@ -352,6 +381,8 @@ def github_outputs(
     for key, value in channel.items():
         if isinstance(value, bool):
             result[key] = str(value).lower()
+        elif isinstance(value, list):
+            result[key] = json.dumps(value, separators=(",", ":"))
         else:
             result[key] = str(value)
     if tag:

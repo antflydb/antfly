@@ -50,14 +50,12 @@ jobs:
       container_digest: ${{ steps.container-state.outputs.digest }}
       channel: ${{ steps.identity.outputs.channel }}
       journal_key: ${{ steps.identity.outputs.journal_key }}
-      bootstrap: ${{ steps.identity.outputs.bootstrap }}
       npm_tag: ${{ steps.identity.outputs.npm_tag }}
       publish_pypi: ${{ steps.identity.outputs.publish_pypi }}
       publish_homebrew: ${{ steps.identity.outputs.publish_homebrew }}
       container_alias: ${{ steps.identity.outputs.container_alias }}
       object_alias: ${{ steps.identity.outputs.object_alias }}
       github_release: ${{ steps.identity.outputs.github_release }}
-      recovery_source: ${{ steps.identity.outputs.recovery_source }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -241,21 +239,6 @@ jobs:
         with:
           subject-path: dist/release-payload/*
 
-      - name: Save immutable assets on a draft GitHub release
-        if: ${{ github.event_name == 'workflow_run' && steps.identity.outputs.github_release != 'none' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
-          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
-        run: |
-          python scripts/release/create_github_release.py \
-            --repo "$GITHUB_REPOSITORY" \
-            --tag "$RELEASE_TAG" \
-            --commit "$RELEASE_COMMIT" \
-            --draft \
-            --immutable-assets \
-            --asset 'dist/release-payload/*'
-
       - name: Seal immutable object-storage keys
         if: ${{ github.event_name == 'workflow_run' }}
         env:
@@ -272,30 +255,42 @@ jobs:
             --content-addressed-prefix antfly/artifacts \
             dist/release-payload/*
 
-      - name: Recover the complete immutable payload from GitHub
-        if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.recovery_source == 'github-release' }}
+      - name: Save immutable assets on a draft GitHub release
+        if: ${{ github.event_name == 'workflow_run' && steps.identity.outputs.github_release != 'none' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
-          mkdir -p dist/release-payload
-          gh release download "$RELEASE_TAG" \
+          python scripts/release/create_github_release.py \
             --repo "$GITHUB_REPOSITORY" \
-            --dir dist/release-payload
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --draft \
+            --immutable-assets \
+            --asset 'dist/release-payload/*'
 
-      - name: Recover the complete immutable payload from object storage
-        if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.recovery_source == 'object-storage' }}
+      - name: Recover and verify the complete immutable payload
+        id: recovery
+        if: ${{ github.event_name == 'repository_dispatch' }}
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          EXPECTED_LEDGER: ${{ steps.identity.outputs.expected_ledger }}
+          RELEASE_CHANNEL: ${{ steps.identity.outputs.channel }}
         run: |
-          python scripts/release/download_objectstorage.py \
-            --provider s3 \
+          python scripts/release/recover_release_payload.py \
+            --channel "$RELEASE_CHANNEL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$EXPECTED_LEDGER" \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
-            --prefix "antfly/${RELEASE_TAG}" \
             --out-dir dist/release-payload
 
       - name: Verify recovered artifact attestations
@@ -332,6 +327,23 @@ jobs:
             --commit "$RELEASE_COMMIT" \
             --ledger-sha256 "$actual"
           echo "sha256=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Repair the GitHub release mirror from verified bytes
+        if: ${{ github.event_name == 'repository_dispatch' && steps.identity.outputs.github_release != 'none' && steps.recovery.outputs.source == 'object-storage' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          EXPECTED_LEDGER: ${{ steps.identity.outputs.expected_ledger }}
+        run: |
+          python scripts/release/create_github_release.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --draft \
+            --repair-assets \
+            --verified-ledger-sha256 "$EXPECTED_LEDGER" \
+            --asset 'dist/release-payload/*'
 
       - name: Bind authenticated registry versions to the sealed ledger
         id: registry-identity
@@ -601,16 +613,17 @@ jobs:
         id: channel
         env:
           CHANNEL: ${{ needs.prepare-release-promotion.outputs.channel }}
-          BOOTSTRAP: ${{ needs.prepare-release-promotion.outputs.bootstrap }}
-          NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         run: |
           set -euo pipefail
-          discovery_args=("$BOOTSTRAP")
-          if [ "$BOOTSTRAP" = npm ]; then
-            discovery_args+=(--npm-tag "$NPM_TAG")
-          fi
-          current_tag="$(python scripts/release/discover_channel_tag.py "${discovery_args[@]}")"
+          current_tag="$(python scripts/release/discover_channel_tag.py reconcile \
+            --channel "$CHANNEL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases)"
           echo "name=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
       - name: Validate release channel without reserving it
@@ -758,16 +771,17 @@ jobs:
         id: channel
         env:
           CHANNEL: ${{ needs.prepare-release-promotion.outputs.channel }}
-          BOOTSTRAP: ${{ needs.prepare-release-promotion.outputs.bootstrap }}
-          NPM_TAG: ${{ needs.prepare-release-promotion.outputs.npm_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         run: |
           set -euo pipefail
-          discovery_args=("$BOOTSTRAP")
-          if [ "$BOOTSTRAP" = npm ]; then
-            discovery_args+=(--npm-tag "$NPM_TAG")
-          fi
-          current_tag="$(python scripts/release/discover_channel_tag.py "${discovery_args[@]}")"
+          current_tag="$(python scripts/release/discover_channel_tag.py reconcile \
+            --channel "$CHANNEL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases)"
           echo "name=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
       - name: Begin or resume the complete release transaction

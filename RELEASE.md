@@ -124,9 +124,16 @@ projections to match the digest-verified release ledger, then exports the sealed
 values. Preflight, publication, and final verification consume them verbatim;
 they do not independently reinterpret canonical or legacy version spellings.
 
-Channel bootstrap is fail-closed. The discovery controller treats only an
-explicit missing release, package, or dist-tag as empty state; authentication,
-rate-limit, malformed-response, and network failures stop promotion.
+Channel bootstrap is fail-closed and happens exactly once. Before creating a
+journal, the discovery controller reconciles every policy-selected,
+version-bearing projection: all four npm packages, the R2 object alias, stable
+GitHub `latest`, and the stable Homebrew formula. Missing projections may be
+initialized, but present projections must name one identical release. After a
+journal exists it is the channel authority, including while a partially
+committed transaction is being resumed; mutable mirrors are no longer used to
+reconstruct history. Only an explicit missing release, package, dist-tag,
+object, or formula is empty state. Authentication, rate-limit,
+malformed-response, and network failures stop promotion.
 Container and npm operations use the typed adapters under
 `scripts/release/registry/`. Registry lookups return only present or explicitly
 missing; failures are a separate error path and can never authorize creation.
@@ -143,11 +150,12 @@ promotion can continue, so a partial publication is safe to retry without
 hiding content drift or accepting untracked distributions. An existing npm
 version is resumable only if its requested dist-tag also points to that exact
 version; trusted-publishing recovery otherwise stops with an explicit dist-tag
-repair requirement. Existing GitHub
-release assets are likewise accepted only when byte-identical; release
-automation never replaces a saved artifact. GitHub release visibility is also
-one-way: a retry may add missing identical assets to a published release but
-never returns it to draft state.
+repair requirement. Existing GitHub release assets are likewise accepted only
+when byte-identical on the normal path. Recovery may replace a corrupt asset
+only after the operator-supplied ledger digest, complete payload, and
+provenance attestations all verify against the immutable R2 copy. GitHub
+release visibility is also one-way: a retry may repair assets on a published
+release but never returns it to draft state.
 
 Normal registry promotion is triggered by `workflow_run`; the explicit
 `promote-release-channel` `repository_dispatch` event is the general recovery
@@ -159,7 +167,12 @@ and the existing SDK publishers without allowing similarly named branches.
 Both environments require review with self-approval disabled. Recovery
 requests include the exact `artifacts.json` SHA-256; the promotion verifies
 that digest, its attestation, tag and source commit before granting either
-registry job access.
+registry job access. Stable and next recovery try the GitHub Release and then
+the immutable R2 version prefix. Each source must independently contain the
+supplied ledger and every byte it names before it is accepted. If R2 repairs a
+missing or corrupt GitHub payload, the controller restores the verified bytes
+before publishing the release. Nightly uses R2 as its only policy-selected
+source.
 
 `.github/workflows/antfly-container.yml` has only a `workflow_call` entry point.
 It accepts only the default-branch promotion controller's normal `workflow_run`
@@ -223,9 +236,12 @@ scripts under `scripts/release/`:
 - `prepare_npm_promotion.py` read-only verifies every ledger-defined npm
   package and required channel tag against the authenticated npm registry
   version as part of the global publication gate.
-- `download_objectstorage.py` restores a nightly's exact ledger members from
-  immutable object storage for recovery; the normal ledger and attestation
-  verification still runs before promotion.
+- `recover_release_payload.py` restores an exact ledger from the channel's
+  ordered immutable mirrors and accepts a mirror only after the ledger digest,
+  tag, commit, member set, sizes, and hashes all verify. GitHub release and
+  asset listings are fully paginated, including draft releases.
+- `download_objectstorage.py` provides the authenticated R2 reader and exact
+  ledger-member restoration used by bootstrap and recovery.
 - `publish_objectstorage.py` first writes content-addressed and versioned keys
   with compare-or-fail semantics, then updates mutable channel aliases only
   after every immutable upload succeeds. The release workflow currently uses

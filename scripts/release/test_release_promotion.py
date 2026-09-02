@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -94,6 +95,13 @@ class ReleasePromotionTests(unittest.TestCase):
         )
 
         self.assertEqual((stable_name, stable["npm_tag"]), ("stable", "latest"))
+        self.assertEqual(
+            stable["bootstrap_sources"],
+            ["github-latest", "npm", "object-storage", "homebrew"],
+        )
+        self.assertEqual(
+            stable["recovery_sources"], ["github-release", "object-storage"]
+        )
         self.assertEqual((next_name, next_channel["npm_tag"]), ("next", "next"))
         self.assertEqual(
             (nightly_name, nightly["npm_tag"], nightly["github_release"]),
@@ -197,6 +205,52 @@ class ReleasePromotionTests(unittest.TestCase):
                 "@antfly/cli", "next", lambda *_args, **_kwargs: http_error(500)
             )
 
+    def test_channel_bootstrap_reconciles_every_observed_projection(self) -> None:
+        discovery = load_module(
+            "discover_channel_reconcile_test", "discover_channel_tag.py"
+        )
+        channels = load_module("release_channels_reconcile_test", "release_channels.py")
+        policy = channels.load_policy()
+
+        self.assertEqual(
+            discovery.reconcile_observations(
+                "stable",
+                {
+                    "github-latest": "v1.2.3",
+                    "npm": "v1.2.3",
+                    "object-storage": "",
+                    "homebrew": "v1.2.3",
+                },
+                policy,
+            ),
+            "v1.2.3",
+        )
+        with self.assertRaisesRegex(SystemExit, "bootstrap sources disagree"):
+            discovery.reconcile_observations(
+                "stable",
+                {"github-latest": "v1.2.2", "npm": "v1.2.3"},
+                policy,
+            )
+
+        stored = type(
+            "Stored", (), {"etag": '"1"', "document": {"current": {"tag": "v1.2.3"}}}
+        )()
+        self.assertEqual(discovery.journal_current(stored, "stable", policy), "v1.2.3")
+
+    def test_npm_bootstrap_requires_all_packages_to_agree(self) -> None:
+        discovery = load_module(
+            "discover_npm_reconcile_test", "discover_channel_tag.py"
+        )
+        with (
+            mock.patch.object(
+                discovery,
+                "discover_npm_tag",
+                side_effect=["v1.2.3", "v1.2.3", "", "v1.2.3"],
+            ),
+            self.assertRaisesRegex(SystemExit, "partially initialized"),
+        ):
+            discovery.discover_npm_channel("latest", mock.Mock())
+
     def test_object_storage_recovery_restores_exact_ledger_members(self) -> None:
         download = load_module(
             "download_objectstorage_test", "download_objectstorage.py"
@@ -228,6 +282,60 @@ class ReleasePromotionTests(unittest.TestCase):
                 {"artifacts.json", "metadata.json", "artifact.tgz"},
             )
             self.assertEqual((out_dir / "artifact.tgz").read_bytes(), b"snapshot")
+
+    def test_recovery_falls_back_only_to_a_fully_verified_mirror(self) -> None:
+        recovery = load_module(
+            "recover_release_payload_test", "recover_release_payload.py"
+        )
+
+        class MemoryReader:
+            def __init__(self, objects: dict[str, bytes]) -> None:
+                self.objects = objects
+
+            def read(self, name: str) -> bytes:
+                return self.objects[name]
+
+        artifact = b"immutable"
+        ledger = json.dumps(
+            {
+                "schema_version": 1,
+                "tag": "v1.2.3",
+                "commit": COMMIT,
+                "artifacts": [
+                    {
+                        "name": "artifact.bin",
+                        "size": len(artifact),
+                        "sha256": hashlib.sha256(artifact).hexdigest(),
+                    }
+                ],
+            }
+        ).encode()
+        digest = hashlib.sha256(ledger).hexdigest()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            out_dir = Path(raw_tmp) / "payload"
+            source = recovery.recover_payload(
+                [
+                    (
+                        "github-release",
+                        lambda: MemoryReader(
+                            {"artifacts.json": ledger, "artifact.bin": b"corrupt"}
+                        ),
+                    ),
+                    (
+                        "object-storage",
+                        lambda: MemoryReader(
+                            {"artifacts.json": ledger, "artifact.bin": artifact}
+                        ),
+                    ),
+                ],
+                out_dir,
+                "v1.2.3",
+                COMMIT,
+                digest,
+            )
+
+            self.assertEqual(source, "object-storage")
+            self.assertEqual((out_dir / "artifact.bin").read_bytes(), artifact)
 
     def test_release_channel_store_uses_atomic_create_and_update(self) -> None:
         channel = load_module("release_channel_store_test", "release_channel_state.py")
@@ -269,6 +377,24 @@ class ReleasePromotionTests(unittest.TestCase):
 
         self.assertIs(actual, published)
         api.assert_not_called()
+
+    def test_draft_github_release_lookup_is_fully_paginated(self) -> None:
+        github = load_module(
+            "create_github_release_pagination_test", "create_github_release.py"
+        )
+
+        def api(_method: str, _repo: str, path: str, _token: str, _body=None):
+            if path.startswith("/releases/tags/"):
+                raise github.GitHubError("failed with 404")
+            if path.endswith("page=1"):
+                return [{"tag_name": f"v0.0.{index}"} for index in range(100)]
+            if path.endswith("page=2"):
+                return [{"tag_name": "v1.2.3", "draft": True}]
+            self.fail(path)
+
+        with mock.patch.object(github, "github_api", side_effect=api):
+            release = github.get_release_by_tag("antflydb/antfly", "v1.2.3", "token")
+        self.assertEqual(release, {"tag_name": "v1.2.3", "draft": True})
 
     def test_stable_channel_transaction_is_monotonic_and_resumable(self) -> None:
         channel = load_module("release_channel_state_test", "release_channel_state.py")
@@ -599,6 +725,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "id": 1,
                 "assets": [
                     {
+                        "id": 1,
                         "name": artifact.name,
                         "digest": f"sha256:{github.sha256(artifact)}",
                     }
@@ -615,6 +742,24 @@ class ReleasePromotionTests(unittest.TestCase):
                 github.upload_asset(
                     "antflydb/antfly", release, artifact, "token", False, True
                 )
+
+            with (
+                mock.patch.object(github, "github_api") as api,
+                mock.patch.object(github, "request_bytes") as upload,
+            ):
+                github.upload_asset(
+                    "antflydb/antfly",
+                    release,
+                    artifact,
+                    "token",
+                    False,
+                    False,
+                    repair_assets=True,
+                )
+                api.assert_called_once_with(
+                    "DELETE", "antflydb/antfly", "/releases/assets/1", "token"
+                )
+                upload.assert_called_once()
 
     def test_local_versioned_object_is_compare_or_fail(self) -> None:
         storage = load_module("publish_objectstorage_test", "publish_objectstorage.py")
