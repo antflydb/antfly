@@ -21,6 +21,7 @@ const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
 const common_secrets = @import("../common/secrets.zig");
+const credential_safety = @import("../common/credential_safety.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
@@ -980,16 +981,21 @@ pub const ManagedEmbedder = struct {
     }
 
     fn findQueryEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
+        // Query names have a global precedence order. In particular, a public
+        // index alias must not lose to an unrelated artifact whose producer
+        // happened to be registered earlier in the catalog.
         for (self.entries) |*entry| {
             if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
+        }
+        for (self.entries) |*entry| {
+            for (entry.lookup_aliases) |alias| {
+                if (std.mem.eql(u8, alias, index_name)) return entry;
+            }
         }
         for (self.entries) |*entry| {
             if (entry.embedding_name.len > 0 and std.mem.eql(u8, entry.embedding_name, index_name)) return entry;
             for (entry.embedding_names) |embedding_name| {
                 if (std.mem.eql(u8, embedding_name, index_name)) return entry;
-            }
-            for (entry.lookup_aliases) |alias| {
-                if (std.mem.eql(u8, alias, index_name)) return entry;
             }
         }
         return null;
@@ -1392,6 +1398,8 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
             try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
     };
     defer alloc.free(endpoint);
+    if (credential_safety.containsSecretReference(endpoint) or credential_safety.urlContainsCredentials(endpoint))
+        return error.InvalidCreateTableRequest;
     const SemanticProducer = struct {
         version: u8 = 2,
         provider: []const u8,
@@ -2022,6 +2030,8 @@ fn semanticProducerComparisonConfigJsonAlloc(
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
+    if (credential_safety.containsSecretReference(endpoint.string) or credential_safety.urlContainsCredentials(endpoint.string))
+        return error.InvalidEmbeddingArtifactProducer;
     const embedded = std.mem.eql(u8, endpoint.string, "antfly:embedded");
     if (embedded and !std.mem.eql(u8, provider.string, "antfly"))
         return error.InvalidEmbeddingArtifactProducer;
@@ -3834,30 +3844,33 @@ pub fn testMultiSourceEmbeddingContracts() !void {
 
     var explicit = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]},
-        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]}
+        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","expected_dims":3,"vector_space":"acme:dense-v1"}]},
+        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","expected_dims":3,"vector_space":"acme:dense-v1"}]}
         \\}
     , local.provider());
     defer explicit.deinit();
     try std.testing.expect(explicit.findEntry("shared_dense_v1") != null);
 
-    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    try std.testing.expectError(error.ConflictingEmbeddingArtifactDimensions, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]},
-        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":4,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]}
+        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","expected_dims":3,"vector_space":"acme:dense-v1"}]},
+        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":4,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","expected_dims":4,"vector_space":"acme:dense-v1"}]}
         \\}
     , local.provider()));
 
     try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
-        \\{"combined":{"type":"embeddings","sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"title_dense_v1","kind":"embedding","field":"title","vector_space":"acme:dense-v1"},{"name":"body_dense_v1","kind":"embedding","field":"body"}]}}
+        \\{"combined":{"type":"embeddings","sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"title_dense_v1","kind":"embedding","field":"title","expected_dims":3,"vector_space":"acme:dense-v1"},{"name":"body_dense_v1","kind":"embedding","field":"body","expected_dims":3}]}}
     , local.provider()));
 
-    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    var aliased = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
         \\  "aliased_vectors":{"type":"embeddings","sources":[{"artifact":"document_vectors"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"}},
         \\  "document_vectors":{"type":"embeddings","sources":[{"artifact":"document_vectors_v2"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"}}
         \\}
-    , local.provider()));
+    , local.provider());
+    defer aliased.deinit();
+    try std.testing.expectEqualStrings("antflydb/model-b", aliased.findQueryEntry("document_vectors").?.model);
+    try std.testing.expectEqualStrings("antflydb/model-a", aliased.findArtifactEntry("document_vectors").?.model);
 
     var producer = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://models.example/v1","api_key":"secret","requests_per_minute":10}}
@@ -3868,6 +3881,27 @@ pub fn testMultiSourceEmbeddingContracts() !void {
     try std.testing.expect(std.mem.indexOf(u8, identity, "https://models.example/v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, identity, "secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, identity, "requests_per_minute") == null);
+
+    const credential_endpoints = [_][]const u8{
+        "https://alice:password@models.example/v1",
+        "https://models.example/v1?api_key=secret",
+        "https://models.example/v1#access_token=secret",
+        "${secret:openai.endpoint}",
+    };
+    for (credential_endpoints) |endpoint| {
+        const raw = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{{\"provider\":\"openai\",\"model\":\"embed-v1\",\"url\":\"{s}\"}}}}",
+            .{endpoint},
+        );
+        defer std.testing.allocator.free(raw);
+        var credential_endpoint = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer credential_endpoint.deinit();
+        try std.testing.expectError(
+            error.InvalidCreateTableRequest,
+            embeddingSemanticProducerJsonAlloc(std.testing.allocator, credential_endpoint.value),
+        );
+    }
 }
 
 test "managed embedder enforces multi-source producer and vector-space contracts" {
@@ -4149,6 +4183,23 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
     try std.testing.expectEqualStrings("direct-model", colliding.findQueryEntry("shared_name").?.model);
     try std.testing.expectEqualStrings("artifact-model", colliding.findArtifactEntry("shared_name").?.model);
 
+    // Public query aliases outrank every legacy artifact name globally, not
+    // merely within whichever registry entry is encountered first.
+    var alias_collision = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{
+        \\  "other_owner":{"type":"embeddings","dimension":384,"embedding_name":"artifact_consumer","embedder":{"provider":"antfly","model":"wrong-model"}},
+        \\  "actual_owner":{"type":"embeddings","dimension":384,"embedding_name":"actual_artifact","embedder":{"provider":"antfly","model":"right-model"}},
+        \\  "enrichments":[
+        \\    {"name":"artifact_consumer","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"wrong-model\",\"endpoint\":\"antfly:embedded\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},
+        \\    {"name":"actual_artifact","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"right-model\",\"endpoint\":\"antfly:embedded\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}
+        \\  ],
+        \\  "artifact_consumer":{"type":"embeddings","dimension":384,"sources":[{"artifact":"actual_artifact"}]}
+        \\}
+    , .{ .antfly_provider = local.provider() });
+    defer alias_collision.deinit();
+    try std.testing.expectEqualStrings("right-model", alias_collision.findQueryEntry("artifact_consumer").?.model);
+    try std.testing.expectEqualStrings("wrong-model", alias_collision.findArtifactEntry("artifact_consumer").?.model);
+
     var semantic_identity = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
         \\{
         \\  "enrichments":[{"name":"semantic_artifact","kind":"embedding","field":"body","expected_dims":384,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"semantic-model\",\"endpoint\":\"antfly:embedded\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}],
@@ -4214,6 +4265,14 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
         validateEmbeddingEnrichmentProducerJsonWithOptions(
             std.testing.allocator,
             "{\"name\":\"credential_bearing_identity\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"dense-model\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"sparse\\\":false,\\\"api_key\\\":\\\"must-not-be-provenance\\\"}\"}",
+            .{ .antfly_provider = local.provider() },
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateEmbeddingEnrichmentProducerJsonWithOptions(
+            std.testing.allocator,
+            "{\"name\":\"credential_endpoint_identity\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"openai\\\",\\\"model\\\":\\\"dense-model\\\",\\\"endpoint\\\":\\\"https://models.example/v1?api_key=secret\\\",\\\"sparse\\\":false}\"}",
             .{ .antfly_provider = local.provider() },
         ),
     );

@@ -1287,6 +1287,55 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     # Failed replacement is atomic: the original owner and its artifact remain.
     detail = stateful_api.get_index(owner_table, "document_vectors")
     assert detail["config"]["type"] == "embeddings"
+    doc_key = "original-producer-still-runnable"
+    written = stateful_api.batch_write(
+        owner_table,
+        inserts={doc_key: {"body": "durable artifact producer remains runnable"}},
+        sync_level="full_index",
+    )
+    assert written["inserted"] == 1
+    runtime = wait_until(
+        lambda: (
+            current
+            if (
+                (current := stateful_api.get_index(owner_table, "document_vectors"))
+                .get("status", {})
+                .get("total_indexed")
+                == 1
+                and current.get("status", {}).get("query_visible_doc_count") == 1
+                and current.get("status", {})
+                .get("enrichment_runtime", {})
+                .get("embed_batches_completed", 0)
+                > 0
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert runtime is not None, json.dumps(
+        stateful_api.get_index(owner_table, "document_vectors"), sort_keys=True
+    )
+    semantic = wait_until(
+        lambda: (
+            response
+            if doc_key
+            in _query_hit_ids(
+                response := stateful_api.query_table(
+                    owner_table,
+                    {
+                        "semantic_search": "durable artifact producer",
+                        "indexes": ["document_vectors"],
+                        "limit": 5,
+                    },
+                )
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert semantic is not None
 
 
 def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(

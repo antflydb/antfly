@@ -31,6 +31,7 @@ const chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const credential_safety = @import("../common/credential_safety.zig");
 const table_index_config = @import("table_index_config.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -538,7 +539,7 @@ fn validateEmbeddingArtifactReferences(
             saw_implicit = true;
             if (cfg.producer_json.len == 0) return error.InvalidEnrichmentConfig;
             if (implicit_producer) |expected| {
-                if (!try producerJsonValuesEqual(alloc, expected, cfg.producer_json))
+                if (!try enrichment_config_validation.producerJsonValuesEqual(alloc, expected, cfg.producer_json))
                     return error.InvalidEnrichmentConfig;
             } else {
                 implicit_producer = cfg.producer_json;
@@ -663,17 +664,6 @@ fn findArtifactEnrichmentConfig(
     return null;
 }
 
-fn producerJsonValuesEqual(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8) !bool {
-    if (lhs.len == 0 or rhs.len == 0) return lhs.len == rhs.len;
-    var lhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, lhs, .{}) catch
-        return error.InvalidEnrichmentConfig;
-    defer lhs_parsed.deinit();
-    var rhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, rhs, .{}) catch
-        return error.InvalidEnrichmentConfig;
-    defer rhs_parsed.deinit();
-    return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
-}
-
 fn artifactEnrichmentConfigsEqual(
     alloc: std.mem.Allocator,
     a: db_mod.types.EnrichmentConfig,
@@ -691,7 +681,7 @@ fn artifactEnrichmentConfigsEqual(
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        try producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.meta.eql(a.execution, b.execution);
 }
 
@@ -1338,61 +1328,16 @@ fn appendCanonicalSingleGraphSource(
 }
 
 fn isSensitivePublicConfigField(field: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(field, "authorization") or
-        std.ascii.eqlIgnoreCase(field, "proxy-authorization") or
-        std.ascii.eqlIgnoreCase(field, "cookie") or
-        std.ascii.eqlIgnoreCase(field, "set-cookie") or
-        std.ascii.eqlIgnoreCase(field, "credentials_path") or
-        std.ascii.eqlIgnoreCase(field, "private_key") or
-        std.ascii.eqlIgnoreCase(field, "secret")) return true;
-    return normalizedCredentialNameIsSensitive(field);
-}
-
-fn normalizedCredentialNameIsSensitive(name: []const u8) bool {
-    var normalized_buffer: [128]u8 = undefined;
-    if (name.len > normalized_buffer.len) return true;
-    var normalized_len: usize = 0;
-    for (name) |byte| {
-        if (!std.ascii.isAlphanumeric(byte)) continue;
-        normalized_buffer[normalized_len] = std.ascii.toLower(byte);
-        normalized_len += 1;
-    }
-    const normalized = normalized_buffer[0..normalized_len];
-    if (normalized.len == 0) return true;
-    const exact_sensitive = [_][]const u8{
-        "auth", "code", "cookie", "credentials", "key", "password", "secret", "sig", "token", "xauth",
-    };
-    for (exact_sensitive) |candidate| {
-        if (std.mem.eql(u8, normalized, candidate)) return true;
-    }
-    const sensitive_components = [_][]const u8{
-        "apikey",
-        "accesskey",
-        "secretkey",
-        "privatekey",
-        "subscriptionkey",
-        "authtoken",
-        "authkey",
-    };
-    for (sensitive_components) |component| {
-        if (std.mem.indexOf(u8, normalized, component) != null) return true;
-    }
-    const sensitive_suffixes = [_][]const u8{
-        "password", "passwd", "secret", "token", "credential", "signature", "authorization",
-    };
-    for (sensitive_suffixes) |suffix| {
-        if (std.mem.endsWith(u8, normalized, suffix)) return true;
-    }
-    return false;
+    return credential_safety.fieldNameIsSensitive(field);
 }
 
 fn isSensitivePublicConfigValue(field: []const u8, value: std.json.Value) bool {
     if (value != .string) return false;
     // Secret-store references are implementation details and can disclose
     // credential inventory even when they do not contain the secret value.
-    if (std.mem.indexOf(u8, value.string, "${secret:") != null) return true;
+    if (credential_safety.containsSecretReference(value.string)) return true;
     if (!isPublicProviderUrlField(field)) return false;
-    return urlContainsCredentials(value.string);
+    return credential_safety.urlContainsCredentials(value.string);
 }
 
 fn isPublicProviderUrlField(field: []const u8) bool {
@@ -1401,69 +1346,6 @@ fn isPublicProviderUrlField(field: []const u8) bool {
         std.ascii.eqlIgnoreCase(field, "base_url") or
         std.ascii.eqlIgnoreCase(field, "endpoint") or
         std.ascii.eqlIgnoreCase(field, "endpoint_url");
-}
-
-fn urlContainsCredentials(url: []const u8) bool {
-    const authority_start = if (std.mem.indexOf(u8, url, "://")) |scheme_end|
-        scheme_end + 3
-    else if (std.mem.startsWith(u8, url, "//"))
-        @as(usize, 2)
-    else
-        null;
-    if (authority_start) |start| {
-        var authority_end = url.len;
-        for (url[start..], start..) |byte, index| {
-            if (byte == '/' or byte == '?' or byte == '#') {
-                authority_end = index;
-                break;
-            }
-        }
-        if (std.mem.indexOfScalar(u8, url[start..authority_end], '@') != null) return true;
-    }
-
-    const fragment_start = std.mem.indexOfScalar(u8, url, '#');
-    if (std.mem.indexOfScalar(u8, url, '?')) |query_marker| {
-        if (fragment_start == null or query_marker < fragment_start.?) {
-            const query_end = fragment_start orelse url.len;
-            if (urlParameterListContainsCredentials(url[query_marker + 1 .. query_end])) return true;
-        }
-    }
-    if (fragment_start) |marker| {
-        return urlParameterListContainsCredentials(url[marker + 1 ..]);
-    }
-    return false;
-}
-
-fn urlParameterListContainsCredentials(encoded_parameters: []const u8) bool {
-    var parameters = std.mem.tokenizeAny(u8, encoded_parameters, "&;");
-    while (parameters.next()) |parameter| {
-        const key = parameter[0 .. std.mem.indexOfScalar(u8, parameter, '=') orelse parameter.len];
-        if (urlQueryKeyIsSensitive(key)) return true;
-    }
-    return false;
-}
-
-fn urlQueryKeyIsSensitive(encoded: []const u8) bool {
-    var decoded_buffer: [128]u8 = undefined;
-    if (encoded.len > decoded_buffer.len) return true;
-    var decoded_len: usize = 0;
-    var index: usize = 0;
-    while (index < encoded.len) {
-        if (encoded[index] == '%') {
-            if (index + 2 >= encoded.len) return true;
-            const high = std.fmt.charToDigit(encoded[index + 1], 16) catch return true;
-            const low = std.fmt.charToDigit(encoded[index + 2], 16) catch return true;
-            decoded_buffer[decoded_len] = @intCast((high << 4) | low);
-            decoded_len += 1;
-            index += 3;
-            continue;
-        }
-        decoded_buffer[decoded_len] = if (encoded[index] == '+') ' ' else encoded[index];
-        decoded_len += 1;
-        index += 1;
-    }
-    const key = std.mem.trim(u8, decoded_buffer[0..decoded_len], &std.ascii.whitespace);
-    return isSensitivePublicConfigField(key);
 }
 
 fn appendPublicConfigValue(

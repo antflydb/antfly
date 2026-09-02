@@ -12243,7 +12243,13 @@ pub const ApiHttpServer = struct {
         // after all potentially expensive validation, but never claim a
         // canceled result once consensus may have committed the mutation.
         try ensureTableOperationActive(request);
-        self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
+        var replacement = table_before;
+        replacement.indexes_json = expected_indexes_json;
+        const mutation_result = if (uses_artifact_sources)
+            self.source.replaceTableDefinition(table_before, replacement)
+        else
+            self.source.createIndex(alloc, table_name, index_name, stored_index_json);
+        mutation_result catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -12450,7 +12456,9 @@ pub const ApiHttpServer = struct {
         };
 
         try ensureTableOperationActive(request);
-        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+        var replacement = table_before;
+        replacement.indexes_json = expected_indexes_json;
+        self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -34138,6 +34146,8 @@ test "api http server create index installs exact visible config and defers lagg
         mutex: std.atomic.Mutex = .unlocked,
         projection_wait_calls: std.atomic.Value(usize) = .init(0),
         put_enrichment_calls: usize = 0,
+        replace_definition_calls: usize = 0,
+        force_replace_conflict: bool = false,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -34148,6 +34158,7 @@ test "api http server create index installs exact visible config and defers lagg
                     .linearizable_snapshot = linearizableSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
+                    .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                     .put_artifact_enrichment = putArtifactEnrichment,
                     .wait_table_projection = waitTableProjection,
@@ -34222,6 +34233,23 @@ test "api http server create index installs exact visible config and defers lagg
             // equality with the pre-proposal snapshot.
             const concurrent = try indexes_api.addIndexToTableIndexesJson(allocator, next, "concurrent_text", "{\"type\":\"full_text\"}");
             self.replaceIndexesJson(allocator, concurrent, true);
+        }
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            self.replace_definition_calls += 1;
+            if (self.force_replace_conflict) return error.TableGenerationChanged;
+            const current: metadata_table_manager.TableRecord = .{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = self.indexes_json,
+                .placement_role = "data",
+            };
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            const next = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            self.replaceIndexesJson(std.testing.allocator, next, true);
         }
 
         fn dropIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -34368,6 +34396,22 @@ test "api http server create index installs exact visible config and defers lagg
             try std.testing.expectEqual(@as(i64, 384), stored.?.config.object.get("dimension").?.integer);
         }
         try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_source.replace_definition_calls);
+
+        // Artifact validation is tied to the exact catalog generation it read.
+        // A concurrent producer/catalog change must conflict instead of
+        // committing a mutation validated against stale ownership.
+        artifact_source.force_replace_conflict = true;
+        var conflicted = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/concurrent_artifact_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+        });
+        defer conflicted.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), conflicted.status);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        artifact_source.force_replace_conflict = false;
 
         var missing_enrichment = try executeHttpxTestRequest(&artifact_server, .{
             .method = .POST,
