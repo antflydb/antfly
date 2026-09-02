@@ -25,6 +25,7 @@ const metadata_service = @import("service.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
+const metadata_table_topology_mutations = @import("table_topology_mutations.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_test_runtime = @import("../api/http_test_runtime.zig");
@@ -3108,9 +3109,11 @@ pub const MetadataHttpNodeSimulation = struct {
 
         self.cluster.metadata_proposal_in_flight += 1;
         defer self.cluster.metadata_proposal_in_flight -= 1;
+        var operation_may_have_been_admitted = false;
 
         for (commands) |command| {
-            const encoded = try metadata_storage.encodeTransitionCommand(self.cluster.alloc, command);
+            const encoded = metadata_storage.encodeTransitionCommand(self.cluster.alloc, command) catch |err|
+                return simulationMutationError(err, operation_may_have_been_admitted);
             defer self.cluster.alloc.free(encoded);
 
             const recovery_candidate_index = bestMetadataElectionCandidateIndex(self.cluster) orelse self.index;
@@ -3122,37 +3125,48 @@ pub const MetadataHttpNodeSimulation = struct {
                     // different replicas.
                     self.cluster.node(recovery_candidate_index).campaignMetadataGroup() catch |err| switch (err) {
                         error.UnknownGroup => {},
-                        else => return err,
+                        else => return simulationMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
-                        try self.cluster.stepAll();
+                        self.cluster.stepAll() catch |err|
+                            return simulationMutationError(err, operation_may_have_been_admitted);
                         if (self.cluster.currentMetadataLeaderIndex() != null) continue :command_retry;
                     }
                     continue;
                 };
 
                 const leader_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse {
-                    try self.cluster.stepAll();
+                    self.cluster.stepAll() catch |err|
+                        return simulationMutationError(err, operation_may_have_been_admitted);
                     continue;
                 };
                 const proposal_index = leader_status.last_index + 1;
                 self.cluster.node(target_index).sim().propose(self.cluster.metadata_group_id, encoded) catch |err| switch (err) {
                     error.NotLeader => {
-                        try self.cluster.stepAll();
+                        self.cluster.stepAll() catch |step_err|
+                            return simulationMutationError(step_err, operation_may_have_been_admitted);
                         continue;
                     },
-                    else => return err,
+                    else => return simulationMutationError(err, operation_may_have_been_admitted),
                 };
+                operation_may_have_been_admitted = true;
 
                 // `propose` only appends locally. Do not report success until
                 // the exact index assigned by that leader is committed and
                 // applied; otherwise a stale leader can acknowledge a command
                 // that is subsequently overwritten.
                 for (0..16) |_| {
-                    try self.cluster.stepAll();
+                    self.cluster.stepAll() catch |err|
+                        return simulationMutationError(err, operation_may_have_been_admitted);
                     const raft_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse break;
                     if (raft_status.soft.role != .leader or raft_status.hard.current_term != leader_status.hard.current_term) break;
-                    if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) break :command_retry;
+                    if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) {
+                        if (self.cluster.metadata_proposal_post_apply_failure) |post_apply_failure| {
+                            self.cluster.metadata_proposal_post_apply_failure = null;
+                            return simulationMutationError(post_apply_failure, operation_may_have_been_admitted);
+                        }
+                        break :command_retry;
+                    }
                 }
             } else {
                 for (self.cluster.cluster.nodes, 0..) |*node, index| {
@@ -3165,7 +3179,7 @@ pub const MetadataHttpNodeSimulation = struct {
                         std.debug.print("metadata proposal exhausted node={d} status=absent\n", .{index});
                     }
                 }
-                return error.NotLeader;
+                return simulationMutationError(error.NotLeader, operation_may_have_been_admitted);
             }
         }
 
@@ -3174,7 +3188,19 @@ pub const MetadataHttpNodeSimulation = struct {
         else
             @max(@as(usize, 4), @min(commands.len * 2, @as(usize, 16)));
         var rounds: usize = 0;
-        while (rounds < settle_rounds) : (rounds += 1) try self.cluster.stepAll();
+        while (rounds < settle_rounds) : (rounds += 1) {
+            self.cluster.stepAll() catch |err|
+                return simulationMutationError(err, operation_may_have_been_admitted);
+        }
+    }
+
+    fn simulationMutationError(err: anyerror, operation_may_have_been_admitted: bool) anyerror {
+        if (!operation_may_have_been_admitted) return err;
+        std.log.warn(
+            "simulated metadata mutation outcome became ambiguous after admission err={s}",
+            .{@errorName(err)},
+        );
+        return error.MetadataMutationOutcomeUnknown;
     }
 
     fn commandsOnlyReconcileLease(commands: []const metadata_storage.TransitionCommand) bool {
@@ -3335,6 +3361,7 @@ pub const MetadataHttpClusterSimulation = struct {
     scheduler_gate: SimulationSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    metadata_proposal_post_apply_failure: ?anyerror = null,
     next_reallocation_request_id: u128 = 1,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
@@ -4740,18 +4767,59 @@ fn applyDropTableMutation(
     node: MetadataHttpNodeSimulation,
     alloc: std.mem.Allocator,
     table_name: []const u8,
-) !void {
+) !metadata_table_topology_mutations.DropResult {
     const target = currentMetadataMutationNode(node);
-    var snapshot = try target.adminSnapshot();
-    defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    for (snapshot.ranges) |record| {
-        if (record.table_id != table.table_id) continue;
-        try target.removeRange(record.group_id);
+    const store = target.sim().runtime.svc.host.owned_metadata_store orelse
+        return error.MissingMetadataStore;
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        if (attempt == 0) {
+            try store.ensureDerivedCatalogIndexes(target.cluster.metadata_group_id);
+        } else {
+            try store.rebuildDerivedCatalogIndexes(target.cluster.metadata_group_id);
+        }
+        var projection = (store.captureTableDropProjection(
+            alloc,
+            target.cluster.metadata_group_id,
+            table_name,
+        ) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => continue,
+            else => return err,
+        }) orelse return error.TableNotFound;
+        defer projection.deinit(alloc);
+        if (projection.fence.active()) return error.TableTransitionActive;
+        if (projection.extension_owned) return error.ExtensionOwnedObject;
+
+        try target.proposeTransitionCommand(.{ .apply_table_topology = .{ .drop = .{
+            .table_id = projection.table.table_id,
+            .expected_name = projection.table.name,
+            .expected_transition_generation = projection.fence.generation,
+            .range_contract = .{
+                .membership = projection.fence.membership(projection.table.table_id),
+            },
+        } } });
+        const verification_index = target.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataMutationOutcomeUnknown;
+        const verification_store = target.cluster.node(verification_index).sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MetadataMutationOutcomeUnknown;
+        if (try verification_store.getTable(
+            alloc,
+            target.cluster.metadata_group_id,
+            projection.table.table_id,
+        )) |current| {
+            metadata_table_manager.freeTable(alloc, current);
+            return error.TableTransitionActive;
+        }
+
+        const result: metadata_table_topology_mutations.DropResult = .{
+            .table_id = projection.table.table_id,
+            .expected_transition_generation = projection.fence.generation,
+            .group_ids = projection.range_group_ids,
+        };
+        projection.range_group_ids = &.{};
+        return result;
     }
-    try target.removeTable(table.table_id);
-    try target.runRound();
-    _ = alloc;
+    return error.InvalidDerivedCatalogIndex;
 }
 
 fn applyUpdateSchemaMutation(
@@ -5083,6 +5151,7 @@ const PublicApiStatusSource = struct {
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
                 .drop_table = dropTable,
+                .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
@@ -5159,8 +5228,17 @@ const PublicApiStatusSource = struct {
     }
 
     fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+        var result = try dropTableExact(ptr, alloc, table_name);
+        defer result.deinit(alloc);
+    }
+
+    fn dropTableExact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !metadata_table_topology_mutations.DropResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try applyDropTableMutation(self.node, alloc, table_name);
+        return try applyDropTableMutation(self.node, alloc, table_name);
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -12161,6 +12239,24 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     defer manifest.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
     try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+
+    // Inject authority loss after the atomic topology entry is committed and
+    // applied but before the caller receives success. The exact simulation
+    // source must preserve the ambiguous outcome instead of replaying the
+    // destructive operation, while the committed table and all of its ranges
+    // disappear together.
+    cluster.metadata_proposal_post_apply_failure = error.NotLeader;
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        status_sources[elected_leader].iface().dropTableExact(std.testing.allocator, "docs"),
+    );
+    try std.testing.expect(cluster.metadata_proposal_post_apply_failure == null);
+    const projected_tables = try cluster.node(elected_leader).listProjectedTables(std.testing.allocator);
+    defer cluster.node(elected_leader).freeProjectedTables(std.testing.allocator, projected_tables);
+    try std.testing.expectEqual(@as(usize, 0), projected_tables.len);
+    const projected_ranges = try cluster.node(elected_leader).listProjectedRanges(std.testing.allocator);
+    defer cluster.node(elected_leader).freeProjectedRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expectEqual(@as(usize, 0), projected_ranges.len);
 }
 
 test "metadata http cluster simulation skips reconcile work without lease ownership" {

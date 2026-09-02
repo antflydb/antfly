@@ -1386,12 +1386,14 @@ pub const StatusSource = struct {
     /// Drops metadata and returns the exact group set fenced by the committed
     /// mutation when the backend supports it. The empty legacy result is safe:
     /// callers must never reconstruct destructive cleanup targets from a stale
-    /// snapshot after this point.
+    /// snapshot after this point. A failing legacy callback has no admission
+    /// receipt, so authority errors are conservatively reported as ambiguous.
     pub fn dropTableExact(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
         try tables_api.validateTableMutationName(table_name);
         if (self.vtable.drop_table_exact) |fn_ptr|
             return try BoundaryAbi.call("drop_table_exact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
-        try self.dropTable(alloc, table_name);
+        self.dropTable(alloc, table_name) catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
         return .{ .table_id = 0, .expected_transition_generation = 0, .group_ids = try alloc.alloc(u64, 0) };
     }
 
@@ -36291,6 +36293,41 @@ test "api http server retries only pre-admission public table drop failures" {
         );
         try std.testing.expectEqual(@as(usize, 2), ambiguous_source.drop_calls);
     }
+
+    const LegacySource = struct {
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .drop_table = dropTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drop_calls += 1;
+            // A legacy callback has no receipt boundary, so even this typed
+            // authority error cannot prove that an earlier side effect did
+            // not commit.
+            return error.NotLeader;
+        }
+    };
+
+    var legacy_source: LegacySource = .{};
+    var legacy_server = ApiHttpServer.init(alloc, .{}, legacy_source.iface(), null, null);
+    legacy_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
+    var legacy_response = try executeHttpxTestRequest(&legacy_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer legacy_response.deinit(alloc);
+    try expectPublicMetadataMutationOutcomeUnknownResponse(legacy_response);
+    try std.testing.expectEqual(@as(usize, 1), legacy_source.drop_calls);
 }
 
 test "schema projection expectation uses backend committed generation" {
