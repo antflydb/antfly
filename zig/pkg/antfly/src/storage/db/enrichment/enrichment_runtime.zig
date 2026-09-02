@@ -12291,29 +12291,19 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     };
     defer runtime.alloc.free(raw);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, runtime.alloc, raw, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(source_field) orelse return null;
-    if (source != .string) return null;
-    return enrichment_artifact_codec.hashEmbeddingSource(source.string, producer_json);
+    const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
+    defer runtime.alloc.free(source);
+    return enrichment_artifact_codec.hashEmbeddingSource(source, producer_json);
 }
 
 fn chunkPayloadHasText(alloc: Allocator, payload: []const u8, source_field: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const source = parsed.value.object.get(source_field) orelse return false;
-    return source == .string and source.string.len > 0;
+    const source = try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field) orelse return false;
+    defer alloc.free(source);
+    return true;
 }
 
 fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(source_field) orelse return null;
-    if (source != .string or source.string.len == 0) return null;
-    return try alloc.dupe(u8, source.string);
+    return try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field);
 }
 
 fn storedChunkEmbeddingSourcesForRequest(

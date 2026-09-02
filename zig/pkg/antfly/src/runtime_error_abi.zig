@@ -318,6 +318,10 @@ pub const Detail = enum(c_int) {
     /// A metadata mutation may already be committed. Callers must observe the
     /// durable catalog state before deciding whether a retry is safe.
     metadata_mutation_outcome_unknown,
+    missing_embedding_artifact_producer,
+    invalid_embedding_artifact_producer,
+    embedding_artifact_dimension_required,
+    conflicting_embedding_artifact_dimensions,
 };
 
 pub const Status = extern struct {
@@ -488,6 +492,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
         error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
+        error.MissingEmbeddingArtifactProducer => status(.invalid_argument, .missing_embedding_artifact_producer),
+        error.InvalidEmbeddingArtifactProducer => status(.invalid_argument, .invalid_embedding_artifact_producer),
+        error.EmbeddingArtifactDimensionRequired => status(.invalid_argument, .embedding_artifact_dimension_required),
+        error.ConflictingEmbeddingArtifactDimensions => status(.invalid_argument, .conflicting_embedding_artifact_dimensions),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -936,6 +944,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
         .graph_path_weight_overflow => "GraphPathWeightOverflow",
         .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
+        .missing_embedding_artifact_producer => "MissingEmbeddingArtifactProducer",
+        .invalid_embedding_artifact_producer => "InvalidEmbeddingArtifactProducer",
+        .embedding_artifact_dimension_required => "EmbeddingArtifactDimensionRequired",
+        .conflicting_embedding_artifact_dimensions => "ConflictingEmbeddingArtifactDimensions",
     };
 }
 
@@ -958,6 +970,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
+    try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
