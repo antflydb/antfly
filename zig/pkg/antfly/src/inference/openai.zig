@@ -35,6 +35,7 @@ pub const Provider = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+    max_response_bytes: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -73,6 +74,10 @@ pub const Provider = struct {
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
+    }
+
+    pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
+        self.max_response_bytes = max_response_bytes;
     }
 
     pub fn setSamplingOptions(
@@ -118,7 +123,11 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .max_response_size = self.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return mapEmbedStatus(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
@@ -182,7 +191,11 @@ pub const Provider = struct {
             .presence_penalty = self.presence_penalty,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .max_response_size = self.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;

@@ -792,20 +792,66 @@ document. They are architectural requirements, not Florence-specific cleanup:
     provider serializes the URI into JSON. `AttachmentTransport.data_uri` now
     represents raw bytes plus both encoded copies at peak. Borrowed binary and
     a base64-only streaming executor retain their lower concrete peaks. A
-    remote generator producer that can recover through a data-URI singleton
-    adapter reserves the larger fallback peak even though its normal Antfly
-    batch writes one base64 body.
+    local compatibility adapter reserves that peak. A distributed generator
+    host charges only the base64 batch body it owns; serial fallback inside an
+    inference node is admitted independently by that node.
 78. **Optional embedder memory hooks silently implied borrowed media.** The
     part-item embedding path now fails closed with
     `InferenceInvocationMemoryUnavailable` unless its concrete implementation
     publishes a plan. The managed ClipClap/remote embedding implementation
     supplies one; adding a new multimodal embedder can no longer accidentally
     bypass wire and response accounting.
-79. **Remote response memory had no matching transport ceiling.** The owned
-    asset-producer HTTP client now applies a four-MiB response-body limit, and
-    its invocation plan reads the actual client ceiling when reserving response
-    and parser memory. A caller-supplied client keeps its own ceiling, which is
-    reflected by the same route plan rather than overwritten or guessed.
+79. **Remote response memory had no matching transport ceiling.** Provider
+    requests now carry operation-scoped response ceilings derived from the
+    selected task's configured result policy and item count. The HTTP client's
+    64-MiB setting is only an outer safety ceiling; catalog discovery retains a
+    separate four-MiB limit. Caller-supplied clients use the smaller of their
+    own outer ceiling and the route ceiling, so the planner and transport
+    enforce the same value.
+80. **The invocation plan described an estimate as a complete contract.** Every
+    media plan now publishes both an executor-allocator ceiling and an aggregate
+    result ceiling. Public media producer and part-item embedder entry points
+    execute through a freeing peak-live bounded allocator and reject oversized
+    returned results. The per-task defaults are policy, not guesses: reader,
+    generator, extractor, transcriber, copy, and document-extraction limits are
+    independently configurable on the asset runtime. A route that needs a
+    larger result must raise and reserve that explicit hard limit.
+81. **Callers could bypass media admission by invoking the executor directly.**
+    `Producer.produce`, `produceBatch`, `produceBatchReported`, and
+    `DenseEmbedder.embedDensePartItems` now resolve the concrete route plan
+    themselves whenever borrowed media is present. Missing or invalid plans
+    fail before entering a callback. PDF scheduling still obtains the same plan
+    before rendering, but executor safety no longer depends on that one caller
+    remembering the protocol.
+82. **Distributed fallback accounting crossed process boundaries.** The host
+    generator plan now describes its actual base64 `/generate/batch` request.
+    The inference node owns and admits any singleton/data-URI fallback it
+    performs after receiving that request. Execution reports cross the boundary;
+    transient memory reservations do not.
+83. **A global response cap coupled unrelated operations.** Reader, generator,
+    extractor, and transcriber adapters propagate a route-owned response limit
+    into each HTTP request. Capability discovery has its own smaller ceiling.
+    This avoids both rejecting configured large extraction/generation results at four MiB
+    and reserving four times a caller-owned client's default 100-MiB ceiling for
+    a small OCR request.
+84. **RFC 2397 parsing existed in several subtly different forms.** A single
+    dependency-neutral parser in `antfly_scraping` now validates canonical
+    standard base64, percent decoding, case-insensitive markers, parameters,
+    and the RFC's omitted-media-type form. The generic parser returns the
+    `text/plain;charset=US-ASCII` default; image/audio admission layers require
+    an explicit compatible MIME type as policy. Host preflight, inference-node
+    decoding, remote-content downloads, reader adaptation, transcription, and
+    Vertex/Gemini serialization use that shared implementation.
+85. **The reader wire adapter did not consume the shared report's rejected-item
+    count.** Reader batches currently return a success value for every input,
+    so a nonzero remote rejection count contradicts their result cardinality.
+    The adapter now rejects that report instead of dropping the field, and its
+    fixtures initialize the complete generated wire type.
+86. **Decoded data-URI MIME metadata had ambiguous ownership.** The shared
+    decoder returns owned MIME and payload buffers. Consumers that retain only
+    the payload explicitly release the MIME allocation; consumers that retain
+    both transfer both. This keeps request parsing allocation-failure safe while
+    preserving parameter-only RFC media types such as `;charset=utf-8`.
 
 ### Post-review implementation contract
 
@@ -828,7 +874,9 @@ The hardening above follows these long-term rules:
   closed when this plan is absent rather than inferring it from model
   capabilities. Linked callbacks charge borrowed bytes, base64 transports
   charge exact expansion, and data-URI adapters charge the complete URI plus
-  its downstream serialized copy. Provider
+  downstream serialization copy. The plan also contains hard allocator and
+  result ceilings. Every public executor entry point containing borrowed media
+  applies those ceilings even when invoked outside the PDF scheduler. Provider
   wire ceilings and process resident ceilings are distinct: render planning
   reserves retained raw media, one concrete transport body, and the complete
   route-specific fixed peak for envelopes, responses, parsing, typed results,
@@ -1022,6 +1070,12 @@ The hardening above follows these long-term rules:
     canonical copy for every request; base64 is written into the one exact body.
     Direct inference-node media decoding accepts the same validated RFC 2397
     base64 and percent forms as host preflight.
+33. **Implemented after enforcement review:** media executor plans now carry
+    hard allocator and result ceilings that public producer/embedder boundaries
+    enforce automatically; distributed generator fallback is admitted in the
+    process that executes it; provider response ceilings are operation-scoped;
+    and all inline-data consumers share the RFC 2397 parser while keeping MIME
+    acceptance and ownership as explicit task-layer contracts.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

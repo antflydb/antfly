@@ -8,6 +8,7 @@
 //! owning model-family packages.
 
 const std = @import("std");
+const data_uri = @import("antfly_scraping").data_uri;
 
 pub const Task = enum {
     read,
@@ -323,7 +324,107 @@ pub const AttachmentTransport = enum {
 pub const InvocationMemoryPlan = struct {
     attachment_transport: AttachmentTransport,
     fixed_bytes: usize,
+    /// Hard ceiling for allocations performed through the executor's caller
+    /// allocator. Media-capable public executor boundaries wrap the supplied
+    /// allocator with this limit, so a stale or low estimate fails closed.
+    allocator_limit_bytes: usize = 0,
+    /// Maximum aggregate bytes retained in successful logical results.
+    max_result_bytes: usize = 0,
+
+    pub fn validate(self: InvocationMemoryPlan) !void {
+        if (self.allocator_limit_bytes == 0 or self.max_result_bytes == 0)
+            return error.InvalidInferenceInvocationMemory;
+        if (self.allocator_limit_bytes > self.fixed_bytes or self.max_result_bytes > self.allocator_limit_bytes)
+            return error.InvalidInferenceInvocationMemory;
+    }
 };
+
+/// Freeing, peak-live allocator used at every public media executor boundary.
+/// Returned allocations may be freed through the backing allocator after this
+/// wrapper goes out of scope; the wrapper exists to enforce the invocation,
+/// not to own the returned bytes.
+pub const BoundedInvocationAllocator = struct {
+    backing: std.mem.Allocator,
+    max_live_bytes: usize,
+    live_bytes: usize = 0,
+    peak_live_bytes: usize = 0,
+    limit_exceeded: bool = false,
+
+    pub fn init(backing: std.mem.Allocator, max_live_bytes: usize) BoundedInvocationAllocator {
+        return .{ .backing = backing, .max_live_bytes = max_live_bytes };
+    }
+
+    pub fn allocator(self: *BoundedInvocationAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn permit(self: *BoundedInvocationAllocator, additional: usize) bool {
+        if (additional > self.max_live_bytes -| self.live_bytes) {
+            self.limit_exceeded = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn recordGrowth(self: *BoundedInvocationAllocator, additional: usize) void {
+        self.live_bytes += additional;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permit(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.recordGrowth(len);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permit(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permit(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
+
+test "bounded invocation allocator enforces peak live bytes and credits frees" {
+    var bounded = BoundedInvocationAllocator.init(std.testing.allocator, 8);
+    const alloc = bounded.allocator();
+    const first = try alloc.alloc(u8, 4);
+    const second = try alloc.alloc(u8, 4);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 1));
+    try std.testing.expect(bounded.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 8), bounded.peak_live_bytes);
+    alloc.free(first);
+    const replacement = try alloc.alloc(u8, 4);
+    alloc.free(replacement);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
+}
 
 pub const InlineDataUri = struct {
     mime_type: []const u8,
@@ -331,54 +432,10 @@ pub const InlineDataUri = struct {
     encoding: enum { base64, percent },
 };
 
-fn standardBase64Index(byte: u8) ?u8 {
-    return switch (byte) {
-        'A'...'Z' => byte - 'A',
-        'a'...'z' => byte - 'a' + 26,
-        '0'...'9' => byte - '0' + 52,
-        '+' => 62,
-        '/' => 63,
-        else => null,
-    };
-}
-
 /// Validate a complete padded standard-base64 value, including canonical
 /// trailing bits, without allocating its decoded representation.
 pub fn validateCanonicalStandardBase64(data: []const u8) !usize {
-    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(data) catch
-        return error.InvalidDataURI;
-    var padding: usize = 0;
-    while (padding < data.len and data[data.len - 1 - padding] == '=') : (padding += 1) {}
-    if (padding > 2) return error.InvalidDataURI;
-    const content_end = data.len - padding;
-    for (data[0..content_end]) |byte| _ = standardBase64Index(byte) orelse return error.InvalidDataURI;
-    for (data[content_end..]) |byte| if (byte != '=') return error.InvalidDataURI;
-    if (padding == 1) {
-        if (content_end < 3 or (standardBase64Index(data[content_end - 1]).? & 0x03) != 0)
-            return error.InvalidDataURI;
-    } else if (padding == 2) {
-        if (content_end < 2 or (standardBase64Index(data[content_end - 1]).? & 0x0f) != 0)
-            return error.InvalidDataURI;
-    }
-    return decoded_size;
-}
-
-fn percentEncodedDataSize(data: []const u8) !usize {
-    var size: usize = 0;
-    var index: usize = 0;
-    while (index < data.len) {
-        if (data[index] == '%') {
-            if (index + 2 >= data.len or
-                !std.ascii.isHex(data[index + 1]) or
-                !std.ascii.isHex(data[index + 2]))
-                return error.InvalidDataURI;
-            index += 3;
-        } else {
-            index += 1;
-        }
-        size = std.math.add(usize, size, 1) catch return error.InvalidDataURI;
-    }
-    return size;
+    return data_uri.validateCanonicalStandardBase64(data) catch return error.InvalidDataURI;
 }
 
 /// Parse an inline data URI without materializing its decoded bytes. Both
@@ -386,22 +443,18 @@ fn percentEncodedDataSize(data: []const u8) !usize {
 /// the inference-node downloader supports both forms. Capability checks use
 /// the media-type essence rather than parameters such as `charset`.
 pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
-    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
-    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
-    const metadata = uri["data:".len..comma];
-    const base64 = std.ascii.endsWithIgnoreCase(metadata, ";base64");
-    const media_metadata = if (base64) metadata[0 .. metadata.len - ";base64".len] else metadata;
-    const parameter = std.mem.indexOfScalar(u8, media_metadata, ';') orelse media_metadata.len;
-    const mime_type = std.mem.trim(u8, media_metadata[0..parameter], &std.ascii.whitespace);
-    if (mime_type.len == 0) return error.InvalidDataURI;
-    const payload = uri[comma + 1 ..];
+    const parsed = data_uri.parse(uri) catch return error.InvalidDataURI;
+    const value = parsed orelse return null;
+    // This is a media-admission boundary, not the generic RFC parser. Omitted
+    // media types default to text/plain and are intentionally rejected here.
+    if (!value.has_explicit_media_type) return error.InvalidDataURI;
     return .{
-        .mime_type = mime_type,
-        .decoded_size = if (base64)
-            try validateCanonicalStandardBase64(payload)
-        else
-            try percentEncodedDataSize(payload),
-        .encoding = if (base64) .base64 else .percent,
+        .mime_type = value.media_type_essence,
+        .decoded_size = value.decodedSize() catch return error.InvalidDataURI,
+        .encoding = switch (value.encoding) {
+            .base64 => .base64,
+            .percent => .percent,
+        },
     };
 }
 

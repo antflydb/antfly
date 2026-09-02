@@ -90,6 +90,8 @@ pub const Request = struct {
     /// providers preserve these bytes across the native boundary; HTTP
     /// providers encode them only while constructing the final wire request.
     attachments: []const Attachment = &.{},
+    /// Route-owned hard response ceiling for bounded orchestration.
+    max_response_bytes: ?usize = null,
 };
 
 pub const Attachment = struct {
@@ -349,7 +351,11 @@ const HttpExtractorState = struct {
             try headers.append(alloc, .{ "Authorization", auth_header.? });
         }
 
-        var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+        var resp = try self.http.post(url, .{
+            .json = body,
+            .headers = headers.items,
+            .max_response_size = req.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.ExtractionRequestFailed;
         const payload = resp.body orelse return error.EmptyExtractionResponse;

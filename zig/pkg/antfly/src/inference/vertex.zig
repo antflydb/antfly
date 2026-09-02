@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const data_uri = @import("antfly_scraping").data_uri;
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference = @import("types.zig");
@@ -34,6 +35,7 @@ pub const GeminiProvider = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
+    max_response_bytes: ?usize = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
         var provider = GeminiProvider{
@@ -67,6 +69,10 @@ pub const GeminiProvider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setMaxResponseBytes(self: *GeminiProvider, max_response_bytes: ?usize) void {
+        self.max_response_bytes = max_response_bytes;
+    }
+
     pub fn setSamplingOptions(self: *GeminiProvider, temperature: ?f32, top_p: ?f32, top_k: ?i64) void {
         self.temperature = temperature;
         self.top_p = top_p;
@@ -88,7 +94,11 @@ pub const GeminiProvider = struct {
         defer alloc.free(json_body);
 
         const headers = [_][2][]const u8{self.api_key_header};
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = &headers });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = &headers,
+            .max_response_size = self.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse);
@@ -119,6 +129,7 @@ pub const Provider = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
+    max_response_bytes: ?usize = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: Options) !Provider {
         var provider = Provider{
@@ -177,6 +188,10 @@ pub const Provider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
+        self.max_response_bytes = max_response_bytes;
+    }
+
     pub fn setSamplingOptions(self: *Provider, temperature: ?f32, top_p: ?f32, top_k: ?i64) void {
         self.temperature = temperature;
         self.top_p = top_p;
@@ -209,7 +224,11 @@ pub const Provider = struct {
         defer if (minted_auth) |value| alloc.free(value);
         try self.appendAuthHeaders(alloc, &headers, &minted_auth);
 
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = headers.items });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = headers.items,
+            .max_response_size = self.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
@@ -387,8 +406,8 @@ fn appendVertexPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), part: in
 }
 
 fn appendVertexMediaUrl(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), url: []const u8, fallback_mime_type: []const u8) !void {
-    if (parseDataUri(url)) |data_uri| {
-        try appendVertexInlineData(alloc, out, data_uri.mime_type, data_uri.data);
+    if (parseDataUri(url)) |inline_uri| {
+        try appendVertexInlineData(alloc, out, inline_uri.mime_type, inline_uri.data);
         return;
     }
     try out.appendSlice(alloc, "{\"fileData\":{");
@@ -417,13 +436,12 @@ const DataUri = struct {
 };
 
 fn parseDataUri(value: []const u8) ?DataUri {
-    if (!std.mem.startsWith(u8, value, "data:")) return null;
-    const rest = value["data:".len..];
-    const marker = ";base64,";
-    const marker_idx = std.mem.indexOf(u8, rest, marker) orelse return null;
+    const parsed = (data_uri.parse(value) catch return null) orelse return null;
+    if (!parsed.has_explicit_media_type or parsed.encoding != .base64) return null;
+    _ = parsed.decodedSize() catch return null;
     return .{
-        .mime_type = rest[0..marker_idx],
-        .data = rest[marker_idx + marker.len ..],
+        .mime_type = parsed.media_type_essence,
+        .data = parsed.payload,
     };
 }
 

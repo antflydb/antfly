@@ -67,6 +67,8 @@ pub const Config = struct {
     language_code: ?[]const u8 = null,
     enable_automatic_punctuation: ?bool = null,
     use_enhanced: ?bool = null,
+    /// Route-owned hard response ceiling for bounded orchestration.
+    max_response_bytes: ?usize = null,
 
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
@@ -232,6 +234,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .language_code = try dupOpt(alloc, cfg.language_code),
         .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
         .use_enhanced = cfg.use_enhanced,
+        .max_response_bytes = cfg.max_response_bytes,
         .provider = cfg.provider,
     };
 }
@@ -314,6 +317,7 @@ const AntflyTranscriberState = struct {
     auth_header: ?[2][]const u8 = null,
     model: ?[]const u8 = null,
     language_code: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(AntflyTranscriberState);
@@ -325,6 +329,7 @@ const AntflyTranscriberState = struct {
             .api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080"),
             .model = try dupOpt(alloc, cfg.model),
             .language_code = try dupOpt(alloc, cfg.language_code),
+            .max_response_bytes = cfg.max_response_bytes,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -381,7 +386,11 @@ const AntflyTranscriberState = struct {
             header_buf[0] = header;
             break :blk header_buf[0..];
         } else &.{};
-        var resp = try self.http.post(url, .{ .json = body, .headers = headers });
+        var resp = try self.http.post(url, .{
+            .json = body,
+            .headers = headers,
+            .max_response_size = self.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
@@ -406,6 +415,7 @@ const OpenAiTranscriberState = struct {
     auth_header: ?[2][]const u8 = null,
     model: []const u8,
     language_code: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(OpenAiTranscriberState);
@@ -417,6 +427,7 @@ const OpenAiTranscriberState = struct {
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
             .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
             .language_code = try dupOpt(alloc, cfg.language_code),
+            .max_response_bytes = cfg.max_response_bytes,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token);
 
@@ -467,6 +478,7 @@ const OpenAiTranscriberState = struct {
         var resp = try self.http.post(url, .{
             .body = multipart.body,
             .headers = headers.items,
+            .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
@@ -490,6 +502,7 @@ const VertexTranscriberState = struct {
     location: []const u8,
     model: []const u8,
     language_code: []const u8,
+    max_response_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(VertexTranscriberState);
@@ -503,6 +516,7 @@ const VertexTranscriberState = struct {
             .location = try alloc.dupe(u8, cfg.location orelse "global"),
             .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
             .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
+            .max_response_bytes = cfg.max_response_bytes,
         };
         errdefer state.deinitState();
 
@@ -610,6 +624,7 @@ const VertexTranscriberState = struct {
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers.items,
+            .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
@@ -718,7 +733,7 @@ fn appendMultipartFile(
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, url, "data:")) {
+    if (std.ascii.startsWithIgnoreCase(url, "data:")) {
         return try decodeDataUriAlloc(alloc, url);
     }
 
@@ -739,17 +754,15 @@ fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
 }
 
 fn decodeDataUriAlloc(alloc: Allocator, uri: []const u8) ![]u8 {
-    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataUri;
-    const meta = uri[5..comma];
-    const data = uri[comma + 1 ..];
-    if (std.mem.endsWith(u8, meta, ";base64")) {
-        const size = try std.base64.standard.Decoder.calcSizeForSlice(data);
-        const out = try alloc.alloc(u8, size);
-        errdefer alloc.free(out);
-        try std.base64.standard.Decoder.decode(out, data);
-        return out;
-    }
-    return try alloc.dupe(u8, data);
+    const parsed = try scraping.data_uri.parseRequired(uri);
+    if (!parsed.has_explicit_media_type or
+        !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/"))
+        return error.InvalidDataUri;
+    var decoded = try scraping.data_uri.decodeAlloc(alloc, uri);
+    alloc.free(decoded.media_type);
+    const data = decoded.data;
+    decoded = undefined;
+    return data;
 }
 
 fn cloneResponse(alloc: Allocator, response: Response) !Response {
@@ -835,6 +848,16 @@ test "transcribing registry preserves named providers and default" {
     const explicit_cfg = try registry.getConfig("whisper-remote");
     try std.testing.expectEqual(Provider.openai, explicit_cfg.provider);
     try std.testing.expectEqualStrings("whisper-1", explicit_cfg.model.?);
+}
+
+test "transcribing config clone preserves the route response ceiling" {
+    const alloc = std.testing.allocator;
+    var cloned = try cloneConfig(alloc, .{
+        .provider = .antfly,
+        .max_response_bytes = 1234,
+    });
+    defer deinitConfig(alloc, &cloned);
+    try std.testing.expectEqual(@as(?usize, 1234), cloned.max_response_bytes);
 }
 
 test "transcribing registry duplicate provider error does not double free config" {

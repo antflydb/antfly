@@ -17,6 +17,7 @@ const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;
 const capability_cache_max_entries: usize = 64;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+const capability_catalog_response_bytes: usize = 4 << 20;
 
 fn monotonicNowNs(io: std.Io) u64 {
     _ = io;
@@ -723,7 +724,10 @@ pub fn discover(
 ) !?work.InferenceCapabilities {
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, task);
     defer alloc.free(url);
-    var response = try http.get(url, .{ .headers = headers });
+    var response = try http.get(url, .{
+        .headers = headers,
+        .max_response_size = capability_catalog_response_bytes,
+    });
     defer response.deinit();
     if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;
     return try parseModelCapabilities(alloc, response.body orelse return error.RemoteCapabilityDiscoveryFailed, model, task);
@@ -760,6 +764,7 @@ fn discoverWithContext(
             context.cancellation.ptr,
             context.cancellation.is_cancelled_fn,
         ),
+        .max_response_size = capability_catalog_response_bytes,
     });
     defer response.deinit();
     if (!response.ok()) return error.RemoteCapabilityDiscoveryFailed;

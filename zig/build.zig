@@ -2025,6 +2025,7 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
@@ -3472,9 +3473,12 @@ pub fn build(b: *std.Build) void {
             "asset producer runtime",
             "asset producer destroys returned values",
             "asset producer media invocation memory fails closed",
+            "asset producer enforces media allocator and result contracts",
+            "media part item embedding",
             "inference capabilities",
             "batch capabilities",
             "work identity and execution reports",
+            "bounded invocation allocator",
             "remote Antfly",
         },
     });
@@ -3697,6 +3701,7 @@ pub fn build(b: *std.Build) void {
         "managed embedder admission follows the selected attachment transport",
         "managed embedder partitions and validates inline image data URIs",
         "attachment transport separates wire and peak resident representations",
+        "bounded invocation allocator",
         "inline data URI parser validates canonical metadata",
         "antfly embed parts streams binary base64 into one request body",
         "antfly embed parts request sizing is exact for escaped strings",
@@ -3704,6 +3709,8 @@ pub fn build(b: *std.Build) void {
         "remote generator batch streams attachments into one exact JSON body",
         "asset producer runtime rejects empty borrowed media",
         "asset producer media invocation memory fails closed",
+        "asset producer enforces media allocator and result contracts",
+        "media part item embedding",
         "PDF render budget reserves the complete invocation peak",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",

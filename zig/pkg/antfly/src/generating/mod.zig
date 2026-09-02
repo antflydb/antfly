@@ -46,6 +46,7 @@ pub const BackendFactory = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -63,6 +64,7 @@ pub const BackendFactory = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
+        max_response_bytes: ?usize = null,
     };
 
     pub fn initWithOptions(
@@ -76,6 +78,7 @@ pub const BackendFactory = struct {
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
+            .max_response_bytes = options.max_response_bytes,
         };
     }
 
@@ -88,7 +91,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes);
     }
 };
 
@@ -98,6 +101,7 @@ const BackendState = struct {
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
+    max_response_bytes: ?usize = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -113,6 +117,7 @@ const BackendState = struct {
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
+        max_response_bytes: ?usize,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -127,6 +132,7 @@ const BackendState = struct {
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
+        state.max_response_bytes = max_response_bytes;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
@@ -194,6 +200,7 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
@@ -206,16 +213,19 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .gemini => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },

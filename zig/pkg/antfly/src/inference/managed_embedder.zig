@@ -1208,6 +1208,9 @@ pub const ManagedEmbedder = struct {
             .attachment_transport = .borrowed_binary,
             .fixed_bytes = std.math.add(usize, vector_bytes, item_control_bytes) catch
                 return error.InferenceEncodedBytesExceeded,
+            .allocator_limit_bytes = std.math.add(usize, vector_bytes, item_control_bytes) catch
+                return error.InferenceEncodedBytesExceeded,
+            .max_result_bytes = vector_bytes,
         };
 
         const outer = std.math.add(
@@ -1248,7 +1251,12 @@ pub const ManagedEmbedder = struct {
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, remote_embedding_transport_control_bytes) catch
             return error.InferenceEncodedBytesExceeded;
-        return .{ .attachment_transport = .base64_payload, .fixed_bytes = fixed };
+        return .{
+            .attachment_transport = .base64_payload,
+            .fixed_bytes = fixed,
+            .allocator_limit_bytes = fixed,
+            .max_result_bytes = vector_bytes,
+        };
     }
 
     fn denseCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {

@@ -17,6 +17,7 @@ const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
 const config = @import("antfly_reader_config");
+const data_uri = @import("antfly_scraping").data_uri;
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
@@ -52,6 +53,9 @@ pub const Request = struct {
     /// Stable source fingerprint for opt-in inference profiling. Remote reader
     /// providers deliberately do not serialize this internal-only value.
     source_fingerprint: ?[]const u8 = null,
+    /// Route-owned hard response ceiling. Null delegates to the client-wide
+    /// ceiling for callers that do not participate in bounded orchestration.
+    max_response_bytes: ?usize = null,
 };
 
 /// Borrowed encoded image bytes for trusted in-process producers. This avoids
@@ -71,6 +75,7 @@ pub const EncodedRequest = struct {
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     source_fingerprint: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
 };
 
 /// Validate the shared in-process encoded-image contract before execution
@@ -410,7 +415,11 @@ const AntflyReaderState = struct {
             header_buf[0] = header;
             break :blk header_buf[0..];
         } else &.{};
-        var resp = try self.http.post(url, .{ .json = body, .headers = headers });
+        var resp = try self.http.post(url, .{
+            .json = body,
+            .headers = headers,
+            .max_response_size = req.max_response_bytes,
+        });
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code);
 
@@ -458,6 +467,10 @@ const AntflyReaderState = struct {
 
 fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count: usize) !BatchExecution {
     const report = wire orelse return .{ .requested_items = item_count, .serial_items = item_count };
+    // Reader responses currently contain one successful item for every
+    // request. A nonzero rejected count would contradict that cardinality and
+    // must not disappear while adapting the shared wire report.
+    if (report.rejected_items != 0) return error.InvalidReadExecutionReport;
     const execution = BatchExecution{
         .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
         .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
@@ -479,6 +492,7 @@ test "reader wire execution is observed, validated, and backward compatible" {
         .native_batches = 1,
         .native_items = 2,
         .serial_items = 0,
+        .rejected_items = 0,
         .fallback_items = 0,
     }, 2);
     try std.testing.expectEqual(@as(usize, 2), native.native_items);
@@ -489,10 +503,20 @@ test "reader wire execution is observed, validated, and backward compatible" {
         .native_batches = 1,
         .native_items = 1,
         .serial_items = 1,
+        .rejected_items = 0,
         .fallback_items = 0,
     }, 2);
     try std.testing.expectEqual(@as(usize, 1), mixed.native_items);
     try std.testing.expectEqual(@as(usize, 1), mixed.serial_items);
+
+    try std.testing.expectError(error.InvalidReadExecutionReport, batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 0,
+        .native_items = 0,
+        .serial_items = 1,
+        .rejected_items = 1,
+        .fallback_items = 0,
+    }, 2));
 
     try std.testing.expectError(
         error.InvalidReadExecutionReport,
@@ -637,7 +661,11 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
-            var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+            var resp = try self.http.post(url, .{
+                .json = body,
+                .headers = headers.items,
+                .max_response_size = req.max_response_bytes,
+            });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
@@ -673,7 +701,11 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
-            var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+            var resp = try self.http.post(url, .{
+                .json = body,
+                .headers = headers.items,
+                .max_response_size = req.max_response_bytes,
+            });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct {
@@ -758,13 +790,11 @@ const DataUriImage = struct {
 };
 
 fn parseDataUriImage(url: []const u8) ?DataUriImage {
-    if (!std.mem.startsWith(u8, url, "data:")) return null;
-    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return null;
-    const meta = url["data:".len..comma];
-    if (!std.mem.endsWith(u8, meta, ";base64")) return null;
-    const mime_type = meta[0 .. meta.len - ";base64".len];
-    if (mime_type.len == 0) return null;
-    return .{ .mime_type = mime_type, .data = url[comma + 1 ..] };
+    const parsed = (data_uri.parse(url) catch return null) orelse return null;
+    if (!parsed.has_explicit_media_type or parsed.encoding != .base64 or
+        !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "image/")) return null;
+    _ = parsed.decodedSize() catch return null;
+    return .{ .mime_type = parsed.media_type_essence, .data = parsed.payload };
 }
 
 fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {

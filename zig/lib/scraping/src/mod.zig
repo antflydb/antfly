@@ -16,6 +16,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
+pub const data_uri = @import("data_uri.zig");
+
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 const default_download_timeout_ms: u64 = 30_000;
@@ -409,43 +411,13 @@ fn maxDownloadSize(security: ?*const ContentSecurityConfig) usize {
 }
 
 fn parseDataUriAlloc(alloc: Allocator, uri: []const u8, security: ?*const ContentSecurityConfig) !DownloadedContent {
-    const prefix = "data:";
-    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
-
-    const payload = uri[prefix.len..];
-    const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
-    const meta = payload[0..comma];
-    const body = payload[comma + 1 ..];
-
-    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
-        const mime = meta[0 .. meta.len - ";base64".len];
-        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
-        try validateDownloadSize(decoded_len, security);
-        const decoded = try alloc.alloc(u8, decoded_len);
-        errdefer alloc.free(decoded);
-        std.base64.standard.Decoder.decode(decoded, body) catch return error.InvalidBase64;
-        return .{
-            .content_type = try alloc.dupe(u8, if (mime.len > 0) mime else "application/octet-stream"),
-            .data = decoded,
-        };
-    }
-
-    const decoded_len = try percentDecodedLen(body);
-    try validateDownloadSize(decoded_len, security);
-    const decoded_body_buf = try alloc.dupe(u8, body);
-    var data = decoded_body_buf;
-    errdefer alloc.free(data);
-    const decoded_body = std.Uri.percentDecodeInPlace(decoded_body_buf);
-    if (decoded_body.len != decoded_body_buf.len) {
-        const exact = try alloc.dupe(u8, decoded_body);
-        alloc.free(decoded_body_buf);
-        data = exact;
-    }
-
-    return .{
-        .content_type = try alloc.dupe(u8, if (meta.len > 0) meta else "text/plain"),
-        .data = data,
-    };
+    const parsed = try data_uri.parseRequired(uri);
+    try validateDownloadSize(try parsed.decodedSize(), security);
+    var decoded = try data_uri.decodeAlloc(alloc, uri);
+    errdefer decoded.deinit(alloc);
+    const result = DownloadedContent{ .content_type = decoded.media_type, .data = decoded.data };
+    decoded = undefined;
+    return result;
 }
 
 fn downloadHttpOutcomeAlloc(

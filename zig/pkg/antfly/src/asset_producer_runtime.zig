@@ -30,11 +30,34 @@ const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
 const default_local_reader_batch_images: usize = 8;
 const max_asset_provider_timeout_ms: u64 = 300_000;
-const max_asset_provider_response_bytes: usize = 4 << 20;
+const default_asset_provider_response_bytes: usize = 64 << 20;
+const max_asset_http_response_bytes: usize = 64 << 20;
 const invocation_response_resident_multiplier: usize = 4;
-const invocation_nonmedia_resident_multiplier: usize = 8;
-const invocation_result_bytes_per_item: usize = 1 << 20;
+// This is an enforced allocator budget for request construction and parsing,
+// not an estimate of what a particular JSON implementation happens to use.
+const invocation_nonmedia_allocator_multiplier: usize = 8;
 const invocation_control_bytes_per_item: usize = 4096;
+const default_provider_response_envelope_bytes: usize = 1 << 20;
+
+pub const ResultLimits = struct {
+    reader_bytes_per_item: usize = 256 << 10,
+    generator_bytes_per_item: usize = 1 << 20,
+    extractor_bytes_per_item: usize = 4 << 20,
+    transcriber_bytes_per_item: usize = 4 << 20,
+    copy_bytes_per_item: usize = 16 << 20,
+    document_extraction_bytes_per_item: usize = 16 << 20,
+
+    fn forProducer(self: ResultLimits, producer_type: asset_producer.ProducerType) usize {
+        return switch (producer_type) {
+            .reader => self.reader_bytes_per_item,
+            .generator => self.generator_bytes_per_item,
+            .extractor => self.extractor_bytes_per_item,
+            .transcriber => self.transcriber_bytes_per_item,
+            .copy => self.copy_bytes_per_item,
+            .document_extraction => self.document_extraction_bytes_per_item,
+        };
+    }
+};
 fn mergeReaderExecution(report: *inference_work.ExecutionReport, chunk: readers.BatchExecution) !void {
     report.requested_items = std.math.add(usize, report.requested_items, chunk.requested_items) catch
         return error.InvalidReadExecutionReport;
@@ -82,10 +105,16 @@ pub const Runtime = struct {
     owned_http: ?*httpx.Client = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
+    max_provider_response_bytes: usize = default_asset_provider_response_bytes,
+    provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
+    result_limits: ResultLimits = .{},
 
     pub const Options = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
+        max_provider_response_bytes: usize = default_asset_provider_response_bytes,
+        provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
+        result_limits: ResultLimits = .{},
     };
 
     pub fn init(alloc: Allocator, http: *httpx.Client) Runtime {
@@ -99,6 +128,9 @@ pub const Runtime = struct {
             .capability_cache = remote_capabilities.Cache.init(alloc, http.io),
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
+            .max_provider_response_bytes = options.max_provider_response_bytes,
+            .provider_response_envelope_bytes = options.provider_response_envelope_bytes,
+            .result_limits = options.result_limits,
         };
     }
 
@@ -109,7 +141,11 @@ pub const Runtime = struct {
         const client = try alloc.create(httpx.Client);
         errdefer alloc.destroy(client);
         var client_config = httpx.ClientConfig{ .keep_alive = false };
-        client_config.max_response_size = max_asset_provider_response_bytes;
+        // Operation-specific ceilings are applied on provider requests. This
+        // client-wide value is only an outer safety maximum and must not turn a
+        // catalog or a configured large extraction into an unrelated 4 MiB
+        // failure.
+        client_config.max_response_size = max_asset_http_response_bytes;
         client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
         client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
         client.* = httpx.Client.initWithConfig(alloc, io, client_config);
@@ -223,11 +259,10 @@ pub const Runtime = struct {
                     if (local.generate_messages == null) return error.InferenceInvocationMemoryUnavailable;
                     break :blk .data_uri;
                 }
-                // Remote Antfly batches stream one base64 body, but OCR may
-                // recover from a failed batch through the singleton provider
-                // adapter, which retains data URIs. Reserve the larger legal
-                // execution path so fallback cannot escape admission.
-                break :blk .data_uri;
+                // The host sends one base64 batch body. Any serial fallback
+                // reported by a distributed inference node is admitted by that
+                // node and must not be charged against this host process.
+                break :blk .base64_payload;
             },
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
@@ -244,23 +279,59 @@ pub const Runtime = struct {
             .transcriber, .copy, .document_extraction => return error.InferenceInvocationMemoryUnavailable,
         };
 
-        var fixed = std.math.mul(usize, nonmedia_bytes, invocation_nonmedia_resident_multiplier) catch
+        var fixed = std.math.mul(usize, nonmedia_bytes, invocation_nonmedia_allocator_multiplier) catch
             return error.InferenceEncodedBytesExceeded;
         const control = std.math.mul(usize, requests.len, invocation_control_bytes_per_item) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
-        const results = std.math.mul(usize, requests.len, invocation_result_bytes_per_item) catch
+        const results = std.math.mul(
+            usize,
+            requests.len,
+            self.result_limits.forProducer(requests[0].producer_type),
+        ) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, results) catch return error.InferenceEncodedBytesExceeded;
+        var allocator_limit = fixed;
         if (remote) {
+            const response_limit = self.responseLimitForTask(requests[0].producer_type, requests.len);
+            const parser_and_copy_limit = std.math.mul(
+                usize,
+                response_limit,
+                invocation_response_resident_multiplier - 1,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            allocator_limit = std.math.add(usize, allocator_limit, parser_and_copy_limit) catch
+                return error.InferenceEncodedBytesExceeded;
             const response_peak = std.math.mul(
                 usize,
-                self.http.maxResponseSize(),
+                response_limit,
                 invocation_response_resident_multiplier,
             ) catch return error.InferenceEncodedBytesExceeded;
             fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
         }
-        return .{ .attachment_transport = transport, .fixed_bytes = fixed };
+        return .{
+            .attachment_transport = transport,
+            .fixed_bytes = fixed,
+            .allocator_limit_bytes = allocator_limit,
+            .max_result_bytes = results,
+        };
+    }
+
+    fn responseLimitForTask(
+        self: *const Runtime,
+        producer_type: asset_producer.ProducerType,
+        item_count: usize,
+    ) usize {
+        const result_bytes = std.math.mul(
+            usize,
+            @max(item_count, 1),
+            self.result_limits.forProducer(producer_type),
+        ) catch std.math.maxInt(usize);
+        const envelope = std.math.add(
+            usize,
+            result_bytes,
+            self.provider_response_envelope_bytes,
+        ) catch std.math.maxInt(usize);
+        return @min(self.http.maxResponseSize(), @min(self.max_provider_response_bytes, envelope));
     }
 
     fn requestForegroundBounded(self: *Runtime, alloc: Allocator, request: asset_producer.Request) !bool {
@@ -833,6 +904,7 @@ pub const Runtime = struct {
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
+            .max_response_bytes = self.responseLimitForTask(.extractor, requests.len),
         };
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
@@ -921,7 +993,12 @@ pub const Runtime = struct {
             try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
             const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, chunk);
             defer alloc.free(body);
-            var resp = try self.http.post(batch_url, .{ .json = body, .headers = headers, .timeout_ms = 300_000 });
+            var resp = try self.http.post(batch_url, .{
+                .json = body,
+                .headers = headers,
+                .timeout_ms = 300_000,
+                .max_response_size = self.responseLimitForTask(.generator, chunk.len),
+            });
             defer resp.deinit();
             if (!resp.ok()) return mapAntflyGenerateBatchStatus(resp.status.code);
             const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
@@ -1122,6 +1199,7 @@ pub const Runtime = struct {
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .source_fingerprint = chunk_source_fingerprint,
+                    .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
                 })
             else blk: {
                 break :blk try self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
@@ -1130,6 +1208,7 @@ pub const Runtime = struct {
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                     .source_fingerprint = chunk_source_fingerprint,
+                    .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
                 });
             };
             const chunk_results = chunk_batch.items;
@@ -1243,6 +1322,7 @@ pub const Runtime = struct {
         var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
+            .max_response_bytes = self.responseLimitForTask(.generator, 1),
         }, &messages);
         defer result.deinit();
         if (parsed_cfg.tool_output == .arguments) {
@@ -1282,6 +1362,7 @@ pub const Runtime = struct {
                 .prompt = source.prompt orelse cfg_parsed.value.prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
                 .source_fingerprint = request.source_fingerprint,
+                .max_response_bytes = self.responseLimitForTask(.reader, @max(request.media.len, 1)),
             });
         } else try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
             .images = source.images,
@@ -1289,6 +1370,7 @@ pub const Runtime = struct {
             .max_tokens = cfg_parsed.value.max_tokens,
             .inline_content_trust = if (request.inline_media_trusted) .trusted_internal else .untrusted,
             .source_fingerprint = request.source_fingerprint,
+            .max_response_bytes = self.responseLimitForTask(.reader, @max(source.images.len, 1)),
         });
         defer {
             for (results) |*result| readers.deinitResult(alloc, result);
@@ -1436,6 +1518,7 @@ pub const Runtime = struct {
             .max_tokens = request.max_tokens,
             .inline_content_trust = .trusted_internal,
             .source_fingerprint = request.source_fingerprint,
+            .max_response_bytes = request.max_response_bytes,
         });
         errdefer adapted.deinit(alloc);
         const items = adapted.items;
@@ -1457,6 +1540,7 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
@@ -1521,6 +1605,7 @@ pub const Runtime = struct {
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
+            .max_response_bytes = self.responseLimitForTask(.extractor, 1),
         };
 
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
@@ -2196,6 +2281,28 @@ test "asset producer runtime media accounting follows attachment transport" {
     var extractor_encoded = try extractorRequestShape(std.testing.allocator, extractor_capabilities, .base64_payload, extractor_request);
     defer extractor_encoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), extractor_encoded.encoded_media_bytes);
+}
+
+test "remote generator planning charges the host batch transport and route response limit" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    const bytes = [_]u8{ 1, 2, 3 };
+    const request = asset_producer.Request{
+        .producer_type = .generator,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"gemma4\",\"url\":\"http://127.0.0.1:8080\"}",
+        .source_text = "",
+        .inline_media_trusted = true,
+        .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }},
+    };
+    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(inference_work.AttachmentTransport.base64_payload, plan.attachment_transport);
+    try std.testing.expect(plan.fixed_bytes < client.maxResponseSize());
+    try std.testing.expectEqual(@as(usize, 1 << 20), plan.max_result_bytes);
 }
 
 test "asset producer runtime validates the complete base64 representation" {
