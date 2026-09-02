@@ -42,11 +42,12 @@ from port_reservations import find_free_port
 
 @pytest.fixture(scope="module")
 def cli_inference_servers():
-    embedder = InferenceEmbeddingServer()
+    embedder = InferenceEmbeddingServer(response_delay_s=30.0)
     generator = InferenceGeneratorServer()
     reranker = InferenceRerankerServer()
     yield {
         "embedder": embedder.url,
+        "embedder_server": embedder,
         "generator": generator.url,
         "reranker": reranker.url,
     }
@@ -84,6 +85,7 @@ def cli(cli_server):
             text=True,
             timeout=timeout_s,
             env=env,
+            check=False,
         )
         if check and result.returncode != 0:
             raise AssertionError(
@@ -167,13 +169,14 @@ def test_table_create_list_get_drop(cli):
 
 
 def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
-    cli, cli_server, tmp_path
+    cli, cli_server, cli_inference_servers, tmp_path
 ):
     """Exercise the documented CLI path across parsing, readiness, and retrieval."""
     table = f"cli_quickstart_{time.time_ns()}"
     embedder_url = cli_server.cli_inference_urls["embedder"]
     generator_url = cli_server.cli_inference_urls["generator"]
     reranker_url = cli_server.cli_inference_urls["reranker"]
+    embedder_server = cli_inference_servers["embedder_server"]
     inline_index = json.dumps(
         {
             "name": "title_body",
@@ -218,6 +221,8 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         + "\n"
     )
+
+    later_wait: subprocess.Popen[str] | None = None
 
     try:
         cli(
@@ -379,6 +384,130 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
 
+        # An invalid ClipClap response is a per-source terminal outcome, not
+        # a terminal generation failure while a later source is still embedded.
+        # Hold that later request open so the CLI observes and waits through
+        # the exact status boundary exercised by the documented quickstart.
+        embedder_server.arm_malformed_embedding_response("antflydb/clipclap")
+        insert_started = time.monotonic()
+        cli(
+            "insert",
+            "--table",
+            table,
+            "--key",
+            "doc:image-broken",
+            "--document",
+            json.dumps(
+                {
+                    "title": "Broken image",
+                    "body": "source-specific image failure",
+                    "thumbnail_url": tiny_png,
+                }
+            ),
+        )
+        assert time.monotonic() - insert_started < 5.0, (
+            "the default point-mutation barrier waited for generated indexing"
+        )
+
+        def isolated_failure_is_settled() -> dict | None:
+            status = parse_json(
+                cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+            )["status"]
+            if status["coverage"]["terminal_failed"] >= 1:
+                return status
+            return None
+
+        settled_failure = wait_until(
+            isolated_failure_is_settled, timeout_s=10.0, interval_s=0.025
+        )
+        assert settled_failure is not None, cli(
+            "index", "get", "--table", table, "--index", "thumbnail"
+        ).stdout
+        embedder_server.arm_delay()
+        insert_started = time.monotonic()
+        cli(
+            "insert",
+            "--table",
+            table,
+            "--key",
+            "doc:image-later",
+            "--document",
+            json.dumps(
+                {
+                    "title": "Later image",
+                    "body": "later usable image",
+                    "thumbnail_url": tiny_png,
+                }
+            ),
+        )
+        assert time.monotonic() - insert_started < 5.0, (
+            "the default point-mutation barrier inherited provider latency"
+        )
+        assert embedder_server.wait_for_embedding_request(10.0)
+
+        def isolated_failure_is_pending() -> dict | None:
+            status = parse_json(
+                cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+            )["status"]
+            coverage = status["coverage"]
+            if (
+                coverage["terminal_failed"] >= 1
+                and coverage["pending"] >= 1
+                and status["readiness"]["state"] == "queryable_partial"
+                and status["searchable_vectors"] == 1
+            ):
+                return status
+            return None
+
+        pending_status = wait_until(
+            isolated_failure_is_pending, timeout_s=10.0, interval_s=0.025
+        )
+        assert pending_status is not None, cli(
+            "index", "get", "--table", table, "--index", "thumbnail"
+        ).stdout
+
+        binary = resolve_binary_path(
+            os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+        )
+        wait_env = os.environ.copy()
+        wait_env["ANTFLY_URL"] = cli_server.url
+        later_wait = subprocess.Popen(
+            [
+                binary,
+                "index",
+                "wait",
+                "--table",
+                table,
+                "--index",
+                "thumbnail",
+                "--until",
+                "searchable-artifacts=2",
+                "--timeout",
+                "20s",
+                "--poll-interval",
+                "25ms",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=wait_env,
+        )
+        time.sleep(0.15)
+        assert later_wait.poll() is None, (
+            "index wait treated an isolated source failure as terminal while "
+            f"later work remained: {later_wait.communicate(timeout=1.0)}"
+        )
+        embedder_server.release_delay()
+        later_stdout, later_stderr = later_wait.communicate(timeout=30.0)
+        assert later_wait.returncode == 0, (
+            f"stdout: {later_stdout}\nstderr: {later_stderr}\n"
+            f"pending status: {json.dumps(pending_status, indent=2)}"
+        )
+        assert (
+            "Index thumbnail (embeddings) reached searchable-artifacts=2:"
+            in later_stdout
+        )
+
         rag = cli(
             "agents",
             "retrieval",
@@ -425,6 +554,14 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert rag_result["generation"]
         assert rag_result["hits"][0]["_id"] == "doc:alpha"
     finally:
+        embedder_server.release_delay()
+        if later_wait is not None and later_wait.poll() is None:
+            later_wait.terminate()
+            try:
+                later_wait.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                later_wait.kill()
+                later_wait.communicate(timeout=5.0)
         cli("table", "drop", "--table", table, check=False)
 
 

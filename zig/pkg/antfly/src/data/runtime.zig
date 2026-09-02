@@ -653,7 +653,9 @@ fn indexRepairQueueScheduleFromResult(
     // as an immediate wake creates a node-level hot loop. Retain a bounded
     // audit instead; an exact visibility/progress callback still replaces the
     // queue generation with an immediate wake as soon as useful work lands.
-    if (busy and retry_at_realtime_ms == 0 and aggregate_wake == .empty) {
+    if (busy and retry_at_realtime_ms == 0 and
+        (aggregate_wake == .empty or aggregate_wake == .immediate))
+    {
         return .{
             .retry_at_realtime_ms = realtime_now_ms +| provisioned_index_repair_interval_ms,
             .wake = .retained,
@@ -679,6 +681,13 @@ test "cooperative writer contention uses a preemptible bounded repair audit" {
     const scheduled = indexRepairQueueScheduleFromResult(.empty, 0, true, 1_000);
     try std.testing.expectEqual(@as(u64, 6_000), scheduled.retry_at_realtime_ms);
     try std.testing.expectEqual(IndexRepairQueueWake.retained, scheduled.wake);
+
+    // Runnable debt discovered behind the resident writer is still
+    // cooperative contention. The selected queue generation applies this
+    // delay only if no newer progress/visibility callback replaced it.
+    const runnable = indexRepairQueueScheduleFromResult(.immediate, 0, true, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), runnable.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, runnable.wake);
 
     const durable = indexRepairQueueScheduleFromResult(.{ .at_realtime_ms = 9_000 }, 9_000, true, 1_000);
     try std.testing.expectEqual(@as(u64, 9_000), durable.retry_at_realtime_ms);

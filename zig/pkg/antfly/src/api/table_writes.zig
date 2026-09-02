@@ -14570,14 +14570,23 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: ?[]const u8,
     ) !void {
         if (self.restore_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
-        // Enqueue is a structural invalidation boundary even when an existing
-        // request already covers this target. A status observer admitted
-        // before the request must not publish after it.
+        // Enqueue is the publication boundary for an asynchronously activated
+        // catalog definition. Install the exact target reservation before any
+        // catalog or allocation work: advancing a table epoch first would
+        // leave a window in which an opening observation could replace the
+        // cached group before the target fence existed, making ready siblings
+        // appear runtime-unavailable. Concurrent enqueues may temporarily own
+        // another reference; the request that wins coalescing retains the
+        // durable reservation and every other path releases its reference.
+        var targeted_status_reserved = false;
         if (index_name == null) {
             self.invalidateRuntimeStatusCache(table_name);
-        } else if (self.runtime_status_cache) |snapshot_cache| {
-            snapshot_cache.fenceTablePublications(table_name);
+        } else {
+            self.reserveTargetedStructuralReconcileStatus(table_name, index_name.?);
+            targeted_status_reserved = true;
         }
+        errdefer if (targeted_status_reserved)
+            self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
 
@@ -14591,7 +14600,13 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.structural_reconcile_mutex.unlock(io);
 
         for (self.structural_reconcile_tables.items) |candidate| {
-            if (candidate.covers(table_name, index_name) or candidate.sameTarget(table_name, index_name)) return;
+            if (candidate.covers(table_name, index_name) or candidate.sameTarget(table_name, index_name)) {
+                if (targeted_status_reserved) {
+                    self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
+                    targeted_status_reserved = false;
+                }
+                return;
+            }
         }
 
         if (index_name == null) {
@@ -14628,10 +14643,14 @@ pub const ProvisionedTableWriteSource = struct {
             .preempted_maintenance_group_ids = preempted_group_ids,
         });
         preempted_group_ids = &.{};
-        if (index_name == null)
-            self.reserveStructuralReconcileStatus(table_name)
-        else
-            self.reserveTargetedStructuralReconcileStatus(table_name, index_name.?);
+        if (index_name == null) {
+            self.reserveStructuralReconcileStatus(table_name);
+        } else {
+            // The queued request now owns the reservation installed at the
+            // function boundary; error cleanup below releases it with the
+            // request instead of through this caller's errdefer.
+            targeted_status_reserved = false;
+        }
         if (index_name == null) self.reserveStructuralReconcileActivity(table_name);
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;

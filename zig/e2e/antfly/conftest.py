@@ -1831,6 +1831,8 @@ class InferenceEmbeddingServer:
         self._embedding_request_active = threading.Event()
         self._delay_enabled = threading.Event()
         self._delay_released = threading.Event()
+        self._malformed_embedding_lock = threading.Lock()
+        self._malformed_embedding_model: str | None = None
 
         outer = self
 
@@ -1903,10 +1905,37 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    model = payload.get("model", "")
+                    with outer._malformed_embedding_lock:
+                        malformed = (
+                            outer._malformed_embedding_model is not None
+                            and outer._malformed_embedding_model in model
+                        )
+                        if malformed:
+                            outer._malformed_embedding_model = None
+                    if malformed:
+                        body = json.dumps(
+                            {
+                                "object": "list",
+                                "data": [
+                                    {
+                                        "object": "embedding",
+                                        "index": 0,
+                                        "embedding": [1.0, 0.0],
+                                    }
+                                ],
+                                "model": model,
+                            }
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     if outer._delay_enabled.is_set():
                         outer._embedding_request_active.set()
                         outer._delay_released.wait(outer.response_delay_s)
-                    model = payload.get("model", "")
                     input_value = payload.get("input", [])
                     if isinstance(input_value, list):
                         values = [
@@ -1994,6 +2023,11 @@ class InferenceEmbeddingServer:
         self._embedding_request_active.clear()
         self._delay_released.clear()
         self._delay_enabled.set()
+
+    def arm_malformed_embedding_response(self, model: str) -> None:
+        """Give the next request for ``model`` a wrong-dimension vector."""
+        with self._malformed_embedding_lock:
+            self._malformed_embedding_model = model
 
     def release_delay(self) -> None:
         self._delay_enabled.clear()

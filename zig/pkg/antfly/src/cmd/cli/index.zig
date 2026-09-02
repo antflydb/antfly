@@ -483,6 +483,7 @@ const IndexSummary = struct {
     complete: bool = false,
     queryable: bool = false,
     failed: bool = false,
+    milestones_known: bool = false,
     pending_reasons: []const antfly_client.types.IndexReadinessReason = &.{},
     queryable_blockers: []const []const u8 = &.{},
     complete_blockers: []const []const u8 = &.{},
@@ -633,6 +634,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .complete = complete,
         .queryable = queryable,
         .failed = failed,
+        .milestones_known = milestones != null,
         .pending_reasons = if (readiness) |value| value.pending_reasons else &.{},
         .queryable_blockers = if (milestones) |value| value.queryable.blockers else &.{},
         .complete_blockers = if (milestones) |value| value.complete.blockers else &.{},
@@ -885,8 +887,34 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
             summary.visible.? >= 0 and @as(u64, @intCast(summary.visible.?)) >= minimum,
     };
     if (reached) return .ready;
-    if (summary.failed) return .failed;
+    if (waitFailureBlocksTarget(summary, target)) return .failed;
     return .waiting;
+}
+
+fn waitFailureBlocksTarget(summary: IndexSummary, target: WaitTarget) bool {
+    if (!summary.failed) return false;
+    if (!summary.milestones_known) return true;
+    switch (target) {
+        .complete => return true,
+        else => {},
+    }
+    if (containsBlocker(summary.queryable_blockers, "failure")) return true;
+
+    // A typed complete-only failure can describe one terminal source while
+    // later sources are still able to satisfy a query-availability threshold.
+    // Do not turn that durable diagnostic into a false early failure. Once no
+    // potentially useful source remains, the same exact failure is terminal.
+    const pending = summary.source_pending orelse return true;
+    if (pending <= 0) return true;
+    return switch (target) {
+        .complete => unreachable,
+        .searchable_artifacts => false,
+        .source_covered => |threshold| blk: {
+            const covered = summary.source_covered orelse break :blk true;
+            const possible = std.math.add(i64, covered, pending) catch std.math.maxInt(i64);
+            break :blk !threshold.reached(possible, summary.source_total);
+        },
+    };
 }
 
 fn waitTargetBlockerLabel(target: WaitTarget) []const u8 {
@@ -1771,6 +1799,29 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expect(retained_failure.queryable);
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(retained_failure, .{ .searchable_artifacts = 1 }));
     try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(retained_failure, .complete));
+
+    var advancing_source_failure = retained_failure;
+    advancing_source_failure.milestones_known = true;
+    advancing_source_failure.source_total = 4;
+    advancing_source_failure.source_covered = 1;
+    advancing_source_failure.source_pending = 1;
+    try std.testing.expectEqual(
+        WaitDisposition.waiting,
+        waitDisposition(advancing_source_failure, .{ .searchable_artifacts = 2 }),
+    );
+    try std.testing.expectEqual(
+        WaitDisposition.waiting,
+        waitDisposition(advancing_source_failure, .{ .source_covered = .{ .count = 2 } }),
+    );
+    try std.testing.expectEqual(
+        WaitDisposition.failed,
+        waitDisposition(advancing_source_failure, .{ .source_covered = .{ .count = 3 } }),
+    );
+    advancing_source_failure.source_pending = 0;
+    try std.testing.expectEqual(
+        WaitDisposition.failed,
+        waitDisposition(advancing_source_failure, .{ .searchable_artifacts = 2 }),
+    );
 
     var empty_reasons_buffer: [64]u8 = undefined;
     var empty_reasons_writer = std.Io.Writer.fixed(&empty_reasons_buffer);

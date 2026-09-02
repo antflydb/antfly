@@ -6528,6 +6528,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
             "multi-source embedding enrichments receive a shared semantic producer identity",
             "source readiness isolates terminal enrichment failures",
             "source readiness distinguishes durable repair debt from runtime enrichment failure",

@@ -5306,6 +5306,15 @@ fn appendSingleIndexRuntimeStatus(
     const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
+    // Coverage can be authoritative before the serving incarnation is. Keep
+    // that useful coverage visible, but never project the lifecycle as ready
+    // while the exact incarnation still lacks a readiness proof.
+    if (index_type == .embeddings and
+        (coverage_generation == 0 or !authority.readiness_authoritative))
+    {
+        backfill_active = true;
+        backfill_progress = 0.0;
+    }
     // Replay watermarks describe the managed index worker's real ledger.
     // Coverage and enrichment are separate stages with separate sequence
     // domains; they may keep readiness/backfill active, but must not rewrite a
@@ -5430,21 +5439,26 @@ fn appendSingleIndexRuntimeStatus(
     // and identity, so keep readiness aligned with the legacy terminal state
     // without allowing a retained replacement snapshot to poison its
     // successor.
-    // Coverage counters are updated incrementally as the enrichment worker
-    // advances its sequence. Sources without a terminal decision remain
-    // pending, so do not turn an in-flight coverage snapshot into a terminal
-    // failure; an isolated per-index failure or a failed worker is still
-    // terminal immediately.
-    const enrichment_work_pending = if (visible_enrichment) |stats|
-        stats.enabled and !stats.worker_failed and
-            (stats.retrying or stats.applied_sequence < stats.target_sequence or
-                stats.active_embed_batch_items > 0)
-    else
-        false;
+    // Coverage and replay are incarnation- and index-scoped, whereas the
+    // enrichment owner telemetry is group-scoped. Use the exact index facts
+    // to decide whether an isolated source failure is terminal; unrelated
+    // activity in a sibling index must neither mask nor manufacture failure.
+    const index_activity_pending = index_type == .embeddings and
+        item.embedding_activity.epoch != 0 and
+        item.embedding_activity.effectivePhase() != .idle;
+    const enrichment_work_pending = index_activity_pending or
+        replay_catch_up_required or replay_applied_sequence < replay_target_sequence or
+        catch_up_pending;
     const coverage_degraded = (if (embeddings_view) |view| view.coverage_degraded else false) and
         !enrichment_work_pending;
+    // An isolated request failure is a durable per-source outcome, not a
+    // generation-wide worker failure. While the supervised owner still has
+    // sequence debt, keep the incarnation pending so later sources can
+    // publish useful artifacts and threshold waits do not fail on the first
+    // bad document. Once the owner settles, the isolated failure remains an
+    // honest terminal degraded result for an otherwise empty generation.
     const enrichment_degraded = index_type == .embeddings and
-        ((embeddings_materialization_current and item.enrichment_failed) or coverage_degraded);
+        ((embeddings_materialization_current and item.enrichment_failed and !enrichment_work_pending) or coverage_degraded);
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
@@ -8264,6 +8278,10 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         .coverage_config_hash = visual_config_hash,
         .coverage_identity_ready = true,
         .enrichment_failed = true,
+        .embedding_activity = .{
+            .epoch = 1,
+            .reported_phase = .waiting_retry,
+        },
     };
     indexes[1] = .{
         .name = try alloc.dupe(u8, "semantic_idx"),
@@ -8318,32 +8336,56 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
 
+    local_items[0].stats.enrichment.target_sequence = 2;
+    local_items[0].stats.enrichment.applied_sequence = 1;
+    local_items[0].stats.enrichment.retrying = true;
+    const progressing_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer alloc.free(progressing_encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"backfill_state\":\"retrying\",\"readiness\":{\"state\":\"pending\"},\"enrichment_runtime\":{\"retrying\":true,\"worker_failed\":false}}}",
+        progressing_encoded,
+    );
+
+    indexes[0].coverage_terminal_failed_count = 1;
+    indexes[0].embedding_activity = .{};
+    local_items[0].stats.enrichment.target_sequence = 1;
+    local_items[0].stats.enrichment.applied_sequence = 1;
+    local_items[0].stats.enrichment.retrying = false;
+
     const failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(failed_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"backfill_state\":\"degraded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"worker_failed\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"readiness\":{\"state\":\"failed\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"backfill_state\":\"degraded\",\"readiness\":{\"state\":\"failed\"},\"enrichment_runtime\":{\"worker_failed\":false}}}",
+        failed_encoded,
+    );
 
     const healthy_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer alloc.free(healthy_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"failed\"") == null);
+    try ant_json.testing.expectSubsetJsonText(alloc, "{\"status\":{\"backfill_state\":\"ready\"}}", healthy_encoded);
 
     indexes[0].enrichment_failed = false;
+    indexes[0].coverage_terminal_failed_count = 0;
     indexes[0].coverage_skipped_count = 1;
     local_items[0].stats.enrichment.target_sequence = 2;
     local_items[0].stats.enrichment.applied_sequence = 1;
     const recovering_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(recovering_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"backfill_state\":\"running\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"readiness\":{\"state\":\"pending\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"readiness\":{\"state\":\"failed\"") == null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"backfill_state\":\"running\",\"readiness\":{\"state\":\"pending\"}}}",
+        recovering_encoded,
+    );
 
     local_items[0].stats.enrichment.worker_failed = true;
     const worker_failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(worker_failed_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, worker_failed_encoded, "\"backfill_state\":\"failed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, worker_failed_encoded, "\"readiness\":{\"state\":\"failed\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"backfill_state\":\"failed\",\"readiness\":{\"state\":\"failed\"},\"enrichment_runtime\":{\"worker_failed\":true}}}",
+        worker_failed_encoded,
+    );
 }
 
 test "single embeddings index encoder keeps published visibility separate from replay debt" {
