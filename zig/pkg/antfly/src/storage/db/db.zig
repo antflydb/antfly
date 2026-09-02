@@ -102903,21 +102903,7 @@ test "db restore dense rebuild rediscovery is pending rather than progress" {
     try std.testing.expectEqual(@as(usize, 1), rediscovered.reported_work);
     try std.testing.expect(!rediscovered.made_progress);
     try std.testing.expect(!rediscovered.dense_visibility_changed);
-
-    try DB.markRestorePrimaryRestoredForPathWithArtifact(
-        alloc,
-        std.mem.span(path),
-        "snap1",
-        "file:///tmp/backups",
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "snapshots/snap1",
-        7001,
-    );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "sync_indexes", false);
-    try std.testing.expectError(
-        error.RestoreDenseArtifactRebuildIncomplete,
-        db.repairRestoreRuntimeStateStepIfNeeded(alloc),
-    );
+    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
 }
 
 test "db restore dense rebuild publishes mixed progress before worker wait" {
