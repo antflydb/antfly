@@ -35,6 +35,15 @@ pub const HostedGroupRouter = struct {
         node_status: ?*const fn (ptr: *anyopaque, node_id: u64, group_id: u64) raft_host.HostedReplicaStatus = null,
         node_base_uri: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) anyerror!?[]u8,
         node_base_uri_for_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) anyerror!?[]u8 = null,
+        /// Resolve a fanout from one routing snapshot. Metadata-backed routers
+        /// use this to avoid copying and rescanning the full catalog once per
+        /// shard; generic routers retain the scalar fallback below.
+        resolve_group_routes: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_ids: []const u64,
+            policy: RoutePolicy,
+        ) anyerror!?[]GroupRoute = null,
     };
 
     pub fn localNodeId(self: HostedGroupRouter) u64 {
@@ -186,6 +195,45 @@ pub fn resolveGroupRoute(
 
     if (local_status == .active) return .local;
     return null;
+}
+
+pub fn resolveGroupRoutes(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    router: HostedGroupRouter,
+    group_ids: []const u64,
+    policy: RoutePolicy,
+) !?[]GroupRoute {
+    if (router.vtable.resolve_group_routes) |resolve| {
+        const resolved = try resolve(router.ptr, alloc, group_ids, policy);
+        const routes = resolved orelse return null;
+        if (routes.len != group_ids.len) {
+            freeGroupRoutes(alloc, routes);
+            return error.InvalidGroupRouteBatch;
+        }
+        return routes;
+    }
+
+    const routes = try alloc.alloc(GroupRoute, group_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (routes[0..initialized]) |*route| route.deinit(alloc);
+        alloc.free(routes);
+    }
+    for (group_ids, 0..) |group_id, index| {
+        routes[index] = (try resolveGroupRoute(alloc, catalog, router, group_id, policy)) orelse {
+            for (routes[0..initialized]) |*route| route.deinit(alloc);
+            alloc.free(routes);
+            return null;
+        };
+        initialized += 1;
+    }
+    return routes;
+}
+
+pub fn freeGroupRoutes(alloc: std.mem.Allocator, routes: []GroupRoute) void {
+    for (routes) |*route| route.deinit(alloc);
+    alloc.free(routes);
 }
 
 fn managedHttpHostLocalNodeId(ptr: *anyopaque) u64 {
@@ -486,6 +534,85 @@ test "resolve group route prefers leader for strong reads and writes" {
         .local => return error.TestExpectedRemoteLeaderRoute,
         .remote => |remote| try std.testing.expectEqual(@as(u64, 2), remote.node_id),
     }
+}
+
+test "resolve group routes uses one router-owned snapshot callback for fanout" {
+    const State = struct {
+        batch_calls: usize = 0,
+        scalar_calls: usize = 0,
+        omit_last_route: bool = false,
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scalar_calls += 1;
+            return try std.fmt.allocPrint(alloc, "http://scalar-{d}", .{node_id});
+        }
+
+        fn resolveRoutes(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_ids: []const u64,
+            policy: RoutePolicy,
+        ) !?[]GroupRoute {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            try std.testing.expectEqual(RoutePolicy.prefer_leader, policy);
+            const route_count = group_ids.len - @intFromBool(self.omit_last_route and group_ids.len != 0);
+            const routes = try alloc.alloc(GroupRoute, route_count);
+            var initialized: usize = 0;
+            errdefer {
+                for (routes[0..initialized]) |*route| route.deinit(alloc);
+                alloc.free(routes);
+            }
+            for (group_ids[0..route_count], 0..) |group_id, index| {
+                routes[index] = .{ .remote = .{
+                    .node_id = group_id + 100,
+                    .base_uri = try std.fmt.allocPrint(alloc, "http://group-{d}", .{group_id}),
+                } };
+                initialized += 1;
+            }
+            return routes;
+        }
+    };
+
+    var state = State{};
+    const router: HostedGroupRouter = .{
+        .ptr = &state,
+        .vtable = &.{
+            .local_node_id = State.localNodeId,
+            .local_status = State.localStatus,
+            .node_base_uri = State.nodeBaseUri,
+            .resolve_group_routes = State.resolveRoutes,
+        },
+    };
+    const unused_catalog: table_catalog.CatalogSource = undefined;
+    const routes = (try resolveGroupRoutes(
+        std.testing.allocator,
+        unused_catalog,
+        router,
+        &.{ 7, 9, 11 },
+        .prefer_leader,
+    )).?;
+    defer freeGroupRoutes(std.testing.allocator, routes);
+    try std.testing.expectEqual(@as(usize, 1), state.batch_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+    try std.testing.expectEqual(@as(u64, 107), routes[0].remote.node_id);
+    try std.testing.expectEqualStrings("http://group-11", routes[2].remote.base_uri);
+
+    state.omit_last_route = true;
+    try std.testing.expectError(
+        error.InvalidGroupRouteBatch,
+        resolveGroupRoutes(std.testing.allocator, unused_catalog, router, &.{ 7, 9, 11 }, .prefer_leader),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
 }
 
 test "catalog backed router routes metadata-owned writes to placement leader api url" {

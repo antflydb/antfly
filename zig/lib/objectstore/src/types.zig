@@ -128,6 +128,17 @@ pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; streaming providers check between bounded
+    /// chunks and before the final publication step.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const BucketOptions = struct {
+    /// Borrowed for the duration of bucket discovery or creation. Remote
+    /// providers must attach it to the active transport, since provisioning is
+    /// part of the caller's operation budget rather than repository startup.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const GetOptions = struct {
@@ -156,6 +167,9 @@ pub const StatOptions = struct {
 pub const DeleteOptions = struct {
     version_id: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; local providers check before committing delete.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const ListOptions = struct {
@@ -168,6 +182,10 @@ pub const ListOptions = struct {
     /// Opaque provider cursor. Mutually exclusive with `start_after`.
     continuation_token: ?[]const u8 = null,
     max_keys: u32 = 1000,
+    /// Borrowed for the duration of one listing page. Providers attach this
+    /// to remote transport and local implementations check it while walking
+    /// bounded candidates.
+    cancellation: ?CancellationToken = null,
 };
 
 /// One immutable entry returned by a provider's object-version inventory.

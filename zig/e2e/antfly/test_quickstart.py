@@ -748,10 +748,14 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
     )
     assert batch["inserted"] == 2
 
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    status = backup_api.wait_index_ready(
+        table_name, index_name, timeout_s=30.0, interval_s=0.25
+    )
     index = backup_api.get_index(table_name, index_name)
     assert index["config"]["name"] == index_name
-    status = index["status"]
+    # Assert the exact readiness observation that satisfied the wait. A second
+    # status GET is useful for config validation but is not the completion
+    # receipt and must not create a time-of-check/time-of-use race here.
     assert status["backfill_state"] == "ready"
     assert status["rebuilding"] is False
     assert status["coverage"]["observation_complete"] is True
@@ -806,10 +810,11 @@ def test_inline_managed_index_create_load_ready_query_pipeline(
     )
     assert batch["inserted"] == 2
 
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    status = backup_api.wait_index_ready(
+        table_name, index_name, timeout_s=30.0, interval_s=0.25
+    )
     index = backup_api.get_index(table_name, index_name)
     assert index["config"]["name"] == index_name
-    status = index["status"]
     assert status["backfill_state"] == "ready"
     assert status["rebuilding"] is False
     assert status["coverage"]["observation_complete"] is True
