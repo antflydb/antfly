@@ -78306,13 +78306,25 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
 test "text replay delete keys include upserted derived document keys" {
     const alloc = std.testing.allocator;
 
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
     const selected_target = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "selected_text" }};
     const other_target = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "other_text" }};
     const docs = [_]derived_types.DerivedDocument{
-        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}" },
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}", .targets = &selected_target },
         .{ .key = "deleted:2", .action = .delete, .targets = &selected_target },
         .{ .key = "ignored", .action = .delete, .targets = &other_target },
-        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}" },
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}", .targets = &selected_target },
     };
     const deleted = [_][]const u8{"deleted:1"};
     const overwritten = [_][]const u8{ "chunk:1", "overwritten:1" };
@@ -78322,7 +78334,20 @@ test "text replay delete keys include upserted derived document keys" {
         .overwritten_doc_keys = &overwritten,
     };
 
-    const keys = try collectTextReplayDeleteKeys(alloc, batch, "selected_text", true);
+    var publication = try db.core.index_manager.acquireTextPublicationContext(alloc, "selected_text");
+    defer publication.deinit();
+    var apply_guard = try db.core.index_manager.lockManagedIndexApply(.{
+        .name = "selected_text",
+        .kind = .full_text,
+    });
+    defer apply_guard.unlock();
+    const keys = try collectTextReplayDeleteKeys(
+        alloc,
+        db.core.index_manager,
+        batch,
+        "selected_text",
+        publication,
+    );
     defer alloc.free(keys);
 
     try std.testing.expectEqual(@as(usize, 4), keys.len);
