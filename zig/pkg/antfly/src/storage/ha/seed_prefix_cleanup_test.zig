@@ -68,16 +68,16 @@ const VersionedTestStore = struct {
         self.backing.deinit();
     }
 
-    fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !bool {
         const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
         var backing = self.backing.client();
-        return try backing.bucketExists(bucket);
+        return try backing.bucketExistsWithOptions(bucket, opts);
     }
 
-    fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn makeBucket(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !void {
         const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
         var backing = self.backing.client();
-        try backing.makeBucket(bucket);
+        try backing.makeBucketWithOptions(bucket, opts);
     }
 
     fn putObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: object_storage.PutOptions) !object_storage.PutResult {

@@ -31,10 +31,35 @@ pub const RuntimeConfig = struct {
     max_tick_batch: usize = 128,
     max_pending_outbound_messages: usize = std.math.maxInt(usize),
     max_pending_outbound_bytes: usize = std.math.maxInt(usize),
+    /// Hard ceiling for the one-Ready liveness exception when the outbound
+    /// queue is empty. Unlike the backlog limit, this is never exceeded.
+    max_single_outbound_ready_bytes: usize = std.math.maxInt(usize),
     max_transport_messages_per_round: usize = std.math.maxInt(usize),
     max_transport_bytes_per_round: usize = std.math.maxInt(usize),
+    /// Snapshot admission is a separate work class so capacity backoff can
+    /// never consume the latency-sensitive Raft control-message quantum.
+    max_snapshot_submissions_per_round: usize = 2,
+    max_snapshot_submission_scans_per_round: usize = 32,
+    /// Maximum time an asynchronous transport may own a snapshot attempt
+    /// without publishing its exact terminal completion.
+    // This exceeds the production HTTP transport's five-minute per-transfer
+    // deadline while still bounding a wedged queue/worker independently.
+    snapshot_transport_completion_timeout_ms: u64 = 10 * 60_000,
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
+    /// Hard ceiling for the one-Ready liveness exception when the apply queue
+    /// is empty. Operators should size this above the largest accepted entry
+    /// or snapshot representation while keeping it below an OOM-scale value.
+    max_single_apply_ready_bytes: usize = std.math.maxInt(usize),
+    /// Absolute ceiling for an operator-authorized, incident-local Ready
+    /// recovery permit. The normal per-Ready limits remain immutable.
+    max_quarantine_recovery_bytes: usize = 1 << 30,
+    /// Recovery permits are deliberately short lived and single use.
+    quarantine_recovery_permit_rounds: u64 = 6_000,
+    /// Aggregate snapshot payload ownership retained by fetch, Raft Ready,
+    /// persistence, and apply. This is intentionally separate from apply queue
+    /// pressure because an accepted snapshot may still be pending in Raft.
+    max_pending_snapshot_bytes: usize = 1 << 30,
     max_apply_tasks_per_round: usize = std.math.maxInt(usize),
     applied_log_retained_entries: u64 = 4096,
     applied_log_compaction_min_interval_entries: u64 = 4096,
@@ -86,6 +111,8 @@ pub const ReadyGroupDiagnostics = struct {
     denied_by_backpressure: bool = false,
     denied_by_transport_capacity: bool = false,
     denied_by_apply_capacity: bool = false,
+    rejected_oversized_outbound_ready: bool = false,
+    rejected_oversized_apply_ready: bool = false,
     denied_by_snapshot_throttle: bool = false,
     has_more_ready: bool = false,
 };
@@ -128,6 +155,11 @@ pub const DrainReadyDiagnostics = struct {
 pub const HostMetrics = struct {
     group_count: usize = 0,
     quiesced_group_count: usize = 0,
+    quarantined_group_count: usize = 0,
+    quarantined_inbound_messages: usize = 0,
+    quarantine_resume_attempts: usize = 0,
+    quarantine_resume_successes: usize = 0,
+    quarantine_resume_conflicts: usize = 0,
     rounds: usize = 0,
     virtual_round: u64 = 0,
     virtual_time_ms: u64 = 0,
@@ -144,13 +176,27 @@ pub const HostMetrics = struct {
     transport_message_sends: usize = 0,
     transport_peer_batch_flushes: usize = 0,
     transport_snapshot_sends: usize = 0,
+    transport_snapshot_submission_deferrals: usize = 0,
+    transport_snapshot_backoff_skips: usize = 0,
+    transport_snapshot_completions: usize = 0,
+    transport_snapshot_completion_failures: usize = 0,
+    transport_snapshot_stale_completions: usize = 0,
+    transport_snapshot_completion_timeouts: usize = 0,
+    transport_snapshot_cancellations: usize = 0,
+    transport_snapshot_owned_attempts: usize = 0,
     restored_replicas: usize = 0,
     pending_outbound_messages: usize = 0,
     pending_outbound_bytes: usize = 0,
+    pending_control_messages: usize = 0,
+    pending_snapshot_submissions: usize = 0,
     pending_apply_tasks: usize = 0,
     pending_apply_bytes: usize = 0,
+    pending_snapshot_bytes: usize = 0,
+    snapshot_admission_denials: usize = 0,
     transport_queue_denials: usize = 0,
     apply_queue_denials: usize = 0,
+    oversized_outbound_ready_rejections: usize = 0,
+    oversized_apply_ready_rejections: usize = 0,
     snapshot_compaction_requests: usize = 0,
     snapshot_compaction_completions: usize = 0,
     snapshot_compaction_failures: usize = 0,
@@ -160,6 +206,59 @@ pub const HostMetrics = struct {
     snapshot_compaction_candidates: usize = 0,
     snapshot_compaction_bytes: usize = 0,
     snapshot_compaction_build_ns: u64 = 0,
+};
+
+pub const StepDisposition = enum {
+    applied,
+    quarantined,
+};
+
+pub const GroupQuarantineStatus = struct {
+    group_id: core.types.GroupId,
+    quarantine: scheduler_mod.GroupQuarantine,
+    current_limit: usize,
+    max_recovery_bytes: usize,
+    can_resume: bool,
+};
+
+pub const ResumeQuarantineOptions = struct {
+    expected_incident_id: u64,
+    /// Optional one-shot allowance for this incident's retained Ready. The
+    /// process-wide safety limit is never changed.
+    new_limit_bytes: ?usize = null,
+};
+
+const RecoveryPermitKey = struct {
+    group_id: core.types.GroupId,
+    reason: QuarantineReason,
+};
+
+const RecoveryPermit = struct {
+    incident_id: u64,
+    observed_bytes: usize,
+    allowance_bytes: usize,
+    expires_after_round: u64,
+};
+
+/// Attempt-scoped capability for crossing an irreversible Ready boundary.
+/// Admission and allocation failures leave the underlying incident permits
+/// intact; the first state mutation atomically spends every permit involved in
+/// this Ready so no later error path can accidentally reuse authorization.
+const ReadyRecoveryAttempt = struct {
+    host: *MultiRaft,
+    group_id: core.types.GroupId,
+    outbound: bool,
+    apply: bool,
+    spent: bool = false,
+
+    fn crossIrreversibleBoundary(self: *@This()) void {
+        std.debug.assert(!self.spent);
+        if (self.outbound)
+            self.host.consumeRecoveryPermit(self.group_id, .outbound_ready_too_large);
+        if (self.apply)
+            self.host.consumeRecoveryPermit(self.group_id, .apply_ready_too_large);
+        self.spent = true;
+    }
 };
 
 const PendingApplyTask = struct {
@@ -388,6 +487,16 @@ const snapshot_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
 const snapshot_retry_max_ns: u64 = 5 * std.time.ns_per_s;
 const snapshot_publish_inline_retry_limit: u8 = 5;
 
+pub const QuarantineReason = scheduler_mod.QuarantineReason;
+pub const GroupQuarantine = scheduler_mod.GroupQuarantine;
+
+const OversizedReadyGroup = struct {
+    group_id: core.types.GroupId,
+    reason: QuarantineReason,
+    observed_bytes: usize,
+    configured_limit: usize,
+};
+
 fn snapshotRetryDelayNs(attempt: u8) u64 {
     const shift: u6 = @intCast(@min(attempt -| 1, 9));
     return @min(snapshot_retry_base_ns << shift, snapshot_retry_max_ns);
@@ -402,7 +511,21 @@ pub const MultiRaft = struct {
     group_incarnations: std.AutoHashMapUnmanaged(core.types.GroupId, u64) = .empty,
     next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
+    pending_snapshot_submissions: std.AutoHashMapUnmanaged(
+        snapshot_transport_iface.SnapshotAttemptKey,
+        u64,
+    ) = .empty,
+    expired_snapshot_submissions: std.ArrayListUnmanaged(
+        snapshot_transport_iface.SnapshotAttemptKey,
+    ) = .empty,
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    pending_snapshot_bytes: std.atomic.Value(usize) = .init(0),
+    snapshot_admission_denials: std.atomic.Value(usize) = .init(0),
+    // Reused by every bounded Ready drain. Capacity is reserved when groups
+    // are admitted so the consensus hot path never allocates merely to record
+    // hard-limit quarantines.
+    oversized_ready_scratch: std.ArrayListUnmanaged(OversizedReadyGroup) = .empty,
+    recovery_permits: std.AutoHashMapUnmanaged(RecoveryPermitKey, RecoveryPermit) = .empty,
     snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
     next_snapshot_candidate_sequence: u64 = 1,
     snapshot_worker: ?*SnapshotBuildWorker = null,
@@ -434,18 +557,35 @@ pub const MultiRaft = struct {
         self.groups.deinit(self.alloc);
         self.group_incarnations.deinit(self.alloc);
         self.pending_outbox.deinit(self.alloc);
+        if (self.hooks.snapshot_transport) |transport| {
+            var pending = self.pending_snapshot_submissions.keyIterator();
+            while (pending.next()) |key| transport.cancelSubmission(key.*);
+        }
+        self.pending_snapshot_submissions.deinit(self.alloc);
+        self.expired_snapshot_submissions.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        self.oversized_ready_scratch.deinit(self.alloc);
+        self.recovery_permits.deinit(self.alloc);
         var snapshot_candidates = self.snapshot_candidates.valueIterator();
         while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
+        std.debug.assert(self.pending_snapshot_bytes.load(.acquire) == 0);
         self.* = undefined;
     }
 
     pub fn addGroup(self: *MultiRaft, cfg: group_mod.GroupConfig) !void {
         if (self.groups.count() >= self.cfg.max_groups) return error.MaxGroupsExceeded;
         if (self.groups.contains(cfg.group_id)) return error.GroupAlreadyExists;
+
+        // A drain can quarantine at most one entry per registered group. Pay
+        // this allocation on infrequent topology admission, not once per Raft
+        // round, and preserve the old group set if reservation fails.
+        try self.oversized_ready_scratch.ensureTotalCapacity(
+            self.alloc,
+            self.groups.count() + 1,
+        );
 
         var grp = try group_mod.Group.init(self.alloc, cfg);
         var grp_owned = true;
@@ -473,13 +613,62 @@ pub const MultiRaft = struct {
     }
 
     pub fn ensureReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        try self.validateReplicaAdmission(desc);
+        // Reject deterministic conflicts before changing desired state. The
+        // runtime is single-owner, so this check and publication cannot race
+        // another local admission.
+        // The catalog is durable desired state. Validate and publish admission
+        // before exposing a live group or fetching bytes. A later runtime
+        // failure intentionally leaves retryable admission debt for restart or
+        // reconciliation instead of an untracked live replica.
+        try self.persistReplicaRecord(desc);
+        return try self.installReplicaDescriptor(desc);
+    }
+
+    /// Publishes a descriptor whose admission is owned by an outer durable
+    /// catalog transaction. This is the production Host/Reconciler boundary;
+    /// it deliberately cannot write the runtime's optional standalone catalog.
+    pub fn installDurableReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        try self.validateReplicaAdmission(desc);
+        return try self.installReplicaDescriptor(desc);
+    }
+
+    /// Validates both the descriptor and its idempotence against any live
+    /// replica. Durable catalog owners call this before committing admission.
+    pub fn validateReplicaAdmission(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !void {
+        try desc.validateForAdmission();
+        if (self.group(desc.group.group_id)) |existing| {
+            switch (existing.admissionConflict(desc.group) orelse return) {
+                .local_node_id => return error.LocalNodeIdMismatch,
+                .runtime_policy => return error.ReplicaRuntimePolicyMismatch,
+            }
+        }
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *MultiRaft,
+        desc: replica_mod.ReplicaDescriptor,
+    ) ?group_mod.ReplicaAdmissionConflict {
+        const existing = self.group(desc.group.group_id) orelse return null;
+        return existing.admissionConflict(desc.group);
+    }
+
+    /// Reconstructs a replica from an already-durable catalog record. Restore
+    /// must never rewrite that record: decoder-first releases may legitimately
+    /// read a format that their predecessor-compatible writer cannot emit.
+    pub fn restoreReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        return try self.installDurableReplica(desc);
+    }
+
+    fn installReplicaDescriptor(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
         var result: replica_mod.EnsureReplicaResult = .{};
+        errdefer if (result.created) std.debug.assert(self.removeGroup(desc.group.group_id));
 
         if (self.group(desc.group.group_id)) |existing| {
             if (existing.localNodeId() != desc.group.local_node_id) return error.LocalNodeIdMismatch;
             if (self.isGroupQuiesced(desc.group.group_id)) {
-                try self.resumeGroup(desc.group.group_id);
-                result.resumed = true;
+                result.resumed = self.scheduler.resumeGroupOnActivity(desc.group.group_id);
+                if (result.resumed) self.refreshMetricsTopology();
             }
         } else {
             try self.addGroup(desc.group);
@@ -500,8 +689,6 @@ pub const MultiRaft = struct {
                 }
             },
         }
-
-        try self.persistReplicaRecord(desc);
 
         return result;
     }
@@ -531,7 +718,7 @@ pub const MultiRaft = struct {
         for (records) |*record| {
             if (self.groups.contains(record.group_id)) continue;
             const desc = try factory.instantiateReplica(record);
-            const result = try self.ensureReplica(desc);
+            const result = try self.restoreReplica(desc);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }
         self.metrics.restored_replicas += restored;
@@ -554,6 +741,9 @@ pub const MultiRaft = struct {
         }
         self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         self.removePendingAppliesForGroup(group_id);
+        self.cancelPendingSnapshotSubmissionsForGroup(group_id, incarnation);
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .outbound_ready_too_large });
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .apply_ready_too_large });
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -574,12 +764,113 @@ pub const MultiRaft = struct {
 
     pub fn resumeGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        if (self.scheduler.isHardQuarantined(group_id))
+            return error.GroupHardQuarantined;
         _ = self.scheduler.resumeGroup(group_id);
         self.refreshMetricsTopology();
     }
 
+    /// Explicitly acknowledge and retry a quarantined group after an operator
+    /// has corrected the configured limit. The incident fence prevents a
+    /// delayed retry from clearing a newer quarantine.
+    pub fn resumeQuarantinedGroup(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        options: ResumeQuarantineOptions,
+    ) !void {
+        self.metrics.quarantine_resume_attempts +|= 1;
+        if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        const quarantine = self.scheduler.groupQuarantine(group_id) orelse return error.GroupNotQuarantined;
+        if (quarantine.incident_id != options.expected_incident_id) {
+            self.metrics.quarantine_resume_conflicts +|= 1;
+            return error.QuarantineIncidentChanged;
+        }
+        const configured_limit = switch (quarantine.reason) {
+            .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
+            .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+        };
+        if (options.new_limit_bytes) |new_limit| {
+            if (new_limit < quarantine.observed_bytes or
+                new_limit > self.cfg.max_quarantine_recovery_bytes)
+                return error.InvalidQuarantineRecoveryLimit;
+            try self.recovery_permits.put(self.alloc, .{
+                .group_id = group_id,
+                .reason = quarantine.reason,
+            }, .{
+                .incident_id = quarantine.incident_id,
+                .observed_bytes = quarantine.observed_bytes,
+                .allowance_bytes = new_limit,
+                .expires_after_round = self.scheduler.round() +|
+                    self.cfg.quarantine_recovery_permit_rounds,
+            });
+        } else if (configured_limit < quarantine.observed_bytes) {
+            return error.QuarantineLimitStillExceeded;
+        }
+        _ = try self.scheduler.resumeQuarantinedGroup(group_id, options.expected_incident_id);
+        self.metrics.quarantine_resume_successes +|= 1;
+        self.refreshMetricsTopology();
+    }
+
+    fn recoveryPermitAllows(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        reason: QuarantineReason,
+        observed_bytes: usize,
+    ) bool {
+        const key = RecoveryPermitKey{ .group_id = group_id, .reason = reason };
+        const permit = self.recovery_permits.get(key) orelse return false;
+        if (self.scheduler.round() > permit.expires_after_round or
+            permit.observed_bytes != observed_bytes or
+            observed_bytes > permit.allowance_bytes)
+        {
+            _ = self.recovery_permits.remove(key);
+            return false;
+        }
+        return true;
+    }
+
+    fn consumeRecoveryPermit(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        reason: QuarantineReason,
+    ) void {
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = reason });
+    }
+
+    pub fn listQuarantines(self: *const MultiRaft, alloc: std.mem.Allocator) ![]GroupQuarantineStatus {
+        const statuses = try alloc.alloc(GroupQuarantineStatus, self.scheduler.quarantinedGroupCount());
+        var initialized: usize = 0;
+        var it = self.groups.keyIterator();
+        while (it.next()) |group_id| {
+            const quarantine = self.scheduler.groupQuarantine(group_id.*) orelse continue;
+            const configured_limit = switch (quarantine.reason) {
+                .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
+                .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+            };
+            statuses[initialized] = .{
+                .group_id = group_id.*,
+                .quarantine = quarantine,
+                .current_limit = configured_limit,
+                .max_recovery_bytes = self.cfg.max_quarantine_recovery_bytes,
+                .can_resume = configured_limit >= quarantine.observed_bytes,
+            };
+            initialized += 1;
+        }
+        std.debug.assert(initialized == statuses.len);
+        std.mem.sort(GroupQuarantineStatus, statuses, {}, struct {
+            fn lessThan(_: void, lhs: GroupQuarantineStatus, rhs: GroupQuarantineStatus) bool {
+                return lhs.group_id < rhs.group_id;
+            }
+        }.lessThan);
+        return statuses;
+    }
+
     pub fn isGroupQuiesced(self: *const MultiRaft, group_id: core.types.GroupId) bool {
         return self.scheduler.isQuiesced(group_id);
+    }
+
+    pub fn groupQuarantine(self: *const MultiRaft, group_id: core.types.GroupId) ?GroupQuarantine {
+        return self.scheduler.groupQuarantine(group_id);
     }
 
     pub fn addPeer(self: *MultiRaft, group_id: core.types.GroupId, peer: transport_iface.PeerDescriptor) !void {
@@ -721,13 +1012,25 @@ pub const MultiRaft = struct {
     }
 
     pub fn metricsSnapshot(self: *const MultiRaft) HostMetrics {
-        return self.metrics;
+        var snapshot = self.metrics;
+        snapshot.pending_snapshot_bytes = self.pending_snapshot_bytes.load(.acquire);
+        snapshot.snapshot_admission_denials = self.snapshot_admission_denials.load(.acquire);
+        return snapshot;
+    }
+
+    pub fn stepWithDisposition(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !StepDisposition {
+        if (try self.activityDisposition(group_id) == .quarantined) {
+            self.metrics.quarantined_inbound_messages +|= 1;
+            return .quarantined;
+        }
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try grp.step(msg);
+        return .applied;
     }
 
     pub fn step(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !void {
-        try self.resumeOnActivity(group_id);
-        const grp = self.group(group_id) orelse return error.UnknownGroup;
-        try grp.step(msg);
+        if (try self.stepWithDisposition(group_id, msg) == .quarantined)
+            return error.GroupHardQuarantined;
     }
 
     pub fn campaignGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
@@ -763,6 +1066,24 @@ pub const MultiRaft = struct {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         try grp.proposeWithReceipt(data, accepted_index);
+    }
+
+    pub fn proposeBatchWithReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        payloads: []const []const u8,
+        accepted_first_index: *?core.types.Index,
+        accepted_last_index: *?core.types.Index,
+    ) !void {
+        accepted_first_index.* = null;
+        accepted_last_index.* = null;
+        try self.resumeOnActivity(group_id);
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try grp.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
     }
 
     pub fn prepareProposalReceiptTracking(self: *MultiRaft, group_id: core.types.GroupId) !void {
@@ -822,6 +1143,30 @@ pub const MultiRaft = struct {
         try snapshot_transport.fetchSnapshot(req, self.snapshotReceiver());
     }
 
+    /// Reserves the process-wide snapshot ownership budget before an external
+    /// ingress path materializes a live payload.
+    pub fn admitInboundSnapshot(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        to: core.types.NodeId,
+        data_len: usize,
+    ) !void {
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        if (to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        try self.reserveSnapshotBytes(data_len);
+    }
+
+    pub fn cancelSnapshotAdmission(self: *MultiRaft, data_len: usize) void {
+        self.releaseSnapshotBytes(data_len);
+    }
+
+    pub fn attachSnapshotAdmission(self: *MultiRaft, snapshot: *core.types.Snapshot) !void {
+        try snapshot.shareOwnedData(self.alloc, .{
+            .ptr = self,
+            .release = releaseSnapshotBytesCallback,
+        });
+    }
+
     pub fn proposeConfChange(self: *MultiRaft, group_id: core.types.GroupId, conf_change: core.ConfChange) !void {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
@@ -852,10 +1197,31 @@ pub const MultiRaft = struct {
     pub fn processReady(self: *MultiRaft, group_id: core.types.GroupId) !bool {
         var outbox = TransportOutbox{};
         defer outbox.deinit(self.alloc);
+        // The single-group path must remain allocation-free until Ready passes
+        // admission (backpressure tests deliberately install a failing
+        // allocator). Back this one-element quarantine sink with stack memory.
+        var oversized_ready_group_buf: [1]OversizedReadyGroup = undefined;
+        var oversized_ready_groups = std.ArrayListUnmanaged(OversizedReadyGroup){
+            .items = oversized_ready_group_buf[0..0],
+            .capacity = oversized_ready_group_buf.len,
+        };
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (batch != null) self.metrics.persist_batches += 1;
         defer if (batch) |persist_batch| persist_batch.finish() catch unreachable;
-        const processed = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
+        const processed = try self.processReadyIntoOutbox(
+            group_id,
+            &outbox,
+            batch,
+            false,
+            false,
+            null,
+            &oversized_ready_groups,
+        );
+        var oversized_quarantine_cursor: usize = 0;
+        self.quiesceOversizedReadyGroups(
+            oversized_ready_groups.items,
+            &oversized_quarantine_cursor,
+        );
         try outbox.drainInto(self.alloc, &self.pending_outbox);
         try self.flushPendingApply();
         try self.flushPendingTransport();
@@ -886,6 +1252,10 @@ pub const MultiRaft = struct {
 
         var fair_attempts: usize = 0;
         const scan_limit = self.groups.count();
+        self.oversized_ready_scratch.clearRetainingCapacity();
+        std.debug.assert(self.oversized_ready_scratch.capacity >= scan_limit);
+        const oversized_ready_groups = &self.oversized_ready_scratch;
+        var oversized_quarantine_cursor: usize = 0;
         const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         {
             var ready_pass = self.scheduler.beginReadyPass(.fair);
@@ -893,12 +1263,16 @@ pub const MultiRaft = struct {
             while (fair_attempts < scan_limit) : (fair_attempts += 1) {
                 if (result.processed_ready_steps >= max_ready_steps) break;
                 const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
-                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, oversized_ready_groups)) {
                     result.processed_groups += 1;
                     result.processed_ready_steps += 1;
                 }
             }
         }
+        self.quiesceOversizedReadyGroups(
+            oversized_ready_groups.items,
+            &oversized_quarantine_cursor,
+        );
 
         // If budget remains, every group received one fair opportunity above.
         // Spend that budget only on hints produced while useful work advanced.
@@ -921,12 +1295,16 @@ pub const MultiRaft = struct {
                     const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
                     continuation_attempts += 1;
                     attempted_this_pass += 1;
-                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, oversized_ready_groups)) {
                         result.processed_ready_steps += 1;
                         progressed_this_pass += 1;
                     }
                 }
             }
+            self.quiesceOversizedReadyGroups(
+                oversized_ready_groups.items,
+                &oversized_quarantine_cursor,
+            );
             if (attempted_this_pass == 0 or progressed_this_pass == 0) break;
         }
         if (diagnostics) |diag| diag.scan_elapsed_ns = clock.elapsedSinceNs(scan_start_ns);
@@ -953,12 +1331,39 @@ pub const MultiRaft = struct {
         return result;
     }
 
+    fn quiesceOversizedReadyGroups(
+        self: *MultiRaft,
+        groups: []const OversizedReadyGroup,
+        cursor: *usize,
+    ) void {
+        var changed = false;
+        while (cursor.* < groups.len) : (cursor.* += 1) {
+            const oversized = groups[cursor.*];
+            self.scheduler.quarantineGroup(
+                oversized.group_id,
+                oversized.reason,
+                oversized.observed_bytes,
+                oversized.configured_limit,
+            ) catch |err| {
+                std.log.err(
+                    "failed to quarantine oversized Ready group_id={d} err={s}",
+                    .{ oversized.group_id, @errorName(err) },
+                );
+                self.scheduler.deferReady(oversized.group_id);
+                continue;
+            };
+            changed = true;
+        }
+        if (changed) self.refreshMetricsTopology();
+    }
+
     fn processReadyCandidate(
         self: *MultiRaft,
         group_id: core.types.GroupId,
         outbox: *TransportOutbox,
         persist_batch: ?storage_iface.PersistBatch,
         diagnostics: ?*DrainReadyDiagnostics,
+        oversized_ready_groups: *std.ArrayListUnmanaged(OversizedReadyGroup),
     ) !bool {
         if (diagnostics) |diag| {
             var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
@@ -970,6 +1375,7 @@ pub const MultiRaft = struct {
                 false,
                 false,
                 &ready_diag,
+                oversized_ready_groups,
             );
             ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
             ready_diag.processed = processed;
@@ -985,6 +1391,7 @@ pub const MultiRaft = struct {
             false,
             false,
             null,
+            oversized_ready_groups,
         );
     }
 
@@ -996,6 +1403,7 @@ pub const MultiRaft = struct {
         flush_transport: bool,
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
+        oversized_ready_groups: *std.ArrayListUnmanaged(OversizedReadyGroup),
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (!grp.hasReady()) {
@@ -1039,10 +1447,56 @@ pub const MultiRaft = struct {
         }
 
         const capacity_check_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        if (!self.hasOutboundCapacity(
-            outbox.items.items.len + ready_pressure.message_count,
-            outbox.approxBytes() + ready_pressure.message_bytes,
-        )) {
+        const apply_ready_bytes = ready_pressure.snapshot_bytes +|
+            ready_pressure.committed_entry_bytes +|
+            approxReadStatesSize(ready.read_states);
+        const outbound_capacity_available = self.hasOutboundCapacity(
+            outbox.len() +| ready_pressure.message_count,
+            outbox.approxBytes() +| ready_pressure.message_bytes,
+        );
+        const outbound_recovery_permit = ready_pressure.message_bytes >
+            self.cfg.max_single_outbound_ready_bytes and self.recoveryPermitAllows(
+            group_id,
+            .outbound_ready_too_large,
+            ready_pressure.message_bytes,
+        );
+        // A byte ceiling must bound backlog, not make a single bounded Ready
+        // impossible forever. When both queues are empty, admit one oversized
+        // Ready so Raft can make progress; subsequent groups remain gated until
+        // it drains. Message-count limits stay hard to cap fan-out allocations.
+        const outbound_single_ready_progress =
+            self.pending_outbox.isEmpty() and
+            outbox.isEmpty() and
+            ready_pressure.message_count <= self.cfg.max_pending_outbound_messages and
+            (ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes or
+                outbound_recovery_permit);
+        if (ready_pressure.message_bytes > self.cfg.max_single_outbound_ready_bytes and
+            !outbound_recovery_permit)
+        {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.rejected_oversized_outbound_ready = true;
+            }
+            self.metrics.oversized_outbound_ready_rejections += 1;
+            std.log.warn(
+                "raft Ready exceeds hard outbound ceiling; quarantining group group_id={d} message_bytes={d} max_bytes={d}",
+                .{ group_id, ready_pressure.message_bytes, self.cfg.max_single_outbound_ready_bytes },
+            );
+            // This is a group-local invariant violation. Returning from the
+            // middle of a multi-group drain would discard the local outbox
+            // for Ready batches already persisted and advanced earlier in the
+            // pass. Quarantine only the offending group and let the batch
+            // flush normally; metrics and quiesced status retain the operator
+            // signal without starving healthy groups or log-spinning.
+            oversized_ready_groups.appendAssumeCapacity(.{
+                .group_id = group_id,
+                .reason = .outbound_ready_too_large,
+                .observed_bytes = ready_pressure.message_bytes,
+                .configured_limit = self.cfg.max_single_outbound_ready_bytes,
+            });
+            return false;
+        }
+        if (!outbound_capacity_available and !outbound_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.denied_by_transport_capacity = true;
@@ -1051,10 +1505,42 @@ pub const MultiRaft = struct {
             self.scheduler.deferReady(group_id);
             return false;
         }
-        if (!self.hasApplyCapacity(
-            if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
-            ready_pressure.snapshot_bytes + ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
-        )) {
+        const new_apply_tasks: usize = if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0;
+        const apply_capacity_available = self.hasApplyCapacity(
+            new_apply_tasks,
+            apply_ready_bytes,
+        );
+        const apply_recovery_permit = apply_ready_bytes >
+            self.cfg.max_single_apply_ready_bytes and self.recoveryPermitAllows(
+            group_id,
+            .apply_ready_too_large,
+            apply_ready_bytes,
+        );
+        const apply_single_ready_progress = self.pending_apply.items.len == 0 and
+            new_apply_tasks <= self.cfg.max_pending_apply_tasks and
+            (apply_ready_bytes <= self.cfg.max_single_apply_ready_bytes or
+                apply_recovery_permit);
+        if (apply_ready_bytes > self.cfg.max_single_apply_ready_bytes and
+            !apply_recovery_permit)
+        {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.rejected_oversized_apply_ready = true;
+            }
+            self.metrics.oversized_apply_ready_rejections += 1;
+            std.log.warn(
+                "raft Ready exceeds hard apply ceiling; quarantining group group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
+                .{ group_id, apply_ready_bytes, self.cfg.max_single_apply_ready_bytes, ready_pressure.snapshot_bytes },
+            );
+            oversized_ready_groups.appendAssumeCapacity(.{
+                .group_id = group_id,
+                .reason = .apply_ready_too_large,
+                .observed_bytes = apply_ready_bytes,
+                .configured_limit = self.cfg.max_single_apply_ready_bytes,
+            });
+            return false;
+        }
+        if (!apply_capacity_available and !apply_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.denied_by_apply_capacity = true;
@@ -1064,6 +1550,13 @@ pub const MultiRaft = struct {
             return false;
         }
         if (diagnostics) |diag| diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+
+        var recovery_attempt = ReadyRecoveryAttempt{
+            .host = self,
+            .group_id = group_id,
+            .outbound = outbound_recovery_permit,
+            .apply = apply_recovery_permit,
+        };
 
         const snapshot_throttle_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const snapshot_started = blk: {
@@ -1100,6 +1593,17 @@ pub const MultiRaft = struct {
         } else ready.messages;
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
+        // A recovery permit authorizes exactly one processing attempt for the
+        // retained Ready, not one successful attempt. Everything before this
+        // point is allocation/admission preflight and leaves the Ready wholly
+        // untouched. Configuration application, persistence, async local
+        // responses, and advance below can each cross an irreversible boundary
+        // before returning an error, so consume the incident permit before the
+        // first of them. A transient failure consequently re-quarantines the
+        // still-oversized Ready and requires an explicit, newly fenced retry
+        // instead of silently reusing an old operator authorization.
+        recovery_attempt.crossIrreversibleBoundary();
+
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;
         }
@@ -1135,7 +1639,12 @@ pub const MultiRaft = struct {
             try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try outbox.appendMessages(self.alloc, group_id, ready_messages);
+            try outbox.appendMessages(
+                self.alloc,
+                group_id,
+                self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                ready_messages,
+            );
             if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
             const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
@@ -1193,7 +1702,12 @@ pub const MultiRaft = struct {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
                 .storage_apply => try self.handleLocalStorageApply(group_id, grp, msg, outbox),
-                else => try outbox.appendMessage(self.alloc, group_id, msg),
+                else => try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    msg,
+                ),
             }
         }
         if (diagnostics) |diag| diag.async_message_loop_elapsed_ns = clock.elapsedSinceNs(async_message_loop_start_ns);
@@ -1640,11 +2154,15 @@ pub const MultiRaft = struct {
     fn refreshMetricsTopology(self: *MultiRaft) void {
         self.metrics.group_count = self.groups.count();
         self.metrics.quiesced_group_count = self.groups.count() - self.scheduler.activeGroupCount();
+        self.metrics.quarantined_group_count = self.scheduler.quarantinedGroupCount();
     }
 
     fn refreshQueueMetrics(self: *MultiRaft) void {
-        self.metrics.pending_outbound_messages = self.pending_outbox.items.items.len;
+        self.metrics.pending_outbound_messages = self.pending_outbox.len();
         self.metrics.pending_outbound_bytes = self.pending_outbox.approxBytes();
+        self.metrics.pending_control_messages = self.pending_outbox.controlLen();
+        self.metrics.pending_snapshot_submissions = self.pending_outbox.snapshotLen();
+        self.metrics.transport_snapshot_owned_attempts = self.pending_snapshot_submissions.count();
 
         var pending_apply_bytes: usize = 0;
         for (self.pending_apply.items) |task| pending_apply_bytes += task.approx_bytes;
@@ -1663,31 +2181,203 @@ pub const MultiRaft = struct {
         self.metrics.transport_message_sends += stats.message_sends;
         self.metrics.transport_peer_batch_flushes += stats.peer_batch_flushes;
         self.metrics.transport_snapshot_sends += stats.snapshot_sends;
+        self.metrics.transport_snapshot_submission_deferrals += stats.snapshot_submission_deferrals;
+        self.metrics.transport_snapshot_backoff_skips += stats.snapshot_backoff_skips;
     }
 
     fn hasOutboundCapacity(self: *const MultiRaft, total_messages: usize, total_bytes: usize) bool {
-        return self.pending_outbox.items.items.len + total_messages <= self.cfg.max_pending_outbound_messages and
-            self.pending_outbox.approxBytes() + total_bytes <= self.cfg.max_pending_outbound_bytes;
+        return self.pending_outbox.len() +| total_messages <= self.cfg.max_pending_outbound_messages and
+            self.pending_outbox.approxBytes() +| total_bytes <= self.cfg.max_pending_outbound_bytes;
     }
 
     fn hasApplyCapacity(self: *const MultiRaft, new_tasks: usize, new_bytes: usize) bool {
         var pending_bytes: usize = 0;
-        for (self.pending_apply.items) |task| pending_bytes += task.approx_bytes;
-        return self.pending_apply.items.len + new_tasks <= self.cfg.max_pending_apply_tasks and
-            pending_bytes + new_bytes <= self.cfg.max_pending_apply_bytes;
+        for (self.pending_apply.items) |task| pending_bytes +|= task.approx_bytes;
+        return self.pending_apply.items.len +| new_tasks <= self.cfg.max_pending_apply_tasks and
+            pending_bytes +| new_bytes <= self.cfg.max_pending_apply_bytes;
     }
 
     fn flushPendingTransport(self: *MultiRaft) !void {
-        if (self.pending_outbox.items.items.len == 0) return;
+        self.drainSnapshotTransportCompletions();
+        self.expireSnapshotTransportSubmissions(clock.monotonicNs());
+        if (self.pending_outbox.isEmpty()) return;
         if (self.hooks.transport == null and self.hooks.snapshot_transport == null) return;
 
+        var synchronous_completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+        var accepted_submissions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotAttemptKey).empty;
+        defer {
+            for (synchronous_completions.items) |completion|
+                self.processSnapshotTransportCompletion(completion, false);
+            synchronous_completions.deinit(self.alloc);
+            accepted_submissions.deinit(self.alloc);
+        }
+        const submission_capacity: u32 = @intCast(@min(
+            self.cfg.max_snapshot_submissions_per_round,
+            self.pending_outbox.snapshotLen(),
+            std.math.maxInt(u32),
+        ));
+        try accepted_submissions.ensureTotalCapacity(self.alloc, submission_capacity);
+        try self.pending_snapshot_submissions.ensureUnusedCapacity(self.alloc, submission_capacity);
+        try self.expired_snapshot_submissions.ensureTotalCapacity(
+            self.alloc,
+            self.pending_snapshot_submissions.count() + submission_capacity,
+        );
+        const now_ns = clock.monotonicNs();
+        const deadline_ns = now_ns +|
+            (self.cfg.snapshot_transport_completion_timeout_ms *| std.time.ns_per_ms);
+        // Submission can fail after earlier attempts in this bounded batch
+        // transferred ownership. Register those attempts on both success and
+        // error so partial progress can never escape the liveness registry.
+        var submissions_registered = false;
+        defer if (!submissions_registered)
+            self.registerSnapshotTransportSubmissions(accepted_submissions.items, deadline_ns);
         const stats = try self.pending_outbox.flushBudgeted(
             self.alloc,
             self.hooks,
             self.cfg.max_transport_messages_per_round,
             self.cfg.max_transport_bytes_per_round,
+            self.cfg.max_snapshot_submissions_per_round,
+            self.cfg.max_snapshot_submission_scans_per_round,
+            now_ns,
+            &synchronous_completions,
+            &accepted_submissions,
         );
+        self.registerSnapshotTransportSubmissions(accepted_submissions.items, deadline_ns);
+        submissions_registered = true;
         self.recordTransportFlush(stats);
+        self.drainSnapshotTransportCompletions();
+    }
+
+    fn registerSnapshotTransportSubmissions(
+        self: *MultiRaft,
+        submissions: []const snapshot_transport_iface.SnapshotAttemptKey,
+        deadline_ns: u64,
+    ) void {
+        for (submissions) |key| {
+            const entry = self.pending_snapshot_submissions.getOrPutAssumeCapacity(key);
+            if (!entry.found_existing) entry.value_ptr.* = deadline_ns;
+        }
+        self.refreshQueueMetrics();
+    }
+
+    fn drainSnapshotTransportCompletions(self: *MultiRaft) void {
+        const snapshot_transport = self.hooks.snapshot_transport orelse return;
+        var completions: [32]snapshot_transport_iface.SnapshotCompletion = undefined;
+        while (true) {
+            const count = snapshot_transport.drainCompletions(&completions);
+            if (count == 0) return;
+            for (completions[0..count]) |completion|
+                self.processSnapshotTransportCompletion(completion, true);
+            if (count < completions.len) return;
+        }
+    }
+
+    fn processSnapshotTransportCompletion(
+        self: *MultiRaft,
+        completion: snapshot_transport_iface.SnapshotCompletion,
+        require_pending: bool,
+    ) void {
+        if (require_pending and !self.pending_snapshot_submissions.remove(completion.key())) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        self.metrics.transport_snapshot_owned_attempts = self.pending_snapshot_submissions.count();
+        if (self.group_incarnations.get(completion.group_id) != completion.incarnation) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const grp = self.group(completion.group_id) orelse {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        };
+        if (completion.from != grp.localNodeId()) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const status = grp.status();
+        if (status.soft.role != .leader or status.hard.current_term != completion.term) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const matched = switch (completion.status) {
+            .failed => grp.reportSnapshotFailure(
+                completion.to,
+                completion.term,
+                completion.snapshot_index,
+                completion.snapshot_term,
+                completion.attempt_generation,
+            ),
+            .delivered => grp.reportSnapshotDelivered(
+                completion.to,
+                completion.term,
+                completion.snapshot_index,
+                completion.snapshot_term,
+                completion.attempt_generation,
+            ),
+        };
+        if (!matched) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        if (completion.status == .failed)
+            self.metrics.transport_snapshot_completion_failures += 1;
+        self.metrics.transport_snapshot_completions += 1;
+    }
+
+    fn expireSnapshotTransportSubmissions(self: *MultiRaft, now_ns: u64) void {
+        const transport = self.hooks.snapshot_transport orelse return;
+        self.expired_snapshot_submissions.clearRetainingCapacity();
+        var pending = self.pending_snapshot_submissions.iterator();
+        while (pending.next()) |entry| {
+            if (entry.value_ptr.* <= now_ns)
+                self.expired_snapshot_submissions.appendAssumeCapacity(entry.key_ptr.*);
+        }
+        for (self.expired_snapshot_submissions.items) |key| {
+            if (!self.pending_snapshot_submissions.remove(key)) continue;
+            transport.cancelSubmission(key);
+            self.metrics.transport_snapshot_completion_timeouts += 1;
+            self.metrics.transport_snapshot_cancellations += 1;
+            self.reportSnapshotTransportFailure(key);
+        }
+        self.metrics.transport_snapshot_owned_attempts = self.pending_snapshot_submissions.count();
+    }
+
+    fn reportSnapshotTransportFailure(
+        self: *MultiRaft,
+        key: snapshot_transport_iface.SnapshotAttemptKey,
+    ) void {
+        if (self.group_incarnations.get(key.group_id) != key.incarnation) return;
+        const grp = self.group(key.group_id) orelse return;
+        if (key.from != grp.localNodeId()) return;
+        const status = grp.status();
+        if (status.soft.role != .leader or status.hard.current_term != key.term) return;
+        _ = grp.reportSnapshotFailure(
+            key.to,
+            key.term,
+            key.snapshot_index,
+            key.snapshot_term,
+            key.attempt_generation,
+        );
+    }
+
+    fn cancelPendingSnapshotSubmissionsForGroup(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        incarnation: u64,
+    ) void {
+        const transport = self.hooks.snapshot_transport orelse return;
+        self.expired_snapshot_submissions.clearRetainingCapacity();
+        var pending = self.pending_snapshot_submissions.keyIterator();
+        while (pending.next()) |key| {
+            if (key.group_id == group_id and key.incarnation == incarnation)
+                self.expired_snapshot_submissions.appendAssumeCapacity(key.*);
+        }
+        for (self.expired_snapshot_submissions.items) |key| {
+            if (!self.pending_snapshot_submissions.remove(key)) continue;
+            transport.cancelSubmission(key);
+            self.metrics.transport_snapshot_cancellations += 1;
+        }
+        self.metrics.transport_snapshot_owned_attempts = self.pending_snapshot_submissions.count();
     }
 
     fn consumePendingApplyPrefix(self: *MultiRaft, count: usize) void {
@@ -1713,10 +2403,17 @@ pub const MultiRaft = struct {
         self.pending_apply.items.len = retained;
     }
 
-    fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
+    fn activityDisposition(self: *MultiRaft, group_id: core.types.GroupId) !StepDisposition {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
-        if (self.isGroupQuiesced(group_id)) try self.resumeGroup(group_id);
+        if (self.scheduler.isHardQuarantined(group_id)) return .quarantined;
+        if (self.scheduler.resumeGroupOnActivity(group_id)) self.refreshMetricsTopology();
         self.scheduler.noteActivity(group_id);
+        return .applied;
+    }
+
+    fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
+        if (try self.activityDisposition(group_id) == .quarantined)
+            return error.GroupHardQuarantined;
     }
 
     fn transportReceiver(self: *MultiRaft) transport_iface.TransportReceiver {
@@ -1730,16 +2427,33 @@ pub const MultiRaft = struct {
 
     fn transportHandleMessage(ptr: *anyopaque, group_id: core.types.GroupId, msg: core.Message) !void {
         const self: *MultiRaft = @ptrCast(@alignCast(ptr));
-        try self.step(group_id, msg);
+        _ = try self.stepWithDisposition(group_id, msg);
     }
 
     fn snapshotReceiver(self: *MultiRaft) snapshot_transport_iface.SnapshotReceiver {
         return .{
             .ptr = self,
             .vtable = &.{
+                .admit_snapshot = snapshotAdmitReceive,
+                .cancel_snapshot_admission = snapshotCancelAdmission,
                 .receive_snapshot = snapshotHandleReceive,
             },
         };
+    }
+
+    fn snapshotAdmitReceive(
+        ptr: *anyopaque,
+        req: snapshot_transport_iface.SnapshotFetchRequest,
+        data_len: usize,
+    ) !void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        _ = self.group(req.group_id) orelse return error.UnknownGroup;
+        try self.reserveSnapshotBytes(data_len);
+    }
+
+    fn snapshotCancelAdmission(ptr: *anyopaque, data_len: usize) void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        self.releaseSnapshotBytes(data_len);
     }
 
     fn snapshotHandleReceive(
@@ -1748,16 +2462,69 @@ pub const MultiRaft = struct {
         snapshot: core.types.Snapshot,
     ) !void {
         const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        var owned_snapshot = snapshot;
+        defer owned_snapshot.deinit(self.alloc);
+        var admission_reserved = req.admission_reserved;
+        var admission_bytes = if (admission_reserved) req.admitted_snapshot_bytes else 0;
+        errdefer if (admission_reserved) self.releaseSnapshotBytes(admission_bytes);
         const grp = self.group(req.group_id) orelse return error.UnknownGroup;
+        if (admission_reserved and admission_bytes != owned_snapshot.data.len)
+            return error.SnapshotAdmissionSizeMismatch;
+        if (!admission_reserved) {
+            try self.reserveSnapshotBytes(owned_snapshot.data.len);
+            admission_reserved = true;
+            admission_bytes = owned_snapshot.data.len;
+        }
+        try owned_snapshot.shareOwnedData(self.alloc, .{
+            .ptr = self,
+            .release = releaseSnapshotBytesCallback,
+        });
+        admission_reserved = false;
         var msg: core.Message = .{
             .msg_type = .snapshot,
             .from = req.from,
             .to = grp.localNodeId(),
             .term = req.term,
-            .snapshot = snapshot,
+            .snapshot = owned_snapshot,
         };
+        owned_snapshot = .{};
         defer msg.deinit(self.alloc);
         try self.step(req.group_id, msg);
+    }
+
+    fn reserveSnapshotBytes(self: *MultiRaft, data_len: usize) !void {
+        if (data_len > self.cfg.max_pending_snapshot_bytes) {
+            _ = self.snapshot_admission_denials.fetchAdd(1, .monotonic);
+            return error.SnapshotAdmissionBackpressure;
+        }
+        var current = self.pending_snapshot_bytes.load(.acquire);
+        while (true) {
+            if (current > self.cfg.max_pending_snapshot_bytes - data_len) {
+                _ = self.snapshot_admission_denials.fetchAdd(1, .monotonic);
+                return error.SnapshotAdmissionBackpressure;
+            }
+            if (self.pending_snapshot_bytes.cmpxchgWeak(
+                current,
+                current + data_len,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn releaseSnapshotBytes(self: *MultiRaft, data_len: usize) void {
+        if (data_len == 0) return;
+        const previous = self.pending_snapshot_bytes.fetchSub(data_len, .acq_rel);
+        std.debug.assert(previous >= data_len);
+    }
+
+    fn releaseSnapshotBytesCallback(ptr: *anyopaque, data_len: usize) void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        self.releaseSnapshotBytes(data_len);
     }
 
     fn handleLocalStorageAppend(
@@ -1771,7 +2538,12 @@ pub const MultiRaft = struct {
             if (core.message.isLocalStorageThread(response.to) or response.to == grp.localNodeId()) {
                 try grp.step(response);
             } else {
-                try outbox.appendMessage(self.alloc, group_id, response);
+                try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    response,
+                );
             }
         }
     }
@@ -1787,7 +2559,12 @@ pub const MultiRaft = struct {
             if (core.message.isLocalStorageThread(response.to) or response.to == grp.localNodeId()) {
                 try grp.step(response);
             } else {
-                try outbox.appendMessage(self.alloc, group_id, response);
+                try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    response,
+                );
             }
         }
     }
@@ -1795,13 +2572,26 @@ pub const MultiRaft = struct {
 
 const OutboundMessage = struct {
     group_id: core.types.GroupId,
+    incarnation: u64,
     message: core.Message,
+    accepted: bool = false,
+    retry_not_before_ns: u64 = 0,
 };
 
 const TransportFlushStats = struct {
     message_sends: usize = 0,
     peer_batch_flushes: usize = 0,
     snapshot_sends: usize = 0,
+    snapshot_submission_deferrals: usize = 0,
+    snapshot_backoff_skips: usize = 0,
+
+    fn add(self: *TransportFlushStats, other: TransportFlushStats) void {
+        self.message_sends += other.message_sends;
+        self.peer_batch_flushes += other.peer_batch_flushes;
+        self.snapshot_sends += other.snapshot_sends;
+        self.snapshot_submission_deferrals += other.snapshot_submission_deferrals;
+        self.snapshot_backoff_skips += other.snapshot_backoff_skips;
+    }
 };
 
 fn summarizeReady(group_id: core.types.GroupId, ready: core.Ready) backpressure_iface.ReadyPressure {
@@ -1913,12 +2703,18 @@ const PeerBatchBuilder = struct {
 };
 
 const TransportOutbox = struct {
+    /// Latency-sensitive Raft control traffic. Snapshots never enter this FIFO.
     items: std.ArrayListUnmanaged(OutboundMessage) = .empty,
+    /// Backoff-aware snapshot lane with an independent fair scan cursor.
+    snapshot_items: std.ArrayListUnmanaged(OutboundMessage) = .empty,
+    snapshot_cursor: usize = 0,
     approx_bytes: usize = 0,
 
     fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
+        for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.deinit(alloc);
+        self.snapshot_items.deinit(alloc);
         self.* = undefined;
     }
 
@@ -1926,11 +2722,14 @@ const TransportOutbox = struct {
         self: *TransportOutbox,
         alloc: std.mem.Allocator,
         group_id: core.types.GroupId,
+        incarnation: u64,
         msg: core.Message,
     ) !void {
         const msg_bytes = approxMessagesSize(&.{msg});
-        try self.items.append(alloc, .{
+        const lane = if (msg.msg_type == .snapshot) &self.snapshot_items else &self.items;
+        try lane.append(alloc, .{
             .group_id = group_id,
+            .incarnation = incarnation,
             .message = try msg.clone(alloc),
         });
         self.approx_bytes += msg_bytes;
@@ -1940,13 +2739,25 @@ const TransportOutbox = struct {
         self: *TransportOutbox,
         alloc: std.mem.Allocator,
         group_id: core.types.GroupId,
+        incarnation: u64,
         messages: []const core.Message,
     ) !void {
-        try self.items.ensureUnusedCapacity(alloc, messages.len);
+        var control_count: usize = 0;
+        var snapshot_count: usize = 0;
+        for (messages) |msg| {
+            if (msg.msg_type == .snapshot)
+                snapshot_count += 1
+            else
+                control_count += 1;
+        }
+        try self.items.ensureUnusedCapacity(alloc, control_count);
+        try self.snapshot_items.ensureUnusedCapacity(alloc, snapshot_count);
         for (messages) |msg| {
             const msg_bytes = approxMessagesSize(&.{msg});
-            self.items.appendAssumeCapacity(.{
+            const lane = if (msg.msg_type == .snapshot) &self.snapshot_items else &self.items;
+            lane.appendAssumeCapacity(.{
                 .group_id = group_id,
+                .incarnation = incarnation,
                 .message = try msg.clone(alloc),
             });
             self.approx_bytes += msg_bytes;
@@ -1954,12 +2765,32 @@ const TransportOutbox = struct {
     }
 
     fn drainInto(self: *TransportOutbox, alloc: std.mem.Allocator, dst: *TransportOutbox) !void {
-        if (self.items.items.len == 0) return;
+        if (self.isEmpty()) return;
         try dst.items.ensureUnusedCapacity(alloc, self.items.items.len);
+        try dst.snapshot_items.ensureUnusedCapacity(alloc, self.snapshot_items.items.len);
         for (self.items.items) |item| dst.items.appendAssumeCapacity(item);
+        for (self.snapshot_items.items) |item| dst.snapshot_items.appendAssumeCapacity(item);
         dst.approx_bytes += self.approx_bytes;
         self.items.clearRetainingCapacity();
+        self.snapshot_items.clearRetainingCapacity();
+        self.snapshot_cursor = 0;
         self.approx_bytes = 0;
+    }
+
+    fn len(self: *const TransportOutbox) usize {
+        return self.items.items.len + self.snapshot_items.items.len;
+    }
+
+    fn controlLen(self: *const TransportOutbox) usize {
+        return self.items.items.len;
+    }
+
+    fn snapshotLen(self: *const TransportOutbox) usize {
+        return self.snapshot_items.items.len;
+    }
+
+    fn isEmpty(self: *const TransportOutbox) bool {
+        return self.len() == 0;
     }
 
     fn approxBytes(self: *const TransportOutbox) usize {
@@ -1968,31 +2799,18 @@ const TransportOutbox = struct {
 
     fn flush(self: *TransportOutbox, alloc: std.mem.Allocator, hooks: RuntimeHooks) !TransportFlushStats {
         if (self.items.items.len == 0) return .{};
-        defer self.clear(alloc);
+        // Only acknowledged submissions cross the ownership boundary. The
+        // caller restores every unaccepted entry to the pending outbox.
+        defer self.consumeAccepted(alloc);
 
         var stats: TransportFlushStats = .{};
-
-        if (hooks.snapshot_transport) |snapshot_transport| {
-            for (self.items.items) |item| {
-                if (item.message.msg_type != .snapshot) continue;
-                const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
-                try snapshot_transport.sendSnapshot(.{
-                    .group_id = item.group_id,
-                    .from = item.message.from,
-                    .to = item.message.to,
-                    .term = item.message.term,
-                    .snapshot = snapshot,
-                });
-                stats.snapshot_sends += 1;
-            }
-        }
 
         const transport = hooks.transport orelse return stats;
 
         if (!transport.supportsPeerBatches()) {
-            for (self.items.items) |item| {
-                if (item.message.msg_type == .snapshot) continue;
+            for (self.items.items) |*item| {
                 try transport.sendMessages(item.group_id, &.{item.message});
+                item.accepted = true;
                 stats.message_sends += 1;
             }
             return stats;
@@ -2005,7 +2823,7 @@ const TransportOutbox = struct {
         }
 
         for (self.items.items) |item| {
-            if (item.message.msg_type == .snapshot) continue;
+            if (item.accepted) continue;
             const peer_idx = blk: {
                 for (peer_builders.items, 0..) |peer, i| {
                     if (peer.peer_id == item.message.to) break :blk i;
@@ -2074,6 +2892,113 @@ const TransportOutbox = struct {
                 stats.message_sends += group_batch.messages.len;
             }
         }
+        for (self.items.items) |*item| {
+            item.accepted = true;
+        }
+        return stats;
+    }
+
+    fn flushSnapshotsBudgeted(
+        self: *TransportOutbox,
+        alloc: std.mem.Allocator,
+        hooks: RuntimeHooks,
+        max_submissions: usize,
+        max_scans: usize,
+        now_ns: u64,
+        synchronous_completions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion),
+        accepted_submissions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotAttemptKey),
+    ) !TransportFlushStats {
+        var stats: TransportFlushStats = .{};
+        if (self.snapshot_items.items.len == 0 or max_submissions == 0 or max_scans == 0)
+            return stats;
+        const transport = hooks.snapshot_transport orelse return stats;
+        try synchronous_completions.ensureUnusedCapacity(
+            alloc,
+            @min(max_submissions, self.snapshot_items.items.len),
+        );
+        try accepted_submissions.ensureUnusedCapacity(
+            alloc,
+            @min(max_submissions, self.snapshot_items.items.len),
+        );
+
+        var submissions: usize = 0;
+        var scans: usize = 0;
+        // Visit each entry at most once per runtime turn. In particular, a
+        // zero retry hint means "retry on the next capacity wake-up", not a
+        // hot loop that can immediately resubmit the same snapshot.
+        const scan_budget = @min(max_scans, self.snapshot_items.items.len);
+        while (self.snapshot_items.items.len > 0 and
+            submissions < max_submissions and scans < scan_budget)
+        {
+            if (self.snapshot_cursor >= self.snapshot_items.items.len)
+                self.snapshot_cursor = 0;
+            const item = &self.snapshot_items.items[self.snapshot_cursor];
+            scans += 1;
+            if (item.retry_not_before_ns > now_ns) {
+                stats.snapshot_backoff_skips += 1;
+                self.snapshot_cursor = (self.snapshot_cursor + 1) % self.snapshot_items.items.len;
+                continue;
+            }
+
+            const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
+            const outcome = try transport.submitSnapshot(.{
+                .group_id = item.group_id,
+                .incarnation = item.incarnation,
+                .from = item.message.from,
+                .to = item.message.to,
+                .term = item.message.term,
+                .attempt_generation = item.message.snapshot_attempt_generation,
+                .snapshot = snapshot,
+            });
+            submissions += 1;
+            switch (outcome) {
+                .delivered, .accepted, .duplicate => {
+                    if (outcome == .delivered) {
+                        synchronous_completions.appendAssumeCapacity(.{
+                            .group_id = item.group_id,
+                            .incarnation = item.incarnation,
+                            .from = item.message.from,
+                            .to = item.message.to,
+                            .term = item.message.term,
+                            .attempt_generation = item.message.snapshot_attempt_generation,
+                            .snapshot_index = snapshot.metadata.index,
+                            .snapshot_term = snapshot.metadata.term,
+                            .status = .delivered,
+                        });
+                    }
+                    if (outcome == .accepted or outcome == .duplicate) {
+                        accepted_submissions.appendAssumeCapacity(.{
+                            .group_id = item.group_id,
+                            .incarnation = item.incarnation,
+                            .from = item.message.from,
+                            .to = item.message.to,
+                            .term = item.message.term,
+                            .attempt_generation = item.message.snapshot_attempt_generation,
+                            .snapshot_index = snapshot.metadata.index,
+                            .snapshot_term = snapshot.metadata.term,
+                        });
+                    }
+                    const item_bytes = approxMessagesSize(&.{item.message});
+                    // Snapshot attempts are independent across groups. Use a
+                    // swap removal so accepting one item remains O(1) even
+                    // with thousands of lagging groups.
+                    var accepted = self.snapshot_items.swapRemove(self.snapshot_cursor);
+                    accepted.message.deinit(alloc);
+                    self.approx_bytes -= item_bytes;
+                    if (outcome != .duplicate) stats.snapshot_sends += 1;
+                    if (self.snapshot_items.items.len == 0)
+                        self.snapshot_cursor = 0
+                    else
+                        self.snapshot_cursor %= self.snapshot_items.items.len;
+                },
+                .retry_later => |retry| {
+                    const delay_ns = retry.retry_after_ms *| std.time.ns_per_ms;
+                    item.retry_not_before_ns = now_ns +| delay_ns;
+                    stats.snapshot_submission_deferrals += 1;
+                    self.snapshot_cursor = (self.snapshot_cursor + 1) % self.snapshot_items.items.len;
+                },
+            }
+        }
         return stats;
     }
 
@@ -2083,15 +3008,35 @@ const TransportOutbox = struct {
         hooks: RuntimeHooks,
         max_messages: usize,
         max_bytes: usize,
+        max_snapshot_submissions: usize,
+        max_snapshot_scans: usize,
+        now_ns: u64,
+        synchronous_completions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion),
+        accepted_submissions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotAttemptKey),
     ) !TransportFlushStats {
-        if (self.items.items.len == 0) return .{};
+        if (self.isEmpty()) return .{};
 
+        var stats: TransportFlushStats = .{};
         const take_count = self.countWithinBudget(max_messages, max_bytes);
-        if (take_count == 0) return .{};
+        if (take_count > 0) {
+            var prefix = try self.takePrefix(alloc, take_count);
+            defer {
+                self.restorePrefix(&prefix);
+                prefix.deinit(alloc);
+            }
+            stats.add(try prefix.flush(alloc, hooks));
+        }
 
-        var prefix = try self.takePrefix(alloc, take_count);
-        defer prefix.deinit(alloc);
-        return try prefix.flush(alloc, hooks);
+        stats.add(try self.flushSnapshotsBudgeted(
+            alloc,
+            hooks,
+            max_snapshot_submissions,
+            max_snapshot_scans,
+            now_ns,
+            synchronous_completions,
+            accepted_submissions,
+        ));
+        return stats;
     }
 
     fn countWithinBudget(self: *const TransportOutbox, max_messages: usize, max_bytes: usize) usize {
@@ -2128,12 +3073,260 @@ const TransportOutbox = struct {
         return out;
     }
 
+    fn restorePrefix(self: *TransportOutbox, prefix: *TransportOutbox) void {
+        if (prefix.items.items.len == 0) return;
+        std.debug.assert(self.items.capacity - self.items.items.len >= prefix.items.items.len);
+        const prefix_len = prefix.items.items.len;
+        const old_len = self.items.items.len;
+        self.items.items.len += prefix_len;
+        std.mem.copyBackwards(
+            OutboundMessage,
+            self.items.items[prefix_len .. prefix_len + old_len],
+            self.items.items[0..old_len],
+        );
+        @memcpy(self.items.items[0..prefix_len], prefix.items.items);
+        self.approx_bytes += prefix.approx_bytes;
+        prefix.items.items.len = 0;
+        prefix.approx_bytes = 0;
+    }
+
+    fn consumeAccepted(self: *TransportOutbox, alloc: std.mem.Allocator) void {
+        var retained: usize = 0;
+        var retained_bytes: usize = 0;
+        for (self.items.items, 0..) |*item, index| {
+            if (item.accepted) {
+                item.message.deinit(alloc);
+                continue;
+            }
+            item.accepted = false;
+            retained_bytes += approxMessagesSize(&.{item.message});
+            if (retained != index) self.items.items[retained] = item.*;
+            retained += 1;
+        }
+        self.items.items.len = retained;
+        self.approx_bytes = retained_bytes;
+    }
+
     fn clear(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
+        for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.clearRetainingCapacity();
+        self.snapshot_items.clearRetainingCapacity();
+        self.snapshot_cursor = 0;
         self.approx_bytes = 0;
     }
 };
+
+test "snapshot submission backpressure cannot starve control traffic and honors retry deadlines" {
+    const Recorder = struct {
+        control_messages: usize = 0,
+        snapshot_submissions: usize = 0,
+        deferrals_remaining: usize = std.math.maxInt(usize),
+        retry_after_ms: u64 = 1_000,
+
+        fn transport(self: *@This()) transport_iface.Transport {
+            return .{ .ptr = self, .vtable = &.{ .send_messages = sendMessages } };
+        }
+
+        fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
+            return .{
+                .ptr = self,
+                .sender = .{ .asynchronous = .{
+                    .submit_snapshot = submitSnapshot,
+                    .drain_completions = drainCompletions,
+                    .cancel_submission = cancelSubmission,
+                } },
+                .vtable = &.{},
+            };
+        }
+
+        fn sendMessages(ptr: *anyopaque, _: core.types.GroupId, messages: []const core.Message) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.control_messages += messages.len;
+        }
+
+        fn submitSnapshot(
+            ptr: *anyopaque,
+            _: snapshot_transport_iface.SnapshotSendRequest,
+        ) !snapshot_transport_iface.AsyncSnapshotSubmitResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_submissions += 1;
+            if (self.deferrals_remaining > 0) {
+                self.deferrals_remaining -= 1;
+                return .{ .retry_later = .{ .retry_after_ms = self.retry_after_ms } };
+            }
+            return .accepted;
+        }
+
+        fn drainCompletions(_: *anyopaque, _: []snapshot_transport_iface.SnapshotCompletion) usize {
+            return 0;
+        }
+
+        fn cancelSubmission(_: *anyopaque, _: snapshot_transport_iface.SnapshotAttemptKey) void {}
+    };
+
+    var recorder: Recorder = .{};
+    var outbox: TransportOutbox = .{};
+    defer outbox.deinit(std.testing.allocator);
+    var synchronous_completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+    defer synchronous_completions.deinit(std.testing.allocator);
+    var accepted_submissions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotAttemptKey).empty;
+    defer accepted_submissions.deinit(std.testing.allocator);
+    for (0..70) |index| {
+        try outbox.appendMessage(std.testing.allocator, @intCast(index + 1), 1, .{
+            .msg_type = .snapshot,
+            .from = 1,
+            .to = @intCast(index + 2),
+            .term = 5,
+            .snapshot_attempt_generation = @intCast(index + 1),
+            .snapshot = .{
+                .metadata = .{ .index = @intCast(index + 10), .term = 4 },
+                .data = @constCast("x"),
+            },
+        });
+    }
+    // This message was appended after a backlog larger than the production
+    // control quantum. It must still use the independent control lane now.
+    try outbox.appendMessage(std.testing.allocator, 999, 1, .{
+        .msg_type = .heartbeat,
+        .from = 1,
+        .to = 2,
+        .term = 5,
+    });
+    const first = try outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .transport = recorder.transport(), .snapshot_transport = recorder.snapshotTransport() },
+        64,
+        512 * 1024,
+        2,
+        32,
+        1_000,
+        &synchronous_completions,
+        &accepted_submissions,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.control_messages);
+    try std.testing.expectEqual(@as(usize, 2), recorder.snapshot_submissions);
+    try std.testing.expectEqual(@as(usize, 1), first.message_sends);
+    try std.testing.expectEqual(@as(usize, 2), first.snapshot_submission_deferrals);
+    try std.testing.expectEqual(@as(usize, 0), outbox.controlLen());
+    try std.testing.expectEqual(@as(usize, 70), outbox.snapshotLen());
+
+    // A one-item lane proves the hint is an eligibility deadline rather than
+    // a spin-loop suggestion.
+    var deadline_recorder: Recorder = .{ .deferrals_remaining = 1 };
+    var deadline_outbox: TransportOutbox = .{};
+    defer deadline_outbox.deinit(std.testing.allocator);
+    try deadline_outbox.appendMessage(std.testing.allocator, 7, 1, .{
+        .msg_type = .snapshot,
+        .from = 1,
+        .to = 2,
+        .term = 5,
+        .snapshot_attempt_generation = 1,
+        .snapshot = .{ .metadata = .{ .index = 10, .term = 4 }, .data = @constCast("x") },
+    });
+    _ = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000,
+        &synchronous_completions,
+        &accepted_submissions,
+    );
+    const early = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000 + 999 * std.time.ns_per_ms,
+        &synchronous_completions,
+        &accepted_submissions,
+    );
+    try std.testing.expectEqual(@as(usize, 1), deadline_recorder.snapshot_submissions);
+    try std.testing.expectEqual(@as(usize, 1), early.snapshot_backoff_skips);
+    _ = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000 + std.time.ns_per_s,
+        &synchronous_completions,
+        &accepted_submissions,
+    );
+    try std.testing.expectEqual(@as(usize, 2), deadline_recorder.snapshot_submissions);
+    try std.testing.expect(deadline_outbox.isEmpty());
+}
+
+test "synchronous snapshot submission emits an exact delivery completion" {
+    const Recorder = struct {
+        sends: usize = 0,
+
+        fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
+            return .{
+                .ptr = self,
+                .sender = .{ .synchronous = sendSnapshot },
+                .vtable = &.{},
+            };
+        }
+
+        fn sendSnapshot(
+            ptr: *anyopaque,
+            _: snapshot_transport_iface.SnapshotSendRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sends += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var outbox = TransportOutbox{};
+    defer outbox.deinit(std.testing.allocator);
+    try outbox.appendMessage(std.testing.allocator, 41, 9, .{
+        .msg_type = .snapshot,
+        .from = 1,
+        .to = 2,
+        .term = 7,
+        .snapshot_attempt_generation = 13,
+        .snapshot = .{
+            .metadata = .{ .index = 101, .term = 6 },
+            .data = @constCast("snapshot"),
+        },
+    });
+    var completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+    defer completions.deinit(std.testing.allocator);
+    var accepted_submissions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotAttemptKey).empty;
+    defer accepted_submissions.deinit(std.testing.allocator);
+
+    const stats = try outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        0,
+        &completions,
+        &accepted_submissions,
+    );
+
+    try std.testing.expect(outbox.isEmpty());
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends);
+    try std.testing.expectEqual(@as(usize, 1), stats.snapshot_sends);
+    try std.testing.expectEqual(@as(usize, 1), completions.items.len);
+    const completion = completions.items[0];
+    try std.testing.expectEqual(@as(core.types.GroupId, 41), completion.group_id);
+    try std.testing.expectEqual(@as(u64, 9), completion.incarnation);
+    try std.testing.expectEqual(@as(core.types.Term, 7), completion.term);
+    try std.testing.expectEqual(@as(u64, 13), completion.attempt_generation);
+    try std.testing.expectEqual(@as(core.types.Index, 101), completion.snapshot_index);
+    try std.testing.expectEqual(snapshot_transport_iface.SnapshotCompletionStatus.delivered, completion.status);
+}
 
 test "multi raft owns real groups" {
     var runtime = MultiRaft.init(std.testing.allocator, .{}, .{});

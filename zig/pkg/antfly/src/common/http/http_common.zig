@@ -244,6 +244,10 @@ pub const RequestExecutor = struct {
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
+        /// True only when independent calls may run concurrently. Executors
+        /// that omit this capability retain the conservative serialized
+        /// contract used by test doubles and foreign callback boundaries.
+        supports_concurrent_requests: ?*const fn (ptr: *const anyopaque) bool = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -255,6 +259,11 @@ pub const RequestExecutor = struct {
         // that does not implement tracking therefore remains safely unknown.
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
         return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
+    }
+
+    pub fn supportsConcurrentRequests(self: RequestExecutor) bool {
+        const supports = self.vtable.supports_concurrent_requests orelse return false;
+        return supports(self.ptr);
     }
 };
 

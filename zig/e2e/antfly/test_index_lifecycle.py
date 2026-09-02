@@ -24,7 +24,8 @@ from urllib.parse import quote
 
 import pytest
 import requests
-from conftest import ready_index_status
+
+from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -214,6 +215,7 @@ def test_ready_index_status_uses_current_milestones_and_v020_fallback():
                 "state": "queryable_partial",
                 "queryable": True,
                 "complete": False,
+                "pending_reasons": ["coverage"],
             },
             "milestones": {
                 "queryable": {"reached": True, "blockers": []},
@@ -265,10 +267,62 @@ def test_ready_index_status_uses_current_milestones_and_v020_fallback():
         is complete_status["status"]
     )
 
+    canonical_without_receipt = json.loads(json.dumps(complete_status))
+    assert (
+        ready_index_status(canonical_without_receipt, until="complete")
+        is canonical_without_receipt["status"]
+    )
+
+    canonical_with_receipt = json.loads(json.dumps(complete_status))
+    canonical_with_receipt["status"]["readiness"].update(
+        incarnation="g-0000000000000001",
+        published_revision=12,
+        target_revision=12,
+        pending_reasons=[],
+    )
+    assert (
+        ready_index_status(canonical_with_receipt, until="complete")
+        is canonical_with_receipt["status"]
+    )
+
+    stale_receipt = json.loads(json.dumps(canonical_with_receipt))
+    stale_receipt["status"]["readiness"]["published_revision"] = 11
+    assert ready_index_status(stale_receipt, until="complete") is None
+
+    for malformed in (None, "ready", [], True):
+        invalid = json.loads(json.dumps(complete_status))
+        invalid["status"]["readiness"] = malformed
+        with pytest.raises(IndexReadinessProtocolError, match="status.readiness"):
+            ready_index_status(invalid, until="complete")
+
+    for field, value in (
+        ("state", "future_state"),
+        ("queryable", 1),
+        ("complete", None),
+        ("pending_reasons", "none"),
+        ("published_revision", True),
+        ("target_revision", "12"),
+    ):
+        invalid = json.loads(json.dumps(canonical_with_receipt))
+        invalid["status"]["readiness"][field] = value
+        with pytest.raises(IndexReadinessProtocolError, match=field):
+            ready_index_status(invalid, until="complete")
+
+    for missing_field in ("published_revision", "target_revision"):
+        invalid = json.loads(json.dumps(canonical_with_receipt))
+        invalid["status"]["readiness"].pop(missing_field)
+        with pytest.raises(IndexReadinessProtocolError, match="provided together"):
+            ready_index_status(invalid, until="complete")
+
     legacy_ready = json.loads(json.dumps(complete_status))
     del legacy_ready["status"]["milestones"]
     assert ready_index_status(legacy_ready, until="complete") is legacy_ready["status"]
     assert ready_index_status(legacy_ready, until="queryable") is legacy_ready["status"]
+    v020_ready = json.loads(json.dumps(legacy_ready))
+    del v020_ready["status"]["readiness"]
+    v020_ready["status"]["backfill_state"] = "ready"
+    assert ready_index_status(v020_ready, until="complete") is v020_ready["status"]
+    assert ready_index_status(v020_ready, until="queryable") is v020_ready["status"]
     legacy_not_queryable = json.loads(json.dumps(legacy_ready))
     legacy_not_queryable["status"]["readiness"]["queryable"] = False
     assert ready_index_status(legacy_not_queryable, until="queryable") is None
@@ -293,6 +347,9 @@ def test_ready_index_status_uses_current_milestones_and_v020_fallback():
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
+        ("backfill_state", "failed"),
+        ("backfill_state", "running"),
+        ("backfill_state", "retrying"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),

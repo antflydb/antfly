@@ -53,9 +53,102 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         lhs.min_ranges == rhs.min_ranges;
 }
 
+pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .little);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-table-definition-v1");
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, table.table_id, .little);
+    hasher.update(&encoded);
+    hashTableDefinitionPart(&hasher, table.name);
+    hashTableDefinitionPart(&hasher, table.description);
+    hashTableDefinitionPart(&hasher, table.schema_json);
+    hashTableDefinitionPart(&hasher, table.read_schema_json);
+    hashTableDefinitionPart(&hasher, table.indexes_json);
+    hashTableDefinitionPart(&hasher, table.replication_sources_json);
+    hashTableDefinitionPart(&hasher, table.placement_role);
+    hashTableDefinitionPart(&hasher, table.restore_backup_id);
+    hashTableDefinitionPart(&hasher, table.restore_location);
+    std.mem.writeInt(u32, encoded[0..4], table.desired_replica_count, .little);
+    hasher.update(encoded[0..4]);
+    std.mem.writeInt(u32, encoded[0..4], table.min_ranges, .little);
+    hasher.update(encoded[0..4]);
+    var fingerprint: TableDefinitionFingerprint = undefined;
+    hasher.final(&fingerprint);
+    return fingerprint;
+}
+
 pub const TableMigrationState = topology_records.TableMigrationState;
 pub const TableIndexCatalog = topology_records.TableIndexCatalog;
 pub const RangeRecord = topology_records.RangeRecord;
+
+/// Canonical ordering for every complete table keyspace projection. Keeping
+/// this in the metadata domain lets backup admission, restore planning, and
+/// Raft apply enforce exactly the same bytewise routing contract.
+pub fn sortKeyspaceRanges(comptime Range: type, ranges: []Range) void {
+    std.mem.sort(Range, ranges, {}, struct {
+        fn lessThan(_: void, lhs: Range, rhs: Range) bool {
+            return std.mem.order(u8, lhs.start_key, rhs.start_key) == .lt;
+        }
+    }.lessThan);
+}
+
+/// Validate a sorted, gap-free, non-overlapping partition of the complete
+/// byte-string keyspace. The empty start and open final end are routing
+/// sentinels, not optional decoration: omitting either would publish a table
+/// for which some document keys have no owner.
+pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
+    if (ranges.len == 0 or ranges[0].start_key.len != 0 or
+        ranges[ranges.len - 1].end_key != null)
+        return error.InvalidRangeTopology;
+
+    for (ranges, 0..) |range, index| {
+        if (range.end_key) |end_key| {
+            if (end_key.len == 0 or std.mem.order(u8, range.start_key, end_key) != .lt)
+                return error.InvalidRangeTopology;
+        } else if (index != ranges.len - 1) {
+            return error.InvalidRangeTopology;
+        }
+        if (index > 0) {
+            const previous_end = ranges[index - 1].end_key orelse
+                return error.InvalidRangeTopology;
+            if (!std.mem.eql(u8, previous_end, range.start_key))
+                return error.InvalidRangeTopology;
+        }
+    }
+}
+
+test "complete keyspace range validation requires both routing sentinels" {
+    const complete = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "m" },
+        .{ .group_id = 7002, .table_id = 1, .start_key = "m", .end_key = null },
+    };
+    try validateCompleteKeyspaceRanges(&complete);
+
+    const missing_leading = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "a", .end_key = null },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_leading),
+    );
+
+    const missing_trailing = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "z" },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_trailing),
+    );
+}
 
 pub const RestoreCompletionFingerprint = topology_records.RestoreCompletionFingerprint;
 pub const empty_restore_completion_fingerprint =
@@ -262,30 +355,53 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         );
 }
 
-/// Returns true when an existing topology is either the exact requested
-/// restore intent or a prefix left by an interrupted multi-record publish.
-pub fn restoreIntentTopologyCompatible(
-    alloc: std.mem.Allocator,
-    existing_table: TableRecord,
-    existing_ranges: []const RangeRecord,
-    expected_table: TableRecord,
-    expected_ranges: []const RangeRecord,
-) !bool {
-    if (!tableDefinitionsEqual(existing_table, expected_table)) return false;
+/// Restore publication is monotonic: immediately after the catalog publishes
+/// an active restore intent, a data node may complete it and clear the
+/// transient restore fields. Admission retries and post-commit verification
+/// must therefore accept either the exact published record or that one valid
+/// successor state. All topology and document-identity fields remain exact,
+/// and the completion fingerprint proves which restore cleared the intent.
+pub fn rangeMatchesRestorePublication(
+    projected: RangeRecord,
+    expected: RangeRecord,
+) bool {
+    if (rangeRecordsEqual(projected, expected)) return true;
 
-    var expected_by_group: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty;
-    defer expected_by_group.deinit(alloc);
-    try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
-    for (expected_ranges) |expected_range| {
-        if (expected_by_group.contains(expected_range.group_id)) return false;
-        expected_by_group.putAssumeCapacity(expected_range.group_id, expected_range);
+    if (expected.restore_backup_id.len == 0 or
+        expected.restore_artifact_backup_id.len == 0 or
+        expected.restore_location.len == 0)
+    {
+        return false;
     }
-    for (existing_ranges) |existing_range| {
-        if (existing_range.table_id != existing_table.table_id) continue;
-        const expected_range = expected_by_group.get(existing_range.group_id) orelse return false;
-        if (!rangeRecordsEqual(existing_range, expected_range)) return false;
+    if (projected.restore_backup_id.len != 0 or
+        projected.restore_artifact_backup_id.len != 0 or
+        projected.restore_location.len != 0 or
+        projected.restore_snapshot_path.len != 0 or
+        projected.restore_connection.len != 0 or
+        projected.restore_artifact_size_bytes != 0 or
+        projected.restore_artifact_sha256.len != 0 or
+        projected.restore_native_manifest_size_bytes != 0 or
+        projected.restore_native_manifest_sha256.len != 0)
+    {
+        return false;
     }
-    return true;
+
+    return projected.group_id == expected.group_id and
+        projected.range_id == expected.range_id and
+        projected.table_id == expected.table_id and
+        std.mem.eql(u8, projected.start_key, expected.start_key) and
+        ((projected.end_key == null and expected.end_key == null) or
+            (projected.end_key != null and expected.end_key != null and
+                std.mem.eql(u8, projected.end_key.?, expected.end_key.?))) and
+        projected.doc_identity_shard_id == expected.doc_identity_shard_id and
+        projected.doc_identity_range_id == expected.doc_identity_range_id and
+        projected.split_attempt_epoch == expected.split_attempt_epoch and
+        rangeRestoreCompletionMatches(
+            projected,
+            expected.restore_backup_id,
+            expected.restore_artifact_backup_id,
+            expected.restore_location,
+        );
 }
 
 pub const node_lifecycle_active = "active";
@@ -1068,6 +1184,28 @@ pub const RestoreProgressRecord = struct {
     phase: []const u8 = "",
     last_error: []const u8 = "",
     updated_at_ms: u64 = 0,
+};
+
+/// Stable key for one node's durable restore-repair observation. Keeping the
+/// delete contract separate from the full record prevents stale callers from
+/// accidentally re-publishing artifact state while cleaning up completed
+/// restore intents.
+pub const RestoreProgressIdentity = struct {
+    table_id: u64,
+    node_id: u64,
+    group_id: u64,
+};
+
+/// Keep one reconciliation page comfortably below both the metadata request
+/// and Raft proposal byte ceilings while amortizing network and consensus
+/// overhead across a useful amount of work. The byte limit remains the final
+/// authority because diagnostic strings and storage paths are variable-sized.
+pub const max_restore_progress_sync_records: usize = 128;
+pub const max_restore_progress_sync_body_bytes: usize = 1024 * 1024;
+
+pub const RestoreProgressSync = struct {
+    upserts: []const RestoreProgressRecord = &.{},
+    removals: []const RestoreProgressIdentity = &.{},
 };
 
 pub const ReplicationSourceStatusRecord = struct {

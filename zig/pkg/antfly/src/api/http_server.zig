@@ -47,11 +47,13 @@ const internal_service_auth = @import("internal_service_auth.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
+const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const schema_mod = @import("../schema/mod.zig");
@@ -120,6 +122,8 @@ const json_helpers = @import("json_helpers.zig");
 const eval_openapi = @import("antfly_eval_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
 const metadata_service = @import("../metadata/service.zig");
+const metadata_table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
+const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
@@ -490,6 +494,7 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 const max_concurrent_restore_jobs: usize = 2;
 const max_pending_backup_maintenance_targets: usize = 128;
+const max_pending_table_reclaims_per_target: usize = 128;
 /// Retain a repository long enough for a crashed attempt to become eligible
 /// and receive many bounded cleanup passes, while ensuring the fixed-size
 /// registry cannot be exhausted forever by repositories that are no longer
@@ -524,11 +529,29 @@ fn trimBackupMaintenanceLocationTrailingSlash(value: []const u8) []const u8 {
     return value[0..end];
 }
 
-const ClusterBackupMaintenanceTarget = struct {
+fn tableBackupReclaimRetryAtUnixNs(
+    eligible_at_unix_ns: ?u64,
+    now_unix_ns: u64,
+) u64 {
+    if (eligible_at_unix_ns) |eligible_at| {
+        if (eligible_at > now_unix_ns) return eligible_at;
+    }
+    return now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+}
+
+const BackupRepositoryMaintenanceTarget = struct {
+    const TableReclaim = struct {
+        backup_id: []u8,
+        not_before_unix_ns: u64,
+    };
+
     location_uri: []u8,
     connection: []u8,
+    table_reclaims: std.ArrayListUnmanaged(TableReclaim) = .empty,
+    cluster_maintenance_requested: bool = false,
     next_run_monotonic_ns: u64 = 0,
     last_scheduled_monotonic_ns: u64,
+    last_progress_monotonic_ns: u64,
 
     fn create(
         alloc: std.mem.Allocator,
@@ -545,11 +568,14 @@ const ClusterBackupMaintenanceTarget = struct {
             .location_uri = owned_location,
             .connection = owned_connection,
             .last_scheduled_monotonic_ns = now_monotonic_ns,
+            .last_progress_monotonic_ns = now_monotonic_ns,
         };
         return target;
     }
 
     fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.table_reclaims.items) |reclaim| alloc.free(reclaim.backup_id);
+        self.table_reclaims.deinit(alloc);
         alloc.free(self.connection);
         alloc.free(self.location_uri);
         alloc.destroy(self);
@@ -569,15 +595,76 @@ const ClusterBackupMaintenanceTarget = struct {
             trimBackupMaintenanceLocationTrailingSlash(location_uri),
         ) and std.mem.eql(u8, self.connection, connection);
     }
+
+    fn enqueueTableReclaim(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        backup_id: []const u8,
+        not_before_unix_ns: u64,
+    ) !void {
+        for (self.table_reclaims.items) |*reclaim| {
+            if (!std.mem.eql(u8, reclaim.backup_id, backup_id)) continue;
+            reclaim.not_before_unix_ns = @min(
+                reclaim.not_before_unix_ns,
+                not_before_unix_ns,
+            );
+            return;
+        }
+        if (self.table_reclaims.items.len >= max_pending_table_reclaims_per_target)
+            return error.BackupMaintenanceQueueFull;
+        const owned_backup_id = try alloc.dupe(u8, backup_id);
+        errdefer alloc.free(owned_backup_id);
+        try self.table_reclaims.append(alloc, .{
+            .backup_id = owned_backup_id,
+            .not_before_unix_ns = not_before_unix_ns,
+        });
+    }
+
+    fn nextDueTableReclaim(self: *const @This(), now_unix_ns: u64) ?[]const u8 {
+        for (self.table_reclaims.items) |reclaim| {
+            if (reclaim.not_before_unix_ns <= now_unix_ns)
+                return reclaim.backup_id;
+        }
+        return null;
+    }
+
+    fn finishTableReclaim(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        backup_id: []const u8,
+        retry_at_unix_ns: ?u64,
+    ) void {
+        for (self.table_reclaims.items, 0..) |*reclaim, index| {
+            if (!std.mem.eql(u8, reclaim.backup_id, backup_id)) continue;
+            if (retry_at_unix_ns) |retry_at| {
+                reclaim.not_before_unix_ns = retry_at;
+            } else {
+                const removed = self.table_reclaims.swapRemove(index);
+                alloc.free(removed.backup_id);
+            }
+            return;
+        }
+    }
+
+    fn noteProgress(self: *@This(), now_monotonic_ns: u64) void {
+        self.last_progress_monotonic_ns = now_monotonic_ns;
+    }
+
+    fn lastActivityMonotonicNs(self: *const @This()) u64 {
+        return @max(
+            self.last_scheduled_monotonic_ns,
+            self.last_progress_monotonic_ns,
+        );
+    }
 };
 
 /// Bounded FIFO of distinct backup repositories. The queue owns every target
 /// from admission through worker completion. A head index avoids shifting the
 /// tail on every dequeue while retaining strict FIFO fairness.
-const ClusterBackupMaintenanceQueue = struct {
-    pending: std.ArrayListUnmanaged(*ClusterBackupMaintenanceTarget) = .empty,
+const BackupRepositoryMaintenanceQueue = struct {
+    pending: std.ArrayListUnmanaged(*BackupRepositoryMaintenanceTarget) = .empty,
     pending_head: usize = 0,
-    active: ?*ClusterBackupMaintenanceTarget = null,
+    active: ?*BackupRepositoryMaintenanceTarget = null,
 
     fn pendingCount(self: *const @This()) usize {
         return self.pending.items.len - self.pending_head;
@@ -591,7 +678,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self: *@This(),
         location_uri: []const u8,
         connection: []const u8,
-    ) ?*ClusterBackupMaintenanceTarget {
+    ) ?*BackupRepositoryMaintenanceTarget {
         if (self.active) |target| {
             if (target.matches(location_uri, connection)) return target;
         }
@@ -613,7 +700,7 @@ const ClusterBackupMaintenanceQueue = struct {
         }
         var destination = destination_start;
         for (self.pending.items[self.pending_head..]) |target| {
-            if (now_monotonic_ns -| target.last_scheduled_monotonic_ns >=
+            if (now_monotonic_ns -| target.lastActivityMonotonicNs() >=
                 backup_maintenance_target_retention_ns)
             {
                 target.destroy(alloc);
@@ -641,7 +728,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pruneExpired(alloc, now_monotonic_ns);
         if (self.targetCount() >= max_pending_backup_maintenance_targets)
             return error.BackupMaintenanceQueueFull;
-        const target = try ClusterBackupMaintenanceTarget.create(
+        const target = try BackupRepositoryMaintenanceTarget.create(
             alloc,
             location_uri,
             connection,
@@ -652,7 +739,7 @@ const ClusterBackupMaintenanceQueue = struct {
         return true;
     }
 
-    fn activateNext(self: *@This()) ?*ClusterBackupMaintenanceTarget {
+    fn activateNext(self: *@This()) ?*BackupRepositoryMaintenanceTarget {
         if (self.active != null or self.pendingCount() == 0) return null;
         const target = self.pending.items[self.pending_head];
         self.pending_head += 1;
@@ -660,7 +747,7 @@ const ClusterBackupMaintenanceQueue = struct {
         return target;
     }
 
-    fn requeueActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn requeueActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         std.debug.assert(self.pending_head > 0);
         self.active = null;
@@ -668,7 +755,7 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pending.items[self.pending_head] = target;
     }
 
-    fn completeActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn completeActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         self.active = null;
     }
@@ -676,12 +763,12 @@ const ClusterBackupMaintenanceQueue = struct {
     /// Rotate the completed target behind every repository currently waiting.
     /// The active slot already supplies enough storage, so steady-state
     /// maintenance performs no allocation.
-    fn rotateActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+    fn rotateActive(self: *@This(), target: *BackupRepositoryMaintenanceTarget) void {
         std.debug.assert(self.active == target);
         std.debug.assert(self.pending_head > 0);
         const live = self.pending.items[self.pending_head..];
         std.mem.copyForwards(
-            *ClusterBackupMaintenanceTarget,
+            *BackupRepositoryMaintenanceTarget,
             self.pending.items[0..live.len],
             live,
         );
@@ -689,6 +776,20 @@ const ClusterBackupMaintenanceQueue = struct {
         self.pending.items.len = live.len + 1;
         self.pending_head = 0;
         self.active = null;
+    }
+
+    /// Roll back the most recent enqueue while the scheduler mutex is held.
+    /// New targets are appended and cannot become active until submission, so
+    /// task-admission failure can release the otherwise empty queue slot in O(1).
+    fn discardNewestPending(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        target: *BackupRepositoryMaintenanceTarget,
+    ) void {
+        std.debug.assert(self.pending.items.len > self.pending_head);
+        std.debug.assert(self.pending.items[self.pending.items.len - 1] == target);
+        self.pending.items.len -= 1;
+        target.destroy(alloc);
     }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -711,7 +812,7 @@ test "restore repository contention backoff is bounded and increasing" {
 
 test "cluster backup maintenance queue retains distinct locations with bounded deduplication" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
 
     try std.testing.expect(try queue.enqueue(
@@ -761,9 +862,54 @@ test "cluster backup maintenance queue retains distinct locations with bounded d
     try std.testing.expectEqual(@as(usize, 0), queue.pendingCount());
 }
 
+test "backup maintenance target coalesces exact table reclaim intent" {
+    const alloc = std.testing.allocator;
+    const target = try BackupRepositoryMaintenanceTarget.create(
+        alloc,
+        "s3://bucket/backups",
+        "external",
+        1,
+    );
+    defer target.destroy(alloc);
+
+    try target.enqueueTableReclaim(alloc, "docs", 100);
+    try target.enqueueTableReclaim(alloc, "docs", 80);
+    try target.enqueueTableReclaim(alloc, "events", 120);
+    target.noteProgress(50);
+    try std.testing.expectEqual(@as(u64, 50), target.lastActivityMonotonicNs());
+    try std.testing.expectEqual(@as(usize, 2), target.table_reclaims.items.len);
+    try std.testing.expect(target.nextDueTableReclaim(79) == null);
+    try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(80).?);
+
+    target.finishTableReclaim(alloc, "docs", 140);
+    try std.testing.expect(target.nextDueTableReclaim(120) != null);
+    try std.testing.expectEqualStrings("events", target.nextDueTableReclaim(120).?);
+    target.finishTableReclaim(alloc, "events", null);
+    try std.testing.expect(target.nextDueTableReclaim(139) == null);
+    try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(140).?);
+    target.finishTableReclaim(alloc, "docs", null);
+    try std.testing.expectEqual(@as(usize, 0), target.table_reclaims.items.len);
+}
+
+test "table backup reclaim retry uses exact future eligibility" {
+    const now_unix_ns: u64 = 100;
+    try std.testing.expectEqual(
+        @as(u64, 101),
+        tableBackupReclaimRetryAtUnixNs(101, now_unix_ns),
+    );
+    try std.testing.expectEqual(
+        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+        tableBackupReclaimRetryAtUnixNs(now_unix_ns, now_unix_ns),
+    );
+    try std.testing.expectEqual(
+        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+        tableBackupReclaimRetryAtUnixNs(null, now_unix_ns),
+    );
+}
+
 test "cluster backup maintenance queue rotates repositories without allocation" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
     _ = try queue.enqueue(alloc, "file:///a", "local", 1);
     _ = try queue.enqueue(alloc, "file:///b", "local", 2);
@@ -781,7 +927,7 @@ test "cluster backup maintenance queue rotates repositories without allocation" 
 
 test "cluster backup maintenance queue expires inactive repositories" {
     const alloc = std.testing.allocator;
-    var queue: ClusterBackupMaintenanceQueue = .{};
+    var queue: BackupRepositoryMaintenanceQueue = .{};
     defer queue.deinit(alloc);
     _ = try queue.enqueue(alloc, "file:///old", "local", 1);
     _ = try queue.enqueue(
@@ -860,6 +1006,9 @@ pub const ApiHttpServerConfig = struct {
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// Node-local inference request admission capacity. Zero is unlimited.
     inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// End-to-end ceiling for one table or cluster backup. This is distinct
+    /// from the longer durable writer fence used for safe cleanup.
+    backup_operation_timeout_ms: u64 = common_config.default_backup_operation_timeout_ms,
     /// Per-request graph execution ceilings owned by the operator. These are
     /// never populated from the public graph-query DSL.
     graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
@@ -893,6 +1042,9 @@ pub const ApiHttpServerConfig = struct {
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
+    /// Node-local Raft quarantine diagnostics and fenced recovery. The source
+    /// owns runtime serialization; handlers never access a Raft host directly.
+    raft_quarantine_admin: ?RaftQuarantineAdminSource = null,
     /// Dedicated bearer token for /admin/v1 operations when public API
     /// authentication is disabled. Admin routes fail closed when neither this
     /// token nor normal authenticated admin identity is available.
@@ -957,6 +1109,34 @@ pub const ApiHttpServerConfig = struct {
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+};
+
+pub const RaftQuarantineAdminSource = struct {
+    ptr: *anyopaque,
+    list_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) anyerror![]raft_host.GroupQuarantineStatus,
+    resume_fn: *const fn (
+        ptr: *anyopaque,
+        group_id: u64,
+        options: raft_host.ResumeQuarantineOptions,
+    ) anyerror!void,
+
+    pub fn list(
+        self: RaftQuarantineAdminSource,
+        alloc: std.mem.Allocator,
+    ) ![]raft_host.GroupQuarantineStatus {
+        return try self.list_fn(self.ptr, alloc);
+    }
+
+    pub fn resumeGroup(
+        self: RaftQuarantineAdminSource,
+        group_id: u64,
+        options: raft_host.ResumeQuarantineOptions,
+    ) !void {
+        try self.resume_fn(self.ptr, group_id, options);
+    }
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -1086,6 +1266,7 @@ pub const StatusSource = struct {
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_table_exact: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -1171,6 +1352,7 @@ pub const StatusSource = struct {
     }
 
     pub fn createTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+        try tables_api.validateTableMutationName(table_name);
         const fn_ptr = self.vtable.create_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("create_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
@@ -1195,8 +1377,21 @@ pub const StatusSource = struct {
     }
 
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
+        try tables_api.validateTableMutationName(table_name);
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+    }
+
+    /// Drops metadata and returns the exact group set fenced by the committed
+    /// mutation when the backend supports it. The empty legacy result is safe:
+    /// callers must never reconstruct destructive cleanup targets from a stale
+    /// snapshot after this point.
+    pub fn dropTableExact(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
+        try tables_api.validateTableMutationName(table_name);
+        if (self.vtable.drop_table_exact) |fn_ptr|
+            return try BoundaryAbi.call("drop_table_exact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+        try self.dropTable(alloc, table_name);
+        return .{ .table_id = 0, .expected_transition_generation = 0, .group_ids = try alloc.alloc(u64, 0) };
     }
 
     /// Returns the generation committed by an authoritative backend when the
@@ -1347,7 +1542,7 @@ pub const StatusSource = struct {
             }
 
             fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
-                return try createTableOnService(cast(ptr), alloc, table_name, req);
+                return try metadata_table_topology_mutations.create(cast(ptr), alloc, .{}, table_name, req);
             }
 
             fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void {
@@ -1367,7 +1562,12 @@ pub const StatusSource = struct {
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
-                return try dropTableOnService(cast(ptr), alloc, table_name);
+                var result = try @This().dropTableExact(ptr, alloc, table_name);
+                defer result.deinit(alloc);
+            }
+
+            fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
+                return try metadata_table_topology_mutations.drop(cast(ptr), alloc, .{}, table_name);
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -1472,6 +1672,7 @@ pub const StatusSource = struct {
             .replace_table_definition = Gen.replaceTableDefinition,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
+            .drop_table_exact = Gen.dropTableExact,
             .update_schema = Gen.updateSchema,
             .update_schema_versioned = Gen.updateSchemaVersioned,
             .create_index = Gen.createIndex,
@@ -1494,10 +1695,173 @@ pub const StatusSource = struct {
         };
     }
 
+    /// The HTTP-backed metadata source runs behind a load-balanced public
+    /// Service, so table create/drop may arrive on a follower. Route those two
+    /// mutations to the current metadata Raft leader instead of failing
+    /// locally; every other operation keeps the generated local vtable.
+    fn makeHttpServiceVTable() VTable {
+        var vtable = makeServiceVTable(metadata_service.MetadataHttpService);
+        vtable.create_table = HttpRoutedTableMutations.createTable;
+        vtable.drop_table = HttpRoutedTableMutations.dropTable;
+        vtable.drop_table_exact = HttpRoutedTableMutations.dropTableExact;
+        return vtable;
+    }
+
+    const HttpRoutedTableMutations = struct {
+        fn cast(ptr: *anyopaque) *metadata_service.MetadataHttpService {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
+            const svc = cast(ptr);
+            var prepared = try PreparedCreate.init(alloc, table_name, req);
+            defer prepared.deinit(alloc);
+            const deadline_ns = platform_time.monotonicNs() +|
+                @as(u64, raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+            const ops: CreateOps = .{
+                .svc = svc,
+                .alloc = alloc,
+                .request = .{ .deadline_ns = deadline_ns },
+                .table_name = table_name,
+                .req = prepared.req,
+                .body = prepared.body,
+            };
+            try runRoutedTableMutation(svc, ops);
+        }
+
+        fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            var result = try HttpRoutedTableMutations.dropTableExact(ptr, alloc, table_name);
+            defer result.deinit(alloc);
+        }
+
+        fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
+            const svc = cast(ptr);
+            const deadline_ns = platform_time.monotonicNs() +|
+                @as(u64, raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+            var result: ?metadata_table_topology_mutations.DropResult = null;
+            const ops: DropOps = .{
+                .svc = svc,
+                .alloc = alloc,
+                .request = .{ .deadline_ns = deadline_ns },
+                .table_name = table_name,
+                .result = &result,
+            };
+            try runRoutedTableMutation(svc, ops);
+            return result orelse error.MetadataMutationOutcomeUnknown;
+        }
+
+        const PreparedCreate = struct {
+            req: tables_api.CreateTableRequest,
+            expanded_indexes_json: []u8,
+            body: []u8,
+
+            fn init(
+                alloc: std.mem.Allocator,
+                table_name: []const u8,
+                input: tables_api.CreateTableRequest,
+            ) !PreparedCreate {
+                var req = input;
+                const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
+                    alloc,
+                    table_name,
+                    input.indexes_json orelse tables_api.default_indexes_json,
+                    tables_api.effectiveSchemaJson(input.schema_json),
+                );
+                errdefer alloc.free(expanded_indexes_json);
+                req.indexes_json = expanded_indexes_json;
+                const body = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, req);
+                errdefer alloc.free(body);
+                try tables_api.validateTableCreateBodySize(body.len);
+                return .{
+                    .req = req,
+                    .expanded_indexes_json = expanded_indexes_json,
+                    .body = body,
+                };
+            }
+
+            fn deinit(self: *PreparedCreate, alloc: std.mem.Allocator) void {
+                alloc.free(self.expanded_indexes_json);
+                alloc.free(self.body);
+                self.* = undefined;
+            }
+        };
+
+        const CreateOps = struct {
+            svc: *metadata_service.MetadataHttpService,
+            alloc: std.mem.Allocator,
+            request: api_operation.RequestContext,
+            table_name: []const u8,
+            req: tables_api.CreateTableRequest,
+            body: []const u8,
+
+            pub fn local(self: @This()) anyerror!void {
+                try metadata_table_topology_mutations.create(
+                    self.svc,
+                    self.alloc,
+                    self.request,
+                    self.table_name,
+                    self.req,
+                );
+            }
+
+            pub fn forward(
+                self: @This(),
+                peer: metadata_service.ReallocationProtocolPeer,
+                forwarding: raft_mutation_forwarding.Context,
+            ) anyerror!void {
+                // Route resolution proves this is present; fail closed to a
+                // pre-admission authority error rather than panic if a future
+                // caller constructs `.forward` without the guarantee.
+                const orchestration_url = peer.orchestration_url orelse return error.NotLeader;
+                std.log.info("forwarding table create to metadata leader table={s} leader={d}", .{ self.table_name, peer.node_id });
+                var client = self.svc.tableMutationForwardClient();
+                try client.forwardTableMutation(
+                    orchestration_url,
+                    .create_table,
+                    self.table_name,
+                    self.body,
+                    forwarding,
+                );
+            }
+        };
+
+        const DropOps = struct {
+            svc: *metadata_service.MetadataHttpService,
+            alloc: std.mem.Allocator,
+            request: api_operation.RequestContext,
+            table_name: []const u8,
+            result: *?metadata_table_topology_mutations.DropResult,
+
+            pub fn local(self: @This()) anyerror!void {
+                self.result.* = try metadata_table_topology_mutations.drop(
+                    self.svc,
+                    self.alloc,
+                    self.request,
+                    self.table_name,
+                );
+            }
+
+            pub fn forward(
+                self: @This(),
+                peer: metadata_service.ReallocationProtocolPeer,
+                forwarding: raft_mutation_forwarding.Context,
+            ) anyerror!void {
+                const orchestration_url = peer.orchestration_url orelse return error.NotLeader;
+                std.log.info("forwarding table drop to metadata leader table={s} leader={d}", .{ self.table_name, peer.node_id });
+                var client = self.svc.tableMutationForwardClient();
+                self.result.* = try client.forwardTableDropMutationExact(
+                    orchestration_url,
+                    self.table_name,
+                    forwarding,
+                );
+            }
+        };
+    };
+
     pub fn fromMetadataHttpService(svc: *metadata_service.MetadataHttpService) StatusSource {
         return .{
             .ptr = svc,
-            .vtable = &comptime makeServiceVTable(metadata_service.MetadataHttpService),
+            .vtable = &comptime makeHttpServiceVTable(),
             .routing = table_catalog.CatalogSource.fromMetadataHttpService(svc).routingSource() catch unreachable,
         };
     }
@@ -1514,6 +1878,14 @@ pub const StatusSource = struct {
         return fromMetadataHttpService(srv.svc);
     }
 };
+
+test "routed table mutation bounds the canonical create body before route selection" {
+    try tables_api.validateTableCreateBodySize(tables_api.max_table_create_body_bytes);
+    try std.testing.expectError(
+        error.CreateTableRequestTooLarge,
+        tables_api.validateTableCreateBodySize(tables_api.max_table_create_body_bytes + 1),
+    );
+}
 
 const RestoreMetadataSpec = struct {
     table: metadata_table_manager.TableRecord,
@@ -1555,23 +1927,204 @@ fn deriveRestoreMetadataSpec(
     };
 }
 
-fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    var normalized_req = req;
-    var expanded_indexes_json: ?[]u8 = null;
-    defer if (expanded_indexes_json) |value| alloc.free(value);
-    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-    expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
-    normalized_req.indexes_json = expanded_indexes_json;
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
-    const ranges = try tables_api.deriveInitialRanges(alloc, table);
-    defer {
-        for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-        alloc.free(ranges);
+const max_table_mutation_route_attempts: usize = 3;
+
+/// Drives one public table create/drop through the current metadata
+/// authority. `ops.local()` runs the existing local workflow when this node
+/// is the leader; `ops.forward(peer)` sends the mutation to the resolved
+/// leader otherwise. A typed `error.NotLeader` consumes a delivered hop;
+/// `error.RaftMutationRequestNotSent` retries without consuming one because
+/// the executor proved the request never crossed the process boundary.
+/// Ambiguous transport or server failures surface unchanged and are never
+/// replayed; callers converge through an exact state probe.
+fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
+    return raft_mutation_forwarding.runRoutedMutation(router, ops, .{
+        .max_attempts = max_table_mutation_route_attempts,
+    });
+}
+
+test "routed table mutation runs locally on the metadata leader" {
+    var script = RoutedTableMutationScript{ .routes = &.{.local} };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), script.forward_calls);
+}
+
+test "routed table mutation forwards to the resolved leader from a follower" {
+    var script = RoutedTableMutationScript{ .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://leader" } }} };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 0), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 1), script.last_forwarding.?.forwards_remaining);
+    try std.testing.expect(!script.last_forwarding.?.campaign_allowed);
+}
+
+test "routed table mutation rediscovers the leader after a typed pre-admission rejection" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://stale-leader" } },
+            .{ .forward = .{ .node_id = 3, .orchestration_url = "http://new-leader" } },
+        },
+        .forward_errors = &.{error.NotLeader},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 0), script.last_forwarding.?.forwards_remaining);
+    try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
+}
+
+test "routed table mutation preserves hop budget for provably unsent request" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://offline" } },
+            .{ .forward = .{ .node_id = 3, .orchestration_url = "http://leader" } },
+        },
+        .forward_errors = &.{error.RaftMutationRequestNotSent},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 1), script.last_forwarding.?.forwards_remaining);
+}
+
+test "routed table mutation rediscovery converges on a leader that becomes local" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://stale-leader" } },
+            .local,
+        },
+        .forward_errors = &.{error.NotLeader},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+}
+
+test "routed table mutation rediscovers after local pre-admission leadership loss" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .local,
+            .{ .forward = .{ .node_id = 3, .orchestration_url = "http://new-leader" } },
+        },
+        .local_errors = &.{error.NotLeader},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+    try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
+}
+
+test "routed table mutation bounds leader rediscovery" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://flapping" } }},
+        .forward_errors = &.{ error.NotLeader, error.NotLeader, error.NotLeader, error.NotLeader },
+    };
+    try std.testing.expectError(
+        error.NotLeader,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, raft_mutation_forwarding.max_forwards), script.forward_calls);
+}
+
+test "routed table mutation never replays an ambiguous forward outcome" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://leader" } }},
+        .forward_errors = &.{error.MetadataMutationOutcomeUnknown},
+    };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+}
+
+test "routed table mutation surfaces resolution failure without mutating" {
+    var script = RoutedTableMutationScript{ .routes = &.{}, .resolve_error = error.NotLeader };
+    try std.testing.expectError(
+        error.NotLeader,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), script.forward_calls);
+}
+
+test "routed table mutation grants one bounded campaign owner" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{},
+        .resolve_error = error.NotLeader,
+        .campaign_route = .local,
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.campaign_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+}
+
+const RoutedTableMutationScript = struct {
+    routes: []const metadata_service.MetadataHttpService.TableMutationRoute,
+    local_errors: []const anyerror = &.{},
+    forward_errors: []const anyerror = &.{},
+    resolve_error: ?anyerror = null,
+    campaign_route: ?metadata_service.MetadataHttpService.TableMutationRoute = null,
+    route_resolutions: usize = 0,
+    campaign_calls: usize = 0,
+    local_calls: usize = 0,
+    forward_calls: usize = 0,
+    last_forwarding: ?raft_mutation_forwarding.Context = null,
+
+    pub fn resolveTableMutationRoute(self: *@This()) !metadata_service.MetadataHttpService.TableMutationRoute {
+        if (self.resolve_error) |err| return err;
+        const index = @min(self.route_resolutions, self.routes.len - 1);
+        self.route_resolutions += 1;
+        return self.routes[index];
     }
-    _ = try workflow.createTableWithRanges(svc, table, ranges);
-    try svc.runRound();
+
+    pub fn resolveTableMutationRouteWithCampaign(
+        self: *@This(),
+        campaign_allowed: *bool,
+        _: u32,
+    ) !metadata_service.MetadataHttpService.TableMutationRoute {
+        return self.resolveTableMutationRoute() catch |err| {
+            const campaign_route = self.campaign_route orelse return err;
+            if (err != error.NotLeader or !campaign_allowed.*) return err;
+            campaign_allowed.* = false;
+            self.campaign_calls += 1;
+            self.resolve_error = null;
+            return campaign_route;
+        };
+    }
+
+    const Ops = struct {
+        script: *RoutedTableMutationScript,
+
+        pub fn local(self: @This()) anyerror!void {
+            const index = self.script.local_calls;
+            self.script.local_calls += 1;
+            if (index < self.script.local_errors.len) return self.script.local_errors[index];
+        }
+
+        pub fn forward(
+            self: @This(),
+            peer: metadata_service.ReallocationProtocolPeer,
+            forwarding: raft_mutation_forwarding.Context,
+        ) anyerror!void {
+            _ = peer;
+            self.script.last_forwarding = forwarding;
+            const index = self.script.forward_calls;
+            self.script.forward_calls += 1;
+            if (index < self.script.forward_errors.len) return self.script.forward_errors[index];
+        }
+    };
+};
+
+fn runPostMutationRound(svc: anytype) !void {
+    // The production HTTP service has a dedicated Raft ticker, so this path
+    // must not become a second clock owner. The in-process service used by
+    // embedded callers and tests owns its Raft clock and must run the complete
+    // round to make the accepted proposal observable.
+    if (comptime @hasDecl(@TypeOf(svc.*), "runControlRoundOnly")) {
+        try svc.runControlRoundOnly();
+    } else {
+        try svc.runRound();
+    }
 }
 
 fn replaceTableDefinitionOnService(
@@ -1586,7 +2139,7 @@ fn replaceTableDefinitionOnService(
     if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
 
     try svc.replaceTableDefinition(expected, replacement);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -1598,7 +2151,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, table.table_id);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
@@ -1611,7 +2164,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     defer metadata_table_manager.freeTable(alloc, updated);
     const version = try tables_api.schemaVersion(updated.schema_json);
     try svc.replaceTableDefinition(table.*, updated);
-    try svc.runRound();
+    try runPostMutationRound(svc);
     return version;
 }
 
@@ -1628,7 +2181,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -1642,7 +2195,7 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -1656,7 +2209,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
@@ -1671,7 +2224,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn persistRestoreTableIntent(
@@ -1686,16 +2239,12 @@ fn persistRestoreTableIntent(
     var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
     defer spec.deinit(alloc);
 
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    if (tables_api.findTableByName(&snapshot, table_name)) |existing| {
-        if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
-            return error.TableAlreadyExists;
-    }
-
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    _ = try workflow.createTableWithRanges(service, spec.table, spec.ranges);
+    try table_topology_mutations.restore(service, alloc, .{}, spec.table, spec.ranges);
+    // Topology is already committed. Reconciliation is continuously driven in
+    // the background, so an opportunistic local round must not turn a durable
+    // restore admission into a misleading retryable failure.
+    runPostMutationRound(service) catch |err|
+        std.log.warn("restore topology committed; immediate reconciliation deferred err={s}", .{@errorName(err)});
 }
 
 pub const default_metadata_mutation_retry_timeout_ns: u64 = 5 * std.time.ns_per_s;
@@ -2111,7 +2660,7 @@ pub const ApiHttpServer = struct {
     index_installation_cursor: usize = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
-    backup_maintenance_queue: ClusterBackupMaintenanceQueue = .{},
+    backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -3259,9 +3808,26 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    const ClusterBackupMaintenanceWork = struct {
+    const BackupRepositoryMaintenanceWork = struct {
+        const reclaim_deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+        const ReclaimControl = struct {
+            server: *ApiHttpServer,
+            deadline_monotonic_ns: u64,
+
+            fn isCancelled(raw: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return self.server.backup_maintenance_closing.load(.acquire) or
+                    platform_time.monotonicNs() >= self.deadline_monotonic_ns;
+            }
+
+            fn token(self: *const @This()) api_operation.CancellationToken {
+                return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            }
+        };
+
         server: *ApiHttpServer,
-        target: ?*ClusterBackupMaintenanceTarget,
+        target: ?*BackupRepositoryMaintenanceTarget,
 
         fn waitUntilDue(self: *@This(), io: std.Io) bool {
             while (!self.server.backup_maintenance_closing.load(.acquire)) {
@@ -3285,6 +3851,19 @@ pub const ApiHttpServer = struct {
                 return error.BackgroundRuntimeUnavailable;
             while (self.waitUntilDue(io)) {
                 const target = self.target orelse break;
+                const now_unix_ns: u64 = @intCast(
+                    std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                );
+                const target_has_due_io = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    break :blk target.cluster_maintenance_requested or
+                        target.nextDueTableReclaim(now_unix_ns) != null;
+                };
+                if (!target_has_due_io) {
+                    self.rotateToNextTarget();
+                    continue;
+                }
                 var location = backups_api.openBackupLocationWithOptions(
                     self.server.owner_alloc,
                     target.location_uri,
@@ -3300,28 +3879,156 @@ pub const ApiHttpServer = struct {
                     self.rotateToNextTarget();
                     continue;
                 };
-                const now_unix_ns: u64 = @intCast(
-                    std.Io.Timestamp.now(io, .real).toNanoseconds(),
-                );
-                _ = backups_api.reclaimStaleClusterBackupAttempts(
-                    self.server.owner_alloc,
-                    io,
-                    &location,
-                    now_unix_ns,
-                ) catch |err| {
-                    std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                const run_cluster_maintenance = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    break :blk target.cluster_maintenance_requested;
                 };
+                if (run_cluster_maintenance) {
+                    _ = backups_api.reclaimStaleClusterBackupAttempts(
+                        self.server.owner_alloc,
+                        io,
+                        &location,
+                        now_unix_ns,
+                    ) catch |err| {
+                        std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                    };
+                }
+                self.reclaimDueTableAttempts(io, &location, now_unix_ns);
                 location.deinit(self.server.owner_alloc);
                 self.rotateToNextTarget();
             }
+        }
+
+        fn reclaimDueTableAttempts(
+            self: *@This(),
+            io: std.Io,
+            location: *backups_api.BackupLocation,
+            now_unix_ns: u64,
+        ) void {
+            var control: ReclaimControl = .{
+                .server = self.server,
+                .deadline_monotonic_ns = platform_time.monotonicNs() +|
+                    reclaim_deadline_ns,
+            };
+            const cancellation = control.token();
+            var processed: usize = 0;
+            while (processed < backups_api.backup_attempt_reclaim_batch_size) : (processed += 1) {
+                if (cancellation.isCancelled()) return;
+                const backup_id = blk: {
+                    platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+                    defer self.server.backup_maintenance_mutex.unlock();
+                    const target = self.target orelse return;
+                    const due = target.nextDueTableReclaim(now_unix_ns) orelse return;
+                    break :blk self.server.owner_alloc.dupe(u8, due) catch {
+                        std.log.warn("table backup maintenance identity allocation deferred", .{});
+                        return;
+                    };
+                };
+                defer self.server.owner_alloc.free(backup_id);
+
+                generation: while (!cancellation.isCancelled()) {
+                    var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
+                    var inspection = (backups_api.inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
+                        self.server.owner_alloc,
+                        io,
+                        location,
+                        backup_id,
+                        &object_budget,
+                        cancellation,
+                    ) catch |err| {
+                        if (err == error.Canceled) return;
+                        std.log.warn("table backup stale-attempt inspection deferred class={s}", .{@errorName(err)});
+                        self.finishTableReclaim(
+                            backup_id,
+                            now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                        );
+                        break :generation;
+                    }) orelse {
+                        self.finishTableReclaim(backup_id, null);
+                        break :generation;
+                    };
+                    defer inspection.deinit(self.server.owner_alloc);
+
+                    page: while (!cancellation.isCancelled()) {
+                        const result = backups_api.advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+                            self.server.owner_alloc,
+                            io,
+                            location,
+                            backup_id,
+                            &inspection,
+                            now_unix_ns,
+                            &object_budget,
+                            cancellation,
+                        ) catch |err| {
+                            if (err == error.Canceled) return;
+                            std.log.warn("table backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                            self.finishTableReclaim(
+                                backup_id,
+                                now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+                            );
+                            break :generation;
+                        };
+                        switch (result) {
+                            .reclaimed, .committed => {
+                                self.finishTableReclaim(backup_id, null);
+                                break :generation;
+                            },
+                            .active => {
+                                const retry_at = tableBackupReclaimRetryAtUnixNs(
+                                    inspection.reclaimNotBeforeUnixNs(),
+                                    now_unix_ns,
+                                );
+                                self.finishTableReclaim(backup_id, retry_at);
+                                break :generation;
+                            },
+                            .replaced => {
+                                self.noteTableReclaimProgress();
+                                continue :generation;
+                            },
+                            .incomplete => {
+                                self.noteTableReclaimProgress();
+                                object_budget = backups_api.backup_attempt_reclaim_object_budget;
+                                continue :page;
+                            },
+                        }
+                    }
+                    // A deadline leaves the due task in place. The queue keeps
+                    // its progress timestamp and resumes it on the next turn.
+                    return;
+                }
+            }
+        }
+
+        fn noteTableReclaimProgress(self: *@This()) void {
+            platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+            defer self.server.backup_maintenance_mutex.unlock();
+            const target = self.target orelse return;
+            target.noteProgress(platform_time.monotonicNs());
+        }
+
+        fn finishTableReclaim(
+            self: *@This(),
+            backup_id: []const u8,
+            retry_at_unix_ns: ?u64,
+        ) void {
+            platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+            defer self.server.backup_maintenance_mutex.unlock();
+            const target = self.target orelse return;
+            target.finishTableReclaim(
+                self.server.owner_alloc,
+                backup_id,
+                retry_at_unix_ns,
+            );
         }
 
         fn rotateToNextTarget(self: *@This()) void {
             const target = self.target orelse return;
             const now_ns = platform_time.monotonicNs();
             platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
-            if (now_ns -| target.last_scheduled_monotonic_ns >=
-                backup_maintenance_target_retention_ns)
+            if ((!target.cluster_maintenance_requested and target.table_reclaims.items.len == 0) or
+                now_ns -| target.lastActivityMonotonicNs() >=
+                    backup_maintenance_target_retention_ns)
             {
                 self.server.backup_maintenance_queue.completeActive(target);
                 self.target = self.server.backup_maintenance_queue.activateNext();
@@ -3348,7 +4055,239 @@ pub const ApiHttpServer = struct {
         }
     };
 
-    fn submitNextClusterBackupMaintenance(self: *ApiHttpServer) !void {
+    const BackupAttemptCleanupWork = struct {
+        const max_attempts: usize = 4;
+        const deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+        const Control = struct {
+            server: *ApiHttpServer,
+            deadline_ns: u64,
+
+            fn isCancelled(raw: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return self.server.backup_maintenance_closing.load(.acquire) or
+                    platform_time.monotonicNs() >= self.deadline_ns;
+            }
+
+            fn token(self: *const @This()) api_operation.CancellationToken {
+                return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            }
+        };
+
+        const TableAction = enum {
+            rollback,
+            committed_state,
+            committed_logical_state,
+        };
+        const Attempt = union(enum) {
+            table: struct {
+                backup_id: []u8,
+                artifact_backup_id: []u8,
+                format: backups_api.BackupFormat,
+                action: TableAction,
+                writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
+            },
+            cluster: struct { attempt_id: []u8 },
+        };
+
+        server: *ApiHttpServer,
+        location_uri: []u8,
+        connection: []u8,
+        attempt: Attempt,
+
+        fn runOnce(
+            self: *@This(),
+            io: std.Io,
+            cancellation: api_operation.CancellationToken,
+        ) anyerror!void {
+            var location = try backups_api.openBackupLocationWithOptions(
+                self.server.owner_alloc,
+                self.location_uri,
+                .{
+                    .secret_store = self.server.cfg.secret_store,
+                    .node_config = self.server.cfg.node_config,
+                    .connection = self.connection,
+                    .required_capability = "backup.write",
+                    .io = io,
+                },
+            );
+            defer location.deinit(self.server.owner_alloc);
+            switch (self.attempt) {
+                .table => |table| switch (table.action) {
+                    .rollback => {
+                        var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
+                        const progress = try backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
+                            self.server.owner_alloc,
+                            io,
+                            &location,
+                            table.backup_id,
+                            table.artifact_backup_id,
+                            table.format,
+                            table.writer_state_cleanup,
+                            &object_budget,
+                            cancellation,
+                        );
+                        if (progress == .incomplete)
+                            return error.BackupCleanupBudgetExceeded;
+                    },
+                    .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
+                        self.server.owner_alloc,
+                        io,
+                        &location,
+                        table.artifact_backup_id,
+                    ),
+                    .committed_logical_state => _ = try backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
+                        self.server.owner_alloc,
+                        io,
+                        &location,
+                        table.backup_id,
+                    ),
+                },
+                .cluster => |cluster_attempt| backups_api.cleanupClusterBackupAttemptByIdAtLocation(
+                    self.server.owner_alloc,
+                    io,
+                    &location,
+                    cluster_attempt.attempt_id,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                },
+            }
+        }
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const io = self.server.sharedApiIo() orelse
+                return error.BackgroundRuntimeUnavailable;
+            const started_ns = platform_time.monotonicNs();
+            var control = Control{
+                .server = self.server,
+                .deadline_ns = started_ns +| deadline_ns,
+            };
+            var attempts: usize = 0;
+            var backoff_ms: i64 = 25;
+            while (true) {
+                self.runOnce(io, control.token()) catch |err| {
+                    // Exhausting a page is successful forward progress, not a
+                    // transient storage failure. Keep consuming bounded pages
+                    // until the shared 30-second deadline; applying the error
+                    // retry cap here stranded every rollback above 1,024
+                    // objects even while the repository was healthy.
+                    if (err == error.BackupCleanupBudgetExceeded and
+                        !Control.isCancelled(&control))
+                    {
+                        continue;
+                    }
+                    attempts += 1;
+                    if (attempts == max_attempts or Control.isCancelled(&control))
+                        return err;
+                    std.log.warn("backup exact cleanup retrying attempt={d} class={s}", .{ attempts, @errorName(err) });
+                    try io.sleep(.fromMilliseconds(backoff_ms), .awake);
+                    backoff_ms = @min(backoff_ms * 2, 200);
+                    continue;
+                };
+                return;
+            }
+        }
+
+        fn destroy(self: *@This()) void {
+            const alloc = self.server.owner_alloc;
+            switch (self.attempt) {
+                .table => |table| {
+                    alloc.free(table.artifact_backup_id);
+                    alloc.free(table.backup_id);
+                },
+                .cluster => |cluster_attempt| alloc.free(cluster_attempt.attempt_id),
+            }
+            alloc.free(self.connection);
+            alloc.free(self.location_uri);
+            alloc.destroy(self);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroy();
+        }
+    };
+
+    fn submitBackupAttemptCleanup(
+        self: *ApiHttpServer,
+        work: *BackupAttemptCleanupWork,
+    ) !void {
+        if (self.backup_maintenance_closing.load(.acquire))
+            return error.BackupMaintenanceUnavailable;
+        const runtime = self.cfg.backend_runtime orelse
+            return error.BackupMaintenanceUnavailable;
+        if (runtime.threaded_jobs == null or self.backup_maintenance_owner_id == 0)
+            return error.BackupMaintenanceUnavailable;
+        try runtime.durable_jobs.submit(.{
+            .owner_id = self.backup_maintenance_owner_id,
+            .class = .cleanup,
+            .ptr = work,
+            .run = BackupAttemptCleanupWork.run,
+            .deinit = BackupAttemptCleanupWork.deinit,
+        });
+    }
+
+    fn scheduleTableBackupAttemptCleanup(
+        self: *ApiHttpServer,
+        location_uri: []const u8,
+        connection: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        action: BackupAttemptCleanupWork.TableAction,
+        writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
+    ) !void {
+        const work = try self.owner_alloc.create(BackupAttemptCleanupWork);
+        errdefer self.owner_alloc.destroy(work);
+        const owned_location = try self.owner_alloc.dupe(u8, location_uri);
+        errdefer self.owner_alloc.free(owned_location);
+        const owned_connection = try self.owner_alloc.dupe(u8, connection);
+        errdefer self.owner_alloc.free(owned_connection);
+        const owned_backup_id = try self.owner_alloc.dupe(u8, backup_id);
+        errdefer self.owner_alloc.free(owned_backup_id);
+        const owned_artifact_id = try self.owner_alloc.dupe(u8, artifact_backup_id);
+        errdefer self.owner_alloc.free(owned_artifact_id);
+        work.* = .{
+            .server = self,
+            .location_uri = owned_location,
+            .connection = owned_connection,
+            .attempt = .{ .table = .{
+                .backup_id = owned_backup_id,
+                .artifact_backup_id = owned_artifact_id,
+                .format = format,
+                .action = action,
+                .writer_state_cleanup = writer_state_cleanup,
+            } },
+        };
+        try self.submitBackupAttemptCleanup(work);
+    }
+
+    fn scheduleClusterBackupAttemptCleanup(
+        self: *ApiHttpServer,
+        location_uri: []const u8,
+        connection: []const u8,
+        attempt_id: []const u8,
+    ) !void {
+        const work = try self.owner_alloc.create(BackupAttemptCleanupWork);
+        errdefer self.owner_alloc.destroy(work);
+        const owned_location = try self.owner_alloc.dupe(u8, location_uri);
+        errdefer self.owner_alloc.free(owned_location);
+        const owned_connection = try self.owner_alloc.dupe(u8, connection);
+        errdefer self.owner_alloc.free(owned_connection);
+        const owned_attempt_id = try self.owner_alloc.dupe(u8, attempt_id);
+        errdefer self.owner_alloc.free(owned_attempt_id);
+        work.* = .{
+            .server = self,
+            .location_uri = owned_location,
+            .connection = owned_connection,
+            .attempt = .{ .cluster = .{ .attempt_id = owned_attempt_id } },
+        };
+        try self.submitBackupAttemptCleanup(work);
+    }
+
+    fn submitNextBackupRepositoryMaintenance(self: *ApiHttpServer) !void {
         if (self.backup_maintenance_closing.load(.acquire))
             return error.BackupMaintenanceUnavailable;
         const runtime = self.cfg.backend_runtime orelse
@@ -3365,7 +4304,7 @@ pub const ApiHttpServer = struct {
             self.backup_maintenance_mutex.unlock();
             return;
         };
-        const work = self.owner_alloc.create(ClusterBackupMaintenanceWork) catch |err| {
+        const work = self.owner_alloc.create(BackupRepositoryMaintenanceWork) catch |err| {
             self.backup_maintenance_queue.requeueActive(target);
             self.backup_maintenance_mutex.unlock();
             return err;
@@ -3379,8 +4318,8 @@ pub const ApiHttpServer = struct {
             .owner_id = self.backup_maintenance_owner_id,
             .class = .cleanup,
             .ptr = work,
-            .run = ClusterBackupMaintenanceWork.run,
-            .deinit = ClusterBackupMaintenanceWork.deinit,
+            .run = BackupRepositoryMaintenanceWork.run,
+            .deinit = BackupRepositoryMaintenanceWork.deinit,
         }) catch |err| {
             self.backup_maintenance_queue.requeueActive(target);
             self.backup_maintenance_mutex.unlock();
@@ -3415,14 +4354,73 @@ pub const ApiHttpServer = struct {
             connection,
             platform_time.monotonicNs(),
         );
+        if (enqueue_result) |_| {
+            self.backup_maintenance_queue.find(
+                location_uri,
+                connection,
+            ).?.cluster_maintenance_requested = true;
+        } else |_| {}
         self.backup_maintenance_mutex.unlock();
         _ = enqueue_result catch |err| {
             // Preserve progress for already queued repositories even when this
             // caller receives explicit bounded-queue backpressure.
-            self.submitNextClusterBackupMaintenance() catch {};
+            self.submitNextBackupRepositoryMaintenance() catch {};
             return err;
         };
-        try self.submitNextClusterBackupMaintenance();
+        try self.submitNextBackupRepositoryMaintenance();
+    }
+
+    /// Registers an exact standalone reservation with the coalesced repository
+    /// supervisor. The reservation body is the durable work record; this queue
+    /// only carries credentials and wake-up timing, so a retry after process
+    /// loss can cheaply reconstruct it without duplicating cleanup authority.
+    fn scheduleTableBackupReclamation(
+        self: *ApiHttpServer,
+        location_uri: []const u8,
+        connection: []const u8,
+        backup_id: []const u8,
+        not_before_unix_ns: u64,
+    ) !void {
+        if (self.backup_maintenance_closing.load(.acquire))
+            return error.BackupMaintenanceUnavailable;
+        const runtime = self.cfg.backend_runtime orelse
+            return error.BackupMaintenanceUnavailable;
+        if (runtime.threaded_jobs == null or self.backup_maintenance_owner_id == 0)
+            return error.BackupMaintenanceUnavailable;
+
+        platform_sync.lockYielding(&self.backup_maintenance_mutex);
+        if (self.backup_maintenance_closing.load(.acquire)) {
+            self.backup_maintenance_mutex.unlock();
+            return error.BackupMaintenanceUnavailable;
+        }
+        const target_created = self.backup_maintenance_queue.enqueue(
+            self.owner_alloc,
+            location_uri,
+            connection,
+            platform_time.monotonicNs(),
+        ) catch |err| {
+            self.backup_maintenance_mutex.unlock();
+            return err;
+        };
+        const target = self.backup_maintenance_queue.find(
+            location_uri,
+            connection,
+        ).?;
+        target.enqueueTableReclaim(
+            self.owner_alloc,
+            backup_id,
+            not_before_unix_ns,
+        ) catch |err| {
+            if (target_created)
+                self.backup_maintenance_queue.discardNewestPending(
+                    self.owner_alloc,
+                    target,
+                );
+            self.backup_maintenance_mutex.unlock();
+            return err;
+        };
+        self.backup_maintenance_mutex.unlock();
+        try self.submitNextBackupRepositoryMaintenance();
     }
 
     pub fn storageMaintenanceExclusiveActive(self: *const ApiHttpServer) bool {
@@ -5876,6 +6874,41 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    pub const CommittedTableCreateLocalOutcome = enum {
+        applied,
+        delegated,
+        repair_required,
+        repair_unavailable,
+    };
+
+    /// Materialize a table definition that is already durably committed in
+    /// metadata. Once this boundary is entered, local failures are repair
+    /// debt—not replay-safe DDL failures—so hand them to the structural worker
+    /// and return an explicit committed outcome to every transport.
+    pub fn materializeCommittedTableCreate(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        request: tables_api.CreateTableRequest,
+    ) CommittedTableCreateLocalOutcome {
+        const writes = self.table_writes orelse return .delegated;
+        const handled = writes.createTable(alloc, table_name, request) catch |err| {
+            std.log.warn(
+                "table create committed with local materialization debt table={s} err={s}",
+                .{ table_name, @errorName(err) },
+            );
+            const scheduled = writes.requestTableStructuralReconcile(alloc, table_name) catch |schedule_err| {
+                std.log.err(
+                    "committed table create structural repair enqueue failed table={s} create_err={s} enqueue_err={s}",
+                    .{ table_name, @errorName(err), @errorName(schedule_err) },
+                );
+                return .repair_unavailable;
+            };
+            return if (scheduled != null) .repair_required else .repair_unavailable;
+        };
+        return if (handled != null) .applied else .delegated;
+    }
+
     pub fn probeTableStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.TableStorageStatus {
         const source = self.table_reads orelse return null;
         var result = (try source.scan(
@@ -6987,9 +8020,12 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        receipt: *public_table_http.TableApi.BackupExecutionReceipt,
+        request: api_operation.RequestContext,
     ) !void {
         const artifact_backup_id = try self.backupGenerationIdAlloc();
         defer self.alloc.free(artifact_backup_id);
+        receipt.recordArtifactBackupId(artifact_backup_id);
         return try self.backupOwnedTableWithArtifactId(
             io,
             table,
@@ -7001,7 +8037,9 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             connection,
+            receipt,
             .logical_create,
+            request,
         );
     }
 
@@ -7023,7 +8061,94 @@ pub const ApiHttpServer = struct {
         fn ownsCommittedRetirement(self: @This()) bool {
             return self == .logical_create;
         }
+
+        fn rollbackWriterStateCleanup(self: @This()) backups_api.TableBackupWriterStateCleanup {
+            return if (self.createsLease()) .retire_if_owned else .preserve;
+        }
     };
+
+    fn isBackupInterruption(err: anyerror) bool {
+        return err == error.Canceled or err == error.Cancelled or
+            err == error.Timeout or err == error.DeadlineExceeded;
+    }
+
+    /// Converges every failed creator through the same reservation-last
+    /// rollback protocol. The durable logical reservation remains the retry
+    /// address until any possibly-created writer lease has been retired. A
+    /// foreground cleanup failure is therefore ambiguous, never retryable, and
+    /// leaves enough identity for the bounded maintenance lane to finish it.
+    fn rollbackFailedTableBackupAttempt(
+        self: *ApiHttpServer,
+        io: std.Io,
+        backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
+        connection: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
+        operation_control: *backups_api.BackupOperationControl,
+        failure: anyerror,
+        phase: []const u8,
+    ) anyerror {
+        const normalized_err = operation_control.normalizeInterruption(failure);
+        if (!isBackupInterruption(normalized_err)) {
+            var object_budget: usize = backups_api.backup_attempt_request_reclaim_object_budget;
+            const progress = backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_state_cleanup,
+                &object_budget,
+                operation_control.token(),
+            ) catch |cleanup_err| {
+                std.log.err("table backup rollback incomplete phase={s} class={s}", .{ phase, @errorName(cleanup_err) });
+                self.scheduleTableBackupAttemptCleanup(
+                    location_uri,
+                    connection,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                    .rollback,
+                    writer_state_cleanup,
+                ) catch |schedule_err| {
+                    std.log.warn("table backup rollback cleanup scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+                };
+                return error.BackupOutcomeAmbiguous;
+            };
+            if (progress == .incomplete) {
+                std.log.info("table backup rollback deferred phase={s} reason=quantum_exhausted", .{phase});
+                self.scheduleTableBackupAttemptCleanup(
+                    location_uri,
+                    connection,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                    .rollback,
+                    writer_state_cleanup,
+                ) catch |schedule_err| {
+                    std.log.warn("table backup rollback continuation scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+                };
+                return error.BackupOutcomeAmbiguous;
+            }
+            return normalized_err;
+        }
+        self.scheduleTableBackupAttemptCleanup(
+            location_uri,
+            connection,
+            backup_id,
+            artifact_backup_id,
+            format,
+            .rollback,
+            writer_state_cleanup,
+        ) catch |schedule_err| {
+            std.log.warn("table backup interrupted rollback cleanup scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+        };
+        return normalized_err;
+    }
 
     fn backupOwnedTableWithArtifactId(
         self: *ApiHttpServer,
@@ -7037,24 +8162,12 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        receipt: ?*public_table_http.TableApi.BackupExecutionReceipt,
         writer_lease_role: TableBackupWriterLeaseRole,
+        request: api_operation.RequestContext,
     ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-        if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id)) {
-            if (writer_lease_role.ownsCommittedRetirement()) {
-                _ = backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    backup_id,
-                ) catch |err| {
-                    std.log.warn("committed table backup writer-state reconciliation deferred class={s}", .{@errorName(err)});
-                    return error.BackupOutcomeAmbiguous;
-                };
-            }
-            return error.BackupAlreadyExists;
-        }
         const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
         var writer_fence = fence;
         const initial_writer_lease_expiration = switch (writer_lease_role) {
@@ -7072,9 +8185,33 @@ pub const ApiHttpServer = struct {
             writer_fence.writer_not_after_unix_ns != null and
             admission_now >= initial_writer_lease_expiration)
             return error.BackupAttemptLeaseLost;
-        var reclaimed_stale_attempt = false;
-        while (true) {
-            backups_api.reserveTableBackupAttemptAtLocation(
+        var operation_control = try backupOperationControl(io, writer_fence, request);
+        try operation_control.ensureActive();
+        if (backups_api.manifestExistsAtLocationWithIoAndCancellation(
+            self.alloc,
+            io,
+            backup_location,
+            backup_id,
+            operation_control.token(),
+        ) catch |err| return operation_control.normalizeInterruption(err)) {
+            if (writer_lease_role.ownsCommittedRetirement()) {
+                self.scheduleTableBackupAttemptCleanup(
+                    location_uri,
+                    connection,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                    .committed_logical_state,
+                    .preserve,
+                ) catch |schedule_err| {
+                    std.log.warn("committed table backup writer-state reconciliation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                };
+            }
+            return error.BackupAlreadyExists;
+        }
+        var reclaimed_reservation_retry = false;
+        reservation_admission: while (true) {
+            backups_api.reserveTableBackupAttemptAtLocationWithCancellation(
                 self.alloc,
                 io,
                 backup_location,
@@ -7082,111 +8219,244 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
                 format,
                 writer_fence,
+                operation_control.token(),
             ) catch |err| switch (err) {
                 error.BackupAlreadyExists => {
-                    const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
+                    var reclaim_budget: usize =
+                        backups_api.backup_attempt_request_reclaim_object_budget;
+                    var inspection = (backups_api.inspectTableBackupAttemptAtLocationWithBudgetAndCancellation(
                         self.alloc,
                         io,
                         backup_location,
                         backup_id,
-                    ) catch return error.BackupAlreadyExists;
-                    if (retained_artifact_id) |value| {
-                        defer self.alloc.free(value);
-                        if (!reclaimed_stale_attempt) {
-                            const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
-                            switch (backups_api.reclaimExpiredTableBackupAttemptAtLocation(
-                                self.alloc,
-                                io,
-                                backup_location,
-                                backup_id,
-                                now_unix_ns,
-                            ) catch return error.BackupOutcomeAmbiguous) {
-                                .reclaimed => {
-                                    reclaimed_stale_attempt = true;
-                                    continue;
-                                },
-                                .committed => return error.BackupAlreadyExists,
-                                .active => {},
-                            }
+                        &reclaim_budget,
+                        operation_control.token(),
+                    ) catch |read_err| {
+                        const normalized_err = operation_control.normalizeInterruption(read_err);
+                        if (isBackupInterruption(normalized_err)) return normalized_err;
+                        return error.BackupAlreadyExists;
+                    }) orelse {
+                        if (!reclaimed_reservation_retry) {
+                            reclaimed_reservation_retry = true;
+                            if (receipt) |execution_receipt|
+                                execution_receipt.recordArtifactBackupId(artifact_backup_id);
+                            continue :reservation_admission;
                         }
+                        return error.BackupAlreadyExists;
+                    };
+                    defer inspection.deinit(self.alloc);
+                    if (receipt) |execution_receipt|
+                        execution_receipt.recordArtifactBackupId(inspection.artifact_backup_id);
+                    if (backups_api.tableBackupAttemptCommittedAtLocationWithBudgetAndCancellation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        &reclaim_budget,
+                        operation_control.token(),
+                    ) catch |read_err| {
+                        const normalized_err = operation_control.normalizeInterruption(read_err);
+                        if (isBackupInterruption(normalized_err)) return normalized_err;
                         return error.BackupOutcomeAmbiguous;
+                    }) {
+                        if (writer_lease_role.ownsCommittedRetirement()) {
+                            self.scheduleTableBackupAttemptCleanup(
+                                location_uri,
+                                connection,
+                                backup_id,
+                                inspection.artifact_backup_id,
+                                inspection.format,
+                                .committed_logical_state,
+                                .preserve,
+                            ) catch |schedule_err| {
+                                std.log.warn("committed table backup collision reconciliation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                            };
+                        }
+                        return error.BackupAlreadyExists;
                     }
-                    return error.BackupAlreadyExists;
+                    const eligible_at_unix_ns = inspection.reclaimNotBeforeUnixNs() orelse
+                        return error.BackupOutcomeAmbiguous;
+                    const now_unix_ns: u64 = @intCast(
+                        std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                    );
+                    if (eligible_at_unix_ns <= now_unix_ns) {
+                        const reclaim_result = backups_api.advanceExpiredTableBackupAttemptAtLocationWithCancellation(
+                            self.alloc,
+                            io,
+                            backup_location,
+                            backup_id,
+                            &inspection,
+                            now_unix_ns,
+                            &reclaim_budget,
+                            operation_control.token(),
+                        ) catch |reclaim_err| {
+                            const retry_at = now_unix_ns +|
+                                backups_api.backup_attempt_lease_renew_interval_ns;
+                            self.scheduleTableBackupReclamation(
+                                location_uri,
+                                connection,
+                                backup_id,
+                                retry_at,
+                            ) catch |schedule_err| {
+                                std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                            };
+                            const normalized_err = operation_control.normalizeInterruption(reclaim_err);
+                            if (isBackupInterruption(normalized_err)) return normalized_err;
+                            return error.BackupOutcomeAmbiguous;
+                        };
+                        switch (reclaim_result) {
+                            .reclaimed, .replaced => {
+                                if (!reclaimed_reservation_retry) {
+                                    reclaimed_reservation_retry = true;
+                                    if (receipt) |execution_receipt|
+                                        execution_receipt.recordArtifactBackupId(artifact_backup_id);
+                                    continue :reservation_admission;
+                                }
+                            },
+                            .committed => return error.BackupAlreadyExists,
+                            .active => {},
+                            .incomplete => {
+                                self.scheduleTableBackupReclamation(
+                                    location_uri,
+                                    connection,
+                                    backup_id,
+                                    now_unix_ns,
+                                ) catch |schedule_err| {
+                                    std.log.warn("stale table backup reclamation continuation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                                };
+                                return error.BackupOutcomeAmbiguous;
+                            },
+                        }
+                    }
+                    const retry_at = tableBackupReclaimRetryAtUnixNs(
+                        eligible_at_unix_ns,
+                        now_unix_ns,
+                    );
+                    self.scheduleTableBackupReclamation(
+                        location_uri,
+                        connection,
+                        backup_id,
+                        retry_at,
+                    ) catch |schedule_err| {
+                        std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                    };
+                    return error.BackupOutcomeAmbiguous;
                 },
-                else => return err,
+                else => return operation_control.normalizeInterruption(err),
             };
-            break;
+            break :reservation_admission;
         }
         var writer_lease_heartbeat: TableBackupWriterLeaseHeartbeat = .{
             .alloc = self.alloc,
             .io = io,
             .location = backup_location,
             .artifact_backup_id = artifact_backup_id,
+            .operation_cancellation = operation_control.token(),
             .expires_at_unix_ns = .init(initial_writer_lease_expiration),
         };
         switch (writer_lease_role) {
-            .logical_create, .legacy_forwarded_create => backups_api.reserveTableBackupWriterLeaseAtLocation(
+            .logical_create, .legacy_forwarded_create => backups_api.reserveTableBackupWriterLeaseAtLocationWithCancellation(
                 self.alloc,
                 io,
                 backup_location,
                 artifact_backup_id,
                 initial_writer_lease_expiration,
+                operation_control.token(),
             ) catch |err| {
-                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                    self.alloc,
+                const normalized_err = operation_control.normalizeInterruption(err);
+                // A known precondition failure did not create this lease. It
+                // nevertheless proves another same-generation writer may be
+                // live, so retain both fences and require reconciliation.
+                if (normalized_err == error.BackupAlreadyExists)
+                    return error.BackupOutcomeAmbiguous;
+                // Any other provider failure may have happened after the
+                // conditional create committed. Owner-checked lease release is
+                // idempotent, so creators must include it in rollback.
+                return self.rollbackFailedTableBackupAttempt(
                     io,
                     backup_location,
+                    location_uri,
+                    connection,
                     backup_id,
                     artifact_backup_id,
                     format,
-                ) catch {};
-                return err;
+                    .retire_if_owned,
+                    &operation_control,
+                    normalized_err,
+                    "writer_lease_admission",
+                );
             },
             .adopt => {
                 const adopt_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
                 if (writer_fence.writer_not_after_unix_ns != null and
                     adopt_now >= initial_writer_lease_expiration)
                 {
-                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                        self.alloc,
-                        io,
-                        backup_location,
+                    self.scheduleTableBackupAttemptCleanup(
+                        location_uri,
+                        connection,
                         backup_id,
                         artifact_backup_id,
                         format,
-                    ) catch {};
+                        .rollback,
+                        .preserve,
+                    ) catch |schedule_err| {
+                        std.log.warn("expired adopted table backup cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
+                    };
                     return error.BackupAttemptLeaseLost;
                 }
                 writer_lease_heartbeat.ensureOwned() catch |err| {
-                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                        self.alloc,
+                    return self.rollbackFailedTableBackupAttempt(
                         io,
                         backup_location,
+                        location_uri,
+                        connection,
                         backup_id,
                         artifact_backup_id,
                         format,
-                    ) catch {};
-                    return err;
+                        .preserve,
+                        &operation_control,
+                        err,
+                        "writer_lease_adoption",
+                    );
                 };
             },
         }
-        const reservation_owned = backups_api.tableBackupAttemptMatchesAtLocation(
+        const reservation_owned = backups_api.tableBackupAttemptMatchesAtLocationWithCancellation(
             self.alloc,
             io,
             backup_location,
             backup_id,
             artifact_backup_id,
-        ) catch return error.BackupOutcomeAmbiguous;
+            operation_control.token(),
+        ) catch |err| {
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "reservation_ownership_read",
+            );
+        };
         if (!reservation_owned) {
-            if (writer_lease_role.createsLease()) {
-                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    artifact_backup_id,
-                ) catch false;
-            }
-            return error.BackupAttemptLeaseLost;
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                error.BackupAttemptLeaseLost,
+                "reservation_ownership_lost",
+            );
         }
         var writer_lease_future = std.Io.async(
             io,
@@ -7199,7 +8469,7 @@ pub const ApiHttpServer = struct {
             writer_lease_future.await(io);
         };
         var cleanup_safe = true;
-        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
+        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &operation_control, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
             writer_lease_heartbeat.stop_event.set(io);
             writer_lease_future.await(io);
             writer_lease_future_running = false;
@@ -7207,51 +8477,75 @@ pub const ApiHttpServer = struct {
                 std.log.warn("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
                 return error.BackupOutcomeAmbiguous;
             }
-            backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                self.alloc,
+            return self.rollbackFailedTableBackupAttempt(
                 io,
                 backup_location,
+                location_uri,
+                connection,
                 backup_id,
                 artifact_backup_id,
                 format,
-            ) catch |cleanup_err| {
-                // A retained reservation fences retries when cleanup cannot be
-                // confirmed. Surface ambiguity rather than preserving a
-                // retryable authority/storage error from before rollback.
-                std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
-                return error.BackupOutcomeAmbiguous;
-            };
-            if (writer_lease_role.createsLease()) {
-                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    artifact_backup_id,
-                ) catch |release_err| blk: {
-                    std.log.warn("table backup writer lease release deferred phase=rollback class={s}", .{@errorName(release_err)});
-                    break :blk false;
-                };
-            }
-            return err;
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "execution",
+            );
         };
         writer_lease_heartbeat.stop_event.set(io);
         writer_lease_future.await(io);
         writer_lease_future_running = false;
         if (writer_lease_role.ownsCommittedRetirement()) {
-            backups_api.releaseCommittedTableBackupWriterStateAtLocation(
-                self.alloc,
-                io,
-                backup_location,
+            self.scheduleTableBackupAttemptCleanup(
+                location_uri,
+                connection,
+                backup_id,
                 artifact_backup_id,
-            ) catch |release_err| {
-                std.log.warn("table backup writer lease release deferred phase=commit class={s}", .{@errorName(release_err)});
-                // The manifest is already durable. Preserve the reservation as
-                // a reconciliation journal and surface the committed outcome
-                // as ambiguous so a same-ID inspection/retry retires the
-                // sidecar instead of leaking it permanently.
-                return error.BackupOutcomeAmbiguous;
+                format,
+                .committed_state,
+                .retire_if_owned,
+            ) catch |schedule_err| {
+                // The manifest is already the durable result. Same-ID
+                // reconciliation remains the fallback if the cleanup lane is
+                // unavailable during shutdown or saturation.
+                std.log.warn("table backup committed state cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
             };
         }
+    }
+
+    fn boundedBackupRequest(
+        self: *const ApiHttpServer,
+        request: api_operation.RequestContext,
+    ) api_operation.RequestContext {
+        var bounded = request;
+        const configured_duration_ns = @max(
+            @as(u64, 1),
+            self.cfg.backup_operation_timeout_ms,
+        ) *| std.time.ns_per_ms;
+        const configured_deadline_ns = platform_time.monotonicNs() +| configured_duration_ns;
+        bounded.deadline_ns = if (request.deadline_ns) |deadline_ns|
+            @min(deadline_ns, configured_deadline_ns)
+        else
+            configured_deadline_ns;
+        return bounded;
+    }
+
+    fn backupOperationControl(
+        io: std.Io,
+        fence: backups_api.TableBackupFence,
+        request: api_operation.RequestContext,
+    ) !backups_api.BackupOperationControl {
+        const writer_not_after = fence.writer_not_after_unix_ns orelse
+            return error.InvalidBackupFence;
+        const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+        if (now_unix_ns >= writer_not_after) return error.BackupAttemptLeaseLost;
+        const lease_deadline_ns = platform_time.monotonicNs() +| (writer_not_after - now_unix_ns);
+        return .{
+            .deadline_ns = if (request.deadline_ns) |deadline_ns|
+                @min(deadline_ns, lease_deadline_ns)
+            else
+                lease_deadline_ns,
+            .cancellation = request.cancellation,
+        };
     }
 
     fn executeReservedTableBackup(
@@ -7266,26 +8560,52 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        operation_control: *backups_api.BackupOperationControl,
         writer_lease: *TableBackupWriterLeaseHeartbeat,
         cleanup_safe: *bool,
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location) catch |err| {
+        const remote_repository = switch (backup_location.*) {
+            .file => false,
+            .remote => true,
+        };
+        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location, operation_control.*) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
         };
         if (forwarded_shards) |shards| {
             defer freeBackupShards(self.alloc, shards);
             try writer_lease.ensureOwned();
+            try operation_control.ensureActive();
+            for (shards) |shard| {
+                std.log.debug(
+                    "fenced backup shard captured group_id={d} start={s} end={s} path={s} bytes={d}",
+                    .{ shard.group_id, shard.start_key, shard.end_key orelse "<unbounded>", shard.snapshot_path, shard.artifact_size_bytes },
+                );
+            }
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
+            try operation_control.ensureActive();
             cleanup_safe.* = false;
-            backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-                cleanup_safe.* = switch (err) {
+            backups_api.writeManifestToLocationWithIoAndCancellation(
+                self.alloc,
+                io,
+                backup_location,
+                &manifest,
+                operation_control.token(),
+            ) catch |err| {
+                const normalized_err = operation_control.normalizeInterruption(err);
+                cleanup_safe.* = switch (normalized_err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                    error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                     else => false,
                 };
-                return err;
+                if (remote_repository and
+                    (normalized_err == error.Canceled or
+                        normalized_err == error.Cancelled or
+                        normalized_err == error.Timeout))
+                    return error.BackupOutcomeAmbiguous;
+                return normalized_err;
             };
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 backups_api.retireForwardedTableBackupEnvelopeAtLocation(
@@ -7318,6 +8638,8 @@ pub const ApiHttpServer = struct {
             .format = format,
             .io = io,
             .fence = fence,
+            .cancellation = operation_control.token(),
+            .deadline_ns = operation_control.deadline_ns,
         }) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
@@ -7326,43 +8648,165 @@ pub const ApiHttpServer = struct {
         defer freeBackupShards(self.alloc, shards);
         try writer_lease.ensureOwned();
 
-        if (switch (backup_location.*) {
-            .remote => true,
-            .file => false,
-        }) {
+        if (remote_repository) {
             for (shards) |shard| {
+                try operation_control.ensureActive();
                 const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(snapshot_root);
                 switch (format) {
-                    .portable => try backups_api.copyFileToLocation(
+                    .portable => backups_api.copyFileToLocationWithCancellation(
                         self.alloc,
                         backup_location,
                         shard.snapshot_path,
                         snapshot_root,
                         "application/vnd.antfly.backup",
-                    ),
-                    .native => try backups_api.copyDirectoryToLocation(
+                        operation_control.token(),
+                    ) catch |err| return operation_control.normalizeInterruption(err),
+                    .native => backups_api.copyDirectoryToLocationWithCancellation(
                         self.alloc,
                         backup_location,
                         artifact_backup_id,
                         shard.group_id,
                         snapshot_root,
-                    ),
+                        operation_control.token(),
+                    ) catch |err| return operation_control.normalizeInterruption(err),
                 }
             }
         }
 
+        try operation_control.ensureActive();
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
         try writer_lease.ensureOwned();
+        try operation_control.ensureActive();
         cleanup_safe.* = false;
-        backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-            cleanup_safe.* = switch (err) {
+        backups_api.writeManifestToLocationWithIoAndCancellation(
+            self.alloc,
+            io,
+            backup_location,
+            &manifest,
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            cleanup_safe.* = switch (normalized_err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                 else => false,
             };
-            return err;
+            if (remote_repository and
+                (normalized_err == error.Canceled or
+                    normalized_err == error.Cancelled or
+                    normalized_err == error.Timeout))
+                return error.BackupOutcomeAmbiguous;
+            return normalized_err;
         };
+    }
+
+    /// Captures exactly one fenced storage group for an authenticated internal
+    /// coordinator. The caller owns the table-level reservation and is the
+    /// only process allowed to publish the canonical manifest.
+    pub fn executeInternalTableBackupShard(
+        self: *ApiHttpServer,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
+        backup_location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
+    ) ![]backups_api.ShardSnapshot {
+        const io = self.sharedApiIo() orelse return error.BackupStorageUnavailable;
+        const writer_not_after = fence.writer_not_after_unix_ns orelse
+            return error.InvalidBackupFence;
+        const ensure_writer_active = struct {
+            fn call(active_io: std.Io, deadline: u64) !void {
+                const now: u64 = @intCast(std.Io.Timestamp.now(active_io, .real).toNanoseconds());
+                if (now >= deadline) return error.BackupAttemptLeaseLost;
+            }
+        }.call;
+        // The persisted not-after timestamp fences delayed delivery: a shard
+        // that did not begin before this point must never create artifacts.
+        // Once admitted, participate in the coordinator's same-owner durable
+        // lease so a long snapshot remains valid and stale-attempt cleanup
+        // cannot race an in-flight upload after the coordinator disconnects.
+        try ensure_writer_active(io, writer_not_after);
+        const bounded_request = self.boundedBackupRequest(request);
+        var operation_control = try backupOperationControl(io, fence, bounded_request);
+        var writer_lease: TableBackupWriterLeaseHeartbeat = .{
+            .alloc = self.alloc,
+            .io = io,
+            .location = backup_location,
+            .artifact_backup_id = artifact_backup_id,
+            .operation_cancellation = operation_control.token(),
+            .expires_at_unix_ns = .init(writer_not_after),
+        };
+        try writer_lease.ensureOwned();
+        var writer_lease_future = std.Io.async(
+            io,
+            TableBackupWriterLeaseHeartbeat.run,
+            .{&writer_lease},
+        );
+        defer {
+            writer_lease.stop_event.set(io);
+            writer_lease_future.await(io);
+        }
+
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => try self.createBackupStagingRoot(artifact_backup_id),
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
+        };
+
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const maybe_shards = try table_writes_source.backupTable(self.alloc, table_name, .{
+            .backup_root = local_backup_root,
+            .backup_id = artifact_backup_id,
+            .format = format,
+            .io = io,
+            .fence = fence,
+            .target_group_id = group_id,
+            .cancellation = operation_control.token(),
+            .deadline_ns = operation_control.deadline_ns,
+        });
+        const shards = maybe_shards orelse return error.TableNotFound;
+        errdefer freeBackupShards(self.alloc, shards);
+        if (shards.len != 1 or shards[0].group_id != group_id)
+            return error.CatalogChanged;
+        try writer_lease.ensureOwned();
+
+        if (switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            try operation_control.ensureActive();
+            const shard = shards[0];
+            const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+            defer self.alloc.free(snapshot_root);
+            switch (format) {
+                .portable => backups_api.copyFileToLocationWithCancellation(
+                    self.alloc,
+                    backup_location,
+                    shard.snapshot_path,
+                    snapshot_root,
+                    "application/vnd.antfly.backup",
+                    operation_control.token(),
+                ) catch |err| return operation_control.normalizeInterruption(err),
+                .native => backups_api.copyDirectoryToLocationWithCancellation(
+                    self.alloc,
+                    backup_location,
+                    artifact_backup_id,
+                    shard.group_id,
+                    snapshot_root,
+                    operation_control.token(),
+                ) catch |err| return operation_control.normalizeInterruption(err),
+            }
+        }
+        try operation_control.ensureActive();
+        try writer_lease.ensureOwned();
+        return shards;
     }
 
     fn cleanupClusterBackupAttempt(
@@ -7388,19 +8832,22 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         backup_id: []const u8,
         owner_id: []const u8,
+        control: *const backups_api.BackupOperationControl,
     ) !void {
         var reclaimed_expired = false;
         while (true) {
+            try control.ensureActive();
             const now_unix_ns: u64 =
                 @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
-            backups_api.reserveClusterBackupAttemptLeaseAtLocation(
+            backups_api.reserveClusterBackupAttemptLeaseAtLocationWithCancellation(
                 alloc,
                 io,
                 location,
                 backup_id,
                 owner_id,
                 now_unix_ns +| backups_api.backup_attempt_lease_duration_ns,
-            ) catch |err| switch (err) {
+                control.token(),
+            ) catch |err| switch (control.normalizeInterruption(err)) {
                 error.BackupAlreadyExists => {
                     const reclaimed = if (!reclaimed_expired)
                         try backups_api.reclaimExpiredClusterBackupAttemptAtLocation(
@@ -7418,7 +8865,7 @@ pub const ApiHttpServer = struct {
                     }
                     return error.BackupRepositoryBusy;
                 },
-                else => return err,
+                else => |normalized_err| return normalized_err,
             };
             return;
         }
@@ -7473,6 +8920,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         attempt_id: []const u8,
         stop_event: std.Io.Event = .unset,
+        operation_cancellation: api_operation.CancellationToken = .none,
         lost: std.atomic.Value(bool) = .init(false),
         expires_at_unix_ns: std.atomic.Value(u64),
 
@@ -7481,15 +8929,29 @@ pub const ApiHttpServer = struct {
             return now +| backups_api.backup_attempt_lease_duration_ns;
         }
 
+        fn cancellationToken(self: *const @This()) api_operation.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const heartbeat: *const ClusterBackupMutationLeaseHeartbeat = @ptrCast(@alignCast(raw));
+                        return heartbeat.stop_event.isSet() or
+                            heartbeat.operation_cancellation.isCancelled();
+                    }
+                }.call,
+            };
+        }
+
         fn renew(self: *@This()) !bool {
             const expiration = self.renewedExpiration();
-            const owned = try backups_api.renewClusterBackupAttemptLeaseAtLocation(
+            const owned = try backups_api.renewClusterBackupAttemptLeaseAtLocationWithCancellation(
                 self.alloc,
                 self.io,
                 self.location,
                 self.backup_id,
                 self.attempt_id,
                 expiration,
+                self.cancellationToken(),
             );
             if (owned) self.expires_at_unix_ns.store(expiration, .release);
             return owned;
@@ -7542,6 +9004,7 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         artifact_backup_id: []const u8,
         stop_event: std.Io.Event = .unset,
+        operation_cancellation: api_operation.CancellationToken = .none,
         lost: std.atomic.Value(bool) = .init(false),
         expires_at_unix_ns: std.atomic.Value(u64),
 
@@ -7550,14 +9013,28 @@ pub const ApiHttpServer = struct {
             return now +| backups_api.table_backup_writer_lease_duration_ns;
         }
 
+        fn cancellationToken(self: *const @This()) api_operation.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const heartbeat: *const TableBackupWriterLeaseHeartbeat = @ptrCast(@alignCast(raw));
+                        return heartbeat.stop_event.isSet() or
+                            heartbeat.operation_cancellation.isCancelled();
+                    }
+                }.call,
+            };
+        }
+
         fn renew(self: *@This()) !bool {
             const expiration = self.renewedExpiration();
-            const owned = try backups_api.renewTableBackupWriterLeaseAtLocation(
+            const owned = try backups_api.renewTableBackupWriterLeaseAtLocationWithCancellation(
                 self.alloc,
                 self.io,
                 self.location,
                 self.artifact_backup_id,
                 expiration,
+                self.cancellationToken(),
             );
             if (owned) self.expires_at_unix_ns.store(expiration, .release);
             return owned;
@@ -8117,13 +9594,18 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedBackupFormat,
                     error.UnsupportedMultiRangeTable,
                     error.TableNotFound,
+                    error.TableAlreadyExists,
+                    error.TableTransitionActive,
+                    error.MetadataTopologyCommandTooLarge,
+                    error.InvalidTableTopologyMutation,
                     error.UnsupportedOperation,
                     error.OutOfMemory,
                     => return err,
                     else => {
-                        // A reconciliation plan publishes the table and ranges as
-                        // separate proposals. Any error after one proposal may be
-                        // an interrupted exact restore intent, not a clean abort.
+                        // The atomic topology command may commit even if the
+                        // response is lost after admission. Resolve that
+                        // ambiguity from the exact durable restore intent
+                        // before considering a bounded replay.
                         const intent_state = self.distributedRestoreIntentState(
                             table_name,
                             location_uri,
@@ -8212,7 +9694,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?RestoreCancellation,
     ) !void {
         const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
-        var poll_ms: u64 = 250;
+        var poll_ms: u64 = 100;
         while (true) {
             try self.ensureRestoreActive(cancellation);
             switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id, artifact_backup_id)) {
@@ -8222,7 +9704,10 @@ pub const ApiHttpServer = struct {
                 .conflicting => return error.RestoreIntentConflict,
             }
             io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch return error.RestoreWaitInterrupted;
-            poll_ms = @min(poll_ms * 2, 5000);
+            // Completion is operator-visible job state. Keep observation
+            // reasonably prompt while bounding metadata load, and never make
+            // shutdown inherit a multi-second sleep from an active restore.
+            poll_ms = @min(poll_ms * 2, 1000);
         }
     }
 
@@ -9989,13 +11474,15 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        receipt: *public_table_http.TableApi.BackupExecutionReceipt,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        try ensureTableOperationActive(request);
+        const operation_request = self.boundedBackupRequest(request);
+        try ensureTableOperationActive(operation_request);
         var admitted_fence: backups_api.TableBackupFence = undefined;
         var table = table: {
-            var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+            var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
                 if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
                 std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
@@ -10019,14 +11506,16 @@ pub const ApiHttpServer = struct {
             null;
         defer if (fallback_io) |*owned| owned.deinit();
         const io = self.sharedApiIo() orelse fallback_io.?.io();
-        // This is the last safe cancellation point: once backup publication
-        // starts, returning cancellation could invite an unsafe replay after
-        // an ambiguous durable outcome.
-        try ensureTableOperationActive(request);
+        // Establish admission before publication. Cancellation remains safe
+        // afterward because the operation control drains in-flight work and
+        // the reservation rollback path converts uncertain delivery into an
+        // explicitly ambiguous outcome.
+        try ensureTableOperationActive(operation_request);
         // A forwarded storage-owner hop must preserve the coordinator's
         // generation ID. Generating another ID here would leave cleanup unable
         // to address the actual payload after a failed or ambiguous transport.
         const backup_result = if (expected_fence) |forwarded_fence| blk: {
+            receipt.recordArtifactBackupId(backup_id);
             var storage_fence = admitted_fence;
             storage_fence.writer_not_after_unix_ns = forwarded_fence.writer_not_after_unix_ns;
             break :blk self.backupOwnedTableWithArtifactId(
@@ -10040,14 +11529,16 @@ pub const ApiHttpServer = struct {
                 backup_id,
                 format,
                 connection,
+                receipt,
                 // Legacy coordinators forward only the original four-field
                 // fence and cannot pre-create a writer lease. Preserve that
                 // one rolling-upgrade direction by letting the new owner
                 // create the lease; current coordinators carry metadata
                 // identity and require adoption of their delivery fence.
                 if (forwarded_fence.hasMetadataIdentity()) .adopt else .legacy_forwarded_create,
+                operation_request,
             );
-        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
+        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection, receipt, operation_request);
         backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
@@ -10060,6 +11551,8 @@ pub const ApiHttpServer = struct {
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
             error.BackupOutcomeAmbiguous => return error.BackupOutcomeAmbiguous,
             error.BackupAttemptLeaseLost => return error.BackupOutcomeAmbiguous,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -11125,10 +12618,19 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        request.ensureActive() catch |err| switch (err) {
+        const operation_request = self.boundedBackupRequest(request);
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
+        };
+        var operation_control: backups_api.BackupOperationControl = .{
+            .deadline_ns = operation_request.deadline_ns.?,
+            .cancellation = operation_request.cancellation,
+        };
+        const remote_repository = switch (location.*) {
+            .file => false,
+            .remote => true,
         };
         const op_alloc = self.alloc;
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
@@ -11140,7 +12642,7 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+        var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
             if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
             if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
@@ -11151,7 +12653,7 @@ pub const ApiHttpServer = struct {
             return error.MetadataCapabilityUnavailable;
         };
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
-        request.ensureActive() catch |err| switch (err) {
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
@@ -11241,18 +12743,35 @@ pub const ApiHttpServer = struct {
         // Cancellation is safe through this point because no durable backup
         // state exists. Once the marker is published, preserve the existing
         // ambiguous-outcome invariant and let cleanup own failure handling.
-        request.ensureActive() catch |err| switch (err) {
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
         };
         trace.enter(.attempt_marker);
-        backups_api.writeClusterBackupAttemptMarker(
+        backups_api.writeClusterBackupAttemptMarkerWithCancellation(
             op_alloc,
             backup_io,
             location,
             &attempt_marker,
-        ) catch |err| return trace.internal(err);
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            // Local publication may already have exposed the reclaim ticket;
+            // remote publication may have committed despite cancellation.
+            // Durable maintenance owns either orphan form. Never put an
+            // uncancellable repository delete on the response path after the
+            // caller's operation budget has expired.
+            self.scheduleClusterBackupMaintenance(req.location, connection) catch |schedule_err| {
+                std.log.warn("cluster backup interrupted marker maintenance scheduling deferred class={s}", .{@errorName(schedule_err)});
+            };
+            self.scheduleClusterBackupAttemptCleanup(req.location, connection, attempt_id) catch |schedule_err| {
+                std.log.warn("cluster backup interrupted marker exact cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
+            };
+            if (normalized_err == error.Canceled) return error.Canceled;
+            if (normalized_err == error.Timeout) return error.DeadlineExceeded;
+            return trace.internal(normalized_err);
+        };
         // Admission must establish the durable journal before this repository
         // becomes visible to asynchronous maintenance. On a new filesystem
         // repository, scheduling first lets the reclaimer and publisher race
@@ -11284,6 +12803,7 @@ pub const ApiHttpServer = struct {
             location,
             req.backup_id,
             attempt_id,
+            &operation_control,
         ) catch |err| switch (err) {
             error.BackupRepositoryBusy => {
                 backups_api.deleteClusterBackupAttemptMarker(
@@ -11296,6 +12816,20 @@ pub const ApiHttpServer = struct {
                 };
                 return error.BackupRepositoryBusy;
             },
+            error.Canceled, error.Timeout => |interruption| {
+                // Conditional reservation writes are ambiguous when their
+                // transport is interrupted. The durable marker and reclaim
+                // ticket make the maintenance owner authoritative; returning
+                // does not wait for repository health to recover.
+                self.scheduleClusterBackupMaintenance(req.location, connection) catch |schedule_err| {
+                    std.log.warn("cluster backup interrupted admission maintenance scheduling deferred class={s}", .{@errorName(schedule_err)});
+                };
+                self.scheduleClusterBackupAttemptCleanup(req.location, connection, attempt_id) catch |schedule_err| {
+                    std.log.warn("cluster backup interrupted admission exact cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
+                };
+                if (interruption == error.Canceled) return error.Canceled;
+                return error.DeadlineExceeded;
+            },
             // An unknown conditional-write outcome may have acquired the
             // reservation. Retain the marker so recovery can resolve it.
             else => return trace.internal(err),
@@ -11303,8 +12837,13 @@ pub const ApiHttpServer = struct {
         var cluster_committed = false;
         var cluster_cleanup_safe = true;
         var table_outcome_ambiguous = false;
-        errdefer if (!cluster_committed) {
-            if (cluster_cleanup_safe) {
+        errdefer |err| if (!cluster_committed) {
+            if (cluster_cleanup_safe and
+                err != error.Canceled and
+                err != error.Cancelled and
+                err != error.DeadlineExceeded and
+                err != error.Timeout)
+            {
                 self.cleanupClusterBackupAttempt(
                     backup_io,
                     location,
@@ -11312,8 +12851,15 @@ pub const ApiHttpServer = struct {
                 ) catch |cleanup_err| {
                     std.log.err("cluster backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
                 };
-            } else {
+            } else if (!cluster_cleanup_safe) {
                 std.log.err("cluster backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
+            } else {
+                self.scheduleClusterBackupMaintenance(req.location, connection) catch |schedule_err| {
+                    std.log.warn("cluster backup interrupted rollback maintenance scheduling deferred class={s}", .{@errorName(schedule_err)});
+                };
+                self.scheduleClusterBackupAttemptCleanup(req.location, connection, attempt_id) catch |schedule_err| {
+                    std.log.warn("cluster backup interrupted rollback exact cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
+                };
             }
         };
         // Publishing the head is the attempt-start linearization point. It is
@@ -11322,12 +12868,18 @@ pub const ApiHttpServer = struct {
         // every attempt that can produce side effects is visible to restore.
         // Cleanup conditionally retires an ambiguous or failed publication.
         trace.enter(.attempt_head);
-        backups_api.writeClusterBackupAttemptHead(
+        backups_api.writeClusterBackupAttemptHeadWithCancellation(
             op_alloc,
             backup_io,
             location,
             attempt_id,
-        ) catch |err| return trace.internal(err);
+            operation_control.token(),
+        ) catch |err| {
+            const normalized_err = operation_control.normalizeInterruption(err);
+            if (normalized_err == error.Canceled) return error.Canceled;
+            if (normalized_err == error.Timeout) return error.DeadlineExceeded;
+            return trace.internal(normalized_err);
+        };
         const initial_lease_expiration =
             @as(u64, @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds())) +|
             backups_api.backup_attempt_lease_duration_ns;
@@ -11337,6 +12889,7 @@ pub const ApiHttpServer = struct {
             .location = location,
             .backup_id = req.backup_id,
             .attempt_id = attempt_id,
+            .operation_cancellation = operation_control.token(),
             .expires_at_unix_ns = .init(initial_lease_expiration),
         };
         // Refresh once synchronously so the tracked expiration exactly matches
@@ -11357,6 +12910,10 @@ pub const ApiHttpServer = struct {
 
         trace.enter(.table_snapshots);
         for (table_names, attempt_tables, 0..) |table_name, attempt_table, i| {
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             if (lease_heartbeat.lost.load(.acquire))
                 return trace.internal(error.BackupAttemptLeaseLost);
             const status_name = op_alloc.dupe(u8, table_name) catch |err| return trace.internal(err);
@@ -11380,7 +12937,9 @@ pub const ApiHttpServer = struct {
                 attempt_table.artifact_backup_id,
                 req.format,
                 connection,
+                null,
                 .logical_create,
+                operation_request,
             ) catch |err| {
                 if (err == error.BackupOutcomeAmbiguous) {
                     // The forwarded owner may still be completing work after a
@@ -11417,6 +12976,8 @@ pub const ApiHttpServer = struct {
                     error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     error.CatalogChanged => backups_api.catalog_changed_message,
                     error.BackupOutcomeAmbiguous => backups_api.backup_outcome_ambiguous_message,
+                    error.Canceled, error.Cancelled => return error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
                     else => blk: {
                         std.log.warn("cluster backup table snapshot failed table={s} class={s}", .{
                             table_name,
@@ -11448,6 +13009,10 @@ pub const ApiHttpServer = struct {
         // status without exposing a partial aggregate as a restore candidate.
         if (cluster_tables.items.len == table_names.len) {
             trace.enter(.aggregate_publish);
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             // Close the last renewal/publication race. If another process took
             // an expired lease, this conditional renewal fences publication.
             lease_heartbeat.ensureOwned() catch |err| return trace.internal(err);
@@ -11464,16 +13029,35 @@ pub const ApiHttpServer = struct {
                 extension_dependencies,
             ) catch |err| return trace.internal(err);
             defer manifest.deinit(op_alloc);
+            operation_control.ensureActive() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.DeadlineExceeded,
+            };
             cluster_cleanup_safe = false;
-            backups_api.writeClusterManifestToLocationWithIo(op_alloc, backup_io, location, &manifest) catch |err| {
-                cluster_cleanup_safe = switch (err) {
+            backups_api.writeClusterManifestToLocationWithIoAndCancellation(
+                op_alloc,
+                backup_io,
+                location,
+                &manifest,
+                operation_control.token(),
+            ) catch |err| {
+                const normalized_err = operation_control.normalizeInterruption(err);
+                cluster_cleanup_safe = switch (normalized_err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
+                    error.Canceled, error.Cancelled, error.Timeout => !remote_repository,
                     else => false,
                 };
-                return switch (err) {
+                if (remote_repository and
+                    (normalized_err == error.Canceled or
+                        normalized_err == error.Cancelled or
+                        normalized_err == error.Timeout))
+                    return error.BackupOutcomeAmbiguous;
+                return switch (normalized_err) {
                     error.BackupAlreadyExists => error.BackupAlreadyExists,
                     error.BackupManifestTooLarge => error.BackupManifestTooLarge,
-                    else => trace.internal(err),
+                    error.Canceled => error.Canceled,
+                    error.Timeout => error.DeadlineExceeded,
+                    else => trace.internal(normalized_err),
                 };
             };
             if (!(backups_api.commitClusterBackupAttemptHeadIfOwned(
@@ -12089,6 +13673,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn ensureRestoreActive(self: *ApiHttpServer, cancellation: ?RestoreCancellation) error{ NotLeader, Cancelled, InternalFailure }!void {
+        if (self.restore_jobs_closing.load(.acquire)) return error.Cancelled;
         if (!self.restoreExecutionPermitted()) return error.NotLeader;
         const token = cancellation orelse return;
         const attempt_state = self.restore_job_store.attemptState(self.alloc, token.job_id, token.attempt_id) catch
@@ -12307,6 +13892,8 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        if (body.len > tables_api.max_table_create_body_bytes)
+            return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
         var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
             return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
         defer request.deinit(self.alloc);
@@ -12389,23 +13976,40 @@ pub const ApiHttpServer = struct {
 
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
-            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
+            error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
+            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => return err,
+            else => if (metadata_authority.isRetryableError(err))
+                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else
+                return err,
         };
-        const local_handled = if (self.table_writes) |writes|
-            (try writes.createTable(self.alloc, table_name, request)) != null
-        else
-            false;
+        const local_outcome = self.materializeCommittedTableCreate(self.alloc, table_name, request);
+        switch (local_outcome) {
+            .repair_required => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_required),
+            .repair_unavailable => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_unavailable),
+            .applied, .delegated => {},
+        }
+        const local_handled = local_outcome == .applied;
         if (local_handled) {
             self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
-                error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                else => return err,
+                else => {
+                    std.log.warn("MCP table create committed before projected presence was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                    return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                },
             };
             if (!self.cfg.deployment_mode.isStandalone()) {
                 self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed before write quorum was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             }
         } else {
@@ -12413,53 +14017,92 @@ pub const ApiHttpServer = struct {
                 break :lifecycle switch (err) {
                     error.TableVisibilityTimeout => {
                         self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
-                            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                            else => return fallback_err,
+                            else => {
+                                std.log.warn("MCP table create committed before projected readiness was observable table={s} err={s}", .{ table_name, @errorName(fallback_err) });
+                                return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                            },
                         };
                         break :lifecycle true;
                     },
-                    error.NotLeader => return err,
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed with lifecycle observation failure table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             };
             if (!metadata_wait_handled) {
                 self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed before visibility was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             }
         }
         const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
-            return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+            return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
         return contextual_operations.json(response_body, false);
     }
 
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
-        var group_ids: ?[]u64 = null;
-        defer if (group_ids) |values| self.alloc.free(values);
-        if (self.table_writes != null) {
-            if (try self.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.source.freeAdminSnapshot(&snapshot);
-                group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
-            }
-        }
-        self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+        var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
+            error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
-            error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
-            error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => return err,
+            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size"),
+            error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
+            error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            else => if (metadata_authority.isRetryableError(err))
+                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else
+                return err,
+        };
+        defer drop_result.deinit(self.alloc);
+        var repair_required = false;
+        // The metadata commit can complete on a remote leader before this
+        // node applies the resulting catalog projection. Prefer observing the
+        // absence before consulting catalog ownership for destructive cleanup;
+        // the cleanup path still persists and retains repair debt if the wait
+        // times out or ownership remains inconclusive.
+        self.waitForTableVisibility(table_name, .absent) catch |err| {
+            repair_required = true;
+            std.log.warn(
+                "MCP drop table committed before local absence became observable table={s} err={s}",
+                .{ table_name, @errorName(err) },
+            );
         };
         if (self.table_writes) |writes| {
-            _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
+            _ = writes.dropTable(self.alloc, table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
-                else => return err,
+                error.DropCleanupIntentNotDurable => {
+                    std.log.err("MCP drop table committed but cleanup intent was not durable table={s}", .{table_name});
+                    const body = try std.json.Stringify.valueAlloc(
+                        self.alloc,
+                        .{ .status = "committed_repair_unavailable" },
+                        .{},
+                    );
+                    // The metadata mutation committed; surface operator debt
+                    // without reporting a replay-safe request failure.
+                    return contextual_operations.jsonWithStatus(202, body, false);
+                },
+                else => {
+                    repair_required = true;
+                    std.log.warn("MCP drop table committed with local cleanup repair required table={s} err={s}", .{ table_name, @errorName(err) });
+                },
             };
         }
-        self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table delete did not converge"),
-            else => return err,
-        };
+        if (repair_required) {
+            const body = try std.json.Stringify.valueAlloc(
+                self.alloc,
+                .{ .status = "committed_repair_required" },
+                .{},
+            );
+            return contextual_operations.jsonWithStatus(202, body, false);
+        }
         return try contextual_operations.textAlloc(self.alloc, 204, "");
     }
 
@@ -14968,12 +16611,17 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try createTableOnService(service, alloc, table_name, req);
+            return try metadata_table_topology_mutations.create(service, alloc, .{}, table_name, req);
         }
 
         fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            var result = try dropTableExact(ptr, alloc, table_name);
+            defer result.deinit(alloc);
+        }
+
+        fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try dropTableOnService(service, alloc, table_name);
+            return try metadata_table_topology_mutations.drop(service, alloc, .{}, table_name);
         }
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -15006,6 +16654,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .free_admin_snapshot = V.freeAdminSnapshot,
             .create_table = V.createTable,
             .drop_table = V.dropTable,
+            .drop_table_exact = V.dropTableExact,
             .update_schema = V.updateSchema,
             .update_schema_versioned = V.updateSchemaVersioned,
             .create_index = V.createIndex,
@@ -15953,6 +17602,92 @@ fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: 
     };
 }
 
+fn contextualMutationOutcomeUnknownTextResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = try ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+    );
+    errdefer headers[0].deinit(alloc);
+    return .{
+        // Conflict is deliberately non-retryable: the mutation may already be
+        // committed, and callers must observe its durable projection first.
+        .status = 409,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, body),
+        .headers = headers,
+    };
+}
+
+const CommittedCreateOutcome = enum { visibility_pending, repair_required, repair_unavailable };
+
+fn contextualCommittedCreateOutcomeResponse(
+    alloc: std.mem.Allocator,
+    outcome: CommittedCreateOutcome,
+) !contextual_operations.OwnedResponse {
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .status = switch (outcome) {
+        .visibility_pending => "committed_visibility_pending",
+        .repair_required => "committed_repair_required",
+        .repair_unavailable => "committed_repair_unavailable",
+    } }, .{});
+    errdefer alloc.free(body);
+    var response = contextual_operations.jsonWithStatus(202, body, false);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(response.headers);
+    response.headers[0] = try ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        switch (outcome) {
+            .visibility_pending => metadata_http_routes.Routes.raft_mutation_outcome_committed_visibility_pending,
+            .repair_required, .repair_unavailable => metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        },
+    );
+    return response;
+}
+
+fn contextualMutationOutcomeUnknownJsonResponse(
+    alloc: std.mem.Allocator,
+    message: []const u8,
+) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonErrorResponse(alloc, 409, message);
+    errdefer response.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+    ) catch |err| {
+        alloc.free(response.headers);
+        response.headers = &.{};
+        return err;
+    };
+    return response;
+}
+
+test "ambiguous mutation response is explicitly non-retryable" {
+    var response = try contextualMutationOutcomeUnknownTextResponse(
+        std.testing.allocator,
+        "outcome unknown",
+    );
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        response.headers[0].name,
+    );
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        response.headers[0].value,
+    );
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(response.headers[0].name, "Retry-After"));
+}
+
 fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
     var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
     errdefer response.deinit(alloc);
@@ -15971,9 +17706,11 @@ fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_ope
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
+        error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownJsonResponse(alloc, "extension mutation outcome is unknown; observe extension state before retrying"),
         error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
         error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
         error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
+        error.ExtensionLifecycleConflict => try contextualJsonErrorResponse(alloc, 409, "extension lifecycle conflicted with a concurrent catalog transition; retry after observing current state"),
         error.DependentExtensionExists => try contextualJsonErrorResponse(alloc, 409, "dependent extension exists"),
         error.RequiredExtensionNotInstalled => try contextualJsonErrorResponse(alloc, 409, "required extension not installed"),
         error.UnsupportedManifestApiVersion,
@@ -16514,6 +18251,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (isHaAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
+    if (std.mem.eql(u8, path, admin_routes.raft) or std.mem.startsWith(u8, path, admin_routes.raft ++ "/")) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
@@ -23897,6 +25635,13 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(requiresAdminPermission("/extensions/v1/installed/memoryaf"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/packagesXYZ"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
+}
+
+test "api http server treats only the raft admin namespace as admin routes" {
+    try std.testing.expect(requiresAdminPermission(admin_routes.raft));
+    try std.testing.expect(requiresAdminPermission(admin_routes.raft_quarantines));
+    try std.testing.expect(requiresAdminPermission("/admin/v1/raft/groups/41/quarantine/resume"));
+    try std.testing.expect(!requiresAdminPermission("/admin/v1/raftish"));
 }
 
 test "retrieval route delegates authorization to referenced tables" {
@@ -33707,18 +35452,31 @@ test "api http server create table with local writes waits for projected presenc
     };
 
     const FakeWrites = struct {
+        fail_create: bool = false,
+        reconcile_calls: u32 = 0,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .create_table = createTable,
+                    .request_table_structural_reconcile = requestTableStructuralReconcile,
                     .local_runtime_statuses = localRuntimeStatuses,
                     .batch = batch,
                 },
             };
         }
 
-        fn createTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !?void {
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_create) return error.InjectedLocalCreateFailure;
+            return;
+        }
+
+        fn requestTableStructuralReconcile(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.reconcile_calls += 1;
             return;
         }
 
@@ -33757,6 +35515,133 @@ test "api http server create table with local writes waits for projected presenc
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+
+    // The metadata definition is already committed when local materialization
+    // runs. A local failure must hand off repair and return a non-replayable
+    // committed outcome instead of a generic 5xx.
+    source.created = false;
+    writes.fail_create = true;
+    var repair_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer repair_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), repair_resp.status);
+    try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls);
+    try std.testing.expect(std.mem.indexOf(u8, repair_resp.body, "committed_repair_required") != null);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        repair_resp.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse return error.MissingMutationOutcomeHeader,
+    );
+}
+
+test "api http server rejects oversized table definitions before parsing across public and MCP" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .create_table = createTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+        }
+    };
+
+    const oversized = try alloc.alloc(u8, tables_api.max_table_create_body_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+
+    var public_response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = oversized,
+    });
+    defer public_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 413), public_response.status);
+
+    var mcp_response = try server.executeMcpCreateTable("docs", oversized, null);
+    defer mcp_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 413), mcp_response.status);
+    try std.testing.expectEqual(@as(usize, 0), source.create_calls);
+}
+
+test "api http server reports exhausted table mutation authority consistently" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .create_table = createTable,
+                .drop_table = dropTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            return error.MetadataLinearizableReadTimeout;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drop_calls += 1;
+            return error.NotLeader;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 2 };
+
+    var public_create = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer public_create.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(public_create);
+
+    var public_drop = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer public_drop.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(public_drop);
+
+    var mcp_create = try server.executeMcpCreateTable("docs", "{}", null);
+    defer mcp_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), mcp_create.status);
+    try std.testing.expectEqualStrings("1", mcp_create.headers[0].value);
+
+    var mcp_drop = try server.executeMcpDropTable("docs");
+    defer mcp_drop.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), mcp_drop.status);
+    try std.testing.expectEqualStrings("1", mcp_drop.headers[0].value);
+    try std.testing.expectEqual(@as(usize, 3), source.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), source.drop_calls);
 }
 
 test "schema projection expectation uses backend committed generation" {
@@ -35633,7 +37518,7 @@ test "api index status reports missing remote shard as not ready" {
     try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
 }
 
-test "api http server drop table waits for metadata lifecycle absence" {
+test "api http server drop table observes metadata absence before local cleanup" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -35648,6 +37533,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .drop_table = dropTable,
+                    .drop_table_exact = dropTableExact,
                     .wait_table_lifecycle = waitTableLifecycle,
                 },
             };
@@ -35693,6 +37579,15 @@ test "api http server drop table waits for metadata lifecycle absence" {
             self.created = false;
         }
 
+        fn dropTableExact(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
+            try dropTable(ptr, inner_alloc, table_name);
+            return .{
+                .table_id = 1,
+                .expected_transition_generation = 4,
+                .group_ids = try inner_alloc.dupe(u64, &.{10}),
+            };
+        }
+
         fn waitTableLifecycle(ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
@@ -35702,12 +37597,18 @@ test "api http server drop table waits for metadata lifecycle absence" {
     };
 
     const FakeWrites = struct {
+        lifecycle_wait_calls: *std.atomic.Value(u32),
+        expected_lifecycle_wait_calls: u32 = 1,
+        observed_group_id: ?u64 = null,
+        fail_cleanup: bool = false,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .local_runtime_statuses = localRuntimeStatuses,
                     .batch = batch,
+                    .drop_table = dropTable,
                 },
             };
         }
@@ -35719,10 +37620,22 @@ test "api http server drop table waits for metadata lifecycle absence" {
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
             return;
         }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, contract: table_writes.DropCleanupContract) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), contract.group_ids.len);
+            try std.testing.expectEqual(
+                self.expected_lifecycle_wait_calls,
+                self.lifecycle_wait_calls.load(.monotonic),
+            );
+            self.observed_group_id = contract.group_ids[0];
+            if (self.fail_cleanup) return error.InjectedCleanupFailure;
+        }
     };
 
     var source = FakeSource{};
-    var writes = FakeWrites{};
+    var writes = FakeWrites{ .lifecycle_wait_calls = &source.lifecycle_wait_calls };
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
 
     var resp = try executeHttpxTestRequest(&server, .{
@@ -35732,6 +37645,19 @@ test "api http server drop table waits for metadata lifecycle absence" {
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
     try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, 10), writes.observed_group_id);
+
+    source.created = true;
+    writes.fail_cleanup = true;
+    writes.expected_lifecycle_wait_calls = 2;
+    var repair_response = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer repair_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), repair_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_response.body, "committed_repair_required") != null);
+    try std.testing.expectEqual(@as(u32, 2), source.lifecycle_wait_calls.load(.monotonic));
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {
@@ -35943,6 +37869,49 @@ test "api http server serves table metadata routes against real metadata service
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    const derived_schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"customer":{"type":"keyword"},"amount":{"type":"number"},"created_at":{"type":"datetime"}}}}}}
+    ;
+    const derived_indexes_json =
+        \\{"sales_rollup":{"type":"algebraic","derive_from_schema":true}}
+    ;
+    const embedded_source = StatusSource.fromMetadataService(&svc);
+    const owned_derived_schema = try std.testing.allocator.dupe(u8, derived_schema_json);
+    const owned_derived_indexes = std.testing.allocator.dupe(u8, derived_indexes_json) catch |err| {
+        std.testing.allocator.free(owned_derived_schema);
+        return err;
+    };
+    var derived_request = tables_api.CreateTableRequest{
+        .schema_json = owned_derived_schema,
+        .indexes_json = owned_derived_indexes,
+    };
+    defer derived_request.deinit(std.testing.allocator);
+    var derived_create_attempt: usize = 0;
+    while (true) {
+        embedded_source.createTable(std.testing.allocator, "derived_orders", derived_request) catch |err| {
+            // A just-campaigned in-memory Raft group may advance its term while
+            // the protocol capability token is being captured. The shared
+            // mutation boundary proves this NotLeader outcome is pre-admission,
+            // so mirror the production router's bounded rediscovery retry.
+            if (err != error.NotLeader or derived_create_attempt == 7) return err;
+            derived_create_attempt += 1;
+            try svc.runRound();
+            continue;
+        };
+        break;
+    }
+    {
+        var derived_snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&derived_snapshot);
+        const derived_table = tables_api.findTableByName(&derived_snapshot, "derived_orders") orelse
+            return error.MissingDerivedTable;
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"derive_from_schema\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"capability_fingerprint\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"group_fields\"") != null);
+    }
+    var derived_drop = try embedded_source.dropTableExact(std.testing.allocator, "derived_orders");
+    derived_drop.deinit(std.testing.allocator);
+
     var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
@@ -36061,6 +38030,14 @@ test "api http server serves table metadata routes against real metadata service
     });
     defer invalid_batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), invalid_batch_resp.status);
+
+    var drop_result = try StatusSource.fromMetadataService(&svc).dropTableExact(std.testing.allocator, "docs");
+    defer drop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, tables_api.deriveTableRecord("docs", .{}).table_id), drop_result.table_id);
+    try std.testing.expectEqual(@as(usize, 1), drop_result.group_ids.len);
+    var dropped_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&dropped_snapshot);
+    try std.testing.expect(tables_api.findTableByName(&dropped_snapshot, "docs") == null);
 }
 
 test "api http server create table with replication sources returns encoded table detail" {
@@ -37090,6 +39067,7 @@ test "table backup retry preserves the retained ambiguous generation" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     defer server.deinit();
+    var execution_receipt: public_table_http.TableApi.BackupExecutionReceipt = .{};
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
         .name = "docs",
@@ -37109,7 +39087,9 @@ test "table backup retry preserves the retained ambiguous generation" {
             "new-generation",
             .portable,
             "backups",
+            &execution_receipt,
             .logical_create,
+            .{},
         ),
     );
     const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
@@ -37120,6 +39100,164 @@ test "table backup retry preserves the retained ambiguous generation" {
     )).?;
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("retained-generation", retained);
+    try std.testing.expectEqualStrings("retained-generation", execution_receipt.artifactBackupId().?);
+}
+
+test "table backup retry reclaims an eligible reservation and admits the new generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stale-table-retry", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupAttemptAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "stale-generation",
+        .portable,
+        fence,
+    );
+    const reservation_path = try std.fmt.allocPrint(alloc, "{s}/logical-reservation", .{root});
+    defer alloc.free(reservation_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = reservation_path,
+        .data =
+        \\{"format_version":1,"created_at_unix_ns":1,"backup_id":"logical","artifact_backup_id":"stale-generation","format":"portable","writer_not_after_unix_ns":2}
+        ,
+    });
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var execution_receipt: public_table_http.TableApi.BackupExecutionReceipt = .{};
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    // UnsupportedOperation is reached only after stale reclamation admitted
+    // the new generation; this test server intentionally has no write source.
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            "docs",
+            &location,
+            "file:///backups",
+            "logical",
+            "new-generation",
+            .portable,
+            "backups",
+            &execution_receipt,
+            .logical_create,
+            .{},
+        ),
+    );
+    try std.testing.expectEqualStrings("new-generation", execution_receipt.artifactBackupId().?);
+    try std.testing.expect((try backups_api.tableBackupAttemptArtifactIdAlloc(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+    )) == null);
+}
+
+test "table backup lease conflict retains the retry address and live writer fence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-writer-lease", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "generation",
+        std.math.maxInt(u64),
+    );
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    try std.testing.expectError(
+        error.BackupOutcomeAmbiguous,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            table.name,
+            &location,
+            "file:///backups",
+            "logical",
+            "generation",
+            .portable,
+            "backups",
+            null,
+            .logical_create,
+            .{},
+        ),
+    );
+
+    try std.testing.expect(try backups_api.tableBackupAttemptMatchesAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "generation",
+    ));
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "generation",
+        std.math.maxInt(u64),
+    ));
 }
 
 test "table backup writer roles enforce rolling forwarded lease lifecycle" {
@@ -37165,8 +39303,10 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
             _: []const u8,
             _: []const u8,
             _: *anyopaque,
+            control: backups_api.BackupOperationControl,
         ) !?[]backups_api.ShardSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try control.ensureActive();
             self.calls += 1;
             const shards = try inner_alloc.alloc(backups_api.ShardSnapshot, 1);
             errdefer inner_alloc.free(shards);
@@ -37222,7 +39362,9 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "logical-artifact",
         .portable,
         "backups",
+        null,
         .logical_create,
+        .{},
     );
     try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
@@ -37243,7 +39385,9 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "legacy",
         .portable,
         "backups",
+        null,
         .legacy_forwarded_create,
+        .{},
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
@@ -37273,7 +39417,9 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "adopt-artifact",
         .portable,
         "backups",
+        null,
         .adopt,
+        .{},
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
@@ -37449,22 +39595,6 @@ test "restore job list paginates after authorization filtering" {
     try std.testing.expectEqual(@as(usize, 1), second_jobs.len);
     try std.testing.expectEqualStrings("docs-old", second_jobs[0].object.get("backup_id").?.string);
     try std.testing.expect(second_json.value.object.get("next_cursor") == null);
-}
-
-test "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges" {
-    const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 2 };
-    const expected = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 101, .table_id = 7, .start_key = "", .end_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "101" },
-        .{ .group_id = 102, .table_id = 7, .start_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "102" },
-    };
-    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, expected[0..1], table, &expected));
-    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &expected, table, &expected));
-
-    const foreign = [_]metadata_table_manager.RangeRecord{.{ .group_id = 103, .table_id = 7, .start_key = "" }};
-    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &foreign, table, &expected));
-    var changed = table;
-    changed.schema_json = "{\"version\":2}";
-    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, changed, &.{}, table, &expected));
 }
 
 test "restore job list bounds authorization scans with an empty continuation page" {
@@ -38217,10 +40347,10 @@ test "api http server cluster overwrite restores from read-only repository witho
             return error.UnsupportedOperation;
         }
 
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, contract: table_writes.DropCleanupContract) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            _ = group_ids;
+            _ = contract;
             self.state.local_drop_called = true;
             return error.TestUnexpectedResult;
         }
@@ -38803,7 +40933,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
     try std.testing.expect(restore_source.restored);
 }
 
-test "api http server retries stale metadata table-exists restore race" {
+test "api http server does not retry authoritative metadata table-exists conflict" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -38811,8 +40941,8 @@ test "api http server retries stale metadata table-exists restore race" {
     defer alloc.free(location_uri);
 
     const RestoreSource = struct {
-        attempts: usize = 0,
-        restored: bool = false,
+        attempts: std.atomic.Value(usize) = .init(0),
+        restored: std.atomic.Value(bool) = .init(false),
         expected_location: []const u8,
 
         fn iface(self: *@This()) StatusSource {
@@ -38845,9 +40975,9 @@ test "api http server retries stale metadata table-exists restore race" {
             try std.testing.expectEqualStrings("snap1", artifact_backup_id);
             try std.testing.expectEqualStrings("snap1", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
-            self.attempts += 1;
-            if (self.attempts == 1) return error.TableAlreadyExists;
-            self.restored = true;
+            const attempt = self.attempts.fetchAdd(1, .acq_rel) + 1;
+            if (attempt == 1) return error.TableAlreadyExists;
+            self.restored.store(true, .release);
         }
     };
 
@@ -38876,8 +41006,12 @@ test "api http server retries stale metadata table-exists restore race" {
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
     defer alloc.free(terminal_restore);
-    try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
-    try std.testing.expect(restore_source.restored);
+    var parsed_terminal = try std.json.parseFromSlice(restore_jobs.JobState, alloc, terminal_restore, .{ .ignore_unknown_fields = true });
+    defer parsed_terminal.deinit();
+    try std.testing.expectEqual(restore_jobs.Phase.failed, parsed_terminal.value.phase);
+    try std.testing.expectEqualStrings("TableAlreadyExists", parsed_terminal.value.last_error orelse "");
+    try std.testing.expectEqual(@as(usize, 1), restore_source.attempts.load(.acquire));
+    try std.testing.expect(!restore_source.restored.load(.acquire));
 }
 
 test "api http server retries interrupted metadata restore publication" {

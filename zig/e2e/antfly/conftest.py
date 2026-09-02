@@ -311,6 +311,54 @@ def _created_table_from_path(path: str) -> str | None:
     return unquote(parts[1])
 
 
+class IndexReadinessProtocolError(AssertionError):
+    """The server advertised canonical readiness with an invalid shape."""
+
+
+def _canonical_index_readiness(status: dict[str, Any]) -> dict[str, Any] | None:
+    if "readiness" not in status:
+        return None
+    readiness = status["readiness"]
+    if not isinstance(readiness, dict):
+        raise IndexReadinessProtocolError(
+            "status.readiness must be an object when present, "
+            f"got {type(readiness).__name__}"
+        )
+    state = readiness.get("state")
+    if state not in {"pending", "queryable_partial", "ready", "failed"}:
+        raise IndexReadinessProtocolError(
+            f"status.readiness.state has unsupported value {state!r}"
+        )
+    for field in ("queryable", "complete"):
+        if type(readiness.get(field)) is not bool:
+            raise IndexReadinessProtocolError(
+                f"status.readiness.{field} must be a boolean"
+            )
+    pending_reasons = readiness.get("pending_reasons")
+    if not isinstance(pending_reasons, list) or not all(
+        isinstance(reason, str) for reason in pending_reasons
+    ):
+        raise IndexReadinessProtocolError(
+            "status.readiness.pending_reasons must be an array of strings"
+        )
+    published_revision = readiness.get("published_revision")
+    target_revision = readiness.get("target_revision")
+    for field, value in (
+        ("published_revision", published_revision),
+        ("target_revision", target_revision),
+    ):
+        if value is not None and type(value) is not int:
+            raise IndexReadinessProtocolError(
+                f"status.readiness.{field} must be an integer when present"
+            )
+    if (published_revision is None) != (target_revision is None):
+        raise IndexReadinessProtocolError(
+            "status.readiness.published_revision and target_revision "
+            "must be provided together"
+        )
+    return readiness
+
+
 def ready_index_status(
     index_info: dict[str, Any],
     *,
@@ -330,13 +378,17 @@ def ready_index_status(
     # Absence of `milestones` identifies the released v0.2.0 fallback below.
     if isinstance(status.get("milestones"), dict):
         milestone = status["milestones"].get(until)
-        readiness = status.get("readiness")
+        readiness = _canonical_index_readiness(status)
         if not isinstance(milestone, dict) or milestone.get("reached") is not True:
             return None
         blockers = milestone.get("blockers")
         if not isinstance(blockers, list) or blockers:
             return None
-        if isinstance(readiness, dict) and readiness.get("state") == "failed":
+        if readiness is None or readiness.get("state") == "failed":
+            return None
+        published_revision = readiness.get("published_revision")
+        target_revision = readiness.get("target_revision")
+        if published_revision is not None and published_revision < target_revision:
             return None
         if require_query_fresh and not _index_query_observation_fresh(status):
             return None
@@ -344,12 +396,31 @@ def ready_index_status(
 
     # v0.2.0 has no milestone contract. Its only safe interpretation is the
     # historical fully-settled state for either requested milestone.
+    readiness = _canonical_index_readiness(status)
+    if readiness is not None:
+        if readiness.get("state") != "ready":
+            return None
+        if (
+            readiness.get("queryable") is not True
+            or readiness.get("complete") is not True
+        ):
+            return None
+        published_revision = readiness.get("published_revision")
+        target_revision = readiness.get("target_revision")
+        # Revision receipts are optional for immutable serverless artifacts
+        # that do not expose a replay domain. When a receipt is present, the
+        # parser above guarantees a complete integer pair and readiness must
+        # still fail closed until the published revision reaches its target.
+        if published_revision is not None and published_revision < target_revision:
+            return None
+    if "backfill_state" in status and status.get("backfill_state") != "ready":
+        # v0.2.0 exposes this field without canonical readiness. Current
+        # serverless artifacts can expose both, so neither signal may weaken
+        # the other when milestones are absent.
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
-        return None
-    backfill_state = status.get("backfill_state")
-    if backfill_state is not None and backfill_state != "ready":
         return None
     if isinstance(status.get("repair"), dict):
         return None
@@ -365,9 +436,6 @@ def ready_index_status(
     if status.get("replay_catch_up_required", False):
         return None
     if status.get("catch_up_active", False):
-        return None
-    readiness = status.get("readiness")
-    if not isinstance(readiness, dict) or readiness.get(until) is not True:
         return None
     coverage = status.get("coverage")
     if isinstance(coverage, dict):

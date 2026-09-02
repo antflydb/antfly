@@ -30,6 +30,8 @@ components:
           $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
+        backup:
+          $ref: "#/components/schemas/BackupConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
@@ -866,6 +868,19 @@ components:
             leaving envelope headroom beneath common 100 KiB connector limits.
             Nonzero values must be at least 512 bytes so the replacement error
             itself fits. Set to 0 to disable the compatibility guard.
+
+    BackupConfig:
+      type: object
+      additionalProperties: false
+      description: Operator-owned limits for backup execution.
+      properties:
+        operation_timeout_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 86400
+          default: 3600
+          description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
     QueryAdmissionConfig:
       type: object

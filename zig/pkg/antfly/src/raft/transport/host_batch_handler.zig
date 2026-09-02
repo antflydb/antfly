@@ -32,6 +32,8 @@ pub const HostBatchHandler = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .admit_snapshot_upload = admitSnapshotUpload,
+                .cancel_snapshot_upload = cancelSnapshotUpload,
                 .handle_snapshot_upload = handleSnapshotUpload,
             },
         };
@@ -45,6 +47,16 @@ pub const HostBatchHandler = struct {
     fn handleSnapshotUpload(ptr: *anyopaque, upload: http_server.SnapshotUpload) !void {
         const self: *HostBatchHandler = @ptrCast(@alignCast(ptr));
         try self.host.handleSnapshotUpload(upload);
+    }
+
+    fn admitSnapshotUpload(ptr: *anyopaque, admission: http_server.SnapshotUploadAdmission) !void {
+        const self: *HostBatchHandler = @ptrCast(@alignCast(ptr));
+        try self.host.admitSnapshotUpload(admission);
+    }
+
+    fn cancelSnapshotUpload(ptr: *anyopaque, admission: http_server.SnapshotUploadAdmission) void {
+        const self: *HostBatchHandler = @ptrCast(@alignCast(ptr));
+        self.host.cancelSnapshotUpload(admission);
     }
 };
 
