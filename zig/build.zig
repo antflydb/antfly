@@ -5557,10 +5557,11 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
-        // The macOS debug root includes the complete public transport and
-        // generated-contract surface; current measured compilation peaks a
-        // little above the aggregate's generic 7 GiB scheduler claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        // The macOS debug root includes the complete public transport,
+        // generated-contract, and native-index surface. ReleaseSafe test
+        // compilation currently peaks above 13 GiB; reserve the measured
+        // envelope so the scheduler does not reject a successful compile.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

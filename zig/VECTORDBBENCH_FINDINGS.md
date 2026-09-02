@@ -3708,6 +3708,43 @@ is durable, and explicit re-creation can reclaim a broken orphan pointer after a
 crash. Before capability activation, fresh managed indexes remain v1, while all
 pre-existing v1 indexes continue to use online shadow migration.
 
+A follow-up fresh-backfill failure exposed that the posting and exact-vector
+halves still established authority in the wrong order. Posting backfill could
+see a direct document vector while the later vector-block snapshot searched only
+for an index-managed embedding artifact which backfill had never materialized.
+That both failed readiness and attempted a second primary scan. Fresh v2
+construction now establishes the shared exact-vector base before capture:
+
+- the first managed index publishes a real empty generation at source sequence
+  zero with no physical shard files or primary scan;
+- an existing exact table-wide generation adds a new zero-count artifact scope
+  through a checksummed `CURRENT`-only transaction, preserving immutable blocks
+  and the committed WAL prefix;
+- synchronous backfill materializes the same index-managed source artifact as
+  foreground direct-field writes, appends its exact vector to the native WAL,
+  and builds HBC postings from that one pinned source transaction; and
+- stable-tip publication compacts the captured native delta instead of
+  rescanning primary artifacts. The wider snapshot sequence is accepted only
+  while the generation is unpublished; promotion permanently closes that
+  construction capability.
+
+The regressions require zero primary vector snapshot builds for both managed
+empty admission and standalone backfill, verify exact scoped coverage after a
+second index joins a shared generation, reopen the metadata-only scope update
+without changing WAL generation/bytes, and reject reuse of the construction
+sequence override after v2 publication.
+
+The managed corruption/recreate E2E then exposed a separate publication race:
+repair-shadow orphan collection derived liveness only from one manager's
+in-memory catalog. A catalog-lagging cleanup worker could therefore delete a
+new native generation after its construction marker was cleared even though a
+durable canonical `ACTIVE_ROOT` pointer already selected it. Cleanup now scans
+all canonical pointers before orphan collection and treats their targets as
+live without using payload health as deletion authority. The construction
+marker protects a unique root before pointer publication; the durable pointer
+protects it afterward. The exact public API corruption/delete/recreate test and
+a catalog-lagging cleanup regression both pass with this rule.
+
 The natural extension for reusable embeddings and other source artifacts is a
 catalog-managed immutable artifact identity. Indexes should hold references,
 not ownership by convention. Index-created artifacts remain scoped to their

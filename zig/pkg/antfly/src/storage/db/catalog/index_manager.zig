@@ -278,6 +278,7 @@ pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_vector_block_primary_snapshot_builds: usize = 0;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -2936,6 +2937,92 @@ pub const IndexManager = struct {
         return try self.alloc.realloc(hashes, unique_count);
     }
 
+    /// Establishes the exact-vector transaction base for a fresh unpublished
+    /// dense index. The common first-index path publishes only CURRENT and an
+    /// empty WAL. When a table-wide generation already exists, this performs a
+    /// CURRENT-only scope declaration and preserves every immutable block/WAL
+    /// byte. A pre-existing projection which is behind the pinned snapshot is
+    /// repaired once before the scope is declared; that is existing table debt,
+    /// not a second scan of the new index's backfill.
+    fn prepareFreshDenseVectorCaptureBase(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        snapshot_sequence: u64,
+    ) !void {
+        if (self.vector_block_storage == null) return;
+        if (try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence)) return;
+        try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, snapshot_sequence);
+        if (!try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence))
+            return error.FreshDenseVectorCaptureBaseUnavailable;
+    }
+
+    fn tryPrepareFreshDenseVectorCaptureBase(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        snapshot_sequence: u64,
+    ) !bool {
+        const storage = self.vector_block_storage orelse return true;
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        defer self.vector_block_build_mu.unlock();
+
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        const scope_hashes = try self.vectorBlockArtifactScopeHashesAlloc();
+        defer self.alloc.free(scope_hashes);
+
+        if (self.acquireVectorBlockGeneration()) |current| {
+            defer current.release();
+            if (!vectorBlockGenerationExactAtSequence(current, snapshot_sequence)) return false;
+            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
+            defer writer.deinit();
+            if (writer.covered_source_sequence != snapshot_sequence) return false;
+            const changed = try writer.declareArtifactScopes(scope_hashes);
+            if (changed) {
+                var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
+                    self.alloc,
+                    storage,
+                    root,
+                    &current.opened,
+                );
+                var opened_owned = true;
+                errdefer if (opened_owned) opened.deinit();
+                const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+                opened_owned = false;
+                self.installVectorBlockGeneration(generation);
+            }
+            self.vector_block_projection_dirty.store(false, .release);
+            return true;
+        }
+
+        // An empty table-wide authority is valid only when no already-open dense
+        // index owns vectors. Otherwise the missing generation is repair debt
+        // and the caller must rebuild it from the pinned primary boundary.
+        for (self.dense_indexes.items) |*dense_entry| {
+            if (dense_entry == entry) continue;
+            if (dense_entry.index.stats().active_count != 0) return false;
+        }
+        var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
+        defer writer.deinit();
+        if (writer.manifest == null) {
+            try writer.publishEmptyBase(1, snapshot_sequence, .{
+                .encoding = denseVectorBlockPreferredEncoding(),
+                .artifact_scope_hashes = scope_hashes,
+            });
+        } else {
+            if (writer.covered_source_sequence != snapshot_sequence) return false;
+            _ = try writer.declareArtifactScopes(scope_hashes);
+        }
+        var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, storage, root);
+        var opened_owned = true;
+        errdefer if (opened_owned) opened.deinit();
+        if (!openedVectorBlockGenerationExactAtSequence(&opened, snapshot_sequence)) return false;
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        opened_owned = false;
+        self.installVectorBlockGeneration(generation);
+        self.vector_block_projection_dirty.store(false, .release);
+        return true;
+    }
+
     fn acquireVectorBlockGeneration(self: *IndexManager) ?*SharedVectorBlockGeneration {
         lockAtomicWithBackoff(&self.vector_block_generation_mu);
         defer self.vector_block_generation_mu.unlock();
@@ -2977,9 +3064,16 @@ pub const IndexManager = struct {
         generation: *const SharedVectorBlockGeneration,
         source_sequence: u64,
     ) bool {
-        if (generation.opened.store.covered_source_sequence != source_sequence or
-            !generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding())) return false;
-        const score_precision = generation.opened.scorePrecision();
+        return openedVectorBlockGenerationExactAtSequence(&generation.opened, source_sequence);
+    }
+
+    fn openedVectorBlockGenerationExactAtSequence(
+        opened: *const vector_block_store_mod.Opened,
+        source_sequence: u64,
+    ) bool {
+        if (opened.store.covered_source_sequence != source_sequence or
+            !opened.usesBaseEncoding(denseVectorBlockPreferredEncoding())) return false;
+        const score_precision = opened.scorePrecision();
         return score_precision == .authoritative_float32 or
             score_precision == .authoritative_float32_with_bounded_float16;
     }
@@ -3578,6 +3672,7 @@ pub const IndexManager = struct {
         build_mu_locked = false;
 
         const started = platform_time.monotonicNs();
+        if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
         std.log.info(
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
@@ -9521,6 +9616,17 @@ pub const IndexManager = struct {
             while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
             active_roots.deinit(self.alloc);
         }
+        // The filesystem pointer is the publication authority even when this
+        // manager has not loaded the corresponding catalog row yet. That is a
+        // normal window during Raft apply/restart and between cooperating DB
+        // handles. Restricting liveness to the in-memory catalog lets a stale
+        // cleanup view collect a newly published generation after its
+        // construction marker is cleared, leaving a fail-closed pointer to a
+        // missing root. Discover every canonical pointer before considering a
+        // repair-shadow root orphaned; roots are unique, so the construction
+        // marker protects the pre-pointer window and the pointer protects the
+        // post-publication window.
+        try self.collectPublishedRepairShadowRoots(&active_roots);
         try self.collectActiveRepairShadowRoots(&active_roots);
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -11698,6 +11804,12 @@ pub const IndexManager = struct {
         /// unrelated enrichment or repair writer must never infer ownership
         /// merely from observing an open HBC session.
         borrow_active_source: bool = false,
+        /// Construction-only capability for a complete pinned backfill. The
+        /// fresh posting base is empty at sequence zero, while the shared exact-
+        /// vector authority may already be certified at the snapshot sequence.
+        /// Incremental captures must leave this null and preserve strict
+        /// posting/vector sequence equality.
+        full_snapshot_exact_vector_sequence: ?u64 = null,
     };
 
     pub const DensePostingCaptureRights = enum {
@@ -11747,6 +11859,15 @@ pub const IndexManager = struct {
         var capture_exact_vectors = false;
         if (self.vector_block_storage != null) {
             if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
+                const vector_sequence = if (options.full_snapshot_exact_vector_sequence) |sequence| blk: {
+                    // This is deliberately not a permanent index capability.
+                    // It exists only while a fresh v2 generation is private;
+                    // publication closes the wider snapshot window forever.
+                    if (!entry.native_candidate_build_authorized or entry.native_physical_v2 or
+                        sequence < posting_sequence)
+                        return error.InvalidFreshDenseVectorCaptureCapability;
+                    break :blk sequence;
+                } else posting_sequence;
                 if (self.acquireVectorBlockGeneration()) |generation| {
                     // Mutation capture needs an exact transaction authority,
                     // not the preferred serving layout. In particular, the
@@ -11759,7 +11880,7 @@ pub const IndexManager = struct {
                     // here disabled capture after that first overlay, fenced
                     // the otherwise complete native mutation chain, and
                     // forced a redundant primary-LSM corpus scan.
-                    capture_exact_vectors = vectorBlockGenerationCanCaptureMutationsAtSequence(generation, posting_sequence);
+                    capture_exact_vectors = vectorBlockGenerationCanCaptureMutationsAtSequence(generation, vector_sequence);
                     generation.release();
                 }
             }
@@ -14932,12 +15053,26 @@ pub const IndexManager = struct {
             .{ .validate_payloads = true, .flatten = true },
         );
         var ready_sequence: u64 = 0;
+        if (!allow_backfill and entry.index.stats().active_count == 0) {
+            // Managed creation deliberately publishes at the empty posting
+            // boundary and leaves corpus reconstruction to its durable outbox.
+            // Bootstrap the matching vector authority directly when possible;
+            // the generic repair path below remains the fallback when another
+            // index owns incompatible table-wide projection state.
+            _ = try self.tryPrepareFreshDenseVectorCaptureBase(entry, ready_sequence);
+        }
         if (allow_backfill and entry.index.stats().active_count == 0) {
-            const lease = (try self.beginDensePostingSidecarCaptureLeaseByNameWithOptions(cfg.name, .{})) orelse
+            var source_txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer source_txn.abort();
+            ready_sequence = try store.lastReplaySequenceFromTxn(&source_txn, 0);
+            try self.prepareFreshDenseVectorCaptureBase(entry, ready_sequence);
+            const lease = (try self.beginDensePostingSidecarCaptureLeaseByNameWithOptions(cfg.name, .{
+                .full_snapshot_exact_vector_sequence = ready_sequence,
+            })) orelse
                 return error.PostingWalMutationStoreUnavailable;
             var capture_active = true;
             errdefer if (capture_active) self.cancelDensePostingSidecarCaptureLeaseByName(cfg.name, lease) catch {};
-            ready_sequence = try self.backfillDenseIndex(store, entry);
+            try self.backfillDenseIndexFromSnapshot(store, entry, &source_txn, ready_sequence);
             try self.recordDensePostingCaptureMutationSequence(cfg.name, lease, ready_sequence);
             try self.finishDensePostingSidecarCaptureLeaseByName(cfg.name, lease, ready_sequence);
             capture_active = false;
@@ -15292,6 +15427,56 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
         for (self.algebraic_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
         for (self.status_only_index_configs) |cfg| try self.collectActiveRepairShadowRoot(active_roots, cfg.name);
+    }
+
+    /// Collect generation roots named by durable canonical pointers without
+    /// consulting the in-memory catalog or validating the pointed-to payload.
+    /// Payload validation belongs to serving/open. Cleanup must instead treat
+    /// even a corrupt or temporarily unavailable published generation as live:
+    /// corruption is repair debt, never deletion authority.
+    fn collectPublishedRepairShadowRoots(
+        self: *IndexManager,
+        active_roots: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        if (builtin.os.tag == .freestanding) return;
+        const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
+        defer self.alloc.free(indexes_path);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer indexes_dir.close(io);
+
+        var iter = indexes_dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, entry.name });
+            defer self.alloc.free(canonical_path);
+            const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
+            defer self.alloc.free(pointer_path);
+            const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+
+            const magic = if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v2))
+                active_index_root_pointer_magic_v2
+            else if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v1))
+                active_index_root_pointer_magic_v1
+            else
+                return error.InvalidIndexRootPointer;
+            const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
+            if (!validRelativeRepairIndexRoot(entry.name, relative)) return error.InvalidIndexRootPointer;
+            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse return error.InvalidIndexRootPointer;
+            const root = relative[0..separator];
+            if (active_roots.contains(root)) continue;
+            try active_roots.put(self.alloc, try self.alloc.dupe(u8, root), {});
+        }
     }
 
     fn collectActiveRepairShadowRoot(
@@ -17749,6 +17934,22 @@ pub const IndexManager = struct {
     /// boundary. Direct-v2 admission uses that boundary to commit the native
     /// capture without ever claiming writes that raced the snapshot.
     fn backfillDenseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex) !u64 {
+        var source_txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer source_txn.abort();
+        const snapshot_sequence = try store.lastReplaySequenceFromTxn(&source_txn, 0);
+        try self.backfillDenseIndexFromSnapshot(store, entry, &source_txn, snapshot_sequence);
+        return snapshot_sequence;
+    }
+
+    fn backfillDenseIndexFromSnapshot(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *DenseIndex,
+        source_txn: *docstore_mod.DocStore.Txn,
+        snapshot_sequence: u64,
+    ) !void {
+        if (try store.lastReplaySequenceFromTxn(source_txn, 0) != snapshot_sequence)
+            return error.DenseBackfillSnapshotSequenceMismatch;
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -17772,9 +17973,6 @@ pub const IndexManager = struct {
         var mapping_batch = try runtime_store.store.beginBatch();
         errdefer mapping_batch.abort();
 
-        var source_txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
-        defer source_txn.abort();
-        const snapshot_sequence = try store.lastReplaySequenceFromTxn(&source_txn, 0);
         const ScanContext = struct {
             manager: *IndexManager,
             entry: *DenseIndex,
@@ -17809,6 +18007,22 @@ pub const IndexManager = struct {
                     null,
                     ctx.metadata_presence_memo,
                 );
+                // Foreground direct-field writes always materialize the exact
+                // source vector as an index-managed artifact. Backfill must use
+                // the same contract: the native vector WAL can then authenticate
+                // this payload and future repair/backup paths have one stable
+                // source key instead of reparsing documents by convention.
+                if (ctx.entry.embedding_name == null and ctx.entry.embedding_names.len == 0) {
+                    try ctx.manager.writeDenseEmbeddingArtifactTxn(
+                        ctx.mapping_batch,
+                        raw_key,
+                        raw_key,
+                        ctx.entry.config.name,
+                        "_embeddings",
+                        null,
+                        vector_values,
+                    );
+                }
                 try ctx.items.append(ctx.manager.alloc, .{
                     .vector_id = assignment.vector_id,
                     .vector = vector_values,
@@ -17833,7 +18047,7 @@ pub const IndexManager = struct {
             .pending_mappings = &pending_mappings,
         };
         try store.scanReadTxnWithContext(
-            &source_txn,
+            source_txn,
             lower,
             if (upper) |buf| buf else "",
             .{},
@@ -17843,7 +18057,6 @@ pub const IndexManager = struct {
 
         try self.insertDenseItems(entry, items.items);
         try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
-        return snapshot_sequence;
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
@@ -26690,6 +26903,30 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
         }
     }
 
+    // A cleanup worker can lag catalog application while observing the same
+    // durable filesystem. The canonical pointer alone must protect the
+    // published generation after its construction marker has been removed.
+    {
+        var catalog_lagging = try IndexManager.initWithOptions(alloc, path, .{
+            .dense_native_migration_policy_source = .{
+                .ptr = &gate,
+                .authority_permitted = Gate.read,
+            },
+        });
+        defer catalog_lagging.deinit();
+        try std.testing.expect(catalog_lagging.get(cfg.name) == null);
+        _ = try catalog_lagging.cleanupInactiveRepairShadowRootsPage();
+
+        const canonical_path = try catalog_lagging.indexPath(cfg.name);
+        defer alloc.free(canonical_path);
+        const relative_path = (try catalog_lagging.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(relative_path);
+        const active_path = try std.fs.path.join(alloc, &.{ path, relative_path });
+        defer alloc.free(active_path);
+        try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+    }
+
     // Restart selects the incompatible pointer directly. It must not reopen a
     // legacy generation and enqueue a second whole-index rebuild.
     var reopened = try IndexManager.initWithOptions(alloc, path, .{
@@ -26929,6 +27166,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
     };
+    test_vector_block_primary_snapshot_builds = 0;
     try manager.add(&store, cfg);
 
     const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
@@ -26936,6 +27174,17 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(?u64, snapshot_sequence), entry.index.experimentalPostingDurableAppliedSequence());
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", cfg.name);
+    defer alloc.free(artifact_key);
+    const artifact = try store.get(alloc, artifact_key);
+    defer alloc.free(artifact);
+    var artifact_vector: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 1.0, 2.0 },
+        try enrichment_artifact_codec.decodeDenseEmbeddingInto(artifact, &artifact_vector),
+    );
     const canonical_path = try manager.indexPath(cfg.name);
     defer alloc.free(canonical_path);
     const relative_path = (try manager.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse
@@ -26946,6 +27195,56 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     var ready = try index_generation_manifest.load(alloc, active_path);
     defer ready.deinit(alloc);
     try std.testing.expectEqual(snapshot_sequence, ready.ready_applied_sequence);
+}
+
+test "fresh native dense backfill extends a shared vector generation without a source rescan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const first: types.IndexConfig = .{
+        .name = "first_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    };
+    test_vector_block_primary_snapshot_builds = 0;
+    try manager.addManaged(&store, first, null);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    const document_key = try internal_keys.documentKeyAlloc(alloc, "doc:shared");
+    defer alloc.free(document_key);
+    try store.put(document_key, "{\"embedding\":[3.0,4.0]}");
+
+    const second: types.IndexConfig = .{
+        .name = "second_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    };
+    test_vector_block_primary_snapshot_builds = 0;
+    try manager.add(&store, second);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expect(manager.vectorBlockReadyForDenseIndex(second.name));
+    try std.testing.expectError(
+        error.InvalidFreshDenseVectorCaptureCapability,
+        manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(second.name, .{
+            .full_snapshot_exact_vector_sequence = 1,
+        }),
+    );
+
+    const generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+    defer generation.release();
+    const first_scope = IndexManager.denseVectorArtifactScopeHash(manager.denseIndex(first.name).?);
+    const second_scope = IndexManager.denseVectorArtifactScopeHash(manager.denseIndex(second.name).?);
+    try std.testing.expectEqual(@as(u64, 0), generation.opened.baseOnlyCoverage(first_scope).?.vector_count);
+    try std.testing.expectEqual(@as(u64, 1), generation.opened.baseOnlyCoverage(second_scope).?.vector_count);
 }
 
 test "standalone dense native migration still requires an explicit physical generation" {

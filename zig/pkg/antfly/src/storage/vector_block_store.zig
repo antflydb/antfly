@@ -427,6 +427,123 @@ pub const Store = struct {
         try self.appendWriter(batch_id, covered_source_sequence, writer.bytes(), options);
     }
 
+    /// Publishes the real, O(1) authority for a logical projection which has no
+    /// vectors yet. This is also the transaction bootstrap for a fresh index:
+    /// a subsequent complete-snapshot capture may append every vector at this
+    /// same source boundary without first scanning primary artifacts.
+    pub fn publishEmptyBase(
+        self: *Store,
+        generation: u64,
+        covered_source_sequence: u64,
+        options: BaseBuildOptions,
+    ) !void {
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        if (self.manifest != null) return error.VectorBlockManifestAlreadyExists;
+        if (options.shard_count == 0 or options.shard_count > vector_manifest.max_shards or
+            !std.math.isPowerOfTwo(options.shard_count))
+        {
+            return error.InvalidVectorBlockBuildOptions;
+        }
+        var previous_scope: ?u64 = null;
+        for (options.artifact_scope_hashes) |scope_hash| {
+            if (previous_scope) |previous| if (scope_hash <= previous) return error.InvalidVectorBlockBuildOptions;
+            previous_scope = scope_hash;
+        }
+        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scope_hashes.len);
+        defer self.alloc.free(coverages);
+        for (coverages, options.artifact_scope_hashes) |*coverage, scope_hash| coverage.* = .{
+            .scope_hash = scope_hash,
+            .vector_count = 0,
+            .key_hash_xor = 0,
+            .key_hash_sum = 0,
+        };
+        try self.publishStagedGenerationMode(
+            generation,
+            covered_source_sequence,
+            &.{},
+            .replace_base,
+            coverages,
+            null,
+            false,
+            .{ .shard_count = options.shard_count, .encoding = options.encoding },
+        );
+    }
+
+    /// Adds logical artifact scopes to an already-authoritative generation.
+    /// Scope declaration is a checksummed CURRENT-only transaction: immutable
+    /// blocks and the committed WAL prefix do not change, so existing query
+    /// leases remain valid. New scopes begin empty and are populated by the
+    /// following source-capture WAL transaction before readiness is certified.
+    pub fn declareArtifactScopes(self: *Store, scope_hashes: []const u64) !bool {
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        const manifest = self.manifest orelse return error.MissingVectorBlockManifest;
+        var previous_scope: ?u64 = null;
+        for (scope_hashes) |scope_hash| {
+            if (previous_scope) |previous| if (scope_hash <= previous) return error.InvalidVectorBlockBuildOptions;
+            previous_scope = scope_hash;
+        }
+
+        const max_count = std.math.add(usize, manifest.coverages.len, scope_hashes.len) catch
+            return error.VectorBlockManifestTooLarge;
+        const merged = try self.alloc.alloc(vector_manifest.Coverage, max_count);
+        var existing_index: usize = 0;
+        var requested_index: usize = 0;
+        var merged_count: usize = 0;
+        var changed = false;
+        while (existing_index < manifest.coverages.len or requested_index < scope_hashes.len) {
+            const take_existing = requested_index == scope_hashes.len or
+                (existing_index < manifest.coverages.len and
+                    manifest.coverages[existing_index].scope_hash < scope_hashes[requested_index]);
+            if (take_existing) {
+                merged[merged_count] = manifest.coverages[existing_index];
+                existing_index += 1;
+                merged_count += 1;
+                continue;
+            }
+            if (existing_index < manifest.coverages.len and
+                manifest.coverages[existing_index].scope_hash == scope_hashes[requested_index])
+            {
+                merged[merged_count] = manifest.coverages[existing_index];
+                existing_index += 1;
+                requested_index += 1;
+                merged_count += 1;
+                continue;
+            }
+            merged[merged_count] = .{
+                .scope_hash = scope_hashes[requested_index],
+                .vector_count = 0,
+                .key_hash_xor = 0,
+                .key_hash_sum = 0,
+            };
+            requested_index += 1;
+            merged_count += 1;
+            changed = true;
+        }
+        if (!changed) {
+            self.alloc.free(merged);
+            return false;
+        }
+        const owned = try self.alloc.realloc(merged, merged_count);
+        errdefer self.alloc.free(owned);
+        var next = manifest;
+        next.coverages = owned;
+        try next.validate();
+        const encoded = try next.encodeAlloc(self.alloc);
+        defer self.alloc.free(encoded);
+        const current_path = try self.currentPathAlloc();
+        defer self.alloc.free(current_path);
+        generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+
+        if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
+        self.manifest_coverages = owned;
+        self.manifest = next;
+        self.manifest.?.coverages = self.manifest_coverages;
+        return true;
+    }
+
     fn appendWriter(self: *Store, batch_id: u64, covered_source_sequence: u64, bytes: []const u8, options: AppendOptions) !void {
         const next_bytes = std.math.add(u64, self.wal_committed_bytes, bytes.len) catch return error.VectorWalTooLarge;
         if (next_bytes > max_wal_bytes) return error.VectorWalTooLarge;
@@ -3362,6 +3479,48 @@ test "vector block store publishes snapshot base with committed WAL suffix" {
     try std.testing.expect(current.store.wal_has_mutations);
     try std.testing.expectEqualSlices(f32, &.{2.0}, (try current.get("artifact-a", 0, 2)).vector.vectorView().?);
     try std.testing.expectEqualSlices(f32, &.{3.0}, (try current.get("artifact-a", 1, 3)).vector.vectorView().?);
+}
+
+test "empty vector authority declares a new scope without rewriting WAL or blocks" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-declare-scope";
+    const scope_a: u64 = 11;
+    const scope_b: u64 = 29;
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+
+    try store.publishEmptyBase(1, 7, .{ .artifact_scope_hashes = &.{scope_a} });
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .upsert,
+        .key = "artifact-a",
+        .source_sequence = 7,
+        .revision = 3,
+        .vector = &.{ 1.0, 2.0 },
+    }}, 7, .{});
+    const wal_generation = store.wal_generation;
+    const wal_bytes = store.wal_committed_bytes;
+    try std.testing.expect(try store.declareArtifactScopes(&.{ scope_a, scope_b }));
+    try std.testing.expect(!try store.declareArtifactScopes(&.{scope_b}));
+    try std.testing.expectEqual(wal_generation, store.wal_generation);
+    try std.testing.expectEqual(wal_bytes, store.wal_committed_bytes);
+    try std.testing.expectEqual(@as(usize, 2), store.manifest.?.coverages.len);
+    try std.testing.expectEqual(scope_a, store.manifest.?.coverages[0].scope_hash);
+    try std.testing.expectEqual(scope_b, store.manifest.?.coverages[1].scope_hash);
+    try std.testing.expectEqual(@as(u64, 0), store.manifest.?.coverages[1].vector_count);
+
+    var reopened = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer reopened.deinit();
+    try std.testing.expectEqual(wal_generation, reopened.store.wal_generation);
+    try std.testing.expectEqual(wal_bytes, reopened.store.wal_committed_bytes);
+    try std.testing.expectEqual(@as(usize, 2), reopened.store.manifest.?.coverages.len);
+    var decoded: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 1.0, 2.0 },
+        try (try reopened.get("artifact-a", 7, 3)).vector.decodeExactInto(&decoded),
+    );
 }
 
 test "vector block store authoritative snapshot flattens older WAL prefix" {
