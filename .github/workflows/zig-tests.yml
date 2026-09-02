@@ -197,6 +197,7 @@ jobs:
             scripts/release/prepare_pypi_promotion.py \
             scripts/release/publish_objectstorage.py \
             scripts/release/verify_cli_snapshot.py \
+            scripts/release/verify_release_ledger.py \
             scripts/release/test_cli_snapshot.py \
             scripts/release/test_pypi_promotion.py \
             scripts/release/test_release_promotion.py \
@@ -885,9 +886,11 @@ jobs:
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          {
+            echo "ZIG_LOCAL_CACHE_DIR=$local_cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$global_cache"
+            echo "TMPDIR=$test_tmp"
+          } >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly

@@ -104,14 +104,34 @@ class S3Publisher(Publisher):
         assert self.client is not None
         local_digest = sha256(path)
         if immutable:
-            existing_digest = self.existing_sha256(key)
-            if existing_digest is not None:
-                if existing_digest != local_digest:
-                    raise SystemExit(
-                        f"immutable object differs: {destination}\nremote: {existing_digest}\nlocal:  {local_digest}"
+            try:
+                with path.open("rb") as src:
+                    self.client.put_object(
+                        Bucket=self.bucket,
+                        Key=key,
+                        Body=src,
+                        ContentType=content_type,
+                        Metadata={"sha256": local_digest},
+                        IfNoneMatch="*",
                     )
-                print(f"immutable object already matches: {destination}")
                 return
+            except self.client_error as exc:
+                error = exc.response.get("Error", {})
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if str(error.get("Code")) not in {
+                    "409",
+                    "412",
+                    "ConditionalRequestConflict",
+                    "PreconditionFailed",
+                } and status not in {409, 412}:
+                    raise
+            existing_digest = self.existing_sha256(key)
+            if existing_digest != local_digest:
+                raise SystemExit(
+                    f"immutable object differs: {destination}\nremote: {existing_digest or 'missing'}\nlocal:  {local_digest}"
+                )
+            print(f"immutable object already matches: {destination}")
+            return
         self.client.upload_file(
             str(path),
             self.bucket,
@@ -166,11 +186,24 @@ class LocalPublisher(Publisher):
         if dry_run:
             return
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if immutable and destination.exists():
-            if sha256(destination) != sha256(path):
-                raise SystemExit(f"immutable object differs: {destination}")
-            print(f"immutable object already matches: {destination}")
-            return
+        if immutable:
+            local_digest = sha256(path)
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent, prefix=f".{destination.name}.", delete=False
+            ) as tmp:
+                temporary = Path(tmp.name)
+            try:
+                shutil.copy2(path, temporary)
+                try:
+                    os.link(temporary, destination)
+                    return
+                except FileExistsError:
+                    if sha256(destination) != local_digest:
+                        raise SystemExit(f"immutable object differs: {destination}")
+                    print(f"immutable object already matches: {destination}")
+                    return
+            finally:
+                temporary.unlink(missing_ok=True)
         shutil.copy2(path, destination)
 
 
@@ -247,8 +280,20 @@ def main() -> int:
         )
     if publish_latest:
         assert args.latest_prefix is not None
+        pointers = [path for path in sorted_files if path.name == "metadata.json"]
+        if len(pointers) != 1:
+            raise SystemExit(
+                "latest publication requires exactly one metadata.json channel pointer"
+            )
         for path in sorted_files:
+            if path == pointers[0]:
+                continue
             publisher.upload(path, storage_key(args.latest_prefix, path), args.dry_run)
+        # metadata.json is the channel commit point. Installers read it first
+        # and then fetch the immutable versioned payload named by its tag.
+        publisher.upload(
+            pointers[0], storage_key(args.latest_prefix, pointers[0]), args.dry_run
+        )
     return 0
 
 

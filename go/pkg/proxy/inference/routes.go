@@ -386,13 +386,17 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 	return selectWeightedDestination(route, req, eligible, totalWeight), nil
 }
 
-// SelectActivationDestination chooses a cold destination using the same
-// static eligibility and weighted selection contract as normal routing.
-func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequest, enabled func(string) bool) *Destination {
+// SelectActivationDestination chooses a genuinely cold destination using the
+// same static eligibility and weighted selection contract as normal routing.
+// A destination with healthy endpoints is runtime-ineligible, not cold, and
+// must fall through without spending the activation timeout.
+func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequest, registry *ModelRegistry, enabled func(string) bool) *Destination {
 	eligible := make([]Destination, 0, len(route.Destinations))
 	totalWeight := int32(0)
 	for _, destination := range route.Destinations {
-		if !enabled(destination.Pool) || !staticDestinationEligible(&destination, req) {
+		if !enabled(destination.Pool) ||
+			!staticDestinationEligible(&destination, req) ||
+			registry.PoolConditionStats(destination.Pool, req.Model).HealthyEndpoints != 0 {
 			continue
 		}
 		eligible = append(eligible, destination)

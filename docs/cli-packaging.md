@@ -48,20 +48,38 @@ consumers.
 4. GitHub Release assets and versioned object-storage objects are immutable:
    retries accept an existing object only when its digest matches. Object
    storage also retains content-addressed objects under `sha256/<digest>/`.
-5. Top-level trusted-publisher jobs promote the exact snapshot bytes to PyPI
-   and npm. They skip an existing version only after comparing the registry
-   digest, so retries cannot conceal drift. Native archives remain available
-   under `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
+5. The tag run sends the version and ledger digest through a
+   `promote-cli-release` repository dispatch. GitHub always loads that promotion
+   path from the default branch; top-level trusted-publisher jobs then promote
+   the exact snapshot bytes to PyPI and npm. They skip an existing version only
+   after comparing the registry digest, so retries cannot conceal drift. Native
+   archives remain available under
+   `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
 
-For recovery, manually dispatch `.github/workflows/antfly-release.yml` with an
-existing release version. Recovery downloads the saved npm tarballs, wheels,
-and manifest from the GitHub release; verifies every GitHub attestation against
-the expected release-workflow signer, tag ref, repository, and source-commit
-digest; verifies every artifact hash; and promotes those exact bytes. It never
-checks out historical source to rebuild registry artifacts.
+For recovery, send the same repository dispatch with an existing release tag
+and the SHA-256 of its `artifacts.json` asset:
+
+```sh
+gh api --method POST repos/antflydb/antfly/dispatches \
+  -f event_type=promote-cli-release \
+  -f 'client_payload[version]=v0.2.0' \
+  -f 'client_payload[ledger_sha256]=<64-character-sha256>'
+```
+
+Recovery downloads the saved ledger, npm tarballs, wheels, and manifest from
+the GitHub release; verifies every GitHub attestation against the expected
+release-workflow signer, tag ref, repository, and source-commit digest; binds
+the promotion to the supplied ledger digest; verifies every artifact hash; and
+promotes those exact bytes. It never checks out historical or operator-selected
+source to rebuild or publish registry artifacts.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
-jobs remain in the top-level release workflow.
+jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub
+environments admit the CLI promotion only from the `main` branch, which is the
+ref used by `repository_dispatch` runs. Their other allow rules are typed tag
+rules for the existing Python and TypeScript SDK publishers, not branch globs;
+both environments require approval from a repository administrator and prevent
+the triggering administrator from approving their own deployment.
 
 Linux releases have two libc variants. The unsuffixed archive is the portable,
 CPU-only musl build used by musl hosts and direct portable downloads. The

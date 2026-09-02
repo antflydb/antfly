@@ -61,9 +61,12 @@ SDK and enables Metal and Accelerate.
 3. `publish-release-assets` combines the native archives and CLI snapshot into
    one deterministic artifact ledger, attests every payload file, and stores the
    exact bytes on the draft GitHub Release and under immutable, content-addressed
-   object-storage keys. Top-level trusted-publisher jobs promote those same CLI
-   bytes. A manual dispatch verifies the saved snapshot against its tag, commit,
-   digest, and release-workflow signer before promoting it without rebuilding.
+   object-storage keys. Immutable S3-compatible writes use a conditional create,
+   and the stable `metadata.json` channel pointer is updated only after every
+   immutable object and compatibility alias succeeds. The tag run then requests
+   a default-branch registry promotion with the release tag and ledger digest.
+   Top-level trusted-publisher jobs verify and promote those same CLI bytes. A
+   recovery repository dispatch follows the identical path without rebuilding.
 4. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
    Zig archive checksums. RC tags do not update the stable tap formula.
 5. `publish-container` calls `.github/workflows/antfly-container.yml` with
@@ -78,6 +81,16 @@ are skipped only when their registry digest matches, so a partial publication
 is safe to retry without hiding content drift. Existing GitHub release assets
 are likewise accepted only when byte-identical; release automation never
 replaces a saved artifact.
+
+Registry promotion is triggered only by the `promote-cli-release`
+`repository_dispatch` event, so GitHub loads the workflow from the default
+branch rather than an operator-selected ref. The `pypi` and `npm` environments
+admit this CLI workflow only from `main`; separate typed tag rules preserve the
+existing SDK publishers without allowing similarly named branches. Both
+environments require review with self-approval disabled. Recovery requests
+include the exact `artifacts.json` SHA-256; the promotion verifies that digest,
+its attestation, tag and source commit before granting either registry job
+access.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the GNU Linux archives on native Linux

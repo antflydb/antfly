@@ -551,6 +551,85 @@ func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
 	}
 }
 
+func TestRuntimeIneligiblePoolFallsBackWithoutColdStartWait(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/runtime-ineligible",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var gpuActivations atomic.Int32
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+		if pool == "gpu" {
+			gpuActivations.Add(1)
+			return time.Second, true, nil
+		}
+		return 0, false, nil
+	}})
+
+	start := time.Now()
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" {
+		t.Fatalf("expected immediate CPU fallback, got %q", resolved.Pool)
+	}
+	if gpuActivations.Load() != 0 {
+		t.Fatalf("runtime-ineligible GPU pool was treated as cold; activations=%d", gpuActivations.Load())
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("runtime-ineligible fallback spent a cold-start wait: %s", elapsed)
+	}
+}
+
+func TestResolveRequestActivatesColdRedirectFallback(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	p.RegisterEndpoint("http://gpu.internal", "gpu", WorkloadTypeGeneral)
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:         "default/cold-fallback",
+		Operations:   map[OperationType]bool{OperationType("extract"): true},
+		Destinations: []Destination{{Pool: "gpu", Weight: 100, RequireModelLoaded: true}},
+		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
+	})
+
+	var fallbackActivations atomic.Int32
+	p.SetPoolActivator(testPoolActivator{
+		enabled: func(_ string, pool string) bool { return pool == "cpu" },
+		activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
+			if pool != "cpu" {
+				return 0, false, nil
+			}
+			if fallbackActivations.Add(1) == 1 {
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					p.RegisterEndpoint("http://cpu.internal", "cpu", WorkloadTypeGeneral)
+				}()
+			}
+			return 500 * time.Millisecond, true, nil
+		},
+	})
+
+	resolved, err := p.ResolveRequest(context.Background(), ResolveRequest{Operation: OperationType("extract"), Model: "not-loaded"})
+	if err != nil {
+		t.Fatalf("ResolveRequest: %v", err)
+	}
+	if resolved.Pool != "cpu" || resolved.Endpoint.Address != "http://cpu.internal" {
+		t.Fatalf("expected activated CPU fallback, got pool=%q endpoint=%q", resolved.Pool, resolved.Endpoint.Address)
+	}
+	if fallbackActivations.Load() != 1 {
+		t.Fatalf("expected one fallback activation, got %d", fallbackActivations.Load())
+	}
+}
+
 func TestColdRouteActivationUsesDestinationWeights(t *testing.T) {
 	t.Parallel()
 

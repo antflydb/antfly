@@ -306,11 +306,9 @@ func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
 }
 
 func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map[string]string, reserve bool) (*Resolution, error) {
-	var pool string
-	var matchedRoute *Route
-	var selectedDest *Destination
-
-	if matchedRoute = p.router.RouteManager().Match(routeReq); matchedRoute != nil {
+	workloadType := resolveWorkloadType(routeReq.Operation, headers)
+	matchedRoute := p.router.RouteManager().Match(routeReq)
+	if matchedRoute != nil {
 		dest, err := p.router.RouteManager().SelectDestination(matchedRoute, routeReq, p.registry)
 		if err != nil {
 			return nil, &ResolutionError{
@@ -319,74 +317,82 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 			}
 		}
 		if dest == nil {
-			activatedDestination, activationWait := p.activateRouteDestination(ctx, matchedRoute, routeReq)
-			if activatedDestination != nil {
-				dest = p.waitForRouteDestination(ctx, activatedDestination, routeReq, activationWait)
-				if ctx.Err() != nil {
-					return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: ctx.Err().Error()}
-				}
-			}
+			dest = p.selectActivationDestination(matchedRoute, routeReq)
 		}
 		if dest != nil {
-			selectedDest = dest
-			pool = dest.Pool
-		} else if matchedRoute.Fallback != nil {
+			endpoint, resolveErr := p.resolvePoolTarget(ctx, routeNamespace(matchedRoute), dest.Pool, routeReq, workloadType, reserve, dest)
+			if resolveErr == nil {
+				return &Resolution{
+					Route:       matchedRoute,
+					Destination: dest,
+					Endpoint:    endpoint,
+					Pool:        dest.Pool,
+				}, nil
+			}
+			if ctx.Err() != nil {
+				return nil, resolutionError(ctx.Err())
+			}
+			if matchedRoute.Fallback == nil {
+				return nil, resolutionError(resolveErr)
+			}
+		}
+		if matchedRoute.Fallback != nil {
 			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq)
 			if fallbackErr != nil {
 				return nil, fallbackErr
 			}
-			pool = fallbackPool
-		} else {
-			return nil, noEligibleDestinationsError()
+			endpoint, resolveErr := p.resolvePoolTarget(ctx, routeNamespace(matchedRoute), fallbackPool, routeReq, workloadType, reserve, nil)
+			if resolveErr != nil {
+				return nil, resolutionError(resolveErr)
+			}
+			return &Resolution{Route: matchedRoute, Endpoint: endpoint, Pool: fallbackPool}, nil
 		}
+		return nil, noEligibleDestinationsError()
 	}
 
-	if pool == "" {
-		pool = headerValue(headers, "X-Antfly-Inference-Pool")
-	}
+	pool := headerValue(headers, "X-Antfly-Inference-Pool")
 	if pool == "" {
 		pool = p.defaultPool
 	}
 
-	namespace := ""
-	if matchedRoute != nil {
-		namespace = routeNamespace(matchedRoute)
-	}
-	activationWait, activationEnabled, activationErr := p.activatePool(ctx, namespace, pool)
-	if activationErr != nil {
-		p.logger.Warn("failed to refresh inference pool activation", zap.String("pool", pool), zap.Error(activationErr))
-	}
-	workloadType := resolveWorkloadType(routeReq.Operation, headers)
-	endpoint, err := p.resolveEndpoint(ctx, routeReq.Model, pool, workloadType, reserve)
-	if err != nil && matchedRoute == nil && activationEnabled && activationErr == nil {
-		endpoint, err = p.waitForPoolEndpoint(ctx, routeReq.Model, pool, workloadType, reserve, activationWait)
-	}
+	endpoint, err := p.resolvePoolTarget(ctx, "", pool, routeReq, workloadType, reserve, nil)
 	if err != nil {
-		return nil, &ResolutionError{
-			StatusCode: http.StatusServiceUnavailable,
-			Message:    err.Error(),
-		}
+		return nil, resolutionError(err)
 	}
 
 	return &Resolution{
-		Route:       matchedRoute,
-		Destination: selectedDest,
-		Endpoint:    endpoint,
-		Pool:        pool,
+		Endpoint: endpoint,
+		Pool:     pool,
 	}, nil
 }
 
-func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req *RouteRequest) (*Destination, time.Duration) {
+func resolutionError(err error) *ResolutionError {
+	if typed, ok := err.(*ResolutionError); ok {
+		return typed
+	}
+	return &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: err.Error()}
+}
+
+func (p *Proxy) selectActivationDestination(route *Route, req *RouteRequest) *Destination {
 	if p.activator == nil {
-		return nil, 0
+		return nil
 	}
 	namespace := routeNamespace(route)
-	selected := p.router.RouteManager().SelectActivationDestination(route, req, func(pool string) bool {
+	return p.router.RouteManager().SelectActivationDestination(route, req, p.registry, func(pool string) bool {
 		return p.activator.IsEnabled(namespace, pool)
 	})
+}
+
+// activateRouteDestination is retained as a small activation primitive for
+// callers that only need to select and wake a cold route destination. Request
+// resolution itself goes through resolvePoolTarget so every target follows the
+// same wake/wait/fallback state machine.
+func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req *RouteRequest) (*Destination, time.Duration) {
+	selected := p.selectActivationDestination(route, req)
 	if selected == nil {
 		return nil, 0
 	}
+	namespace := routeNamespace(route)
 	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
 	if err != nil {
 		p.logger.Warn("failed to activate inference route destination", zap.String("namespace", namespace), zap.String("pool", selected.Pool), zap.Error(err))
@@ -396,6 +402,36 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 		return nil, 0
 	}
 	return selected, wait
+}
+
+// resolvePoolTarget resolves one concrete pool through a single state machine:
+// refresh its activation lease, try it immediately, wait only when it was
+// genuinely cold, and return the result to the caller for fallback handling.
+func (p *Proxy) resolvePoolTarget(ctx context.Context, namespace, pool string, req *RouteRequest, workloadType WorkloadType, reserve bool, destination *Destination) (*Endpoint, error) {
+	wasCold := p.registry.PoolConditionStats(pool, req.Model).HealthyEndpoints == 0
+	activationWait, activationEnabled, activationErr := p.activatePool(ctx, namespace, pool)
+	if activationErr != nil {
+		p.logger.Warn("failed to refresh inference pool activation", zap.String("namespace", namespace), zap.String("pool", pool), zap.Error(activationErr))
+	}
+
+	endpoint, err := p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+	if err == nil && (destination == nil || p.router.RouteManager().evaluateConditions(destination, req, p.registry)) {
+		return endpoint, nil
+	}
+	if err == nil {
+		err = noEligibleDestinationsError()
+	}
+	if !wasCold || !activationEnabled || activationErr != nil {
+		return nil, err
+	}
+
+	if destination != nil {
+		if p.waitForRouteDestination(ctx, destination, req, activationWait) == nil {
+			return nil, err
+		}
+		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+	}
+	return p.waitForPoolEndpoint(ctx, req.Model, pool, workloadType, reserve, activationWait)
 }
 
 func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {

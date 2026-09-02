@@ -66,6 +66,46 @@ class ReleasePromotionTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "immutable object differs"):
                 publisher.upload(artifact, "v1/artifact.bin", False, immutable=True)
 
+    def test_s3_immutable_object_uses_atomic_create_and_compare(self) -> None:
+        storage = load_module(
+            "publish_objectstorage_s3_test", "publish_objectstorage.py"
+        )
+
+        class ConditionalConflict(Exception):
+            def __init__(self) -> None:
+                self.response = {
+                    "Error": {"Code": "PreconditionFailed"},
+                    "ResponseMetadata": {"HTTPStatusCode": 412},
+                }
+
+        class FakeS3:
+            def __init__(self, digest: str) -> None:
+                self.digest = digest
+                self.put_args = None
+
+            def put_object(self, **kwargs):
+                self.put_args = kwargs
+                raise ConditionalConflict()
+
+            def head_object(self, **_kwargs):
+                return {"Metadata": {"sha256": self.digest}}
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            artifact = Path(raw_tmp) / "artifact.bin"
+            artifact.write_bytes(b"immutable")
+            client = FakeS3(storage.sha256(artifact))
+            publisher = storage.S3Publisher.__new__(storage.S3Publisher)
+            publisher.bucket = "releases"
+            publisher.client = client
+            publisher.client_error = ConditionalConflict
+
+            publisher.upload(artifact, "v1/artifact.bin", False, immutable=True)
+            self.assertEqual(client.put_args["IfNoneMatch"], "*")
+
+            client.digest = "0" * 64
+            with self.assertRaisesRegex(SystemExit, "immutable object differs"):
+                publisher.upload(artifact, "v1/artifact.bin", False, immutable=True)
+
     def test_mutable_aliases_wait_for_every_immutable_object(self) -> None:
         storage = load_module(
             "publish_objectstorage_order_test", "publish_objectstorage.py"
@@ -84,9 +124,14 @@ class ReleasePromotionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            first, second = root / "artifact-a.bin", root / "artifact-b.bin"
+            first, second, metadata = (
+                root / "artifact-a.bin",
+                root / "artifact-b.bin",
+                root / "metadata.json",
+            )
             first.write_bytes(b"a")
             second.write_bytes(b"b")
+            metadata.write_text('{"tag":"v1"}\n')
             publisher = RecordingPublisher()
             argv = [
                 "publish_objectstorage.py",
@@ -103,6 +148,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "--publish-latest",
                 str(first),
                 str(second),
+                str(metadata),
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -115,6 +161,52 @@ class ReleasePromotionTests(unittest.TestCase):
                 any(key.startswith("channels/latest/") for key, _ in publisher.calls)
             )
             self.assertTrue(all(immutable for _, immutable in publisher.calls))
+
+    def test_latest_metadata_pointer_is_published_last(self) -> None:
+        storage = load_module(
+            "publish_objectstorage_pointer_test", "publish_objectstorage.py"
+        )
+
+        class RecordingPublisher:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool]] = []
+
+            def upload(
+                self, path: Path, key: str, dry_run: bool, immutable: bool = False
+            ) -> None:
+                self.calls.append((key, immutable))
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            artifact, metadata = root / "artifact.bin", root / "metadata.json"
+            artifact.write_bytes(b"artifact")
+            metadata.write_text('{"tag":"v1"}\n')
+            publisher = RecordingPublisher()
+            argv = [
+                "publish_objectstorage.py",
+                "--provider",
+                "local",
+                "--bucket",
+                "release",
+                "--prefix",
+                "versions/v1",
+                "--latest-prefix",
+                "channels/latest",
+                "--publish-latest",
+                str(artifact),
+                str(metadata),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(storage, "build_publisher", return_value=publisher),
+            ):
+                self.assertEqual(storage.main(), 0)
+
+            self.assertEqual(
+                publisher.calls[-1], ("channels/latest/metadata.json", False)
+            )
+            immutable_calls = [call for call in publisher.calls if call[1]]
+            self.assertEqual(len(immutable_calls), 2)
 
     def test_release_ledger_is_deterministic_and_includes_registry_artifacts(
         self,
@@ -168,6 +260,42 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertIn("runtime-archive", kinds)
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
+
+            verifier = load_module(
+                "verify_release_ledger_test", "verify_release_ledger.py"
+            )
+            promotion = root / "promotion"
+            promotion.mkdir()
+            promoted_package = promotion / "antfly-cli-1.2.3.tgz"
+            promoted_package.write_bytes((output / promoted_package.name).read_bytes())
+            promoted_manifest = promotion / "cli-snapshot.json"
+            promoted_manifest.write_bytes(
+                (output / promoted_manifest.name).read_bytes()
+            )
+            verify_argv = [
+                "verify_release_ledger.py",
+                "--ledger",
+                str(output / "artifacts.json"),
+                "--payload-dir",
+                str(promotion),
+                "--tag",
+                "v1.2.3",
+                "--commit",
+                COMMIT,
+                "--ledger-sha256",
+                verifier.sha256(output / "artifacts.json"),
+            ]
+            with mock.patch.object(sys, "argv", verify_argv):
+                self.assertEqual(verifier.main(), 0)
+
+            promoted_package.write_bytes(b"drift")
+            with (
+                mock.patch.object(sys, "argv", verify_argv),
+                self.assertRaisesRegex(
+                    SystemExit, "promoted artifact differs from release ledger"
+                ),
+            ):
+                verifier.main()
 
 
 if __name__ == "__main__":
