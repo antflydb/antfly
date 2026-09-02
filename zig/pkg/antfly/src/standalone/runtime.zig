@@ -6134,7 +6134,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "DATA:IMAGE/PNG,%01%02",
+                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
                 .mime_type = "image/png",
             } },
         } },
@@ -6148,7 +6148,11 @@ test "standalone runtime local generator accepts media url data uris" {
     const message = converted.messages[0];
     try std.testing.expectEqualStrings("describe", message.content);
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, message.image_bytes.?[0]);
+    var expected = [_]u8{0} ** 24;
+    @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, expected[16..20], 2, .big);
+    std.mem.writeInt(u32, expected[20..24], 3, .big);
+    try std.testing.expectEqualSlices(u8, &expected, message.image_bytes.?[0]);
     try std.testing.expectEqual(@as(usize, 2), message.content_parts.?.len);
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
@@ -6283,17 +6287,17 @@ test "standalone runtime local generator preflights mixed resident media exactly
                 .data = "AQID",
                 .mime_type = "audio/wav",
             } },
-            .{ .image_url = .{ .url = "data:image/png;base64,BAU=" } },
+            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" } },
         } },
     }};
 
     const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
     try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
     try std.testing.expectEqual(
-        @as(usize, "AQID".len + "data:image/png;base64,BAU=".len),
+        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD".len),
         preflight.encoded_media_bytes,
     );
-    try std.testing.expectEqual(@as(usize, 5), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 27), preflight.decoded_media_bytes);
     try std.testing.expectEqual(@as(usize, 2), preflight.media_count);
     try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
     try std.testing.expect(preflight.has_audio);

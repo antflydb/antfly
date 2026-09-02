@@ -1024,6 +1024,21 @@ document. They are architectural requirements, not Florence-specific cleanup:
     now parses the complete MIME type, and the production host resolves and
     validates the concrete read invocation before dispatch. The only exemption
     is the explicit test executor override, which has no model catalog.
+105. **Decoded-pixel admission bounded render waves instead of model
+    invocations.** The renderer correctly reset its in-flight pixel counter
+    after each joined worker wave, but every completed page remained retained
+    for one later OCR or embedding call. A serial eight-page render could
+    therefore satisfy a 50-megapixel wave limit while constructing an
+    80-megapixel model batch. PDF sessions now expose allocation-free adaptive
+    geometry preflight; OCR and page-embedding planners accumulate that exact
+    geometry and shorten the invocation window at the resolved model ceiling.
+    The render-wave limit remains a separate scratch/concurrency control.
+    Independently, reader, generator, embedder, and extractor executor
+    boundaries inspect concrete encoded-image headers, populate aggregate
+    `InvocationShape.decoded_pixels`, reject declared/physical MIME mismatch,
+    and partition candidate batches on pixels as well as items and bytes. The
+    shared image-header inspector is also used by inference nodes, so linked
+    and distributed execution measure the same physical payload.
 
 ### Post-review implementation contract
 
@@ -1039,7 +1054,13 @@ The hardening above follows these long-term rules:
   expired or canceled caller never does.
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
-  ceilings. A single item larger than the model ceiling fails before transport.
+  ceilings. Image-bearing readers, generators, embedders, and extractors also
+  split on aggregate decoded pixels measured from physical headers. A single
+  item larger than the model ceiling fails before transport.
+- Renderer admission and model admission are distinct dimensions. In-flight
+  render pixels bound one concurrent worker wave; cumulative preflighted pixels
+  bound every retained page image passed to one model invocation. Neither limit
+  may stand in for the other.
 - Render planners preserve a singleton quality invariant. The retained-output
   allowance for an item in a batch is never smaller than its admitted singleton
   allowance. If that invariant does not fit, the planner reduces the window;

@@ -30,10 +30,7 @@ pub const PixelFormat = shared.PixelFormat;
 pub const ImageU8 = shared.ImageU8;
 pub const DecodeLimits = antfly_image.DecodeLimits;
 
-pub const EncodedImageInfo = struct {
-    width: u32,
-    height: u32,
-};
+pub const EncodedImageInfo = antfly_image.EncodedImageInfo;
 
 /// Decoded image in HWC u8 format.
 pub const Image = struct {
@@ -83,53 +80,12 @@ fn validateImageDimensions(width: u32, height: u32) !void {
 /// server uses this before model loading/inference to account aggregate pixel
 /// pressure and to distinguish malformed input from configured size limits.
 pub fn inspectEncodedForInference(image_bytes: []const u8, max_dimension: ?u32) !EncodedImageInfo {
-    const info = try inspectEncoded(image_bytes);
+    const info = antfly_image.inspectEncoded(image_bytes) catch return error.ImageDecodeFailed;
     try antfly_image.DecodeLimits.inference_default.validate(info.width, info.height);
     if (max_dimension) |limit| {
         if (info.width > limit or info.height > limit) return error.ImageTooLarge;
     }
     return info;
-}
-
-fn inspectEncoded(image_bytes: []const u8) !EncodedImageInfo {
-    switch (antfly_image.detectFormat(image_bytes)) {
-        .png => {
-            if (image_bytes.len < 24) return error.ImageDecodeFailed;
-            const width = std.mem.readInt(u32, image_bytes[16..20], .big);
-            const height = std.mem.readInt(u32, image_bytes[20..24], .big);
-            if (width == 0 or height == 0) return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        .jpeg => {
-            const info = antfly_image.jpeg.probe(image_bytes) catch |err| switch (err) {
-                error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
-            };
-            return .{ .width = info.width, .height = info.height };
-        },
-        .gif => {
-            if (image_bytes.len < 10) return error.ImageDecodeFailed;
-            const width = std.mem.readInt(u16, image_bytes[6..8], .little);
-            const height = std.mem.readInt(u16, image_bytes[8..10], .little);
-            if (width == 0 or height == 0) return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        .bmp => {
-            const info = antfly_image.bmp.probe(image_bytes) catch |err| switch (err) {
-                error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.ImageDecodeFailed,
-                else => return err,
-            };
-            return .{ .width = info.width, .height = info.height };
-        },
-        .webp => {
-            const info = antfly_image.webp.probe(image_bytes) catch |err| switch (err) {
-                error.WebpDecodeFailed, error.UnsupportedWebpFormat => return error.ImageDecodeFailed,
-            };
-            const width = info.width orelse return error.ImageDecodeFailed;
-            const height = info.height orelse return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        else => return error.ImageDecodeFailed,
-    }
 }
 
 fn validateEncodedImageDimensions(image_bytes: []const u8) !void {

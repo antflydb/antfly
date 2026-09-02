@@ -1168,9 +1168,9 @@ pub const ManagedEmbedder = struct {
         }
         var offset: usize = 0;
         while (offset < items.len) {
-            const end = try densePartBatchEnd(capabilities, attachment_transport, items, offset);
+            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset);
             const chunk = items[offset..end];
-            try validateDensePartItemInvocation(capabilities, attachment_transport, chunk);
+            try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
             const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims);
             defer alloc.free(chunk_vectors);
             for (chunk_vectors) |vector| {
@@ -4218,7 +4218,15 @@ fn denseMediaUrlWireBytes(
     return url.len;
 }
 
+fn denseMediaUrlPixelsAlloc(alloc: std.mem.Allocator, url: []const u8) !u64 {
+    const parsed_uri = (try inference_work.parseInlineDataUri(url)) orelse return 0;
+    var decoded = try inference_work.decodeInlineDataUriAlloc(alloc, url);
+    defer decoded.deinit(alloc);
+    return try inference_work.encodedImagePixels(parsed_uri.mime_type, decoded.data);
+}
+
 fn validateDensePartItemInvocation(
+    alloc: std.mem.Allocator,
     capabilities: inference_work.InferenceCapabilities,
     attachment_transport: inference_work.AttachmentTransport,
     items: []const template_mod.ContentPart,
@@ -4240,6 +4248,9 @@ fn validateDensePartItemInvocation(
             const wire_bytes = try denseMediaUrlWireBytes(capabilities, url);
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, wire_bytes) catch
                 return error.InferenceEncodedBytesExceeded;
+            const pixels = try denseMediaUrlPixelsAlloc(alloc, url);
+            shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                return error.InferenceDecodedPixelsExceeded;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
         .binary => |media| {
@@ -4249,6 +4260,12 @@ fn validateDensePartItemInvocation(
             const resident = try attachment_transport.wireSize(media.data.len, media.mime_type.len);
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
                 return error.InferenceEncodedBytesExceeded;
+            const modality = try modalityForContentType(media.mime_type);
+            if (modality.image) {
+                const pixels = try inference_work.encodedImagePixels(media.mime_type, media.data);
+                shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
     };
@@ -4256,6 +4273,7 @@ fn validateDensePartItemInvocation(
 }
 
 fn densePartBatchEnd(
+    alloc: std.mem.Allocator,
     capabilities: inference_work.InferenceCapabilities,
     attachment_transport: inference_work.AttachmentTransport,
     items: []const template_mod.ContentPart,
@@ -4264,6 +4282,7 @@ fn densePartBatchEnd(
     if (start >= items.len) return start;
     const max_items = capabilities.batch.max_items;
     var encoded_media_bytes: usize = 0;
+    var decoded_pixels: u64 = 0;
     var end = start;
     while (end < items.len and end - start < max_items) : (end += 1) {
         const item_bytes: usize = switch (items[end]) {
@@ -4276,19 +4295,39 @@ fn densePartBatchEnd(
         };
         const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
             return error.InferenceEncodedBytesExceeded;
+        const item_pixels: u64 = switch (items[end]) {
+            .text => 0,
+            .binary => |value| if ((try modalityForContentType(value.mime_type)).image)
+                try inference_work.encodedImagePixels(value.mime_type, value.data)
+            else
+                0,
+            .media_url => |url| try denseMediaUrlPixelsAlloc(alloc, url),
+        };
+        const next_pixels = std.math.add(u64, decoded_pixels, item_pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
         if (capabilities.batch.max_encoded_media_bytes) |limit| {
             if (next_bytes > limit) {
                 if (end == start) return error.InferenceEncodedBytesExceeded;
                 break;
             }
         }
+        if (capabilities.batch.max_decoded_pixels) |limit| {
+            if (next_pixels > limit) {
+                if (end == start) return error.InferenceDecodedPixelsExceeded;
+                break;
+            }
+        }
         encoded_media_bytes = next_bytes;
+        decoded_pixels = next_pixels;
     }
     return end;
 }
 
 test "managed embedder admission follows the selected attachment transport" {
-    const bytes = [_]u8{ 1, 2, 3 };
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const items = [_]template_mod.ContentPart{
         .{ .binary = .{ .mime_type = "image/png", .data = &bytes } },
         .{ .binary = .{ .mime_type = "image/png", .data = &bytes } },
@@ -4302,29 +4341,40 @@ test "managed embedder admission follows the selected attachment transport" {
             .mode = .native,
             .preferred_items = 2,
             .max_items = 2,
-            .max_encoded_media_bytes = 7,
+            .max_encoded_media_bytes = 63,
             .max_media_parts_per_item = 1,
         },
         .output = .embedding,
     };
     try std.testing.expectEqual(
         @as(usize, 2),
-        try densePartBatchEnd(capabilities, .borrowed_binary, &items, 0),
+        try densePartBatchEnd(std.testing.allocator, capabilities, .borrowed_binary, &items, 0),
     );
     try std.testing.expectEqual(
         @as(usize, 1),
-        try densePartBatchEnd(capabilities, .base64_payload, &items, 0),
+        try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0),
     );
-    try validateDensePartItemInvocation(capabilities, .base64_payload, items[0..1]);
+    try validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, items[0..1]);
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
-        validateDensePartItemInvocation(capabilities, .base64_payload, &items),
+        validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, &items),
+    );
+    var pixel_limited = capabilities;
+    pixel_limited.batch.max_encoded_media_bytes = null;
+    pixel_limited.batch.max_decoded_pixels = 6;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try densePartBatchEnd(std.testing.allocator, pixel_limited, .borrowed_binary, &items, 0),
+    );
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateDensePartItemInvocation(std.testing.allocator, pixel_limited, .borrowed_binary, &items),
     );
 }
 
 test "managed embedder partitions and validates inline image data URIs" {
-    const first = "data:image/png;base64,AQID";
-    const second = "data:image/png;base64,BAUG";
+    const first = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const second = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
     const items = [_]template_mod.ContentPart{
         .{ .media_url = first },
         .{ .media_url = second },
@@ -4343,11 +4393,11 @@ test "managed embedder partitions and validates inline image data URIs" {
         },
         .output = .embedding,
     };
-    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(capabilities, .base64_payload, &items, 0));
-    try validateDensePartItemInvocation(capabilities, .base64_payload, items[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0));
+    try validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, items[0..1]);
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
-        validateDensePartItemInvocation(capabilities, .base64_payload, &items),
+        validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, &items),
     );
     try std.testing.expectError(
         error.InvalidDataURI,
@@ -4359,7 +4409,7 @@ test "managed embedder partitions and validates inline image data URIs" {
     );
     try std.testing.expectError(
         error.InvalidInferenceMedia,
-        validateDensePartItemInvocation(capabilities, .borrowed_binary, &.{.{
+        validateDensePartItemInvocation(std.testing.allocator, capabilities, .borrowed_binary, &.{.{
             .binary = .{ .mime_type = "image/png", .data = &.{} },
         }}),
     );
@@ -6859,7 +6909,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             try std.testing.expectEqualStrings("local-model", model);
             try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
             try std.testing.expectEqualStrings("caption", parts_slice[0].text);
-            try std.testing.expectEqualStrings("data:image/png;base64,YWFh", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD", parts_slice[1].media_url);
             try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
             self.saw_parts = true;
 
@@ -6900,10 +6950,11 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     defer bedrock_managed.deinit();
     try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
 
+    const png_header = "\x89PNG\r\n\x1a\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x03";
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
-        .{ .media_url = "data:image/png;base64,YWFh" },
-        .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+        .{ .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" },
+        .{ .binary = .{ .mime_type = "image/png", .data = png_header } },
     };
     const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);
     defer std.testing.allocator.free(vector);

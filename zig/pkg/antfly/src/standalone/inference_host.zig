@@ -926,12 +926,18 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     return error.InferenceTextBytesExceeded;
                 extract_shape.max_text_bytes_per_item = @max(extract_shape.max_text_bytes_per_item, input.content_json.len);
             }
-            for (attachments) |attachment| extract_shape.encoded_media_bytes = std.math.add(
-                usize,
-                extract_shape.encoded_media_bytes,
-                attachment.bytes.len,
-            ) catch return error.InferenceEncodedBytesExceeded;
             const extract_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .extract);
+            for (attachments) |attachment| {
+                try extract_capabilities.validateMimeType(attachment.mime_type);
+                extract_shape.encoded_media_bytes = std.math.add(
+                    usize,
+                    extract_shape.encoded_media_bytes,
+                    attachment.bytes.len,
+                ) catch return error.InferenceEncodedBytesExceeded;
+                const pixels = try antfly.inference.work.encodedImagePixels(attachment.mime_type, attachment.bytes);
+                extract_shape.decoded_pixels = std.math.add(u64, extract_shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
             try extract_capabilities.validateInvocation(.extract, extract_shape);
             var result = try state.node.extractDirect(alloc, parsed.value.model, request);
             defer result.deinit();
@@ -1544,13 +1550,24 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, text.len);
             try capabilities.validateMimeType("text/plain");
         },
-        .media_url => {
+        .media_url => |url| {
             shape.modalities.image = true;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
+            if (try antfly.inference.work.parseInlineDataUri(url)) |_| {
+                var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, url);
+                defer decoded.deinit(alloc);
+                try capabilities.validateMimeType(decoded.mime_type);
+                shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+                const pixels = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
+                shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
         },
         .binary => |media| {
             try capabilities.validateMimeType(media.mime_type);
-            if (mimeEssenceStartsWith(media.mime_type, "image/")) {
+            const is_image = mimeEssenceStartsWith(media.mime_type, "image/");
+            if (is_image) {
                 shape.modalities.image = true;
             } else if (mimeEssenceStartsWith(media.mime_type, "audio/")) {
                 shape.modalities.audio = true;
@@ -1561,6 +1578,11 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             } else return error.UnsupportedInferenceMimeType;
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
                 return error.InferenceEncodedBytesExceeded;
+            if (is_image) {
+                const pixels = try antfly.inference.work.encodedImagePixels(media.mime_type, media.data);
+                shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
     };
@@ -1712,6 +1734,7 @@ fn validateEncodedReadCapabilities(
     request: antfly.readers.EncodedRequest,
 ) !void {
     var encoded_media_bytes: usize = 0;
+    var decoded_pixels: u64 = 0;
     for (request.images) |image| {
         try capabilities.validateMimeType(image.mime_type);
         const resident = try antfly.inference.work.AttachmentTransport.borrowed_binary.wireSize(
@@ -1720,6 +1743,9 @@ fn validateEncodedReadCapabilities(
         );
         encoded_media_bytes = std.math.add(usize, encoded_media_bytes, resident) catch
             return error.InferenceEncodedBytesExceeded;
+        const pixels = try antfly.inference.work.encodedImagePixels(image.mime_type, image.bytes);
+        decoded_pixels = std.math.add(u64, decoded_pixels, pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
     }
     const output_tokens: usize = if (request.max_tokens) |tokens|
         if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
@@ -1730,6 +1756,7 @@ fn validateEncodedReadCapabilities(
         .item_count = request.images.len,
         .modalities = if (request.images.len > 0) .{ .image = true } else .{},
         .encoded_media_bytes = encoded_media_bytes,
+        .decoded_pixels = decoded_pixels,
         .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
         .text_bytes = prompt_bytes,
         .max_text_bytes_per_item = prompt_bytes,
@@ -1738,7 +1765,10 @@ fn validateEncodedReadCapabilities(
 }
 
 test "encoded reader ABI enforces resolved model capabilities" {
-    const bytes = [_]u8{ 1, 2, 3 };
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const image = antfly.readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
     const capabilities = antfly.inference.work.InferenceCapabilities{
         .task = .read,
@@ -1750,6 +1780,7 @@ test "encoded reader ABI enforces resolved model capabilities" {
             .preferred_items = 1,
             .max_items = 1,
             .max_encoded_media_bytes = bytes.len,
+            .max_decoded_pixels = 6,
             .max_media_parts_per_item = 1,
         },
         .task_limits = .{ .max_output_tokens_per_item = 4 },
@@ -1760,7 +1791,7 @@ test "encoded reader ABI enforces resolved model capabilities" {
         error.InferenceBatchTooLarge,
         validateEncodedReadCapabilities(capabilities, .{ .images = &.{ image, image } }),
     );
-    const oversized = [_]u8{ 1, 2, 3, 4 };
+    const oversized = bytes ++ [_]u8{0};
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
         validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &oversized, .mime_type = "image/png" }} }),
@@ -1772,6 +1803,12 @@ test "encoded reader ABI enforces resolved model capabilities" {
     try std.testing.expectError(
         error.InferenceOutputTokensExceeded,
         validateEncodedReadCapabilities(capabilities, .{ .images = &.{image}, .max_tokens = 5 }),
+    );
+    var too_many_pixels = bytes;
+    std.mem.writeInt(u32, too_many_pixels[16..20], 3, .big);
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &too_many_pixels, .mime_type = "image/png" }} }),
     );
 }
 

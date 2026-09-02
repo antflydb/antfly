@@ -1316,7 +1316,7 @@ pub const Runtime = struct {
             // source boundary until their transport also carries per-item
             // identity.
             const image_end = if (uses_encoded_media)
-                encodedReaderBatchEnd(
+                try encodedReaderBatchEnd(
                     flat_encoded.items,
                     image_offset,
                     capabilities.batch,
@@ -1524,7 +1524,7 @@ pub const Runtime = struct {
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
         const local_reader = isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
         if (try self.readerCapabilities(alloc, cfg)) |capabilities| {
-            const inline_shape = try readerUriInvocationShape(capabilities, request);
+            const inline_shape = try readerUriInvocationShape(alloc, capabilities, request);
             try capabilities.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
@@ -1535,6 +1535,7 @@ pub const Runtime = struct {
                 else
                     0,
                 .encoded_media_bytes = inline_shape.encoded_media_bytes,
+                .decoded_pixels = inline_shape.decoded_pixels,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
         } else if (local_reader) {
@@ -1564,12 +1565,14 @@ pub const Runtime = struct {
 
     const ReaderUriInvocationShape = struct {
         encoded_media_bytes: usize = 0,
+        decoded_pixels: u64 = 0,
     };
 
     /// Inspect inline payloads before selecting a local callback or remote
     /// adapter. Network URLs remain provider-owned until download, where the
     /// inference server applies its own byte/MIME limits.
     fn readerUriInvocationShape(
+        alloc: Allocator,
         capabilities: inference_work.InferenceCapabilities,
         request: readers.Request,
     ) !ReaderUriInvocationShape {
@@ -1580,6 +1583,9 @@ pub const Runtime = struct {
             if (parsed.decoded_size == 0) return error.InvalidDataURI;
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
                 return error.InferenceEncodedBytesExceeded;
+            const pixels = try inlineImagePixelsAlloc(alloc, parsed.mime_type, url);
+            shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                return error.InferenceDecodedPixelsExceeded;
         }
         return shape;
     }
@@ -1594,6 +1600,7 @@ pub const Runtime = struct {
         const capabilities = try self.readerCapabilities(alloc, cfg);
         if (capabilities) |resolved| {
             var encoded_bytes: usize = 0;
+            var decoded_pixels: u64 = 0;
             const transport: inference_work.AttachmentTransport = if (local_reader)
                 .borrowed_binary
             else
@@ -1603,6 +1610,9 @@ pub const Runtime = struct {
                 const resident = try transport.wireSize(image.bytes.len, image.mime_type.len);
                 encoded_bytes = std.math.add(usize, encoded_bytes, resident) catch
                     return error.InferenceEncodedBytesExceeded;
+                const pixels = try inference_work.encodedImagePixels(image.mime_type, image.bytes);
+                decoded_pixels = std.math.add(u64, decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
             }
             try resolved.validateInvocation(.read, .{
                 .item_count = request.images.len,
@@ -1614,6 +1624,7 @@ pub const Runtime = struct {
                 else
                     0,
                 .encoded_media_bytes = encoded_bytes,
+                .decoded_pixels = decoded_pixels,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
         } else if (local_reader) {
@@ -1957,19 +1968,30 @@ fn encodedReaderBatchEnd(
     start: usize,
     capabilities: inference_work.BatchCapabilities,
     transport: inference_work.AttachmentTransport,
-) usize {
+) !usize {
     const item_end = @min(start +| capabilities.max_items, images.len);
-    const max_encoded_media_bytes = capabilities.max_encoded_media_bytes orelse return item_end;
     var end = start;
     var bytes: usize = 0;
+    var pixels: u64 = 0;
     while (end < item_end) : (end += 1) {
         const resident = transport.wireSize(
             images[end].bytes.len,
             images[end].mime_type.len,
         ) catch break;
         const next = std.math.add(usize, bytes, resident) catch break;
-        if (next > max_encoded_media_bytes and end > start) break;
+        const item_pixels = try inference_work.encodedImagePixels(images[end].mime_type, images[end].bytes);
+        const next_pixels = std.math.add(u64, pixels, item_pixels) catch break;
+        if (capabilities.max_encoded_media_bytes) |limit| {
+            if (next > limit and end > start) break;
+        }
+        if (capabilities.max_decoded_pixels) |limit| {
+            if (next_pixels > limit) {
+                if (end == start) return error.InferenceDecodedPixelsExceeded;
+                break;
+            }
+        }
         bytes = next;
+        pixels = next_pixels;
     }
     return @max(start + 1, end);
 }
@@ -1978,6 +2000,7 @@ const GeneratorItemShape = struct {
     modalities: inference_work.Modalities = .{},
     text_bytes: usize = 0,
     encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
     media_parts: usize = 0,
 };
 
@@ -2048,6 +2071,27 @@ fn inlineBase64ResidentSize(data: []const u8) !usize {
     return data.len;
 }
 
+fn inlineImagePixelsAlloc(
+    alloc: Allocator,
+    declared_mime_type: []const u8,
+    encoded: []const u8,
+) !u64 {
+    if (try inference_work.parseInlineDataUri(encoded)) |_| {
+        var decoded = try inference_work.decodeInlineDataUriAlloc(alloc, encoded);
+        defer decoded.deinit(alloc);
+        if (declared_mime_type.len > 0 and !inference_work.mediaTypesCompatible(declared_mime_type, decoded.mime_type))
+            return error.InvalidInferenceMedia;
+        return try inference_work.encodedImagePixels(decoded.mime_type, decoded.data);
+    }
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch
+        return error.InvalidDataURI;
+    if (decoded_len == 0) return error.InvalidDataURI;
+    const decoded = try alloc.alloc(u8, decoded_len);
+    defer alloc.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidDataURI;
+    return try inference_work.encodedImagePixels(declared_mime_type, decoded);
+}
+
 fn extractorAttachmentTransport(cfg: extracting.Config) inference_work.AttachmentTransport {
     return if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl()))
         .borrowed_binary
@@ -2079,6 +2123,9 @@ fn generatorRequestShape(
                 if (try dataUriResidentSize(image.url)) |media_bytes| {
                     shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media_bytes) catch
                         return error.InferenceEncodedBytesExceeded;
+                    const pixels = try inlineImagePixelsAlloc(alloc, dataUriMimeType(image.url).?, image.url);
+                    shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                        return error.InferenceDecodedPixelsExceeded;
                 }
             },
             .media => |media| {
@@ -2092,6 +2139,16 @@ fn generatorRequestShape(
                     try inlineBase64ResidentSize(media.data);
                 shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media_bytes) catch
                     return error.InferenceEncodedBytesExceeded;
+                const essence = inference_work.mimeTypeEssence(media.mime_type) catch
+                    return error.UnsupportedInferenceMimeType;
+                if (std.ascii.startsWithIgnoreCase(essence, "image/")) {
+                    const inline_value = media.url orelse media.data;
+                    if (media.url == null or dataUriMimeType(inline_value) != null) {
+                        const pixels = try inlineImagePixelsAlloc(alloc, media.mime_type, inline_value);
+                        shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                            return error.InferenceDecodedPixelsExceeded;
+                    }
+                }
             },
         };
     } else {
@@ -2107,6 +2164,13 @@ fn generatorRequestShape(
         const resident = try attachment_transport.wireSize(media.bytes.len, media.mime_type.len);
         shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, resident) catch
             return error.InferenceEncodedBytesExceeded;
+        const essence = inference_work.mimeTypeEssence(media.mime_type) catch
+            return error.UnsupportedInferenceMimeType;
+        if (std.ascii.startsWithIgnoreCase(essence, "image/")) {
+            const pixels = try inference_work.encodedImagePixels(media.mime_type, media.bytes);
+            shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
     }
     return shape;
 }
@@ -2126,6 +2190,8 @@ fn validateGeneratorInvocation(
         invocation.max_text_bytes_per_item = @max(invocation.max_text_bytes_per_item, item.text_bytes);
         invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;
+        invocation.decoded_pixels = std.math.add(u64, invocation.decoded_pixels, item.decoded_pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
     }
     try capabilities.validateInvocation(.generate, invocation);
@@ -2134,6 +2200,7 @@ fn validateGeneratorInvocation(
 const ExtractorItemShape = struct {
     modalities: inference_work.Modalities = .{},
     encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
     media_parts: usize = 0,
     prompt: []u8,
 
@@ -2149,6 +2216,7 @@ fn addExtractorMediaShape(
     shape: *ExtractorItemShape,
     mime_type: ?[]const u8,
     encoded_bytes: ?usize,
+    decoded_pixels: ?u64,
     inline_data: bool,
 ) !void {
     if (inline_data and !request.inline_media_trusted) return error.UntrustedInlineMedia;
@@ -2164,6 +2232,11 @@ fn addExtractorMediaShape(
         shape.encoded_media_bytes,
         bytes,
     ) catch return error.InferenceEncodedBytesExceeded;
+    if (decoded_pixels) |pixels| shape.decoded_pixels = std.math.add(
+        u64,
+        shape.decoded_pixels,
+        pixels,
+    ) catch return error.InferenceDecodedPixelsExceeded;
 }
 
 fn extractorRequestShape(
@@ -2211,12 +2284,14 @@ fn extractorRequestShape(
                 else
                     return error.InvalidExtractionContent;
                 const is_inline = dataUriMimeType(url) != null;
+                const mime_type = dataUriMimeType(url);
                 try addExtractorMediaShape(
                     capabilities,
                     request,
                     &shape,
-                    dataUriMimeType(url),
+                    mime_type,
                     try dataUriResidentSize(url),
+                    if (is_inline) try inlineImagePixelsAlloc(alloc, mime_type.?, url) else null,
                     is_inline,
                 );
             } else if (std.mem.eql(u8, type_value.string, "media")) {
@@ -2227,23 +2302,27 @@ fn extractorRequestShape(
                 if (part.object.get("url")) |url_value| {
                     if (url_value != .string) return error.InvalidExtractionContent;
                     const inferred_mime = dataUriMimeType(url_value.string);
+                    const effective_mime = declared_mime orelse inferred_mime;
                     try addExtractorMediaShape(
                         capabilities,
                         request,
                         &shape,
-                        declared_mime orelse inferred_mime,
+                        effective_mime,
                         try dataUriResidentSize(url_value.string),
+                        if (inferred_mime != null) try inlineImagePixelsAlloc(alloc, effective_mime.?, url_value.string) else null,
                         inferred_mime != null,
                     );
                 } else if (part.object.get("data")) |data_value| {
                     if (data_value != .string) return error.InvalidExtractionContent;
                     const inferred_mime = dataUriMimeType(data_value.string);
+                    const effective_mime = declared_mime orelse inferred_mime;
                     try addExtractorMediaShape(
                         capabilities,
                         request,
                         &shape,
-                        declared_mime orelse inferred_mime,
+                        effective_mime,
                         try inlineBase64ResidentSize(data_value.string),
+                        if (effective_mime) |mime| try inlineImagePixelsAlloc(alloc, mime, data_value.string) else null,
                         true,
                     );
                 } else return error.InvalidExtractionContent;
@@ -2263,6 +2342,7 @@ fn extractorRequestShape(
             &shape,
             media.mime_type,
             try attachment_transport.wireSize(media.bytes.len, media.mime_type.len),
+            try inference_work.encodedImagePixels(media.mime_type, media.bytes),
             true,
         );
     }
@@ -2304,6 +2384,8 @@ fn validateExtractorInvocation(
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
         invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;
+        invocation.decoded_pixels = std.math.add(u64, invocation.decoded_pixels, item.decoded_pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
     }
     try capabilities.validateInvocation(.extract, invocation);
 }
@@ -2381,7 +2463,7 @@ test "asset producer runtime generator admission accepts PDF only for document-c
 }
 
 test "asset producer runtime generator admission accounts for resident inline media" {
-    const data_uri = "data:image/png;base64,AQID";
+    const data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
     const capabilities = inference_work.InferenceCapabilities{
         .task = .generate,
         .input_modalities = .{ .text = true, .image = true },
@@ -2391,8 +2473,8 @@ test "asset producer runtime generator admission accounts for resident inline me
         .output = .generated_text,
     };
     const requests = [_]asset_producer.Request{
-        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AQID\"}}]" },
-        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,BAUG\"}}]" },
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}}]" },
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}}]" },
     };
     try std.testing.expectEqual(@as(usize, 1), try generatorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
     try validateGeneratorInvocation(std.testing.allocator, capabilities, .base64_payload, requests[0..1]);
@@ -2400,10 +2482,21 @@ test "asset producer runtime generator admission accounts for resident inline me
         error.InferenceEncodedBytesExceeded,
         validateGeneratorInvocation(std.testing.allocator, capabilities, .base64_payload, &requests),
     );
+    var pixel_limited = capabilities;
+    pixel_limited.batch.max_encoded_media_bytes = null;
+    pixel_limited.batch.max_decoded_pixels = 6;
+    try std.testing.expectEqual(@as(usize, 1), try generatorBatchEnd(std.testing.allocator, pixel_limited, .base64_payload, &requests, 0));
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateGeneratorInvocation(std.testing.allocator, pixel_limited, .base64_payload, &requests),
+    );
 }
 
 test "asset producer runtime media accounting follows attachment transport" {
-    const bytes = [_]u8{ 1, 2, 3 };
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const request = asset_producer.Request{
         .producer_type = .generator,
         .config_json = "{}",
@@ -2415,15 +2508,15 @@ test "asset producer runtime media accounting follows attachment transport" {
         .input_modalities = .{ .text = true, .image = true },
         .accepted_mime_types = .{ .text_plain = true, .image_png = true },
         .input_granularity = .page,
-        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_media_bytes = 4, .max_media_parts_per_item = 1 },
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_media_bytes = 32, .max_media_parts_per_item = 1 },
         .output = .generated_text,
         .borrowed_attachments = false,
     };
     const encoded = try generatorRequestShape(std.testing.allocator, capabilities, .base64_payload, request);
-    try std.testing.expectEqual(@as(usize, 4), encoded.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 32), encoded.encoded_media_bytes);
 
     const borrowed = try generatorRequestShape(std.testing.allocator, capabilities, .borrowed_binary, request);
-    try std.testing.expectEqual(@as(usize, 3), borrowed.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 24), borrowed.encoded_media_bytes);
 
     const extractor_request = asset_producer.Request{
         .producer_type = .extractor,
@@ -2441,10 +2534,10 @@ test "asset producer runtime media accounting follows attachment transport" {
 
     var extractor_borrowed = try extractorRequestShape(std.testing.allocator, extractor_capabilities, .borrowed_binary, extractor_request);
     defer extractor_borrowed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), extractor_borrowed.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 24), extractor_borrowed.encoded_media_bytes);
     var extractor_encoded = try extractorRequestShape(std.testing.allocator, extractor_capabilities, .base64_payload, extractor_request);
     defer extractor_encoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 4), extractor_encoded.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 32), extractor_encoded.encoded_media_bytes);
 }
 
 test "remote generator planning charges the host batch transport and route response limit" {
@@ -2484,7 +2577,7 @@ test "asset producer runtime validates the complete base64 representation" {
         try dataUriResidentSize("data:image/png,%89PNG"),
     );
     try std.testing.expectEqualStrings(
-        "image/png",
+        "image/png;charset=binary",
         dataUriMimeType("data:image/png;charset=binary;base64,AQID").?,
     );
 }
@@ -2495,15 +2588,16 @@ test "asset producer runtime reader URI admission measures data payloads before 
         .input_modalities = .{ .image = true },
         .accepted_mime_types = .{ .image_png = true },
         .input_granularity = .page,
-        .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 2, .max_media_parts_per_item = 1 },
+        .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 2, .max_decoded_pixels = 6, .max_media_parts_per_item = 1 },
         .output = .read_result,
     };
     const request = readers.Request{
-        .images = &.{"data:image/png;base64,AQID"},
+        .images = &.{"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"},
         .inline_content_trust = .trusted_internal,
     };
-    const shape = try Runtime.readerUriInvocationShape(capabilities, request);
+    const shape = try Runtime.readerUriInvocationShape(std.testing.allocator, capabilities, request);
     try std.testing.expectEqual(request.images[0].len, shape.encoded_media_bytes);
+    try std.testing.expectEqual(@as(u64, 6), shape.decoded_pixels);
     try std.testing.expectError(error.InferenceEncodedBytesExceeded, capabilities.validateInvocation(.read, .{
         .item_count = 1,
         .modalities = .{ .image = true },
@@ -2512,7 +2606,7 @@ test "asset producer runtime reader URI admission measures data payloads before 
     }));
     try std.testing.expectError(
         error.InvalidDataURI,
-        Runtime.readerUriInvocationShape(capabilities, .{
+        Runtime.readerUriInvocationShape(std.testing.allocator, capabilities, .{
             .images = &.{"data:image/png;base64,"},
             .inline_content_trust = .trusted_internal,
         }),
@@ -2527,16 +2621,29 @@ fn generatorBatchEnd(
     start: usize,
 ) !usize {
     const item_end = @min(start +| capabilities.batch.max_items, requests.len);
-    const max_encoded_media_bytes = capabilities.batch.max_encoded_media_bytes orelse return item_end;
+    if (capabilities.batch.max_encoded_media_bytes == null and capabilities.batch.max_decoded_pixels == null)
+        return item_end;
     var end = start;
     var bytes: usize = 0;
+    var pixels: u64 = 0;
     while (end < item_end) : (end += 1) {
         const item = try generatorRequestShape(alloc, capabilities, attachment_transport, requests[end]);
-        if (item.encoded_media_bytes > max_encoded_media_bytes)
-            return error.InferenceEncodedBytesExceeded;
         const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch break;
-        if (next > max_encoded_media_bytes and end > start) break;
+        const next_pixels = std.math.add(u64, pixels, item.decoded_pixels) catch break;
+        if (capabilities.batch.max_encoded_media_bytes) |limit| {
+            if (next > limit) {
+                if (end == start) return error.InferenceEncodedBytesExceeded;
+                break;
+            }
+        }
+        if (capabilities.batch.max_decoded_pixels) |limit| {
+            if (next_pixels > limit) {
+                if (end == start) return error.InferenceDecodedPixelsExceeded;
+                break;
+            }
+        }
         bytes = next;
+        pixels = next_pixels;
     }
     return @max(start + 1, end);
 }
@@ -2549,22 +2656,40 @@ fn extractorBatchEnd(
     start: usize,
 ) !usize {
     const item_end = @min(start +| capabilities.batch.max_items, requests.len);
-    const max_encoded_media_bytes = capabilities.batch.max_encoded_media_bytes orelse return item_end;
+    if (capabilities.batch.max_encoded_media_bytes == null and capabilities.batch.max_decoded_pixels == null)
+        return item_end;
     var end = start;
     var bytes: usize = 0;
+    var pixels: u64 = 0;
     while (end < item_end) : (end += 1) {
         var item = try extractorRequestShape(alloc, capabilities, attachment_transport, requests[end]);
         defer item.deinit(alloc);
-        if (item.encoded_media_bytes > max_encoded_media_bytes) return error.InferenceEncodedBytesExceeded;
         const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
-        if (next > max_encoded_media_bytes) break;
+        const next_pixels = std.math.add(u64, pixels, item.decoded_pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
+        if (capabilities.batch.max_encoded_media_bytes) |limit| {
+            if (next > limit) {
+                if (end == start) return error.InferenceEncodedBytesExceeded;
+                break;
+            }
+        }
+        if (capabilities.batch.max_decoded_pixels) |limit| {
+            if (next_pixels > limit) {
+                if (end == start) return error.InferenceDecodedPixelsExceeded;
+                break;
+            }
+        }
         bytes = next;
+        pixels = next_pixels;
     }
     return @max(start + 1, end);
 }
 
 test "asset producer runtime extractor windows obey resolved item and encoded-byte ceilings" {
-    const bytes = [_]u8{ 1, 2, 3 };
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const requests = [_]asset_producer.Request{
         .{ .producer_type = .extractor, .config_json = "{}", .source_text = "ocr", .inline_media_trusted = true, .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} },
         .{ .producer_type = .extractor, .config_json = "{}", .source_text = "ocr", .inline_media_trusted = true, .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} },
@@ -2575,7 +2700,7 @@ test "asset producer runtime extractor windows obey resolved item and encoded-by
         .input_modalities = .{ .image = true },
         .accepted_mime_types = .{ .image_png = true },
         .input_granularity = .page,
-        .batch = .{ .mode = .serial_compatibility, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 5, .max_media_parts_per_item = 1 },
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 63, .max_media_parts_per_item = 1 },
         .output = .extraction,
         .prompt_policy = .structured_schema,
     };
@@ -2590,8 +2715,8 @@ test "asset producer runtime extractor windows obey resolved item and encoded-by
 }
 
 test "asset producer runtime extractor admission accounts for resident inline source parts" {
-    const first_uri = "data:image/png;base64,AQID";
-    const second_uri = "data:image/png;base64,BAUG";
+    const first_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const second_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
     const capabilities = inference_work.InferenceCapabilities{
         .task = .extract,
         .input_modalities = .{ .image = true },
@@ -2602,8 +2727,8 @@ test "asset producer runtime extractor admission accounts for resident inline so
         .prompt_policy = .structured_schema,
     };
     const requests = [_]asset_producer.Request{
-        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,AQID\"}]" },
-        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,BAUG\"}]" },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]" },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]" },
     };
     try std.testing.expectEqual(first_uri.len, second_uri.len);
     try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
@@ -2650,7 +2775,7 @@ test "asset producer runtime extractor shape is allocation-failure safe" {
                 .config_json = "{}",
                 .source_text = "",
                 .inline_media_trusted = true,
-                .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,AQID\"}]",
+                .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]",
             });
             defer shape.deinit(alloc);
         }
@@ -2666,29 +2791,32 @@ test "asset producer runtime local reader chunks stop at source boundaries befor
 }
 
 test "encoded reader chunks obey model item and byte limits" {
-    const bytes = [_]u8{ 1, 2, 3 };
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const images = [_]readers.EncodedImage{
         .{ .bytes = &bytes, .mime_type = "image/png" },
         .{ .bytes = &bytes, .mime_type = "image/png" },
         .{ .bytes = &bytes, .mime_type = "image/png" },
     };
-    try std.testing.expectEqual(@as(usize, 1), encodedReaderBatchEnd(&images, 0, .{
+    try std.testing.expectEqual(@as(usize, 1), try encodedReaderBatchEnd(&images, 0, .{
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,
-        .max_encoded_media_bytes = 5,
+        .max_encoded_media_bytes = 47,
     }, .borrowed_binary));
-    try std.testing.expectEqual(@as(usize, 2), encodedReaderBatchEnd(&images, 0, .{
+    try std.testing.expectEqual(@as(usize, 2), try encodedReaderBatchEnd(&images, 0, .{
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,
-        .max_encoded_media_bytes = 6,
+        .max_encoded_media_bytes = 48,
     }, .borrowed_binary));
     const data_uri_bytes = try inference_work.AttachmentTransport.data_uri.wireSize(
         bytes.len,
         "image/png".len,
     );
-    try std.testing.expectEqual(@as(usize, 1), encodedReaderBatchEnd(&images, 0, .{
+    try std.testing.expectEqual(@as(usize, 1), try encodedReaderBatchEnd(&images, 0, .{
         .mode = .native,
         .preferred_items = 2,
         .max_items = 2,

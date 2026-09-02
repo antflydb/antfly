@@ -341,6 +341,26 @@ const AdaptiveRenderGeometry = struct {
     rotation: render.PageRotation,
 };
 
+pub const PageRenderGeometry = struct {
+    effective_dpi: u16,
+    width: u32,
+    height: u32,
+    pixels: u64,
+};
+
+/// Resolve the raster geometry for a page using the exact same adaptive rules
+/// as rendering, without allocating the raster. Document planners use this to
+/// bound the aggregate pixels retained by the following inference invocation.
+pub fn planParsedPageRenderGeometry(parsed: *reader.Reader, request: PageRenderRequest) !PageRenderGeometry {
+    const geometry = try adaptiveRenderGeometry(parsed, request);
+    return .{
+        .effective_dpi = geometry.effective_dpi,
+        .width = geometry.width,
+        .height = geometry.height,
+        .pixels = geometry.pixels,
+    };
+}
+
 fn adaptiveRenderGeometry(parsed: *reader.Reader, request: PageRenderRequest) !AdaptiveRenderGeometry {
     if (request.page_number == 0) return error.InvalidPageNumber;
     if (request.requested_dpi < 72 or request.requested_dpi > 600) return error.InvalidRenderDpi;
@@ -3264,7 +3284,17 @@ test "adaptive OCR rendering records effective DPI and enforces safety caps" {
 
     var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 1000);
     defer adaptive.deinit(alloc);
+    const planned = try planParsedPageRenderGeometry(&parsed, .{
+        .page_number = 1,
+        .requested_dpi = 150,
+        .max_pixels = 40_000_000,
+        .max_dimension = 1000,
+    });
     try std.testing.expectEqual(@as(u16, 150), adaptive.requested_dpi);
+    try std.testing.expectEqual(adaptive.effective_dpi, planned.effective_dpi);
+    try std.testing.expectEqual(adaptive.width, planned.width);
+    try std.testing.expectEqual(adaptive.height, planned.height);
+    try std.testing.expectEqual(@as(u64, adaptive.width) * adaptive.height, planned.pixels);
     try std.testing.expect(adaptive.effective_dpi >= 72);
     try std.testing.expect(adaptive.effective_dpi < adaptive.requested_dpi);
     try std.testing.expect(adaptive.width <= 1000);

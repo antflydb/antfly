@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const data_uri = @import("antfly_scraping").data_uri;
+const antfly_image = @import("antfly_image");
 
 pub const mimeTypeEssence = data_uri.mediaTypeEssence;
 pub const parseMediaType = data_uri.parseMediaType;
@@ -312,6 +313,35 @@ pub const InvocationShape = struct {
     decoded_pixels: u64 = 0,
     max_media_parts_per_item: usize = 0,
 };
+
+/// Measure a concrete encoded image at an executor boundary. Declarations are
+/// not trusted for accounting: dimensions are read from the actual payload,
+/// and a mismatched common MIME type is rejected before model work.
+pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
+    const essence = mimeTypeEssence(content_type) catch return error.UnsupportedInferenceMimeType;
+    const format = antfly_image.detectFormat(bytes);
+    const matches = switch (format) {
+        .png => std.ascii.eqlIgnoreCase(essence, "image/png"),
+        .jpeg => std.ascii.eqlIgnoreCase(essence, "image/jpeg") or std.ascii.eqlIgnoreCase(essence, "image/jpg"),
+        .gif => std.ascii.eqlIgnoreCase(essence, "image/gif"),
+        .bmp => std.ascii.eqlIgnoreCase(essence, "image/bmp"),
+        .webp => std.ascii.eqlIgnoreCase(essence, "image/webp"),
+        else => false,
+    };
+    if (!matches) return error.InvalidInferenceMedia;
+    const info = antfly_image.inspectEncoded(bytes) catch return error.InvalidInferenceMedia;
+    return info.pixels() catch return error.InferenceDecodedPixelsExceeded;
+}
+
+test "inference capabilities measure physical image pixels and MIME" {
+    var png = [_]u8{0} ** 24;
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 7, .big);
+    std.mem.writeInt(u32, png[20..24], 5, .big);
+    try std.testing.expectEqual(@as(u64, 35), try encodedImagePixels("image/png;charset=binary", &png));
+    try std.testing.expectError(error.InvalidInferenceMedia, encodedImagePixels("image/jpeg", &png));
+    try std.testing.expectError(error.InvalidInferenceMedia, encodedImagePixels("image/png", "not an image"));
+}
 
 /// Versioned, task-neutral resource dimensions. Unknown limits remain null and
 /// must be enforced by the concrete executor; published limits are consumed by

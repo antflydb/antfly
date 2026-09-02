@@ -152,6 +152,12 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             min_output_dimension: u32 = 1,
             max_output_attempts: u8 = 8,
         };
+        pub const PageRenderGeometry = struct {
+            effective_dpi: u16,
+            width: u32,
+            height: u32,
+            pixels: u64,
+        };
         pub const PageRenderBatchOptions = struct {
             max_batch_pages: usize = 8,
             max_parallel_pages: usize = 1,
@@ -212,6 +218,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         }
 
         pub fn renderParsedPagesBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PageRenderRequest, _: PageRenderBatchOptions) anyerror!RenderedPageBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn planParsedPageRenderGeometry(_: *reader.Reader, _: PageRenderRequest) anyerror!PageRenderGeometry {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -387,6 +397,7 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
 
 pub const RenderedPdfPage = pdf.RenderedPagePng;
 pub const PdfPageRenderRequest = pdf.PageRenderRequest;
+pub const PdfPageRenderGeometry = pdf.PageRenderGeometry;
 pub const PdfPageRenderBatchOptions = pdf.PageRenderBatchOptions;
 pub const RenderedPdfPageBatch = pdf.RenderedPageBatch;
 pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
@@ -462,6 +473,10 @@ pub const PdfRenderSession = struct {
 
     pub fn pageCount(self: *PdfRenderSession) !usize {
         return try self.parsed.pageCount();
+    }
+
+    pub fn planPageRenderGeometry(self: *PdfRenderSession, request: PdfPageRenderRequest) !PdfPageRenderGeometry {
+        return try pdf.planParsedPageRenderGeometry(&self.parsed, request);
     }
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
