@@ -5462,10 +5462,29 @@ fn inferenceProviderExtract(
     model: []const u8,
     request: antfly.extracting.Request,
 ) anyerror!antfly.extracting.Response {
-    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
+    const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, request.attachments.len);
+    defer alloc.free(payloads);
+    const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, request.attachments.len);
+    defer alloc.free(refs);
+    for (request.attachments, 0..) |attachment, i| {
+        if (attachment.input_index >= request.inputs.len or attachment.mime_type.len == 0)
+            return error.InvalidExtractionAttachment;
+        payloads[i] = .{
+            .bytes = inference_bridge.String.init(attachment.bytes),
+            .content_type = inference_bridge.String.init(attachment.mime_type),
+        };
+        refs[i] = .{ .attachment_index = i, .item_index = attachment.input_index };
+    }
+    const wire_request = antfly.extracting.Request{
+        .inputs = request.inputs,
+        .schema_json = request.schema_json,
+        .options_json = request.options_json,
+    };
+    const json = try invokeInferenceProviderWithBinary([]u8, alloc, handle, .extract, .{
         .model = model,
-        .request = request,
-    }, null);
+        .request = wire_request,
+        .attachment_count = request.attachments.len,
+    }, null, payloads, refs);
     return .{ .allocator = alloc, .json = json };
 }
 

@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 22;
+pub const abi_version: u32 = 23;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -184,9 +184,10 @@ pub const ProviderAttachmentRef = extern struct {
 };
 
 /// JSON metadata paired with ProviderInvokeContext.binary_payloads for
-/// read_encoded_images. Binary payloads are operation-neutral; the operation
-/// JSON defines their interpretation. `image_count` deliberately appears in
-/// both channels so the host rejects a torn call before borrowing memory.
+/// operations that borrow attachments. Binary payloads are operation-neutral;
+/// the operation JSON defines their interpretation. Cardinality deliberately
+/// appears in both channels so the host rejects a torn call before borrowing
+/// memory.
 pub const ReadEncodedImagesRequest = struct {
     model: []const u8,
     image_count: usize,

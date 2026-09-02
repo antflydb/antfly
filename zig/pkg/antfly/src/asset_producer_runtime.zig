@@ -277,6 +277,11 @@ pub const Runtime = struct {
                 }
                 break :blk null;
             },
+            .extractor => blk: {
+                var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+                defer cfg.deinit(alloc);
+                break :blk try self.extractorCapabilities(alloc, cfg);
+            },
             else => null,
         };
     }
@@ -319,7 +324,11 @@ pub const Runtime = struct {
             // produceBatch implementation is therefore a compatibility loop,
             // not an atomic provider batch, and must be isolated by callers.
             .transcriber => .none,
-            .extractor => if (try self.canExtractBatch(alloc, requests)) .native else .none,
+            .extractor => blk: {
+                if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
+                const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
+                break :blk capabilities.batch.mode;
+            },
         };
     }
 
@@ -438,11 +447,47 @@ pub const Runtime = struct {
 
     fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
         if (!requestsShareConfig(requests)) return false;
-        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
-        defer cfg.deinit(alloc);
-        if (!isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) return true;
-        const local = self.antfly_provider orelse return false;
-        return local.extract != null;
+        const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
+        if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
+            capabilities.batch.mode == .none) return false;
+        validateExtractorBatchPlan(capabilities, requests) catch return false;
+        return true;
+    }
+
+    fn extractorCapabilities(
+        self: *Runtime,
+        alloc: Allocator,
+        cfg: extracting.Config,
+    ) !?inference_work.InferenceCapabilities {
+        if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) {
+            const local = self.antfly_provider orelse return null;
+            if (local.extract == null) return null;
+            const resolve = local.model_capabilities orelse return null;
+            const capabilities = try resolve(local.ptr, alloc, cfg.model, .extract);
+            try capabilities.validate();
+            if (capabilities.task != .extract) return error.InvalidInferenceCapabilities;
+            return capabilities;
+        }
+        if (cfg.provider != .antfly) return null;
+        const endpoint = cfg.resolvedUrl() orelse return null;
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (cfg.bearer_token orelse cfg.api_key) |token| blk: {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+            header_storage[0] = .{ "Authorization", auth_value.? };
+            break :blk &header_storage;
+        } else &.{};
+        return self.capability_cache.getOrDiscover(
+            self.http,
+            endpoint,
+            cfg.model,
+            .extract,
+            headers,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
     }
 
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -522,6 +567,18 @@ pub const Runtime = struct {
             },
             else => return err,
         };
+        if (first_type == .extractor) return self.tryExtractBatchReported(alloc, requests) catch |err| switch (err) {
+            error.BatchIncompatible => blk: {
+                const outputs = try self.produceBatchSequential(alloc, requests);
+                break :blk try asset_producer.producedBatchFromOutputs(
+                    alloc,
+                    requests,
+                    outputs,
+                    inference_work.ExecutionReport.fallback(requests.len, "capabilities_unavailable"),
+                );
+            },
+            else => return err,
+        };
 
         const mode = try batchMode(ptr, alloc, requests);
         const items = try produceBatch(self, alloc, requests);
@@ -568,11 +625,55 @@ pub const Runtime = struct {
     }
 
     fn tryExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        var batch = try self.tryExtractBatchReported(alloc, requests);
+        defer batch.deinit(alloc);
+        return try batch.intoOutputs(alloc);
+    }
+
+    fn tryExtractBatchReported(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
         for (requests) |request| {
             if (request.producer_type != .extractor) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
         }
 
+        const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return error.BatchIncompatible;
+        try validateExtractorBatchCompatibility(capabilities, requests);
+        const outputs = try alloc.alloc([]u8, requests.len);
+        var outputs_owned = true;
+        errdefer if (outputs_owned) {
+            for (outputs) |output| if (output.len > 0) alloc.free(output);
+            alloc.free(outputs);
+        };
+        for (outputs) |*output| output.* = &.{};
+        var windows: usize = 0;
+        var start: usize = 0;
+        while (start < requests.len) {
+            const end = try extractorBatchEnd(capabilities, requests, start);
+            try validateExtractorInvocation(capabilities, requests[start..end]);
+            const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end]);
+            defer alloc.free(chunk_outputs);
+            if (chunk_outputs.len != end - start) {
+                for (chunk_outputs) |output| if (output.len > 0) alloc.free(output);
+                return error.InvalidProducedBatchCardinality;
+            }
+            for (chunk_outputs, 0..) |output, i| outputs[start + i] = output;
+            windows += 1;
+            start = end;
+        }
+        const execution = switch (capabilities.batch.mode) {
+            .native => inference_work.ExecutionReport{
+                .requested_items = requests.len,
+                .native_batches = windows,
+                .native_items = requests.len,
+            },
+            .serial_compatibility => inference_work.ExecutionReport.serial(requests.len),
+            .none => return error.BatchIncompatible,
+        };
+        outputs_owned = false;
+        return try asset_producer.producedBatchFromOutputs(alloc, requests, outputs, execution);
+    }
+
+    fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
 
@@ -583,17 +684,32 @@ pub const Runtime = struct {
             alloc.free(inputs);
         }
 
+        var attachment_count: usize = 0;
+        for (requests) |request| attachment_count = try std.math.add(usize, attachment_count, request.media.len);
+        const attachments = try alloc.alloc(extracting.Attachment, attachment_count);
+        defer alloc.free(attachments);
+        var attachment_index: usize = 0;
+
         for (requests, 0..) |request, i| {
             inputs[i] = .{
                 .content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json),
             };
             inputs_filled += 1;
+            for (request.media) |media| {
+                attachments[attachment_index] = .{
+                    .input_index = i,
+                    .bytes = media.bytes,
+                    .mime_type = media.mime_type,
+                };
+                attachment_index += 1;
+            }
         }
 
         const extract_request = extracting.Request{
             .inputs = inputs,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
+            .attachments = attachments,
         };
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
@@ -1260,16 +1376,29 @@ pub const Runtime = struct {
     }
 
     fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
         defer cfg.deinit(alloc);
+
+        if (try self.extractorCapabilities(alloc, cfg)) |capabilities| {
+            try validateExtractorInvocation(capabilities, &.{request});
+        }
 
         const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
         defer alloc.free(content_json);
         const input = extracting.Input{ .content_json = content_json };
+        const attachments = try alloc.alloc(extracting.Attachment, request.media.len);
+        defer alloc.free(attachments);
+        for (request.media, attachments) |media, *attachment| attachment.* = .{
+            .input_index = 0,
+            .bytes = media.bytes,
+            .mime_type = media.mime_type,
+        };
         const extract_request = extracting.Request{
             .inputs = &.{input},
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
+            .attachments = attachments,
         };
 
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
@@ -1586,6 +1715,77 @@ fn validateGeneratorInvocation(
     try capabilities.validateInvocation(.generate, invocation);
 }
 
+fn validateExtractorInvocation(
+    capabilities: inference_work.InferenceCapabilities,
+    requests: []const asset_producer.Request,
+) !void {
+    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item)
+        return error.InvalidInferenceCapabilities;
+    var invocation = inference_work.InvocationShape{ .item_count = requests.len };
+    var uses_media: ?bool = null;
+    for (requests) |request| {
+        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        const item_uses_media = request.media.len > 0;
+        if (uses_media) |expected| {
+            if (expected != item_uses_media) return error.BatchIncompatible;
+        } else uses_media = item_uses_media;
+        if (item_uses_media) {
+            invocation.modalities.image = true;
+            invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, request.media.len);
+            for (request.media) |media| {
+                try capabilities.validateMimeType(media.mime_type);
+                invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, media.bytes.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+            }
+        } else {
+            invocation.modalities.text = true;
+            try capabilities.validateMimeType("text/plain");
+        }
+    }
+    try capabilities.validateInvocation(.extract, invocation);
+}
+
+fn validateExtractorBatchCompatibility(
+    capabilities: inference_work.InferenceCapabilities,
+    requests: []const asset_producer.Request,
+) !void {
+    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
+        capabilities.batch.mode == .none) return error.InvalidInferenceCapabilities;
+    var uses_media: ?bool = null;
+    var media_prompt_text: ?[]const u8 = null;
+    var media_prompt_parts: ?[]const u8 = null;
+    for (requests) |request| {
+        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+        const item_uses_media = request.media.len > 0;
+        if (uses_media) |expected| {
+            if (expected != item_uses_media) return error.BatchIncompatible;
+        } else uses_media = item_uses_media;
+        if (item_uses_media) {
+            if (media_prompt_text) |expected| {
+                if (!std.mem.eql(u8, expected, request.source_text) or
+                    !optionalStringsEqual(media_prompt_parts, request.source_parts_json))
+                    return error.BatchIncompatible;
+            } else {
+                media_prompt_text = request.source_text;
+                media_prompt_parts = request.source_parts_json;
+            }
+        }
+    }
+}
+
+fn validateExtractorBatchPlan(
+    capabilities: inference_work.InferenceCapabilities,
+    requests: []const asset_producer.Request,
+) !void {
+    try validateExtractorBatchCompatibility(capabilities, requests);
+    var start: usize = 0;
+    while (start < requests.len) {
+        const end = try extractorBatchEnd(capabilities, requests, start);
+        try validateExtractorInvocation(capabilities, requests[start..end]);
+        start = end;
+    }
+}
+
 test "asset producer runtime generator admission accepts PDF only for document-capable models" {
     const capabilities = inference_work.InferenceCapabilities{
         .task = .generate,
@@ -1654,6 +1854,53 @@ fn generatorBatchEnd(
         bytes = next;
     }
     return @max(start + 1, end);
+}
+
+fn extractorBatchEnd(
+    capabilities: inference_work.InferenceCapabilities,
+    requests: []const asset_producer.Request,
+    start: usize,
+) !usize {
+    const item_end = @min(start +| capabilities.batch.max_items, requests.len);
+    const max_encoded_media_bytes = capabilities.batch.max_encoded_media_bytes orelse return item_end;
+    var end = start;
+    var bytes: usize = 0;
+    while (end < item_end) : (end += 1) {
+        var item_bytes: usize = 0;
+        for (requests[end].media) |media| item_bytes = std.math.add(usize, item_bytes, media.bytes.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (item_bytes > max_encoded_media_bytes) return error.InferenceEncodedBytesExceeded;
+        const next = std.math.add(usize, bytes, item_bytes) catch return error.InferenceEncodedBytesExceeded;
+        if (next > max_encoded_media_bytes) break;
+        bytes = next;
+    }
+    return @max(start + 1, end);
+}
+
+test "asset producer runtime extractor windows obey resolved item and encoded-byte ceilings" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "ocr", .inline_media_trusted = true, .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "ocr", .inline_media_trusted = true, .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "ocr", .inline_media_trusted = true, .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} },
+    };
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .extract,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 5, .max_media_parts_per_item = 1 },
+        .output = .extraction,
+        .prompt_policy = .structured_schema,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(capabilities, &requests, 0));
+    try validateExtractorInvocation(capabilities, requests[0..1]);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateExtractorInvocation(capabilities, requests[0..2]));
+    try validateExtractorBatchPlan(capabilities, &requests);
+
+    var different_prompts = requests;
+    different_prompts[1].source_text = "different prompt";
+    try std.testing.expectError(error.BatchIncompatible, validateExtractorBatchPlan(capabilities, &different_prompts));
 }
 
 test "asset producer runtime local reader chunks stop at source boundaries before the Florence cap" {
@@ -3481,6 +3728,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .extract = extract,
+                .model_capabilities = modelCapabilities,
             };
         }
 
@@ -3490,6 +3738,19 @@ test "asset producer runtime routes antfly extractor without url to local provid
 
         fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
             return error.TestUnexpectedResult;
+        }
+
+        fn modelCapabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqual(inference_work.Task.extract, task);
+            return .{
+                .task = .extract,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .item,
+                .batch = .{ .mode = .serial_compatibility, .preferred_items = 8, .max_items = 128 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
         }
 
         fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
@@ -3541,6 +3802,7 @@ test "asset producer runtime batches compatible antfly extractor requests" {
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .extract = extract,
+                .model_capabilities = modelCapabilities,
             };
         }
 
@@ -3550,6 +3812,19 @@ test "asset producer runtime batches compatible antfly extractor requests" {
 
         fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
             return error.TestUnexpectedResult;
+        }
+
+        fn modelCapabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqual(inference_work.Task.extract, task);
+            return .{
+                .task = .extract,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .item,
+                .batch = .{ .mode = .serial_compatibility, .preferred_items = 8, .max_items = 128 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
         }
 
         fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {

@@ -775,6 +775,12 @@ func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, err
 	result := make(map[string]map[OperationType]bool)
 	add := func(name string, operations []OperationType) {
 		name = strings.TrimSpace(name)
+		for _, operation := range operations {
+			if operation == "chunk" {
+				name = canonicalChunkModel(name)
+				break
+			}
+		}
 		if name == "" {
 			return
 		}
@@ -1452,8 +1458,28 @@ func catalogContainsTaskModel(catalog map[string]json.RawMessage, scope catalogT
 	if json.Unmarshal(raw, &models) != nil {
 		return false
 	}
-	_, ok = models[model]
+	_, ok = catalogModelDescriptor(models, scope.Category, model)
 	return ok
+}
+
+func canonicalCatalogModel(category, model string) string {
+	if category == "chunkers" {
+		return canonicalChunkModel(model)
+	}
+	return model
+}
+
+func catalogModelDescriptor(models map[string]json.RawMessage, category, model string) (json.RawMessage, bool) {
+	canonical := canonicalCatalogModel(category, model)
+	if descriptor, ok := models[canonical]; ok {
+		return descriptor, true
+	}
+	for candidate, descriptor := range models {
+		if canonicalCatalogModel(category, candidate) == canonical {
+			return descriptor, true
+		}
+	}
+	return nil, false
 }
 
 func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) int {
@@ -1461,6 +1487,7 @@ func modelCatalogEncodedBytes(categories map[string]map[string]json.RawMessage) 
 	for category, models := range categories {
 		total += len(category)
 		for model, descriptor := range models {
+			model = canonicalCatalogModel(category, model)
 			total += len(model) + len(descriptor)
 		}
 	}
@@ -1486,6 +1513,7 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 			target[category] = make(map[string]json.RawMessage)
 		}
 		for model, descriptor := range models {
+			model = canonicalCatalogModel(category, model)
 			if existing, duplicate := target[category][model]; duplicate {
 				target[category][model] = conservativeModelDescriptor(existing, descriptor)
 			} else {
@@ -1501,13 +1529,14 @@ func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, sourc
 	if json.Unmarshal(raw, &models) != nil {
 		return
 	}
-	descriptor, ok := models[model]
+	descriptor, ok := catalogModelDescriptor(models, scope.Category, model)
 	if !ok {
 		return
 	}
 	if target[scope.Category] == nil {
 		target[scope.Category] = make(map[string]json.RawMessage)
 	}
+	model = canonicalCatalogModel(scope.Category, model)
 	if existing, duplicate := target[scope.Category][model]; duplicate {
 		target[scope.Category][model] = conservativeModelDescriptor(existing, descriptor)
 	} else {
@@ -1623,7 +1652,27 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		return nil, false
 	}
 	batch["per_item_failures"] = aFailures && bFailures
-	return map[string]any{"version": float64(2), "task": a["task"], "batch": batch}, true
+	version := 2
+	result := map[string]any{"version": float64(version), "task": a["task"], "batch": batch}
+	if aVersion >= 3 && bVersion >= 3 {
+		for _, field := range []string{"input_modalities", "accepted_mime_types"} {
+			result[field] = intersectStringValues(a[field], b[field])
+		}
+		for _, field := range []string{"input_granularity", "output", "result_cardinality", "prompt_policy"} {
+			if a[field] == nil || !reflect.DeepEqual(a[field], b[field]) {
+				return nil, false
+			}
+			result[field] = a[field]
+		}
+		aBorrowed, aok := a["borrowed_attachments"].(bool)
+		bBorrowed, bok := b["borrowed_attachments"].(bool)
+		if !aok || !bok {
+			return nil, false
+		}
+		result["borrowed_attachments"] = aBorrowed && bBorrowed
+		result["version"] = float64(3)
+	}
+	return result, true
 }
 
 func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {
@@ -1632,7 +1681,7 @@ func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {
 		return 1, true
 	}
 	number, ok := nonNegativeInteger(value)
-	if !ok || number < 1 || number > 2 {
+	if !ok || number < 1 || number > 3 {
 		return 0, false
 	}
 	return int(number), true

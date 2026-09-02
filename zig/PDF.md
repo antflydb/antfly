@@ -536,7 +536,7 @@ document. They are architectural requirements, not Florence-specific cleanup:
     extraction models; the distributed proxy routes and scopes the family as
     `classifiers`; and linked execution has a typed classification call.
 44. **Several embedded model families stopped at catalog discovery.** Provider
-    ABI v22 adds typed chunk, rewrite, and classify operations alongside the
+    ABI v23 includes typed chunk, rewrite, and classify operations alongside the
     existing embed, rerank, generate, read, transcribe, and extract operations.
     Linked providers wire all nine current task families to concrete server
     executors. Descriptor presence is therefore no longer used as a substitute
@@ -568,6 +568,58 @@ document. They are architectural requirements, not Florence-specific cleanup:
     model-family dependencies into minimal embedded storage builds. Fixed
     chunking remains the local fallback; a selected unsupported semantic model
     still fails closed.
+49. **Capability truth was duplicated across the server catalog, embedded
+    resolver, and asset scheduler.** One exported resolver now derives task
+    ceilings, execution mode, media limits, and manifest reductions for both
+    local callbacks and `/ai/v1/models`. Extract, rewrite, and classify resolve
+    to the same bounded serial-compatibility contract in either deployment;
+    callers no longer upgrade an extractor merely because its provider is
+    Antfly.
+50. **Extractor asset requests dropped prepared media.** Extraction requests
+    now carry input-indexed borrowed attachments. Provider ABI v23 transports
+    those bytes without JSON/base64 through the linked boundary, the inference
+    node charges them as borrowed request media, and external HTTP adapters
+    base64-encode only while constructing the final wire request. Extractor
+    windows obey resolved item, byte, MIME, modality, and per-item media-part
+    limits and report serial versus native execution honestly.
+51. **Canonical fixed chunk requests could not route through older nodes that
+    advertised `fixed_bert` or `fixed_bpe`.** Inventory extraction, catalog
+    lookup, scoped merge, and unscoped merge now normalize all built-in aliases
+    to `fixed`. This is a compatibility boundary at discovery/routing; the
+    executor continues to expose only the canonical identity.
+52. **The distributed capability descriptor was too coarse to round-trip the
+    normalized contract.** Capability wire version 3 publishes exact input
+    modalities, accepted MIME types, granularity, output kind, result
+    cardinality, prompt policy, borrowed-attachment availability, and the
+    bounded batch descriptor. The proxy conservatively intersects arrays and
+    boolean support and requires scalar semantics to agree. V1/V2 remain
+    readable at their legacy boundary but cannot acquire V3 claims.
+53. **HTTP and linked classification/extraction admitted different request
+    shapes.** Both paths now call the same validators. Extraction requires
+    1..128 logical inputs; classification requires nonempty texts and labels,
+    caps each dimension at 128, and caps Cartesian text-label work at 4,096.
+    The source OpenAPI schemas publish the same array limits.
+54. **Extractor windowing validated the whole document against one window's
+    ceiling.** Batch compatibility is now checked across the logical request,
+    while item count and aggregate media bytes are validated separately for
+    every emitted window immediately before dispatch. A PDF larger than one
+    model batch is split instead of rejected, and an oversized single page
+    still fails before transport.
+55. **An attachment-only HTTP extraction request could skip attachment
+    validation when it had no logical inputs.** Attachment indexes, MIME
+    presence, and nonempty bytes are now validated once at the request
+    boundary, before the per-input content encoder runs. The direct inference
+    boundary independently enforces the same index and nonempty-byte rules.
+56. **Version 3 exact capability sets silently ignored unknown or duplicate
+    values.** Remote capability parsing now rejects unrecognized modalities,
+    MIME types, and duplicate set members. A malformed catalog therefore
+    fails closed instead of being interpreted as a narrower but apparently
+    valid executor contract.
+57. **Image-extraction batches could silently use the first item's prompt for
+    every page.** The scheduler now groups media extraction only when the
+    effective content/prompt representation matches. The direct executor also
+    rejects conflicting nonempty per-image prompts, so fallback and direct ABI
+    callers cannot produce prompt-dependent results under the wrong prompt.
 
 ### Post-review implementation contract
 
@@ -615,13 +667,14 @@ The hardening above follows four long-term rules:
 2. **Implemented:** local reader batching is selected from resolved model
    capabilities. Native and serial-compatibility modes are distinct, and OCR
    profiling no longer labels an accepted serial batch as native.
-3. **Implemented:** provider ABI v22 separates borrowed binary payload storage
+3. **Implemented:** provider ABI v23 separates borrowed binary payload storage
    from logical attachment references. One generator item may own several
    attachments, while read and embedding batches retain independent item,
    source, and page identity. Reader, generator, and embedder host paths borrow
    the same representation; remote transports encode only at the HTTP
    boundary. The version also makes capability v2 media-limit semantics and
-   executable chunk, rewrite, and classification operations an explicit
+   executable chunk, rewrite, classification, and borrowed extraction
+   operations an explicit
    host/component compatibility boundary.
 4. **Implemented:** document OCR selects `reader` or `generator` explicitly.
    The generation batch endpoint accepts bounded multimodal requests and uses
@@ -644,10 +697,13 @@ The hardening above follows four long-term rules:
    cleanup. A partial attempt therefore cannot overwrite or delete the last
    complete public page-vector set; the normal durable retry supervisor either
    retries it or records terminal repair debt.
-6. **Implemented:** capability lookup participates in reader, generator, and
-   dense-embedder planning. MIME acceptance, item count, encoded bytes, decoded
-   pixels, media cardinality, and result cardinality are validated at executor
-   boundaries. Unknown remote capabilities remain conservative.
+6. **Implemented:** capability lookup participates in reader, generator,
+   dense-embedder, and extractor planning. The same normalized catalog covers
+   rerank, chunk, rewrite, classify, and transcribe even when their current
+   executor is singleton or serial compatibility. MIME acceptance, item count,
+   encoded bytes, decoded pixels, media cardinality, and result cardinality are
+   validated at executor boundaries. Unknown remote capabilities remain
+   conservative.
 7. **Implemented:** observed reader execution propagates from the native
    pipeline through the standalone boundary. OCR telemetry distinguishes
    native completion, compatibility serialization, and native-to-serial
@@ -746,6 +802,11 @@ The hardening above follows four long-term rules:
     distributed discovery contracts cover every current model family. Existing
     task-specific executors remain distinct, and unbatched families publish a
     conservative singleton capability until their own batch ABI exists.
+29. **Implemented after contract review:** one shared server/embedded resolver,
+    exact capability wire V3, mixed-version chunk alias normalization,
+    capability-aware extractor windowing, borrowed extractor attachments, and
+    shared HTTP/linked validators remove the remaining deployment-specific
+    interpretations of the model-work contract.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

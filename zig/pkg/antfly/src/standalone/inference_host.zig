@@ -411,7 +411,36 @@ const TranscribeAudioRequest = struct {
 const ExtractRequest = struct {
     model: []const u8,
     request: antfly.extracting.Request,
+    attachment_count: usize = 0,
 };
+
+fn decodeExtractionAttachments(
+    alloc: std.mem.Allocator,
+    input_count: usize,
+    expected_count: usize,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) ![]antfly.extracting.Attachment {
+    if (expected_count != payload_len or ref_len != payload_len) return error.InvalidArguments;
+    if (payload_len > 0 and (payload_ptr == null or ref_ptr == null)) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const attachments = try alloc.alloc(antfly.extracting.Attachment, payload_len);
+    errdefer alloc.free(attachments);
+    if (payload_ptr) |payloads| for (attachments, 0..) |*attachment, i| {
+        const ref = providerAttachmentRefForAttachment(ref_ptr.?, ref_len, i) orelse return error.InvalidArguments;
+        if (ref.item_index >= input_count) return error.InvalidArguments;
+        const payload = payloads[ref.attachment_index];
+        if (payload.content_type.len == 0) return error.InvalidArguments;
+        attachment.* = .{
+            .input_index = ref.item_index,
+            .bytes = payload.bytes.slice(),
+            .mime_type = payload.content_type.slice(),
+        };
+    };
+    return attachments;
+}
 
 const ChunkInputRequest = struct {
     model: []const u8,
@@ -854,7 +883,20 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .extract => blk: {
             var parsed = try std.json.parseFromSlice(ExtractRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            var result = try state.node.extractDirect(alloc, parsed.value.model, parsed.value.request);
+            if (parsed.value.request.attachments.len != 0) return error.InvalidArguments;
+            const attachments = try decodeExtractionAttachments(
+                alloc,
+                parsed.value.request.inputs.len,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(attachments);
+            var request = parsed.value.request;
+            request.attachments = attachments;
+            var result = try state.node.extractDirect(alloc, parsed.value.model, request);
             defer result.deinit();
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
         },
@@ -1617,7 +1659,7 @@ fn localModelCapabilities(
                 .max_encoded_media_bytes = 0,
             },
             .output = .chunks,
-            .result_cardinality = .one_per_item,
+            .result_cardinality = .one_per_request,
             .prompt_policy = .model_default,
             .borrowed_attachments = false,
         };
@@ -1663,28 +1705,24 @@ fn localModelCapabilities(
         .transcribe => modalities.audio = true,
     };
 
-    const native_batch = switch (task) {
-        .read => manifest.native_arch_hint == .florence,
-        // The local generation executor currently accepts a batch-shaped ABI
-        // but executes each multimodal item under the shared model lock.
-        .generate => false,
-        .embed => true,
-        // These executors have task-specific request shapes. Until they expose
-        // a generic item-batch ABI, advertise only singleton execution.
-        .rerank, .chunk, .extract, .rewrite, .classify, .transcribe => false,
-    };
-    const max_items: usize = switch (task) {
-        .read => inference.server.max_read_batch_images,
-        .generate => inference.server.max_generate_batch_items,
-        .embed => 64,
-        .rerank, .chunk, .extract, .rewrite, .classify, .transcribe => 1,
-    };
+    const native_batch_read = task == .read and manifest.native_arch_hint == .florence;
+    const task_max_items = inference.server.resolvedTaskMaxItems(@tagName(task));
     const max_images = if (!modalities.image)
         0
     else if (task == .generate)
-        std.math.mul(usize, max_items, inference.server.max_generate_media_parts_per_item) catch std.math.maxInt(usize)
+        std.math.mul(usize, task_max_items, inference.server.max_generate_media_parts_per_item) catch std.math.maxInt(usize)
     else
-        max_items;
+        task_max_items;
+    const resolved_batch = try inference.server.resolveInferenceBatchCapabilities(
+        @tagName(task),
+        manifest.capabilities,
+        native_batch_read,
+        inference.server.requestMediaMaxBytes(node),
+        if (max_images > 0) inference.server.requestMediaMaxDecodedPixels(node, max_images) else 0,
+        modalities.image,
+        modalities.audio,
+        modalities.document,
+    );
     const output: antfly.inference.work.OutputKind = switch (task) {
         .read => .read_result,
         .generate => .generated_text,
@@ -1717,36 +1755,31 @@ fn localModelCapabilities(
         else
             .item,
         .batch = .{
-            .mode = if (native_batch) .native else if (max_items == 1) .none else .serial_compatibility,
-            .preferred_items = @min(@as(usize, 8), max_items),
-            .max_items = max_items,
-            .max_encoded_media_bytes = inference.server.requestMediaMaxBytes(node),
-            .max_decoded_pixels = if (max_images > 0)
-                inference.server.requestMediaMaxDecodedPixels(node, max_images)
-            else
-                null,
-            .max_media_parts_per_item = if (task == .generate)
-                inference.server.max_generate_media_parts_per_item
-            else if (modalities.image or modalities.audio)
-                1
-            else
-                0,
-            .per_item_failures = task == .generate,
+            .mode = switch (resolved_batch.mode) {
+                .none => .none,
+                .serial_compatibility => .serial_compatibility,
+                .native => .native,
+            },
+            .preferred_items = resolved_batch.preferred_items,
+            .max_items = resolved_batch.max_items,
+            .max_encoded_media_bytes = resolved_batch.max_encoded_media_bytes,
+            .max_decoded_pixels = resolved_batch.max_decoded_pixels,
+            .max_media_parts_per_item = resolved_batch.max_media_parts_per_item,
+            .per_item_failures = resolved_batch.per_item_failures,
         },
         .output = output,
-        .result_cardinality = .one_per_item,
-        .prompt_policy = .explicit,
-        .borrowed_attachments = task == .read or task == .generate or task == .embed,
+        .result_cardinality = if (task == .rerank or task == .chunk or task == .transcribe)
+            .one_per_request
+        else
+            .one_per_item,
+        .prompt_policy = if (task == .extract)
+            .structured_schema
+        else if (task == .chunk or task == .transcribe)
+            .model_default
+        else
+            .explicit,
+        .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
     };
-    for (manifest.capabilities) |capability| {
-        try result.batch.applyManifestCapability(capability);
-    }
-    // Manifests may tighten resource limits, but execution mode is a property
-    // of the resolved server executor and cannot be upgraded by a model claim.
-    result.batch.mode = if (native_batch) .native else if (max_items == 1) .none else .serial_compatibility;
-    // A model may lower max_items without redundantly overriding the
-    // throughput hint. The hard ceiling always wins.
-    result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);
     try result.validate();
     return result;
 }

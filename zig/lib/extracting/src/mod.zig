@@ -86,6 +86,16 @@ pub const Request = struct {
     inputs: []const Input,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
+    /// Borrowed binary media associated with one logical input. Embedded
+    /// providers preserve these bytes across the native boundary; HTTP
+    /// providers encode them only while constructing the final wire request.
+    attachments: []const Attachment = &.{},
+};
+
+pub const Attachment = struct {
+    input_index: usize,
+    bytes: []const u8,
+    mime_type: []const u8,
 };
 
 pub const Response = struct {
@@ -349,6 +359,7 @@ const HttpExtractorState = struct {
 };
 
 fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
+    try validateAttachments(req);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"model\":");
@@ -365,7 +376,9 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
         }
         if (!first) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"content\":");
-        try out.appendSlice(alloc, input.content_json);
+        const content_json = try inputContentJsonAlloc(alloc, req, i, input.content_json);
+        defer alloc.free(content_json);
+        try out.appendSlice(alloc, content_json);
         if (input.tokens_json) |tokens_json| {
             try out.appendSlice(alloc, ",\"tokens\":");
             try out.appendSlice(alloc, tokens_json);
@@ -386,6 +399,63 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn inputContentJsonAlloc(
+    alloc: Allocator,
+    req: Request,
+    input_index: usize,
+    original: []const u8,
+) ![]u8 {
+    var attachment_count: usize = 0;
+    for (req.attachments) |attachment| {
+        if (attachment.input_index == input_index) attachment_count += 1;
+    }
+    if (attachment_count == 0) return try alloc.dupe(u8, original);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, original, .{});
+    defer parsed.deinit();
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var emitted = false;
+    if (parsed.value == .array) {
+        for (parsed.value.array.items) |part| {
+            if (emitted) try out.append(alloc, ',');
+            const encoded = try std.json.Stringify.valueAlloc(alloc, part, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            emitted = true;
+        }
+    } else if (parsed.value == .string and parsed.value.string.len > 0) {
+        try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+        try appendJsonString(alloc, &out, parsed.value.string);
+        try out.append(alloc, '}');
+        emitted = true;
+    } else if (parsed.value != .string) return error.InvalidExtractionContent;
+    for (req.attachments) |attachment| {
+        if (attachment.input_index != input_index) continue;
+        if (emitted) try out.append(alloc, ',');
+        const encoded_len = std.base64.standard.Encoder.calcSize(attachment.bytes.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, attachment.bytes);
+        try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+        try appendJsonString(alloc, &out, attachment.mime_type);
+        try out.appendSlice(alloc, ",\"data\":");
+        try appendJsonString(alloc, &out, encoded);
+        try out.append(alloc, '}');
+        emitted = true;
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn validateAttachments(req: Request) !void {
+    for (req.attachments) |attachment| {
+        if (attachment.input_index >= req.inputs.len or attachment.mime_type.len == 0 or attachment.bytes.len == 0)
+            return error.InvalidExtractionAttachment;
+    }
 }
 
 fn canonicalResponseJsonAlloc(alloc: Allocator, payload: []const u8) ![]u8 {
@@ -485,6 +555,32 @@ test "extracting first result returns asset value" {
     defer alloc.free(value);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"object\"") == null);
+}
+
+test "extracting HTTP boundary encodes borrowed media only in final content" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const inputs = [_]Input{.{ .content_json = "\"ocr prompt\"" }};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    const content = try inputContentJsonAlloc(std.testing.allocator, .{
+        .inputs = &inputs,
+        .attachments = &attachments,
+    }, 0, inputs[0].content_json);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"mime_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"data\":\"AQID\"") != null);
+}
+
+test "extracting HTTP boundary rejects attachments without a logical input" {
+    const bytes = [_]u8{1};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    try std.testing.expectError(error.InvalidExtractionAttachment, requestJsonAlloc(std.testing.allocator, .{
+        .provider = .antfly,
+        .model = "extractor",
+    }, .{
+        .inputs = &.{},
+        .attachments = &attachments,
+    }));
 }
 
 fn expectExtractRequest(req: httpx.testing_mod.RequestInfo) !void {

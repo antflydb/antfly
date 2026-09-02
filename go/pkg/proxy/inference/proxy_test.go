@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1598,6 +1599,27 @@ func TestProxyRequestModelReadsAndCanonicalizesChunkConfig(t *testing.T) {
 	}
 }
 
+func TestChunkCatalogAliasesNormalizeAcrossMixedVersions(t *testing.T) {
+	scope, err := catalogTaskScopeFor("chunk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]json.RawMessage{
+		"chunkers": json.RawMessage(`{"fixed_bert":{"inputs":["text"]}}`),
+	}
+	if !catalogContainsTaskModel(legacy, scope, "fixed") {
+		t.Fatal("canonical fixed request did not match legacy fixed_bert catalog")
+	}
+	merged := make(map[string]map[string]json.RawMessage)
+	mergeModelCatalog(merged, legacy)
+	if _, ok := merged["chunkers"]["fixed"]; !ok {
+		t.Fatalf("legacy chunk alias was not normalized: %#v", merged["chunkers"])
+	}
+	if _, ok := merged["chunkers"]["fixed_bert"]; ok {
+		t.Fatalf("legacy alias leaked into merged catalog: %#v", merged["chunkers"])
+	}
+}
+
 func TestScopedCatalogForwardsCallerAuthorization(t *testing.T) {
 	const caller = "Bearer caller-token"
 	p := NewProxy(Config{DefaultPool: "primary", RefreshInterval: time.Minute, Logger: zap.NewNop()})
@@ -1676,6 +1698,33 @@ func TestConservativeCapabilitiesV2PreservesDisabledLimit(t *testing.T) {
 	batch := merged["batch"].(map[string]any)
 	if batch["max_encoded_media_bytes"] != float64(0) || batch["max_decoded_pixels"] != float64(0) {
 		t.Fatalf("disabled v2 limits were lost: %#v", batch)
+	}
+}
+
+func TestConservativeCapabilitiesV3PreservesExactContract(t *testing.T) {
+	base := func(modalities, mimes []any, borrowed bool) map[string]any {
+		return map[string]any{
+			"version": float64(3), "task": "extract",
+			"input_modalities": modalities, "accepted_mime_types": mimes,
+			"input_granularity": "page", "output": "extraction",
+			"result_cardinality": "one_per_item", "prompt_policy": "structured_schema",
+			"borrowed_attachments": borrowed,
+			"batch": map[string]any{
+				"mode": "serial_compatibility", "preferred_items": float64(8), "max_items": float64(32),
+				"max_encoded_media_bytes": float64(4096), "max_decoded_pixels": float64(8192),
+				"max_media_parts_per_item": float64(1), "per_item_failures": false,
+			},
+		}
+	}
+	left := base([]any{"image", "text"}, []any{"image/png", "image/jpeg"}, true)
+	right := base([]any{"image"}, []any{"image/png"}, false)
+	merged, ok := conservativeInferenceCapabilities(left, right)
+	if !ok {
+		t.Fatal("v3 capabilities did not merge")
+	}
+	if merged["version"] != float64(3) || !reflect.DeepEqual(merged["input_modalities"], []string{"image"}) ||
+		!reflect.DeepEqual(merged["accepted_mime_types"], []string{"image/png"}) || merged["borrowed_attachments"] != false {
+		t.Fatalf("exact v3 contract was not conservatively preserved: %#v", merged)
 	}
 }
 

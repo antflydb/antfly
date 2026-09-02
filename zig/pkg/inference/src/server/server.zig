@@ -3855,8 +3855,7 @@ pub const Node = struct {
         hypothesis_template: ?[]const u8,
         multi_label: bool,
     ) ![]const []const DirectClassificationScore {
-        if (texts.len == 0 or labels.len == 0) return error.InvalidClassificationRequest;
-        if (texts.len > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
+        try validateClassificationInvocation(texts, labels);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
         self.metrics.incRequest("classify.local");
@@ -5195,7 +5194,7 @@ pub const Node = struct {
         request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
     ) !extracting_api.Response {
-        if (request.inputs.len > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
+        try validateDirectExtractionRequest(request);
         switch (admission_owner) {
             .direct => try self.acquireAdmissionUnits(1),
             .http_route => try self.reserveAdmissionUnits(1),
@@ -5216,6 +5215,7 @@ pub const Node = struct {
         const operation = try canonicalExtractionOperation(schema_parsed.value);
 
         if (operation != .structures) {
+            if (request.attachments.len != 0) return error.UnsupportedInput;
             // Entity, relation, and classification models are text-only. Parse
             // them with a no-I/O path so a request that will be rejected cannot
             // trigger remote media fetches or decoding work first.
@@ -5257,7 +5257,7 @@ pub const Node = struct {
         // This parser bounds max_tokens before resolver or media work begins.
         var options = try parseExtractionOptionsJson(allocator, request.options_json);
         defer options.deinit();
-        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
+        const media_shape = try directExtractionMediaShape(allocator, request.inputs, request.attachments);
         if (media_shape.image_count > max_read_batch_images) return error.ReadBatchTooLarge;
         const media_admission = requestMediaAdmission(self, media_shape);
         try self.growAdmissionUnits(reserved_units, media_admission.units);
@@ -5291,6 +5291,7 @@ pub const Node = struct {
             self,
             allocator,
             request.inputs,
+            request.attachments,
             options.prompt,
             options.max_tokens,
             media_admission.byte_cap,
@@ -10801,8 +10802,8 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (body.texts.len > max_serial_family_batch_items)
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "too many classification inputs" });
+        validateClassificationInvocation(body.texts, body.labels) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
         const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
         defer self.releaseSlotUnits(admission_units);
@@ -11655,12 +11656,8 @@ pub const Node = struct {
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
-        if (body.inputs.len == 0) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "inputs are required" });
-        }
-        if (body.inputs.len > max_serial_family_batch_items) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "too many extraction inputs" });
-        }
+        validateExtractionCardinality(body.inputs.len) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
         const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
         const operation = canonicalExtractionOperation(body.schema) catch |err| switch (err) {
             error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
@@ -12768,14 +12765,16 @@ const DirectExtractionInputs = struct {
     allocator: std.mem.Allocator,
     texts: std.ArrayListUnmanaged([]const u8) = .empty,
     images: std.ArrayListUnmanaged([]const u8) = .empty,
+    owned_images: std.ArrayListUnmanaged([]const u8) = .empty,
     prompt: ?[]u8 = null,
     max_tokens: ?usize = null,
 
     fn deinit(self: *@This()) void {
         for (self.texts.items) |text| self.allocator.free(@constCast(text));
         self.texts.deinit(self.allocator);
-        for (self.images.items) |image| self.allocator.free(@constCast(image));
         self.images.deinit(self.allocator);
+        for (self.owned_images.items) |image| self.allocator.free(@constCast(image));
+        self.owned_images.deinit(self.allocator);
         if (self.prompt) |prompt| self.allocator.free(prompt);
         self.* = undefined;
     }
@@ -12784,10 +12783,44 @@ const DirectExtractionInputs = struct {
 fn directExtractionMediaShape(
     allocator: std.mem.Allocator,
     inputs: []const extracting_api.Input,
+    attachments: []const extracting_api.Attachment,
 ) !RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
     for (inputs) |input| try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
+    for (attachments) |attachment| shape.addBorrowed(attachment.bytes.len, true);
     return shape;
+}
+
+fn validateDirectExtractionRequest(request: extracting_api.Request) !void {
+    try validateExtractionCardinality(request.inputs.len);
+    var attachment_counts = [_]usize{0} ** max_serial_family_batch_items;
+    for (request.attachments) |attachment| {
+        if (attachment.input_index >= request.inputs.len or attachment.bytes.len == 0)
+            return error.InvalidExtractionAttachment;
+        if (!std.mem.eql(u8, attachment.mime_type, "image/png") and
+            !std.mem.eql(u8, attachment.mime_type, "image/jpeg") and
+            !std.mem.eql(u8, attachment.mime_type, "image/webp"))
+            return error.UnsupportedInput;
+        attachment_counts[attachment.input_index] += 1;
+        if (attachment_counts[attachment.input_index] > 1) return error.InferenceMediaPartLimitExceeded;
+    }
+}
+
+fn validateExtractionCardinality(input_count: usize) !void {
+    if (input_count == 0) return error.UnsupportedInput;
+    if (input_count > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
+}
+
+const max_classification_labels: usize = 128;
+const max_classification_pairs: usize = 4096;
+
+fn validateClassificationInvocation(texts: []const []const u8, labels: []const []const u8) !void {
+    if (texts.len == 0 or labels.len == 0) return error.InvalidClassificationRequest;
+    if (texts.len > max_serial_family_batch_items or labels.len > max_classification_labels)
+        return error.InferenceBatchTooLarge;
+    const pairs = std.math.mul(usize, texts.len, labels.len) catch return error.InferenceBatchTooLarge;
+    if (pairs > max_classification_pairs) return error.InferenceBatchTooLarge;
+    for (labels) |label| if (label.len == 0) return error.InvalidClassificationRequest;
 }
 
 fn addDirectExtractionContentMediaShape(
@@ -13026,6 +13059,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
             "inference_admission",
         ),
         error.InvalidExtractionConfig,
+        error.InvalidExtractionAttachment,
         error.InvalidClassificationSchema,
         error.InvalidEntitySchema,
         error.InvalidModelForExtraction,
@@ -13045,6 +13079,8 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedRebelRelationEndpoints,
         => rebelSchemaFailureResponse(ctx, err),
         error.ReadBatchTooLarge,
+        error.InferenceBatchTooLarge,
+        error.InferenceMediaPartLimitExceeded,
         error.StreamTooLong,
         => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = @errorName(err) }),
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
@@ -13117,6 +13153,7 @@ fn parseDirectExtractionInputs(
     node: *Node,
     allocator: std.mem.Allocator,
     inputs: []const extracting_api.Input,
+    attachments: []const extracting_api.Attachment,
     prompt: ?[]const u8,
     max_tokens: ?usize,
     max_media_bytes: usize,
@@ -13129,8 +13166,17 @@ fn parseDirectExtractionInputs(
     };
     errdefer out.deinit();
 
-    for (inputs) |input| {
-        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget);
+    for (inputs, 0..) |input, input_index| {
+        var borrowed: ?extracting_api.Attachment = null;
+        for (attachments) |attachment| if (attachment.input_index == input_index) {
+            borrowed = attachment;
+            break;
+        };
+        if (borrowed) |attachment| {
+            try media_budget.add(attachment.bytes.len);
+            try out.images.append(allocator, attachment.bytes);
+        }
+        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget, borrowed != null);
     }
     if (out.texts.items.len > 0 and out.images.items.len > 0) return error.UnsupportedInput;
     if (out.texts.items.len == 0 and out.images.items.len == 0) return error.UnsupportedInput;
@@ -13143,12 +13189,17 @@ fn appendDirectExtractionContent(
     out: *DirectExtractionInputs,
     content_json: []const u8,
     media_budget: *RequestMediaBudget,
+    has_borrowed_media: bool,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
     defer parsed.deinit();
 
     switch (parsed.value) {
         .string => |text| {
+            if (has_borrowed_media) {
+                try adoptDirectExtractionPrompt(allocator, out, text);
+                return;
+            }
             const owned_text = try allocator.dupe(u8, text);
             errdefer allocator.free(owned_text);
             try out.texts.append(allocator, owned_text);
@@ -13156,7 +13207,7 @@ fn appendDirectExtractionContent(
         .array => |parts| {
             var text_buf = std.ArrayListUnmanaged(u8).empty;
             defer text_buf.deinit(allocator);
-            var saw_media = false;
+            var saw_media = has_borrowed_media;
             for (parts.items) |part| {
                 if (part != .object) continue;
                 const type_value = part.object.get("type") orelse continue;
@@ -13167,6 +13218,7 @@ fn appendDirectExtractionContent(
                     if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
                     try text_buf.appendSlice(allocator, text_value.string);
                 } else if (std.mem.eql(u8, type_value.string, "image_url")) {
+                    if (saw_media) return error.InferenceMediaPartLimitExceeded;
                     const image_url = part.object.get("image_url") orelse continue;
                     const url = if (image_url == .object)
                         if (image_url.object.get("url")) |url_value| (if (url_value == .string) url_value.string else null) else null
@@ -13179,6 +13231,7 @@ fn appendDirectExtractionContent(
                         saw_media = true;
                     }
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
+                    if (saw_media) return error.InferenceMediaPartLimitExceeded;
                     if (part.object.get("url")) |url_value| {
                         if (url_value == .string) {
                             try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget);
@@ -13193,6 +13246,7 @@ fn appendDirectExtractionContent(
                                 if (!std.mem.startsWith(u8, mime, "image/")) return error.UnsupportedInput;
                             }
                             try out.images.append(allocator, decoded.data);
+                            try out.owned_images.append(allocator, decoded.data);
                             owns_decoded = false;
                             saw_media = true;
                         }
@@ -13200,7 +13254,7 @@ fn appendDirectExtractionContent(
                 }
             }
             if (saw_media) {
-                if (out.prompt == null and text_buf.items.len > 0) out.prompt = try text_buf.toOwnedSlice(allocator);
+                try adoptDirectExtractionPrompt(allocator, out, text_buf.items);
             } else if (text_buf.items.len > 0) {
                 const owned_text = try text_buf.toOwnedSlice(allocator);
                 errdefer allocator.free(owned_text);
@@ -13215,6 +13269,19 @@ fn appendDirectExtractionContent(
     }
 }
 
+fn adoptDirectExtractionPrompt(
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    candidate: []const u8,
+) !void {
+    if (candidate.len == 0) return;
+    if (out.prompt) |prompt| {
+        if (!std.mem.eql(u8, prompt, candidate)) return error.UnsupportedInput;
+        return;
+    }
+    out.prompt = try allocator.dupe(u8, candidate);
+}
+
 fn appendDownloadedExtractionImage(
     node: *Node,
     allocator: std.mem.Allocator,
@@ -13227,6 +13294,7 @@ fn appendDownloadedExtractionImage(
     errdefer allocator.free(downloaded.data);
     if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
     try out.images.append(allocator, downloaded.data);
+    try out.owned_images.append(allocator, downloaded.data);
 }
 
 fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
@@ -13946,7 +14014,9 @@ fn appendModelInfo(
     const inferred_native_batch_read = native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
-        model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
+        model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio") or
+        model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "document") or
+        model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "pdf");
     const publishes_inference_capabilities = normalizedInferenceTask(task) != null;
 
     if (!publishes_inference_capabilities and capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !inferred_native_batch_read and !has_known_inputs) {
@@ -14007,13 +14077,21 @@ fn appendModelInfo(
         cap_index += 1;
     }
     try buf.appendSlice(allocator, "],\"inputs\":[");
+    const accepts_text = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text");
     const accepts_image = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image");
     const accepts_audio = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
+    const accepts_document = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "document") or
+        model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "pdf");
     var input_index: usize = 0;
-    for ([_][]const u8{ "text", "image", "audio" }) |input| {
-        if (!model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, input)) continue;
+    for ([_]struct { bool, []const u8 }{
+        .{ accepts_text, "text" },
+        .{ accepts_image, "image" },
+        .{ accepts_audio, "audio" },
+        .{ accepts_document, "document" },
+    }) |input| {
+        if (!input[0]) continue;
         if (input_index > 0) try buf.append(allocator, ',');
-        try jsonEncodeString(buf, allocator, input);
+        try jsonEncodeString(buf, allocator, input[1]);
         input_index += 1;
     }
     try buf.append(allocator, ']');
@@ -14021,11 +14099,14 @@ fn appendModelInfo(
         buf,
         allocator,
         task,
+        capabilities,
         native_batch_read,
         request_media_max_bytes,
         request_media_max_decoded_pixels,
+        accepts_text,
         accepts_image,
         accepts_audio,
+        accepts_document,
     );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
@@ -14057,47 +14138,93 @@ fn appendResolvedInferenceCapabilities(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     task: []const u8,
+    manifest_capabilities: []const []const u8,
     native_batch_read: bool,
     request_media_max_bytes: usize,
     request_media_max_decoded_pixels: u64,
+    accepts_text: bool,
     accepts_image: bool,
     accepts_audio: bool,
+    accepts_document: bool,
 ) !void {
     const resolved_task = normalizedInferenceTask(task) orelse return;
-    const max_items = resolvedTaskMaxItems(resolved_task);
-    const native = std.mem.eql(u8, resolved_task, "embed") or
-        (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
-    const accepts_media = accepts_image or accepts_audio;
-    const max_bytes = if (!accepts_media)
-        0
-    else if (std.mem.eql(u8, resolved_task, "read"))
-        @min(default_max_read_batch_bytes, request_media_max_bytes)
-    else
-        request_media_max_bytes;
-    const max_parts: usize = if (!accepts_media)
-        0
-    else if (std.mem.eql(u8, resolved_task, "generate"))
-        max_generate_media_parts_per_item
-    else
-        1;
+    const resolved = try resolveInferenceBatchCapabilities(
+        resolved_task,
+        manifest_capabilities,
+        native_batch_read,
+        request_media_max_bytes,
+        request_media_max_decoded_pixels,
+        accepts_image,
+        accepts_audio,
+        accepts_document,
+    );
 
-    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":2,\"task\":");
+    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":3,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
+    try buf.appendSlice(allocator, ",\"input_modalities\":[");
+    var modality_index: usize = 0;
+    for ([_]struct { bool, []const u8 }{
+        .{ accepts_text, "text" },
+        .{ accepts_image, "image" },
+        .{ accepts_audio, "audio" },
+        .{ accepts_document, "document" },
+    }) |modality| {
+        if (!modality[0]) continue;
+        if (modality_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, modality[1]);
+        modality_index += 1;
+    }
+    try buf.appendSlice(allocator, "],\"accepted_mime_types\":[");
+    var mime_index: usize = 0;
+    for ([_]struct { bool, []const u8 }{
+        .{ accepts_text, "text/plain" },
+        .{ accepts_image, "image/png" },
+        .{ accepts_image, "image/jpeg" },
+        .{ accepts_image, "image/webp" },
+        .{ accepts_audio, "audio/wav" },
+        .{ accepts_audio, "audio/mpeg" },
+        .{ accepts_document, "application/pdf" },
+    }) |mime| {
+        if (!mime[0]) continue;
+        if (mime_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, mime[1]);
+        mime_index += 1;
+    }
+    try buf.appendSlice(allocator, "],\"input_granularity\":");
+    try jsonEncodeString(buf, allocator, if (accepts_document) "document" else if (accepts_image) "page" else if (accepts_text and
+        (std.mem.eql(u8, resolved_task, "read") or std.mem.eql(u8, resolved_task, "generate") or
+            std.mem.eql(u8, resolved_task, "embed"))) "chunk" else "item");
+    try buf.appendSlice(allocator, ",\"output\":");
+    try jsonEncodeString(buf, allocator, resolvedTaskOutput(resolved_task));
+    try buf.appendSlice(allocator, ",\"result_cardinality\":");
+    try jsonEncodeString(buf, allocator, if (std.mem.eql(u8, resolved_task, "rerank") or
+        std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
+        "one_per_request"
+    else
+        "one_per_item");
+    try buf.appendSlice(allocator, ",\"prompt_policy\":");
+    try jsonEncodeString(buf, allocator, if (std.mem.eql(u8, resolved_task, "extract"))
+        "structured_schema"
+    else if (std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
+        "model_default"
+    else
+        "explicit");
+    try buf.appendSlice(allocator, ",\"borrowed_attachments\":false");
     try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
-    try jsonEncodeString(buf, allocator, if (native) "native" else if (max_items == 1) "none" else "serial_compatibility");
+    try jsonEncodeString(buf, allocator, @tagName(resolved.mode));
     const limits_prefix = try std.fmt.allocPrint(
         allocator,
         ",\"preferred_items\":{d},\"max_items\":{d},\"max_encoded_media_bytes\":{d},\"max_decoded_pixels\":",
         .{
-            @min(@as(usize, 8), max_items),
-            max_items,
-            max_bytes,
+            resolved.preferred_items,
+            resolved.max_items,
+            resolved.max_encoded_media_bytes,
         },
     );
     defer allocator.free(limits_prefix);
     try buf.appendSlice(allocator, limits_prefix);
-    if (accepts_image) {
-        const pixels = try std.fmt.allocPrint(allocator, "{d}", .{request_media_max_decoded_pixels});
+    if (resolved.max_decoded_pixels) |max_decoded_pixels| {
+        const pixels = try std.fmt.allocPrint(allocator, "{d}", .{max_decoded_pixels});
         defer allocator.free(pixels);
         try buf.appendSlice(allocator, pixels);
     } else {
@@ -14107,15 +14234,44 @@ fn appendResolvedInferenceCapabilities(
         allocator,
         ",\"max_media_parts_per_item\":{d},\"per_item_failures\":{s}}}}}",
         .{
-            max_parts,
-            if (std.mem.eql(u8, resolved_task, "generate")) "true" else "false",
+            resolved.max_media_parts_per_item,
+            if (resolved.per_item_failures) "true" else "false",
         },
     );
     defer allocator.free(limits_suffix);
     try buf.appendSlice(allocator, limits_suffix);
 }
 
-fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
+fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
+    if (std.mem.eql(u8, resolved_task, "read")) return "read_result";
+    if (std.mem.eql(u8, resolved_task, "generate")) return "generated_text";
+    if (std.mem.eql(u8, resolved_task, "embed")) return "embedding";
+    if (std.mem.eql(u8, resolved_task, "rerank")) return "ranked_items";
+    if (std.mem.eql(u8, resolved_task, "chunk")) return "chunks";
+    if (std.mem.eql(u8, resolved_task, "extract")) return "extraction";
+    if (std.mem.eql(u8, resolved_task, "rewrite")) return "rewritten_text";
+    if (std.mem.eql(u8, resolved_task, "classify")) return "classification";
+    if (std.mem.eql(u8, resolved_task, "transcribe")) return "transcription";
+    unreachable;
+}
+
+pub const ResolvedInferenceBatchMode = enum {
+    none,
+    serial_compatibility,
+    native,
+};
+
+pub const ResolvedInferenceBatchCapabilities = struct {
+    mode: ResolvedInferenceBatchMode,
+    preferred_items: usize,
+    max_items: usize,
+    max_encoded_media_bytes: usize,
+    max_decoded_pixels: ?u64,
+    max_media_parts_per_item: usize,
+    per_item_failures: bool,
+};
+
+pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
     return if (std.mem.eql(u8, resolved_task, "read"))
         max_read_batch_images
     else if (std.mem.eql(u8, resolved_task, "generate"))
@@ -14128,6 +14284,76 @@ fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
         max_serial_family_batch_items
     else
         1;
+}
+
+pub fn resolveInferenceBatchCapabilities(
+    resolved_task: []const u8,
+    manifest_capabilities: []const []const u8,
+    native_batch_read: bool,
+    request_media_max_bytes: usize,
+    request_media_max_decoded_pixels: u64,
+    accepts_image: bool,
+    accepts_audio: bool,
+    accepts_document: bool,
+) !ResolvedInferenceBatchCapabilities {
+    var max_items = resolvedTaskMaxItems(resolved_task);
+    var preferred_items = @min(@as(usize, 8), max_items);
+    const accepts_media = accepts_image or accepts_audio or accepts_document;
+    var max_encoded_media_bytes = if (!accepts_media)
+        0
+    else if (std.mem.eql(u8, resolved_task, "read"))
+        @min(default_max_read_batch_bytes, request_media_max_bytes)
+    else
+        request_media_max_bytes;
+    var max_decoded_pixels: ?u64 = if (accepts_image) request_media_max_decoded_pixels else null;
+    var max_media_parts_per_item: usize = if (!accepts_media)
+        0
+    else if (std.mem.eql(u8, resolved_task, "generate"))
+        max_generate_media_parts_per_item
+    else
+        1;
+
+    for (manifest_capabilities) |capability| {
+        if (try resolvedManifestLimit(usize, capability, "inference.batch.preferred_items=", false)) |limit| {
+            preferred_items = @min(preferred_items, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.batch.max_items=", false)) |limit| {
+            max_items = @min(max_items, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.batch.max_encoded_media_bytes=", true) orelse
+            try resolvedManifestLimit(usize, capability, "inference.batch.max_encoded_bytes=", true)) |limit|
+        {
+            max_encoded_media_bytes = @min(max_encoded_media_bytes, limit);
+        } else if (try resolvedManifestLimit(u64, capability, "inference.batch.max_decoded_pixels=", true)) |limit| {
+            if (max_decoded_pixels) |current| max_decoded_pixels = @min(current, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.batch.max_media_parts_per_item=", true)) |limit| {
+            max_media_parts_per_item = @min(max_media_parts_per_item, limit);
+        }
+    }
+    preferred_items = @min(preferred_items, max_items);
+    const native = std.mem.eql(u8, resolved_task, "embed") or
+        (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
+    return .{
+        .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
+        .preferred_items = preferred_items,
+        .max_items = max_items,
+        .max_encoded_media_bytes = max_encoded_media_bytes,
+        .max_decoded_pixels = max_decoded_pixels,
+        .max_media_parts_per_item = max_media_parts_per_item,
+        .per_item_failures = std.mem.eql(u8, resolved_task, "generate"),
+    };
+}
+
+fn resolvedManifestLimit(
+    comptime T: type,
+    capability: []const u8,
+    prefix: []const u8,
+    allow_zero: bool,
+) !?T {
+    if (!std.mem.startsWith(u8, capability, prefix)) return null;
+    const raw = capability[prefix.len..];
+    if (raw.len == 0) return error.InvalidInferenceCapabilities;
+    const value = std.fmt.parseUnsigned(T, raw, 10) catch return error.InvalidInferenceCapabilities;
+    if (!allow_zero and value == 0) return error.InvalidInferenceCapabilities;
+    return value;
 }
 
 test "resolved capability item ceilings cover array-oriented model families" {
@@ -16225,6 +16451,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
         &out,
         "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YWJj\"}}]",
         &media_budget,
+        false,
     );
     try std.testing.expectEqual(first_uri.len, media_budget.used_bytes);
     try std.testing.expectError(
@@ -16235,6 +16462,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
             &out,
             "[{\"type\":\"media\",\"data\":\"ZGVm\"}]",
             &media_budget,
+            false,
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), out.images.items.len);
@@ -16250,15 +16478,16 @@ test "direct extraction content releases temporary ownership on every allocation
             var out = DirectExtractionInputs{ .allocator = allocator };
             defer out.deinit();
             var budget = RequestMediaBudget.init(32);
-            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget, false);
             try appendDirectExtractionContent(
                 target,
                 allocator,
                 &out,
                 "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
                 &budget,
+                false,
             );
-            try appendDirectExtractionContent(target, allocator, &out, "42", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "42", &budget, false);
             try std.testing.expectEqual(@as(usize, 3), out.texts.items.len);
         }
     };
@@ -16281,6 +16510,53 @@ test "direct extraction content releases temporary ownership on every allocation
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
         break;
     }
+}
+
+test "direct extraction borrows indexed media and treats text as its prompt" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const image = [_]u8{ 1, 2, 3, 4 };
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"read this page\"" }};
+    const attachments = [_]extracting_api.Attachment{.{
+        .input_index = 0,
+        .bytes = &image,
+        .mime_type = "image/png",
+    }};
+    try validateDirectExtractionRequest(.{ .inputs = &inputs, .attachments = &attachments });
+    var parsed = try parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.items.len);
+    try std.testing.expectEqual(@intFromPtr(image[0..].ptr), @intFromPtr(parsed.images.items[0].ptr));
+    try std.testing.expectEqualStrings("read this page", parsed.prompt.?);
+    try std.testing.expectEqual(@as(usize, 0), parsed.owned_images.items.len);
+}
+
+test "direct extraction rejects conflicting per-image prompts" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const image = [_]u8{ 1, 2, 3, 4 };
+    const inputs = [_]extracting_api.Input{
+        .{ .content_json = "\"first prompt\"" },
+        .{ .content_json = "\"second prompt\"" },
+    };
+    const attachments = [_]extracting_api.Attachment{
+        .{ .input_index = 0, .bytes = &image, .mime_type = "image/png" },
+        .{ .input_index = 1, .bytes = &image, .mime_type = "image/png" },
+    };
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16),
+    );
+}
+
+test "shared classification validation bounds labels and Cartesian work" {
+    const texts = [_][]const u8{"text"} ** 33;
+    const labels = [_][]const u8{"label"} ** 125;
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateClassificationInvocation(&texts, &labels));
+    try std.testing.expectError(error.InvalidClassificationRequest, validateClassificationInvocation(&.{"text"}, &.{""}));
+    try validateClassificationInvocation(&.{ "first", "second" }, &.{ "a", "b" });
 }
 
 test "fail-fast embedding capacity response exposes retry contract" {

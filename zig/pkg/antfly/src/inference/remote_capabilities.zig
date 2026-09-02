@@ -480,21 +480,125 @@ fn parseResolvedBatchCapabilities(value: std.json.Value, version: usize) !work.B
     };
 }
 
-fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?work.BatchCapabilities {
+const ExactWireCapabilities = struct {
+    modalities: work.Modalities,
+    mime_types: work.MimeTypes,
+    input_granularity: work.InputGranularity,
+    output: work.OutputKind,
+    result_cardinality: work.ResultCardinality,
+    prompt_policy: work.PromptPolicy,
+    borrowed_attachments: bool,
+};
+
+const ResolvedWireCapabilities = struct {
+    batch: work.BatchCapabilities,
+    exact: ?ExactWireCapabilities,
+};
+
+fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?ResolvedWireCapabilities {
     const value = info.get("inference_capabilities") orelse return null;
     if (value != .object) return error.InvalidInferenceCapabilities;
     const version: usize = if (value.object.get("version")) |version_value| blk: {
         if (version_value != .integer or version_value.integer < 1) return error.InvalidInferenceCapabilities;
         break :blk std.math.cast(usize, version_value.integer) orelse return error.InvalidInferenceCapabilities;
     } else 1;
-    if (version > 2) return error.UnsupportedInferenceCapabilitiesVersion;
+    if (version > 3) return error.UnsupportedInferenceCapabilitiesVersion;
     const task_value = value.object.get("task") orelse return error.InvalidInferenceCapabilities;
     if (task_value != .string or !std.mem.eql(u8, task_value.string, @tagName(task)))
         return error.InvalidInferenceCapabilities;
     const batch_value = value.object.get("batch") orelse return error.InvalidInferenceCapabilities;
     const batch = try parseResolvedBatchCapabilities(batch_value, version);
     try batch.validate();
-    return batch;
+    return .{
+        .batch = batch,
+        .exact = if (version >= 3) try parseExactWireCapabilities(value.object) else null,
+    };
+}
+
+fn requiredString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
+    if (value != .string) return error.InvalidInferenceCapabilities;
+    return value.string;
+}
+
+fn requiredStringArray(object: std.json.ObjectMap, name: []const u8) !std.json.Array {
+    const value = object.get(name) orelse return error.InvalidInferenceCapabilities;
+    if (value != .array) return error.InvalidInferenceCapabilities;
+    for (value.array.items) |item| if (item != .string) return error.InvalidInferenceCapabilities;
+    return value.array;
+}
+
+fn validateStringSet(items: std.json.Array, allowed: []const []const u8) !void {
+    for (items.items, 0..) |item, index| {
+        var known = false;
+        for (allowed) |candidate| {
+            if (std.mem.eql(u8, item.string, candidate)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.InvalidInferenceCapabilities;
+        for (items.items[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.string, item.string)) return error.InvalidInferenceCapabilities;
+        }
+    }
+}
+
+fn parseExactWireCapabilities(object: std.json.ObjectMap) !ExactWireCapabilities {
+    const modality_values = try requiredStringArray(object, "input_modalities");
+    const mime_values = try requiredStringArray(object, "accepted_mime_types");
+    try validateStringSet(modality_values, &.{ "text", "image", "audio", "document" });
+    try validateStringSet(mime_values, &.{
+        "text/plain",
+        "application/json",
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "audio/wav",
+        "audio/mpeg",
+    });
+    const input_granularity: work.InputGranularity = std.meta.stringToEnum(
+        work.InputGranularity,
+        try requiredString(object, "input_granularity"),
+    ) orelse return error.InvalidInferenceCapabilities;
+    const output: work.OutputKind = std.meta.stringToEnum(
+        work.OutputKind,
+        try requiredString(object, "output"),
+    ) orelse return error.InvalidInferenceCapabilities;
+    const result_cardinality: work.ResultCardinality = std.meta.stringToEnum(
+        work.ResultCardinality,
+        try requiredString(object, "result_cardinality"),
+    ) orelse return error.InvalidInferenceCapabilities;
+    const prompt_policy: work.PromptPolicy = std.meta.stringToEnum(
+        work.PromptPolicy,
+        try requiredString(object, "prompt_policy"),
+    ) orelse return error.InvalidInferenceCapabilities;
+    const borrowed_value = object.get("borrowed_attachments") orelse return error.InvalidInferenceCapabilities;
+    if (borrowed_value != .bool) return error.InvalidInferenceCapabilities;
+    return .{
+        .modalities = .{
+            .text = hasString(modality_values, "text"),
+            .image = hasString(modality_values, "image"),
+            .audio = hasString(modality_values, "audio"),
+            .document = hasString(modality_values, "document"),
+        },
+        .mime_types = .{
+            .text_plain = hasString(mime_values, "text/plain"),
+            .application_json = hasString(mime_values, "application/json"),
+            .application_pdf = hasString(mime_values, "application/pdf"),
+            .image_png = hasString(mime_values, "image/png"),
+            .image_jpeg = hasString(mime_values, "image/jpeg"),
+            .image_webp = hasString(mime_values, "image/webp"),
+            .audio_wav = hasString(mime_values, "audio/wav"),
+            .audio_mpeg = hasString(mime_values, "audio/mpeg"),
+        },
+        .input_granularity = input_granularity,
+        .output = output,
+        .result_cardinality = result_cardinality,
+        .prompt_policy = prompt_policy,
+        .borrowed_attachments = borrowed_value.bool,
+    };
 }
 
 pub fn parseModelCapabilities(
@@ -519,17 +623,20 @@ pub fn parseModelCapabilities(
         modalities.audio = hasString(inputs.array, "audio");
         modalities.document = hasString(inputs.array, "document") or hasString(inputs.array, "pdf");
     }
-    if (@as(u8, @bitCast(modalities)) == 0) return null;
-
     const capability_values: ?std.json.Array = if (info.object.get("capabilities")) |values| blk: {
         if (values != .array) return error.InvalidInferenceCapabilities;
         break :blk values.array;
     } else null;
-    const resolved_batch = try parseResolvedCapabilities(info.object, task);
+    const resolved = try parseResolvedCapabilities(info.object, task);
+    if (resolved) |wire| {
+        if (wire.exact) |exact| modalities = exact.modalities;
+    }
+    if (@as(u8, @bitCast(modalities)) == 0) return null;
+    const exact = if (resolved) |wire| wire.exact else null;
     var result = work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
-        .accepted_mime_types = .{
+        .accepted_mime_types = if (exact) |value| value.mime_types else .{
             .text_plain = modalities.text,
             .application_pdf = modalities.document,
             .image_png = modalities.image,
@@ -538,7 +645,7 @@ pub fn parseModelCapabilities(
             .audio_wav = modalities.audio,
             .audio_mpeg = modalities.audio,
         },
-        .input_granularity = if (modalities.document)
+        .input_granularity = if (exact) |value| value.input_granularity else if (modalities.document)
             .document
         else if (modalities.image)
             .page
@@ -549,21 +656,21 @@ pub fn parseModelCapabilities(
         // Older catalogs cannot prove live executor or request-limit facts.
         // Preserve compatibility safely as a singleton until the server
         // publishes the resolved descriptor below.
-        .batch = resolved_batch orelse .{
+        .batch = if (resolved) |wire| wire.batch else .{
             .mode = .none,
             .preferred_items = 1,
             .max_items = 1,
             .max_encoded_media_bytes = null,
             .max_decoded_pixels = null,
-            .max_media_parts_per_item = if (modalities.image or modalities.audio) 1 else 0,
+            .max_media_parts_per_item = if (modalities.image or modalities.audio or modalities.document) 1 else 0,
             .per_item_failures = false,
         },
-        .output = outputForTask(task),
-        .result_cardinality = .one_per_item,
-        .prompt_policy = .explicit,
-        .borrowed_attachments = false,
+        .output = if (exact) |value| value.output else outputForTask(task),
+        .result_cardinality = if (exact) |value| value.result_cardinality else .one_per_item,
+        .prompt_policy = if (exact) |value| value.prompt_policy else .explicit,
+        .borrowed_attachments = if (exact) |value| value.borrowed_attachments else false,
     };
-    if (resolved_batch == null) if (capability_values) |values| {
+    if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
             if (value == .string) try result.batch.applyManifestCapability(value.string);
         }
@@ -736,6 +843,32 @@ test "remote Antfly capability v2 preserves disabled media and pixel limits" {
     const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "text-only", .generate)).?;
     try std.testing.expectEqual(@as(?usize, 0), capabilities.batch.max_encoded_media_bytes);
     try std.testing.expectEqual(@as(?u64, 0), capabilities.batch.max_decoded_pixels);
+}
+
+test "remote Antfly capability v3 preserves exact task contract" {
+    const payload =
+        \\{"extractors":{"vision-extractor":{"inputs":["text"],"inference_capabilities":{"version":3,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"batch":{"mode":"serial_compatibility","preferred_items":8,"max_items":32,"max_encoded_media_bytes":4096,"max_decoded_pixels":8192,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract)).?;
+    try std.testing.expect(!capabilities.supports(.{ .text = true }));
+    try std.testing.expect(capabilities.supports(.{ .image = true }));
+    try std.testing.expect(capabilities.acceptsMimeType("image/png"));
+    try std.testing.expect(!capabilities.acceptsMimeType("image/jpeg"));
+    try std.testing.expectEqual(work.InputGranularity.page, capabilities.input_granularity);
+    try std.testing.expectEqual(work.PromptPolicy.structured_schema, capabilities.prompt_policy);
+    try std.testing.expectEqual(work.BatchMode.serial_compatibility, capabilities.batch.mode);
+    try std.testing.expectEqual(@as(usize, 32), capabilities.batch.max_items);
+    try std.testing.expect(!capabilities.borrowed_attachments);
+}
+
+test "remote Antfly capability v3 rejects unknown exact values" {
+    const payload =
+        \\{"extractors":{"vision-extractor":{"inputs":["text"],"inference_capabilities":{"version":3,"task":"extract","input_modalities":["image","imagge"],"accepted_mime_types":["image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"batch":{"mode":"serial_compatibility","preferred_items":8,"max_items":32,"max_encoded_media_bytes":4096,"max_decoded_pixels":8192,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+    ;
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract),
+    );
 }
 
 test "remote Antfly capability single-flight wait observes deadline and cancellation" {

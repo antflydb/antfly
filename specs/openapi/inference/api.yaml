@@ -1635,6 +1635,8 @@ components:
           example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
         texts:
           type: array
+          minItems: 1
+          maxItems: 128
           items:
             type: string
           description: Texts to classify
@@ -1643,8 +1645,11 @@ components:
             - The service was terrible.
         labels:
           type: array
+          minItems: 1
+          maxItems: 128
           items:
             type: string
+            minLength: 1
           description: |
             Candidate labels for zero-shot classification.
             The model will predict which label(s) best describe each text.
