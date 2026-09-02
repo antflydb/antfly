@@ -4735,16 +4735,49 @@ fn applyReplaceTableDefinitionMutation(
     try target.replaceTableDefinition(expected, replacement);
 }
 
+const PublicApiLinearizableReadProof = struct {
+    cluster: *MetadataHttpClusterSimulation,
+    node_index: usize,
+    group_id: u64,
+    term: u64,
+    read_index: u64,
+    request_sequence: u64,
+
+    fn authoritativeNode(
+        self: @This(),
+        expected_cluster: *MetadataHttpClusterSimulation,
+    ) !MetadataHttpNodeSimulation {
+        if (self.cluster != expected_cluster or
+            self.node_index >= self.cluster.cluster.nodes.len or
+            self.group_id != self.cluster.metadata_group_id)
+            return error.MetadataLinearizableReadTimeout;
+        const leader_index = self.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (leader_index != self.node_index) return error.NotLeader;
+
+        const target = self.cluster.node(self.node_index);
+        const status = target.sim().raftStatus(self.group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (status.soft.role != .leader or status.hard.current_term != self.term)
+            return error.NotLeader;
+        if (status.applied_index < self.read_index)
+            return error.MetadataLinearizableReadTimeout;
+        return target;
+    }
+};
+
 const PublicApiLinearizableReadDriver = struct {
     cluster: ?*MetadataHttpClusterSimulation = null,
     node_index: usize,
     downstream: ?raft_state_machine.ReadStateObserver = null,
     ensure_mutex: std.Io.Mutex = .init,
-    completed: std.atomic.Value(bool) = .init(false),
+    completion_mutex: std.Io.Mutex = .init,
     max_rounds: usize = 48,
     request_sequence: u64 = 0,
-    active_group_id: std.atomic.Value(u64) = .init(0),
-    active_request_sequence: std.atomic.Value(u64) = .init(0),
+    active_group_id: u64 = 0,
+    active_request_sequence: u64 = 0,
+    completed_request_sequence: u64 = 0,
+    completed_read_index: u64 = 0,
 
     fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
         return try std.fmt.bufPrint(
@@ -4763,33 +4796,72 @@ const PublicApiLinearizableReadDriver = struct {
 
     fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (group_id == self.active_group_id.load(.acquire)) {
-            var request_context_buf: [96]u8 = undefined;
-            const request_context = try self.requestContext(
-                &request_context_buf,
-                self.active_request_sequence.load(.acquire),
-            );
-            for (read_states) |read_state| {
-                if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
-                    self.completed.store(true, .release);
-                    break;
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        {
+            defer self.completion_mutex.unlock(std.Options.debug_io);
+            if (group_id == self.active_group_id) {
+                const request_sequence = self.active_request_sequence;
+                var request_context_buf: [96]u8 = undefined;
+                const request_context = try self.requestContext(
+                    &request_context_buf,
+                    request_sequence,
+                );
+                for (read_states) |read_state| {
+                    if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
+                        // The mutex publishes the generation and read index as
+                        // one completion record. A delayed older callback
+                        // cannot overwrite a newer generation after activation.
+                        self.completed_request_sequence = request_sequence;
+                        self.completed_read_index = read_state.index;
+                        break;
+                    }
                 }
             }
         }
         if (self.downstream) |downstream| try downstream.onReadStates(group_id, read_states);
     }
 
-    fn ensure(self: *@This()) !void {
+    fn activateRequest(self: *@This(), group_id: u64) !u64 {
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.completion_mutex.unlock(std.Options.debug_io);
+        // Never recycle a generation: doing so could make an extremely old
+        // delayed response indistinguishable from the active request.
+        if (self.request_sequence == std.math.maxInt(u64))
+            return error.MetadataLinearizableReadTimeout;
+        self.request_sequence += 1;
+        self.active_group_id = group_id;
+        // Activation and callback matching share `completion_mutex`, so an
+        // observer can see either the complete old generation or the complete
+        // new one, never a torn pair.
+        self.active_request_sequence = self.request_sequence;
+        return self.request_sequence;
+    }
+
+    fn completedReadIndex(self: *@This(), sequence: u64) ?u64 {
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.completion_mutex.unlock(std.Options.debug_io);
+        if (self.completed_request_sequence != sequence) return null;
+        return self.completed_read_index;
+    }
+
+    fn ensure(self: *@This()) !PublicApiLinearizableReadProof {
+        return try self.ensureUntil(null);
+    }
+
+    fn ensureUntil(self: *@This(), deadline_ns: ?u64) !PublicApiLinearizableReadProof {
         self.ensure_mutex.lockUncancelable(std.Options.debug_io);
         defer self.ensure_mutex.unlock(std.Options.debug_io);
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
-        self.completed.store(false, .release);
-        self.request_sequence +%= 1;
-        if (self.request_sequence == 0) self.request_sequence = 1;
-        self.active_group_id.store(cluster.metadata_group_id, .release);
-        self.active_request_sequence.store(self.request_sequence, .release);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+        const status_before = cluster.cluster.node(self.node_index).raftStatus(cluster.metadata_group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (status_before.soft.role != .leader) return error.NotLeader;
+        const request_term = status_before.hard.current_term;
+        const sequence = try self.activateRequest(cluster.metadata_group_id);
         var request_context_buf: [96]u8 = undefined;
-        const request_context = try self.requestContext(&request_context_buf, self.request_sequence);
+        const request_context = try self.requestContext(&request_context_buf, sequence);
         cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
             cluster.metadata_group_id,
             request_context,
@@ -4800,12 +4872,62 @@ const PublicApiLinearizableReadDriver = struct {
 
         var rounds: usize = 0;
         while (rounds < self.max_rounds) : (rounds += 1) {
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            }
             try cluster.stepAll();
-            if (self.completed.load(.acquire)) return;
+            const read_index = self.completedReadIndex(sequence) orelse continue;
+            const status_after = cluster.cluster.node(self.node_index).raftStatus(cluster.metadata_group_id) orelse
+                return error.MetadataLinearizableReadTimeout;
+            if (status_after.soft.role != .leader or status_after.hard.current_term != request_term)
+                return error.NotLeader;
+            if (status_after.applied_index < read_index)
+                return error.MetadataLinearizableReadTimeout;
+            return .{
+                .cluster = cluster,
+                .node_index = self.node_index,
+                .group_id = cluster.metadata_group_id,
+                .term = request_term,
+                .read_index = read_index,
+                .request_sequence = sequence,
+            };
         }
         return error.MetadataLinearizableReadTimeout;
     }
 };
+
+test "public api linearizable read driver ignores a delayed earlier generation" {
+    var driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    const group_id: u64 = 91;
+
+    const earlier_sequence = try driver.activateRequest(group_id);
+    var earlier_context_buf: [96]u8 = undefined;
+    const earlier_context = try driver.requestContext(&earlier_context_buf, earlier_sequence);
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 7,
+        .request_ctx = earlier_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, 7), driver.completedReadIndex(earlier_sequence));
+
+    const current_sequence = try driver.activateRequest(group_id);
+    try std.testing.expect(current_sequence != earlier_sequence);
+    // A response delayed past activation of the next request must retain the
+    // old completed generation rather than satisfying the current barrier.
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 8,
+        .request_ctx = earlier_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, null), driver.completedReadIndex(current_sequence));
+    try std.testing.expectEqual(@as(?u64, 7), driver.completedReadIndex(earlier_sequence));
+
+    var current_context_buf: [96]u8 = undefined;
+    const current_context = try driver.requestContext(&current_context_buf, current_sequence);
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 9,
+        .request_ctx = current_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, 9), driver.completedReadIndex(current_sequence));
+}
 
 fn authoritativePublicApiRoutingNode(
     node: MetadataHttpNodeSimulation,
@@ -4816,27 +4938,24 @@ fn authoritativePublicApiRoutingNode(
         if (platform_time.monotonicNs() >= deadline)
             return error.CatalogRoutingSnapshotTimeout;
     }
-    if (external_driver) |driver| {
-        driver.ensure() catch |err| switch (err) {
+    const proof = if (external_driver) |driver|
+        driver.ensureUntil(deadline_ns) catch |err| switch (err) {
             error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
-        };
-    } else {
+        }
+    else blk: {
         const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
             return error.CatalogRoutingSnapshotTimeout;
-        node.cluster.linearizable_read_drivers[leader_index].ensure() catch |err| switch (err) {
+        break :blk node.cluster.linearizable_read_drivers[leader_index].ensureUntil(deadline_ns) catch |err| switch (err) {
             error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         };
-    }
+    };
 
-    const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
-        return error.CatalogRoutingSnapshotTimeout;
-    const target = node.cluster.node(leader_index);
-    const raft_status = target.sim().raftStatus(node.cluster.metadata_group_id) orelse
-        return error.CatalogRoutingSnapshotTimeout;
-    if (raft_status.soft.role != .leader) return error.NotLeader;
-    return target;
+    return proof.authoritativeNode(node.cluster) catch |err| switch (err) {
+        error.MetadataLinearizableReadTimeout => error.CatalogRoutingSnapshotTimeout,
+        else => err,
+    };
 }
 
 const PublicApiStatusSource = struct {
@@ -4895,18 +5014,14 @@ const PublicApiStatusSource = struct {
     fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
         try request.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (self.linearizable_read_driver) |driver| {
-            try driver.ensure();
-            return try self.metadataNode().adminSnapshot();
-        }
-        const target = self.metadataNode();
-        const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
-            return error.MetadataLinearizableReadTimeout;
-        if (target.index != leader_index) return error.NotLeader;
-
-        const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
-            return error.MetadataLinearizableReadTimeout;
-        if (raft_status.soft.role != .leader) return error.NotLeader;
+        const target = authoritativePublicApiRoutingNode(
+            self.node,
+            request.deadline_ns,
+            self.linearizable_read_driver,
+        ) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return error.MetadataLinearizableReadTimeout,
+            else => return err,
+        };
         return try target.adminSnapshot();
     }
 
@@ -11744,6 +11859,12 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     });
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try cluster.stepAll();
+    const initial_barrier_proof = try read_drivers[initial_leader].ensure();
+    try std.testing.expectEqual(initial_leader, initial_barrier_proof.node_index);
+    try std.testing.expectEqual(
+        initial_leader,
+        (try initial_barrier_proof.authoritativeNode(&cluster)).index,
+    );
 
     var node_config = try common_config.Config.parseFromSlice(std.testing.allocator,
         \\{
@@ -11857,6 +11978,10 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     try std.testing.expect(backup_response.attempts > 1);
     const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     try std.testing.expect(elected_leader != initial_leader);
+    // A completed barrier remains bound to the node and term that produced
+    // it. It must fail closed after a handoff instead of authorizing a capture
+    // from the newly elected leader, which has not completed this request.
+    try std.testing.expectError(error.NotLeader, initial_barrier_proof.authoritativeNode(&cluster));
 
     var manifest = try backups_api.readClusterManifest(std.testing.allocator, backup_root_abs, "election-snap");
     defer manifest.deinit(std.testing.allocator);
