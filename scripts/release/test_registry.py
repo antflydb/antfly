@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from registry.container import (
+    ensure_version,
     lookup_digest,
     optional_digest,
     promote_alias,
@@ -87,6 +88,41 @@ class ContainerRegistryTests(unittest.TestCase):
             promote_alias("registry/source:tag", "registry/dest:latest", runner),
             DIGEST,
         )
+
+    def test_missing_version_is_created_from_digest_and_verified(self) -> None:
+        runner = FakeRunner(
+            [
+                (0, f"{DIGEST}\n", ""),
+                (1, "", "MANIFEST_UNKNOWN: manifest unknown"),
+                (0, "", ""),
+                (0, f"{DIGEST}\n", ""),
+            ]
+        )
+        self.assertEqual(
+            ensure_version("registry/source:tag", "registry/dest:v1.2.3", runner),
+            DIGEST,
+        )
+        self.assertEqual(
+            runner.calls[2],
+            ["crane", "copy", f"registry/source@{DIGEST}", "registry/dest:v1.2.3"],
+        )
+
+    def test_existing_identical_version_is_resumable_without_copy(self) -> None:
+        runner = FakeRunner([(0, f"{DIGEST}\n", ""), (0, f"{DIGEST}\n", "")])
+        self.assertEqual(
+            ensure_version("registry/source:tag", "registry/dest:v1.2.3", runner),
+            DIGEST,
+        )
+        self.assertFalse(any(call[1] == "copy" for call in runner.calls))
+
+    def test_existing_different_version_is_never_overwritten(self) -> None:
+        different = f"sha256:{'b' * 64}"
+        runner = FakeRunner([(0, f"{DIGEST}\n", ""), (0, f"{different}\n", "")])
+        with self.assertRaisesRegex(
+            RegistryError, "immutable container version differs"
+        ):
+            ensure_version("registry/source:tag", "registry/dest:v1.2.3", runner)
+        self.assertFalse(any(call[1] == "copy" for call in runner.calls))
 
     def test_expected_digest_is_checked_without_copying(self) -> None:
         runner = FakeRunner([(0, f"{DIGEST}\n", "")])

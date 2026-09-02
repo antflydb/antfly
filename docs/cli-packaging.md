@@ -66,21 +66,21 @@ consumers.
    workflow revision. The controller then verifies the
    complete release bundle before promoting its CLI scope to PyPI and npm, its
    GNU runtime scope to the single container image, and stable archives to
-   Homebrew. Container images are built once under run-scoped staging tags,
-   resolved to OCI digests, retained by ledger-addressed aliases in GAR and
-   GHCR, and added to the
-   compare-and-swap channel journal before any package or public alias is
-   published. Version and channel tags are intentionally
-   mutable aliases of that digest; every copy reads from a digest-pinned source
-   and is verified afterward. OCI content digests, not registry tags, are the
-   immutable container identity.
+   Homebrew. The controller first reserves the compare-and-swap channel
+   transaction. Container images are built under run-scoped staging tags,
+   resolved to OCI digests, bound once to permanent ledger-addressed records,
+   retained by ledger aliases in GAR and GHCR, and then added to the pending
+   channel identity before any package or public alias is published. Semantic
+   version tags are create-or-verify and cannot move to another digest; only
+   channel tags are mutable. Every copy reads from a digest-pinned source and
+   is verified afterward.
    npm `latest`, `next`, or `nightly`, plus the channel's container and R2
    aliases and policy-selected GitHub visibility, are committed through
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for
    nightlies.
    npm additionally verifies the requested dist-tag, so retries cannot conceal
-   content or channel drift. Recovery restores the journaled digest from
-   either retention registry and fails if both copies are gone. It never
+   content or channel drift. Recovery restores the permanently recorded digest
+   from either retention registry and fails if both copies are gone. It never
    rebuilds a journaled container identity.
    Container assembly uses promotion-controller-owned Docker and
    Cloud Build inputs plus the verified GNU archives; it never executes release

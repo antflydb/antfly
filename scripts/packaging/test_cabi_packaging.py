@@ -208,10 +208,15 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("consumer-matrix container", container_workflow)
         self.assertIn("registryctl.py container-digest", container_workflow)
         self.assertIn("registryctl.py container-lookup", container_workflow)
+        self.assertIn("release_container_state.py bind", container_workflow)
+        self.assertLess(
+            container_workflow.index("release_container_state.py bind"),
+            container_workflow.index("Retain the digest-addressed candidate"),
+        )
         self.assertIn("release-ledger-${LEDGER_SHA256}", container_workflow)
         self.assertIn('mirror_image="ghcr.io/antflydb/antfly"', container_workflow)
         self.assertIn(
-            "journaled container digest is missing from both retention registries",
+            "recorded container digest is missing from both retention registries",
             container_workflow,
         )
         self.assertIn("expected_digest:", container_workflow)
@@ -231,6 +236,11 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("group: antfly-release-promotion", release_workflow)
         self.assertIn("release_channel_state.py begin", release_workflow)
         self.assertIn("release_channel_state.py finish", release_workflow)
+        self.assertIn("release_container_state.py resolve", release_workflow)
+        self.assertIn("bind-release-container:", release_workflow)
+        self.assertEqual(
+            release_workflow.count("registryctl.py container-version"), 4
+        )
         self.assertIn("Commit digest-pinned container version", release_workflow)
         self.assertIn('--container-digest "$CONTAINER_DIGEST"', release_workflow)
         self.assertIn("Commit the stable Homebrew formula", release_workflow)

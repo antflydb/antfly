@@ -354,7 +354,7 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "is incomplete"):
             channel.begin_promotion(store, different, None)
 
-    def test_stable_channel_upgrades_a_legacy_pending_container_identity(self) -> None:
+    def test_stable_channel_binds_digest_to_pending_core_identity(self) -> None:
         channel = load_module(
             "release_channel_pending_upgrade_test", "release_channel_state.py"
         )

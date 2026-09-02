@@ -91,13 +91,15 @@ credentials.
    only by this controller, checks out the recorded controller commit, and
    consumes the GNU runtime archives built from the source commit in step 2.
    Its Dockerfile, Cloud Build configuration, platform policy, and registry
-   code are therefore controller-owned rather than source-provided. It first
-   builds a run-scoped image once, resolves the multi-platform OCI digest, and
-   copies a ledger-addressed retention alias to both GAR and GHCR. Recovery
-   restores the journaled digest from either registry and fails if both copies
-   are gone; it never rebuilds an already-journaled OCI identity. Version and
-   channel tags are transaction-controlled aliases of the digest, not
-   immutable records.
+   code are therefore controller-owned rather than source-provided. The
+   controller reserves the channel transaction before building, resolves the
+   multi-platform OCI digest, and atomically creates a permanent
+   `antfly/container-identities/<ledger>.json` record before copying
+   ledger-addressed retention aliases to GAR and GHCR. Recovery resolves that
+   per-release record independently of the channel's current version, restores
+   its digest from either registry, and fails if both copies are gone; it never
+   rebuilds a recorded OCI identity. Semantic version tags are create-or-verify
+   identities, while only channel tags are mutable aliases.
 6. Mutable install channels are transactions. The compare-and-swap transaction
    begins before PyPI, npm, or public container publication, so a precedence
    or identity collision cannot be discovered after publishing a registry
@@ -116,8 +118,10 @@ rate-limit, malformed-response, and network failures stop promotion.
 Container and npm operations use the typed adapters under
 `scripts/release/registry/`. Registry lookups return only present or explicitly
 missing; failures are a separate error path and can never authorize creation.
-Container tags are aliases copied only from digest-pinned sources and then
-digest-verified through the same interface. The OCI digest is the immutable
+Container tags are copied only from digest-pinned sources and then
+digest-verified through the same interface. Version tags reject an existing
+different digest; channel tags may move only inside the channel transaction.
+The permanent ledger-addressed record and OCI digest form the immutable
 container identity.
 
 npm platform packages publish before the top-level selector. Existing npm or
@@ -153,11 +157,12 @@ source-commit-and-ledger-addressed artifact URI and has no mutable or
 ABI-ambiguous default input.
 
 Temporary run-scoped container tags are build staging only. A
-`release-ledger-<ledger digest>` tag in both GAR and GHCR retains the journaled
-content for recovery; either copy can repair the other by digest. If both are
-lost, recovery fails explicitly instead of trying to reproduce bytes from
-mutable package repositories or build tools. `<version>` and channel tags
-remain transaction-controlled aliases. Registry retention may remove
+`release-ledger-<ledger digest>` tag in both GAR and GHCR retains the digest
+bound by the permanent per-release record; either copy can repair the other by
+digest. If both are lost, recovery fails explicitly instead of trying to
+reproduce bytes from mutable package repositories or build tools. Version tags
+are immutable after their first publication, while channel tags remain
+transaction-controlled aliases. Registry retention may remove
 run-scoped staging tags after the release. There
 is deliberately no automatic rollback entry point for mutable channels. A
 rollback requires a separately reviewed administrative change to the channel
@@ -173,9 +178,10 @@ dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
 Every workflow declares an explicit `GITHUB_TOKEN` permission baseline, and all
 external GitHub Actions are pinned to full commit SHAs. CI enforces both rules
-repository-wide, and reviewed Dependabot pull requests advance those pins. The
-repository-level default workflow permission should remain `read`; explicit
-job-level grants are the only supported way to obtain write access.
+repository-wide, and reviewed Dependabot pull requests advance those pins. When
+this policy lands, the repository-level default workflow permission must be set
+to `read` and kept there; explicit job-level grants are the only supported way
+to obtain write access.
 
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:
@@ -195,6 +201,9 @@ scripts under `scripts/release/`:
 - `release_channel_state.py` compare-and-swaps each channel journal, prevents
   backward promotion, and makes an interrupted promotion resumable only by the
   same release identity.
+- `release_container_state.py` create-once binds each release ledger to its OCI
+  digest independently of mutable channel history, so later recovery can find
+  the original container without rebuilding it.
 - `registryctl.py` is the workflow-facing command for the typed npm and
   container adapters. Provider behavior is tested with injected responses for
   missing objects, content drift, authentication and network failures, and

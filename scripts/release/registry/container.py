@@ -85,9 +85,9 @@ def promote_alias(
     source: str, destination: str, runner: Runner = subprocess.run
 ) -> str:
     expected = require_digest(source, runner)
-    # Tags are mutable aliases, never immutable records. Resolve once, then copy
-    # the digest-pinned source so a concurrent source-tag move cannot change the
-    # bytes promoted by this transaction.
+    # Channel and retention tags are mutable aliases, never immutable records.
+    # Resolve once, then copy the digest-pinned source so a concurrent source-tag
+    # move cannot change the bytes promoted by this transaction.
     _copy(digest_reference(source, expected), destination, runner)
     actual = lookup_digest(destination, runner)
     if actual.state is not LookupState.PRESENT or actual.digest != expected:
@@ -95,3 +95,20 @@ def promote_alias(
             f"container alias verification failed for {destination}: expected {expected}"
         )
     return expected
+
+
+def ensure_version(
+    source: str, destination: str, runner: Runner = subprocess.run
+) -> str:
+    """Create a version tag once, or verify an identical prior publication."""
+    expected = require_digest(source, runner)
+    existing = optional_digest(destination, runner)
+    if existing is not None:
+        if existing != expected:
+            raise RegistryError(
+                f"immutable container version differs for {destination}: "
+                f"expected={expected} actual={existing}"
+            )
+        return expected
+    _copy(digest_reference(source, expected), destination, runner)
+    return verify_digest(destination, expected, runner)
