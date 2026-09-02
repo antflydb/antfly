@@ -740,7 +740,6 @@ class ReleasePromotionTests(unittest.TestCase):
                         "registry_versions": {
                             "npm": "1.2.3",
                             "python": "1.2.3",
-                            "container": "v1.2.3",
                         },
                     }
                 )
