@@ -188,6 +188,7 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         value: *const fn (*u32, u32) anyerror!u32,
         fail: ?*const fn (*u32) anyerror!void = null,
         retryable_fail: ?*const fn (*u32) anyerror!void = null,
+        ambiguous_fail: ?*const fn (*u32) anyerror!void = null,
         durability_pending: ?*const fn (*u32) anyerror!void = null,
     };
     const TestBoundary = BoundaryImpl(TestVTable);
@@ -205,6 +206,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
 
         fn retryableFail(_: *u32) anyerror!void {
             return error.ProposalDropped;
+        }
+
+        fn ambiguousFail(_: *u32) anyerror!void {
+            return error.MetadataMutationOutcomeUnknown;
         }
 
         fn durabilityPending(_: *u32) anyerror!void {
@@ -252,6 +257,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ProposalDropped,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.retryableFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        TestBoundary.call("ambiguous_fail", &callbacks.foreignDispatch, &callbacks.ambiguousFail, .{&base}),
     );
     try std.testing.expectError(
         error.HASyncCommitWouldBlock,

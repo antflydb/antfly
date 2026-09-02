@@ -17,8 +17,15 @@ pub const Source = struct {
     pub const VTable = struct {
         validate_publication: *const fn (*anyopaque, metadata_api.CatalogPublicationContract) anyerror!bool,
         validate_table_publication: *const fn (*anyopaque, metadata_api.CatalogTablePublicationContract) anyerror!bool,
+        validate_group_retirement: *const fn (
+            *anyopaque,
+            metadata_api.CatalogGroupRetirementContract,
+        ) anyerror!metadata_api.CatalogGroupRetirementValidation,
         trigger_reallocate: *const fn (*anyopaque) anyerror!void,
         upsert_schema_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.SchemaProgressRecord) anyerror!void,
+        upsert_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressRecord) anyerror!void,
+        remove_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressIdentity) anyerror!void,
+        sync_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressSync) anyerror!void,
     };
 };
 
@@ -43,6 +50,15 @@ pub const Operations = struct {
         return self.source.vtable.validate_table_publication(self.source.ptr, contract);
     }
 
+    pub fn validateGroupRetirement(
+        self: Operations,
+        request: operation.RequestContext,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        try request.ensureActive();
+        return self.source.vtable.validate_group_retirement(self.source.ptr, contract);
+    }
+
     pub fn triggerReallocate(self: Operations, request: operation.RequestContext) !void {
         try request.ensureActive();
         try self.source.vtable.trigger_reallocate(self.source.ptr);
@@ -56,6 +72,36 @@ pub const Operations = struct {
     ) !void {
         try request.ensureActive();
         try self.source.vtable.upsert_schema_progress(self.source.ptr, alloc, record);
+    }
+
+    pub fn upsertRestoreProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        record: metadata_table_manager.RestoreProgressRecord,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.upsert_restore_progress(self.source.ptr, alloc, record);
+    }
+
+    pub fn removeRestoreProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        identity: metadata_table_manager.RestoreProgressIdentity,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.remove_restore_progress(self.source.ptr, alloc, identity);
+    }
+
+    pub fn syncRestoreProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        sync: metadata_table_manager.RestoreProgressSync,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.sync_restore_progress(self.source.ptr, alloc, sync);
     }
 };
 
@@ -75,12 +121,36 @@ test "metadata admin mutations reject canceled work before reaching their source
             return true;
         }
 
+        fn validateGroupRetirement(
+            ptr: *anyopaque,
+            _: metadata_api.CatalogGroupRetirementContract,
+        ) !metadata_api.CatalogGroupRetirementValidation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .group_ids_unowned = true, .table_name_absent = true };
+        }
+
         fn triggerReallocate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }
 
         fn upsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.SchemaProgressRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+
+        fn upsertRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.RestoreProgressRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+
+        fn removeRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.RestoreProgressIdentity) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+
+        fn syncRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.RestoreProgressSync) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }
@@ -92,8 +162,12 @@ test "metadata admin mutations reject canceled work before reaching their source
         .vtable = &.{
             .validate_publication = FakeSource.validatePublication,
             .validate_table_publication = FakeSource.validateTablePublication,
+            .validate_group_retirement = FakeSource.validateGroupRetirement,
             .trigger_reallocate = FakeSource.triggerReallocate,
             .upsert_schema_progress = FakeSource.upsertSchemaProgress,
+            .upsert_restore_progress = FakeSource.upsertRestoreProgress,
+            .remove_restore_progress = FakeSource.removeRestoreProgress,
+            .sync_restore_progress = FakeSource.syncRestoreProgress,
         },
     } };
     var canceled = std.atomic.Value(bool).init(true);

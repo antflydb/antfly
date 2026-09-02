@@ -26,6 +26,7 @@ pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
 pub const ObjectChecksumScope = types.ObjectChecksumScope;
 pub const ObjectChecksumType = types.ObjectChecksumType;
 pub const PutOptions = types.PutOptions;
+pub const BucketOptions = types.BucketOptions;
 pub const GetOptions = types.GetOptions;
 pub const StatOptions = types.StatOptions;
 pub const CancellationToken = types.CancellationToken;

@@ -247,6 +247,61 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.prepare();
     }
 
+    pub fn prepareLiveConvergence(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.PreparedLiveConvergence {
+        return try self.reconciler_loop.prepareLiveConvergence(intents);
+    }
+
+    pub fn reconcileMembershipOnly(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.ReconcileResult {
+        return try self.reconciler_loop.reconcileMembershipOnly(intents);
+    }
+
+    pub fn reconcileMembershipInto(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+        result: *reconciler.ReconcileResult,
+    ) !void {
+        try self.reconciler_loop.reconcileMembershipInto(intents, result);
+    }
+
+    pub fn finishLiveConvergence(
+        self: *ManagedHost,
+        result: reconciler.ReconcileResult,
+    ) void {
+        self.reconciler_loop.finishLiveConvergence(result);
+    }
+
+    pub fn membershipStatus(self: *const ManagedHost, group_id: u64) ?reconciler.MembershipConvergence {
+        return self.reconciler_loop.membershipStatus(group_id);
+    }
+
+    pub fn routeStatus(self: *const ManagedHost, group_id: u64) ?reconciler.RouteConvergence {
+        return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn routeDiagnostics(
+        self: *const ManagedHost,
+        group_id: u64,
+    ) ?reconciler.RouteConvergenceDiagnostics {
+        return self.reconciler_loop.routeDiagnostics(group_id);
+    }
+
+    pub fn failureDiagnostics(self: *const ManagedHost, group_id: u64) ?reconciler.ReconcileFailure {
+        return self.reconciler_loop.failureDiagnostics(group_id);
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *ManagedHost,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.host.replicaAdmissionConflict(group_id);
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
@@ -289,6 +344,25 @@ pub const ManagedHost = struct {
 
     pub fn status(self: *ManagedHost, group_id: u64) host_mod.HostedReplicaStatus {
         return self.host.status(group_id);
+    }
+
+    pub fn quarantineStatus(self: *const ManagedHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.host.quarantineStatus(group_id);
+    }
+
+    pub fn listQuarantines(
+        self: *const ManagedHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *ManagedHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const ManagedHost, group_id: u64) ?host_mod.BootstrapStatus {
@@ -511,6 +585,61 @@ pub const ManagedHttpHost = struct {
         return try self.reconciler_loop.prepare();
     }
 
+    pub fn prepareLiveConvergence(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.PreparedLiveConvergence {
+        return try self.reconciler_loop.prepareLiveConvergence(intents);
+    }
+
+    pub fn reconcileMembershipOnly(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.ReconcileResult {
+        return try self.reconciler_loop.reconcileMembershipOnly(intents);
+    }
+
+    pub fn reconcileMembershipInto(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+        result: *reconciler.ReconcileResult,
+    ) !void {
+        try self.reconciler_loop.reconcileMembershipInto(intents, result);
+    }
+
+    pub fn finishLiveConvergence(
+        self: *ManagedHttpHost,
+        result: reconciler.ReconcileResult,
+    ) void {
+        self.reconciler_loop.finishLiveConvergence(result);
+    }
+
+    pub fn membershipStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.MembershipConvergence {
+        return self.reconciler_loop.membershipStatus(group_id);
+    }
+
+    pub fn routeStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.RouteConvergence {
+        return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn routeDiagnostics(
+        self: *const ManagedHttpHost,
+        group_id: u64,
+    ) ?reconciler.RouteConvergenceDiagnostics {
+        return self.reconciler_loop.routeDiagnostics(group_id);
+    }
+
+    pub fn failureDiagnostics(self: *const ManagedHttpHost, group_id: u64) ?reconciler.ReconcileFailure {
+        return self.reconciler_loop.failureDiagnostics(group_id);
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *ManagedHttpHost,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.http_host.host.replicaAdmissionConflict(group_id);
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
@@ -571,6 +700,25 @@ pub const ManagedHttpHost = struct {
 
     pub fn status(self: *ManagedHttpHost, group_id: u64) host_mod.HostedReplicaStatus {
         return self.http_host.status(group_id);
+    }
+
+    pub fn quarantineStatus(self: *const ManagedHttpHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.http_host.quarantineStatus(group_id);
+    }
+
+    pub fn listQuarantines(
+        self: *const ManagedHttpHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.http_host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *ManagedHttpHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.http_host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const ManagedHttpHost, group_id: u64) ?host_mod.BootstrapStatus {
@@ -1204,7 +1352,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
         },
         &.{.{
             .group_id = 903,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/903",
             .artifact_size_bytes = artifact_integrity.size_bytes,

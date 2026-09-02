@@ -3612,6 +3612,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
@@ -4077,6 +4078,10 @@ pub fn build(b: *std.Build) void {
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "api http server create table with local writes waits for projected presence without lifecycle",
+        "api http server rejects oversized table definitions before parsing across public and MCP",
+        "api http server reports exhausted table mutation authority consistently",
+        "ambiguous mutation response is explicitly non-retryable",
+        "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
         "status source rejects every partial routing capability",
@@ -4291,7 +4296,7 @@ pub fn build(b: *std.Build) void {
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
             "prepared native restore repair reuses target backend admission",
-            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
+            "backup restore bootstrap adopts an exact imported generation while repair holds a reader",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4306,7 +4311,9 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
             "multi raft drainReady reserves continuations for productive groups",
+            "multi raft empty drain remains allocation free after group admission",
             "multi raft backpressure rejects async ready before cloning messages",
+            "multi raft routes outbound snapshots through snapshot transport",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -4316,6 +4323,26 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    // Snapshot artifact storage has its own root because Zig does not collect
+    // tests from the implementation behind the transport compatibility alias.
+    // Keep the target component-wide rather than naming an individual policy
+    // regression so new storage contracts are discovered automatically.
+    const raft_storage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_storage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_storage_test_mod, true, true);
+    const raft_storage_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
 
     // Keep this as the stable behavioral suffix of the declaration rather
     // than duplicating its descriptive worker-model prefix. The exact-filter
@@ -4563,6 +4590,7 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
+        "data runtime retries storage ownership invalidation before publishing fingerprint",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -4611,6 +4639,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
@@ -5423,14 +5452,13 @@ pub fn build(b: *std.Build) void {
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
         "restore job list paginates after authorization filtering",
-        "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges",
         "restore job list bounds authorization scans with an empty continuation page",
         "api http server backs up and restores a table through public routes",
         "api http server cluster overwrite restores from read-only repository without dropping live table",
         "api http server durability-pending restore preserves committed metadata",
         "api http server cluster restore rehydrates extension metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
-        "api http server retries stale metadata table-exists restore race",
+        "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
@@ -5519,6 +5547,7 @@ pub fn build(b: *std.Build) void {
         "stored term filters preserve JSON scalar kinds",
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
+        "api http server drop table observes metadata absence before local cleanup",
         "public api smoke e2e creates table inserts and queries documents",
         "provisioned table write source routes batch writes across ranges",
         "public api e2e recreates managed embeddings index after corrupt artifact",
@@ -5816,6 +5845,7 @@ pub fn build(b: *std.Build) void {
             "table backup cleanup removes the forwarded artifact envelope before payload",
             "cluster backup retains its fenced attempt after an ambiguous table outcome",
             "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
             "cluster backup attempt markers reject overlapping cleanup identities",
             "stale owned cluster backup attempt retains generation fences and retires authoritative head",
             "expired recovery preserves an oversized remote commit record",
@@ -6176,6 +6206,7 @@ pub fn build(b: *std.Build) void {
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn bounds unresolved coordinator decision retries",
+            "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
@@ -6190,6 +6221,7 @@ pub fn build(b: *std.Build) void {
             "resident writer repair state distinguishes clean and metadata-pending writers",
             "api http client preserves group doc identity conflicts",
             "api http client transports txn resolve cancellation and visibility reason",
+            "resolve group routes uses one router-owned snapshot callback for fanout",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client preserves committed visibility outcomes for forwarded raft batches",
@@ -6576,7 +6608,20 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
+            "dropped table quarantine path keeps valid API names in one portable component",
+            "malformed recovery intent is durably removed from the active queue and counted",
+            "transient recovery intent read failure retains active work and retries successfully",
+            "dropped table recovery drains a wake coalesced during the active scan",
+            "dropped table recovery watchdog repairs a failed durable enqueue",
+            "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
+            "provisioned table drop retains repair intent until catalog ownership clears",
+            "replica retirement journal distinguishes active retained and committed removal",
+            "replica retirement journal batches preserve every group phase",
+            "replica retirement batch identity is canonical and rejects duplicate groups",
+            "replica retirement recovery discards a legacy orphan whose catalog removal aborted",
+            "hosted source publication recovers durable dropped-table intent",
             "provisioned table write source drop table retires old publication authority",
+            "provisioned table write source drop table does not hold local db mutex during background delete",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -6608,6 +6653,7 @@ pub fn build(b: *std.Build) void {
             "structural reconcile production catalog fails closed without table publication fence",
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
+            "provisioned source quiesce closes cleanup admission and drains accepted owner jobs",
             "provisioned schema reconcile keeps reads and status available",
             "busy startup open preserves fresh writer runtime status",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
@@ -6830,10 +6876,25 @@ pub fn build(b: *std.Build) void {
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like e2e backs up drops and restores a table",
+            "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",
             "api http server rejects an empty cluster backup without publishing a manifest",
             "backup manifest validation rejects ambiguous or unbound artifacts",
+            "backup manifest cancellation prevents late publication",
+            "backup root publication cancellation leaves no visible control record",
+            "unpublished table cleanup retains its retry address until writer state retires",
+            "unpublished table cleanup preserves its reservation on writer owner mismatch",
+            "unpublished table cleanup exposes bounded resumable progress",
+            "stale table reclaim reports a concurrently replaced generation",
+            "stale table reclaim honors cancellation before storage mutation",
+            "table backup collision commit check is bounded and exact",
+            "standalone stale reclaim bounds foreground native artifact deletion",
+            "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
+            "table backup lease conflict retains the retry address and live writer fence",
+            "backup maintenance target coalesces exact table reclaim intent",
+            "table backup reclaim retry uses exact future eligibility",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",
@@ -6875,9 +6936,28 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "metadata service ",
             "metadata proposal receipt ",
+            "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata.table mutation routing forwards only to a routable remote leader",
+            "metadata http client forwards table create and drop to the internal route",
+            "metadata http client rejects invalid forwarded table names before I/O",
+            "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
+            "metadata http client preserves transport ambiguity for forwarded table mutations",
+            "metadata http client preserves extension ownership across forwarding",
+            "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
+            "metadata http client does not replay unmarked table mutation rejection proof",
+            "metadata http client round-trips server endpoints",
+            "routed table mutation",
+            "forwarded create body limit",
+            "table mutation names preserve the public contract",
+            "stored create table encoding",
+            "raft mutation ",
+            "table topology mutation ",
+            "metadata http server preserves extension-owned table drop conflicts",
+            "extension lifecycle proposal",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -7501,6 +7581,7 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    raft_test_step.dependOn(&run_raft_storage_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -7511,6 +7592,9 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+
+    const raft_storage_test_step = b.step("raft-storage-test", "Run Raft snapshot artifact storage tests");
+    raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
     unit_test_step.dependOn(&run_raft_library_tests.step);

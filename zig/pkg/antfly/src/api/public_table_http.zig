@@ -33,9 +33,20 @@ const query_contract = @import("query_contract.zig");
 const operation = @import("operation.zig");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
+threadlocal var last_ambiguous_batch_txn_id: ?[32]u8 = null;
 
 pub fn resetLastBatchFailureName() void {
     last_batch_failure_name = null;
+}
+
+pub fn setLastAmbiguousBatchTxnId(txn_id_hex: [32]u8) void {
+    last_ambiguous_batch_txn_id = txn_id_hex;
+}
+
+fn takeLastAmbiguousBatchTxnId() ?[32]u8 {
+    const txn_id = last_ambiguous_batch_txn_id;
+    last_ambiguous_batch_txn_id = null;
+    return txn_id;
 }
 
 pub fn setLastBatchFailureName(err: anyerror) void {
@@ -189,6 +200,31 @@ pub const TableApi = struct {
         UnsupportedBackupMigrationState,
         UnsupportedMultiRangeTable,
         InternalFailure,
+    };
+
+    /// Request-owned diagnostic receipt. The execution layer records the
+    /// opaque physical generation before any repository mutation, allowing an
+    /// ambiguous response to remain informative without performing fresh I/O
+    /// after the operation deadline or failure.
+    pub const BackupExecutionReceipt = struct {
+        artifact_backup_id_buffer: [128]u8 = undefined,
+        artifact_backup_id_len: usize = 0,
+
+        pub fn recordArtifactBackupId(self: *@This(), value: []const u8) void {
+            // A diagnostic must never turn an otherwise recoverable failure
+            // into a panic or expose a truncated identity.
+            if (value.len > self.artifact_backup_id_buffer.len) {
+                self.artifact_backup_id_len = 0;
+                return;
+            }
+            @memcpy(self.artifact_backup_id_buffer[0..value.len], value);
+            self.artifact_backup_id_len = value.len;
+        }
+
+        pub fn artifactBackupId(self: *const @This()) ?[]const u8 {
+            if (self.artifact_backup_id_len == 0) return null;
+            return self.artifact_backup_id_buffer[0..self.artifact_backup_id_len];
+        }
     };
 
     pub const ExecuteRestoreError = error{
@@ -373,6 +409,7 @@ pub const TableApi = struct {
             location_uri: []const u8,
             connection: []const u8,
             location: *backups_api.BackupLocation,
+            receipt: *BackupExecutionReceipt,
             request: operation.RequestContext,
         ) ExecuteBackupError!void,
         execute_table_restore: *const fn (
@@ -508,9 +545,10 @@ pub const TableApi = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        receipt: *BackupExecutionReceipt,
     ) ExecuteBackupError!void {
         try self.ensureActive();
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, expected_fence, location_uri, connection, location, self.request);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, expected_fence, location_uri, connection, location, receipt, self.request);
     }
 
     pub fn executeTableRestore(
@@ -1206,6 +1244,7 @@ pub fn handleTableBatch(
     api: TableApi,
 ) !OwnedResponse {
     resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
     var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
@@ -1235,8 +1274,23 @@ pub fn handleTableBatch(
             .body = try alloc.dupe(u8, "write committed locally; standby durability acknowledgment pending"),
         },
         error.OutcomeUnknown => return .{
-            .status = 500,
-            .body = try alloc.dupe(u8, "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits"),
+            // An ambiguous commit is a stable, non-retryable application
+            // outcome, not an internal server failure. Include the immutable
+            // transaction identity for logs/support and reconciliation.
+            .status = 409,
+            .body = if (takeLastAmbiguousBatchTxnId()) |txn_id| try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "transaction_outcome_unknown",
+                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+                .retryable = false,
+                .transaction_id = txn_id[0..],
+                .recovery = "use an explicit transaction session for client-retryable commits",
+            }, .{}) else try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "transaction_outcome_unknown",
+                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+                .retryable = false,
+                .recovery = "use an explicit transaction session for client-retryable commits",
+            }, .{}),
+            .json = true,
         },
         error.CommittedPending => return .{
             .status = 202,
@@ -1595,7 +1649,18 @@ pub fn handleTableBackupExpectedFence(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, expected_fence, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
+    var execution_receipt: TableApi.BackupExecutionReceipt = .{};
+    api.executeTableBackup(
+        alloc,
+        table_name,
+        parsed_req.value.backup_id,
+        backup_format,
+        expected_fence,
+        parsed_req.value.location,
+        parsed_req.value.connection,
+        &location,
+        &execution_receipt,
+    ) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
         error.MetadataCapabilityUnavailable => return .{
             .status = 503,
@@ -1607,29 +1672,14 @@ pub fn handleTableBackupExpectedFence(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.CatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.catalog_changed_body), .json = true },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.backup_already_exists_body), .json = true },
-        error.BackupOutcomeAmbiguous => {
-            var fallback_io: ?std.Io.Threaded = if (io == null)
-                std.Io.Threaded.init(std.heap.page_allocator, .{})
-            else
-                null;
-            defer if (fallback_io) |*owned| owned.deinit();
-            const response_io = io orelse fallback_io.?.io();
-            const artifact_backup_id = backups_api.tableBackupAttemptArtifactIdAlloc(
+        error.BackupOutcomeAmbiguous => return .{
+            .status = 409,
+            .body = try backups_api.encodeBackupOutcomeAmbiguousBody(
                 alloc,
-                response_io,
-                &location,
                 parsed_req.value.backup_id,
-            ) catch null;
-            defer if (artifact_backup_id) |value| alloc.free(value);
-            return .{
-                .status = 409,
-                .body = try backups_api.encodeBackupOutcomeAmbiguousBody(
-                    alloc,
-                    parsed_req.value.backup_id,
-                    artifact_backup_id,
-                ),
-                .json = true,
-            };
+                execution_receipt.artifactBackupId(),
+            ),
+            .json = true,
         },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -2350,6 +2400,7 @@ fn unsupportedBackup(
     _: []const u8,
     _: []const u8,
     _: *backups_api.BackupLocation,
+    _: *TableApi.BackupExecutionReceipt,
     _: operation.RequestContext,
 ) TableApi.ExecuteBackupError!void {
     return error.InternalFailure;
@@ -2885,6 +2936,8 @@ test "public table batch handler maps write unavailable errors" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.err == error.InternalFailure)
                 setLastBatchFailureName(error.InferenceProviderFailure);
+            if (self.err == error.OutcomeUnknown)
+                setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
             return self.err;
         }
     };
@@ -2898,8 +2951,9 @@ test "public table batch handler maps write unavailable errors" {
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
         .{
             .err = error.OutcomeUnknown,
-            .status = 500,
-            .body = "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits",
+            .status = 409,
+            .body = "{\"code\":\"transaction_outcome_unknown\",\"message\":\"transaction outcome is unknown; do not replay this stateless batch because it may already have committed\",\"retryable\":false,\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"recovery\":\"use an explicit transaction session for client-retryable commits\"}",
+            .json = true,
         },
         .{
             .err = error.InternalFailure,
@@ -4646,6 +4700,7 @@ test "public table backup handler maps unsupported multi-range error" {
             _: []const u8,
             _: []const u8,
             _: *backups_api.BackupLocation,
+            _: *TableApi.BackupExecutionReceipt,
             _: operation.RequestContext,
         ) TableApi.ExecuteBackupError!void {
             return error.UnsupportedMultiRangeTable;
@@ -4699,6 +4754,7 @@ test "public table backup handler rejects an existing backup id" {
             _: []const u8,
             _: []const u8,
             _: *backups_api.BackupLocation,
+            _: *TableApi.BackupExecutionReceipt,
             _: operation.RequestContext,
         ) TableApi.ExecuteBackupError!void {
             return error.BackupAlreadyExists;
@@ -4753,9 +4809,12 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
             _: []const u8,
             _: []const u8,
             _: *backups_api.BackupLocation,
+            receipt: *TableApi.BackupExecutionReceipt,
             _: operation.RequestContext,
         ) TableApi.ExecuteBackupError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.failure == error.BackupOutcomeAmbiguous)
+                receipt.recordArtifactBackupId("artifact-123");
             return self.failure;
         }
     };
@@ -4764,7 +4823,7 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
         .{ .failure = error.CatalogChanged, .expected = backups_api.catalog_changed_body },
         .{
             .failure = error.BackupOutcomeAmbiguous,
-            .expected = "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id and artifact id before retrying\",\"retryable\":false,\"backup_id\":\"snap\"}",
+            .expected = "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id and artifact id before retrying\",\"retryable\":false,\"backup_id\":\"snap\",\"artifact_backup_id\":\"artifact-123\"}",
         },
         .{
             .failure = error.UnsupportedBackupMigrationState,
@@ -4825,6 +4884,7 @@ test "public table backup handler accepts portable format" {
             _: []const u8,
             connection: []const u8,
             _: *backups_api.BackupLocation,
+            _: *TableApi.BackupExecutionReceipt,
             _: operation.RequestContext,
         ) TableApi.ExecuteBackupError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));

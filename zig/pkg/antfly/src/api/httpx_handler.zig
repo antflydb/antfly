@@ -74,6 +74,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
+const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
@@ -98,6 +99,47 @@ const ParsedGlobalQueryTable = struct {
     fn deinit(self: *@This()) void {
         self.parsed.deinit();
     }
+};
+
+const RaftQuarantineView = struct {
+    group_id: u64,
+    incident_id: u64,
+    reason: raft_mod.host.QuarantineReason,
+    observed_bytes: usize,
+    configured_limit_at_detection: usize,
+    current_limit_bytes: usize,
+    max_recovery_bytes: usize,
+    first_observed_round: u64,
+    last_observed_round: u64,
+    occurrences: u64,
+    can_resume: bool,
+    suggested_action: []const u8,
+
+    fn fromStatus(status: raft_mod.host.GroupQuarantineStatus) RaftQuarantineView {
+        const quarantine = status.quarantine;
+        return .{
+            .group_id = status.group_id,
+            .incident_id = quarantine.incident_id,
+            .reason = quarantine.reason,
+            .observed_bytes = quarantine.observed_bytes,
+            .configured_limit_at_detection = quarantine.configured_limit,
+            .current_limit_bytes = status.current_limit,
+            .max_recovery_bytes = status.max_recovery_bytes,
+            .first_observed_round = quarantine.first_observed_round,
+            .last_observed_round = quarantine.last_observed_round,
+            .occurrences = quarantine.occurrences,
+            .can_resume = status.can_resume,
+            .suggested_action = if (status.can_resume)
+                "resume with the current incident_id"
+            else
+                "authorize a one-shot recovery allowance of at least observed_bytes for the current incident_id",
+        };
+    }
+};
+
+const ResumeRaftQuarantineRequest = struct {
+    expected_incident_id: u64,
+    new_limit_bytes: ?u64 = null,
 };
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
@@ -251,7 +293,8 @@ pub const AntflyApiHandler = struct {
     /// data-node protocol or internal-group routes on its admin listener.
     pub fn registerGeneratedRoutesWithProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try self.installMiddleware(server);
-        return self.registerRoutesWithOptions(server, false, true);
+        try self.registerRoutesWithOptions(server, false, true);
+        try self.registerRaftAdminRoutes(server);
     }
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
@@ -263,6 +306,8 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         establishInternalTxnPreDecisionDeadline(ctx);
+        establishInternalTxnStatusDeadline(ctx);
+        establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
     }
@@ -289,6 +334,40 @@ pub const AntflyApiHandler = struct {
             return;
         };
         if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_pre_decision_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (routes.matchGroupTxnStatus(ctx.request.uri.path) == null) return;
+        const raw = ctx.header(distributed_txn_contract.status_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_status_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+            !std.mem.endsWith(u8, path, routes.backup_shard_suffix)) return;
+        const raw = ctx.header(backups_api.backup_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > backups_api.max_backup_server_budget_ms) {
             ctx.application_deadline_invalid = true;
             return;
         }
@@ -516,6 +595,7 @@ pub const AntflyApiHandler = struct {
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
         try server.post(admin_routes.maintenance_vacuum, httpx.Handler.bind(self, vacuumStorage));
         try server.get(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, getStorageMaintenanceJob));
+        try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
         const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
@@ -545,6 +625,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
+        try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
         try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
@@ -567,6 +648,12 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
+    }
+
+    fn registerRaftAdminRoutes(self: *AntflyApiHandler, server: anytype) !void {
+        try server.get(admin_routes.raft_quarantines, httpx.Handler.bind(self, listRaftQuarantines));
+        try server.get(admin_routes.raft_groups ++ "/:group_id" ++ admin_routes.raft_group_quarantine_suffix, httpx.Handler.bind(self, getRaftQuarantine));
+        try server.post(admin_routes.raft_groups ++ "/:group_id" ++ admin_routes.raft_group_quarantine_resume_suffix, httpx.Handler.bind(self, resumeRaftQuarantine));
     }
 
     fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
@@ -1160,6 +1247,107 @@ pub const AntflyApiHandler = struct {
         return self.readStorageMaintenanceJob(ctx, true);
     }
 
+    fn raftQuarantineSource(self: *AntflyApiHandler) ?http_server_mod.RaftQuarantineAdminSource {
+        return self.api_server.cfg.raft_quarantine_admin;
+    }
+
+    fn authorizeRaftQuarantineAdmin(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        identity: *?AuthenticatedIdentity,
+    ) !?httpx.Response {
+        return try self.authorizeStorageMaintenance(ctx, identity);
+    }
+
+    fn listRaftQuarantines(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        const statuses = source.list(ctx.allocator) catch
+            return textResponse(ctx, 503, "raft quarantine status unavailable");
+        defer ctx.allocator.free(statuses);
+        const views = try ctx.allocator.alloc(RaftQuarantineView, statuses.len);
+        defer ctx.allocator.free(views);
+        for (statuses, views) |status, *view| view.* = .fromStatus(status);
+        return ctx.json(.{ .quarantines = views });
+    }
+
+    fn raftQuarantineGroupId(ctx: *httpx.Context) ?u64 {
+        const raw = ctx.param("group_id") orelse return null;
+        return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+    }
+
+    fn getRaftQuarantine(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const group_id = raftQuarantineGroupId(ctx) orelse return textResponse(ctx, 400, "invalid group id");
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        const statuses = source.list(ctx.allocator) catch
+            return textResponse(ctx, 503, "raft quarantine status unavailable");
+        defer ctx.allocator.free(statuses);
+        for (statuses) |status| if (status.group_id == group_id)
+            return ctx.json(RaftQuarantineView.fromStatus(status));
+        return textResponse(ctx, 404, "raft group is not quarantined on this node");
+    }
+
+    fn resumeRaftQuarantine(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const group_id = raftQuarantineGroupId(ctx) orelse return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing quarantine recovery request");
+        var parsed = std.json.parseFromSlice(ResumeRaftQuarantineRequest, ctx.allocator, body, .{
+            .ignore_unknown_fields = false,
+        }) catch return textResponse(ctx, 400, "invalid quarantine recovery request");
+        defer parsed.deinit();
+        const new_limit: ?usize = if (parsed.value.new_limit_bytes) |value|
+            std.math.cast(usize, value) orelse return textResponse(ctx, 400, "new_limit_bytes exceeds platform capacity")
+        else
+            null;
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        source.resumeGroup(group_id, .{
+            .expected_incident_id = parsed.value.expected_incident_id,
+            .new_limit_bytes = new_limit,
+        }) catch |err| {
+            std.log.warn(
+                "raft quarantine resume rejected group_id={} incident_id={} principal={s} error={s}",
+                .{
+                    group_id,
+                    parsed.value.expected_incident_id,
+                    if (identity) |authenticated| authenticated.username else "admin-bearer",
+                    @errorName(err),
+                },
+            );
+            return switch (err) {
+                error.UnknownGroup, error.GroupNotQuarantined => textResponse(ctx, 404, "raft group is not quarantined on this node"),
+                error.QuarantineIncidentChanged => textResponse(ctx, 409, "quarantine incident changed; refresh status before retrying"),
+                error.InvalidQuarantineRecoveryLimit => textResponse(ctx, 422, "new_limit_bytes must cover observed_bytes and remain within the configured recovery ceiling"),
+                error.QuarantineLimitStillExceeded => textResponse(ctx, 409, "current safety limit still does not cover the retained Ready"),
+                else => textResponse(ctx, 503, "raft quarantine recovery unavailable"),
+            };
+        };
+        std.log.info(
+            "raft quarantine resumed group_id={} incident_id={} principal={s} new_limit_bytes={?}",
+            .{
+                group_id,
+                parsed.value.expected_incident_id,
+                if (identity) |authenticated| authenticated.username else "admin-bearer",
+                new_limit,
+            },
+        );
+        return ctx.json(.{
+            .status = "resumed",
+            .group_id = group_id,
+            .incident_id = parsed.value.expected_incident_id,
+            .new_limit_bytes = new_limit,
+        });
+    }
+
     fn internalRepairCancelState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const encoded_table_name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
         const table_name = (try decodePathParamOrBadRequest(ctx, encoded_table_name)) orelse
@@ -1290,6 +1478,69 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer if (median_key) |value| ctx.allocator.free(value);
         return ctx.json(.{ .median_key = median_key });
+    }
+
+    fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse
+            return textResponse(ctx, 400, "invalid backup shard request");
+        const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
+            ctx.header(backups_api.backup_fence_metadata_group_id_header),
+            ctx.header(backups_api.backup_fence_metadata_incarnation_header),
+            ctx.header(backups_api.backup_fence_table_id_header),
+            ctx.header(backups_api.backup_fence_definition_header),
+            ctx.header(backups_api.backup_fence_topology_count_header),
+            ctx.header(backups_api.backup_fence_topology_header),
+            ctx.header(backups_api.backup_writer_not_after_header),
+        ) catch return textResponse(ctx, 400, "invalid backup fence");
+        const fence = expected_fence orelse return textResponse(ctx, 400, "backup fence required");
+        var parsed = backups_api.parseBackupRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid backup shard request");
+        defer parsed.deinit();
+        backups_api.validateBackupId(parsed.value.backup_id) catch
+            return textResponse(ctx, 400, "invalid backup id");
+        const format = backups_api.parseBackupFormat(parsed.value.format) catch
+            return textResponse(ctx, 400, "unsupported backup format");
+        var location = backups_api.openBackupLocationWithOptions(ctx.allocator, parsed.value.location, .{
+            .secret_store = self.api_server.cfg.secret_store,
+            .node_config = self.api_server.cfg.node_config,
+            .connection = parsed.value.connection,
+            .required_capability = "backup.write",
+            .io = self.api_server.sharedApiIo(),
+        }) catch return textResponse(ctx, 400, "invalid backup location");
+        defer location.deinit(ctx.allocator);
+
+        const shards = self.api_server.executeInternalTableBackupShard(
+            params.group_id,
+            params.table_name,
+            parsed.value.backup_id,
+            format,
+            fence,
+            &location,
+            operationContext(ctx, null),
+        ) catch |err| return switch (err) {
+            error.TableNotFound, error.NotFound => textResponse(ctx, 404, "not found"),
+            error.CatalogChanged => textResponse(ctx, 409, "table catalog changed"),
+            error.BackupAttemptLeaseLost, error.InvalidBackupFence => textResponse(ctx, 409, "backup writer lease lost"),
+            error.UnsupportedBackupFormat => textResponse(ctx, 400, "unsupported backup format"),
+            error.BackupOutcomeAmbiguous => textResponse(ctx, 500, "backup outcome ambiguous"),
+            error.Canceled, error.Cancelled => blk: {
+                try ctx.setHeader(backups_api.backup_outcome_header, backups_api.backup_outcome_stopped_v1);
+                break :blk textResponse(ctx, 408, "backup canceled");
+            },
+            error.Timeout, error.DeadlineExceeded => blk: {
+                try ctx.setHeader(backups_api.backup_outcome_header, backups_api.backup_outcome_stopped_v1);
+                break :blk textResponse(ctx, 504, "backup deadline exceeded");
+            },
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        defer {
+            for (shards) |shard| shard.deinit(self.api_server.alloc);
+            self.api_server.alloc.free(shards);
+        }
+        return ctx.json(.{ .shards = shards });
     }
 
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2317,6 +2568,22 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "text/plain");
         _ = ctx.response.body(body);
         return ctx.response.build();
+    }
+
+    const CommittedCreateOutcome = enum { visibility_pending, repair_required, repair_unavailable };
+
+    fn committedCreateOutcomeResponse(ctx: *httpx.Context, outcome: CommittedCreateOutcome) !httpx.Response {
+        const header_value = switch (outcome) {
+            .visibility_pending => metadata_http_routes.Routes.raft_mutation_outcome_committed_visibility_pending,
+            .repair_required, .repair_unavailable => metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        };
+        try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, header_value);
+        _ = ctx.status(202);
+        return ctx.json(.{ .status = switch (outcome) {
+            .visibility_pending => "committed_visibility_pending",
+            .repair_required => "committed_repair_required",
+            .repair_unavailable => "committed_repair_unavailable",
+        } });
     }
 
     fn queryOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
@@ -4115,6 +4382,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
+        // Reject oversized requests before JSON allocation, credential
+        // sealing, or remote embedding-model probes. Forwarding has a larger
+        // envelope allowance, but the user definition itself is capped here.
+        if (body_data.len > tables_api.max_table_create_body_bytes) {
+            _ = ctx.status(413);
+            return ctx.text("create table request too large");
+        }
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
@@ -4267,6 +4541,36 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");
                 },
+                error.InvalidTableName, error.CreateTableShardCountOutOfRange => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid table configuration");
+                },
+                error.CreateTableRequestTooLarge => {
+                    _ = ctx.status(413);
+                    return ctx.text("create table request too large");
+                },
+                error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
+                    _ = ctx.status(409);
+                    return ctx.text("table topology changed; retry with the current table state");
+                },
+                error.TableTopologyProtocolUpgradeRequired => {
+                    try ctx.setHeader("Retry-After", "1");
+                    _ = ctx.status(503);
+                    return ctx.text("metadata cluster upgrade in progress; retry later");
+                },
+                error.RaftMutationDeadlineExceeded => {
+                    try ctx.setHeader("Retry-After", "1");
+                    _ = ctx.status(503);
+                    return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+                },
+                error.MetadataMutationOutcomeUnknown => {
+                    try ctx.setHeader(
+                        metadata_http_routes.Routes.raft_mutation_outcome_header,
+                        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                    );
+                    _ = ctx.status(409);
+                    return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+                },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -4287,7 +4591,7 @@ pub const AntflyApiHandler = struct {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
-                        return error.NotLeader;
+                        return metadataNotLeaderResponse(ctx);
                     }
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
@@ -4296,68 +4600,60 @@ pub const AntflyApiHandler = struct {
             break;
         }
         std.log.info("public create table metadata done table={s}", .{decoded_table_name});
-        const local_create_handled = if (self.api_server.table_writes) |table_writes_source| blk: {
-            break :blk (table_writes_source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
-                error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
-                    _ = ctx.status(400);
-                    return ctx.text("unsupported table index configuration");
-                },
-                error.EmbeddingProbeUnavailable => {
-                    _ = ctx.status(503);
-                    return ctx.text("table index validation probe unavailable");
-                },
-                else => {
-                    std.log.err("public create table local create failed table={s} err={}", .{ decoded_table_name, err });
-                    return err;
-                },
-            }) != null;
-        } else false;
+        const local_outcome = self.api_server.materializeCommittedTableCreate(alloc, decoded_table_name, create_req);
+        switch (local_outcome) {
+            .repair_required => return committedCreateOutcomeResponse(ctx, .repair_required),
+            .repair_unavailable => return committedCreateOutcomeResponse(ctx, .repair_unavailable),
+            .applied, .delegated => {},
+        }
+        const local_create_handled = local_outcome == .applied;
         if (local_create_handled) {
             std.log.info("public create table wait projected presence table={s}", .{decoded_table_name});
             self.api_server.waitForProjectedTablePresence(decoded_table_name) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
-                    std.log.err("public create table metadata visibility timed out table={s}", .{decoded_table_name});
-                    _ = ctx.status(500);
-                    return ctx.text("table create did not converge");
+                    std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
-                else => return err,
+                else => {
+                    std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                },
             };
         } else {
             const metadata_wait_handled = self.api_server.source.waitTableLifecycle(decoded_table_name, .present) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
-                    std.log.err("public create table metadata lifecycle timed out table={s}", .{decoded_table_name});
-                    _ = ctx.status(500);
-                    return ctx.text("table create did not converge");
+                    std.log.warn("public create table committed before metadata lifecycle converged table={s}", .{decoded_table_name});
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
                 else => {
-                    std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ decoded_table_name, err });
-                    return err;
+                    std.log.warn("public create table committed with metadata lifecycle observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
             };
             if (!metadata_wait_handled) {
                 std.log.info("public create table wait metadata visibility table={s}", .{decoded_table_name});
                 self.api_server.waitForTableVisibility(decoded_table_name, .present) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
-                        std.log.err("public create table metadata visibility timed out table={s}", .{decoded_table_name});
-                        _ = ctx.status(500);
-                        return ctx.text("table create did not converge");
+                        std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
+                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
                     },
-                    else => return err,
+                    else => {
+                        std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    },
                 };
             }
         }
         std.log.info("public create table visible table={s}", .{decoded_table_name});
 
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+            return committedCreateOutcomeResponse(ctx, .visibility_pending);
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, decoded_table_name, null)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+            return committedCreateOutcomeResponse(ctx, .visibility_pending);
         };
         return ctx.openApiJson(response);
     }
@@ -4369,16 +4665,7 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_table_name);
-        var local_drop_group_ids: ?[]u64 = null;
-        defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
-        if (self.api_server.table_writes != null) {
-            if (try self.api_server.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.api_server.source.freeAdminSnapshot(&snapshot);
-                local_drop_group_ids = try ApiHttpServer.tableGroupIdsFromSnapshot(alloc, &snapshot, decoded_table_name);
-            }
-        }
-        self.api_server.source.dropTable(alloc, decoded_table_name) catch |err| switch (err) {
+        var drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
@@ -4387,29 +4674,85 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
             },
+            error.InvalidTableName => {
+                _ = ctx.status(400);
+                return ctx.text("invalid table name");
+            },
+            error.MetadataTopologyCommandTooLarge => {
+                _ = ctx.status(413);
+                return ctx.text("table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size");
+            },
+            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
+                _ = ctx.status(409);
+                return ctx.text("table topology changed or is extension-owned");
+            },
+            error.TableTopologyProtocolUpgradeRequired => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("metadata cluster upgrade in progress; retry later");
+            },
+            error.RaftMutationDeadlineExceeded => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+            },
+            error.NotLeader => {
+                return metadataNotLeaderResponse(ctx);
+            },
+            error.MetadataMutationOutcomeUnknown => {
+                try ctx.setHeader(
+                    metadata_http_routes.Routes.raft_mutation_outcome_header,
+                    metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                );
+                _ = ctx.status(409);
+                return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+            },
             else => {
+                if (metadata_authority.isRetryableError(err))
+                    return metadataNotLeaderResponse(ctx);
                 std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 return err;
             },
         };
+        defer drop_result.deinit(alloc);
+        var repair_required = false;
+        // A forwarded metadata commit can return before this API node applies
+        // the absence locally. Observe it before destructive ownership checks
+        // so a healthy drop does not manufacture repair debt from a stale
+        // follower projection. Metadata is already committed, so every wait
+        // failure is reported as convergence debt rather than a replayable DDL
+        // failure.
+        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| {
+            repair_required = true;
+            std.log.warn(
+                "public drop table committed before local absence became observable table={s} err={s}",
+                .{ decoded_table_name, @errorName(err) },
+            );
+        };
         if (self.api_server.table_writes) |write_source| {
-            const group_ids = local_drop_group_ids orelse &.{};
-            _ = write_source.dropTable(alloc, decoded_table_name, group_ids) catch |err| switch (err) {
+            _ = write_source.dropTable(alloc, decoded_table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
+                error.DropCleanupIntentNotDurable => {
+                    std.log.err("public drop table committed but cleanup intent was not durable table={s}", .{decoded_table_name});
+                    // The metadata drop committed, so never invite an
+                    // automatic DDL replay with a generic failure status.
+                    _ = ctx.status(202);
+                    return ctx.json(.{ .status = "committed_repair_unavailable" });
+                },
                 else => {
-                    std.log.err("public drop table local cleanup failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                    return err;
+                    // Metadata is already committed and dropTable persisted
+                    // the exact cleanup contract before local mutation. The
+                    // recovery worker owns idempotent completion, so surface
+                    // repair debt without inviting a replay of the DDL.
+                    repair_required = true;
+                    std.log.warn("public drop table committed with local cleanup repair required table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 },
             };
         }
-        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => {
-                std.log.err("public drop table metadata visibility timed out table={s}", .{decoded_table_name});
-                _ = ctx.status(500);
-                return ctx.text("table delete did not converge");
-            },
-            else => return err,
-        };
+        if (repair_required) {
+            _ = ctx.status(202);
+            return ctx.json(.{ .status = "committed_repair_required" });
+        }
         _ = ctx.status(204);
         return ctx.text("");
     }
@@ -6297,6 +6640,51 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&invalid_ctx);
     try std.testing.expect(invalid_ctx.application_deadline_ns == null);
     try std.testing.expect(invalid_ctx.application_deadline_invalid);
+
+    var status_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-status",
+    );
+    defer status_request.deinit();
+    try status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "250");
+    var status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &status_request);
+    defer status_ctx.deinit();
+    const status_before_ns = platform_time.monotonicNs();
+    AntflyApiHandler.establishInternalTxnStatusDeadline(&status_ctx);
+    const status_after_ns = platform_time.monotonicNs();
+    const status_deadline_ns = status_ctx.application_deadline_ns.?;
+    try std.testing.expect(status_deadline_ns >= status_before_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(status_deadline_ns <= status_after_ns + budget_ms * std.time.ns_per_ms);
+
+    var invalid_status_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-status",
+    );
+    defer invalid_status_request.deinit();
+    try invalid_status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "5001");
+    var invalid_status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &invalid_status_request);
+    defer invalid_status_ctx.deinit();
+    AntflyApiHandler.establishInternalTxnStatusDeadline(&invalid_status_ctx);
+    try std.testing.expect(invalid_status_ctx.application_deadline_ns == null);
+    try std.testing.expect(invalid_status_ctx.application_deadline_invalid);
+
+    var backup_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/backup-shard",
+    );
+    defer backup_request.deinit();
+    try backup_request.setHeader(backups_api.backup_remaining_ms_header, "250");
+    var backup_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &backup_request);
+    defer backup_ctx.deinit();
+    const backup_before_ns = platform_time.monotonicNs();
+    AntflyApiHandler.establishInternalBackupDeadline(&backup_ctx);
+    const backup_after_ns = platform_time.monotonicNs();
+    const backup_deadline_ns = backup_ctx.application_deadline_ns.?;
+    try std.testing.expect(backup_deadline_ns >= backup_before_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(backup_deadline_ns <= backup_after_ns + budget_ms * std.time.ns_per_ms);
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {
@@ -7288,6 +7676,120 @@ test "httpx storage maintenance routes call typed operations directly" {
     defer canceled.deinit();
     try std.testing.expectEqual(@as(u16, 202), canceled.status.code);
     try std.testing.expect(std.mem.indexOf(u8, canceled.body.?, "\"state\":\"succeeded\"") != null);
+}
+
+test "httpx raft quarantine administration is authenticated and incident fenced" {
+    const alloc = std.testing.allocator;
+    const FakeQuarantineAdmin = struct {
+        resume_calls: usize = 0,
+        last_limit: ?usize = null,
+
+        fn source(self: *@This()) http_server_mod.RaftQuarantineAdminSource {
+            return .{ .ptr = self, .list_fn = list, .resume_fn = resumeGroup };
+        }
+
+        fn list(_: *anyopaque, list_alloc: std.mem.Allocator) ![]raft_mod.host.GroupQuarantineStatus {
+            const statuses = try list_alloc.alloc(raft_mod.host.GroupQuarantineStatus, 1);
+            statuses[0] = .{
+                .group_id = 41,
+                .quarantine = .{
+                    .incident_id = 77,
+                    .reason = .apply_ready_too_large,
+                    .observed_bytes = 8192,
+                    .configured_limit = 4096,
+                    .first_observed_round = 11,
+                    .last_observed_round = 12,
+                    .occurrences = 2,
+                },
+                .current_limit = 4096,
+                .can_resume = false,
+            };
+            return statuses;
+        }
+
+        fn resumeGroup(
+            ptr: *anyopaque,
+            group_id: u64,
+            options: raft_mod.host.ResumeQuarantineOptions,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id != 41) return error.UnknownGroup;
+            if (options.expected_incident_id != 77) return error.QuarantineIncidentChanged;
+            if (options.new_limit_bytes == null or options.new_limit_bytes.? < 8192)
+                return error.InvalidQuarantineRecoveryLimit;
+            self.resume_calls += 1;
+            self.last_limit = options.new_limit_bytes;
+        }
+    };
+
+    var status_source = AuthStatusSource{};
+    var quarantine_admin = FakeQuarantineAdmin{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .raft_quarantine_admin = quarantine_admin.source(),
+        .admin_bearer_token = "raft-admin-secret",
+    }, status_source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const list_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, admin_routes.raft_quarantines });
+    defer alloc.free(list_url);
+
+    var unauthorized = try getWithRetry(&client, client_io.io(), list_url, null, 20);
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status.code);
+
+    const auth_headers = [_][2][]const u8{.{ "authorization", "Bearer raft-admin-secret" }};
+    var listed = try getWithRetry(&client, client_io.io(), list_url, &auth_headers, 20);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), listed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"incident_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"can_resume\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"suggested_action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"max_recovery_bytes\"") != null);
+
+    const resume_url = try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}/41{s}",
+        .{ base_url, admin_routes.raft_groups, admin_routes.raft_group_quarantine_resume_suffix },
+    );
+    defer alloc.free(resume_url);
+    const json_auth_headers = [_][2][]const u8{
+        .{ "authorization", "Bearer raft-admin-secret" },
+        .{ "content-type", "application/json" },
+    };
+    var stale = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        resume_url,
+        "{\"expected_incident_id\":76,\"new_limit_bytes\":8192}",
+        &json_auth_headers,
+        20,
+    );
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale.status.code);
+
+    var resumed = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        resume_url,
+        "{\"expected_incident_id\":77,\"new_limit_bytes\":8192}",
+        &json_auth_headers,
+        20,
+    );
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resumed.status.code);
+    try std.testing.expectEqual(@as(usize, 1), quarantine_admin.resume_calls);
+    try std.testing.expectEqual(@as(?usize, 8192), quarantine_admin.last_limit);
 }
 
 test "httpx owned response preserves retryable JSON metadata" {
