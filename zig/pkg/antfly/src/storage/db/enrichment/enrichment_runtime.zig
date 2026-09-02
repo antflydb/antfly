@@ -10578,10 +10578,22 @@ fn processChunkText(
     }
 
     const persist_chunks = try shouldStoreChunkArtifacts(runtime.alloc, request, text_indexes.len != 0);
-    const desired_chunks: []const chunker_mod.Chunk = if (persist_chunks) chunks else &.{};
-    const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, desired_chunks);
+    // Stored chunk rows and derived embeddings have independent lifecycles.
+    // An ephemeral chunker intentionally wants no chunk records, but its
+    // deterministic virtual chunk identities still own the embedding
+    // artifacts published for those chunks. Conflating the two desired sets
+    // makes every idempotent replay delete the serving vectors before adding
+    // them back.
+    const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
     defer freeKeyList(runtime.alloc, desired_chunk_keys);
-    const stale_vector_keys = try deleteStaleChunkArtifacts(runtime, request.doc_key, artifact_name, desired_chunk_keys);
+    const desired_stored_chunk_keys: []const []const u8 = if (persist_chunks) desired_chunk_keys else &.{};
+    const stale_vector_keys = try deleteStaleChunkArtifacts(
+        runtime,
+        request.doc_key,
+        artifact_name,
+        desired_stored_chunk_keys,
+        desired_chunk_keys,
+    );
     // Graph reconciliation consumes the artifact journal, not the vector/text
     // deletion stream. Publish stale chunk identities there as well so graph
     // edges disappear when a source document shrinks or is rechunked.
@@ -13033,7 +13045,8 @@ fn deleteStaleChunkArtifacts(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
     artifact_name: []const u8,
-    desired_chunk_keys: []const []const u8,
+    desired_stored_chunk_keys: []const []const u8,
+    desired_logical_chunk_keys: []const []const u8,
 ) ![][]u8 {
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", artifact_name);
     defer runtime.alloc.free(prefix);
@@ -13051,13 +13064,18 @@ fn deleteStaleChunkArtifacts(
 
     for (existing) |entry| {
         if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
-            if (keyInList(entry.key, desired_chunk_keys)) continue;
-            try appendUniqueDupeKey(runtime.alloc, &stale_vector_keys, entry.key);
+            if (keyInList(entry.key, desired_stored_chunk_keys)) continue;
+            // Dropping an optional stored chunk row does not retire its
+            // logical identity. Only a chunk absent from the current chunking
+            // result should be withdrawn from downstream indexes.
+            if (!keyInList(entry.key, desired_logical_chunk_keys)) {
+                try appendUniqueDupeKey(runtime.alloc, &stale_vector_keys, entry.key);
+            }
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
             continue;
         }
         if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
-            if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
+            if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_logical_chunk_keys)) continue;
             if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
                 try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
             }

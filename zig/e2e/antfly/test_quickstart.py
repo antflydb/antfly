@@ -1517,13 +1517,22 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         {
             "name": index_name,
             "type": "embeddings",
-            "field": "body",
+            "template": "{{title}} {{body}}",
             "dimension": 3,
             "execution": {"embedding": {"batch_items": 1}},
             "embedder": {
                 "provider": "openai",
                 "model": "text-embedding-3-small",
                 "url": progressive_openai_embedder.url,
+            },
+            "chunker": {
+                "provider": "antfly",
+                "model": "fixed-bert-tokenizer",
+                "text": {
+                    "target_tokens": 8,
+                    "overlap_tokens": 2,
+                    "separator": " ",
+                },
             },
         },
     )
@@ -1546,15 +1555,15 @@ def test_progressive_publication_remains_queryable_across_process_restart(
     # The worker publishes the first window, persists its position within this
     # revision, then remains throttled with later documents still outstanding.
     progressive_openai_embedder.rate_limit_after_next_requests(
-        70, input_substring="restart publication document"
+        160, input_substring="restart publication document"
     )
     documents = {
         f"doc:{i:03d}": {
             "title": f"Restart {i}",
             "body": (
-                f"alpha restart publication document {i}"
+                f"alpha restart publication document {i} context evidence history details"
                 if i < 70
-                else f"beta restart publication document {i}"
+                else f"beta restart publication document {i} context evidence history details"
             ),
         }
         for i in range(100)
@@ -1594,20 +1603,25 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         assert before is not None
         incarnation = before["incarnation"]
         searchable_vectors = before["searchable_vectors"]
-        assert 0 < searchable_vectors < len(documents)
+        covered_sources = before["source_coverage"]["covered"]
+        assert 0 < covered_sources < len(documents)
+        assert searchable_vectors > covered_sources
         assert before["source_coverage"]["pending"] > 0
 
         stateful_api.restart_server()
         restarted_at = __import__("time").monotonic()
+        restart_last_searchable = searchable_vectors
 
         def restored_queryability() -> dict | None:
+            nonlocal restart_last_searchable
             status = stateful_api.get_index(table_name, index_name)["status"]
             if status.get("incarnation") != incarnation:
                 return None
             if not (status.get("milestones") or {}).get("queryable", {}).get("reached"):
                 return None
-            if int(status.get("searchable_vectors", 0)) < searchable_vectors:
-                return None
+            current_searchable = int(status.get("searchable_vectors", 0))
+            assert current_searchable >= restart_last_searchable, status
+            restart_last_searchable = current_searchable
             return status
 
         after = wait_until(
@@ -1634,10 +1648,14 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         # delay queries or erase last-known facts, and the current pending
         # count should become authoritative promptly afterward.
         def restored_convergence() -> dict | None:
+            nonlocal restart_last_searchable
             status = stateful_api.get_index(table_name, index_name)["status"]
             pending = (status.get("source_coverage") or {}).get("pending")
             if status.get("incarnation") != incarnation:
                 return None
+            current_searchable = int(status.get("searchable_vectors", 0))
+            assert current_searchable >= restart_last_searchable, status
+            restart_last_searchable = current_searchable
             if not isinstance(pending, int) or pending <= 0:
                 return None
             return status
@@ -1678,10 +1696,17 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         timeout_s=120.0,
         interval_s=0.1,
     )
-    assert complete is not None
+    assert complete is not None, __import__("json").dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "logs": stateful_api.debug_logs(),
+        },
+        indent=2,
+        sort_keys=True,
+    )
     assert complete["milestones"]["complete"]["reached"] is True
     assert complete["source_coverage"]["covered"] == len(documents)
-    assert complete["searchable_vectors"] == len(documents)
+    assert complete["searchable_vectors"] > len(documents)
 
 
 @pytest.mark.slow

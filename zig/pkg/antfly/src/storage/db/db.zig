@@ -72306,11 +72306,11 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var counting = CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
-            .dense_embedder = deterministic.interface(),
+            .dense_embedder = counting.interface(),
         },
     });
     defer db.close();
@@ -72333,15 +72333,47 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
-    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    {
+        const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, artifacts);
 
-    var chunk_count: usize = 0;
-    for (artifacts) |entry| {
-        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+        var chunk_count: usize = 0;
+        var embedding_count: usize = 0;
+        for (artifacts) |entry| {
+            if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+            if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) embedding_count += 1;
+        }
+
+        try std.testing.expectEqual(@as(usize, 0), chunk_count);
+        try std.testing.expectEqual(@as(usize, 3), embedding_count);
+        try std.testing.expectEqual(@as(usize, 3), counting.calls);
     }
 
+    // Replaying an unchanged source must retain the virtual chunks' derived
+    // embeddings even though their intermediate chunk rows are intentionally
+    // ephemeral. Deleting those embeddings before the source-hash check both
+    // regresses serving counts and needlessly invokes the provider again.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\",\"revision\":2}" },
+        },
+        .sync_level = .write,
+    });
+    try db.enrichment_runtime.?.waitForApplied(2);
+    try waitForDerivedReplayTarget(&db);
+
+    const replayed_artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, replayed_artifacts);
+    var chunk_count: usize = 0;
+    var embedding_count: usize = 0;
+    for (replayed_artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) embedding_count += 1;
+    }
     try std.testing.expectEqual(@as(usize, 0), chunk_count);
+    try std.testing.expectEqual(@as(usize, 3), embedding_count);
+    try std.testing.expectEqual(@as(usize, 3), counting.calls);
+
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
 }
@@ -73095,7 +73127,10 @@ test "db shared enrichment failure parks repair debt for every consumer" {
     try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
     const retrying = db.enrichment_runtime.?.stats();
     try std.testing.expect(retrying.retrying);
-    try std.testing.expectEqual(@as(u32, 1), retrying.consecutive_retry_count);
+    // Request-owned provider retries are tracked by durable request identity;
+    // they must not consume the unrelated table-wide pipeline retry budget.
+    try std.testing.expectEqual(@as(u32, 0), retrying.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 1), retrying.retryable_error_count);
     sleepNs(550 * std.time.ns_per_ms);
     try db.runEnrichmentUntil(sequence);
 
