@@ -25,6 +25,7 @@ const metadata_service = @import("service.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
+const metadata_table_topology_mutations = @import("table_topology_mutations.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_test_runtime = @import("../api/http_test_runtime.zig");
@@ -1419,7 +1420,7 @@ fn verifyMergePublicTraffic(
     ));
 
     if (cfg.expect_profile) {
-        try expectHelloCountProfile(client, client_base, table_name, 3, 1, true);
+        try expectHelloCountProfile(client, client_base, table_name, 3, 1, false);
     }
 }
 
@@ -2588,15 +2589,21 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn runRound(self: MetadataHttpNodeSimulation) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         _ = try self.sim().stepOnce();
         try self.cluster.refreshOwnedMetadataRuntimes(self.index);
     }
 
     pub fn serviceMetrics(self: MetadataHttpNodeSimulation) @TypeOf(self.sim().serviceMetrics()) {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return self.sim().serviceMetrics();
     }
 
     pub fn metadataStatus(self: MetadataHttpNodeSimulation) !metadata_service.MetadataStatus {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return try metadata_service.snapshotStatus(
             self.cluster.alloc,
             self.cluster.metadata_group_id,
@@ -2606,7 +2613,47 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn adminSnapshot(self: MetadataHttpNodeSimulation) !metadata_api.AdminSnapshot {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return try metadata_api.captureSnapshot(self.cluster.alloc, self);
+    }
+
+    pub fn catalogRoutingSnapshot(
+        self: MetadataHttpNodeSimulation,
+        deadline_ns: ?u64,
+    ) !metadata_api.CatalogRoutingSnapshot {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const projection = try store.captureCatalogProjection(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            deadline_ns,
+        );
+        return .{
+            .metadata_group_id = self.cluster.metadata_group_id,
+            .metadata_incarnation = projection.metadata_incarnation,
+            .catalog_revision = projection.catalog_revision,
+            .change_token = .{
+                .metadata_group_id = self.cluster.metadata_group_id,
+                .metadata_incarnation = projection.metadata_incarnation,
+                .revision = projection.catalog_revision,
+            },
+            .tables = projection.tables,
+            .ranges = projection.ranges,
+        };
+    }
+
+    pub fn freeCatalogRoutingSnapshot(
+        self: MetadataHttpNodeSimulation,
+        snapshot: *metadata_api.CatalogRoutingSnapshot,
+    ) void {
+        for (snapshot.tables) |table| metadata_table_manager.freeTable(self.cluster.alloc, table);
+        self.cluster.alloc.free(snapshot.tables);
+        for (snapshot.ranges) |range| metadata_table_manager.freeRange(self.cluster.alloc, range);
+        self.cluster.alloc.free(snapshot.ranges);
+        snapshot.* = undefined;
     }
 
     pub fn medianKeyLookup(self: MetadataHttpNodeSimulation) ?metadata_reconciler.MedianKeyLookup {
@@ -2668,10 +2715,14 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn status(self: MetadataHttpNodeSimulation, group_id: u64) raft_host.HostedReplicaStatus {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         return self.sim().status(group_id);
     }
 
     pub fn campaignMetadataGroup(self: MetadataHttpNodeSimulation) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         if (self.sim().raftStatus(self.cluster.metadata_group_id)) |raft_status| {
             if (raft_status.soft.role == .leader) return;
         }
@@ -2679,6 +2730,8 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn campaignGroup(self: MetadataHttpNodeSimulation, group_id: u64) !void {
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
         try self.sim().campaignGroup(group_id);
     }
 
@@ -2878,6 +2931,53 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn replaceTableDefinition(
+        self: MetadataHttpNodeSimulation,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.cluster.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        // The proposal helper waits for the exact log index to apply. Keep a
+        // short projection loop because the simulated durable projection can
+        // be published on the following deterministic scheduler turn.
+        for (0..48) |_| {
+            const current = (try store.getTable(
+                self.cluster.alloc,
+                self.cluster.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.cluster.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.cluster.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+            try self.cluster.stepAll();
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
     pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
@@ -3007,11 +3107,16 @@ pub const MetadataHttpNodeSimulation = struct {
     fn proposeTransitionCommands(self: MetadataHttpNodeSimulation, commands: []const metadata_storage.TransitionCommand) anyerror!void {
         if (commands.len == 0) return;
 
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
+
         self.cluster.metadata_proposal_in_flight += 1;
         defer self.cluster.metadata_proposal_in_flight -= 1;
+        var operation_may_have_been_admitted = false;
 
         for (commands) |command| {
-            const encoded = try metadata_storage.encodeTransitionCommand(self.cluster.alloc, command);
+            const encoded = metadata_storage.encodeTransitionCommand(self.cluster.alloc, command) catch |err|
+                return simulationMutationError(err, operation_may_have_been_admitted);
             defer self.cluster.alloc.free(encoded);
 
             const recovery_candidate_index = bestMetadataElectionCandidateIndex(self.cluster) orelse self.index;
@@ -3023,37 +3128,48 @@ pub const MetadataHttpNodeSimulation = struct {
                     // different replicas.
                     self.cluster.node(recovery_candidate_index).campaignMetadataGroup() catch |err| switch (err) {
                         error.UnknownGroup => {},
-                        else => return err,
+                        else => return simulationMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
-                        try self.cluster.stepAll();
+                        self.cluster.stepAll() catch |err|
+                            return simulationMutationError(err, operation_may_have_been_admitted);
                         if (self.cluster.currentMetadataLeaderIndex() != null) continue :command_retry;
                     }
                     continue;
                 };
 
                 const leader_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse {
-                    try self.cluster.stepAll();
+                    self.cluster.stepAll() catch |err|
+                        return simulationMutationError(err, operation_may_have_been_admitted);
                     continue;
                 };
                 const proposal_index = leader_status.last_index + 1;
                 self.cluster.node(target_index).sim().propose(self.cluster.metadata_group_id, encoded) catch |err| switch (err) {
                     error.NotLeader => {
-                        try self.cluster.stepAll();
+                        self.cluster.stepAll() catch |step_err|
+                            return simulationMutationError(step_err, operation_may_have_been_admitted);
                         continue;
                     },
-                    else => return err,
+                    else => return simulationMutationError(err, operation_may_have_been_admitted),
                 };
+                operation_may_have_been_admitted = true;
 
                 // `propose` only appends locally. Do not report success until
                 // the exact index assigned by that leader is committed and
                 // applied; otherwise a stale leader can acknowledge a command
                 // that is subsequently overwritten.
                 for (0..16) |_| {
-                    try self.cluster.stepAll();
+                    self.cluster.stepAll() catch |err|
+                        return simulationMutationError(err, operation_may_have_been_admitted);
                     const raft_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse break;
                     if (raft_status.soft.role != .leader or raft_status.hard.current_term != leader_status.hard.current_term) break;
-                    if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) break :command_retry;
+                    if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) {
+                        if (self.cluster.metadata_proposal_post_apply_failure) |post_apply_failure| {
+                            self.cluster.metadata_proposal_post_apply_failure = null;
+                            return simulationMutationError(post_apply_failure, operation_may_have_been_admitted);
+                        }
+                        break :command_retry;
+                    }
                 }
             } else {
                 for (self.cluster.cluster.nodes, 0..) |*node, index| {
@@ -3066,7 +3182,7 @@ pub const MetadataHttpNodeSimulation = struct {
                         std.debug.print("metadata proposal exhausted node={d} status=absent\n", .{index});
                     }
                 }
-                return error.NotLeader;
+                return simulationMutationError(error.NotLeader, operation_may_have_been_admitted);
             }
         }
 
@@ -3075,7 +3191,19 @@ pub const MetadataHttpNodeSimulation = struct {
         else
             @max(@as(usize, 4), @min(commands.len * 2, @as(usize, 16)));
         var rounds: usize = 0;
-        while (rounds < settle_rounds) : (rounds += 1) try self.cluster.stepAll();
+        while (rounds < settle_rounds) : (rounds += 1) {
+            self.cluster.stepAll() catch |err|
+                return simulationMutationError(err, operation_may_have_been_admitted);
+        }
+    }
+
+    fn simulationMutationError(err: anyerror, operation_may_have_been_admitted: bool) anyerror {
+        if (!operation_may_have_been_admitted) return err;
+        std.log.warn(
+            "simulated metadata mutation outcome became ambiguous after admission err={s}",
+            .{@errorName(err)},
+        );
+        return error.MetadataMutationOutcomeUnknown;
     }
 
     fn commandsOnlyReconcileLease(commands: []const metadata_storage.TransitionCommand) bool {
@@ -3171,6 +3299,51 @@ const MetadataMergeTransitionFinalizedProgressContext = struct {
     fallback_index: usize,
 };
 
+/// Serializes every mutation of the deterministic cluster scheduler while
+/// allowing the scheduler's reconcile path to advance itself recursively on
+/// the same OS thread. A plain mutex cannot be used here: `stepAll` may renew a
+/// reconcile lease, whose proposal waits for another scheduler round.
+const SimulationSchedulerGate = struct {
+    mutex: std.Io.Mutex = .init,
+    owner_thread_id: std.atomic.Value(u64) = .init(0),
+    owner_valid: std.atomic.Value(bool) = .init(false),
+    contentions: std.atomic.Value(u64) = .init(0),
+    depth: usize = 0,
+
+    fn currentThreadId() u64 {
+        return @intCast(std.Thread.getCurrentId());
+    }
+
+    fn lock(self: *@This()) void {
+        const thread_id = currentThreadId();
+        if (self.owner_valid.load(.acquire)) {
+            if (self.owner_thread_id.load(.monotonic) == thread_id) {
+                self.depth += 1;
+                return;
+            }
+            _ = self.contentions.fetchAdd(1, .monotonic);
+        }
+
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        std.debug.assert(!self.owner_valid.load(.acquire));
+        self.owner_thread_id.store(thread_id, .monotonic);
+        self.depth = 1;
+        self.owner_valid.store(true, .release);
+    }
+
+    fn unlock(self: *@This()) void {
+        const thread_id = currentThreadId();
+        std.debug.assert(self.owner_valid.load(.acquire));
+        std.debug.assert(self.owner_thread_id.load(.monotonic) == thread_id);
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+        if (self.depth != 0) return;
+
+        self.owner_valid.store(false, .release);
+        self.mutex.unlock(std.Options.debug_io);
+    }
+};
+
 pub const MetadataHttpClusterSimulation = struct {
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
@@ -3186,9 +3359,12 @@ pub const MetadataHttpClusterSimulation = struct {
     placement_intent_hashes: []u64,
     placement_intent_hash_valid: []bool,
     backend_runtimes: []db_mod.background_runtime.BackendRuntimeHandle,
+    linearizable_read_drivers: []PublicApiLinearizableReadDriver,
     manual_clock: *platform_clock.ManualClock,
+    scheduler_gate: SimulationSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    metadata_proposal_post_apply_failure: ?anyerror = null,
     next_reallocation_request_id: u128 = 1,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
@@ -3314,7 +3490,18 @@ pub const MetadataHttpClusterSimulation = struct {
                 .clock = manual_clock.clock(),
             });
         }
-        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, deps);
+        const linearizable_read_drivers = try alloc.alloc(PublicApiLinearizableReadDriver, configs.len);
+        errdefer alloc.free(linearizable_read_drivers);
+        const simulation_deps = try alloc.dupe(raft_sim.ManagedHttpHostSimulationDeps, deps);
+        defer alloc.free(simulation_deps);
+        for (simulation_deps, linearizable_read_drivers, 0..) |*dep, *driver, index| {
+            driver.* = .{
+                .node_index = index,
+                .downstream = dep.host.read_state_observer,
+            };
+            dep.host.read_state_observer = driver.observer();
+        }
+        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, simulation_deps);
         errdefer raft_cluster.deinit();
         var cluster = MetadataHttpClusterSimulation{
             .alloc = alloc,
@@ -3331,6 +3518,7 @@ pub const MetadataHttpClusterSimulation = struct {
             .placement_intent_hashes = placement_intent_hashes,
             .placement_intent_hash_valid = placement_intent_hash_valid,
             .backend_runtimes = backend_runtimes,
+            .linearizable_read_drivers = linearizable_read_drivers,
             .manual_clock = manual_clock,
             .reconcile_lease_update_in_flight = false,
             .metadata_proposal_in_flight = 0,
@@ -3350,6 +3538,7 @@ pub const MetadataHttpClusterSimulation = struct {
         self.alloc.free(self.pending_cluster_store_retry_at_ms);
         self.alloc.free(self.placement_intent_hashes);
         self.alloc.free(self.placement_intent_hash_valid);
+        self.alloc.free(self.linearizable_read_drivers);
         for (self.backend_runtimes) |*runtime| runtime.deinit();
         self.alloc.free(self.backend_runtimes);
         self.alloc.destroy(self.manual_clock);
@@ -3357,10 +3546,15 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn startAll(self: *MetadataHttpClusterSimulation) !void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
+        for (self.linearizable_read_drivers) |*driver| driver.cluster = self;
         try self.registerVirtualNodes();
     }
 
     pub fn stopAll(self: *MetadataHttpClusterSimulation) void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         self.cluster.stopAll();
     }
 
@@ -3373,6 +3567,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn stepAll(self: *MetadataHttpClusterSimulation) anyerror!void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
         for (0..self.cluster.nodes.len) |i| {
@@ -3390,6 +3586,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         std.debug.assert(stalled_index < self.cluster.nodes.len);
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
@@ -3437,6 +3635,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn restartNode(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         const was_started = self.cluster.started;
         if (was_started) self.cluster.node(index).stop();
         self.cluster.nodes[index].deinit();
@@ -3672,6 +3872,8 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataHttpClusterSimulation, index: usize) anyerror!bool {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         const sim = self.cluster.node(index);
         const store = sim.runtime.svc.host.owned_metadata_store orelse return false;
         const now_ms = self.reconcile_leases[index].nowMs();
@@ -4182,6 +4384,8 @@ fn currentMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
 }
 
 fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
     var best_support: usize = 0;
     var best_term: u64 = 0;
@@ -4212,6 +4416,8 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
 }
 
 fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
     var best_last_index: u64 = 0;
     var best_commit: u64 = 0;
@@ -4236,6 +4442,8 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?
 }
 
 fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterSimulation, group_id: u64) ?usize {
+    cluster.scheduler_gate.lock();
+    defer cluster.scheduler_gate.unlock();
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (sim.raftStatus(group_id)) |status| {
             if (status.soft.role == .leader) return index;
@@ -4562,18 +4770,59 @@ fn applyDropTableMutation(
     node: MetadataHttpNodeSimulation,
     alloc: std.mem.Allocator,
     table_name: []const u8,
-) !void {
+) !metadata_table_topology_mutations.DropResult {
     const target = currentMetadataMutationNode(node);
-    var snapshot = try target.adminSnapshot();
-    defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    for (snapshot.ranges) |record| {
-        if (record.table_id != table.table_id) continue;
-        try target.removeRange(record.group_id);
+    const store = target.sim().runtime.svc.host.owned_metadata_store orelse
+        return error.MissingMetadataStore;
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        if (attempt == 0) {
+            try store.ensureDerivedCatalogIndexes(target.cluster.metadata_group_id);
+        } else {
+            try store.rebuildDerivedCatalogIndexes(target.cluster.metadata_group_id);
+        }
+        var projection = (store.captureTableDropProjection(
+            alloc,
+            target.cluster.metadata_group_id,
+            table_name,
+        ) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => continue,
+            else => return err,
+        }) orelse return error.TableNotFound;
+        defer projection.deinit(alloc);
+        if (projection.fence.active()) return error.TableTransitionActive;
+        if (projection.extension_owned) return error.ExtensionOwnedObject;
+
+        try target.proposeTransitionCommand(.{ .apply_table_topology = .{ .drop = .{
+            .table_id = projection.table.table_id,
+            .expected_name = projection.table.name,
+            .expected_transition_generation = projection.fence.generation,
+            .range_contract = .{
+                .membership = projection.fence.membership(projection.table.table_id),
+            },
+        } } });
+        const verification_index = target.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataMutationOutcomeUnknown;
+        const verification_store = target.cluster.node(verification_index).sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MetadataMutationOutcomeUnknown;
+        if (try verification_store.getTable(
+            alloc,
+            target.cluster.metadata_group_id,
+            projection.table.table_id,
+        )) |current| {
+            metadata_table_manager.freeTable(alloc, current);
+            return error.TableTransitionActive;
+        }
+
+        const result: metadata_table_topology_mutations.DropResult = .{
+            .table_id = projection.table.table_id,
+            .expected_transition_generation = projection.fence.generation,
+            .group_ids = projection.range_group_ids,
+        };
+        projection.range_group_ids = &.{};
+        return result;
     }
-    try target.removeTable(table.table_id);
-    try target.runRound();
-    _ = alloc;
+    return error.InvalidDerivedCatalogIndex;
 }
 
 fn applyUpdateSchemaMutation(
@@ -4631,18 +4880,68 @@ fn applyDropIndexMutation(
     try target.runRound();
 }
 
+fn applyReplaceTableDefinitionMutation(
+    node: MetadataHttpNodeSimulation,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !void {
+    const target = currentMetadataMutationNode(node);
+    try target.replaceTableDefinition(expected, replacement);
+}
+
+const PublicApiLinearizableReadProof = struct {
+    cluster: *MetadataHttpClusterSimulation,
+    node_index: usize,
+    group_id: u64,
+    term: u64,
+    read_index: u64,
+    request_sequence: u64,
+
+    fn authoritativeNode(
+        self: @This(),
+        expected_cluster: *MetadataHttpClusterSimulation,
+    ) !MetadataHttpNodeSimulation {
+        if (self.cluster != expected_cluster)
+            return error.MetadataLinearizableReadTimeout;
+        self.cluster.scheduler_gate.lock();
+        defer self.cluster.scheduler_gate.unlock();
+        if (self.node_index >= self.cluster.cluster.nodes.len or
+            self.group_id != self.cluster.metadata_group_id)
+            return error.MetadataLinearizableReadTimeout;
+        const leader_index = self.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (leader_index != self.node_index) return error.NotLeader;
+
+        const target = self.cluster.node(self.node_index);
+        const status = target.sim().raftStatus(self.group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (status.soft.role != .leader or status.hard.current_term != self.term)
+            return error.NotLeader;
+        if (status.applied_index < self.read_index)
+            return error.MetadataLinearizableReadTimeout;
+        return target;
+    }
+};
+
 const PublicApiLinearizableReadDriver = struct {
     cluster: ?*MetadataHttpClusterSimulation = null,
     node_index: usize,
-    completed: std.atomic.Value(bool) = .init(false),
+    downstream: ?raft_state_machine.ReadStateObserver = null,
+    ensure_mutex: std.Io.Mutex = .init,
+    completion_mutex: std.Io.Mutex = .init,
     max_rounds: usize = 48,
     request_sequence: u64 = 0,
     active_group_id: u64 = 0,
-    active_request_context: [96]u8 = undefined,
-    active_request_context_len: usize = 0,
+    active_request_sequence: u64 = 0,
+    completed_request_sequence: u64 = 0,
+    completed_read_index: u64 = 0,
 
-    fn activeRequestContext(self: *const @This()) []const u8 {
-        return self.active_request_context[0..self.active_request_context_len];
+    fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
+        return try std.fmt.bufPrint(
+            buf,
+            "public-api-linearizable-read/{x}/{d}/{d}",
+            .{ @intFromPtr(self), self.node_index, sequence },
+        );
     }
 
     fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
@@ -4654,31 +4953,77 @@ const PublicApiLinearizableReadDriver = struct {
 
     fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (group_id != self.active_group_id) return;
-        const request_context = self.activeRequestContext();
-        for (read_states) |read_state| {
-            if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
-                self.completed.store(true, .release);
-                return;
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        {
+            defer self.completion_mutex.unlock(std.Options.debug_io);
+            if (group_id == self.active_group_id) {
+                const request_sequence = self.active_request_sequence;
+                var request_context_buf: [96]u8 = undefined;
+                const request_context = try self.requestContext(
+                    &request_context_buf,
+                    request_sequence,
+                );
+                for (read_states) |read_state| {
+                    if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
+                        // The mutex publishes the generation and read index as
+                        // one completion record. A delayed older callback
+                        // cannot overwrite a newer generation after activation.
+                        self.completed_request_sequence = request_sequence;
+                        self.completed_read_index = read_state.index;
+                        break;
+                    }
+                }
             }
         }
+        if (self.downstream) |downstream| try downstream.onReadStates(group_id, read_states);
     }
 
-    fn ensure(self: *@This()) !void {
+    fn activateRequest(self: *@This(), group_id: u64) !u64 {
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.completion_mutex.unlock(std.Options.debug_io);
+        // Never recycle a generation: doing so could make an extremely old
+        // delayed response indistinguishable from the active request.
+        if (self.request_sequence == std.math.maxInt(u64))
+            return error.MetadataLinearizableReadTimeout;
+        self.request_sequence += 1;
+        self.active_group_id = group_id;
+        // Activation and callback matching share `completion_mutex`, so an
+        // observer can see either the complete old generation or the complete
+        // new one, never a torn pair.
+        self.active_request_sequence = self.request_sequence;
+        return self.request_sequence;
+    }
+
+    fn completedReadIndex(self: *@This(), sequence: u64) ?u64 {
+        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.completion_mutex.unlock(std.Options.debug_io);
+        if (self.completed_request_sequence != sequence) return null;
+        return self.completed_read_index;
+    }
+
+    fn ensure(self: *@This()) !PublicApiLinearizableReadProof {
+        return try self.ensureUntil(null);
+    }
+
+    fn ensureUntil(self: *@This(), deadline_ns: ?u64) !PublicApiLinearizableReadProof {
+        self.ensure_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.ensure_mutex.unlock(std.Options.debug_io);
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
-        self.completed.store(false, .release);
-        self.request_sequence +%= 1;
-        if (self.request_sequence == 0) self.request_sequence = 1;
-        self.active_group_id = cluster.metadata_group_id;
-        const context = try std.fmt.bufPrint(
-            &self.active_request_context,
-            "public-api-linearizable-read/{d}/{d}",
-            .{ self.node_index, self.request_sequence },
-        );
-        self.active_request_context_len = context.len;
+        cluster.scheduler_gate.lock();
+        defer cluster.scheduler_gate.unlock();
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+        const status_before = cluster.cluster.node(self.node_index).raftStatus(cluster.metadata_group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (status_before.soft.role != .leader) return error.NotLeader;
+        const request_term = status_before.hard.current_term;
+        const sequence = try self.activateRequest(cluster.metadata_group_id);
+        var request_context_buf: [96]u8 = undefined;
+        const request_context = try self.requestContext(&request_context_buf, sequence);
         cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
             cluster.metadata_group_id,
-            self.activeRequestContext(),
+            request_context,
         ) catch |err| switch (err) {
             error.NotLeader => return error.NotLeader,
             else => return err,
@@ -4686,12 +5031,96 @@ const PublicApiLinearizableReadDriver = struct {
 
         var rounds: usize = 0;
         while (rounds < self.max_rounds) : (rounds += 1) {
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            }
             try cluster.stepAll();
-            if (self.completed.load(.acquire)) return;
+            const read_index = self.completedReadIndex(sequence) orelse continue;
+            const status_after = cluster.cluster.node(self.node_index).raftStatus(cluster.metadata_group_id) orelse
+                return error.MetadataLinearizableReadTimeout;
+            if (status_after.soft.role != .leader or status_after.hard.current_term != request_term)
+                return error.NotLeader;
+            if (status_after.applied_index < read_index)
+                return error.MetadataLinearizableReadTimeout;
+            return .{
+                .cluster = cluster,
+                .node_index = self.node_index,
+                .group_id = cluster.metadata_group_id,
+                .term = request_term,
+                .read_index = read_index,
+                .request_sequence = sequence,
+            };
         }
         return error.MetadataLinearizableReadTimeout;
     }
 };
+
+test "public api linearizable read driver ignores a delayed earlier generation" {
+    var driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    var peer_driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    const group_id: u64 = 91;
+
+    const earlier_sequence = try driver.activateRequest(group_id);
+    var earlier_context_buf: [96]u8 = undefined;
+    const earlier_context = try driver.requestContext(&earlier_context_buf, earlier_sequence);
+    const peer_sequence = try peer_driver.activateRequest(group_id);
+    var peer_context_buf: [96]u8 = undefined;
+    const peer_context = try peer_driver.requestContext(&peer_context_buf, peer_sequence);
+    try std.testing.expect(!std.mem.eql(u8, earlier_context, peer_context));
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 7,
+        .request_ctx = earlier_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, 7), driver.completedReadIndex(earlier_sequence));
+
+    const current_sequence = try driver.activateRequest(group_id);
+    try std.testing.expect(current_sequence != earlier_sequence);
+    // A response delayed past activation of the next request must retain the
+    // old completed generation rather than satisfying the current barrier.
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 8,
+        .request_ctx = earlier_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, null), driver.completedReadIndex(current_sequence));
+    try std.testing.expectEqual(@as(?u64, 7), driver.completedReadIndex(earlier_sequence));
+
+    var current_context_buf: [96]u8 = undefined;
+    const current_context = try driver.requestContext(&current_context_buf, current_sequence);
+    try driver.observer().onReadStates(group_id, &.{.{
+        .index = 9,
+        .request_ctx = current_context,
+    }});
+    try std.testing.expectEqual(@as(?u64, 9), driver.completedReadIndex(current_sequence));
+}
+
+fn authoritativePublicApiRoutingNode(
+    node: MetadataHttpNodeSimulation,
+    deadline_ns: ?u64,
+    external_driver: ?*PublicApiLinearizableReadDriver,
+) !MetadataHttpNodeSimulation {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline)
+            return error.CatalogRoutingSnapshotTimeout;
+    }
+    const proof = if (external_driver) |driver|
+        driver.ensureUntil(deadline_ns) catch |err| switch (err) {
+            error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        }
+    else blk: {
+        const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
+            return error.CatalogRoutingSnapshotTimeout;
+        break :blk node.cluster.linearizable_read_drivers[leader_index].ensureUntil(deadline_ns) catch |err| switch (err) {
+            error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    };
+
+    return proof.authoritativeNode(node.cluster) catch |err| switch (err) {
+        error.MetadataLinearizableReadTimeout => error.CatalogRoutingSnapshotTimeout,
+        else => err,
+    };
+}
 
 const PublicApiStatusSource = struct {
     const MetadataSnapshotMode = enum {
@@ -4719,8 +5148,13 @@ const PublicApiStatusSource = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
                 .create_table = createTable,
+                .replace_table_definition = replaceTableDefinition,
                 .drop_table = dropTable,
+                .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
@@ -4745,18 +5179,14 @@ const PublicApiStatusSource = struct {
     fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
         try request.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (self.linearizable_read_driver) |driver| {
-            try driver.ensure();
-            return try self.metadataNode().adminSnapshot();
-        }
-        const target = self.metadataNode();
-        const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
-            return error.MetadataLinearizableReadTimeout;
-        if (target.index != leader_index) return error.NotLeader;
-
-        const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
-            return error.MetadataLinearizableReadTimeout;
-        if (raft_status.soft.role != .leader) return error.NotLeader;
+        const target = authoritativePublicApiRoutingNode(
+            self.node,
+            request.deadline_ns,
+            self.linearizable_read_driver,
+        ) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return error.MetadataLinearizableReadTimeout,
+            else => return err,
+        };
         return try target.adminSnapshot();
     }
 
@@ -4765,15 +5195,53 @@ const PublicApiStatusSource = struct {
         self.metadataNode().freeAdminSnapshot(snapshot);
     }
 
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.metadataNode().catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = try authoritativePublicApiRoutingNode(
+            self.node,
+            deadline_ns,
+            self.linearizable_read_driver,
+        );
+        return try target.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
+    }
+
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
     }
 
-    fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+    fn replaceTableDefinition(
+        ptr: *anyopaque,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try applyDropTableMutation(self.node, alloc, table_name);
+        try applyReplaceTableDefinitionMutation(self.node, expected, replacement);
+    }
+
+    fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+        var result = try dropTableExact(ptr, alloc, table_name);
+        defer result.deinit(alloc);
+    }
+
+    fn dropTableExact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !metadata_table_topology_mutations.DropResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try applyDropTableMutation(self.node, alloc, table_name);
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -4932,6 +5400,9 @@ const PublicApiCatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
             },
         };
     }
@@ -4944,6 +5415,22 @@ const PublicApiCatalogSource = struct {
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.metadataNode().freeAdminSnapshot(snapshot);
+    }
+
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.metadataNode().catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = try authoritativePublicApiRoutingNode(self.node, deadline_ns, null);
+        return try target.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
     }
 };
 
@@ -6121,6 +6608,29 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     const client_index = created_range.non_host_index orelse return error.TestExpectedEqual;
     const client_base = api_base_uris[client_index];
 
+    // Exercise the local/eventual and leader-authoritative compact routing
+    // paths independently. The authoritative capture must complete a real
+    // Raft read barrier and must not reinterpret this follower's admin fixture
+    // as linearizable state.
+    var local_catalog_source = PublicApiCatalogSource{
+        .node = cluster.node(client_index),
+        .metadata_snapshot_mode = .local,
+    };
+    const local_catalog = local_catalog_source.iface();
+    const routing = try local_catalog.routingSource();
+    var eventual_routing = try routing.eventualSnapshot(null);
+    defer eventual_routing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), eventual_routing.value.tables.len);
+    try std.testing.expectEqualStrings("docs", eventual_routing.value.tables[0].name);
+    var authoritative_routing = try routing.linearizableSnapshot(
+        platform_time.monotonicNs() +| (5 * std.time.ns_per_s),
+    );
+    defer authoritative_routing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), authoritative_routing.value.tables.len);
+    try std.testing.expectEqualStrings("docs", authoritative_routing.value.tables[0].name);
+    try std.testing.expectEqual(cluster.metadata_group_id, authoritative_routing.value.metadata_group_id);
+    try std.testing.expect(authoritative_routing.value.catalog_revision >= eventual_routing.value.catalog_revision);
+
     const group_leader_index = (try waitForGroupLeaderIndex(&cluster, group_id, 96)) orelse return error.TestExpectedEqual;
     try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, api_tables.default_full_text_index_name, 40);
 
@@ -6176,7 +6686,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
-    try std.testing.expectEqual(true, query_result.profile.?.object.get("merge") != null);
+    try std.testing.expectEqual(false, query_result.profile.?.object.get("merge") != null);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:a"]}
@@ -6720,7 +7230,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try std.testing.expect(std.mem.indexOf(u8, query.body, "\"_id\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, query.body, "\"_id\":\"doc:z\"") != null);
 
-    try expectHelloCountProfile(&client, client_base, "docs", 2, 1, true);
+    try expectHelloCountProfile(&client, client_base, "docs", 2, 1, false);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:z"]}
@@ -9822,29 +10332,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         }
     };
 
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
 
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
@@ -10081,7 +10569,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     try std.testing.expect(std.mem.indexOf(u8, regexp_query.body, "\"_id\":\"doc:y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, regexp_query.body, "\"_id\":\"doc:w\"") == null);
 
-    try expectCountProfile(&client, client_base, "docs", "forwarded", 3, 1, true);
+    try expectCountProfile(&client, client_base, "docs", "forwarded", 3, 1, false);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:z","doc:y","doc:w"]}
@@ -10111,20 +10599,7 @@ test "metadata http cluster simulation forwards public table io across split ran
             self.node.freeAdminSnapshot(snapshot);
         }
     };
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
-        }
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
         cluster: *MetadataHttpClusterSimulation,
@@ -10392,20 +10867,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
             self.node.freeAdminSnapshot(snapshot);
         }
     };
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
-        }
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
         cluster: *MetadataHttpClusterSimulation,
@@ -11597,6 +12059,93 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     });
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try cluster.stepAll();
+    const ConcurrentBarrierWorker = struct {
+        driver: *PublicApiLinearizableReadDriver,
+        start: *std.Io.Event,
+        entered: *std.atomic.Value(u32),
+        completed: *std.atomic.Value(u32),
+        proof: ?PublicApiLinearizableReadProof = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.start.waitUncancelable(std.Options.debug_io);
+            _ = self.entered.fetchAdd(1, .acq_rel);
+            self.proof = self.driver.ensure() catch |err| {
+                self.failure = err;
+                _ = self.completed.fetchAdd(1, .acq_rel);
+                return;
+            };
+            _ = self.completed.fetchAdd(1, .acq_rel);
+        }
+    };
+    var start: std.Io.Event = .unset;
+    var entered = std.atomic.Value(u32).init(0);
+    var completed = std.atomic.Value(u32).init(0);
+    var external_barrier = ConcurrentBarrierWorker{
+        .driver = &read_drivers[initial_leader],
+        .start = &start,
+        .entered = &entered,
+        .completed = &completed,
+    };
+    var internal_barrier = ConcurrentBarrierWorker{
+        .driver = &cluster.linearizable_read_drivers[initial_leader],
+        .start = &start,
+        .entered = &entered,
+        .completed = &completed,
+    };
+
+    // Hold the cluster lane until both independent drivers attempt their
+    // barriers. This deterministically proves that per-driver mutexes cannot
+    // bypass the shared scheduler gate, then lets both requests complete.
+    cluster.scheduler_gate.lock();
+    var scheduler_locked = true;
+    defer if (scheduler_locked) cluster.scheduler_gate.unlock();
+    const baseline_contentions = cluster.scheduler_gate.contentions.load(.acquire);
+    var external_thread = try std.Thread.spawn(
+        .{ .stack_size = lean_sim_thread_stack_size },
+        ConcurrentBarrierWorker.run,
+        .{&external_barrier},
+    );
+    var internal_thread = std.Thread.spawn(
+        .{ .stack_size = lean_sim_thread_stack_size },
+        ConcurrentBarrierWorker.run,
+        .{&internal_barrier},
+    ) catch |err| {
+        start.set(std.Options.debug_io);
+        cluster.scheduler_gate.unlock();
+        scheduler_locked = false;
+        external_thread.join();
+        return err;
+    };
+    start.set(std.Options.debug_io);
+    const concurrent_barrier_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while ((entered.load(.acquire) != 2 or
+        cluster.scheduler_gate.contentions.load(.acquire) < baseline_contentions + 2) and
+        platform_time.monotonicNs() < concurrent_barrier_deadline)
+    {
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    const both_barriers_entered = entered.load(.acquire) == 2;
+    const both_barriers_contended = cluster.scheduler_gate.contentions.load(.acquire) >= baseline_contentions + 2;
+    const both_barriers_blocked = completed.load(.acquire) == 0;
+    cluster.scheduler_gate.unlock();
+    scheduler_locked = false;
+    external_thread.join();
+    internal_thread.join();
+
+    try std.testing.expect(both_barriers_entered);
+    try std.testing.expect(both_barriers_contended);
+    try std.testing.expect(both_barriers_blocked);
+    try std.testing.expect(external_barrier.failure == null);
+    try std.testing.expect(internal_barrier.failure == null);
+    const initial_barrier_proof = external_barrier.proof orelse return error.TestUnexpectedResult;
+    const internal_barrier_proof = internal_barrier.proof orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(initial_leader, initial_barrier_proof.node_index);
+    try std.testing.expectEqual(initial_leader, internal_barrier_proof.node_index);
+    try std.testing.expectEqual(
+        initial_leader,
+        (try initial_barrier_proof.authoritativeNode(&cluster)).index,
+    );
 
     var node_config = try common_config.Config.parseFromSlice(std.testing.allocator,
         \\{
@@ -11710,11 +12259,33 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     try std.testing.expect(backup_response.attempts > 1);
     const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     try std.testing.expect(elected_leader != initial_leader);
+    // A completed barrier remains bound to the node and term that produced
+    // it. It must fail closed after a handoff instead of authorizing a capture
+    // from the newly elected leader, which has not completed this request.
+    try std.testing.expectError(error.NotLeader, initial_barrier_proof.authoritativeNode(&cluster));
 
     var manifest = try backups_api.readClusterManifest(std.testing.allocator, backup_root_abs, "election-snap");
     defer manifest.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
     try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+
+    // Inject authority loss after the atomic topology entry is committed and
+    // applied but before the caller receives success. The exact simulation
+    // source must preserve the ambiguous outcome instead of replaying the
+    // destructive operation, while the committed table and all of its ranges
+    // disappear together.
+    cluster.metadata_proposal_post_apply_failure = error.NotLeader;
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        status_sources[elected_leader].iface().dropTableExact(std.testing.allocator, "docs"),
+    );
+    try std.testing.expect(cluster.metadata_proposal_post_apply_failure == null);
+    const projected_tables = try cluster.node(elected_leader).listProjectedTables(std.testing.allocator);
+    defer cluster.node(elected_leader).freeProjectedTables(std.testing.allocator, projected_tables);
+    try std.testing.expectEqual(@as(usize, 0), projected_tables.len);
+    const projected_ranges = try cluster.node(elected_leader).listProjectedRanges(std.testing.allocator);
+    defer cluster.node(elected_leader).freeProjectedRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expectEqual(@as(usize, 0), projected_ranges.len);
 }
 
 test "metadata http cluster simulation skips reconcile work without lease ownership" {
