@@ -2307,6 +2307,310 @@ pub fn validateEmbeddingEnrichmentProducerJsonWithOptions(
     try validateEmbeddingEnrichmentProducer(alloc, parsed.value, options, null);
 }
 
+const CatalogProducerOwner = struct {
+    sparse: bool,
+    dimensions: ?u32,
+    index_value: std.json.Value,
+};
+
+pub const EmbeddingProducerOwnershipOptions = struct {
+    /// Extension-owned catalogs describe a managed pipeline, so an embedding
+    /// enrichment without durable producer provenance must still have an
+    /// executable index owner. General catalog mutations leave this false:
+    /// producer-less enrichments are also used for externally materialized
+    /// vectors and are structurally valid.
+    require_owner_for_missing_producer: bool = false,
+};
+
+fn addCatalogProducerOwner(
+    alloc: std.mem.Allocator,
+    owners: *std.StringHashMapUnmanaged(CatalogProducerOwner),
+    name: []const u8,
+    owner: CatalogProducerOwner,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    const gop = owners.getOrPut(alloc, owned_name) catch |err| {
+        alloc.free(owned_name);
+        return err;
+    };
+    if (!gop.found_existing) {
+        gop.value_ptr.* = owner;
+        return;
+    }
+    alloc.free(owned_name);
+    if (gop.value_ptr.sparse != owner.sparse or gop.value_ptr.dimensions != owner.dimensions)
+        return error.InvalidEmbeddingArtifactProducer;
+}
+
+fn collectCatalogProducerOwners(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+    owners: *std.StringHashMapUnmanaged(CatalogProducerOwner),
+) !void {
+    if (root != .object) return error.InvalidManagedEmbeddingIndex;
+    var it = root.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const object = entry.value_ptr.object;
+        const type_value = object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) continue;
+        if (object.get("embedder") == null) continue;
+
+        var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, entry.value_ptr.*);
+        defer parsed_cfg.deinit();
+        const cfg = parsed_cfg.value;
+        if (cfg.external orelse false) continue;
+        const sparse = cfg.sparse orelse false;
+        const owner = CatalogProducerOwner{
+            .sparse = sparse,
+            .dimensions = if (sparse) null else try resolveDeclaredEmbeddingDimensionsRequired(cfg),
+            .index_value = entry.value_ptr.*,
+        };
+        if (cfg.embedding_name) |name| try addCatalogProducerOwner(alloc, owners, name, owner);
+        if (cfg.sources) |sources| for (sources) |source| {
+            try addCatalogProducerOwner(alloc, owners, source.artifact, owner);
+        };
+    }
+}
+
+fn validateCatalogProducerShape(
+    owner: CatalogProducerOwner,
+    expected_dims: ?u32,
+) !void {
+    if (owner.sparse) {
+        if (expected_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
+    } else if ((expected_dims orelse return error.EmbeddingArtifactDimensionRequired) != owner.dimensions.?) {
+        return error.ConflictingEmbeddingArtifactDimensions;
+    }
+}
+
+fn ownerSemanticEndpointIsFlexible(owner: std.json.Value) bool {
+    if (owner != .object) return false;
+    const embedder = owner.object.get("embedder") orelse return false;
+    if (embedder != .object) return false;
+    const provider = embedder.object.get("provider") orelse return false;
+    if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) return false;
+    return embedder.object.get("url") == null and
+        embedder.object.get("api_url") == null and
+        embedder.object.get("base_url") == null and
+        embedder.object.get("endpoint") == null;
+}
+
+fn semanticIdentityFieldsEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .string => |value| rhs == .string and std.mem.eql(u8, value, rhs.string),
+        .integer => |value| rhs == .integer and value == rhs.integer,
+        .bool => |value| rhs == .bool and value == rhs.bool,
+        .null => rhs == .null,
+        else => false,
+    };
+}
+
+fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
+    if (std.mem.eql(u8, name, "multimodal")) return .{ .bool = false };
+    if (std.mem.eql(u8, name, "region") or
+        std.mem.eql(u8, name, "request_format") or
+        std.mem.eql(u8, name, "input_type") or
+        std.mem.eql(u8, name, "truncate"))
+    {
+        return .{ .string = "" };
+    }
+    return null;
+}
+
+fn validateCatalogSemanticProducerOwner(
+    alloc: std.mem.Allocator,
+    producer: std.json.Value,
+    owner: CatalogProducerOwner,
+) !void {
+    const owner_identity_json = embeddingSemanticProducerJsonAlloc(alloc, owner.index_value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingArtifactProducer,
+    };
+    defer alloc.free(owner_identity_json);
+    var owner_identity = std.json.parseFromSlice(std.json.Value, alloc, owner_identity_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingArtifactProducer,
+    };
+    defer owner_identity.deinit();
+    if (owner_identity.value != .object or producer != .object)
+        return error.InvalidEmbeddingArtifactProducer;
+
+    const flexible_endpoint = ownerSemanticEndpointIsFlexible(owner.index_value);
+    var fields = owner_identity.value.object.iterator();
+    while (fields.next()) |field| {
+        if (flexible_endpoint and std.mem.eql(u8, field.key_ptr.*, "endpoint")) continue;
+        const producer_field = producer.object.get(field.key_ptr.*) orelse
+            semanticIdentityDefaultField(field.key_ptr.*) orelse
+            return error.InvalidEmbeddingArtifactProducer;
+        if (!semanticIdentityFieldsEqual(field.value_ptr.*, producer_field))
+            return error.InvalidEmbeddingArtifactProducer;
+    }
+}
+
+fn validateCatalogEmbeddingProducerOwnership(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    owners: *const std.StringHashMapUnmanaged(CatalogProducerOwner),
+    options: EmbeddingProducerOwnershipOptions,
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("enrichments")) |enrichments| {
+                if (enrichments != .array) return error.InvalidManagedEmbeddingIndex;
+                for (enrichments.array.items) |enrichment| {
+                    if (enrichment != .object) return error.InvalidEmbeddingArtifactProducer;
+                    const kind = enrichment.object.get("kind") orelse return error.InvalidEmbeddingArtifactProducer;
+                    if (kind != .string) return error.InvalidEmbeddingArtifactProducer;
+                    if (!std.mem.eql(u8, kind.string, "embedding")) continue;
+                    const name = enrichment.object.get("name") orelse return error.InvalidEmbeddingArtifactProducer;
+                    if (name != .string or name.string.len == 0) return error.InvalidEmbeddingArtifactProducer;
+                    const expected_dims = try embeddingEnrichmentExpectedDimensionsOptional(enrichment);
+                    const owner = owners.get(name.string);
+                    const producer_json = enrichment.object.get("producer_json") orelse {
+                        if (!options.require_owner_for_missing_producer) continue;
+                        try validateCatalogProducerShape(
+                            owner orelse return error.MissingEmbeddingArtifactProducer,
+                            expected_dims,
+                        );
+                        continue;
+                    };
+
+                    var parsed_string: ?std.json.Parsed(std.json.Value) = null;
+                    defer if (parsed_string) |*parsed| parsed.deinit();
+                    const producer = switch (producer_json) {
+                        .object => producer_json,
+                        .string => |raw| blk: {
+                            if (raw.len == 0) return error.MissingEmbeddingArtifactProducer;
+                            parsed_string = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+                                return error.InvalidEmbeddingArtifactProducer;
+                            break :blk parsed_string.?.value;
+                        },
+                        else => return error.InvalidEmbeddingArtifactProducer,
+                    };
+                    if (try semanticProducerV2Sparse(producer)) |_| {
+                        const comparison = try semanticProducerComparisonConfigJsonAlloc(alloc, producer);
+                        defer if (comparison) |raw| alloc.free(raw);
+                        if (comparison == null) return error.InvalidEmbeddingArtifactProducer;
+                        try validateCatalogProducerShape(
+                            owner orelse return error.InvalidEmbeddingArtifactProducer,
+                            expected_dims,
+                        );
+                        try validateCatalogSemanticProducerOwner(alloc, producer, owner.?);
+                    } else {
+                        try validateEmbeddingEnrichmentProducerValue(
+                            alloc,
+                            name.string,
+                            expected_dims,
+                            producer,
+                            .{},
+                            null,
+                        );
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                try validateCatalogEmbeddingProducerOwnership(alloc, entry.value_ptr.*, owners, options);
+            }
+        },
+        .array => |array| for (array.items) |item|
+            try validateCatalogEmbeddingProducerOwnership(alloc, item, owners, options),
+        else => {},
+    }
+}
+
+/// Context-free catalog invariant used at authoritative metadata boundaries.
+/// It proves that credential-free v2 provenance retains an executable index
+/// owner. Callers admitting a managed extension catalog can additionally
+/// require ownership for producer-less inline enrichments. Provider
+/// availability and exact semantic equivalence remain API/runtime concerns.
+pub fn validateEmbeddingProducerOwnershipValue(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+) !void {
+    return validateEmbeddingProducerOwnershipValueWithOptions(alloc, root, .{});
+}
+
+pub fn validateEmbeddingProducerOwnershipValueWithOptions(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+    options: EmbeddingProducerOwnershipOptions,
+) !void {
+    var owners = std.StringHashMapUnmanaged(CatalogProducerOwner).empty;
+    defer {
+        var keys = owners.keyIterator();
+        while (keys.next()) |key| alloc.free(@constCast(key.*));
+        owners.deinit(alloc);
+    }
+    try collectCatalogProducerOwners(alloc, root, &owners);
+    try validateCatalogEmbeddingProducerOwnership(alloc, root, &owners, options);
+}
+
+pub fn validateEmbeddingProducerOwnershipJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+) !void {
+    return validateEmbeddingProducerOwnershipJsonWithOptions(alloc, indexes_json, .{});
+}
+
+pub fn validateEmbeddingProducerOwnershipJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: EmbeddingProducerOwnershipOptions,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    try validateEmbeddingProducerOwnershipValueWithOptions(alloc, parsed.value, options);
+}
+
+test "managed embedder catalog ownership rejects orphaned semantic producers" {
+    const semantic_enrichment =
+        "{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"test-model\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"sparse\\\":false}\"}";
+    const valid = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"owner\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedding_name\":\"document_dense_v1\",\"embedder\":{{\"provider\":\"antfly\",\"model\":\"test-model\"}}}},\"enrichments\":[{s}]}}",
+        .{semantic_enrichment},
+    );
+    defer std.testing.allocator.free(valid);
+    try validateEmbeddingProducerOwnershipJson(std.testing.allocator, valid);
+
+    const mismatched = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"owner\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedding_name\":\"document_dense_v1\",\"embedder\":{{\"provider\":\"antfly\",\"model\":\"different-model\"}}}},\"enrichments\":[{s}]}}",
+        .{semantic_enrichment},
+    );
+    defer std.testing.allocator.free(mismatched);
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateEmbeddingProducerOwnershipJson(std.testing.allocator, mismatched),
+    );
+
+    const orphan = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"enrichments\":[{s}]}}",
+        .{semantic_enrichment},
+    );
+    defer std.testing.allocator.free(orphan);
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateEmbeddingProducerOwnershipJson(std.testing.allocator, orphan),
+    );
+
+    const externally_materialized =
+        "{\"enrichments\":[{\"name\":\"precomputed_dense_v1\",\"kind\":\"embedding\",\"field\":\"embedding\",\"expected_dims\":3}]}";
+    try validateEmbeddingProducerOwnershipJson(std.testing.allocator, externally_materialized);
+    try std.testing.expectError(
+        error.MissingEmbeddingArtifactProducer,
+        validateEmbeddingProducerOwnershipJsonWithOptions(
+            std.testing.allocator,
+            externally_materialized,
+            .{ .require_owner_for_missing_producer = true },
+        ),
+    );
+}
+
 fn registerArtifactManagedEmbeddingLookup(
     alloc: std.mem.Allocator,
     root: std.json.Value,

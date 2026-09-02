@@ -51,6 +51,7 @@ const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
+const extension_table_ownership = @import("../extensions/table_ownership.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
@@ -2136,7 +2137,12 @@ fn replaceTableDefinitionOnService(
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
     if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
-    if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
+    if (try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.heap.page_allocator,
+        &snapshot,
+        expected,
+        replacement,
+    )) return error.ExtensionOwnedObject;
 
     try svc.replaceTableDefinition(expected, replacement);
     try runPostMutationRound(svc);
@@ -2192,6 +2198,8 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
@@ -2221,6 +2229,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
     defer alloc.free(indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
@@ -9407,6 +9416,7 @@ pub const ApiHttpServer = struct {
             table_name,
             destination_authorizer,
         );
+        try self.validateRestoredManagedEmbeddingCatalog(self.alloc, manifest.indexes_json);
         const target_exists = try self.tableExists(table_name);
         if (replace_existing and !target_exists) return error.TableNotFound;
 
@@ -9551,6 +9561,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
+        try self.validateRestoredManagedEmbeddingCatalog(alloc, manifest.indexes_json);
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             return self.source.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, manifest) catch |err| {
@@ -9596,6 +9607,32 @@ pub const ApiHttpServer = struct {
             };
         }
         return false;
+    }
+
+    fn validateRestoredManagedEmbeddingCatalog(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+    ) !void {
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
     }
 
     const DistributedRestoreIntentState = enum { missing, pending, completed, conflicting };
@@ -12357,6 +12394,11 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions,
+            => return error.Conflict,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -16431,6 +16473,78 @@ fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
         \\  }
         \\}
     );
+}
+
+test "restore admission rejects an embedding artifact catalog without an executable producer" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        server.validateRestoredManagedEmbeddingCatalog(
+            std.testing.allocator,
+            "{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}]},\"enrichments\":[{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]}",
+        ),
+    );
+}
+
+test "exact replacement protects only changed extension-owned state" {
+    var members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "memory",
+            .object_kind = .table_schema,
+            .object_name = "docs_schema",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+        },
+        .{
+            .extension_name = "memory",
+            .object_kind = .index,
+            .object_name = "managed_text",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+        },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+        .extension_members = members[0..],
+    };
+    const expected = metadata_table_manager.TableRecord{
+        .table_id = 1,
+        .name = "docs",
+        .indexes_json = "{\"managed_text\":{\"type\":\"full_text\"}}",
+    };
+    var user_replacement = expected;
+    user_replacement.indexes_json = "{\"managed_text\":{\"type\":\"full_text\"},\"vectors\":{\"type\":\"embeddings\"}}";
+    try std.testing.expect(!try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.testing.allocator,
+        &snapshot,
+        expected,
+        user_replacement,
+    ));
+
+    var owned_replacement = expected;
+    owned_replacement.indexes_json = "{\"managed_text\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+    try std.testing.expect(try extension_table_ownership.definitionMutationTouchesOwnedState(
+        std.testing.allocator,
+        &snapshot,
+        expected,
+        owned_replacement,
+    ));
 }
 
 fn borrowedTestRestoreManifest(backup_id: []const u8, table_name: []const u8) backups_api.TableBackupManifest {

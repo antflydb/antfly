@@ -1284,6 +1284,26 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     assert mismatch_error.value.response.status_code == 400
     assert "embedding enrichment producer is not runnable" in mismatch_error.value.response.text
 
+    # A matching durable identity may be registered at table scope, but doing
+    # so makes the executable index an authoritative owner that cannot be
+    # deleted while the identity remains in the catalog.
+    stateful_api.put(
+        f"{_table_artifact_path(owner_table, 'document_dense_v1')}/enrichment",
+        {
+            "kind": "embedding",
+            "field": "body",
+            "expected_dims": 3,
+            "producer_json": _semantic_embedding_producer(
+                model="text-embedding-3-small",
+                endpoint=f"{openai_embedder}/v1",
+            ),
+        },
+    )
+    with pytest.raises(requests.HTTPError) as owner_delete_error:
+        stateful_api.delete_index(owner_table, "document_vectors")
+    assert owner_delete_error.value.response.status_code == 409
+    assert stateful_api.get_index(owner_table, "document_vectors")["config"]["type"] == "embeddings"
+
     # Failed replacement is atomic: the original owner and its artifact remain.
     detail = stateful_api.get_index(owner_table, "document_vectors")
     assert detail["config"]["type"] == "embeddings"

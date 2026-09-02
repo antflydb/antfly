@@ -1312,6 +1312,8 @@ const LocalStandaloneMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const indexes_json = (try antfly.public_api.indexes.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         var mutation = try self.beginCatalogMutationLocked();
@@ -1345,6 +1347,7 @@ const LocalStandaloneMetadata = struct {
         const indexes_json = (try antfly.public_api.indexes.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         var mutation = try self.beginCatalogMutationLocked();

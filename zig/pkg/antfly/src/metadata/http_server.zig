@@ -28,6 +28,7 @@ const operation = @import("../api/operation.zig");
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
+const extension_table_ownership = @import("../extensions/table_ownership.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -37,6 +38,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
 const tables_api = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -693,7 +695,12 @@ pub const AdminSource = struct {
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
         if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
-        if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
+        if (try extension_table_ownership.definitionMutationTouchesOwnedState(
+            std.heap.page_allocator,
+            &snapshot,
+            expected,
+            replacement,
+        )) return error.ExtensionOwnedObject;
         try svc.replaceTableDefinition(expected, replacement);
     }
 
@@ -790,6 +797,8 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -821,6 +830,7 @@ pub const AdminSource = struct {
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -1208,6 +1218,8 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -1239,6 +1251,7 @@ pub const AdminSource = struct {
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
