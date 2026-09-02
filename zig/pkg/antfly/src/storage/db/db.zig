@@ -26536,6 +26536,7 @@ pub const DB = struct {
             }
             normalizeReplayStatusFromDurableCheckpoint(item);
             if (item.kind == .dense_vector and
+                self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(item.name) and
                 (runtime_stats.async_indexing.dense_projection_finalizing or
                     !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
                         item.name,
@@ -26998,12 +26999,13 @@ pub const DB = struct {
                         item.backfill_active = true;
                     }
                     item.catch_up_phase = async_indexing.dense_catch_up.phase;
-                    if (async_indexing.dense_projection_finalizing or
-                        !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
-                            cfg.name,
-                            item.replay_applied_sequence,
-                            item.doc_count,
-                        ))
+                    if (self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(cfg.name) and
+                        (async_indexing.dense_projection_finalizing or
+                            !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
+                                cfg.name,
+                                item.replay_applied_sequence,
+                                item.doc_count,
+                            )))
                     {
                         item.backfill_active = true;
                         item.backfill_progress = @min(item.backfill_progress, 0.999);
@@ -79055,6 +79057,18 @@ test "managed dense physical migration is online and uses durable repair intent"
     defer repair.deinit(alloc);
     try std.testing.expectEqual(index_repair_state.Trigger.storage_format_migration, repair.intent.trigger);
     try std.testing.expectEqual(IndexRepairAdmission.serviceable, DB.indexRepairAdmission(repair.intent));
+
+    // Candidate vector-block publication is table-wide runtime work. It must
+    // not project onto the readiness of the still-authoritative v1 index.
+    db.async_context.dense_projection_finalizing.store(true, .release);
+    defer db.async_context.dense_projection_finalizing.store(false, .release);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    const dense_stats = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "dense_idx")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
+    try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
 test "db source artifact debt does not synthesize index generation repair debt" {

@@ -3244,6 +3244,16 @@ pub const IndexManager = struct {
         );
     }
 
+    /// Shared exact-vector blocks become part of the serving contract only
+    /// after native postings are authoritative. A legacy HBC generation owns
+    /// its exact vectors in the index LSM, so a v2 shadow build or a missing
+    /// acceleration generation must not make that proven serving generation
+    /// look incomplete.
+    pub fn vectorBlockProjectionRequiredForDenseIndex(self: *IndexManager, name: []const u8) bool {
+        const entry = self.denseIndex(name) orelse return false;
+        return entry.index.experimentalPostingWalAuthoritative();
+    }
+
     pub fn denseNativeStoragePhase(self: *IndexManager, name: []const u8) types.DenseNativeStoragePhase {
         const entry = self.denseIndex(name) orelse return .legacy;
         const posting_authoritative = entry.index.experimentalPostingWalAuthoritative();
@@ -3311,6 +3321,7 @@ pub const IndexManager = struct {
     pub fn vectorBlockProjectionPending(self: *IndexManager) bool {
         if (self.vector_block_storage == null) return false;
         for (self.dense_indexes.items) |*entry| {
+            if (!entry.index.experimentalPostingWalAuthoritative()) continue;
             if (!self.vectorBlockReadyForDenseIndex(entry.config.name)) return true;
         }
         return false;
@@ -27537,6 +27548,7 @@ test "standalone dense native migration still requires an explicit physical gene
     }});
     const entry = manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!manager.denseNativeAuthorityPermitted(entry));
+    try std.testing.expect(!manager.vectorBlockProjectionRequiredForDenseIndex("dv_v1"));
     try std.testing.expect(try manager.denseNativePhysicalMigrationRequired("dv_v1"));
     try std.testing.expect(try manager.finalizeNativePostingGenerationAtStableTip(
         "dv_v1",
