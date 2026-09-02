@@ -8,6 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from release_channels import (
@@ -16,6 +17,78 @@ from release_channels import (
     validate_channel_tag,
     validate_observed_channel_tag,
 )
+
+COMPLETION_ROOT = "antfly/release-history/"
+ISO8601_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def completion_key(ledger_sha256: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", ledger_sha256):
+        raise SystemExit(f"invalid release ledger digest: {ledger_sha256}")
+    return f"{COMPLETION_ROOT}{ledger_sha256}.json"
+
+
+def utc_timestamp(now: datetime | None = None) -> str:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def completion_receipt(
+    identity: dict[str, str], channel: str, committed_at: str
+) -> dict[str, str | int]:
+    if not ISO8601_UTC.fullmatch(committed_at):
+        raise SystemExit(f"invalid release completion timestamp: {committed_at}")
+    if "container_digest" not in identity:
+        raise SystemExit("completed release identity requires a container digest")
+    validated = release_identity(
+        identity["tag"],
+        identity["commit"],
+        identity["ledger_sha256"],
+        channel,
+        allow_legacy=True,
+        container_digest=identity["container_digest"],
+    )
+    return {
+        "schema_version": 1,
+        "channel": channel,
+        **validated,
+        "committed_at": committed_at,
+    }
+
+
+def validate_completion_receipt(document: object) -> dict[str, str | int]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "channel",
+        "tag",
+        "commit",
+        "ledger_sha256",
+        "container_digest",
+        "committed_at",
+    }:
+        raise SystemExit("malformed release completion receipt")
+    channel = document.get("channel")
+    if channel not in load_policy()["channels"]:
+        raise SystemExit("malformed release completion receipt")
+    expected = completion_receipt(
+        {
+            "tag": str(document.get("tag")),
+            "commit": str(document.get("commit")),
+            "ledger_sha256": str(document.get("ledger_sha256")),
+            "container_digest": str(document.get("container_digest")),
+        },
+        str(channel),
+        str(document.get("committed_at")),
+    )
+    if document != expected:
+        raise SystemExit("malformed release completion receipt")
+    return expected
 
 
 def release_identity(
@@ -116,6 +189,36 @@ class S3ChannelStore:
                 raise SystemExit("release channel changed concurrently; retry") from exc
             raise
 
+    def create_completion(self, document: dict[str, str | int]) -> None:
+        validated = validate_completion_receipt(document)
+        key = completion_key(str(validated["ledger_sha256"]))
+        body = (
+            json.dumps(validated, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+            return
+        except self.client_error as exc:
+            error = exc.response.get("Error", {})
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if str(error.get("Code")) not in {
+                "409",
+                "412",
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            } and status not in {409, 412}:
+                raise
+        response = self.client.get_object(Bucket=self.bucket, Key=key)
+        existing = validate_completion_receipt(json.load(response["Body"]))
+        if existing != validated:
+            raise SystemExit("immutable release completion receipt differs")
+
 
 def begin_promotion(
     store: S3ChannelStore,
@@ -128,6 +231,9 @@ def begin_promotion(
         stored.document, identity, bootstrap_current, channel
     )
     pending = stored.document.get("pending")
+    if pending is None and same_identity(current, identity):
+        print(f"release channel promotion already committed for {identity['tag']}")
+        return
     if pending is not None:
         if same_identity(pending, identity):
             print(f"resuming release channel promotion for {identity['tag']}")
@@ -249,26 +355,43 @@ def preflight_promotion(
 
 
 def finish_promotion(
-    store: S3ChannelStore, identity: dict[str, str], channel: str = "stable"
+    store: S3ChannelStore,
+    identity: dict[str, str],
+    channel: str = "stable",
+    *,
+    now: datetime | None = None,
 ) -> None:
     stored = store.load()
     state = stored.document
     if state.get("channel") not in {None, channel}:
         raise SystemExit(f"release channel journal does not belong to {channel}")
     if state.get("pending") is None and same_identity(state.get("current"), identity):
+        current = state["current"]
+        assert isinstance(current, dict)
+        committed_at = current.get("committed_at")
+        if committed_at is None:
+            committed_at = utc_timestamp(now)
+            current = {**current, "committed_at": committed_at}
+            next_state = {**state, "current": current}
+            store.compare_and_swap(stored, next_state)
+        receipt = completion_receipt(identity, channel, str(committed_at))
+        store.create_completion(receipt)
         print(f"release channel promotion already committed for {identity['tag']}")
         return
     if not same_identity(state.get("pending"), identity):
         raise SystemExit(
             f"release channel has no matching pending promotion for {identity['tag']}"
         )
+    committed_at = utc_timestamp(now)
+    committed_identity = {**identity, "committed_at": committed_at}
     next_state = {
         "schema_version": 1,
         "channel": channel,
-        "current": identity,
+        "current": committed_identity,
         "pending": None,
     }
     store.compare_and_swap(stored, next_state)
+    store.create_completion(completion_receipt(identity, channel, committed_at))
     print(f"committed release channel promotion for {identity['tag']}")
 
 

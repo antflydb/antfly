@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -603,6 +604,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 self.document = document
                 self.etag = "1"
                 self.writes = 0
+                self.completions = {}
 
             def load(self):
                 return channel.StoredState(
@@ -618,6 +620,13 @@ class ReleasePromotionTests(unittest.TestCase):
             def assert_etag(self, etag: str) -> None:
                 if etag != self.etag:
                     raise AssertionError("stale channel state")
+
+            def create_completion(self, document: dict) -> None:
+                key = channel.completion_key(document["ledger_sha256"])
+                existing = self.completions.get(key)
+                if existing is not None and existing != document:
+                    raise AssertionError("completion changed")
+                self.completions[key] = document
 
         previous = {
             "tag": "v1.2.2",
@@ -637,18 +646,28 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertEqual(store.writes, 1)
         channel.begin_promotion(store, candidate, None)
         self.assertEqual(store.writes, 1, "same transaction should resume")
-        channel.finish_promotion(store, candidate)
+        completed = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        channel.finish_promotion(store, candidate, now=completed)
+        committed = {**candidate, "committed_at": "2026-09-01T00:00:00Z"}
         self.assertEqual(
             store.document,
             {
                 "schema_version": 1,
                 "channel": "stable",
-                "current": candidate,
+                "current": committed,
                 "pending": None,
             },
         )
-        channel.finish_promotion(store, candidate)
+        store.completions.clear()
+        channel.begin_promotion(store, candidate, None)
+        self.assertEqual(store.writes, 2, "committed transaction should not reopen")
+        channel.finish_promotion(store, candidate, now=completed + timedelta(days=1))
         self.assertEqual(store.writes, 2, "committed transaction should replay")
+        self.assertEqual(len(store.completions), 1)
+        self.assertEqual(
+            next(iter(store.completions.values()))["committed_at"],
+            "2026-09-01T00:00:00Z",
+        )
         self.assertEqual(
             channel.journaled_container_digest(store, candidate),
             f"sha256:{'a' * 64}",

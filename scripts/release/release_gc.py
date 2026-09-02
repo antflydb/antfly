@@ -24,7 +24,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from release_channel_state import COMPLETION_ROOT, validate_completion_receipt
 from release_channels import NIGHTLY_PATTERN, TAG_PATTERN, load_policy
+from release_container_state import validate_record
 
 DEFAULT_BUCKET = "antfly-releases"
 RELEASE_ROOT = "antfly/"
@@ -50,6 +52,7 @@ class StoredObject:
 @dataclass(frozen=True)
 class Release:
     tag: str
+    commit: str
     published_at: datetime
     keys: frozenset[str]
     ledger_sha256: str
@@ -168,12 +171,23 @@ def load_releases(
         if stored is None:
             raise SystemExit(f"release ledger disappeared while planning: {ledger_key}")
         ledger = parse_document(stored, f"release ledger {ledger_key}")
+        schema = ledger.get("schema_version")
         if (
-            ledger.get("schema_version") not in SUPPORTED_LEDGER_SCHEMAS
+            (schema is not None and schema not in SUPPORTED_LEDGER_SCHEMAS)
             or ledger.get("tag") != tag
             or not isinstance(ledger.get("artifacts"), list)
         ):
             raise SystemExit(f"release ledger {ledger_key} has an invalid contract")
+        if schema is None and (
+            not isinstance(ledger.get("version"), str)
+            or not isinstance(ledger.get("commit"), str)
+        ):
+            raise SystemExit(
+                f"legacy release ledger {ledger_key} has an invalid contract"
+            )
+        commit = ledger.get("commit")
+        if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            raise SystemExit(f"release ledger {ledger_key} has an invalid commit")
         content_keys: set[str] = set()
         names: set[str] = set()
         for artifact in ledger["artifacts"]:
@@ -200,12 +214,88 @@ def load_releases(
         content_keys.add(f"{CONTENT_ROOT}{ledger_digest}/{LEDGER_NAME}")
         releases[tag] = Release(
             tag=tag,
+            commit=commit,
             published_at=utc(ledger_info.modified),
             keys=frozenset(keys),
             ledger_sha256=ledger_digest,
             content_keys=frozenset(content_keys),
         )
     return releases, all_content_keys, all_container_keys
+
+
+def load_completion_history(
+    store: ObjectStore,
+    objects: list[ObjectInfo],
+    releases: dict[str, Release],
+    container_records: dict[str, dict[str, object]],
+) -> dict[str, datetime]:
+    stable_completed_at: dict[str, datetime] = {}
+    for item in objects:
+        if not item.key.startswith(COMPLETION_ROOT):
+            continue
+        suffix = item.key.removeprefix(COMPLETION_ROOT)
+        if not re.fullmatch(r"[0-9a-f]{64}\.json", suffix):
+            raise SystemExit(f"release history contains an invalid key: {item.key}")
+        stored = store.read_optional(item.key)
+        if stored is None:
+            raise SystemExit(
+                f"release completion disappeared while planning: {item.key}"
+            )
+        receipt = validate_completion_receipt(
+            parse_document(stored, f"release completion {item.key}")
+        )
+        if suffix.removesuffix(".json") != receipt["ledger_sha256"]:
+            raise SystemExit(
+                f"release completion key disagrees with its receipt: {item.key}"
+            )
+        if receipt["channel"] != "stable":
+            continue
+        tag = str(receipt["tag"])
+        release = releases.get(tag)
+        record = container_records.get(tag)
+        if (
+            release is None
+            or release.ledger_sha256 != receipt["ledger_sha256"]
+            or release.commit != receipt["commit"]
+            or record is None
+            or record["container_digest"] != receipt["container_digest"]
+        ):
+            raise SystemExit(
+                f"stable completion receipt disagrees with immutable release state: {tag}"
+            )
+        committed_at = datetime.fromisoformat(
+            str(receipt["committed_at"]).replace("Z", "+00:00")
+        )
+        previous = stable_completed_at.get(tag)
+        if previous is not None and previous != committed_at:
+            raise SystemExit(
+                f"stable release has conflicting completion receipts: {tag}"
+            )
+        stable_completed_at[tag] = committed_at
+    return stable_completed_at
+
+
+def load_container_records(
+    store: ObjectStore,
+    releases: dict[str, Release],
+    all_container_keys: set[str],
+) -> dict[str, dict[str, object]]:
+    records: dict[str, dict[str, object]] = {}
+    for release in releases.values():
+        key = f"{CONTAINER_IDENTITY_ROOT}{release.ledger_sha256}.json"
+        if key not in all_container_keys:
+            continue
+        stored = store.read_optional(key)
+        if stored is None:
+            raise SystemExit(f"container identity disappeared while planning: {key}")
+        record = validate_record(parse_document(stored, f"container identity {key}"))
+        if (
+            record["tag"] != release.tag
+            or record["ledger_sha256"] != release.ledger_sha256
+        ):
+            raise SystemExit(f"container identity disagrees with release ledger: {key}")
+        records[release.tag] = record
+    return records
 
 
 def stable_tag_for(tag: str) -> str:
@@ -246,6 +336,10 @@ def plan_gc(
     now = utc(now or datetime.now(timezone.utc))
     objects = store.list_objects(RELEASE_ROOT)
     releases, all_content_keys, all_container_keys = load_releases(store, objects)
+    container_records = load_container_records(store, releases, all_container_keys)
+    stable_completed_at = load_completion_history(
+        store, objects, releases, container_records
+    )
     protected_tags, protected_ledgers, snapshots = load_protected_identities(
         store, policy
     )
@@ -277,12 +371,6 @@ def plan_gc(
     newest_nightly = {release.tag for release in nightly[:nightly_min_count]}
     nightly_cutoff = now - timedelta(days=nightly_days)
     prerelease_grace = timedelta(days=prerelease_grace_days)
-    stable = {
-        release.tag: release
-        for release in releases.values()
-        if TAG_PATTERN.fullmatch(release.tag).group("prerelease") is None
-    }
-
     retained: dict[str, str] = {}
     expired: dict[str, str] = {}
     for tag, release in sorted(releases.items()):
@@ -300,10 +388,10 @@ def plan_gc(
             else:
                 expired[tag] = "nightly-retention-expired"
         else:
-            matching_stable = stable.get(stable_tag_for(tag))
-            if matching_stable is None:
+            matching_stable_completed_at = stable_completed_at.get(stable_tag_for(tag))
+            if matching_stable_completed_at is None:
                 retained[tag] = "awaiting-matching-stable"
-            elif now < matching_stable.published_at + prerelease_grace:
+            elif now < matching_stable_completed_at + prerelease_grace:
                 retained[tag] = "matching-stable-grace-window"
             else:
                 expired[tag] = "prerelease-grace-expired"
@@ -323,16 +411,24 @@ def plan_gc(
     )
     delete_keys.update((expired_content - retained_content) & all_content_keys)
 
-    retained_ledgers = {releases[tag].ledger_sha256 for tag in retained}
+    retained_container_digests = {
+        str(container_records[tag]["container_digest"])
+        for tag in retained
+        if tag in container_records
+    }
+    container_deletions: list[dict[str, str]] = []
     for tag in expired:
-        digest = releases[tag].ledger_sha256
-        key = f"{CONTAINER_IDENTITY_ROOT}{digest}.json"
-        if (
-            digest not in retained_ledgers
-            and digest not in protected_ledgers
-            and key in all_container_keys
-        ):
-            delete_keys.add(key)
+        record = container_records.get(tag)
+        if record is None or record["container_digest"] in retained_container_digests:
+            continue
+        container_deletions.append(
+            {
+                "tag": tag,
+                "ledger_sha256": str(record["ledger_sha256"]),
+                "container_digest": str(record["container_digest"]),
+                "record_key": f"{CONTAINER_IDENTITY_ROOT}{record['ledger_sha256']}.json",
+            }
+        )
 
     return {
         "schema_version": 1,
@@ -346,6 +442,9 @@ def plan_gc(
         "protected_tags": sorted(protected_tags),
         "retained": retained,
         "expired": expired,
+        "container_deletions": sorted(
+            container_deletions, key=lambda item: item["tag"]
+        ),
         "delete_keys": sorted(delete_keys),
         "snapshots": snapshots,
     }
@@ -357,6 +456,59 @@ def verify_snapshots(store: ObjectStore, snapshots: dict[str, str | None]) -> No
         current_etag = current.etag if current else None
         if current_etag != expected_etag:
             raise SystemExit(f"release channel changed while planning: {key}; retry")
+
+
+def load_plan(path: Path) -> dict[str, Any]:
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read release-GC plan: {path}") from exc
+    if (
+        not isinstance(plan, dict)
+        or plan.get("schema_version") != 1
+        or not isinstance(plan.get("delete_keys"), list)
+        or not isinstance(plan.get("container_deletions"), list)
+        or not isinstance(plan.get("snapshots"), dict)
+    ):
+        raise SystemExit("malformed release-GC plan")
+    for key in plan["delete_keys"]:
+        if not isinstance(key, str) or not key.startswith(RELEASE_ROOT):
+            raise SystemExit("release-GC plan contains an invalid deletion key")
+        remainder = key.removeprefix(RELEASE_ROOT)
+        tag, separator, _name = remainder.partition("/")
+        if not (
+            key.startswith((CONTENT_ROOT, CONTAINER_IDENTITY_ROOT))
+            or separator
+            and TAG_PATTERN.fullmatch(tag)
+        ):
+            raise SystemExit("release-GC plan attempts to delete a mutable namespace")
+    for item in plan["container_deletions"]:
+        if not isinstance(item, dict) or set(item) != {
+            "tag",
+            "ledger_sha256",
+            "container_digest",
+            "record_key",
+        }:
+            raise SystemExit("release-GC plan contains a malformed container deletion")
+        tag = item["tag"]
+        ledger = item["ledger_sha256"]
+        digest = item["container_digest"]
+        if (
+            not isinstance(tag, str)
+            or TAG_PATTERN.fullmatch(tag) is None
+            or not isinstance(ledger, str)
+            or SHA256.fullmatch(ledger) is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+            or item["record_key"] != f"{CONTAINER_IDENTITY_ROOT}{ledger}.json"
+        ):
+            raise SystemExit("release-GC plan contains a malformed container deletion")
+    if any(
+        not isinstance(key, str) or etag is not None and not isinstance(etag, str)
+        for key, etag in plan["snapshots"].items()
+    ):
+        raise SystemExit("release-GC plan contains invalid channel snapshots")
+    return plan
 
 
 class S3ObjectStore:
@@ -404,15 +556,31 @@ class S3ObjectStore:
         return StoredObject(response["Body"].read(), str(response["ETag"]))
 
     def delete_objects(self, keys: list[str]) -> None:
-        for offset in range(0, len(keys), 1000):
-            batch = keys[offset : offset + 1000]
-            response = self.client.delete_objects(
-                Bucket=self.bucket,
-                Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
-            )
-            errors = response.get("Errors", [])
-            if errors:
-                raise SystemExit(f"object-storage deletion failed: {errors}")
+        release_ledgers = []
+        other_keys = []
+        for key in keys:
+            remainder = key.removeprefix(RELEASE_ROOT)
+            tag, separator, name = remainder.partition("/")
+            if separator and TAG_PATTERN.fullmatch(tag) and name == LEDGER_NAME:
+                release_ledgers.append(key)
+            else:
+                other_keys.append(key)
+        # The version ledger is the release prefix's commit marker. Delete it
+        # only after every other object so a failed batch remains discoverable
+        # and a retry can finish the same plan safely.
+        for phase in (other_keys, release_ledgers):
+            for offset in range(0, len(phase), 1000):
+                batch = phase[offset : offset + 1000]
+                response = self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={
+                        "Objects": [{"Key": key} for key in batch],
+                        "Quiet": True,
+                    },
+                )
+                errors = response.get("Errors", [])
+                if errors:
+                    raise SystemExit(f"object-storage deletion failed: {errors}")
 
 
 def main() -> int:
@@ -423,23 +591,53 @@ def main() -> int:
     parser.add_argument("--nightly-min-count", type=int)
     parser.add_argument("--prerelease-grace-days", type=int)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--apply-plan", type=Path)
+    parser.add_argument("--containers-cleaned", action="store_true")
     parser.add_argument("--plan-out", type=Path)
     args = parser.parse_args()
 
     store = S3ObjectStore(args.endpoint, args.bucket)
-    plan = plan_gc(
-        store,
-        nightly_days=args.nightly_days,
-        nightly_min_count=args.nightly_min_count,
-        prerelease_grace_days=args.prerelease_grace_days,
+    if args.apply and args.apply_plan:
+        parser.error("--apply and --apply-plan are mutually exclusive")
+    if args.apply_plan and any(
+        value is not None
+        for value in (
+            args.nightly_days,
+            args.nightly_min_count,
+            args.prerelease_grace_days,
+        )
+    ):
+        parser.error("retention overrides cannot be combined with --apply-plan")
+    plan = (
+        load_plan(args.apply_plan)
+        if args.apply_plan
+        else plan_gc(
+            store,
+            nightly_days=args.nightly_days,
+            nightly_min_count=args.nightly_min_count,
+            prerelease_grace_days=args.prerelease_grace_days,
+        )
     )
+    applying = args.apply or args.apply_plan is not None
+    if applying:
+        if plan["container_deletions"] and not args.containers_cleaned:
+            raise SystemExit(
+                "container cleanup is required before R2 deletion; pass --containers-cleaned after it succeeds"
+            )
+        if args.containers_cleaned:
+            plan["delete_keys"].extend(
+                item["record_key"] for item in plan["container_deletions"]
+            )
+            plan["delete_keys"] = sorted(set(plan["delete_keys"]))
+        verify_snapshots(store, plan["snapshots"])
+    elif args.containers_cleaned:
+        parser.error("--containers-cleaned requires --apply or --apply-plan")
     rendered = json.dumps(plan, indent=2, sort_keys=True) + "\n"
     print(rendered, end="")
     if args.plan_out:
         args.plan_out.parent.mkdir(parents=True, exist_ok=True)
         args.plan_out.write_text(rendered, encoding="utf-8")
-    if args.apply:
-        verify_snapshots(store, plan["snapshots"])
+    if applying:
         store.delete_objects(plan["delete_keys"])
         print(f"deleted {len(plan['delete_keys'])} release objects")
     else:

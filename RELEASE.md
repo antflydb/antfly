@@ -199,8 +199,8 @@ digest. If both are lost, recovery fails explicitly instead of trying to
 reproduce bytes from mutable package repositories or build tools. Version tags
 are immutable after their first publication, while channel tags remain
 transaction-controlled aliases. Registry retention may remove
-run-scoped staging tags after the release. There
-is deliberately no automatic rollback entry point for mutable channels. A
+run-scoped staging tags after the release. There is deliberately no automatic
+rollback entry point for mutable channels. A
 rollback requires a separately reviewed administrative change to the channel
 journal and aliases, rather than disguising an old-release recovery as a new
 promotion.
@@ -240,7 +240,10 @@ a local convenience.
   increasing workflow-run sequence.
 - `release_channel_state.py` compare-and-swaps each channel journal, prevents
   backward promotion, provides a read-only preflight, and makes an interrupted
-  commit resumable only by the same complete release identity.
+  commit resumable only by the same complete release identity. A completed
+  transaction records its timestamp in the journal and writes an immutable,
+  ledger-addressed receipt under `antfly/release-history/`; retries repair a
+  missing receipt without inventing a new completion time.
 - `release_container_state.py` create-once binds each release ledger to its OCI
   digest independently of mutable channel history, so later recovery can find
   the original container without rebuilding it.
@@ -271,12 +274,16 @@ a local convenience.
 - `release_gc.py` plans retention from immutable ledgers plus channel journals.
   It fails closed on malformed state, permanently marks stable and channel
   `current`/`pending` releases, retains nightlies for 30 days or the newest 10,
-  and retains prereleases until 90 days after their matching stable release.
-  Its sweep removes only expired version objects, content-addressed objects not
-  shared by a retained ledger, and the corresponding R2 container-identity
-  record. The weekly workflow stores a dry-run plan; an explicitly approved
-  manual run recomputes and applies it inside the release-promotion concurrency
-  boundary.
+  and retains prereleases until 90 days after their matching stable release's
+  immutable completion receipt. Unschematized ledgers from the previous release
+  pipeline have an explicit legacy decoder. Its sweep removes only expired
+  version objects and content-addressed objects not shared by a retained ledger.
+- `release_registry_gc.py` consumes that exact plan, verifies that no mutable
+  container channel or unplanned registry tag still reaches a selected digest,
+  and removes the expired manifest list and architecture images from GAR and
+  GHCR.
+  Only after registry cleanup succeeds does the workflow remove the R2
+  container-identity record and release objects.
 
 ## Version Behavior
 
@@ -333,20 +340,24 @@ release artifacts rather than published package-registry versions.
 
 Stable R2 releases are retained forever. A nightly remains recoverable for at
 least 30 days and the newest 10 nightlies are retained regardless of age.
-Prereleases remain until a matching stable release exists and has aged 90 days.
+Prereleases remain until a matching stable completion receipt exists and has
+aged 90 days. An uploaded or draft stable payload does not start this clock.
 The current and pending identities in every channel journal, plus each mutable
 R2 metadata alias, are always protected.
 
 `.github/workflows/antfly-release-gc.yml` computes and archives a plan weekly
 without deleting anything. To inspect a plan immediately, dispatch `Release
 object retention` with its default `apply=false`. To apply retention, dispatch
-it with `apply=true`; the protected `container-publish` environment gates the
-operation. Application recomputes rather than trusting an uploaded plan and
-checks the journal and alias ETags immediately before deleting. The GC never
-deletes stable releases, shared content-addressed objects, npm/PyPI versions, or
-OCI registry tags. Registry-native lifecycle policies may independently remove
-temporary run-scoped container staging tags, while permanent ledger tags remain
-the container recovery roots.
+it with `apply=true`. The protected `container-publish` approval job finishes
+before the apply job enters the short release-promotion concurrency section.
+Inside that lock, application recomputes the plan, removes only container
+digests with no retained or channel references, checks the journal and alias
+ETags, and then removes R2 objects. The GC never deletes stable releases,
+shared content-addressed objects, or npm/PyPI versions. Immutable completion
+receipts remain as compact audit history after payload deletion. Existing
+`termite/` objects are deliberately outside this Antfly release policy and are
+retained until that retired namespace receives an explicit migration or bucket
+lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.

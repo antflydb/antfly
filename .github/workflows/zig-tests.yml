@@ -225,6 +225,11 @@ jobs:
         with:
           python-version: "3.13"
 
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
       - name: Test release packaging and scripts
         run: scripts/release/test.sh
 

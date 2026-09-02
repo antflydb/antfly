@@ -17,11 +17,6 @@ on:
 permissions:
   contents: read
 
-# Object publication and channel movement must not race the retention snapshot.
-concurrency:
-  group: antfly-release-promotion
-  cancel-in-progress: false
-
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -53,12 +48,26 @@ jobs:
           path: dist/release-gc/plan.json
           if-no-files-found: error
 
-  apply:
-    name: Apply a fresh release object retention plan
+  approve:
+    name: Approve release object deletion
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
     needs: plan
-    runs-on: arc-antfly-standard
+    runs-on: ubuntu-latest
     environment: container-publish
+    steps:
+      - run: true
+
+  apply:
+    name: Apply a fresh release object retention plan
+    needs: approve
+    runs-on: arc-antfly-standard
+    concurrency:
+      group: antfly-release-promotion
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -68,7 +77,23 @@ jobs:
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
-      - name: Recompute and apply the retention plan
+      - name: Authenticate to Google Cloud for container retention
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Install crane
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+      - name: Authenticate container registries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login us-central1-docker.pkg.dev -u oauth2accesstoken --password-stdin
+          echo "$GH_TOKEN" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Recompute the approved retention plan inside the release lock
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -76,7 +101,26 @@ jobs:
         run: |
           python scripts/release/release_gc.py \
             --endpoint "$AWS_ENDPOINT_URL" \
-            --apply \
+            --plan-out dist/release-gc/apply-plan.json
+      - name: Delete expired container images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/release/release_registry_gc.py \
+            --plan dist/release-gc/apply-plan.json \
+            --gar-image us-central1-docker.pkg.dev/antfly-image-artifacts/containers/antfly \
+            --ghcr-image antflydb/antfly \
+            --apply
+      - name: Delete expired R2 releases after container cleanup
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+        run: |
+          python scripts/release/release_gc.py \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --apply-plan dist/release-gc/apply-plan.json \
+            --containers-cleaned \
             --plan-out dist/release-gc/applied-plan.json
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

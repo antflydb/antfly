@@ -327,9 +327,15 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("name: antfly-build-request", nightly_workflow)
         self.assertIn('test "$channel" = nightly', build_controller_workflow)
         self.assertIn("schedule:", release_gc_workflow)
-        self.assertEqual(release_gc_workflow.count("--apply"), 1)
+        self.assertEqual(release_gc_workflow.count("            --apply\n"), 1)
+        self.assertEqual(release_gc_workflow.count("--apply-plan"), 1)
         self.assertIn("environment: container-publish", release_gc_workflow)
         self.assertIn("group: antfly-release-promotion", release_gc_workflow)
+        self.assertIn("uses: google-github-actions/setup-gcloud@", release_gc_workflow)
+        self.assertLess(
+            release_gc_workflow.index("environment: container-publish"),
+            release_gc_workflow.index("group: antfly-release-promotion"),
+        )
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
@@ -366,6 +372,8 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("run: make ", release_job)
         self.assertNotIn("scripts/release/test_", release_job)
         self.assertIn('python-version: "3.13"', release_job)
+        self.assertIn("uses: mlugg/setup-zig@", release_job)
+        self.assertIn("version: 0.16.0", release_job)
         self.assertIn("release-scripting-test:", makefile)
         self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(
