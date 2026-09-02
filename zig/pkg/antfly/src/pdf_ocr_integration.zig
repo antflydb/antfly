@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .embed_dense_parts = embedParts,

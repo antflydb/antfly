@@ -4777,6 +4777,7 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
 fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedder.AntflyProvider {
     return .{
         .ptr = handle,
+        .owns_invocation_admission = true,
         .embed_dense_texts = inferenceProviderEmbedDenseTexts,
         .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
         .embed_sparse_texts = inferenceProviderEmbedSparseTexts,

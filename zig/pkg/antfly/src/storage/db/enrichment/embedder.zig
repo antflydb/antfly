@@ -33,11 +33,26 @@ pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, 
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
 pub const DensePartInvocationMemory = inference_work.InvocationMemoryPlan;
+pub const DensePartInvocationShape = struct {
+    item_count: usize,
+    /// Exact fixed JSON envelopes for the concrete part variants, excluding
+    /// binary payload data whose representation is charged by the attachment
+    /// transport.
+    item_envelope_json_bytes: usize = 0,
+    /// Sum of conservative JSON-string upper bounds for text, URLs, and MIME
+    /// values. Keeping this aggregate preserves heterogeneous accounting
+    /// without retaining or allocating a synthetic common MIME type.
+    string_json_bytes: usize = 0,
+    /// Host-side normalization structures and replacement buffers that can be
+    /// live alongside the concrete invocation. This belongs in the route plan,
+    /// not in a private execution-only allowance, so scheduler admission and
+    /// the bounded executor observe the same peak.
+    preparation_bytes: usize = 0,
+};
 pub const DensePartInvocationMemoryFn = *const fn (
     ptr: *anyopaque,
     embedding_name: []const u8,
-    item_count: usize,
-    mime_type: []const u8,
+    shape: DensePartInvocationShape,
     dims: u32,
 ) anyerror!DensePartInvocationMemory;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
@@ -120,15 +135,39 @@ pub const DenseEmbedder = struct {
     pub fn partInvocationMemory(
         self: DenseEmbedder,
         embedding_name: []const u8,
-        item_count: usize,
-        mime_type: []const u8,
+        shape: DensePartInvocationShape,
         dims: u32,
     ) !DensePartInvocationMemory {
         const memory_fn = self.part_invocation_memory_fn orelse
             return error.InferenceInvocationMemoryUnavailable;
-        const plan = try memory_fn(self.ptr, embedding_name, item_count, mime_type, dims);
+        const plan = try memory_fn(self.ptr, embedding_name, shape, dims);
         try plan.validate();
         return plan;
+    }
+
+    /// Planning helper for document renderers that know the output MIME before
+    /// page bytes exist. Runtime execution derives the same shape from the
+    /// concrete heterogeneous item list.
+    pub fn partInvocationMemoryForMime(
+        self: DenseEmbedder,
+        embedding_name: []const u8,
+        item_count: usize,
+        mime_type: []const u8,
+        dims: u32,
+    ) !DensePartInvocationMemory {
+        _ = inference_work.mimeTypeEssence(mime_type) catch
+            return error.UnsupportedInferenceMimeType;
+        const one_mime = try jsonStringUpperBound(mime_type);
+        return try self.partInvocationMemory(embedding_name, .{
+            .item_count = item_count,
+            .item_envelope_json_bytes = std.math.mul(
+                usize,
+                item_count,
+                "{\"type\":\"media\",\"data\":\"\",\"mime_type\":}".len,
+            ) catch return error.InferenceEncodedBytesExceeded,
+            .string_json_bytes = std.math.mul(usize, item_count, one_mime) catch
+                return error.InferenceEncodedBytesExceeded,
+        }, dims);
     }
 
     pub fn embedDenseParts(
@@ -152,8 +191,11 @@ pub const DenseEmbedder = struct {
         dims: u32,
     ) ![]const []const f32 {
         const embed_items = self.dense_embed_part_items_fn orelse return error.UnsupportedEmbeddingProvider;
-        const planning_mime = try invocationPlanningMime(items);
-        const invocation_plan = try self.partInvocationMemory(embedding_name, items.len, planning_mime, dims);
+        const invocation_plan = try self.partInvocationMemory(
+            embedding_name,
+            try densePartInvocationShape(items),
+            dims,
+        );
         var transport_copy_bytes: usize = 0;
         for (items) |item| switch (item) {
             .binary => |binary| {
@@ -166,15 +208,10 @@ pub const DenseEmbedder = struct {
             },
             else => {},
         };
-        var invocation_limit = std.math.add(
+        const invocation_limit = std.math.add(
             usize,
             invocation_plan.allocator_limit_bytes,
             transport_copy_bytes,
-        ) catch return error.InferenceEncodedBytesExceeded;
-        invocation_limit = std.math.add(
-            usize,
-            invocation_limit,
-            try contentPartPreparationBytes(items),
         ) catch return error.InferenceEncodedBytesExceeded;
         var bounded = inference_work.BoundedInvocationAllocator.init(alloc, invocation_limit);
         const invocation_alloc = bounded.allocator();
@@ -184,26 +221,41 @@ pub const DenseEmbedder = struct {
         };
         defer sanitized.deinit(invocation_alloc);
         const safe_items = sanitized.partsSlice();
-        const vectors = embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims) catch |err| {
-            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+        const callback_alloc = if (invocation_plan.allocator_owner == .caller)
+            invocation_alloc
+        else
+            alloc;
+        const vectors = embed_items(self.ptr, callback_alloc, embedding_name, safe_items, dims) catch |err| {
+            if (invocation_plan.allocator_owner == .caller and bounded.limit_exceeded)
+                return error.InferenceInvocationMemoryExceeded;
             return err;
         };
         if (vectors.len != items.len) {
             freeDenseEmbeddingBatch(alloc, vectors);
             return error.InvalidEmbeddingResponse;
         }
-        const expected_values = std.math.mul(usize, items.len, @as(usize, dims)) catch {
-            freeDenseEmbeddingBatch(alloc, vectors);
-            return error.InvalidEmbeddingResponse;
-        };
         var actual_values: usize = 0;
-        for (vectors) |vector| actual_values = std.math.add(usize, actual_values, vector.len) catch {
-            freeDenseEmbeddingBatch(alloc, vectors);
-            return error.InvalidEmbeddingResponse;
-        };
-        if (actual_values != expected_values) {
-            freeDenseEmbeddingBatch(alloc, vectors);
-            return error.InvalidEmbeddingResponse;
+        for (vectors) |vector| {
+            if (vector.len != dims) {
+                freeDenseEmbeddingBatch(alloc, vectors);
+                return error.InvalidEmbeddingDimensions;
+            }
+            for (vector) |value| if (!std.math.isFinite(value)) {
+                freeDenseEmbeddingBatch(alloc, vectors);
+                return error.InvalidEmbeddingResponse;
+            };
+            const item_bytes = std.math.mul(usize, vector.len, @sizeOf(f32)) catch {
+                freeDenseEmbeddingBatch(alloc, vectors);
+                return error.InvalidEmbeddingResponse;
+            };
+            if (item_bytes > invocation_plan.max_result_bytes_per_item) {
+                freeDenseEmbeddingBatch(alloc, vectors);
+                return error.InferenceResultTooLarge;
+            }
+            actual_values = std.math.add(usize, actual_values, vector.len) catch {
+                freeDenseEmbeddingBatch(alloc, vectors);
+                return error.InvalidEmbeddingResponse;
+            };
         }
         const result_bytes = std.math.mul(usize, actual_values, @sizeOf(f32)) catch {
             freeDenseEmbeddingBatch(alloc, vectors);
@@ -222,53 +274,96 @@ pub const DenseEmbedder = struct {
     }
 };
 
-fn invocationPlanningMime(parts: []const template_mod.ContentPart) ![]const u8 {
-    var media_mime: ?[]const u8 = null;
-    for (parts) |part| switch (part) {
-        .binary => |binary| {
-            if (binary.mime_type.len == 0) return error.UnsupportedInferenceMimeType;
-            try mergeInvocationPlanningMime(&media_mime, binary.mime_type);
-        },
-        .media_url => |url| {
-            if (try inference_work.parseInlineDataUri(url)) |parsed| {
-                try mergeInvocationPlanningMime(&media_mime, parsed.mime_type);
-            } else try mergeInvocationPlanningMime(&media_mime, "image/png");
-        },
-        .text => {},
-    };
-    return media_mime orelse "text/plain";
+fn jsonStringUpperBound(value: []const u8) !usize {
+    const escaped = std.math.mul(usize, value.len, 6) catch
+        return error.InferenceEncodedBytesExceeded;
+    return std.math.add(usize, escaped, 2) catch
+        error.InferenceEncodedBytesExceeded;
 }
 
-fn mergeInvocationPlanningMime(current: *?[]const u8, next: []const u8) !void {
-    if (current.*) |known| {
-        if (!std.ascii.eqlIgnoreCase(known, next))
-            return error.InferenceInvocationMemoryUnavailable;
-    } else current.* = next;
+fn densePartInvocationShape(parts: []const template_mod.ContentPart) !DensePartInvocationShape {
+    var item_envelope_json_bytes: usize = 0;
+    var string_json_bytes: usize = 0;
+    for (parts) |part| switch (part) {
+        .binary => |binary| {
+            _ = inference_work.mimeTypeEssence(binary.mime_type) catch
+                return error.UnsupportedInferenceMimeType;
+            item_envelope_json_bytes = std.math.add(
+                usize,
+                item_envelope_json_bytes,
+                "{\"type\":\"media\",\"data\":\"\",\"mime_type\":}".len,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            string_json_bytes = std.math.add(
+                usize,
+                string_json_bytes,
+                try jsonStringUpperBound(binary.mime_type),
+            ) catch return error.InferenceEncodedBytesExceeded;
+        },
+        .media_url => |url| {
+            item_envelope_json_bytes = std.math.add(
+                usize,
+                item_envelope_json_bytes,
+                "{\"type\":\"image_url\",\"image_url\":{\"url\":}}".len,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            string_json_bytes = std.math.add(
+                usize,
+                string_json_bytes,
+                try jsonStringUpperBound(url),
+            ) catch return error.InferenceEncodedBytesExceeded;
+        },
+        .text => |text| {
+            item_envelope_json_bytes = std.math.add(
+                usize,
+                item_envelope_json_bytes,
+                "{\"type\":\"text\",\"text\":}".len,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            string_json_bytes = std.math.add(
+                usize,
+                string_json_bytes,
+                try jsonStringUpperBound(text),
+            ) catch return error.InferenceEncodedBytesExceeded;
+        },
+    };
+    return .{
+        .item_count = parts.len,
+        .item_envelope_json_bytes = item_envelope_json_bytes,
+        .string_json_bytes = string_json_bytes,
+        .preparation_bytes = try contentPartPreparationBytes(parts),
+    };
 }
 
 fn contentPartPreparationBytes(parts: []const template_mod.ContentPart) !usize {
     var total: usize = 0;
+    var has_invalid_text = false;
     for (parts) |part| switch (part) {
         .text => |value| {
-            // Invalid UTF-8 can expand to one three-byte replacement scalar per
-            // source byte; JSON serialization can then escape every byte.
+            if (std.unicode.utf8ValidateSlice(value)) continue;
+            has_invalid_text = true;
+            // The repair helper sizes exactly before allocating. Invalid UTF-8
+            // can still expand to one three-byte replacement scalar per source
+            // byte, so reserve that complete final buffer.
             const sanitized = std.math.mul(usize, value.len, 3) catch
-                return error.InferenceEncodedBytesExceeded;
-            const serialized = std.math.mul(usize, sanitized, 6) catch
                 return error.InferenceEncodedBytesExceeded;
             total = std.math.add(usize, total, sanitized) catch
                 return error.InferenceEncodedBytesExceeded;
-            total = std.math.add(usize, total, serialized) catch
-                return error.InferenceEncodedBytesExceeded;
         },
-        .media_url => |value| {
-            const serialized = std.math.mul(usize, value.len, 6) catch
-                return error.InferenceEncodedBytesExceeded;
-            total = std.math.add(usize, total, serialized) catch
-                return error.InferenceEncodedBytesExceeded;
-        },
+        .media_url => {},
         .binary => {},
     };
+    if (has_invalid_text) {
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, parts.len, @sizeOf(template_mod.ContentPart)) catch
+                return error.InferenceEncodedBytesExceeded,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, parts.len, @sizeOf(?[]u8)) catch
+                return error.InferenceEncodedBytesExceeded,
+        ) catch return error.InferenceEncodedBytesExceeded;
+    }
     return total;
 }
 
@@ -772,11 +867,12 @@ test "media part item embedding enforces its result contract" {
             return out;
         }
 
-        fn memory(_: *anyopaque, _: []const u8, _: usize, _: []const u8, _: u32) !DensePartInvocationMemory {
+        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32) !DensePartInvocationMemory {
             return .{
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 64,
                 .allocator_limit_bytes = 64,
+                .max_result_bytes_per_item = 3,
                 .max_result_bytes = 3,
             };
         }
@@ -802,4 +898,120 @@ test "media part item embedding enforces its result contract" {
         error.InferenceResultTooLarge,
         embedder.embedDensePartItems(std.testing.allocator, "images", &url_parts, 1),
     );
+}
+
+test "media part item embedding validates each vector shape and values" {
+    const Context = struct { non_finite: bool = false };
+    const Stub = struct {
+        fn dense(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            return try alloc.alloc(f32, dims);
+        }
+
+        fn items(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32) ![]const []const f32 {
+            const context: *Context = @ptrCast(@alignCast(ptr));
+            const out = try alloc.alloc([]const f32, 2);
+            errdefer alloc.free(out);
+            out[0] = try alloc.alloc(f32, if (context.non_finite) 2 else 1);
+            errdefer alloc.free(@constCast(out[0]));
+            out[1] = try alloc.alloc(f32, if (context.non_finite) 2 else 3);
+            @memset(@constCast(out[0]), 0);
+            @memset(@constCast(out[1]), 0);
+            if (context.non_finite) @constCast(out[1])[0] = std.math.nan(f32);
+            return out;
+        }
+
+        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32) !DensePartInvocationMemory {
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 256,
+                .allocator_limit_bytes = 256,
+                .max_result_bytes_per_item = 16,
+                .max_result_bytes = 32,
+            };
+        }
+    };
+    var context = Context{};
+    const embedder: DenseEmbedder = .{
+        .ptr = &context,
+        .dense_embed_fn = Stub.dense,
+        .dense_embed_part_items_fn = Stub.items,
+        .part_invocation_memory_fn = Stub.memory,
+    };
+    const parts = [_]template_mod.ContentPart{
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{1} } },
+        .{ .binary = .{ .mime_type = "image/jpeg", .data = &.{2} } },
+    };
+    try std.testing.expectError(
+        error.InvalidEmbeddingDimensions,
+        embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 2),
+    );
+    context.non_finite = true;
+    try std.testing.expectError(
+        error.InvalidEmbeddingResponse,
+        embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 2),
+    );
+}
+
+test "media part item embedding uses concrete executor-owned admission" {
+    const Stub = struct {
+        fn dense(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            return try alloc.alloc(f32, dims);
+        }
+
+        fn items(_: *anyopaque, alloc: Allocator, _: []const u8, parts: []const template_mod.ContentPart, dims: u32) ![]const []const f32 {
+            const scratch = try alloc.alloc(u8, 4096);
+            defer alloc.free(scratch);
+            const out = try alloc.alloc([]const f32, parts.len);
+            errdefer alloc.free(out);
+            for (out, 0..) |*vector, i| {
+                vector.* = alloc.alloc(f32, dims) catch |err| {
+                    for (out[0..i]) |initialized| alloc.free(initialized);
+                    return err;
+                };
+                @memset(@constCast(vector.*), 0);
+            }
+            return out;
+        }
+
+        fn memory(_: *anyopaque, _: []const u8, shape: DensePartInvocationShape, dims: u32) !DensePartInvocationMemory {
+            const per_item = @as(usize, dims) * @sizeOf(f32);
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 64,
+                .allocator_limit_bytes = 64,
+                .allocator_owner = .executor,
+                .max_result_bytes_per_item = per_item,
+                .max_result_bytes = per_item * shape.item_count,
+            };
+        }
+    };
+    var context: u8 = 0;
+    const embedder: DenseEmbedder = .{
+        .ptr = &context,
+        .dense_embed_fn = Stub.dense,
+        .dense_embed_part_items_fn = Stub.items,
+        .part_invocation_memory_fn = Stub.memory,
+    };
+    const parts = [_]template_mod.ContentPart{.{
+        .binary = .{ .mime_type = "image/png; charset=binary", .data = &.{1} },
+    }};
+    const vectors = try embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 1);
+    defer freeDenseEmbeddingBatch(std.testing.allocator, vectors);
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+}
+
+test "media part item embedding planning preserves heterogeneous MIME accounting" {
+    const parts = [_]template_mod.ContentPart{
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{1} } },
+        .{ .binary = .{ .mime_type = "audio/wav; codecs=pcm", .data = &.{2} } },
+    };
+    const shape = try densePartInvocationShape(&parts);
+    try std.testing.expectEqual(@as(usize, 2), shape.item_count);
+    try std.testing.expect(shape.string_json_bytes >= "image/png".len + "audio/wav; codecs=pcm".len);
+    try std.testing.expectEqual(@as(usize, 0), shape.preparation_bytes);
+
+    const invalid_text = [_]template_mod.ContentPart{.{ .text = &.{0xff} }};
+    const repaired_shape = try densePartInvocationShape(&invalid_text);
+    try std.testing.expect(repaired_shape.preparation_bytes >=
+        @sizeOf(template_mod.ContentPart) + @sizeOf(?[]u8) + 3);
 }

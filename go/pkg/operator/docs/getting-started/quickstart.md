@@ -192,7 +192,7 @@ curl -X POST http://localhost:12377/api/v1/tables/my-table/query \
   -d '{"full_text_search": {"query": "Hello"}}'
 ```
 
-For full API documentation, see the [API Reference](/docs/api). Client SDKs for Go, TypeScript, Python, and Rust are listed on the [SDKs page](/docs/sdks).
+For full API documentation, see the [API Reference](/docs/api/getting-started). Client SDKs are available for [Go](https://github.com/antflydb/antfly/tree/main/pkg), [TypeScript](https://github.com/antflydb/antfly/tree/main/ts), and [Python](https://github.com/antflydb/antfly/tree/main/py).
 
 ## Step 6: Clean Up
 

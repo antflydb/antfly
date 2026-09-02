@@ -10,6 +10,8 @@
 const std = @import("std");
 const data_uri = @import("antfly_scraping").data_uri;
 
+pub const mimeTypeEssence = data_uri.mediaTypeEssence;
+
 pub const Task = enum {
     read,
     generate,
@@ -89,14 +91,15 @@ pub const MimeTypes = packed struct(u16) {
     _reserved: u8 = 0,
 
     pub fn accepts(self: MimeTypes, content_type: []const u8) bool {
-        if (std.ascii.eqlIgnoreCase(content_type, "text/plain")) return self.text_plain;
-        if (std.ascii.eqlIgnoreCase(content_type, "application/json")) return self.application_json;
-        if (std.ascii.eqlIgnoreCase(content_type, "application/pdf")) return self.application_pdf;
-        if (std.ascii.eqlIgnoreCase(content_type, "image/png")) return self.image_png;
-        if (std.ascii.eqlIgnoreCase(content_type, "image/jpeg") or std.ascii.eqlIgnoreCase(content_type, "image/jpg")) return self.image_jpeg;
-        if (std.ascii.eqlIgnoreCase(content_type, "image/webp")) return self.image_webp;
-        if (std.ascii.eqlIgnoreCase(content_type, "audio/wav") or std.ascii.eqlIgnoreCase(content_type, "audio/x-wav")) return self.audio_wav;
-        if (std.ascii.eqlIgnoreCase(content_type, "audio/mpeg")) return self.audio_mpeg;
+        const essence = data_uri.mediaTypeEssence(content_type) catch return false;
+        if (std.ascii.eqlIgnoreCase(essence, "text/plain")) return self.text_plain;
+        if (std.ascii.eqlIgnoreCase(essence, "application/json")) return self.application_json;
+        if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) return self.application_pdf;
+        if (std.ascii.eqlIgnoreCase(essence, "image/png")) return self.image_png;
+        if (std.ascii.eqlIgnoreCase(essence, "image/jpeg") or std.ascii.eqlIgnoreCase(essence, "image/jpg")) return self.image_jpeg;
+        if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return self.image_webp;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/wav") or std.ascii.eqlIgnoreCase(essence, "audio/x-wav")) return self.audio_wav;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/mpeg")) return self.audio_mpeg;
         return false;
     }
 };
@@ -315,26 +318,49 @@ pub const AttachmentTransport = enum {
     }
 };
 
-/// Complete route-owned memory contract for one invocation. `fixed_bytes`
+/// Complete public-boundary memory contract for one invocation. `fixed_bytes`
 /// excludes the caller-retained raw attachments and the representation
-/// described by `attachment_transport`; it includes every other bounded peak
-/// (request envelopes, parser/transport scratch, response bodies, and typed
-/// results). Media planners must obtain this from the resolved executor rather
-/// than guessing from a provider or model family.
+/// described by `attachment_transport`; it includes every other peak owned by
+/// this boundary (request envelopes, parser/transport scratch, response bodies,
+/// and typed results). When `allocator_owner` is `.executor`, decoder/model
+/// working memory is deliberately admitted by that concrete executor and is
+/// not double-charged here. Media planners must obtain this contract from the
+/// resolved route rather than guessing from a provider or model family.
+pub const InvocationAllocatorOwner = enum {
+    /// The public boundary applies `allocator_limit_bytes` to the complete
+    /// callback. This is appropriate for adapters whose allocations all flow
+    /// through the supplied allocator (for example, an HTTP JSON adapter).
+    caller,
+    /// The concrete executor owns callback admission and hard internal caps.
+    /// The public boundary still bounds its preparation work and validates the
+    /// returned values, but must not impose an incomplete outer estimate on a
+    /// decoder/model allocator. In-process inference nodes use this contract
+    /// for the same reason as distributed inference nodes.
+    executor,
+};
+
 pub const InvocationMemoryPlan = struct {
     attachment_transport: AttachmentTransport,
     fixed_bytes: usize,
-    /// Hard ceiling for allocations performed through the executor's caller
-    /// allocator. Media-capable public executor boundaries wrap the supplied
-    /// allocator with this limit, so a stale or low estimate fails closed.
+    /// Hard ceiling for allocations owned by this public boundary. With caller
+    /// ownership it wraps the complete callback; with executor ownership it is
+    /// the caller-side planning ceiling while the executor applies its own
+    /// admission and hard caps and returned results are validated separately.
     allocator_limit_bytes: usize = 0,
+    allocator_owner: InvocationAllocatorOwner = .caller,
+    /// Maximum bytes retained by any one successful logical result.
+    max_result_bytes_per_item: usize = 0,
     /// Maximum aggregate bytes retained in successful logical results.
     max_result_bytes: usize = 0,
 
     pub fn validate(self: InvocationMemoryPlan) !void {
-        if (self.allocator_limit_bytes == 0 or self.max_result_bytes == 0)
+        if (self.allocator_limit_bytes == 0 or self.max_result_bytes_per_item == 0 or self.max_result_bytes == 0)
             return error.InvalidInferenceInvocationMemory;
-        if (self.allocator_limit_bytes > self.fixed_bytes or self.max_result_bytes > self.allocator_limit_bytes)
+        if (self.allocator_limit_bytes > self.fixed_bytes or
+            self.max_result_bytes_per_item > self.max_result_bytes or
+            self.max_result_bytes > self.fixed_bytes)
+            return error.InvalidInferenceInvocationMemory;
+        if (self.allocator_owner == .caller and self.max_result_bytes > self.allocator_limit_bytes)
             return error.InvalidInferenceInvocationMemory;
     }
 };
@@ -616,7 +642,8 @@ pub const Attachment = struct {
 
     pub fn validate(self: Attachment) !void {
         if (self.bytes.len == 0) return error.EmptyInferenceAttachment;
-        if (!validContentType(self.content_type)) return error.InvalidInferenceAttachmentContentType;
+        _ = data_uri.mediaTypeEssence(self.content_type) catch
+            return error.InvalidInferenceAttachmentContentType;
     }
 };
 
@@ -680,14 +707,6 @@ pub fn WorkItemResult(comptime T: type) type {
     };
 }
 
-fn validContentType(value: []const u8) bool {
-    if (value.len < 3 or std.mem.indexOfScalar(u8, value, '/') == null) return false;
-    for (value) |byte| {
-        if (std.ascii.isWhitespace(byte) or byte < 0x21 or byte == 0x7f) return false;
-    }
-    return true;
-}
-
 fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -714,6 +733,22 @@ test "inference capabilities distinguish native and compatibility batches" {
     };
     try compatibility.validate();
     try std.testing.expect(!compatibility.batch.executesNatively(8));
+}
+
+test "inference capabilities MIME admission uses a validated parameter-insensitive essence" {
+    const accepted = MimeTypes{ .image_png = true };
+    try std.testing.expect(accepted.accepts(" Image/PNG ; charset=binary"));
+    try std.testing.expect(!accepted.accepts("image/png\r\nX-Evil: yes"));
+    try std.testing.expect(!accepted.accepts("image"));
+
+    try (Attachment{
+        .bytes = &.{1},
+        .content_type = "image/png; charset=binary",
+    }).validate();
+    try std.testing.expectError(
+        error.InvalidInferenceAttachmentContentType,
+        (Attachment{ .bytes = &.{1}, .content_type = "image/png\ninvalid" }).validate(),
+    );
 }
 
 test "attachment transport separates wire and peak resident representations" {

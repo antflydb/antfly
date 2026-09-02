@@ -10987,7 +10987,7 @@ fn processPdfPageImageEmbedding(
         const requests = try runtime.alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
         defer runtime.alloc.free(requests);
         const available_bytes = @min(try coordinator.availableRenderBytes(), render_config.pdf_render_max_inflight_bytes);
-        const invocation_memory = try dense_embedder.partInvocationMemory(
+        const invocation_memory = try dense_embedder.partInvocationMemoryForMime(
             embedding_name,
             count,
             "image/png",
@@ -15984,7 +15984,24 @@ test "document extraction generated OCR bypasses unsupported native batch" {
                     .produce = produce,
                     .produce_batch = produceBatch,
                     .can_produce_batch = canProduceBatch,
+                    .invocation_memory_for_requests = invocationMemory,
                 },
+            };
+        }
+
+        fn invocationMemory(
+            _: *anyopaque,
+            _: Allocator,
+            requests: []const asset_producer_mod.Request,
+        ) !inference_work.InvocationMemoryPlan {
+            const result_bytes = std.math.mul(usize, @max(requests.len, 1), 1024) catch
+                return error.InferenceEncodedBytesExceeded;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = result_bytes,
+                .allocator_limit_bytes = result_bytes,
+                .max_result_bytes_per_item = 1024,
+                .max_result_bytes = result_bytes,
             };
         }
 

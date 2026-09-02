@@ -81,6 +81,25 @@ pub fn parseRequired(value: []const u8) !Parsed {
     return (try parse(value)) orelse error.InvalidDataUri;
 }
 
+/// Return the normalized policy-relevant portion of a Content-Type value.
+///
+/// MIME parameters are transport metadata, not a different model input type:
+/// `image/png` and `image/png; charset=binary` must therefore make the same
+/// admission decision. Keep this parser shared with data-URI handling so MIME
+/// syntax does not drift between attachment validation and capability checks.
+pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return error.InvalidMediaType;
+    for (trimmed) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f)
+            return error.InvalidMediaType;
+    }
+    const end = std.mem.indexOfScalar(u8, trimmed, ';') orelse trimmed.len;
+    const essence = std.mem.trim(u8, trimmed[0..end], " \t");
+    if (!validMediaTypeEssence(essence)) return error.InvalidMediaType;
+    return essence;
+}
+
 pub fn decodeAlloc(alloc: std.mem.Allocator, value: []const u8) !Decoded {
     const parsed = try parseRequired(value);
     const effective_media_type = if (parsed.has_explicit_media_type)

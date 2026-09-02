@@ -12801,9 +12801,11 @@ fn validateDirectExtractionRequest(request: extracting_api.Request) !void {
     for (request.attachments) |attachment| {
         if (attachment.input_index >= request.inputs.len or attachment.bytes.len == 0)
             return error.InvalidExtractionAttachment;
-        if (!std.mem.eql(u8, attachment.mime_type, "image/png") and
-            !std.mem.eql(u8, attachment.mime_type, "image/jpeg") and
-            !std.mem.eql(u8, attachment.mime_type, "image/webp"))
+        const essence = scraping.data_uri.mediaTypeEssence(attachment.mime_type) catch
+            return error.UnsupportedInput;
+        if (!std.ascii.eqlIgnoreCase(essence, "image/png") and
+            !std.ascii.eqlIgnoreCase(essence, "image/jpeg") and
+            !std.ascii.eqlIgnoreCase(essence, "image/webp"))
             return error.UnsupportedInput;
         attachment_counts[attachment.input_index] += 1;
         if (attachment_counts[attachment.input_index] > 1) return error.InferenceMediaPartLimitExceeded;
@@ -21680,12 +21682,9 @@ fn decodeMediaDataWithBudget(
 fn mediaMimeMatches(declared: ?[]const u8, embedded: ?[]const u8) bool {
     const embedded_mime = embedded orelse return true;
     const declared_mime = declared orelse return true;
-    return std.ascii.eqlIgnoreCase(trimMimeParametersLocal(declared_mime), trimMimeParametersLocal(embedded_mime));
-}
-
-fn trimMimeParametersLocal(value: []const u8) []const u8 {
-    const semi = std.mem.indexOfScalar(u8, value, ';') orelse return std.mem.trim(u8, value, &std.ascii.whitespace);
-    return std.mem.trim(u8, value[0..semi], &std.ascii.whitespace);
+    const declared_essence = scraping.data_uri.mediaTypeEssence(declared_mime) catch return false;
+    const embedded_essence = scraping.data_uri.mediaTypeEssence(embedded_mime) catch return false;
+    return std.ascii.eqlIgnoreCase(declared_essence, embedded_essence);
 }
 
 fn unsupportedAudioResponse(ctx: *httpx.Context, message: []const u8) !httpx.Response {

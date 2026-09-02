@@ -62273,6 +62273,7 @@ const TestAssetProducer = struct {
             .attachment_transport = .data_uri,
             .fixed_bytes = 16 << 20,
             .allocator_limit_bytes = 16 << 20,
+            .max_result_bytes_per_item = 8 << 20,
             .max_result_bytes = 8 << 20,
         };
     }
@@ -62465,6 +62466,7 @@ test "db asset producer enrichments batch compatible generated assets" {
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
                 },
             };
         }
@@ -62559,6 +62561,7 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
                 },
             };
         }
@@ -71674,7 +71677,10 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
 
     const FailingProducer = struct {
         fn producer(self: *@This()) asset_producer_mod.Producer {
-            return .{ .ptr = self, .vtable = &.{ .produce = produce } };
+            return .{ .ptr = self, .vtable = &.{
+                .produce = produce,
+                .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+            } };
         }
 
         fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
@@ -71753,7 +71759,24 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         calls: usize = 0,
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
-            return .{ .ptr = self, .vtable = &.{ .produce = produce } };
+            return .{ .ptr = self, .vtable = &.{
+                .produce = produce,
+                .invocation_memory_for_requests = invocationMemory,
+            } };
+        }
+
+        fn invocationMemory(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const asset_producer_mod.Request,
+        ) !inference_work.InvocationMemoryPlan {
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 1,
+                .allocator_limit_bytes = 1,
+                .max_result_bytes_per_item = 1,
+                .max_result_bytes = 1,
+            };
         }
 
         fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {

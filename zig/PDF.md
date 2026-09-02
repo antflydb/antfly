@@ -809,13 +809,16 @@ document. They are architectural requirements, not Florence-specific cleanup:
     own outer ceiling and the route ceiling, so the planner and transport
     enforce the same value.
 80. **The invocation plan described an estimate as a complete contract.** Every
-    media plan now publishes both an executor-allocator ceiling and an aggregate
-    result ceiling. Public media producer and part-item embedder entry points
-    execute through a freeing peak-live bounded allocator and reject oversized
-    returned results. The per-task defaults are policy, not guesses: reader,
-    generator, extractor, transcriber, copy, and document-extraction limits are
-    independently configurable on the asset runtime. A route that needs a
-    larger result must raise and reserve that explicit hard limit.
+    media plan now identifies the allocator owner and publishes independent
+    per-item and aggregate result ceilings. Caller-owned adapters execute
+    through a freeing peak-live bounded allocator. A linked or distributed
+    inference node instead owns decoder/model admission and hard caps; the host
+    does not impose an incomplete second allocator ceiling around it, but still
+    validates returned cardinality and result bytes. The per-task defaults are
+    policy, not guesses: reader, generator, extractor, transcriber, copy, and
+    document-extraction limits are independently configurable on the asset
+    runtime. A route that needs a larger result must raise and reserve that
+    explicit hard limit.
 81. **Callers could bypass media admission by invoking the executor directly.**
     `Producer.produce`, `produceBatch`, `produceBatchReported`, and
     `DenseEmbedder.embedDensePartItems` now resolve the concrete route plan
@@ -869,9 +872,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     attachment. It now resolves the concrete route before sanitization for
     text, network URL, inline data URI, and binary items alike. Sanitized text,
     serialized URL/content-part upper bounds, transport copies, provider
-    allocations, returned cardinality, vector dimensions, and aggregate vector
-    bytes all execute under one freeing live-allocation ceiling. A URL-only
-    embedder without a route plan fails closed.
+    allocations, returned cardinality, per-vector dimensions and finiteness,
+    per-item bytes, and aggregate vector bytes are all enforced at the public
+    boundary. A URL-only embedder without a route plan fails closed.
 89. **Data-URI classification could disagree with RFC 2397 decoding.** Several
     call sites tested a case-sensitive `data:` prefix before calling the shared
     case-insensitive parser. Uppercase schemes could therefore be classified as
@@ -900,6 +903,55 @@ document. They are architectural requirements, not Florence-specific cleanup:
     when the caller/client/provider outer cap is smaller. Execution validates
     the effective logical ceiling, so a request is never admitted under a
     result promise its transport cannot carry.
+92. **Local inference was hard-bounded by an incomplete host estimate.** The
+    local dense-embedding plan reserved vectors plus a small control allowance,
+    then used that value to cap manifest parsing, URL download, media decode,
+    preprocessing, model execution, and results. Valid local PDF pages and URL
+    inputs could therefore fail before the inference node's real admission ran.
+    `InvocationMemoryPlan` now explicitly distinguishes caller-owned adapters
+    from executor-owned inference. HTTP adapters remain hard-bounded by the
+    supplied allocator; linked local and distributed nodes use their concrete
+    decoder/model admission, media caps, deadline, and result caps. This makes
+    the same ownership rule apply whether the node is in-process or remote.
+    Executor ownership is an explicit `AntflyProvider` guarantee; arbitrary
+    callbacks that do not publish it fail closed rather than receiving the
+    inference node's privilege by provider name.
+93. **Legacy reader `source_text` bypassed the plan requirement.** Reader input
+    may be a URL or JSON URL list even when `media` and `source_parts_json` are
+    empty. Every model-backed producer type—reader, generator, extractor, and
+    transcriber—now requires an invocation plan regardless of which legacy
+    field carries its effective input. Copy and built-in document extraction
+    retain their non-model compatibility path; the production runtime still
+    publishes and enforces result plans for them.
+94. **Aggregate embedding dimensions allowed compensating malformed vectors.**
+    A two-item response with lengths `dims - 1` and `dims + 1` had the expected
+    total value count and passed the generic boundary. The boundary now checks
+    every vector for exact dimensions and finite values before measuring result
+    bytes, matching the managed provider validator instead of relying on it.
+95. **Per-item result policy was enforced only as a batch sum.** A single item
+    could consume another item's allowance as long as the aggregate stayed
+    below `items * bytes_per_item`. Invocation plans now carry both
+    `max_result_bytes_per_item` and `max_result_bytes`; producer values,
+    per-item reported successes, and embedding vectors must satisfy both.
+96. **MIME parameters changed capability and attachment decisions.** Exact
+    string checks rejected values such as `image/png; charset=binary`, while
+    local helpers independently stripped parameters with different validation.
+    `antfly_scraping.data_uri.mediaTypeEssence` is now the shared validated
+    authority used by capability admission, borrowed attachments, host/model
+    modality classification, linked ABI MIME matching, and direct inference
+    extraction. Parameters remain available for transport but do not invent a
+    new model input type.
+97. **Dense preprocessing accounting omitted structural and growth peaks.** An
+    invalid UTF-8 repair allocates a `ContentPart` array, an optional-owned-text
+    array, and replacement text. UTF-8 repair now computes the exact output size
+    first and allocates once, eliminating geometric growth and the transient
+    old-buffer-plus-final-slice peak. The preprocessing allowance includes each
+    remaining coexisting structure with checked arithmetic. Request JSON is no
+    longer represented by a single guessed MIME: a concrete invocation shape
+    sums each text, URL, MIME string, and variant envelope, so mixed MIME batches
+    and URL/text items publish the bytes their adapter actually writes. That
+    shape also carries the normalization peak, so scheduler admission and the
+    public executor enforce the same complete plan.
 
 ### Post-review implementation contract
 
@@ -916,18 +968,23 @@ The hardening above follows these long-term rules:
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
-- Admission receives an executor-owned `InvocationMemoryPlan`, containing the
-  selected attachment representation and the complete attachment-independent
-  peak. Media-capable producer and part-item embedder implementations fail
+- Admission receives a route-owned `InvocationMemoryPlan`, containing the
+  selected attachment representation, allocator owner, complete host-boundary
+  peak, and independent per-item and aggregate result limits. Media-capable
+  producer and part-item embedder implementations fail
   closed when this plan is absent rather than inferring it from model
   capabilities. Linked callbacks charge borrowed bytes, base64 transports
   charge exact expansion, and data-URI adapters charge the complete URI plus
-  downstream serialization copy. The plan also contains hard allocator and
-  result ceilings. Every public producer invocation from a
-  contract-publishing runtime and every part-item embedding invocation applies
-  those ceilings even when invoked outside the PDF scheduler. Structured JSON
-  parts, inline data URIs, URL-only inputs, transcription sources, and
-  non-model producers do not bypass this boundary. Provider
+  downstream serialization copy. Caller-owned adapters run under the plan's
+  hard allocator ceiling. Concrete inference nodes own decoder/model admission
+  for both local and distributed dispatch, avoiding an incomplete outer cap
+  and double charging while preserving hard node limits. Every public producer
+  invocation from a contract-publishing runtime and every part-item embedding
+  invocation applies those ceilings even when invoked outside the PDF
+  scheduler. Structured JSON parts, inline data URIs, URL-only inputs,
+  transcription sources, and non-model producers do not bypass this boundary.
+  Legacy callbacks cannot execute any model-backed producer family without a
+  plan. Provider
   wire ceilings and process resident ceilings are distinct: render planning
   reserves retained raw media, one concrete transport body, and the complete
   route-specific fixed peak for envelopes, responses, parsing, typed results,
@@ -935,16 +992,23 @@ The hardening above follows these long-term rules:
 - Route resolution and input normalization are themselves admitted work. They
   run under small request-derived preprocessing ceilings before model/provider
   execution begins; an implementation cannot allocate an unbounded parse tree
-  in order to discover what its later memory limit would have been.
+  in order to discover what its later memory limit would have been. Dense part
+  planning carries the complete heterogeneous item shape rather than a common
+  MIME guess, and UTF-8 repair uses exact allocation while accounting for its
+  structural arrays and final repaired values.
 - Inline media has one RFC 2397 authority. Scheme and encoding markers are
   case-insensitive, payload validation and decoded sizing precede allocation,
   MIME policy compares normalized essences, and materialization consumes the
   same parse contract used by admission.
+- MIME admission has one essence parser. Parameters are preserved on the wire,
+  while capability, modality, and redundant attachment checks compare the
+  validated type/subtype essence case-insensitively.
 - A result policy names logical retained bytes. Remote transport planning maps
   that policy to a conservative encoded JSON response ceiling and lowers the
   logical allowance when an outer client or provider limit is tighter. Local
   and remote result validation therefore enforce achievable limits in the same
-  unit.
+  unit. Both the per-item ceiling and aggregate batch ceiling are enforced;
+  dense vectors additionally require exact dimensions and finite values.
 - Every logical result carries the request identity. Remote indexed responses
   are reordered and validated at the transport boundary, then enriched with
   the original identity. Enrichment rejects any remaining identity mismatch.
@@ -1135,10 +1199,12 @@ The hardening above follows these long-term rules:
     Direct inference-node media decoding accepts the same validated RFC 2397
     base64 and percent forms as host preflight.
 33. **Implemented after enforcement review:** media executor plans now carry
-    hard allocator and result ceilings that public producer/embedder boundaries
-    enforce automatically; distributed generator fallback is admitted in the
-    process that executes it; provider response ceilings are operation-scoped;
-    and all inline-data consumers share the RFC 2397 parser while keeping MIME
+    explicit allocator ownership plus result ceilings. Public boundaries hard
+    bound caller-owned adapters, while linked/distributed inference nodes admit
+    their own decoder/model work and return through independently validated
+    result caps. Distributed generator fallback is admitted in the process
+    that executes it; provider response ceilings are operation-scoped; and all
+    inline-data consumers share the RFC 2397 parser while keeping MIME
     acceptance and ownership as explicit task-layer contracts.
 34. **Implemented after representation review:** producer plans cover every
     runtime invocation rather than only the binary `media` field, transcription
@@ -1148,6 +1214,14 @@ The hardening above follows these long-term rules:
     with worst-case JSON wire expansion. Batches with different tasks,
     configurations, or attachment representations cannot inherit the first
     item's plan.
+35. **Implemented after boundary-completeness review:** every model-backed
+    producer requires a plan even when legacy reader input is carried only in
+    `source_text`; result policy is enforced per item and in aggregate; dense
+    vectors are individually dimensioned and finite; heterogeneous dense-part
+    shapes account each variant/string without a common-MIME guess; UTF-8
+    repair uses an exactly sized allocation and accounts its coexisting
+    structures; and validated MIME essence handling is shared across
+    capability, host, linked, and inference-node boundaries.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

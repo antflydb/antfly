@@ -233,7 +233,7 @@ fn decodeProviderEmbeddingParts(
                 .content_type = payload.content_type.slice(),
             };
             try attachment.validate();
-            if (!std.mem.eql(u8, binary.mime_type, attachment.content_type)) return error.InvalidArguments;
+            if (!mimeEssencesEqual(binary.mime_type, attachment.content_type)) return error.InvalidArguments;
             decoded.* = .{ .binary = .{
                 .mime_type = attachment.content_type,
                 .data = attachment.bytes,
@@ -914,7 +914,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     try validateProviderAttachmentRefs(1, context.attachment_refs, context.attachment_refs_len);
                     const ref = providerAttachmentRefForItem(context.attachment_refs.?, 1, 0) orelse return error.InvalidArguments;
                     const payload = context.binary_payloads.?[ref.attachment_index];
-                    if (binary.data.len != 0 or !std.mem.eql(u8, binary.mime_type, payload.content_type.slice()))
+                    if (binary.data.len != 0 or !mimeEssencesEqual(binary.mime_type, payload.content_type.slice()))
                         return error.InvalidArguments;
                     binary.data = payload.bytes.slice();
                 },
@@ -1484,13 +1484,13 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
         },
         .binary => |media| {
             try capabilities.validateMimeType(media.mime_type);
-            if (std.ascii.startsWithIgnoreCase(media.mime_type, "image/")) {
+            if (mimeEssenceStartsWith(media.mime_type, "image/")) {
                 shape.modalities.image = true;
-            } else if (std.ascii.startsWithIgnoreCase(media.mime_type, "audio/")) {
+            } else if (mimeEssenceStartsWith(media.mime_type, "audio/")) {
                 shape.modalities.audio = true;
-            } else if (std.ascii.eqlIgnoreCase(media.mime_type, "application/pdf")) {
+            } else if (mimeEssencesEqual(media.mime_type, "application/pdf")) {
                 shape.modalities.document = true;
-            } else if (std.ascii.eqlIgnoreCase(media.mime_type, "text/plain")) {
+            } else if (mimeEssencesEqual(media.mime_type, "text/plain")) {
                 shape.modalities.text = true;
             } else return error.UnsupportedInferenceMimeType;
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
@@ -1869,7 +1869,7 @@ fn inspectLocalGenerateDataUri(
         const parsed = (try antfly.inference.work.parseInlineDataUri(raw)) orelse
             return error.UnsupportedGeneratorProvider;
         if (declared_mime_type) |declared| {
-            if (!std.ascii.eqlIgnoreCase(mimeEssence(declared), parsed.mime_type))
+            if (!mimeEssencesEqual(declared, parsed.mime_type))
                 return error.UnsupportedGeneratorProvider;
         }
         mime_type = parsed.mime_type;
@@ -1889,9 +1889,15 @@ fn inspectLocalGenerateDataUri(
     };
 }
 
-fn mimeEssence(value: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
-    return std.mem.trim(u8, value[0..end], &std.ascii.whitespace);
+fn mimeEssencesEqual(a: []const u8, b: []const u8) bool {
+    const a_essence = antfly.inference.work.mimeTypeEssence(a) catch return false;
+    const b_essence = antfly.inference.work.mimeTypeEssence(b) catch return false;
+    return std.ascii.eqlIgnoreCase(a_essence, b_essence);
+}
+
+fn mimeEssenceStartsWith(value: []const u8, prefix: []const u8) bool {
+    const essence = antfly.inference.work.mimeTypeEssence(value) catch return false;
+    return std.ascii.startsWithIgnoreCase(essence, prefix);
 }
 
 fn addLocalGenerateBytes(total: *usize, amount: usize) !void {
@@ -1903,8 +1909,8 @@ fn addLocalGenerateMediaPreflight(
     descriptor: LocalGenerateMediaDescriptor,
     image_only: bool,
 ) !void {
-    const is_image = std.ascii.startsWithIgnoreCase(descriptor.mime_type, "image/");
-    const is_audio = std.ascii.startsWithIgnoreCase(descriptor.mime_type, "audio/");
+    const is_image = mimeEssenceStartsWith(descriptor.mime_type, "image/");
+    const is_audio = mimeEssenceStartsWith(descriptor.mime_type, "audio/");
     if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
 
     try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
@@ -1946,10 +1952,7 @@ fn preflightLocalGenerateMessagesInternal(
                         if (attachment_index >= attachments.?.len) return error.InvalidArguments;
                         const attachment = attachments.?[attachment_index];
                         try attachment.validate();
-                        if (media.mime_type.len > 0 and !std.ascii.eqlIgnoreCase(
-                            mimeEssence(media.mime_type),
-                            mimeEssence(attachment.content_type),
-                        ))
+                        if (media.mime_type.len > 0 and !mimeEssencesEqual(media.mime_type, attachment.content_type))
                             return error.InvalidArguments;
                         try addLocalGenerateMediaPreflight(&preflight, .{
                             .payload = attachment.bytes,
@@ -2062,7 +2065,7 @@ fn convertLocalGenerateParts(
                 const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (!std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/")) {
+                if (!mimeEssenceStartsWith(decoded.mime_type, "image/")) {
                     return error.UnsupportedGeneratorProvider;
                 }
                 try images.append(alloc, decoded.data);
@@ -2076,16 +2079,13 @@ fn convertLocalGenerateParts(
                     if (attachment_index.* >= attachments.?.len) return error.InvalidArguments;
                     const attachment = attachments.?[attachment_index.*];
                     try attachment.validate();
-                    if (media.mime_type.len > 0 and !std.ascii.eqlIgnoreCase(
-                        mimeEssence(media.mime_type),
-                        mimeEssence(attachment.content_type),
-                    ))
+                    if (media.mime_type.len > 0 and !mimeEssencesEqual(media.mime_type, attachment.content_type))
                         return error.InvalidArguments;
                     try decode_budget.reserve(attachment.bytes.len);
-                    if (std.ascii.startsWithIgnoreCase(attachment.content_type, "image/")) {
+                    if (mimeEssenceStartsWith(attachment.content_type, "image/")) {
                         try images.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .image = images.items.len - 1 });
-                    } else if (std.ascii.startsWithIgnoreCase(attachment.content_type, "audio/")) {
+                    } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
                         try audio.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     } else return error.UnsupportedGeneratorProvider;
@@ -2095,12 +2095,12 @@ fn convertLocalGenerateParts(
                 const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/")) {
+                if (mimeEssenceStartsWith(decoded.mime_type, "image/")) {
                     try images.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
-                } else if (std.ascii.startsWithIgnoreCase(decoded.mime_type, "audio/")) {
+                } else if (mimeEssenceStartsWith(decoded.mime_type, "audio/")) {
                     try audio.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
@@ -2168,7 +2168,7 @@ pub fn decodeLocalGenerateDataUri(
         var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, raw);
         errdefer decoded.deinit(alloc);
         if (decoded.data.len != descriptor.decoded_bytes or
-            !std.ascii.eqlIgnoreCase(mimeEssence(decoded.mime_type), descriptor.mime_type))
+            !mimeEssencesEqual(decoded.mime_type, descriptor.mime_type))
             return error.InvalidGenerationAdmission;
         alloc.free(decoded.mime_type);
         const data = decoded.data;

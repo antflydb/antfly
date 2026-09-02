@@ -156,6 +156,32 @@ test "asset producer runtime applies result ceilings to non-model producers" {
     );
 }
 
+fn localInvocationAllocatorOwner(
+    provider: managed_embedder.AntflyProvider,
+) !inference_work.InvocationAllocatorOwner {
+    if (!provider.owns_invocation_admission)
+        return error.InferenceInvocationMemoryUnavailable;
+    return .executor;
+}
+
+test "asset producer runtime local invocation ownership fails closed without executor admission" {
+    var context: u8 = 0;
+    var provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+    };
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        localInvocationAllocatorOwner(provider),
+    );
+    provider.owns_invocation_admission = true;
+    try std.testing.expectEqual(
+        inference_work.InvocationAllocatorOwner.executor,
+        try localInvocationAllocatorOwner(provider),
+    );
+}
+
 pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -287,6 +313,7 @@ pub const Runtime = struct {
                 return error.InferenceEncodedBytesExceeded;
         }
         var remote = false;
+        var allocator_owner: inference_work.InvocationAllocatorOwner = .caller;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction => .borrowed_binary,
             .reader => blk: {
@@ -298,6 +325,7 @@ pub const Runtime = struct {
                 remote = !isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    allocator_owner = try localInvocationAllocatorOwner(local);
                     const binary = local.read_encoded_images != null or local.read_encoded_images_reported != null;
                     if (!binary and local.read_images == null) return error.InferenceInvocationMemoryUnavailable;
                     break :blk if (binary) .borrowed_binary else .data_uri;
@@ -310,6 +338,7 @@ pub const Runtime = struct {
                 remote = parsed.generator.url.len > 0 or parsed.generator.provider != .antfly;
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    allocator_owner = try localInvocationAllocatorOwner(local);
                     if (local.generate_messages_with_attachments != null) break :blk .borrowed_binary;
                     if (local.generate_messages == null) return error.InferenceInvocationMemoryUnavailable;
                     break :blk .data_uri;
@@ -325,6 +354,7 @@ pub const Runtime = struct {
                 remote = !isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    allocator_owner = try localInvocationAllocatorOwner(local);
                     if (local.extract == null) return error.InferenceInvocationMemoryUnavailable;
                 }
                 break :blk extractorAttachmentTransport(parsed);
@@ -338,6 +368,7 @@ pub const Runtime = struct {
                 remote = !isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    allocator_owner = try localInvocationAllocatorOwner(local);
                     if (local.transcribe_audio == null) return error.InferenceInvocationMemoryUnavailable;
                 }
                 const inline_source = inference_work.hasDataUriScheme(requests[0].source_text);
@@ -362,6 +393,10 @@ pub const Runtime = struct {
             self.remoteLogicalResultLimit(requests[0].producer_type, requests.len)
         else
             configured_results;
+        const result_per_item = @min(
+            self.result_limits.forProducer(requests[0].producer_type),
+            results,
+        );
         if (results == 0) return error.InvalidInferenceInvocationMemory;
         fixed = std.math.add(usize, fixed, results) catch return error.InferenceEncodedBytesExceeded;
         var allocator_limit = fixed;
@@ -385,6 +420,8 @@ pub const Runtime = struct {
             .attachment_transport = transport,
             .fixed_bytes = fixed,
             .allocator_limit_bytes = allocator_limit,
+            .allocator_owner = allocator_owner,
+            .max_result_bytes_per_item = result_per_item,
             .max_result_bytes = results,
         };
     }
@@ -1940,16 +1977,19 @@ fn mergeInferenceModalities(
 }
 
 fn modalityForGeneratorMime(mime_type: []const u8) !inference_work.Modalities {
-    if (std.ascii.startsWithIgnoreCase(mime_type, "image/")) return .{ .image = true };
-    if (std.ascii.startsWithIgnoreCase(mime_type, "audio/")) return .{ .audio = true };
-    if (std.ascii.eqlIgnoreCase(mime_type, "text/plain")) return .{ .text = true };
-    if (std.ascii.eqlIgnoreCase(mime_type, "application/pdf")) return .{ .document = true };
+    const essence = inference_work.mimeTypeEssence(mime_type) catch
+        return error.UnsupportedInferenceMimeType;
+    if (std.ascii.startsWithIgnoreCase(essence, "image/")) return .{ .image = true };
+    if (std.ascii.startsWithIgnoreCase(essence, "audio/")) return .{ .audio = true };
+    if (std.ascii.eqlIgnoreCase(essence, "text/plain")) return .{ .text = true };
+    if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) return .{ .document = true };
     return error.UnsupportedInferenceMimeType;
 }
 
 fn validateEncodedMedia(media: asset_producer.EncodedMedia) !void {
     if (media.bytes.len == 0) return error.InvalidInferenceMedia;
-    if (media.mime_type.len == 0) return error.UnsupportedInferenceMimeType;
+    _ = inference_work.mimeTypeEssence(media.mime_type) catch
+        return error.UnsupportedInferenceMimeType;
 }
 
 test "asset producer runtime rejects empty borrowed media" {
@@ -3575,6 +3615,7 @@ test "asset producer runtime passes rendered bytes to embedded generators withou
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .generate_messages_with_attachments = generate,
@@ -3887,6 +3928,7 @@ test "owned asset producer foreground contract follows the selected route" {
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
@@ -4185,6 +4227,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
@@ -4247,6 +4290,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
@@ -4327,6 +4371,7 @@ test "asset producer runtime batches local encoded media without base64 adaptati
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
@@ -4496,6 +4541,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .read_images = readImages,
@@ -4595,6 +4641,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .transcribe_audio = transcribeAudio,
@@ -4684,6 +4731,7 @@ test "asset producer runtime routes antfly transcriber without url to local prov
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .transcribe_audio = transcribeAudio,
@@ -4742,6 +4790,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .extract = extract,
@@ -4816,6 +4865,7 @@ test "asset producer runtime batches compatible antfly extractor requests" {
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
+                .owns_invocation_admission = true,
                 .embed_dense_texts = embedDense,
                 .embed_sparse_texts = embedSparse,
                 .extract = extract,

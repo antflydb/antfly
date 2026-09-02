@@ -203,6 +203,12 @@ pub const AntflyProvider = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
     ) anyerror![]u8 = null,
+    /// The concrete provider applies hard request/media/decoder/model admission
+    /// inside every model callback. Only the linked inference-node boundary may
+    /// normally set this; arbitrary callbacks fail closed when a public
+    /// invocation plan would otherwise depend on this guarantee. Keep new
+    /// boundary fields append-only so callback offsets remain stable.
+    owns_invocation_admission: bool = false,
 };
 
 pub const ClassificationRequest = struct {
@@ -1192,44 +1198,52 @@ pub const ManagedEmbedder = struct {
     fn densePartInvocationMemory(
         ptr: *anyopaque,
         embedding_name: []const u8,
-        item_count: usize,
-        mime_type: []const u8,
+        shape: db_embedder.DensePartInvocationShape,
         dims: u32,
     ) !db_embedder.DensePartInvocationMemory {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
-        const vector_values = std.math.mul(usize, item_count, @as(usize, dims)) catch
+        const vector_values = std.math.mul(usize, shape.item_count, @as(usize, dims)) catch
             return error.InferenceEncodedBytesExceeded;
         const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
             return error.InferenceEncodedBytesExceeded;
-        const item_control_bytes = std.math.mul(usize, item_count, 256) catch
+        const vector_bytes_per_item = std.math.mul(usize, @as(usize, dims), @sizeOf(f32)) catch
             return error.InferenceEncodedBytesExceeded;
-        if (entry.antfly_provider != null) return .{
-            .attachment_transport = .borrowed_binary,
-            .fixed_bytes = std.math.add(usize, vector_bytes, item_control_bytes) catch
-                return error.InferenceEncodedBytesExceeded,
-            .allocator_limit_bytes = std.math.add(usize, vector_bytes, item_control_bytes) catch
-                return error.InferenceEncodedBytesExceeded,
-            .max_result_bytes = vector_bytes,
-        };
+        const item_control_bytes = std.math.mul(usize, shape.item_count, 256) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (entry.antfly_provider) |local| {
+            if (!local.owns_invocation_admission)
+                return error.InferenceInvocationMemoryUnavailable;
+            var fixed = std.math.add(usize, vector_bytes, item_control_bytes) catch
+                return error.InferenceEncodedBytesExceeded;
+            fixed = std.math.add(usize, fixed, shape.preparation_bytes) catch
+                return error.InferenceEncodedBytesExceeded;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = fixed,
+                .allocator_limit_bytes = fixed,
+                .allocator_owner = .executor,
+                .max_result_bytes_per_item = vector_bytes_per_item,
+                .max_result_bytes = vector_bytes,
+            };
+        }
 
         const outer = std.math.add(
             usize,
             "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len,
             try jsonStringUpperBound(entry.model),
         ) catch return error.InferenceEncodedBytesExceeded;
-        const per_item = std.math.add(
+        const item_envelopes = std.math.add(
             usize,
-            "{\"type\":\"media\",\"data\":\"".len + "\",\"mime_type\":".len + "}".len,
-            try jsonStringUpperBound(mime_type),
-        ) catch return error.InferenceEncodedBytesExceeded;
-        const items = std.math.mul(usize, item_count, per_item) catch
+            shape.item_envelope_json_bytes,
+            shape.string_json_bytes,
+        ) catch
             return error.InferenceEncodedBytesExceeded;
-        const commas = if (item_count == 0) 0 else item_count - 1;
+        const commas = if (shape.item_count == 0) 0 else shape.item_count - 1;
         const request_envelope = std.math.add(
             usize,
             outer,
-            std.math.add(usize, items, commas) catch return error.InferenceEncodedBytesExceeded,
+            std.math.add(usize, item_envelopes, commas) catch return error.InferenceEncodedBytesExceeded,
         ) catch return error.InferenceEncodedBytesExceeded;
         // The HTTP response is capped at 4 MiB. Typed JSON float arrays can be
         // denser than their source text and the arena retains geometric-growth
@@ -1249,12 +1263,15 @@ pub const ManagedEmbedder = struct {
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, item_control_bytes) catch
             return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, shape.preparation_bytes) catch
+            return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, remote_embedding_transport_control_bytes) catch
             return error.InferenceEncodedBytesExceeded;
         return .{
             .attachment_transport = .base64_payload,
             .fixed_bytes = fixed,
             .allocator_limit_bytes = fixed,
+            .max_result_bytes_per_item = vector_bytes_per_item,
             .max_result_bytes = vector_bytes,
         };
     }
@@ -4181,10 +4198,12 @@ fn embedWithEntryParts(
 }
 
 fn modalityForContentType(content_type: []const u8) !inference_work.Modalities {
-    if (std.ascii.startsWithIgnoreCase(content_type, "image/")) return .{ .image = true };
-    if (std.ascii.startsWithIgnoreCase(content_type, "audio/")) return .{ .audio = true };
-    if (std.ascii.eqlIgnoreCase(content_type, "application/pdf")) return .{ .document = true };
-    if (std.ascii.eqlIgnoreCase(content_type, "text/plain")) return .{ .text = true };
+    const essence = inference_work.mimeTypeEssence(content_type) catch
+        return error.UnsupportedInferenceMimeType;
+    if (std.ascii.startsWithIgnoreCase(essence, "image/")) return .{ .image = true };
+    if (std.ascii.startsWithIgnoreCase(essence, "audio/")) return .{ .audio = true };
+    if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) return .{ .document = true };
+    if (std.ascii.eqlIgnoreCase(essence, "text/plain")) return .{ .text = true };
     return error.UnsupportedInferenceMimeType;
 }
 
@@ -4200,7 +4219,9 @@ fn denseMediaUrlWireBytes(
 ) !usize {
     const parsed_uri = (try inference_work.parseInlineDataUri(url)) orelse return 0;
     if (parsed_uri.decoded_size == 0) return error.InvalidDataURI;
-    if (!std.ascii.startsWithIgnoreCase(parsed_uri.mime_type, "image/"))
+    const essence = inference_work.mimeTypeEssence(parsed_uri.mime_type) catch
+        return error.UnsupportedInferenceMimeType;
+    if (!std.ascii.startsWithIgnoreCase(essence, "image/"))
         return error.UnsupportedInferenceMimeType;
     try capabilities.validateMimeType(parsed_uri.mime_type);
     return url.len;
@@ -6527,6 +6548,7 @@ test "managed embedder routes antfly model to local provider" {
     var local = Local{};
     const provider = AntflyProvider{
         .ptr = &local,
+        .owns_invocation_admission = true,
         .embed_dense_texts = Local.dense,
         .embed_sparse_texts = Local.sparse,
     };
@@ -6587,6 +6609,7 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     var local = Local{};
     const provider = AntflyProvider{
         .ptr = &local,
+        .owns_invocation_admission = true,
         .embed_dense_texts = Local.dense,
         .embed_dense_texts_with_context = Local.denseWithContext,
         .embed_sparse_texts = Local.sparse,
@@ -6865,6 +6888,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
         .embed_sparse_texts = Local.sparse,
         .embed_dense_parts = Local.parts,
         .model_capabilities = Local.capabilities,
+        .owns_invocation_admission = true,
     };
 
     const indexes_json =

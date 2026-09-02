@@ -206,11 +206,13 @@ pub const Producer = struct {
                 try invocationAllocatorLimit(resolved, &requests),
             );
             const bounded_alloc = bounded.allocator();
-            const output = self.vtable.produce(self.ptr, bounded_alloc, request) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            const callback_alloc = if (resolved.allocator_owner == .caller) bounded_alloc else alloc;
+            const output = self.vtable.produce(self.ptr, callback_alloc, request) catch |err| {
+                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
+                    return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
-            if (output.len > resolved.max_result_bytes) {
+            if (output.len > resolved.max_result_bytes_per_item or output.len > resolved.max_result_bytes) {
                 alloc.free(output);
                 return error.InferenceResultTooLarge;
             }
@@ -226,11 +228,13 @@ pub const Producer = struct {
                 alloc,
                 try invocationAllocatorLimit(resolved, requests),
             );
-            const outputs = self.produceBatchUnchecked(bounded.allocator(), requests) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            const callback_alloc = if (resolved.allocator_owner == .caller) bounded.allocator() else alloc;
+            const outputs = self.produceBatchUnchecked(callback_alloc, requests) catch |err| {
+                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
+                    return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
-            validateOutputBytes(outputs, resolved.max_result_bytes) catch |err| {
+            validateOutputBytes(outputs, resolved.max_result_bytes_per_item, resolved.max_result_bytes) catch |err| {
                 for (outputs) |output| if (output.len > 0) alloc.free(output);
                 alloc.free(outputs);
                 return err;
@@ -272,11 +276,17 @@ pub const Producer = struct {
                 alloc,
                 try invocationAllocatorLimit(resolved, requests),
             );
-            var batch = self.produceBatchReportedUnchecked(bounded.allocator(), requests) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            const callback_alloc = if (resolved.allocator_owner == .caller) bounded.allocator() else alloc;
+            var batch = self.produceBatchReportedUnchecked(callback_alloc, requests) catch |err| {
+                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
+                    return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
-            validateProducedResultBytes(batch.items, resolved.max_result_bytes) catch |err| {
+            validateProducedResultBytes(
+                batch.items,
+                resolved.max_result_bytes_per_item,
+                resolved.max_result_bytes,
+            ) catch |err| {
                 batch.deinit(alloc);
                 return err;
             };
@@ -377,7 +387,10 @@ pub const Producer = struct {
 fn requestsRequireInvocationContract(requests: []const Request) bool {
     for (requests) |request| {
         if (request.media.len > 0 or request.source_parts_json != null or
-            request.producer_type == .transcriber) return true;
+            switch (request.producer_type) {
+                .reader, .generator, .extractor, .transcriber => true,
+                .copy, .document_extraction => false,
+            }) return true;
     }
     return false;
 }
@@ -420,20 +433,22 @@ fn invocationAllocatorLimit(
         error.InferenceEncodedBytesExceeded;
 }
 
-fn validateOutputBytes(outputs: []const []u8, limit: usize) !void {
+fn validateOutputBytes(outputs: []const []u8, per_item_limit: usize, aggregate_limit: usize) !void {
     var total: usize = 0;
     for (outputs) |output| {
+        if (output.len > per_item_limit) return error.InferenceResultTooLarge;
         total = std.math.add(usize, total, output.len) catch return error.InferenceResultTooLarge;
-        if (total > limit) return error.InferenceResultTooLarge;
+        if (total > aggregate_limit) return error.InferenceResultTooLarge;
     }
 }
 
-fn validateProducedResultBytes(items: []const ProducedItem, limit: usize) !void {
+fn validateProducedResultBytes(items: []const ProducedItem, per_item_limit: usize, aggregate_limit: usize) !void {
     var total: usize = 0;
     for (items) |item| switch (item.result) {
         .value => |output| {
+            if (output.len > per_item_limit) return error.InferenceResultTooLarge;
             total = std.math.add(usize, total, output.len) catch return error.InferenceResultTooLarge;
-            if (total > limit) return error.InferenceResultTooLarge;
+            if (total > aggregate_limit) return error.InferenceResultTooLarge;
         },
         .item_error => {},
     };
@@ -510,6 +525,7 @@ test "asset producer enforces media allocator and result contracts at execution"
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 16,
                 .allocator_limit_bytes = 16,
+                .max_result_bytes_per_item = 4,
                 .max_result_bytes = 4,
             };
         }
@@ -552,6 +568,7 @@ test "asset producer enforces invocation contracts for non-media and source part
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 32,
                 .allocator_limit_bytes = 32,
+                .max_result_bytes_per_item = 4,
                 .max_result_bytes = 4,
             };
         }
@@ -594,6 +611,84 @@ test "asset producer enforces invocation contracts for non-media and source part
             .source_text = "file:///tmp/audio.wav",
         }),
     );
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        legacy.produce(std.testing.allocator, .{
+            .producer_type = .reader,
+            .config_json = "{}",
+            .source_text = "https://example.invalid/page.png",
+        }),
+    );
+}
+
+test "asset producer enforces invocation contracts with per-item and aggregate result ceilings" {
+    const Stub = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) ![]u8 {
+            return try alloc.alloc(u8, 5);
+        }
+
+        fn memory(_: *anyopaque, _: Allocator, requests: []const Request) !inference_work.InvocationMemoryPlan {
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 128,
+                .allocator_limit_bytes = 128,
+                .max_result_bytes_per_item = 4,
+                .max_result_bytes = 4 * requests.len,
+            };
+        }
+    };
+    var context: u8 = 0;
+    const producer = Producer{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Stub.produce,
+            .invocation_memory_for_requests = Stub.memory,
+        },
+    };
+    const requests = [_]Request{
+        .{ .producer_type = .reader, .config_json = "{}", .source_text = "a" },
+        .{ .producer_type = .reader, .config_json = "{}", .source_text = "b" },
+    };
+    try std.testing.expectError(
+        error.InferenceResultTooLarge,
+        producer.produceBatch(std.testing.allocator, &requests),
+    );
+}
+
+test "asset producer enforces invocation contracts with executor-owned admission" {
+    const Stub = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) ![]u8 {
+            const scratch = try alloc.alloc(u8, 4096);
+            defer alloc.free(scratch);
+            return try alloc.alloc(u8, 1);
+        }
+
+        fn memory(_: *anyopaque, _: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = 64,
+                .allocator_limit_bytes = 64,
+                .allocator_owner = .executor,
+                .max_result_bytes_per_item = 1,
+                .max_result_bytes = 1,
+            };
+        }
+    };
+    var context: u8 = 0;
+    const producer = Producer{
+        .ptr = &context,
+        .vtable = &.{
+            .produce = Stub.produce,
+            .invocation_memory_for_requests = Stub.memory,
+        },
+    };
+    const output = try producer.produce(std.testing.allocator, .{
+        .producer_type = .reader,
+        .config_json = "{}",
+        .source_text = "https://example.invalid/page.png",
+    });
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqual(@as(usize, 1), output.len);
 }
 
 test "asset producer bounds invocation contract resolution allocations" {
@@ -608,6 +703,7 @@ test "asset producer bounds invocation contract resolution allocations" {
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 1,
                 .allocator_limit_bytes = 1,
+                .max_result_bytes_per_item = 1,
                 .max_result_bytes = 1,
             };
         }
@@ -663,6 +759,17 @@ test "asset producer destroys returned values when reported metadata is invalid"
                 .execution = .{ .requested_items = requests.len },
             };
         }
+
+        fn memory(_: *anyopaque, _: Allocator, requests: []const Request) !inference_work.InvocationMemoryPlan {
+            const limit = 1024 * requests.len;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = limit,
+                .allocator_limit_bytes = limit,
+                .max_result_bytes_per_item = 256,
+                .max_result_bytes = limit,
+            };
+        }
     };
 
     var context: u8 = 0;
@@ -671,6 +778,7 @@ test "asset producer destroys returned values when reported metadata is invalid"
         .vtable = &.{
             .produce = Fake.produce,
             .produce_batch_reported = Fake.produceBatchReported,
+            .invocation_memory_for_requests = Fake.memory,
         },
     };
     const requests = [_]Request{.{
@@ -703,6 +811,17 @@ test "asset producer destroys returned values when reported cardinality is inval
                 .execution = inference_work.ExecutionReport.serial(requests.len),
             };
         }
+
+        fn memory(_: *anyopaque, _: Allocator, requests: []const Request) !inference_work.InvocationMemoryPlan {
+            const limit = 1024 * requests.len;
+            return .{
+                .attachment_transport = .borrowed_binary,
+                .fixed_bytes = limit,
+                .allocator_limit_bytes = limit,
+                .max_result_bytes_per_item = 256,
+                .max_result_bytes = limit,
+            };
+        }
     };
 
     var context: u8 = 0;
@@ -711,6 +830,7 @@ test "asset producer destroys returned values when reported cardinality is inval
         .vtable = &.{
             .produce = Fake.produce,
             .produce_batch_reported = Fake.produceBatchReported,
+            .invocation_memory_for_requests = Fake.memory,
         },
     };
     const requests = [_]Request{
