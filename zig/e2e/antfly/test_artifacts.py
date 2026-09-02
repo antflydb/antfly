@@ -1410,6 +1410,158 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     assert doc_key in _query_hit_ids(artifact_semantic)
 
 
+def test_executable_embedding_artifact_producer_survives_restart(
+    stateful_api, openai_embedder
+):
+    """Exercise a public chunk/embedding chain without an embedding-index owner."""
+
+    table_name = f"embedding_artifact_registry_{time.time_ns()}"
+    chunk_name = "document_chunks_v1"
+    embedding_name = "document_chunk_dense_v1"
+    index_name = "document_artifact_vectors"
+    doc_key = "artifact-registry-doc"
+    restarted_doc_key = "artifact-registry-doc-after-restart"
+
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.put(
+        f"{_table_artifact_path(table_name, chunk_name)}/enrichment",
+        {
+            "kind": "chunk",
+            "field": "body",
+            "chunk_size": 128,
+            "chunk_overlap": 16,
+        },
+    )
+    stateful_api.put(
+        f"{_table_artifact_path(table_name, embedding_name)}/enrichment",
+        {
+            "kind": "embedding",
+            # `text` is the canonical chunk-artifact payload selector even
+            # though the producer retains its original `body` source field.
+            "field": "text",
+            "source_artifact_name": chunk_name,
+            "expected_dims": 3,
+            # This legacy producer document is intentionally executable. Unlike
+            # a v2 semantic identity, it does not require an embedding-index
+            # owner to supply credentials and runtime configuration.
+            "producer_json": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": openai_embedder,
+            },
+        },
+    )
+    created = stateful_api.create_index(
+        table_name,
+        index_name,
+        {
+            "type": "embeddings",
+            # Omit dimension to exercise catalog-derived artifact shape.
+            "sources": [{"artifact": embedding_name}],
+        },
+    )
+    assert_created_index(created, index_name, "embeddings")
+    assert created["dimension"] == 3
+
+    written = stateful_api.batch_write(
+        table_name,
+        inserts={
+            doc_key: {
+                "body": "standalone executable artifact producer restart coverage"
+            }
+        },
+        sync_level="full_index",
+    )
+    assert written["inserted"] == 1
+
+    def ready_status(expected_docs: int, require_new_work: bool):
+        current = stateful_api.get_index(table_name, index_name)
+        status = current.get("status", {})
+        enrichment_runtime = status.get("enrichment_runtime", {})
+        if (
+            status.get("total_indexed") == expected_docs
+            and status.get("query_visible_doc_count") == expected_docs
+            and enrichment_runtime.get("enabled") is True
+            and (
+                not require_new_work
+                or (
+                    enrichment_runtime.get("worker_started") is True
+                    and enrichment_runtime.get("embed_batches_completed", 0) > 0
+                )
+            )
+        ):
+            return current
+        return None
+
+    ready = wait_until(lambda: ready_status(1, True), timeout_s=60.0, interval_s=0.5)
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+
+    def semantic_result(query: str, expected_key: str):
+        response = stateful_api.query_table(
+            table_name,
+            {
+                "semantic_search": query,
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        return response if expected_key in _query_hit_ids(response) else None
+
+    assert (
+        wait_until(
+            lambda: semantic_result("executable artifact producer", doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+
+    stateful_api.restart_server()
+    # Runtime counters are process-local. Existing durable vectors can be ready
+    # before an idle enrichment worker has any reason to start.
+    ready_after_restart = wait_until(
+        lambda: ready_status(1, False), timeout_s=90.0, interval_s=1.0
+    )
+    assert ready_after_restart is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+    assert (
+        wait_until(
+            lambda: semantic_result("executable artifact producer", doc_key),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+        is not None
+    )
+
+    written_after_restart = stateful_api.batch_write(
+        table_name,
+        inserts={
+            restarted_doc_key: {
+                "body": "fresh chained artifact production after process restart"
+            }
+        },
+        sync_level="full_index",
+    )
+    assert written_after_restart["inserted"] == 1
+    produced_after_restart = wait_until(
+        lambda: ready_status(2, True), timeout_s=60.0, interval_s=0.5
+    )
+    assert produced_after_restart is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), sort_keys=True
+    )
+    assert (
+        wait_until(
+            lambda: semantic_result("fresh chained production", restarted_doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+
+
 def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
     stateful_api, openai_embedder
 ):
