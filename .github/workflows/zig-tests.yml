@@ -194,6 +194,7 @@ jobs:
             scripts/release/build_cli_snapshot.py \
             scripts/release/build_release_payload.py \
             scripts/release/create_github_release.py \
+            scripts/release/discover_channel_tag.py \
             scripts/release/download_objectstorage.py \
             scripts/release/prepare_pypi_promotion.py \
             scripts/release/publish_objectstorage.py \
@@ -203,6 +204,7 @@ jobs:
             scripts/release/release_platforms.py \
             scripts/release/release_channel_state.py \
             scripts/release/requirements.lock \
+            scripts/release/stage_release_source.py \
             scripts/release/verify_cli_snapshot.py \
             scripts/release/verify_release_ledger.py \
             scripts/release/test_cli_snapshot.py \

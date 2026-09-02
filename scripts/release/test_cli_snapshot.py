@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import io
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -13,7 +13,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD = REPO_ROOT / "scripts" / "release" / "build_cli_snapshot.py"
@@ -60,11 +59,14 @@ class CLISnapshotTests(unittest.TestCase):
             "cli_release_packager",
             REPO_ROOT / "scripts" / "packaging" / "package_cli_release.py",
         )
-        for version in ("1.2.3", "1.2.3-dev4", "1.2.3-rc2", "1.2.3+CUDA.1"):
+        for version in ("1.2.3", "1.2.3-dev4", "1.2.3-rc2", "1.2.3-rc.2"):
             self.assertEqual(
                 snapshot.python_version_from_release(version),
                 packager.python_version_from_release(version),
             )
+        for unsupported in ("1.2", "1.2.3+CUDA.1", "1.2.3-experimental.1"):
+            with self.subTest(unsupported=unsupported), self.assertRaises(SystemExit):
+                snapshot.python_version_from_release(unsupported)
 
     def test_snapshot_rejects_mutated_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

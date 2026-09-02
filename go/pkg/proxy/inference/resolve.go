@@ -414,12 +414,13 @@ func (p *Proxy) resolvePoolTarget(ctx context.Context, namespace, pool string, r
 		p.logger.Warn("failed to refresh inference pool activation", zap.String("namespace", namespace), zap.String("pool", pool), zap.Error(activationErr))
 	}
 
+	// Destination conditions are the selection snapshot for this request. Do not
+	// reevaluate them after resolveEndpoint reserves a circuit-breaker probe: the
+	// reservation intentionally makes a half-open endpoint unavailable to other
+	// requests and would cause this request to reject (and strand) its own lease.
 	endpoint, err := p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
-	if err == nil && (destination == nil || p.router.RouteManager().evaluateConditions(destination, req, p.registry)) {
-		return endpoint, nil
-	}
 	if err == nil {
-		err = noEligibleDestinationsError()
+		return endpoint, nil
 	}
 	if !wasCold || !activationEnabled || activationErr != nil {
 		return nil, err

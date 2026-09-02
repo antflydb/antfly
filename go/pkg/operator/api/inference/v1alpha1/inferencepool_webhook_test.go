@@ -328,9 +328,9 @@ func TestValidateInferencePool_ExplicitInferenceBackend(t *testing.T) {
 	}{
 		{name: "cpu", backend: InferenceRuntimeBackendCPU},
 		{name: "cpu rejects accelerator", backend: InferenceRuntimeBackendCPU, accelerator: "nvidia-l4", wantError: "cannot be combined"},
-		{name: "cuda", backend: InferenceRuntimeBackendCUDA, accelerator: "nvidia-l4"},
+		{name: "cuda accelerator without resource", backend: InferenceRuntimeBackendCUDA, accelerator: "nvidia-l4", wantError: "positive GPU request or limit"},
 		{name: "cuda resource", backend: InferenceRuntimeBackendCUDA, gpu: true},
-		{name: "cuda requires hardware", backend: InferenceRuntimeBackendCUDA, wantError: "requires GPU resources"},
+		{name: "cuda requires hardware", backend: InferenceRuntimeBackendCUDA, wantError: "positive GPU request or limit"},
 		{name: "cuda rejects tpu", backend: InferenceRuntimeBackendCUDA, accelerator: "tpu-v5-lite-podslice", wantError: "cannot use a TPU"},
 		{name: "pjrt", backend: InferenceRuntimeBackendPJRT, accelerator: "tpu-v5-lite-podslice"},
 		{name: "pjrt requires tpu", backend: InferenceRuntimeBackendPJRT, accelerator: "nvidia-l4", wantError: "requires a TPU"},
@@ -354,6 +354,21 @@ func TestValidateInferencePool_ExplicitInferenceBackend(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %v", test.wantError, err)
 			}
 		})
+	}
+}
+
+func TestHasGPUResourcesRequiresPositiveQuantity(t *testing.T) {
+	zero := &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("0"),
+	}}
+	if HasGPUResources(zero) {
+		t.Fatal("zero GPU limit must not satisfy the backend capability contract")
+	}
+	positive := &corev1.ResourceRequirements{Requests: corev1.ResourceList{
+		"cloud.google.com/gke-gpu": resource.MustParse("1"),
+	}}
+	if !HasGPUResources(positive) {
+		t.Fatal("positive GPU request must satisfy the backend capability contract")
 	}
 }
 

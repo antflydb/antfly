@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +30,33 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_release_source_snapshot_is_extracted_from_the_exact_commit(self) -> None:
+        stage = load_module("stage_release_source_test", "stage_release_source.py")
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            output = Path(raw_tmp) / "source"
+            objects = {
+                "scripts/install.sh": b"#!/bin/sh\n",
+                "openapi.yaml": b"openapi: 3.1.0\n",
+            }
+            with mock.patch.object(
+                stage,
+                "git_object",
+                side_effect=lambda _root, commit, source: (
+                    objects[source] if commit == COMMIT else b"wrong commit"
+                ),
+            ):
+                manifest_path = stage.stage_source(RELEASE_DIR, COMMIT, output)
+
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["commit"], COMMIT)
+            self.assertEqual(
+                {entry["name"] for entry in manifest["artifacts"]},
+                {"install.sh", "openapi.yaml"},
+            )
+            self.assertEqual(
+                (output / "install.sh").read_bytes(), objects["scripts/install.sh"]
+            )
+
     def test_release_channel_policy_resolves_all_supported_channels(self) -> None:
         channels = load_module("release_channels_test", "release_channels.py")
         policy = channels.load_policy()
@@ -52,8 +81,73 @@ class ReleasePromotionTests(unittest.TestCase):
             ),
             0,
         )
+        identity = channels.github_outputs(next_name, next_channel, "v1.3.0-rc.2")
+        self.assertEqual(
+            {
+                key: identity[key]
+                for key in ("npm_version", "python_version", "container_tag")
+            },
+            {
+                "npm_version": "1.3.0-rc.2",
+                "python_version": "1.3.0rc2",
+                "container_tag": "v1.3.0-rc.2",
+            },
+        )
         with self.assertRaisesRegex(SystemExit, "requires the nightly channel"):
             channels.resolve_channel("v0.0.0-dev.123", "auto", policy)
+        for unsupported in (
+            "v1.2",
+            "v1.2.3+build.1",
+            "v1.2.3-experimental.1",
+        ):
+            with self.subTest(unsupported=unsupported), self.assertRaises(SystemExit):
+                channels.resolve_channel(unsupported, "auto", policy)
+
+    def test_channel_discovery_only_treats_missing_aliases_as_empty(self) -> None:
+        discovery = load_module("discover_channel_tag_test", "discover_channel_tag.py")
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def response(document: dict):
+            return Response(json.dumps(document).encode())
+
+        self.assertEqual(
+            discovery.discover_github_latest(
+                "antflydb/antfly",
+                "token",
+                lambda *_args, **_kwargs: response({"tag_name": "v1.2.3"}),
+            ),
+            "v1.2.3",
+        )
+        self.assertEqual(
+            discovery.discover_npm_tag(
+                "@antfly/cli",
+                "next",
+                lambda *_args, **_kwargs: response(
+                    {"dist-tags": {"next": "1.3.0-rc.2"}}
+                ),
+            ),
+            "v1.3.0-rc.2",
+        )
+
+        def http_error(code: int):
+            raise urllib.error.HTTPError("https://registry", code, "error", {}, None)
+
+        self.assertEqual(
+            discovery.discover_npm_tag(
+                "@antfly/cli", "nightly", lambda *_args, **_kwargs: http_error(404)
+            ),
+            "",
+        )
+        with self.assertRaisesRegex(SystemExit, "HTTP 500"):
+            discovery.discover_npm_tag(
+                "@antfly/cli", "next", lambda *_args, **_kwargs: http_error(500)
+            )
 
     def test_object_storage_recovery_restores_exact_ledger_members(self) -> None:
         download = load_module(
@@ -506,13 +600,15 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module("build_release_payload_test", "build_release_payload.py")
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            archives, extras, output = (
+            archives, extras, source, output = (
                 root / "archives",
                 root / "extras",
+                root / "source",
                 root / "output",
             )
             archives.mkdir()
             extras.mkdir()
+            source.mkdir()
             (archives / "antfly_1.2.3_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
             (extras / "antfly-cli-1.2.3.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
@@ -524,6 +620,31 @@ class ReleasePromotionTests(unittest.TestCase):
                     }
                 )
             )
+            source_artifacts = []
+            for name, content in (
+                ("install.sh", b"#!/bin/sh\n"),
+                ("openapi.yaml", b"openapi: 3.1.0\n"),
+            ):
+                path = source / name
+                path.write_bytes(content)
+                source_artifacts.append(
+                    {
+                        "name": name,
+                        "size": path.stat().st_size,
+                        "sha256": payload.sha256(path),
+                    }
+                )
+            (source / "source-snapshot.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "commit": COMMIT,
+                        "artifacts": source_artifacts,
+                    }
+                )
+            )
+            with self.assertRaisesRegex(SystemExit, "does not match"):
+                payload.verify_source_snapshot(source, "f" * 40)
             argv = [
                 "build_release_payload.py",
                 "--tag",
@@ -534,6 +655,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 str(archives),
                 "--extra-dir",
                 str(extras),
+                "--source-dir",
+                str(source),
                 "--out-dir",
                 str(output),
             ]
@@ -552,6 +675,7 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertIn("runtime-archive", kinds)
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
+            self.assertIn("source-manifest", kinds)
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 

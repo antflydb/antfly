@@ -269,12 +269,12 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	if pool.Spec.Models.RegistryURL != "" {
 		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
 	}
-	backendPolicy := inferenceBackendPolicyForPool(pool)
-	if backendPolicy.preferred != "" {
-		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backendPolicy.preferred
+	backendProfile := antflyaiv1alpha1.ResolveInferenceBackendProfile(pool)
+	if backendProfile.PreferredRuntime != "" {
+		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backendProfile.PreferredRuntime
 	}
-	if backendPolicy.required != "" {
-		cm.Data["ANTFLY_INFERENCE_REQUIRED_BACKEND"] = backendPolicy.required
+	if backendProfile.RequiredRuntime != "" {
+		cm.Data["ANTFLY_INFERENCE_REQUIRED_BACKEND"] = backendProfile.RequiredRuntime
 	}
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		cm.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"] = pjrtPluginPath
@@ -410,32 +410,7 @@ func effectiveInferenceLoadingStrategy(modelStrategy, poolStrategy antflyaiv1alp
 }
 
 func isTPUAccelerator(accelerator string) bool {
-	return strings.Contains(strings.ToLower(accelerator), "tpu")
-}
-
-type inferenceBackendPolicy struct {
-	preferred string
-	required  string
-}
-
-func inferenceBackendPolicyForPool(pool *antflyaiv1alpha1.InferencePool) inferenceBackendPolicy {
-	switch pool.Spec.Hardware.InferenceBackend {
-	case antflyaiv1alpha1.InferenceRuntimeBackendCPU:
-		return inferenceBackendPolicy{preferred: "native", required: "native"}
-	case antflyaiv1alpha1.InferenceRuntimeBackendCUDA:
-		return inferenceBackendPolicy{preferred: "cuda", required: "cuda"}
-	case antflyaiv1alpha1.InferenceRuntimeBackendPJRT:
-		return inferenceBackendPolicy{preferred: "pjrt", required: "pjrt"}
-	}
-	// Empty and auto retain the pre-field behavior for existing objects. The
-	// admission policy validates explicit contracts for new configurations.
-	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
-		return inferenceBackendPolicy{preferred: "pjrt"}
-	}
-	if pool.Spec.Hardware.Accelerator != "" || antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
-		return inferenceBackendPolicy{preferred: "cuda", required: "cuda"}
-	}
-	return inferenceBackendPolicy{}
+	return antflyaiv1alpha1.IsTPUAccelerator(accelerator)
 }
 
 func zigWarmModelKind(tasks []string) string {

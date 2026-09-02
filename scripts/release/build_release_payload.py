@@ -12,6 +12,9 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+SOURCE_MANIFEST = "source-snapshot.json"
+REQUIRED_SOURCE_FILES = {"install.sh", "openapi.yaml"}
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -39,6 +42,8 @@ def artifact_kind(path: Path) -> str:
         return "installer"
     if name == "openapi.yaml":
         return "openapi"
+    if name == SOURCE_MANIFEST:
+        return "source-manifest"
     if name == "cli-snapshot.json":
         return "cli-manifest"
     if name.endswith(".whl"):
@@ -77,6 +82,43 @@ def generated_at(repo_root: Path, commit: str) -> str:
     )
 
 
+def verify_source_snapshot(source_dir: Path, commit: str) -> list[Path]:
+    manifest_path = source_dir / SOURCE_MANIFEST
+    if not manifest_path.is_file():
+        raise SystemExit(f"missing release source manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("commit") != commit:
+        raise SystemExit("release source snapshot does not match the release commit")
+    entries = manifest.get("artifacts")
+    if not isinstance(entries, list):
+        raise SystemExit("release source snapshot contains no artifacts")
+
+    verified: list[Path] = []
+    names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SystemExit("release source snapshot contains an invalid artifact")
+        name = entry.get("name")
+        if not isinstance(name, str) or name != Path(name).name or name in names:
+            raise SystemExit(
+                "release source snapshot contains an invalid artifact name"
+            )
+        path = source_dir / name
+        if (
+            not path.is_file()
+            or entry.get("size") != path.stat().st_size
+            or entry.get("sha256") != sha256(path)
+        ):
+            raise SystemExit(f"release source artifact differs from manifest: {name}")
+        names.add(name)
+        verified.append(path)
+    if names != REQUIRED_SOURCE_FILES:
+        raise SystemExit(
+            f"release source artifact set mismatch: expected {sorted(REQUIRED_SOURCE_FILES)}, got {sorted(names)}"
+        )
+    return [*verified, manifest_path]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -93,6 +135,12 @@ def main() -> int:
         "--extra-dir",
         type=Path,
         help="directory containing prebuilt registry package artifacts",
+    )
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        required=True,
+        help="directory containing commit-bound support files and source-snapshot.json",
     )
     parser.add_argument(
         "--out-dir", type=Path, required=True, help="output payload directory"
@@ -145,8 +193,8 @@ def main() -> int:
                 dst.write(f"{sha256(archive)}  {archive.name}\n")
     copied.append(checksums)
 
-    copied.append(copy_payload_file(repo_root / "scripts" / "install.sh", out_dir))
-    copied.append(copy_payload_file(repo_root / "openapi.yaml", out_dir))
+    for source in verify_source_snapshot(args.source_dir, args.commit):
+        copied.append(copy_payload_file(source, out_dir))
 
     release_generated_at = generated_at(repo_root, args.commit)
     artifacts = []

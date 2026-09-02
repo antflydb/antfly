@@ -85,6 +85,15 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Download commit-bound release support files
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-release-source
+          path: dist/release-source
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Resolve and validate requested release identity
         id: identity
         env:
@@ -183,6 +192,7 @@ jobs:
             --commit "$RELEASE_COMMIT" \
             --archive-dir dist/release-archives \
             --extra-dir dist/cli-snapshot \
+            --source-dir dist/release-source \
             --out-dir dist/release-payload
 
       - name: Verify the newly assembled release ledger before sealing
@@ -493,16 +503,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - uses: actions/setup-node@v6
-        if: ${{ needs.prepare-release-promotion.outputs.bootstrap == 'npm' }}
-        with:
-          node-version-file: ts/package.json
-          registry-url: https://registry.npmjs.org/
-      - name: Install exact npm client for prerelease channel discovery
-        if: ${{ needs.prepare-release-promotion.outputs.bootstrap == 'npm' }}
-        run: |
-          npm install -g "npm@$NPM_VERSION"
-          test "$(npm --version)" = "$NPM_VERSION"
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
@@ -516,16 +516,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          case "$BOOTSTRAP" in
-            github-latest)
-              current_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
-              ;;
-            npm)
-              current_version="$(npm view "@antfly/cli@${NPM_TAG}" version 2>/dev/null || true)"
-              current_tag="${current_version:+v$current_version}"
-              ;;
-            *) echo "unsupported channel bootstrap: $BOOTSTRAP" >&2; exit 2 ;;
-          esac
+          discovery_args=("$BOOTSTRAP")
+          if [ "$BOOTSTRAP" = npm ]; then
+            discovery_args+=(--npm-tag "$NPM_TAG")
+          fi
+          current_tag="$(python scripts/release/discover_channel_tag.py "${discovery_args[@]}")"
           echo "name=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
       - name: Begin or resume the release channel transaction

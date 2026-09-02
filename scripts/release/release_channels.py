@@ -27,12 +27,12 @@ REQUIRED_FIELDS = {
 }
 TAG_PATTERN = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\."
-    r"(?P<minor>0|[1-9][0-9]*)"
-    r"(?:\.(?P<patch>0|[1-9][0-9]*))?"
-    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
-    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+    r"(?P<minor>0|[1-9][0-9]*)\."
+    r"(?P<patch>0|[1-9][0-9]*)"
+    r"(?:-(?P<prerelease>(?P<pre_label>dev|alpha|a|beta|b|rc|pre|preview)\.?(?P<pre_number>[0-9]+)))?$"
 )
 NIGHTLY_PATTERN = re.compile(r"^v0\.0\.0-dev\.(?P<sequence>[1-9][0-9]*)$")
+CONTAINER_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 
 def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
@@ -40,20 +40,60 @@ def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | Non
     if not match:
         raise SystemExit(f"release channel requires a semantic version tag: {tag}")
     prerelease = match.group("prerelease")
-    identifiers = tuple(prerelease.split(".")) if prerelease else None
-    if identifiers and any(
-        identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0")
-        for identifier in identifiers
-    ):
+    number = match.group("pre_number")
+    if number and len(number) > 1 and number.startswith("0"):
         raise SystemExit(f"invalid semantic version prerelease: {tag}")
+    identifiers = None
+    if prerelease:
+        label = {
+            "alpha": "a",
+            "beta": "b",
+            "pre": "rc",
+            "preview": "rc",
+        }.get(match.group("pre_label"), match.group("pre_label"))
+        identifiers = (str(label), str(int(number)))
     return (
         (
             int(match.group("major")),
             int(match.group("minor")),
-            int(match.group("patch") or 0),
+            int(match.group("patch")),
         ),
         identifiers,
     )
+
+
+def normalize_release_version(raw: str) -> str:
+    tag = raw if raw.startswith("v") else f"v{raw}"
+    parse_version(tag)
+    return tag.removeprefix("v")
+
+
+def python_version_from_release(raw: str) -> str:
+    version = normalize_release_version(raw)
+    match = TAG_PATTERN.fullmatch(f"v{version}")
+    assert match is not None
+    python_version = (
+        f"{match.group('major')}.{match.group('minor')}.{match.group('patch')}"
+    )
+    if label := match.group("pre_label"):
+        label = {
+            "alpha": "a",
+            "beta": "b",
+            "pre": "rc",
+            "preview": "rc",
+        }.get(label, label)
+        number = str(int(match.group("pre_number")))
+        python_version += f".dev{number}" if label == "dev" else f"{label}{number}"
+    return python_version
+
+
+def registry_identity(tag: str) -> dict[str, str]:
+    version = normalize_release_version(tag)
+    return {
+        "npm_version": version,
+        "python_version": python_version_from_release(version),
+        "container_tag": f"v{version}",
+    }
 
 
 def compare_version_precedence(left: str, right: str) -> int:
@@ -158,6 +198,10 @@ def validate_channel_tag(tag: str, channel_name: str, policy: dict[str, Any]) ->
     if not isinstance(channel, dict):
         raise SystemExit(f"unknown release channel: {channel_name}")
     _, prerelease = parse_version(tag)
+    if not CONTAINER_TAG_PATTERN.fullmatch(tag):
+        raise SystemExit(
+            f"release tag cannot be represented by the container registry: {tag}"
+        )
     kind = channel["tag_kind"]
     if kind == "stable" and prerelease is not None:
         raise SystemExit(
@@ -167,6 +211,8 @@ def validate_channel_tag(tag: str, channel_name: str, policy: dict[str, Any]) ->
         raise SystemExit(
             f"next channel requires a prerelease semantic version tag: {tag}"
         )
+    if kind == "prerelease" and NIGHTLY_PATTERN.fullmatch(tag):
+        raise SystemExit(f"nightly snapshot tag requires the nightly channel: {tag}")
     if kind == "nightly" and not NIGHTLY_PATTERN.fullmatch(tag):
         raise SystemExit(f"nightly channel requires v0.0.0-dev.<sequence>: {tag}")
     if kind != "nightly" and NIGHTLY_PATTERN.fullmatch(tag):
@@ -200,13 +246,17 @@ def compare_channel_tags(
     return (left_sequence > right_sequence) - (left_sequence < right_sequence)
 
 
-def github_outputs(channel_name: str, channel: dict[str, Any]) -> dict[str, str]:
+def github_outputs(
+    channel_name: str, channel: dict[str, Any], tag: str | None = None
+) -> dict[str, str]:
     result = {"channel": channel_name}
     for key, value in channel.items():
         if isinstance(value, bool):
             result[key] = str(value).lower()
         else:
             result[key] = str(value)
+    if tag:
+        result.update(registry_identity(tag))
     return result
 
 
@@ -225,7 +275,7 @@ def main() -> int:
     if not args.tag:
         parser.error("resolve requires --tag")
     channel_name, channel = resolve_channel(args.tag, args.channel, policy)
-    outputs = github_outputs(channel_name, channel)
+    outputs = github_outputs(channel_name, channel, args.tag)
     output_path = args.github_output
     if output_path is None and os.environ.get("GITHUB_OUTPUT"):
         output_path = Path(os.environ["GITHUB_OUTPUT"])

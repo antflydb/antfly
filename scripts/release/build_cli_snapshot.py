@@ -12,6 +12,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+from release_channels import normalize_release_version, python_version_from_release
 
 NPM_PACKAGES = {
     "@antfly/cli": "antfly-cli",
@@ -19,32 +20,6 @@ NPM_PACKAGES = {
     "@antfly/cli-linux-arm64": "antfly-cli-linux-arm64",
     "@antfly/cli-linux-x64": "antfly-cli-linux-x64",
 }
-
-
-def python_version_from_release(version: str) -> str:
-    match = re.fullmatch(
-        r"(?P<base>[0-9]+(?:\.[0-9]+){1,2})(?:-(?P<pre>[0-9A-Za-z.]+))?(?:\+(?P<local>[0-9A-Za-z.]+))?",
-        version,
-    )
-    if not match:
-        raise SystemExit(
-            f"invalid release version for Python package metadata: {version}"
-        )
-    python_version = match.group("base")
-    if prerelease := match.group("pre"):
-        prerelease_match = re.fullmatch(
-            r"(dev|alpha|a|beta|b|rc|pre|preview)\.?([0-9]+)", prerelease.lower()
-        )
-        if not prerelease_match:
-            raise SystemExit(f"unsupported prerelease version for PyPI: {version}")
-        label, number = prerelease_match.groups()
-        label = {"alpha": "a", "beta": "b", "pre": "rc", "preview": "rc"}.get(
-            label, label
-        )
-        python_version += f".dev{number}" if label == "dev" else f"{label}{number}"
-    if local := match.group("local"):
-        python_version += f"+{local.lower()}"
-    return python_version
 
 
 def sha256(path: Path) -> str:
@@ -90,9 +65,7 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    version = args.version.removeprefix("v")
-    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}(?:[-+][0-9A-Za-z.-]+)?", version):
-        raise SystemExit(f"invalid release version: {args.version}")
+    version = normalize_release_version(args.version)
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         raise SystemExit(f"invalid release commit: {args.commit}")
     python_version = python_version_from_release(version)

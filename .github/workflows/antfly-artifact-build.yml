@@ -156,12 +156,33 @@ jobs:
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
 
+  package-release-source:
+    name: Stage commit-bound release support files
+    needs: release-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Stage exact source objects
+        run: |
+          python scripts/release/stage_release_source.py \
+            --commit "${{ inputs.source_commit }}" \
+            --out-dir dist/release-source
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antfly-release-source
+          path: dist/release-source/
+          if-no-files-found: error
+
   release-request:
     name: Record immutable release identity
     needs:
       - release-plan
       - build-zig-runtime-archives
       - package-cli-artifacts
+      - package-release-source
     runs-on: ubuntu-latest
     steps:
       - name: Write request

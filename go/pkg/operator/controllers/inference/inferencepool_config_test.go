@@ -202,9 +202,9 @@ func TestInferenceBackendPolicy(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			policy := inferenceBackendPolicyForPool(test.pool)
-			g.Expect(policy.preferred).To(Equal(test.expectedPreferred))
-			g.Expect(policy.required).To(Equal(test.expectedRequired))
+			profile := antflyaiv1alpha1.ResolveInferenceBackendProfile(test.pool)
+			g.Expect(profile.PreferredRuntime).To(Equal(test.expectedPreferred))
+			g.Expect(profile.RequiredRuntime).To(Equal(test.expectedRequired))
 		})
 	}
 }

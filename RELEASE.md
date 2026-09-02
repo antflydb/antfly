@@ -55,9 +55,11 @@ credentials.
 
 1. `.github/workflows/antfly-artifact-build.yml` is the sole reusable artifact
    builder. With only read permission, it builds the canonical Zig archives,
-   calls `.github/workflows/cli-package.yml`, and uploads the native archives,
-   CLI snapshot, and source-commit-and-channel-bound release request as Actions
-   artifacts. The tag-triggered `.github/workflows/antfly-release-build.yml`
+   calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
+   `openapi.yaml` directly from the selected Git commit, and uploads the native
+   archives, CLI snapshot, commit-bound source snapshot, and
+   source-commit-and-channel-bound release request as Actions artifacts. The
+   tag-triggered `.github/workflows/antfly-release-build.yml`
    and manually triggered `.github/workflows/antfly-nightly.yml` are thin
    callers of this same builder.
 2. Completion of either caller triggers `.github/workflows/antfly-release.yml` through
@@ -85,6 +87,10 @@ credentials.
    record each channel's `pending` and `current` release identity (tag, source
    commit, and ledger digest). A failed run must resume the same pending
    identity, and recovery cannot move a channel backward.
+
+Channel bootstrap is fail-closed. The discovery controller treats only an
+explicit missing release, package, or dist-tag as empty state; authentication,
+rate-limit, malformed-response, and network failures stop promotion.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
@@ -132,14 +138,17 @@ dependencies used by the release control plane are exact and hash-locked in
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:
 
-- `build_release_payload.py` copies release archives and support files into a
-  payload directory, writes `antfly_zig_checksums.txt`, and generates
-  `metadata.json` and `artifacts.json`.
+- `stage_release_source.py` extracts release support files from the exact Git
+  commit and records their digests in `source-snapshot.json`.
+- `build_release_payload.py` verifies that source snapshot before combining it
+  with release archives and CLI packages, writes `antfly_zig_checksums.txt`,
+  and generates `metadata.json` and `artifacts.json`.
 - `create_github_release.py` creates or updates the draft GitHub Release,
   generates release notes through the GitHub API, and accepts existing assets
   only when their digest matches the local payload.
-- `release_channels.py` validates and resolves the canonical channel policy.
-  Stable and next use SemVer precedence; nightly uses its monotonically
+- `release_channels.py` validates and resolves the canonical channel policy and
+  derives the npm, Python, and container identities from one accepted version.
+  Stable and next use version precedence; nightly uses its monotonically
   increasing workflow-run sequence.
 - `release_channel_state.py` compare-and-swaps each channel journal, prevents
   backward promotion, and makes an interrupted promotion resumable only by the
@@ -159,6 +168,11 @@ Stable tags use `vX.Y.Z`; RC tags use `vX.Y.Z-rc.N`. Nightly snapshots use
 `v0.0.0-dev.<GitHub run ID>`. A nightly is a channel, not a cadence: the
 workflow is manual today, and a schedule or default-branch trigger can be added
 later without changing the artifact or promotion model.
+
+Release identity is deliberately narrower than generic SemVer: the core always
+contains three components, prereleases use the supported dev/alpha/beta/RC
+forms, and build metadata is rejected because it cannot be represented by every
+publication target (notably container tags).
 
 Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific

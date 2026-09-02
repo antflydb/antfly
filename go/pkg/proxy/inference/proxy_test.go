@@ -1094,6 +1094,49 @@ func TestRouteRequestClaimsRecoveredCircuitOnce(t *testing.T) {
 	}
 }
 
+func TestAcquireRoutedRequestOwnsRecoveredCircuitProbe(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{
+		DefaultPool:     "primary",
+		RefreshInterval: time.Minute,
+		Logger:          zap.NewNop(),
+	})
+	p.RegisterEndpoint("http://recovering.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://recovering.internal", []string{"model-a"})
+	p.Router().RouteManager().AddRoute(&Route{
+		Name:       "default/recovering",
+		Operations: map[OperationType]bool{OperationType("embed"): true},
+		Destinations: []Destination{{
+			Pool:             "primary",
+			Weight:           100,
+			ReplicaCondition: &ThresholdCondition{Operator: ">=", Value: 1},
+		}},
+	})
+
+	cb := p.registry.GetCircuitBreaker("http://recovering.internal")
+	cb.threshold = 1
+	cb.timeout = 10 * time.Millisecond
+	cb.RecordFailure()
+	time.Sleep(20 * time.Millisecond)
+
+	lease, err := p.AcquireRequestResolution(context.Background(), ResolveRequest{
+		Operation: OperationType("embed"),
+		Model:     "model-a",
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("AcquireRequestResolution: %v", err)
+	}
+	if got := atomic.LoadInt32(&cb.state); got != 2 {
+		t.Fatalf("expected acquired route to own half-open probe, got state=%d", got)
+	}
+	lease.RecordSuccess()
+	if got := atomic.LoadInt32(&cb.state); got != 0 {
+		t.Fatalf("expected successful routed probe to close breaker, got state=%d", got)
+	}
+}
+
 func TestResolveRequestDoesNotClaimCircuitBreakerProbe(t *testing.T) {
 	t.Parallel()
 

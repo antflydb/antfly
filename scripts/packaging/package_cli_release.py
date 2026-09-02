@@ -23,6 +23,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "release"))
+from release_channels import (  # noqa: E402
+    normalize_release_version,
+    python_version_from_release,
+)
 from release_platforms import load_policy  # noqa: E402
 
 
@@ -68,44 +72,6 @@ def release_platforms() -> tuple[Platform, ...]:
 PLATFORMS = release_platforms()
 
 PACKAGE_PLATFORMS = tuple(platform for platform in PLATFORMS if platform.npm_package_dir)
-
-
-def normalize_release_version(raw: str) -> str:
-    version = raw[1:] if raw.startswith("v") else raw
-    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}(?:[-+][0-9A-Za-z.-]+)?", version):
-        raise SystemExit(f"invalid version for package metadata: {raw}")
-    return version
-
-
-def python_version_from_release(version: str) -> str:
-    match = re.fullmatch(
-        r"(?P<base>[0-9]+(?:\.[0-9]+){1,2})(?:-(?P<pre>[0-9A-Za-z.]+))?(?:\+(?P<local>[0-9A-Za-z.]+))?",
-        version,
-    )
-    if not match:
-        raise SystemExit(f"invalid release version for Python package metadata: {version}")
-
-    base = match.group("base")
-    pre = match.group("pre")
-    local = match.group("local")
-    py_version = base
-
-    if pre:
-        pre_match = re.fullmatch(r"(dev|alpha|a|beta|b|rc|pre|preview)\.?([0-9]+)", pre.lower())
-        if not pre_match:
-            raise SystemExit(f"unsupported prerelease version for PyPI: {version}")
-        label, number = pre_match.groups()
-        label = {
-            "alpha": "a",
-            "beta": "b",
-            "pre": "rc",
-            "preview": "rc",
-        }.get(label, label)
-        py_version += f".dev{number}" if label == "dev" else f"{label}{number}"
-
-    if local:
-        py_version += f"+{local.lower()}"
-    return py_version
 
 
 def archive_name(version: str, platform: Platform) -> str:

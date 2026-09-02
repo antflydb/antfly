@@ -104,23 +104,24 @@ func (r *InferencePool) validateInferenceBackend() error {
 	if backend == "" || backend == InferenceRuntimeBackendAuto {
 		return nil
 	}
-	hasGPU := r.hasGPUResources()
-	isTPU := strings.Contains(strings.ToLower(r.Spec.Hardware.Accelerator), "tpu")
+	profile := ResolveInferenceBackendProfile(r)
+	hasGPU := HasGPUResources(r.Spec.Resources)
+	isTPU := IsTPUAccelerator(r.Spec.Hardware.Accelerator)
 	hasAccelerator := strings.TrimSpace(r.Spec.Hardware.Accelerator) != ""
 	switch backend {
 	case InferenceRuntimeBackendCPU:
-		if hasGPU || hasAccelerator {
+		if profile.ForbidsAccelerator && (hasGPU || hasAccelerator) {
 			return fmt.Errorf("spec.hardware.inferenceBackend=cpu cannot be combined with accelerator resources or spec.hardware.accelerator")
 		}
 	case InferenceRuntimeBackendCUDA:
 		if isTPU {
 			return fmt.Errorf("spec.hardware.inferenceBackend=cuda cannot use a TPU accelerator")
 		}
-		if !hasGPU && !hasAccelerator {
-			return fmt.Errorf("spec.hardware.inferenceBackend=cuda requires GPU resources or spec.hardware.accelerator")
+		if profile.RequiresGPU && !hasGPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cuda requires a positive GPU request or limit; spec.hardware.accelerator only selects the GPU type")
 		}
 	case InferenceRuntimeBackendPJRT:
-		if !isTPU {
+		if profile.RequiresTPU && !isTPU {
 			return fmt.Errorf("spec.hardware.inferenceBackend=pjrt requires a TPU accelerator")
 		}
 	default:
@@ -598,10 +599,10 @@ func HasGPUResources(resources *corev1.ResourceRequirements) bool {
 		return false
 	}
 	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
-		if _, ok := resources.Limits[resourceName]; ok {
+		if quantity, ok := resources.Limits[resourceName]; ok && quantity.Sign() > 0 {
 			return true
 		}
-		if _, ok := resources.Requests[resourceName]; ok {
+		if quantity, ok := resources.Requests[resourceName]; ok && quantity.Sign() > 0 {
 			return true
 		}
 	}
