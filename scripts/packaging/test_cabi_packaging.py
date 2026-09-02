@@ -257,6 +257,8 @@ class CAbiPackagingTests(unittest.TestCase):
             "Bind authenticated registry versions to the sealed ledger",
             release_workflow,
         )
+        self.assertEqual(release_workflow.count("--exact-assets"), 2)
+        self.assertIn("recover_release_payload.py", release_workflow)
         self.assertIn('--expected-version "$PYTHON_PACKAGE_VERSION"', release_workflow)
         self.assertIn(
             "VERSION: ${{ needs.prepare-release-promotion.outputs.npm_version }}",

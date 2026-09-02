@@ -25,6 +25,8 @@ from verify_release_ledger import verify_payload
 class PayloadReader(Protocol):
     def read(self, name: str) -> bytes: ...
 
+    def list_names(self) -> set[str]: ...
+
 
 class PrefixedReader:
     def __init__(self, reader: S3Reader, prefix: str) -> None:
@@ -33,6 +35,9 @@ class PrefixedReader:
 
     def read(self, name: str) -> bytes:
         return self.reader.read(f"{self.prefix}/{name}")
+
+    def list_names(self) -> set[str]:
+        return self.reader.list_names(self.prefix)
 
 
 class GitHubReleaseReader:
@@ -60,6 +65,9 @@ class GitHubReleaseReader:
             raise GitHubError(f"GitHub release asset is missing: {name}")
         return download_bytes(url, self.token)
 
+    def list_names(self) -> set[str]:
+        return set(self.assets)
+
 
 def restore_verified_payload(
     reader: PayloadReader,
@@ -70,8 +78,16 @@ def restore_verified_payload(
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     ledger_bytes = reader.read("artifacts.json")
+    names = payload_names(ledger_bytes)
+    expected_names = {"artifacts.json", *names}
+    actual_names = reader.list_names()
+    if actual_names != expected_names:
+        raise SystemExit(
+            "release mirror member set differs: "
+            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
+        )
     (out_dir / "artifacts.json").write_bytes(ledger_bytes)
-    for name in payload_names(ledger_bytes):
+    for name in names:
         (out_dir / name).write_bytes(reader.read(name))
     verify_payload(out_dir / "artifacts.json", out_dir, tag, commit, ledger_sha256)
 

@@ -78,10 +78,15 @@ def discover_npm_integrity(package: str, version: str, opener: OpenURL) -> str:
         raise SystemExit(str(exc)) from exc
 
 
-def discover_npm_channel(tag: str, opener: OpenURL) -> str:
-    observed = {
-        package: discover_npm_tag(package, tag, opener) for package in NPM_PACKAGES
+def discover_npm_projections(tag: str, opener: OpenURL) -> dict[str, str]:
+    return {
+        f"npm:{package}": discover_npm_tag(package, tag, opener)
+        for package in NPM_PACKAGES
     }
+
+
+def discover_npm_channel(tag: str, opener: OpenURL) -> str:
+    observed = discover_npm_projections(tag, opener)
     present = {package: version for package, version in observed.items() if version}
     if not present:
         return ""
@@ -146,9 +151,20 @@ def discover_homebrew_tag(opener: OpenURL) -> str:
     return tags.pop()
 
 
-def reconcile_observations(
+def reconcile_bootstrap_observations(
     channel: str, observations: dict[str, str], policy: dict[str, Any]
 ) -> str:
+    npm = {
+        projection: tag
+        for projection, tag in observations.items()
+        if projection.startswith("npm:")
+    }
+    present_npm = {projection: tag for projection, tag in npm.items() if tag}
+    if present_npm and len(present_npm) != len(npm):
+        missing = sorted(set(npm) - set(present_npm))
+        raise SystemExit(
+            f"npm channel is only partially initialized; missing {missing}"
+        )
     present = {source: tag for source, tag in observations.items() if tag}
     for tag in present.values():
         validate_observed_channel_tag(tag, channel, policy)
@@ -161,7 +177,9 @@ def reconcile_observations(
     return tags.pop() if tags else ""
 
 
-def journal_current(stored: Any, channel: str, policy: dict[str, Any]) -> str | None:
+def journal_tags(
+    stored: Any, channel: str, policy: dict[str, Any]
+) -> tuple[str | None, str | None] | None:
     """Return None only when the journal object itself does not exist."""
     if stored.etag is None:
         return None
@@ -170,14 +188,86 @@ def journal_current(stored: Any, channel: str, policy: dict[str, Any]) -> str | 
         raise SystemExit(
             f"release channel journal belongs to {document.get('channel')}"
         )
-    current = document.get("current")
-    if current is None:
-        return ""
-    tag = current.get("tag") if isinstance(current, dict) else None
-    if not isinstance(tag, str):
-        raise SystemExit("release channel journal has malformed current identity")
-    validate_observed_channel_tag(tag, channel, policy)
-    return tag
+
+    tags: list[str | None] = []
+    for field in ("current", "pending"):
+        identity = document.get(field)
+        if identity is None:
+            tags.append(None)
+            continue
+        tag = identity.get("tag") if isinstance(identity, dict) else None
+        if not isinstance(tag, str):
+            raise SystemExit(f"release channel journal has malformed {field} identity")
+        validate_observed_channel_tag(tag, channel, policy)
+        tags.append(tag)
+    current, pending = tags
+    if current is None and pending is None:
+        raise SystemExit("release channel journal has no current or pending identity")
+    return current, pending
+
+
+def journal_current(stored: Any, channel: str, policy: dict[str, Any]) -> str | None:
+    tags = journal_tags(stored, channel, policy)
+    if tags is None:
+        return None
+    current, _pending = tags
+    return current or ""
+
+
+def reconcile_journal_observations(
+    stored: Any,
+    channel: str,
+    observations: dict[str, str],
+    policy: dict[str, Any],
+) -> str:
+    tags = journal_tags(stored, channel, policy)
+    if tags is None:
+        raise AssertionError("cannot reconcile projections without a journal")
+    current, pending = tags
+    allowed = {tag for tag in tags if tag is not None}
+    for projection, observed in sorted(observations.items()):
+        if not observed:
+            # Missing aliases are repairable and cannot make a channel move
+            # backward. Only a present, contradictory observation is unsafe.
+            continue
+        validate_observed_channel_tag(observed, channel, policy)
+        if observed not in allowed:
+            expected = ", ".join(sorted(allowed))
+            raise SystemExit(
+                f"release channel {channel} projection {projection} is {observed}; "
+                f"expected one of {expected}"
+            )
+        if pending is None and observed != current:
+            raise AssertionError("completed journal admitted a non-current projection")
+    return current or ""
+
+
+def discover_channel_observations(
+    channel: str,
+    policy: dict[str, Any],
+    repository: str,
+    token: str,
+    object_reader: Reader,
+    opener: OpenURL,
+) -> dict[str, str]:
+    channel_policy = policy["channels"][channel]
+    observations: dict[str, str] = {}
+    for source in channel_policy["bootstrap_sources"]:
+        if source == "github-latest":
+            observations[source] = discover_github_latest(repository, token, opener)
+        elif source == "npm":
+            observations.update(
+                discover_npm_projections(channel_policy["npm_tag"], opener)
+            )
+        elif source == "object-storage":
+            observations[source] = discover_object_alias(
+                object_reader, channel_policy["object_alias"]
+            )
+        elif source == "homebrew":
+            observations[source] = discover_homebrew_tag(opener)
+        else:  # Policy validation makes this unreachable.
+            raise AssertionError(source)
+    return observations
 
 
 def discover_bootstrap_channel(
@@ -188,24 +278,13 @@ def discover_bootstrap_channel(
     object_reader: Reader,
     opener: OpenURL,
 ) -> str:
-    channel_policy = policy["channels"][channel]
-    observations: dict[str, str] = {}
-    for source in channel_policy["bootstrap_sources"]:
-        if source == "github-latest":
-            observations[source] = discover_github_latest(repository, token, opener)
-        elif source == "npm":
-            observations[source] = discover_npm_channel(
-                channel_policy["npm_tag"], opener
-            )
-        elif source == "object-storage":
-            observations[source] = discover_object_alias(
-                object_reader, channel_policy["object_alias"]
-            )
-        elif source == "homebrew":
-            observations[source] = discover_homebrew_tag(opener)
-        else:  # Policy validation makes this unreachable.
-            raise AssertionError(source)
-    return reconcile_observations(channel, observations, policy)
+    return reconcile_bootstrap_observations(
+        channel,
+        discover_channel_observations(
+            channel, policy, repository, token, object_reader, opener
+        ),
+        policy,
+    )
 
 
 def main() -> int:
@@ -230,16 +309,23 @@ def main() -> int:
         store = S3ChannelStore(
             args.endpoint, args.bucket, channel_policy["journal_key"]
         )
-        current = journal_current(store.load(), args.channel, policy)
-        if current is None:
-            reader = S3Reader(args.endpoint, args.bucket, "auto")
-            current = discover_bootstrap_channel(
-                args.channel,
-                policy,
-                args.repository or os.environ.get("GITHUB_REPOSITORY", ""),
-                os.environ.get("GH_TOKEN", ""),
-                reader,
-                urllib.request.urlopen,
+        stored = store.load()
+        reader = S3Reader(args.endpoint, args.bucket, "auto")
+        observations = discover_channel_observations(
+            args.channel,
+            policy,
+            args.repository or os.environ.get("GITHUB_REPOSITORY", ""),
+            os.environ.get("GH_TOKEN", ""),
+            reader,
+            urllib.request.urlopen,
+        )
+        if stored.etag is None:
+            current = reconcile_bootstrap_observations(
+                args.channel, observations, policy
+            )
+        else:
+            current = reconcile_journal_observations(
+                stored, args.channel, observations, policy
             )
     elif args.bootstrap == "github-latest":
         current = discover_github_latest(

@@ -145,6 +145,42 @@ def with_complete_assets(repo: str, release: dict, token: str) -> dict:
     return complete
 
 
+def reconcile_release_asset_names(
+    repo: str,
+    release: dict,
+    expected_names: set[str],
+    token: str,
+    repair_assets: bool,
+) -> dict:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise GitHubError("GitHub release has no complete asset listing")
+    unexpected = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict) and asset.get("name") not in expected_names
+    ]
+    malformed = [asset for asset in assets if not isinstance(asset, dict)]
+    if malformed:
+        raise GitHubError("GitHub release has malformed assets")
+    if unexpected and not repair_assets:
+        names = sorted(str(asset.get("name")) for asset in unexpected)
+        raise SystemExit(f"GitHub release has unledgered assets: {names}")
+    unexpected_ids: set[int] = set()
+    for asset in unexpected:
+        asset_id = asset.get("id")
+        if not isinstance(asset_id, int):
+            raise GitHubError("unledgered GitHub release asset has no numeric id")
+        github_api("DELETE", repo, f"/releases/assets/{asset_id}", token)
+        unexpected_ids.add(asset_id)
+        print(f"removed unledgered GitHub release asset: {asset.get('name')}")
+    reconciled = dict(release)
+    reconciled["assets"] = [
+        asset for asset in assets if asset.get("id") not in unexpected_ids
+    ]
+    return reconciled
+
+
 def create_or_update_release(repo: str, tag: str, token: str, payload: dict) -> dict:
     release = get_release_by_tag(repo, tag, token)
     if release is None:
@@ -304,6 +340,11 @@ def main() -> int:
         action="store_true",
         help="restore drifted assets from a complete digest-verified payload",
     )
+    parser.add_argument(
+        "--exact-assets",
+        action="store_true",
+        help="reject release assets outside the supplied complete payload",
+    )
     parser.add_argument("--verified-ledger-sha256")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -311,6 +352,10 @@ def main() -> int:
     if sum((args.replace_assets, args.immutable_assets, args.repair_assets)) > 1:
         raise SystemExit(
             "--replace-assets, --immutable-assets, and --repair-assets are mutually exclusive"
+        )
+    if args.exact_assets and not (args.immutable_assets or args.repair_assets):
+        raise SystemExit(
+            "--exact-assets requires --immutable-assets or --repair-assets"
         )
 
     if not args.repo:
@@ -334,6 +379,13 @@ def main() -> int:
             args.commit,
             args.verified_ledger_sha256,
         )
+        local_names = {path.name for path in payload_dir.iterdir() if path.is_file()}
+        supplied_names = {asset.name for asset in assets}
+        if supplied_names != local_names:
+            raise SystemExit(
+                "repair requires every verified payload file: "
+                f"expected {sorted(local_names)}, got {sorted(supplied_names)}"
+            )
 
     if args.dry_run:
         print(f"would create/update GitHub release {args.repo}@{args.tag}")
@@ -363,6 +415,14 @@ def main() -> int:
         create_or_update_release(args.repo, args.tag, token, payload),
         token,
     )
+    if args.exact_assets or args.repair_assets:
+        release = reconcile_release_asset_names(
+            args.repo,
+            release,
+            {asset.name for asset in assets},
+            token,
+            args.repair_assets,
+        )
 
     for asset in assets:
         upload_asset(

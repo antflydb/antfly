@@ -17,6 +17,8 @@ def clean_prefix(prefix: str) -> str:
 class Reader(Protocol):
     def read(self, key: str) -> bytes: ...
 
+    def list_names(self, prefix: str) -> set[str]: ...
+
 
 class S3Reader:
     def __init__(self, endpoint: str | None, bucket: str, region: str) -> None:
@@ -53,6 +55,18 @@ class S3Reader:
                 return None
             raise
 
+    def list_names(self, prefix: str) -> set[str]:
+        prefix = clean_prefix(prefix) + "/"
+        paginator = self.client.get_paginator("list_objects_v2")
+        names: set[str] = set()
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for entry in page.get("Contents", []):
+                key = entry.get("Key") if isinstance(entry, dict) else None
+                if not isinstance(key, str) or not key.startswith(prefix):
+                    raise SystemExit("object-storage listing returned an invalid key")
+                names.add(key.removeprefix(prefix))
+        return names
+
 
 class LocalReader:
     def __init__(self, root: Path, bucket: str) -> None:
@@ -65,6 +79,16 @@ class LocalReader:
     def read_optional(self, key: str) -> bytes | None:
         path = self.root / self.bucket / key
         return path.read_bytes() if path.exists() else None
+
+    def list_names(self, prefix: str) -> set[str]:
+        directory = self.root / self.bucket / clean_prefix(prefix)
+        if not directory.exists():
+            return set()
+        return {
+            str(path.relative_to(directory))
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
 
 
 def payload_names(ledger_bytes: bytes) -> list[str]:

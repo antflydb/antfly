@@ -129,11 +129,14 @@ journal, the discovery controller reconciles every policy-selected,
 version-bearing projection: all four npm packages, the R2 object alias, stable
 GitHub `latest`, and the stable Homebrew formula. Missing projections may be
 initialized, but present projections must name one identical release. After a
-journal exists it is the channel authority, including while a partially
-committed transaction is being resumed; mutable mirrors are no longer used to
-reconstruct history. Only an explicit missing release, package, dist-tag,
-object, or formula is empty state. Authentication, rate-limit,
-malformed-response, and network failures stop promotion.
+journal exists it is the channel authority and every present completed
+projection must equal its `current` identity; a missing projection remains
+repairable. While a transaction is pending, each projection may be missing,
+`current`, or `pending`, which permits exact resumption without
+accepting an unrelated or newer alias. Mutable mirrors are never used to
+reconstruct history or silently override the journal. Only an explicit missing
+release, package, dist-tag, object, or formula is empty state. Authentication,
+rate-limit, malformed-response, and network failures stop promotion.
 Container and npm operations use the typed adapters under
 `scripts/release/registry/`. Registry lookups return only present or explicitly
 missing; failures are a separate error path and can never authorize creation.
@@ -168,11 +171,11 @@ Both environments require review with self-approval disabled. Recovery
 requests include the exact `artifacts.json` SHA-256; the promotion verifies
 that digest, its attestation, tag and source commit before granting either
 registry job access. Stable and next recovery try the GitHub Release and then
-the immutable R2 version prefix. Each source must independently contain the
-supplied ledger and every byte it names before it is accepted. If R2 repairs a
-missing or corrupt GitHub payload, the controller restores the verified bytes
-before publishing the release. Nightly uses R2 as its only policy-selected
-source.
+the immutable R2 version prefix. Each source must independently contain exactly
+the supplied ledger and every byte it names before it is accepted. If R2
+repairs a missing or corrupt GitHub payload, the controller restores the
+verified bytes and removes unledgered assets before publishing the release.
+Nightly uses R2 as its only policy-selected source.
 
 `.github/workflows/antfly-container.yml` has only a `workflow_call` entry point.
 It accepts only the default-branch promotion controller's normal `workflow_run`
@@ -238,7 +241,7 @@ scripts under `scripts/release/`:
   version as part of the global publication gate.
 - `recover_release_payload.py` restores an exact ledger from the channel's
   ordered immutable mirrors and accepts a mirror only after the ledger digest,
-  tag, commit, member set, sizes, and hashes all verify. GitHub release and
+  tag, commit, exact member set, sizes, and hashes all verify. GitHub release and
   asset listings are fully paginated, including draft releases.
 - `download_objectstorage.py` provides the authenticated R2 reader and exact
   ledger-member restoration used by bootstrap and recovery.

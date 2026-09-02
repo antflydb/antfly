@@ -213,7 +213,7 @@ class ReleasePromotionTests(unittest.TestCase):
         policy = channels.load_policy()
 
         self.assertEqual(
-            discovery.reconcile_observations(
+            discovery.reconcile_bootstrap_observations(
                 "stable",
                 {
                     "github-latest": "v1.2.3",
@@ -226,9 +226,18 @@ class ReleasePromotionTests(unittest.TestCase):
             "v1.2.3",
         )
         with self.assertRaisesRegex(SystemExit, "bootstrap sources disagree"):
-            discovery.reconcile_observations(
+            discovery.reconcile_bootstrap_observations(
                 "stable",
                 {"github-latest": "v1.2.2", "npm": "v1.2.3"},
+                policy,
+            )
+        with self.assertRaisesRegex(SystemExit, "only partially initialized"):
+            discovery.reconcile_bootstrap_observations(
+                "stable",
+                {
+                    "npm:@antfly/cli": "v1.2.3",
+                    "npm:@antfly/cli-linux-x64": "",
+                },
                 policy,
             )
 
@@ -236,6 +245,62 @@ class ReleasePromotionTests(unittest.TestCase):
             "Stored", (), {"etag": '"1"', "document": {"current": {"tag": "v1.2.3"}}}
         )()
         self.assertEqual(discovery.journal_current(stored, "stable", policy), "v1.2.3")
+
+        observations = {
+            "github-latest": "v1.2.3",
+            "npm:@antfly/cli": "v1.2.3",
+            "object-storage": "v1.2.3",
+            "homebrew": "v1.2.3",
+        }
+        self.assertEqual(
+            discovery.reconcile_journal_observations(
+                stored, "stable", observations, policy
+            ),
+            "v1.2.3",
+        )
+        with self.assertRaisesRegex(SystemExit, "projection npm:@antfly/cli"):
+            discovery.reconcile_journal_observations(
+                stored,
+                "stable",
+                {**observations, "npm:@antfly/cli": "v1.2.4"},
+                policy,
+            )
+        self.assertEqual(
+            discovery.reconcile_journal_observations(
+                stored,
+                "stable",
+                {**observations, "object-storage": ""},
+                policy,
+            ),
+            "v1.2.3",
+        )
+
+        pending = type(
+            "Stored",
+            (),
+            {
+                "etag": '"2"',
+                "document": {
+                    "channel": "stable",
+                    "current": {"tag": "v1.2.3"},
+                    "pending": {"tag": "v1.2.4"},
+                },
+            },
+        )()
+        self.assertEqual(
+            discovery.reconcile_journal_observations(
+                pending,
+                "stable",
+                {
+                    "github-latest": "v1.2.3",
+                    "npm:@antfly/cli": "v1.2.4",
+                    "object-storage": "",
+                    "homebrew": "v1.2.3",
+                },
+                policy,
+            ),
+            "v1.2.3",
+        )
 
     def test_npm_bootstrap_requires_all_packages_to_agree(self) -> None:
         discovery = load_module(
@@ -282,6 +347,12 @@ class ReleasePromotionTests(unittest.TestCase):
                 {"artifacts.json", "metadata.json", "artifact.tgz"},
             )
             self.assertEqual((out_dir / "artifact.tgz").read_bytes(), b"snapshot")
+            self.assertEqual(
+                download.LocalReader(root, "release").list_names(
+                    "antfly/v0.0.0-dev.123"
+                ),
+                {"artifacts.json", "metadata.json", "artifact.tgz"},
+            )
 
     def test_recovery_falls_back_only_to_a_fully_verified_mirror(self) -> None:
         recovery = load_module(
@@ -294,6 +365,9 @@ class ReleasePromotionTests(unittest.TestCase):
 
             def read(self, name: str) -> bytes:
                 return self.objects[name]
+
+            def list_names(self) -> set[str]:
+                return set(self.objects)
 
         artifact = b"immutable"
         ledger = json.dumps(
@@ -318,7 +392,11 @@ class ReleasePromotionTests(unittest.TestCase):
                     (
                         "github-release",
                         lambda: MemoryReader(
-                            {"artifacts.json": ledger, "artifact.bin": b"corrupt"}
+                            {
+                                "artifacts.json": ledger,
+                                "artifact.bin": artifact,
+                                "unledgered.bin": b"unexpected",
+                            }
                         ),
                     ),
                     (
@@ -760,6 +838,33 @@ class ReleasePromotionTests(unittest.TestCase):
                     "DELETE", "antflydb/antfly", "/releases/assets/1", "token"
                 )
                 upload.assert_called_once()
+
+            release["assets"].append(
+                {"id": 2, "name": "unledgered.bin", "digest": f"sha256:{'1' * 64}"}
+            )
+            with self.assertRaisesRegex(SystemExit, "unledgered assets"):
+                github.reconcile_release_asset_names(
+                    "antflydb/antfly",
+                    release,
+                    {artifact.name},
+                    "token",
+                    repair_assets=False,
+                )
+            with mock.patch.object(github, "github_api") as api:
+                reconciled = github.reconcile_release_asset_names(
+                    "antflydb/antfly",
+                    release,
+                    {artifact.name},
+                    "token",
+                    repair_assets=True,
+                )
+                api.assert_called_once_with(
+                    "DELETE", "antflydb/antfly", "/releases/assets/2", "token"
+                )
+                self.assertEqual(
+                    [asset["name"] for asset in reconciled["assets"]],
+                    [artifact.name],
+                )
 
     def test_local_versioned_object_is_compare_or_fail(self) -> None:
         storage = load_module("publish_objectstorage_test", "publish_objectstorage.py")
