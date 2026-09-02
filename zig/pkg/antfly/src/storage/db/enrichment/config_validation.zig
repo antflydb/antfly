@@ -7,8 +7,24 @@ const std = @import("std");
 const types = @import("../types.zig");
 const asset_producer = @import("asset_producer.zig");
 const document_extraction = @import("document_extraction.zig");
+const json_helpers = @import("../../../api/json_helpers.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Producer documents are JSON values, not opaque byte strings. Keep this
+/// comparison at the enrichment boundary so API admission, reconciliation,
+/// and index installation all use the same equivalence relation.
+pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u8) !bool {
+    if (std.mem.eql(u8, lhs, rhs)) return true;
+    if (lhs.len == 0 or rhs.len == 0) return false;
+    var lhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, lhs, .{}) catch
+        return error.InvalidEnrichmentConfig;
+    defer lhs_parsed.deinit();
+    var rhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, rhs, .{}) catch
+        return error.InvalidEnrichmentConfig;
+    defer rhs_parsed.deinit();
+    return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
+}
 
 /// Validates the context-free portion of a public enrichment definition.
 /// Dependency edges are validated by the catalog-aware caller, while this
@@ -75,4 +91,17 @@ test "public enrichment validation rejects invalid execution and producer config
         .chunk_size = 256,
         .vector_space = "dense-v1",
     }));
+}
+
+test "producer JSON equality ignores object key order" {
+    try std.testing.expect(try producerJsonValuesEqual(
+        std.testing.allocator,
+        "{\"provider\":\"antfly\",\"model\":\"embed-v1\"}",
+        "{ \"model\" : \"embed-v1\", \"provider\" : \"antfly\" }",
+    ));
+    try std.testing.expect(!try producerJsonValuesEqual(
+        std.testing.allocator,
+        "{\"provider\":\"antfly\",\"model\":\"embed-v1\"}",
+        "{\"provider\":\"antfly\",\"model\":\"embed-v2\"}",
+    ));
 }

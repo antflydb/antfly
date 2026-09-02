@@ -16,8 +16,10 @@
 
 const std = @import("std");
 const operation = @import("../api/operation.zig");
+const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
 const group_ids = @import("../common/group_ids.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const topology_protocol = @import("topology_protocol.zig");
@@ -130,6 +132,8 @@ pub fn create(
     );
     defer alloc.free(expanded_indexes_json);
     normalized_req.indexes_json = expanded_indexes_json;
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expanded_indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, expanded_indexes_json);
 
     // Decoder capability probes perform remote I/O. Complete them before
     // entering the catalog lane, then revalidate their term/membership token
@@ -201,6 +205,8 @@ pub fn restore(
         ranges.len == 0 or ranges.len > topology_protocol.max_initial_ranges or
         ranges.len != @as(usize, table.min_ranges))
         return error.InvalidTableTopologyMutation;
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, table.indexes_json);
     metadata_table_manager.validateCompleteKeyspaceRanges(ranges) catch
         return error.InvalidTableTopologyMutation;
     var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;

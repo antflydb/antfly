@@ -1393,6 +1393,13 @@ pub const MetadataHttpClient = struct {
     fn mapResponseStatus(resp: http_common.HttpResponse, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
         if (resp.status == 409) {
             for (resp.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.table_mutation_error_header) and
+                    std.mem.eql(u8, header.value, routes.Routes.table_mutation_error_artifact_dependency))
+                {
+                    return error.InvalidEnrichmentConfig;
+                }
+            }
+            for (resp.headers) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.extension_lifecycle_error_header) and
                     std.mem.eql(u8, header.value, routes.Routes.extension_lifecycle_error_conflict))
                 {
@@ -2817,6 +2824,26 @@ test "metadata http client preserves typed extension lifecycle conflicts" {
             error.InvalidExtensionLifecycleRequest,
             error.ExtensionNotInstalled,
             error.ExtensionAlreadyInstalled,
+        ),
+    );
+}
+
+test "metadata http client preserves artifact dependency conflicts" {
+    var headers = [_]http_common.Header{.{
+        .name = @constCast(routes.Routes.table_mutation_error_header),
+        .value = @constCast(routes.Routes.table_mutation_error_artifact_dependency),
+    }};
+    const response = http_common.HttpResponse{
+        .status = 409,
+        .headers = headers[0..],
+    };
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        MetadataHttpClient.mapResponseStatus(
+            response,
+            null,
+            error.IndexNotFound,
+            error.TableTransitionActive,
         ),
     );
 }

@@ -28,6 +28,7 @@ const operation = @import("../api/operation.zig");
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
+const extension_table_ownership = @import("../extensions/table_ownership.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -37,6 +38,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
 const tables_api = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -693,7 +695,14 @@ pub const AdminSource = struct {
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
         if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
-        if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
+        if (try extension_table_ownership.definitionMutationTouchesOwnedState(
+            std.heap.page_allocator,
+            &snapshot,
+            expected,
+            replacement,
+        )) return error.ExtensionOwnedObject;
         try svc.replaceTableDefinition(expected, replacement);
     }
 
@@ -777,6 +786,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -790,6 +800,8 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -807,6 +819,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -821,6 +834,7 @@ pub const AdminSource = struct {
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -1195,6 +1209,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -1208,6 +1223,8 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -1225,6 +1242,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -1239,6 +1257,7 @@ pub const AdminSource = struct {
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.replaceTableDefinition(table.*, updated);
@@ -2882,13 +2901,16 @@ pub const MetadataHttpServer = struct {
     fn metadataDropTableIndex(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         const index_name = requiredParam(ctx, "index_name") catch return ctx.status(400).text("invalid index name");
-        self.tableOperations().dropIndex(ctx.allocator, requestContext(ctx), table_name, index_name) catch |err| switch (err) {
-            error.TableNotFound, error.IndexNotFound => return ctx.status(404).text("index not found"),
-            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
-            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
-            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
-            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
-            else => return metadataReadError(ctx, err),
+        self.tableOperations().dropIndex(ctx.allocator, requestContext(ctx), table_name, index_name) catch |err| {
+            if (isArtifactDependencyConflict(err)) return artifactDependencyConflict(ctx);
+            return switch (err) {
+                error.TableNotFound, error.IndexNotFound => ctx.status(404).text("index not found"),
+                error.TableGenerationChanged => ctx.status(409).text("table generation changed"),
+                error.TableTransitionActive => ctx.status(409).text("table transition active"),
+                error.ExtensionOwnedObject => ctx.status(405).text("method not allowed"),
+                error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+                else => metadataReadError(ctx, err),
+            };
         };
         return ctx.status(204).text("");
     }
@@ -2937,6 +2959,7 @@ pub const MetadataHttpServer = struct {
     }
 
     fn tableEnrichmentError(ctx: *httpx.Context, err: anyerror, deleting: bool) !httpx.Response {
+        if (deleting and isArtifactDependencyConflict(err)) return artifactDependencyConflict(ctx);
         return switch (err) {
             error.TableNotFound => ctx.status(404).text(if (deleting) "artifact enrichment not found" else "table not found"),
             error.EnrichmentNotFound => ctx.status(404).text(if (deleting) "artifact enrichment not found" else "table not found"),
@@ -2947,6 +2970,28 @@ pub const MetadataHttpServer = struct {
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => ctx.status(400).text("unsupported artifact enrichment configuration"),
             else => metadataReadError(ctx, err),
         };
+    }
+
+    fn isArtifactDependencyConflict(err: anyerror) bool {
+        return switch (err) {
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions,
+            => true,
+            else => false,
+        };
+    }
+
+    fn artifactDependencyConflict(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_error_header,
+            routes.Routes.table_mutation_error_artifact_dependency,
+        );
+        return ctx.status(409).text("artifact dependency prevents deletion");
     }
 
     fn metadataRestoreTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

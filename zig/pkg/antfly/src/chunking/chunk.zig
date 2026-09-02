@@ -131,6 +131,34 @@ pub fn appendArtifactFieldsWithProvenance(
     }
 }
 
+/// Resolve the textual payload of a persisted chunk artifact.
+///
+/// Chunk artifacts retain the producer's source field for compatibility, but
+/// downstream artifact consumers use `text` as the canonical payload selector.
+/// Falling back through `_source_field` lets those consumers read both newly
+/// generated and already-persisted chunks without changing the artifact format.
+pub fn artifactTextAlloc(
+    alloc: Allocator,
+    payload: []const u8,
+    source_field: []const u8,
+) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    if (parsed.value.object.get(source_field)) |source| {
+        if (source == .string and source.string.len > 0) return try alloc.dupe(u8, source.string);
+        return null;
+    }
+    if (!std.mem.eql(u8, source_field, "text")) return null;
+
+    const stored_source_field = parsed.value.object.get("_source_field") orelse return null;
+    if (stored_source_field != .string or stored_source_field.string.len == 0) return null;
+    const source = parsed.value.object.get(stored_source_field.string) orelse return null;
+    if (source != .string or source.string.len == 0) return null;
+    return try alloc.dupe(u8, source.string);
+}
+
 fn appendProvenanceFields(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
@@ -273,6 +301,23 @@ fn base64EncodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, size);
     _ = std.base64.standard.Encoder.encode(out, bytes);
     return out;
+}
+
+test "artifact text resolves canonical selector through stored source field" {
+    const alloc = std.testing.allocator;
+    const payload =
+        \\{"_source_field":"body","body":"chunk payload"}
+    ;
+
+    const original = (try artifactTextAlloc(alloc, payload, "body")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(original);
+    try std.testing.expectEqualStrings("chunk payload", original);
+
+    const canonical = (try artifactTextAlloc(alloc, payload, "text")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(canonical);
+    try std.testing.expectEqualStrings("chunk payload", canonical);
+
+    try std.testing.expect((try artifactTextAlloc(alloc, payload, "typo")) == null);
 }
 
 test "append artifact fields stores text offsets and payload" {
