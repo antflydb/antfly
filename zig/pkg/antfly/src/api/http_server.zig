@@ -14171,8 +14171,10 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
             error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => if (metadata_authority.isRetryableError(err))
+            else => if (metadata_authority.isMutationNotAdmittedError(err))
                 try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
+                try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying")
             else
                 return err,
         };
@@ -14242,8 +14244,10 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
             error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => if (metadata_authority.isRetryableError(err))
+            else => if (metadata_authority.isMutationNotAdmittedError(err))
                 try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
+                try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying")
             else
                 return err,
         };
@@ -21588,15 +21592,17 @@ fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
 }
 
 pub fn shouldRetryMetadataMutation(err: anyerror, elapsed_ns: u64, timeout_ns: u64) bool {
-    return elapsed_ns < timeout_ns and
-        (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err));
+    return elapsed_ns < timeout_ns and metadata_authority.isMutationNotAdmittedError(err);
 }
 
 test "public metadata mutation retries transient authority loss only within its deadline" {
     const timeout_ns = default_metadata_mutation_retry_timeout_ns;
     try std.testing.expect(shouldRetryMetadataMutation(error.NotLeader, timeout_ns - 1, timeout_ns));
     try std.testing.expect(shouldRetryMetadataMutation(error.ProposalDropped, 0, timeout_ns));
-    try std.testing.expect(shouldRetryMetadataMutation(error.UnexpectedHttpStatus, 0, timeout_ns));
+    try std.testing.expect(shouldRetryMetadataMutation(error.LeaderTransferInProgress, 0, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.UnexpectedHttpStatus, 0, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.MetadataLinearizableReadTimeout, 0, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.ReconcileLeaseNotHeld, 0, timeout_ns));
     try std.testing.expect(!shouldRetryMetadataMutation(error.NotLeader, timeout_ns, timeout_ns));
     try std.testing.expect(!shouldRetryMetadataMutation(error.InvalidArguments, 0, timeout_ns));
 
@@ -36156,7 +36162,7 @@ test "api http server reports exhausted table mutation authority consistently" {
         fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.create_calls += 1;
-            return error.MetadataLinearizableReadTimeout;
+            return error.NotLeader;
         }
 
         fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
@@ -36201,7 +36207,12 @@ test "api http server reports exhausted table mutation authority consistently" {
 
 test "api http server retries only pre-admission public table drop failures" {
     const alloc = std.testing.allocator;
-    const FailureMode = enum { transient_then_success, ambiguous };
+    const FailureMode = enum {
+        transient_then_success,
+        explicit_ambiguous,
+        linearizable_timeout,
+        unexpected_http_status,
+    };
     const FakeSource = struct {
         mode: FailureMode,
         drop_calls: usize = 0,
@@ -36226,7 +36237,9 @@ test "api http server retries only pre-admission public table drop failures" {
             self.drop_calls += 1;
             switch (self.mode) {
                 .transient_then_success => if (self.drop_calls == 1) return error.NotLeader,
-                .ambiguous => return error.MetadataMutationOutcomeUnknown,
+                .explicit_ambiguous => return error.MetadataMutationOutcomeUnknown,
+                .linearizable_timeout => return error.MetadataLinearizableReadTimeout,
+                .unexpected_http_status => return error.UnexpectedHttpStatus,
             }
             return .{
                 .table_id = 7,
@@ -36247,21 +36260,37 @@ test "api http server retries only pre-admission public table drop failures" {
     try std.testing.expectEqual(@as(u16, 204), recovered.status);
     try std.testing.expectEqual(@as(usize, 2), recovered_source.drop_calls);
 
-    var ambiguous_source = FakeSource{ .mode = .ambiguous };
-    var ambiguous_server = ApiHttpServer.init(alloc, .{}, ambiguous_source.iface(), null, null);
-    ambiguous_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
-    var ambiguous = try executeHttpxTestRequest(&ambiguous_server, .{
-        .method = .DELETE,
-        .uri = "/tables/docs",
-    });
-    defer ambiguous.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), ambiguous.status);
-    try std.testing.expectEqualStrings(
-        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
-        ambiguous.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse
-            return error.MissingMutationOutcomeHeader,
-    );
-    try std.testing.expectEqual(@as(usize, 1), ambiguous_source.drop_calls);
+    const ambiguous_modes = [_]FailureMode{
+        .explicit_ambiguous,
+        .linearizable_timeout,
+        .unexpected_http_status,
+    };
+    for (ambiguous_modes) |mode| {
+        var ambiguous_source = FakeSource{ .mode = mode };
+        var ambiguous_server = ApiHttpServer.init(alloc, .{}, ambiguous_source.iface(), null, null);
+        ambiguous_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
+        var ambiguous = try executeHttpxTestRequest(&ambiguous_server, .{
+            .method = .DELETE,
+            .uri = "/tables/docs",
+        });
+        defer ambiguous.deinit(alloc);
+        try expectPublicMetadataMutationOutcomeUnknownResponse(ambiguous);
+        try std.testing.expectEqual(@as(usize, 1), ambiguous_source.drop_calls);
+
+        var mcp_response = try ambiguous_server.executeMcpDropTable("docs");
+        defer mcp_response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), mcp_response.status);
+        try std.testing.expectEqual(@as(usize, 1), mcp_response.headers.len);
+        try std.testing.expectEqualStrings(
+            metadata_http_routes.Routes.raft_mutation_outcome_header,
+            mcp_response.headers[0].name,
+        );
+        try std.testing.expectEqualStrings(
+            metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+            mcp_response.headers[0].value,
+        );
+        try std.testing.expectEqual(@as(usize, 2), ambiguous_source.drop_calls);
+    }
 }
 
 test "schema projection expectation uses backend committed generation" {
@@ -38908,6 +38937,21 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expect(metadata_not_leader);
 }
 
+fn expectPublicMetadataMutationOutcomeUnknownResponse(resp: http_common.HttpResponse) !void {
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        resp.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse
+            return error.MissingMutationOutcomeHeader,
+    );
+    try std.testing.expectEqualStrings(
+        "table mutation outcome is unknown; observe table state before retrying",
+        resp.body,
+    );
+    try std.testing.expect(resp.header("Retry-After") == null);
+    try std.testing.expect(resp.header(http_common.metadata_not_leader_header) == null);
+}
+
 fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpResponse) !void {
     const expected_json =
         \\{"code":"metadata_capability_unavailable","error":"metadata capability unavailable","message":"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}
@@ -38948,7 +38992,7 @@ fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpRespo
     try std.testing.expect(retry_after);
 }
 
-test "api http server returns retryable not leader when local reconcile lease is lost" {
+test "api http server does not replay create when local reconcile lease is lost" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         create_calls: usize = 0,
@@ -38989,8 +39033,22 @@ test "api http server returns retryable not leader when local reconcile lease is
     });
     defer resp.deinit(alloc);
 
-    try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 3), source.create_calls);
+    try expectPublicMetadataMutationOutcomeUnknownResponse(resp);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+
+    var mcp_response = try server.executeMcpCreateTable("docs", create_body, null);
+    defer mcp_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), mcp_response.status);
+    try std.testing.expectEqual(@as(usize, 1), mcp_response.headers.len);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        mcp_response.headers[0].name,
+    );
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        mcp_response.headers[0].value,
+    );
+    try std.testing.expectEqual(@as(usize, 2), source.create_calls);
 }
 
 test "api http server returns retryable not leader when metadata proposal is dropped" {

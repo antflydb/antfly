@@ -2606,6 +2606,42 @@ pub const MetadataHttpNodeSimulation = struct {
         return try metadata_api.captureSnapshot(self.cluster.alloc, self);
     }
 
+    pub fn catalogRoutingSnapshot(
+        self: MetadataHttpNodeSimulation,
+        deadline_ns: ?u64,
+    ) !metadata_api.CatalogRoutingSnapshot {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const projection = try store.captureCatalogProjection(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            deadline_ns,
+        );
+        return .{
+            .metadata_group_id = self.cluster.metadata_group_id,
+            .metadata_incarnation = projection.metadata_incarnation,
+            .catalog_revision = projection.catalog_revision,
+            .change_token = .{
+                .metadata_group_id = self.cluster.metadata_group_id,
+                .metadata_incarnation = projection.metadata_incarnation,
+                .revision = projection.catalog_revision,
+            },
+            .tables = projection.tables,
+            .ranges = projection.ranges,
+        };
+    }
+
+    pub fn freeCatalogRoutingSnapshot(
+        self: MetadataHttpNodeSimulation,
+        snapshot: *metadata_api.CatalogRoutingSnapshot,
+    ) void {
+        for (snapshot.tables) |table| metadata_table_manager.freeTable(self.cluster.alloc, table);
+        self.cluster.alloc.free(snapshot.tables);
+        for (snapshot.ranges) |range| metadata_table_manager.freeRange(self.cluster.alloc, range);
+        self.cluster.alloc.free(snapshot.ranges);
+        snapshot.* = undefined;
+    }
+
     pub fn medianKeyLookup(self: MetadataHttpNodeSimulation) ?metadata_reconciler.MedianKeyLookup {
         return .{
             .ptr = self.cluster,
@@ -2873,6 +2909,53 @@ pub const MetadataHttpNodeSimulation = struct {
 
     pub fn upsertTable(self: MetadataHttpNodeSimulation, record: metadata_table_manager.TableRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
+    }
+
+    pub fn replaceTableDefinition(
+        self: MetadataHttpNodeSimulation,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.cluster.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        // The proposal helper waits for the exact log index to apply. Keep a
+        // short projection loop because the simulated durable projection can
+        // be published on the following deterministic scheduler turn.
+        for (0..48) |_| {
+            const current = (try store.getTable(
+                self.cluster.alloc,
+                self.cluster.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.cluster.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.cluster.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+            try self.cluster.stepAll();
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
@@ -3183,6 +3266,7 @@ pub const MetadataHttpClusterSimulation = struct {
     placement_intent_hashes: []u64,
     placement_intent_hash_valid: []bool,
     backend_runtimes: []db_mod.background_runtime.BackendRuntimeHandle,
+    linearizable_read_drivers: []PublicApiLinearizableReadDriver,
     manual_clock: *platform_clock.ManualClock,
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
@@ -3311,7 +3395,18 @@ pub const MetadataHttpClusterSimulation = struct {
                 .clock = manual_clock.clock(),
             });
         }
-        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, deps);
+        const linearizable_read_drivers = try alloc.alloc(PublicApiLinearizableReadDriver, configs.len);
+        errdefer alloc.free(linearizable_read_drivers);
+        const simulation_deps = try alloc.dupe(raft_sim.ManagedHttpHostSimulationDeps, deps);
+        defer alloc.free(simulation_deps);
+        for (simulation_deps, linearizable_read_drivers, 0..) |*dep, *driver, index| {
+            driver.* = .{
+                .node_index = index,
+                .downstream = dep.host.read_state_observer,
+            };
+            dep.host.read_state_observer = driver.observer();
+        }
+        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, simulation_deps);
         errdefer raft_cluster.deinit();
         var cluster = MetadataHttpClusterSimulation{
             .alloc = alloc,
@@ -3328,6 +3423,7 @@ pub const MetadataHttpClusterSimulation = struct {
             .placement_intent_hashes = placement_intent_hashes,
             .placement_intent_hash_valid = placement_intent_hash_valid,
             .backend_runtimes = backend_runtimes,
+            .linearizable_read_drivers = linearizable_read_drivers,
             .manual_clock = manual_clock,
             .reconcile_lease_update_in_flight = false,
             .metadata_proposal_in_flight = 0,
@@ -3347,6 +3443,7 @@ pub const MetadataHttpClusterSimulation = struct {
         self.alloc.free(self.pending_cluster_store_retry_at_ms);
         self.alloc.free(self.placement_intent_hashes);
         self.alloc.free(self.placement_intent_hash_valid);
+        self.alloc.free(self.linearizable_read_drivers);
         for (self.backend_runtimes) |*runtime| runtime.deinit();
         self.alloc.free(self.backend_runtimes);
         self.alloc.destroy(self.manual_clock);
@@ -3354,6 +3451,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn startAll(self: *MetadataHttpClusterSimulation) !void {
+        for (self.linearizable_read_drivers) |*driver| driver.cluster = self;
         try self.registerVirtualNodes();
     }
 
@@ -4634,31 +4732,26 @@ fn applyReplaceTableDefinitionMutation(
     replacement: metadata_table_manager.TableRecord,
 ) !void {
     const target = currentMetadataMutationNode(node);
-    var snapshot = try target.adminSnapshot();
-    defer target.freeAdminSnapshot(&snapshot);
-    const current = api_tables.findTableByName(&snapshot, replacement.name) orelse
-        return error.TableNotFound;
-    if (replacement.table_id != expected.table_id or
-        !metadata_table_manager.tableDefinitionsEqual(current.*, expected))
-    {
-        return error.TableGenerationChanged;
-    }
-    try target.upsertTable(replacement);
-    try target.runRound();
+    try target.replaceTableDefinition(expected, replacement);
 }
 
 const PublicApiLinearizableReadDriver = struct {
     cluster: ?*MetadataHttpClusterSimulation = null,
     node_index: usize,
+    downstream: ?raft_state_machine.ReadStateObserver = null,
+    ensure_mutex: std.Io.Mutex = .init,
     completed: std.atomic.Value(bool) = .init(false),
     max_rounds: usize = 48,
     request_sequence: u64 = 0,
-    active_group_id: u64 = 0,
-    active_request_context: [96]u8 = undefined,
-    active_request_context_len: usize = 0,
+    active_group_id: std.atomic.Value(u64) = .init(0),
+    active_request_sequence: std.atomic.Value(u64) = .init(0),
 
-    fn activeRequestContext(self: *const @This()) []const u8 {
-        return self.active_request_context[0..self.active_request_context_len];
+    fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
+        return try std.fmt.bufPrint(
+            buf,
+            "public-api-linearizable-read/{d}/{d}",
+            .{ self.node_index, sequence },
+        );
     }
 
     fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
@@ -4670,31 +4763,36 @@ const PublicApiLinearizableReadDriver = struct {
 
     fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (group_id != self.active_group_id) return;
-        const request_context = self.activeRequestContext();
-        for (read_states) |read_state| {
-            if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
-                self.completed.store(true, .release);
-                return;
+        if (group_id == self.active_group_id.load(.acquire)) {
+            var request_context_buf: [96]u8 = undefined;
+            const request_context = try self.requestContext(
+                &request_context_buf,
+                self.active_request_sequence.load(.acquire),
+            );
+            for (read_states) |read_state| {
+                if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
+                    self.completed.store(true, .release);
+                    break;
+                }
             }
         }
+        if (self.downstream) |downstream| try downstream.onReadStates(group_id, read_states);
     }
 
     fn ensure(self: *@This()) !void {
+        self.ensure_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.ensure_mutex.unlock(std.Options.debug_io);
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
         self.completed.store(false, .release);
         self.request_sequence +%= 1;
         if (self.request_sequence == 0) self.request_sequence = 1;
-        self.active_group_id = cluster.metadata_group_id;
-        const context = try std.fmt.bufPrint(
-            &self.active_request_context,
-            "public-api-linearizable-read/{d}/{d}",
-            .{ self.node_index, self.request_sequence },
-        );
-        self.active_request_context_len = context.len;
+        self.active_group_id.store(cluster.metadata_group_id, .release);
+        self.active_request_sequence.store(self.request_sequence, .release);
+        var request_context_buf: [96]u8 = undefined;
+        const request_context = try self.requestContext(&request_context_buf, self.request_sequence);
         cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
             cluster.metadata_group_id,
-            self.activeRequestContext(),
+            request_context,
         ) catch |err| switch (err) {
             error.NotLeader => return error.NotLeader,
             else => return err,
@@ -4708,6 +4806,38 @@ const PublicApiLinearizableReadDriver = struct {
         return error.MetadataLinearizableReadTimeout;
     }
 };
+
+fn authoritativePublicApiRoutingNode(
+    node: MetadataHttpNodeSimulation,
+    deadline_ns: ?u64,
+    external_driver: ?*PublicApiLinearizableReadDriver,
+) !MetadataHttpNodeSimulation {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline)
+            return error.CatalogRoutingSnapshotTimeout;
+    }
+    if (external_driver) |driver| {
+        driver.ensure() catch |err| switch (err) {
+            error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    } else {
+        const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
+            return error.CatalogRoutingSnapshotTimeout;
+        node.cluster.linearizable_read_drivers[leader_index].ensure() catch |err| switch (err) {
+            error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+
+    const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
+        return error.CatalogRoutingSnapshotTimeout;
+    const target = node.cluster.node(leader_index);
+    const raft_status = target.sim().raftStatus(node.cluster.metadata_group_id) orelse
+        return error.CatalogRoutingSnapshotTimeout;
+    if (raft_status.soft.role != .leader) return error.NotLeader;
+    return target;
+}
 
 const PublicApiStatusSource = struct {
     const MetadataSnapshotMode = enum {
@@ -4727,7 +4857,6 @@ const PublicApiStatusSource = struct {
     }
 
     fn iface(self: *@This()) api_http_server.StatusSource {
-        const RoutingAdapter = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
         return .{
             .ptr = self,
             .vtable = &.{
@@ -4736,9 +4865,9 @@ const PublicApiStatusSource = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
-                .routing_snapshot = RoutingAdapter.routingSnapshot,
-                .linearizable_routing_snapshot = RoutingAdapter.linearizableSnapshot,
-                .free_routing_snapshot = RoutingAdapter.freeRoutingSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
                 .drop_table = dropTable,
@@ -4784,6 +4913,26 @@ const PublicApiStatusSource = struct {
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.metadataNode().freeAdminSnapshot(snapshot);
+    }
+
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.metadataNode().catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = try authoritativePublicApiRoutingNode(
+            self.node,
+            deadline_ns,
+            self.linearizable_read_driver,
+        );
+        return try target.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
     }
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
@@ -4957,15 +5106,14 @@ const PublicApiCatalogSource = struct {
     }
 
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
-        const RoutingAdapter = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
         return .{
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
-                .routing_snapshot = RoutingAdapter.routingSnapshot,
-                .linearizable_routing_snapshot = RoutingAdapter.linearizableSnapshot,
-                .free_routing_snapshot = RoutingAdapter.freeRoutingSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
             },
         };
     }
@@ -4978,6 +5126,22 @@ const PublicApiCatalogSource = struct {
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.metadataNode().freeAdminSnapshot(snapshot);
+    }
+
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.metadataNode().catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = try authoritativePublicApiRoutingNode(self.node, deadline_ns, null);
+        return try target.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
     }
 };
 
@@ -6154,6 +6318,29 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     try std.testing.expectEqual(@as(usize, 3), created_range.active_count);
     const client_index = created_range.non_host_index orelse return error.TestExpectedEqual;
     const client_base = api_base_uris[client_index];
+
+    // Exercise the local/eventual and leader-authoritative compact routing
+    // paths independently. The authoritative capture must complete a real
+    // Raft read barrier and must not reinterpret this follower's admin fixture
+    // as linearizable state.
+    var local_catalog_source = PublicApiCatalogSource{
+        .node = cluster.node(client_index),
+        .metadata_snapshot_mode = .local,
+    };
+    const local_catalog = local_catalog_source.iface();
+    const routing = try local_catalog.routingSource();
+    var eventual_routing = try routing.eventualSnapshot(null);
+    defer eventual_routing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), eventual_routing.value.tables.len);
+    try std.testing.expectEqualStrings("docs", eventual_routing.value.tables[0].name);
+    var authoritative_routing = try routing.linearizableSnapshot(
+        platform_time.monotonicNs() +| (5 * std.time.ns_per_s),
+    );
+    defer authoritative_routing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), authoritative_routing.value.tables.len);
+    try std.testing.expectEqualStrings("docs", authoritative_routing.value.tables[0].name);
+    try std.testing.expectEqual(cluster.metadata_group_id, authoritative_routing.value.metadata_group_id);
+    try std.testing.expect(authoritative_routing.value.catalog_revision >= eventual_routing.value.catalog_revision);
 
     const group_leader_index = (try waitForGroupLeaderIndex(&cluster, group_id, 96)) orelse return error.TestExpectedEqual;
     try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, api_tables.default_full_text_index_name, 40);

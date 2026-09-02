@@ -501,6 +501,15 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn metadataMutationOutcomeUnknownResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            metadata_http_routes.Routes.raft_mutation_outcome_header,
+            metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        );
+        _ = ctx.status(409);
+        return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+    }
+
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
         return err;
@@ -4565,28 +4574,19 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("metadata mutation deadline exceeded before admission; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
-                    try ctx.setHeader(
-                        metadata_http_routes.Routes.raft_mutation_outcome_header,
-                        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
-                    );
-                    _ = ctx.status(409);
-                    return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+                    return metadataMutationOutcomeUnknownResponse(ctx);
                 },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
                 },
                 error.UnexpectedHttpStatus => {
-                    const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                    if (!self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
-                        std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
-                        return err;
-                    }
-                    sleepNs(self.api_server.metadataMutationRetryPollNs());
-                    continue;
+                    // An opaque response proves neither rejection nor
+                    // admission. Replaying it can duplicate a committed DDL.
+                    return metadataMutationOutcomeUnknownResponse(ctx);
                 },
                 else => {
-                    if (metadata_authority.isRetryableError(err)) {
+                    if (metadata_authority.isMutationNotAdmittedError(err)) {
                         const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
                         if (self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
@@ -4594,6 +4594,8 @@ pub const AntflyApiHandler = struct {
                         }
                         return metadataNotLeaderResponse(ctx);
                     }
+                    if (metadata_authority.isRetryableError(err))
+                        return metadataMutationOutcomeUnknownResponse(ctx);
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
                 },
@@ -4703,15 +4705,10 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("metadata mutation deadline exceeded before admission; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
-                    try ctx.setHeader(
-                        metadata_http_routes.Routes.raft_mutation_outcome_header,
-                        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
-                    );
-                    _ = ctx.status(409);
-                    return ctx.text("table mutation outcome is unknown; observe table state before retrying");
+                    return metadataMutationOutcomeUnknownResponse(ctx);
                 },
                 else => {
-                    if (metadata_authority.isRetryableError(err)) {
+                    if (metadata_authority.isMutationNotAdmittedError(err)) {
                         const elapsed_ns = platform_time.monotonicNs() -| metadata_drop_start_ns;
                         if (self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_drop_attempts)) {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
@@ -4719,6 +4716,8 @@ pub const AntflyApiHandler = struct {
                         }
                         return metadataNotLeaderResponse(ctx);
                     }
+                    if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
+                        return metadataMutationOutcomeUnknownResponse(ctx);
                     std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                     return err;
                 },
