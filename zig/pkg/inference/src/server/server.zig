@@ -14238,6 +14238,11 @@ fn appendResolvedInferenceCapabilities(
     accepts_audio: bool,
     accepts_document: bool,
 ) !void {
+    // Kept in lockstep with antfly inference.work.MimeTypes' bounded native
+    // capability representation. The wire catalog may contain any validated
+    // essence, but no node may publish more extensions than a peer can retain.
+    const max_additional_inference_mime_types = 16;
+    const max_inference_mime_type_bytes = 63;
     const resolved_task = normalizedInferenceTask(task) orelse return;
     if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document) return;
     const resolved = try resolveInferenceBatchCapabilities(
@@ -14251,7 +14256,7 @@ fn appendResolvedInferenceCapabilities(
         accepts_document,
     );
 
-    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":3,\"task\":");
+    try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":4,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"input_modalities\":[");
     var modality_index: usize = 0;
@@ -14282,6 +14287,46 @@ fn appendResolvedInferenceCapabilities(
         try jsonEncodeString(buf, allocator, mime[1]);
         mime_index += 1;
     }
+    var extension_mime_count: usize = 0;
+    for (manifest_capabilities, 0..) |capability, capability_index| {
+        const prefix = "inference.mime_type=";
+        if (!std.mem.startsWith(u8, capability, prefix)) continue;
+        const value = capability[prefix.len..];
+        const parsed = scraping.data_uri.parseMediaType(value) catch return error.InvalidInferenceCapabilities;
+        if (value.len > max_inference_mime_type_bytes or parsed.parameters.len != 0 or !std.mem.eql(u8, parsed.essence, value))
+            return error.InvalidInferenceCapabilities;
+        for (value) |byte| if (std.ascii.isUpper(byte))
+            return error.InvalidInferenceCapabilities;
+        if (std.mem.eql(u8, value, "image/jpg") or std.mem.eql(u8, value, "audio/x-wav"))
+            return error.InvalidInferenceCapabilities;
+        const modality_supported = if (std.mem.startsWith(u8, value, "text/") or
+            std.mem.eql(u8, value, "application/json"))
+            accepts_text
+        else if (std.mem.startsWith(u8, value, "image/"))
+            accepts_image
+        else if (std.mem.startsWith(u8, value, "audio/"))
+            accepts_audio
+        else if (std.mem.startsWith(u8, value, "application/"))
+            accepts_document
+        else
+            false;
+        if (!modality_supported) return error.InvalidInferenceCapabilities;
+        var duplicate = false;
+        for (manifest_capabilities[0..capability_index]) |prior| {
+            if (std.mem.eql(u8, prior, capability)) duplicate = true;
+        }
+        if (duplicate or
+            std.mem.eql(u8, value, "text/plain") or std.mem.eql(u8, value, "application/json") or
+            std.mem.eql(u8, value, "application/pdf") or std.mem.eql(u8, value, "image/png") or
+            std.mem.eql(u8, value, "image/jpeg") or std.mem.eql(u8, value, "image/webp") or
+            std.mem.eql(u8, value, "audio/wav") or std.mem.eql(u8, value, "audio/mpeg")) continue;
+        if (extension_mime_count == max_additional_inference_mime_types)
+            return error.InvalidInferenceCapabilities;
+        if (mime_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, value);
+        mime_index += 1;
+        extension_mime_count += 1;
+    }
     try buf.appendSlice(allocator, "],\"input_granularity\":");
     try jsonEncodeString(buf, allocator, if (accepts_document) "document" else if (accepts_image) "page" else if (accepts_text and
         (std.mem.eql(u8, resolved_task, "read") or std.mem.eql(u8, resolved_task, "generate") or
@@ -14292,7 +14337,24 @@ fn appendResolvedInferenceCapabilities(
     try jsonEncodeString(buf, allocator, resolvedTaskResultCardinality(resolved_task));
     try buf.appendSlice(allocator, ",\"prompt_policy\":");
     try jsonEncodeString(buf, allocator, resolvedTaskPromptPolicy(resolved_task));
-    try buf.appendSlice(allocator, ",\"borrowed_attachments\":false");
+    try buf.appendSlice(allocator, ",\"borrowed_attachments\":false,\"task_limits\":{");
+    inline for ([_]struct { name: []const u8, value: ?usize }{
+        .{ .name = "max_text_bytes_per_item", .value = resolved.max_text_bytes_per_item },
+        .{ .name = "max_input_tokens_per_item", .value = resolved.max_input_tokens_per_item },
+        .{ .name = "max_output_tokens_per_item", .value = resolved.max_output_tokens_per_item },
+        .{ .name = "max_candidates_per_request", .value = resolved.max_candidates_per_request },
+        .{ .name = "max_schema_bytes", .value = resolved.max_schema_bytes },
+    }, 0..) |limit, index| {
+        if (index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, limit.name);
+        try buf.append(allocator, ':');
+        if (limit.value) |value| {
+            const encoded = try std.fmt.allocPrint(allocator, "{d}", .{value});
+            defer allocator.free(encoded);
+            try buf.appendSlice(allocator, encoded);
+        } else try buf.appendSlice(allocator, "null");
+    }
+    try buf.append(allocator, '}');
     try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
     try jsonEncodeString(buf, allocator, @tagName(resolved.mode));
     const limits_prefix = try std.fmt.allocPrint(
@@ -14352,6 +14414,11 @@ pub const ResolvedInferenceBatchCapabilities = struct {
     max_decoded_pixels: ?u64,
     max_media_parts_per_item: usize,
     per_item_failures: bool,
+    max_text_bytes_per_item: ?usize = null,
+    max_input_tokens_per_item: ?usize = null,
+    max_output_tokens_per_item: ?usize = null,
+    max_candidates_per_request: ?usize = null,
+    max_schema_bytes: ?usize = null,
 };
 
 pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
@@ -14395,6 +14462,11 @@ pub fn resolveInferenceBatchCapabilities(
         max_generate_media_parts_per_item
     else
         1;
+    var max_text_bytes_per_item: ?usize = null;
+    var max_input_tokens_per_item: ?usize = null;
+    var max_output_tokens_per_item: ?usize = if (std.mem.eql(u8, resolved_task, "read")) max_read_tokens else null;
+    var max_candidates_per_request: ?usize = if (std.mem.eql(u8, resolved_task, "classify")) max_classification_labels else null;
+    var max_schema_bytes: ?usize = null;
 
     for (manifest_capabilities) |capability| {
         if (try resolvedManifestLimit(usize, capability, "inference.batch.preferred_items=", false)) |limit| {
@@ -14409,6 +14481,16 @@ pub fn resolveInferenceBatchCapabilities(
             if (max_decoded_pixels) |current| max_decoded_pixels = @min(current, limit);
         } else if (try resolvedManifestLimit(usize, capability, "inference.batch.max_media_parts_per_item=", true)) |limit| {
             max_media_parts_per_item = @min(max_media_parts_per_item, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.limits.max_text_bytes_per_item=", false)) |limit| {
+            max_text_bytes_per_item = minOptionalLimit(max_text_bytes_per_item, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.limits.max_input_tokens_per_item=", false)) |limit| {
+            max_input_tokens_per_item = minOptionalLimit(max_input_tokens_per_item, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.limits.max_output_tokens_per_item=", false)) |limit| {
+            max_output_tokens_per_item = minOptionalLimit(max_output_tokens_per_item, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.limits.max_candidates_per_request=", false)) |limit| {
+            max_candidates_per_request = minOptionalLimit(max_candidates_per_request, limit);
+        } else if (try resolvedManifestLimit(usize, capability, "inference.limits.max_schema_bytes=", false)) |limit| {
+            max_schema_bytes = minOptionalLimit(max_schema_bytes, limit);
         }
     }
     preferred_items = @min(preferred_items, max_items);
@@ -14422,7 +14504,16 @@ pub fn resolveInferenceBatchCapabilities(
         .max_decoded_pixels = max_decoded_pixels,
         .max_media_parts_per_item = max_media_parts_per_item,
         .per_item_failures = std.mem.eql(u8, resolved_task, "generate"),
+        .max_text_bytes_per_item = max_text_bytes_per_item,
+        .max_input_tokens_per_item = max_input_tokens_per_item,
+        .max_output_tokens_per_item = max_output_tokens_per_item,
+        .max_candidates_per_request = max_candidates_per_request,
+        .max_schema_bytes = max_schema_bytes,
     };
+}
+
+fn minOptionalLimit(current: ?usize, requested: usize) ?usize {
+    return if (current) |value| @min(value, requested) else requested;
 }
 
 fn resolvedManifestLimit(
@@ -14478,11 +14569,63 @@ test "standalone inference model catalog publishes resolved native reader batchi
     }
     try std.testing.expect(found);
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 3), resolved.object.get("version").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
     try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
+    const task_limits = resolved.object.get("task_limits").?.object;
+    try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
+    try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
+}
+
+test "standalone inference catalog validates extensible MIME against resolved modalities" {
+    const alloc = std.testing.allocator;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, "{\"model\":true");
+    try appendResolvedInferenceCapabilities(
+        &body,
+        alloc,
+        "embedders",
+        &.{"inference.mime_type=image/tiff"},
+        false,
+        1024,
+        4096,
+        false,
+        true,
+        false,
+        false,
+    );
+    try body.append(alloc, '}');
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
+    defer parsed.deinit();
+    const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
+    const mime_values = resolved.object.get("accepted_mime_types").?.array.items;
+    var found_tiff = false;
+    for (mime_values) |value| if (std.mem.eql(u8, value.string, "image/tiff")) {
+        found_tiff = true;
+    };
+    try std.testing.expect(found_tiff);
+
+    var invalid = std.ArrayListUnmanaged(u8).empty;
+    defer invalid.deinit(alloc);
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        appendResolvedInferenceCapabilities(
+            &invalid,
+            alloc,
+            "embedders",
+            &.{"inference.mime_type=image/tiff"},
+            false,
+            1024,
+            4096,
+            true,
+            false,
+            false,
+            false,
+        ),
+    );
 }
 
 test "normalized inference capabilities cover every model family" {

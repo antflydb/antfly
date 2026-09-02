@@ -65,7 +65,11 @@ pub fn main(init: std.process.Init) !void {
                     .embed => .{ .text = true, .image = true },
                     else => return error.UnexpectedIntegrationRoute,
                 },
-                .accepted_mime_types = .{ .text_plain = true, .image_png = true, .image_jpeg = true },
+                .accepted_mime_types = .{
+                    .text_plain = task != .read,
+                    .image_png = true,
+                    .image_jpeg = true,
+                },
                 .input_granularity = .page,
                 .batch = .{
                     .mode = if (task == .generate) .serial_compatibility else .native,

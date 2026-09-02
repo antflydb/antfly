@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1786,6 +1787,59 @@ func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
 				t.Fatalf("malformed singleton descriptor was not poisoned: %s", got)
 			}
 		})
+	}
+}
+
+func TestConservativeCapabilitiesV4PreservesExtensibleMIMEAndTaskLimits(t *testing.T) {
+	base := func(textBytes any, outputTokens any) map[string]any {
+		return map[string]any{
+			"version": float64(4), "task": "extract",
+			"input_modalities": []any{"image"}, "accepted_mime_types": []any{"image/png", "image/tiff"},
+			"input_granularity": "page", "output": "extraction",
+			"result_cardinality": "one_per_item", "prompt_policy": "structured_schema",
+			"borrowed_attachments": true,
+			"task_limits": map[string]any{
+				"max_text_bytes_per_item": textBytes, "max_input_tokens_per_item": nil,
+				"max_output_tokens_per_item": outputTokens, "max_candidates_per_request": nil,
+				"max_schema_bytes": float64(4096),
+			},
+			"batch": map[string]any{
+				"mode": "serial_compatibility", "preferred_items": float64(8), "max_items": float64(32),
+				"max_encoded_media_bytes": float64(4096), "max_decoded_pixels": float64(8192),
+				"max_media_parts_per_item": float64(1), "per_item_failures": false,
+			},
+		}
+	}
+	merged, ok := conservativeInferenceCapabilities(base(float64(2048), float64(512)), base(float64(1024), nil))
+	if !ok {
+		t.Fatal("v4 capabilities did not merge")
+	}
+	if merged["version"] != float64(4) || !reflect.DeepEqual(merged["accepted_mime_types"], []string{"image/png", "image/tiff"}) {
+		t.Fatalf("extensible v4 MIME contract was lost: %#v", merged)
+	}
+	limits := merged["task_limits"].(map[string]any)
+	if limits["max_text_bytes_per_item"] != float64(1024) || limits["max_output_tokens_per_item"] != nil {
+		t.Fatalf("v4 limits were not conservatively intersected: %#v", limits)
+	}
+
+	malformed := base(float64(1024), nil)
+	malformed["accepted_mime_types"] = []any{"image/tiff;codec=raw"}
+	if _, ok := conservativeInferenceCapabilities(malformed, base(float64(1024), nil)); ok {
+		t.Fatal("catalog accepted a parameterized MIME capability")
+	}
+	alias := base(float64(1024), nil)
+	alias["accepted_mime_types"] = []any{"image/jpg"}
+	if _, ok := conservativeInferenceCapabilities(alias, base(float64(1024), nil)); ok {
+		t.Fatal("catalog accepted a non-canonical MIME alias")
+	}
+	excess := base(float64(1024), nil)
+	mimes := make([]any, maxAdditionalInferenceMIMEValues+1)
+	for index := range mimes {
+		mimes[index] = fmt.Sprintf("image/x-test-%d", index)
+	}
+	excess["accepted_mime_types"] = mimes
+	if _, ok := conservativeInferenceCapabilities(excess, base(float64(1024), nil)); ok {
+		t.Fatal("catalog accepted more MIME extensions than a peer can retain")
 	}
 }
 

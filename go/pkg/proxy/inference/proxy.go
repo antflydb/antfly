@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -1635,8 +1636,8 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	if !validInferenceBatchCapabilities(a, aVersion) || !validInferenceBatchCapabilities(b, bVersion) {
 		return nil, false
 	}
-	if aVersion >= 3 && !validExactInferenceCapabilities(a) ||
-		bVersion >= 3 && !validExactInferenceCapabilities(b) {
+	if aVersion >= 3 && !validExactInferenceCapabilities(a, aVersion) ||
+		bVersion >= 3 && !validExactInferenceCapabilities(b, bVersion) {
 		return nil, false
 	}
 	aBatch, aok := a["batch"].(map[string]any)
@@ -1711,7 +1712,7 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		if !ok || len(modalities) == 0 {
 			return nil, false
 		}
-		mimes, ok := intersectValidatedStringValues(a["accepted_mime_types"], b["accepted_mime_types"], exactMIMETypes)
+		mimes, ok := intersectValidatedMIMEValues(a["accepted_mime_types"], b["accepted_mime_types"])
 		if !ok || len(mimes) == 0 {
 			return nil, false
 		}
@@ -1734,8 +1735,25 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		// local ABI as borrowed.
 		result["borrowed_attachments"] = false
 		version = 3
+		if aVersion >= 4 && bVersion >= 4 {
+			aLimits, aok := a["task_limits"].(map[string]any)
+			bLimits, bok := b["task_limits"].(map[string]any)
+			if !aok || !bok {
+				return nil, false
+			}
+			limits := make(map[string]any)
+			for _, field := range taskLimitFields {
+				value, ok := conservativeOptionalLimit(aLimits[field], bLimits[field], false, false)
+				if !ok {
+					return nil, false
+				}
+				limits[field] = value
+			}
+			result["task_limits"] = limits
+			version = 4
+		}
 		result["version"] = float64(version)
-		if !validExactInferenceCapabilities(result) {
+		if !validExactInferenceCapabilities(result, version) {
 			return nil, false
 		}
 	}
@@ -1750,10 +1768,18 @@ var exactTasks = map[string]bool{
 	"extract": true, "rewrite": true, "classify": true, "transcribe": true,
 }
 var exactModalities = map[string]bool{"text": true, "image": true, "audio": true, "document": true}
-var exactMIMETypes = map[string]bool{
-	"text/plain": true, "application/json": true, "image/png": true, "image/jpeg": true, "image/webp": true,
-	"audio/wav": true, "audio/mpeg": true, "application/pdf": true,
+var canonicalBuiltInMIMETypes = map[string]bool{
+	"text/plain": true, "application/json": true, "application/pdf": true,
+	"image/png": true, "image/jpeg": true, "image/webp": true,
+	"audio/wav": true, "audio/mpeg": true,
 }
+
+const (
+	maxInferenceMIMEValues           = 24
+	maxAdditionalInferenceMIMEValues = 16
+	maxInferenceMIMEValueBytes       = 63
+)
+
 var exactGranularities = map[string]bool{"item": true, "chunk": true, "page": true, "document": true}
 var exactOutputs = map[string]bool{
 	"read_result": true, "generated_text": true, "embedding": true, "ranked_items": true,
@@ -1763,7 +1789,12 @@ var exactOutputs = map[string]bool{
 var exactCardinalities = map[string]bool{"one_per_item": true, "one_per_request": true}
 var exactPromptPolicies = map[string]bool{"explicit": true, "model_default": true, "structured_schema": true}
 
-func validExactInferenceCapabilities(capabilities map[string]any) bool {
+var taskLimitFields = []string{
+	"max_text_bytes_per_item", "max_input_tokens_per_item", "max_output_tokens_per_item",
+	"max_candidates_per_request", "max_schema_bytes",
+}
+
+func validExactInferenceCapabilities(capabilities map[string]any, version int) bool {
 	task, ok := capabilities["task"].(string)
 	if !ok || !exactTasks[task] {
 		return false
@@ -1772,7 +1803,7 @@ func validExactInferenceCapabilities(capabilities map[string]any) bool {
 	if !ok || len(modalities) == 0 {
 		return false
 	}
-	mimes, ok := validatedStringValues(capabilities["accepted_mime_types"], exactMIMETypes)
+	mimes, ok := validatedMIMEValues(capabilities["accepted_mime_types"])
 	if !ok || len(mimes) == 0 {
 		return false
 	}
@@ -1820,6 +1851,8 @@ func validExactInferenceCapabilities(capabilities map[string]any) bool {
 			modality = "text"
 		case mime == "application/pdf":
 			modality = "document"
+		case strings.HasPrefix(mime, "application/"):
+			modality = "document"
 		case strings.HasPrefix(mime, "image/"):
 			modality = "image"
 		case strings.HasPrefix(mime, "audio/"):
@@ -1836,7 +1869,94 @@ func validExactInferenceCapabilities(capabilities map[string]any) bool {
 		}
 	}
 	_, ok = capabilities["borrowed_attachments"].(bool)
-	return ok
+	if !ok {
+		return false
+	}
+	if version >= 4 {
+		limits, ok := capabilities["task_limits"].(map[string]any)
+		if !ok || len(limits) != len(taskLimitFields) {
+			return false
+		}
+		for _, field := range taskLimitFields {
+			value, found := limits[field]
+			if !found {
+				return false
+			}
+			if value == nil {
+				continue
+			}
+			number, valid := nonNegativeInteger(value)
+			if !valid || number == 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validatedMIMEValues(value any) ([]string, bool) {
+	items, ok := stringValues(value)
+	if !ok || len(items) == 0 || len(items) > maxInferenceMIMEValues {
+		return nil, false
+	}
+	seen := make(map[string]bool, len(items))
+	additional := 0
+	for _, item := range items {
+		mediaType, params, err := mime.ParseMediaType(item)
+		if err != nil || len(item) > maxInferenceMIMEValueBytes || len(params) != 0 || mediaType != item ||
+			item == "image/jpg" || item == "audio/x-wav" || seen[item] {
+			return nil, false
+		}
+		if !canonicalBuiltInMIMETypes[item] {
+			additional++
+			if additional > maxAdditionalInferenceMIMEValues {
+				return nil, false
+			}
+		}
+		seen[item] = true
+	}
+	return items, true
+}
+
+func intersectValidatedMIMEValues(left, right any) ([]string, bool) {
+	a, ok := validatedMIMEValues(left)
+	if !ok {
+		return nil, false
+	}
+	b, ok := validatedMIMEValues(right)
+	if !ok {
+		return nil, false
+	}
+	rightValues := make(map[string]bool, len(b))
+	for _, value := range b {
+		rightValues[value] = true
+	}
+	intersection := make([]string, 0, len(a))
+	for _, value := range a {
+		if rightValues[value] {
+			intersection = append(intersection, value)
+		}
+	}
+	return intersection, true
+}
+
+func stringValues(value any) ([]string, bool) {
+	switch typed := value.(type) {
+	case []string:
+		return typed, true
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			items = append(items, text)
+		}
+		return items, true
+	default:
+		return nil, false
+	}
 }
 
 func validatedStringValues(value any, allowed map[string]bool) ([]string, bool) {
@@ -1896,7 +2016,7 @@ func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {
 		return 1, true
 	}
 	number, ok := nonNegativeInteger(value)
-	if !ok || number < 1 || number > 3 {
+	if !ok || number < 1 || number > 4 {
 		return 0, false
 	}
 	return int(number), true

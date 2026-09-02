@@ -204,9 +204,10 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
     ) anyerror![]u8 = null,
     /// The concrete provider applies hard request/media/decoder/model admission
-    /// inside every model callback. Only the linked inference-node boundary may
-    /// normally set this; arbitrary callbacks fail closed when a public
-    /// invocation plan would otherwise depend on this guarantee. Keep new
+    /// inside every model callback. Request and result allocations still use
+    /// the bounded allocator supplied by this public boundary. Only the linked
+    /// inference-node boundary may normally set this; arbitrary callbacks fail
+    /// closed when a public invocation plan depends on this guarantee. Keep new
     /// boundary fields append-only so callback offsets remain stable.
     owns_invocation_admission: bool = false,
 };
@@ -1211,23 +1212,6 @@ pub const ManagedEmbedder = struct {
             return error.InferenceEncodedBytesExceeded;
         const item_control_bytes = std.math.mul(usize, shape.item_count, 256) catch
             return error.InferenceEncodedBytesExceeded;
-        if (entry.antfly_provider) |local| {
-            if (!local.owns_invocation_admission)
-                return error.InferenceInvocationMemoryUnavailable;
-            var fixed = std.math.add(usize, vector_bytes, item_control_bytes) catch
-                return error.InferenceEncodedBytesExceeded;
-            fixed = std.math.add(usize, fixed, shape.preparation_bytes) catch
-                return error.InferenceEncodedBytesExceeded;
-            return .{
-                .attachment_transport = .borrowed_binary,
-                .fixed_bytes = fixed,
-                .allocator_limit_bytes = fixed,
-                .allocator_owner = .executor,
-                .max_result_bytes_per_item = vector_bytes_per_item,
-                .max_result_bytes = vector_bytes,
-            };
-        }
-
         const outer = std.math.add(
             usize,
             "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len,
@@ -1265,12 +1249,19 @@ pub const ManagedEmbedder = struct {
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, shape.preparation_bytes) catch
             return error.InferenceEncodedBytesExceeded;
-        fixed = std.math.add(usize, fixed, remote_embedding_transport_control_bytes) catch
-            return error.InferenceEncodedBytesExceeded;
+        const local = entry.antfly_provider;
+        if (local) |provider| {
+            if (!provider.owns_invocation_admission)
+                return error.InferenceInvocationMemoryUnavailable;
+        } else {
+            fixed = std.math.add(usize, fixed, remote_embedding_transport_control_bytes) catch
+                return error.InferenceEncodedBytesExceeded;
+        }
         return .{
-            .attachment_transport = .base64_payload,
+            .attachment_transport = if (local != null) .borrowed_binary else .base64_payload,
             .fixed_bytes = fixed,
             .allocator_limit_bytes = fixed,
+            .allocator_owner = if (local != null) .executor else .caller,
             .max_result_bytes_per_item = vector_bytes_per_item,
             .max_result_bytes = vector_bytes,
         };
@@ -4234,8 +4225,11 @@ fn validateDensePartItemInvocation(
 ) !void {
     var shape = inference_work.InvocationShape{ .item_count = items.len };
     for (items) |item| switch (item) {
-        .text => {
+        .text => |text| {
             mergeModalities(&shape.modalities, .{ .text = true });
+            shape.text_bytes = std.math.add(usize, shape.text_bytes, text.len) catch
+                return error.InferenceTextBytesExceeded;
+            shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, text.len);
             try capabilities.validateMimeType("text/plain");
         },
         .media_url => |url| {

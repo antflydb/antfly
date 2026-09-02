@@ -221,13 +221,8 @@ pub const DenseEmbedder = struct {
         };
         defer sanitized.deinit(invocation_alloc);
         const safe_items = sanitized.partsSlice();
-        const callback_alloc = if (invocation_plan.allocator_owner == .caller)
-            invocation_alloc
-        else
-            alloc;
-        const vectors = embed_items(self.ptr, callback_alloc, embedding_name, safe_items, dims) catch |err| {
-            if (invocation_plan.allocator_owner == .caller and bounded.limit_exceeded)
-                return error.InferenceInvocationMemoryExceeded;
+        const vectors = embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims) catch |err| {
+            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
         if (vectors.len != items.len) {
@@ -952,7 +947,7 @@ test "media part item embedding validates each vector shape and values" {
     );
 }
 
-test "media part item embedding uses concrete executor-owned admission" {
+test "media part item embedding bounds boundary allocations under executor admission" {
     const Stub = struct {
         fn dense(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
             return try alloc.alloc(f32, dims);
@@ -995,9 +990,10 @@ test "media part item embedding uses concrete executor-owned admission" {
     const parts = [_]template_mod.ContentPart{.{
         .binary = .{ .mime_type = "image/png; charset=binary", .data = &.{1} },
     }};
-    const vectors = try embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 1);
-    defer freeDenseEmbeddingBatch(std.testing.allocator, vectors);
-    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryExceeded,
+        embedder.embedDensePartItems(std.testing.allocator, "images", &parts, 1),
+    );
 }
 
 test "media part item embedding planning preserves heterogeneous MIME accounting" {

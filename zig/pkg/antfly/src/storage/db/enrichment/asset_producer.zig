@@ -206,10 +206,8 @@ pub const Producer = struct {
                 try invocationAllocatorLimit(resolved, &requests),
             );
             const bounded_alloc = bounded.allocator();
-            const callback_alloc = if (resolved.allocator_owner == .caller) bounded_alloc else alloc;
-            const output = self.vtable.produce(self.ptr, callback_alloc, request) catch |err| {
-                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
-                    return error.InferenceInvocationMemoryExceeded;
+            const output = self.vtable.produce(self.ptr, bounded_alloc, request) catch |err| {
+                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             if (output.len > resolved.max_result_bytes_per_item or output.len > resolved.max_result_bytes) {
@@ -228,10 +226,8 @@ pub const Producer = struct {
                 alloc,
                 try invocationAllocatorLimit(resolved, requests),
             );
-            const callback_alloc = if (resolved.allocator_owner == .caller) bounded.allocator() else alloc;
-            const outputs = self.produceBatchUnchecked(callback_alloc, requests) catch |err| {
-                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
-                    return error.InferenceInvocationMemoryExceeded;
+            const outputs = self.produceBatchUnchecked(bounded.allocator(), requests) catch |err| {
+                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             validateOutputBytes(outputs, resolved.max_result_bytes_per_item, resolved.max_result_bytes) catch |err| {
@@ -276,10 +272,8 @@ pub const Producer = struct {
                 alloc,
                 try invocationAllocatorLimit(resolved, requests),
             );
-            const callback_alloc = if (resolved.allocator_owner == .caller) bounded.allocator() else alloc;
-            var batch = self.produceBatchReportedUnchecked(callback_alloc, requests) catch |err| {
-                if (resolved.allocator_owner == .caller and bounded.limit_exceeded)
-                    return error.InferenceInvocationMemoryExceeded;
+            var batch = self.produceBatchReportedUnchecked(bounded.allocator(), requests) catch |err| {
+                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             validateProducedResultBytes(
@@ -655,7 +649,7 @@ test "asset producer enforces invocation contracts with per-item and aggregate r
     );
 }
 
-test "asset producer enforces invocation contracts with executor-owned admission" {
+test "asset producer still bounds boundary allocations with executor-owned model admission" {
     const Stub = struct {
         fn produce(_: *anyopaque, alloc: Allocator, _: Request) ![]u8 {
             const scratch = try alloc.alloc(u8, 4096);
@@ -682,13 +676,14 @@ test "asset producer enforces invocation contracts with executor-owned admission
             .invocation_memory_for_requests = Stub.memory,
         },
     };
-    const output = try producer.produce(std.testing.allocator, .{
-        .producer_type = .reader,
-        .config_json = "{}",
-        .source_text = "https://example.invalid/page.png",
-    });
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqual(@as(usize, 1), output.len);
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryExceeded,
+        producer.produce(std.testing.allocator, .{
+            .producer_type = .reader,
+            .config_json = "{}",
+            .source_text = "https://example.invalid/page.png",
+        }),
+    );
 }
 
 test "asset producer bounds invocation contract resolution allocations" {

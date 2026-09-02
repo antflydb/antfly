@@ -503,6 +503,7 @@ const ExactWireCapabilities = struct {
     result_cardinality: work.ResultCardinality,
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
+    task_limits: work.TaskResourceLimits = .{},
 };
 
 const ResolvedWireCapabilities = struct {
@@ -517,7 +518,7 @@ fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?Resolv
         if (version_value != .integer or version_value.integer < 1) return error.InvalidInferenceCapabilities;
         break :blk std.math.cast(usize, version_value.integer) orelse return error.InvalidInferenceCapabilities;
     } else 1;
-    if (version > 3) return error.UnsupportedInferenceCapabilitiesVersion;
+    if (version > 4) return error.UnsupportedInferenceCapabilitiesVersion;
     const task_value = value.object.get("task") orelse return error.InvalidInferenceCapabilities;
     if (task_value != .string or !std.mem.eql(u8, task_value.string, @tagName(task)))
         return error.InvalidInferenceCapabilities;
@@ -526,7 +527,7 @@ fn parseResolvedCapabilities(info: std.json.ObjectMap, task: work.Task) !?Resolv
     try batch.validate();
     return .{
         .batch = batch,
-        .exact = if (version >= 3) try parseExactWireCapabilities(value.object) else null,
+        .exact = if (version >= 3) try parseExactWireCapabilities(value.object, version) else null,
     };
 }
 
@@ -575,20 +576,35 @@ fn promptPolicyForTask(task: work.Task) work.PromptPolicy {
     };
 }
 
-fn parseExactWireCapabilities(object: std.json.ObjectMap) !ExactWireCapabilities {
+fn parseTaskResourceLimits(object: std.json.ObjectMap) !work.TaskResourceLimits {
+    const value = object.get("task_limits") orelse return error.InvalidInferenceCapabilities;
+    if (value != .object) return error.InvalidInferenceCapabilities;
+    if (value.object.count() != 5) return error.InvalidInferenceCapabilities;
+    const result = work.TaskResourceLimits{
+        .max_text_bytes_per_item = try jsonOptionalCapabilityUsize(value.object, "max_text_bytes_per_item", false),
+        .max_input_tokens_per_item = try jsonOptionalCapabilityUsize(value.object, "max_input_tokens_per_item", false),
+        .max_output_tokens_per_item = try jsonOptionalCapabilityUsize(value.object, "max_output_tokens_per_item", false),
+        .max_candidates_per_request = try jsonOptionalCapabilityUsize(value.object, "max_candidates_per_request", false),
+        .max_schema_bytes = try jsonOptionalCapabilityUsize(value.object, "max_schema_bytes", false),
+    };
+    try result.validate();
+    return result;
+}
+
+fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !ExactWireCapabilities {
     const modality_values = try requiredStringArray(object, "input_modalities");
     const mime_values = try requiredStringArray(object, "accepted_mime_types");
     try validateStringSet(modality_values, &.{ "text", "image", "audio", "document" });
-    try validateStringSet(mime_values, &.{
-        "text/plain",
-        "application/json",
-        "application/pdf",
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "audio/wav",
-        "audio/mpeg",
-    });
+    if (mime_values.items.len == 0) return error.InvalidInferenceCapabilities;
+    var mime_types = work.MimeTypes{};
+    for (mime_values.items) |value| {
+        const parsed = work.parseMediaType(value.string) catch return error.InvalidInferenceCapabilities;
+        if (parsed.parameters.len != 0 or !std.mem.eql(u8, parsed.essence, value.string))
+            return error.InvalidInferenceCapabilities;
+        for (value.string) |byte| if (std.ascii.isUpper(byte))
+            return error.InvalidInferenceCapabilities;
+        try mime_types.add(value.string);
+    }
     const input_granularity: work.InputGranularity = std.meta.stringToEnum(
         work.InputGranularity,
         try requiredString(object, "input_granularity"),
@@ -614,21 +630,13 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap) !ExactWireCapabilities
             .audio = hasString(modality_values, "audio"),
             .document = hasString(modality_values, "document"),
         },
-        .mime_types = .{
-            .text_plain = hasString(mime_values, "text/plain"),
-            .application_json = hasString(mime_values, "application/json"),
-            .application_pdf = hasString(mime_values, "application/pdf"),
-            .image_png = hasString(mime_values, "image/png"),
-            .image_jpeg = hasString(mime_values, "image/jpeg"),
-            .image_webp = hasString(mime_values, "image/webp"),
-            .audio_wav = hasString(mime_values, "audio/wav"),
-            .audio_mpeg = hasString(mime_values, "audio/mpeg"),
-        },
+        .mime_types = mime_types,
         .input_granularity = input_granularity,
         .output = output,
         .result_cardinality = result_cardinality,
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
+        .task_limits = if (version >= 4) try parseTaskResourceLimits(object) else .{},
     };
 }
 
@@ -699,6 +707,7 @@ pub fn parseModelCapabilities(
         .output = if (exact) |value| value.output else outputForTask(task),
         .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
+        .task_limits = if (exact) |value| value.task_limits else .{},
         // Discovery is performed across an HTTP boundary. A remote catalog
         // cannot turn that concrete route into a borrowed-memory invocation,
         // even if a misconfigured upstream publishes its local ABI fact.
@@ -899,6 +908,28 @@ test "remote Antfly capability v3 preserves exact task contract" {
     try std.testing.expectEqual(work.BatchMode.serial_compatibility, capabilities.batch.mode);
     try std.testing.expectEqual(@as(usize, 32), capabilities.batch.max_items);
     try std.testing.expect(!capabilities.borrowed_attachments);
+}
+
+test "remote Antfly capability v4 preserves extensible MIME and task limits" {
+    const payload =
+        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/tiff","image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"task_limits":{"max_text_bytes_per_item":4096,"max_input_tokens_per_item":1024,"max_output_tokens_per_item":512,"max_candidates_per_request":null,"max_schema_bytes":8192},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract)).?;
+    try std.testing.expect(capabilities.acceptsMimeType("image/tiff; profile=baseline"));
+    try std.testing.expect(capabilities.acceptsMimeType("image/png"));
+    try std.testing.expectEqual(@as(?usize, 4096), capabilities.task_limits.max_text_bytes_per_item);
+    try std.testing.expectEqual(@as(?usize, 1024), capabilities.task_limits.max_input_tokens_per_item);
+    try std.testing.expectEqual(@as(?usize, 512), capabilities.task_limits.max_output_tokens_per_item);
+    try std.testing.expectEqual(@as(?usize, null), capabilities.task_limits.max_candidates_per_request);
+    try std.testing.expectEqual(@as(?usize, 8192), capabilities.task_limits.max_schema_bytes);
+    try std.testing.expectError(
+        error.InferenceSchemaBytesExceeded,
+        capabilities.validateInvocation(.extract, .{
+            .item_count = 1,
+            .modalities = .{ .image = true },
+            .schema_bytes = 8193,
+        }),
+    );
 }
 
 test "remote Antfly capability cannot advertise borrowed HTTP attachments" {

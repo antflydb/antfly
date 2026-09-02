@@ -399,23 +399,24 @@ pub const Runtime = struct {
         );
         if (results == 0) return error.InvalidInferenceInvocationMemory;
         fixed = std.math.add(usize, fixed, results) catch return error.InferenceEncodedBytesExceeded;
-        var allocator_limit = fixed;
-        if (remote) {
-            const response_limit = self.responseLimitForTask(requests[0].producer_type, requests.len);
-            const parser_and_copy_limit = std.math.mul(
-                usize,
-                response_limit,
-                invocation_response_resident_multiplier - 1,
-            ) catch return error.InferenceEncodedBytesExceeded;
-            allocator_limit = std.math.add(usize, allocator_limit, parser_and_copy_limit) catch
-                return error.InferenceEncodedBytesExceeded;
-            const response_peak = std.math.mul(
-                usize,
-                response_limit,
-                invocation_response_resident_multiplier,
-            ) catch return error.InferenceEncodedBytesExceeded;
-            fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
-        }
+        // Both HTTP routes and the linked inference-node ABI serialize a
+        // bounded response and materialize typed caller-owned results. Model
+        // memory is executor-owned for the linked route, but its request and
+        // result bridge remains part of this boundary's hard allocator cap.
+        const response_limit = self.responseLimitForTask(requests[0].producer_type, requests.len);
+        const parser_and_copy_limit = std.math.mul(
+            usize,
+            response_limit,
+            invocation_response_resident_multiplier - 1,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        const allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
+            return error.InferenceEncodedBytesExceeded;
+        const response_peak = std.math.mul(
+            usize,
+            response_limit,
+            invocation_response_resident_multiplier,
+        ) catch return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
         return .{
             .attachment_transport = transport,
             .fixed_bytes = fixed,
@@ -1527,6 +1528,12 @@ pub const Runtime = struct {
             try capabilities.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
+                .text_bytes = if (request.prompt) |prompt| prompt.len else 0,
+                .max_text_bytes_per_item = if (request.prompt) |prompt| prompt.len else 0,
+                .requested_output_tokens_per_item = if (request.max_tokens) |tokens|
+                    if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+                else
+                    0,
                 .encoded_media_bytes = inline_shape.encoded_media_bytes,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
@@ -1600,6 +1607,12 @@ pub const Runtime = struct {
             try resolved.validateInvocation(.read, .{
                 .item_count = request.images.len,
                 .modalities = .{ .image = true },
+                .text_bytes = if (request.prompt) |prompt| prompt.len else 0,
+                .max_text_bytes_per_item = if (request.prompt) |prompt| prompt.len else 0,
+                .requested_output_tokens_per_item = if (request.max_tokens) |tokens|
+                    if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+                else
+                    0,
                 .encoded_media_bytes = encoded_bytes,
                 .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
             });
@@ -1963,6 +1976,7 @@ fn encodedReaderBatchEnd(
 
 const GeneratorItemShape = struct {
     modalities: inference_work.Modalities = .{},
+    text_bytes: usize = 0,
     encoded_media_bytes: usize = 0,
     media_parts: usize = 0,
 };
@@ -2052,8 +2066,10 @@ fn generatorRequestShape(
         const parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts, &.{}, false);
         defer freeGeneratorContentParts(alloc, parts);
         for (parts) |part| switch (part) {
-            .text => {
+            .text => |text| {
                 shape.modalities.text = true;
+                shape.text_bytes = std.math.add(usize, shape.text_bytes, text.len) catch
+                    return error.InferenceTextBytesExceeded;
                 try capabilities.validateMimeType("text/plain");
             },
             .image_url => |image| {
@@ -2080,6 +2096,7 @@ fn generatorRequestShape(
         };
     } else {
         shape.modalities.text = true;
+        shape.text_bytes = request.source_text.len;
         try capabilities.validateMimeType("text/plain");
     }
     for (request.media) |media| {
@@ -2104,6 +2121,9 @@ fn validateGeneratorInvocation(
     for (requests) |request| {
         const item = try generatorRequestShape(alloc, capabilities, attachment_transport, request);
         mergeInferenceModalities(&invocation.modalities, item.modalities);
+        invocation.text_bytes = std.math.add(usize, invocation.text_bytes, item.text_bytes) catch
+            return error.InferenceTextBytesExceeded;
+        invocation.max_text_bytes_per_item = @max(invocation.max_text_bytes_per_item, item.text_bytes);
         invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
@@ -2277,6 +2297,10 @@ fn validateExtractorInvocation(
             if (expected != item_uses_media) return error.BatchIncompatible;
         } else uses_media = item_uses_media;
         mergeInferenceModalities(&invocation.modalities, item.modalities);
+        invocation.text_bytes = std.math.add(usize, invocation.text_bytes, item.prompt.len) catch
+            return error.InferenceTextBytesExceeded;
+        invocation.max_text_bytes_per_item = @max(invocation.max_text_bytes_per_item, item.prompt.len);
+        invocation.schema_bytes = @max(invocation.schema_bytes, request.config_json.len);
         invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
         invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
             return error.InferenceEncodedBytesExceeded;

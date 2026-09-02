@@ -113,6 +113,13 @@ const InferenceCapabilities = struct {
         max_media_parts_per_item: usize,
         per_item_failures: bool,
     },
+    task_limits: struct {
+        max_text_bytes_per_item: ?usize,
+        max_input_tokens_per_item: ?usize,
+        max_output_tokens_per_item: ?usize,
+        max_candidates_per_request: ?usize,
+        max_schema_bytes: ?usize,
+    },
     output: enum {
         read_result, generated_text, embedding, ranked_items, chunks,
         extraction, rewritten_text, classification, transcription,
@@ -122,6 +129,12 @@ const InferenceCapabilities = struct {
     borrowed_attachments: bool,
 };
 ```
+
+`MimeTypes` is a bounded value-semantic set: common types have compact flags,
+while additional validated type/subtype essences travel inline through the
+checked native ABI. The public catalog carries canonical essence strings, so a
+new TIFF, FLAC, or vendor document format does not require a capability-schema
+change.
 
 Capabilities are discovered after model resolution and may differ by backend.
 Configuration may restrict a capability but must not assert support the loaded
@@ -813,8 +826,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     per-item and aggregate result ceilings. Caller-owned adapters execute
     through a freeing peak-live bounded allocator. A linked or distributed
     inference node instead owns decoder/model admission and hard caps; the host
-    does not impose an incomplete second allocator ceiling around it, but still
-    validates returned cardinality and result bytes. The per-task defaults are
+    still bounds request/result bridge allocations but does not charge private
+    model working memory to an incomplete host estimate. It also validates
+    returned cardinality and result bytes. The per-task defaults are
     policy, not guesses: reader, generator, extractor, transcriber, copy, and
     document-extraction limits are independently configurable on the asset
     runtime. A route that needs a larger result must raise and reserve that
@@ -909,9 +923,10 @@ document. They are architectural requirements, not Florence-specific cleanup:
     preprocessing, model execution, and results. Valid local PDF pages and URL
     inputs could therefore fail before the inference node's real admission ran.
     `InvocationMemoryPlan` now explicitly distinguishes caller-owned adapters
-    from executor-owned inference. HTTP adapters remain hard-bounded by the
-    supplied allocator; linked local and distributed nodes use their concrete
-    decoder/model admission, media caps, deadline, and result caps. This makes
+    from executor-owned inference. Every adapter retains a hard bounded
+    request/result allocator; linked local and distributed nodes additionally
+    use their concrete decoder/model admission, media caps, deadline, and
+    result caps for allocations that never cross that allocator. This makes
     the same ownership rule apply whether the node is in-process or remote.
     Executor ownership is an explicit `AntflyProvider` guarantee; arbitrary
     callbacks that do not publish it fail closed rather than receiving the
@@ -952,6 +967,39 @@ document. They are architectural requirements, not Florence-specific cleanup:
     and URL/text items publish the bytes their adapter actually writes. That
     shape also carries the normalization peak, so scheduler admission and the
     public executor enforce the same complete plan.
+98. **Executor-owned model admission accidentally disabled the caller boundary
+    cap.** Executor ownership now excludes only decoder/model allocations that
+    stay on the inference node's admitted allocator. Request serialization,
+    attachment descriptors, response parsing, typed results, and all asset-stage
+    preparation continue to use the bounded caller allocator. Linked and remote
+    routes therefore have the same two-layer contract: a hard transport/result
+    ceiling plus independently admitted model memory.
+99. **MIME essence extraction accepted malformed parameters and erased codec
+    conflicts.** A shared parser now validates the complete media type,
+    including token and quoted-string parameters and duplicate names, before
+    returning its essence. Capability checks remain parameter-insensitive, but
+    a redundant declaration that names parameters must match the physical
+    attachment using case-insensitive names and exact logical values, so
+    `codecs=opus` cannot authorize `codecs=vorbis` or a differently cased value
+    unless that parameter's task-specific layer explicitly normalizes it.
+100. **The exact capability wire used a closed eight-MIME allowlist.** The Zig
+    value contract now retains common flags plus bounded additional canonical
+    essences. Capability wire V4 and the distributed proxy validate and
+    conservatively intersect arbitrary legal essence strings instead of
+    rejecting every new image, audio, or document format. Catalog values are
+    lowercase canonical essences, aliases are normalized at attachment
+    admission rather than advertised as distinct capabilities, extension
+    counts are bounded consistently on every node, and each MIME must map to an
+    advertised input modality.
+101. **The normalized scheduler contract described only media pressure.** V4
+    adds optional task-resource ceilings for text bytes, input and output tokens,
+    candidate counts, and schema bytes. Manifest limits reduce executor defaults;
+    remote discovery and proxy intersection preserve unknowns conservatively;
+    and linked read, generate, embed, rerank, chunk, extract, rewrite, classify,
+    and transcribe boundaries validate the dimensions they can measure before
+    model work. Request-scoped limits such as schema and encoded bytes remain
+    active even for a malformed zero-item invocation. Exact tokenizer-dependent
+    counts remain executor-owned when a planner cannot compute them.
 
 ### Post-review implementation contract
 
@@ -976,9 +1024,10 @@ The hardening above follows these long-term rules:
   capabilities. Linked callbacks charge borrowed bytes, base64 transports
   charge exact expansion, and data-URI adapters charge the complete URI plus
   downstream serialization copy. Caller-owned adapters run under the plan's
-  hard allocator ceiling. Concrete inference nodes own decoder/model admission
-  for both local and distributed dispatch, avoiding an incomplete outer cap
-  and double charging while preserving hard node limits. Every public producer
+  hard allocator ceiling. The same boundary allocator remains active when a
+  concrete inference node owns decoder/model admission; only allocations kept
+  on the node's private admitted allocator are excluded. This avoids both an
+  incomplete model cap and unbounded host preparation. Every public producer
   invocation from a contract-publishing runtime and every part-item embedding
   invocation applies those ceilings even when invoked outside the PDF
   scheduler. Structured JSON parts, inline data URIs, URL-only inputs,
@@ -1000,9 +1049,9 @@ The hardening above follows these long-term rules:
   case-insensitive, payload validation and decoded sizing precede allocation,
   MIME policy compares normalized essences, and materialization consumes the
   same parse contract used by admission.
-- MIME admission has one essence parser. Parameters are preserved on the wire,
-  while capability, modality, and redundant attachment checks compare the
-  validated type/subtype essence case-insensitively.
+- MIME admission has one complete parser. Parameters are preserved on the wire;
+  capability and modality checks compare the validated essence, while redundant
+  declarations must also agree on every parameter they explicitly name.
 - A result policy names logical retained bytes. Remote transport planning maps
   that policy to a conservative encoded JSON response ceiling and lowers the
   logical allowance when an outer client or provider limit is tighter. Local

@@ -11,6 +11,8 @@ const std = @import("std");
 const data_uri = @import("antfly_scraping").data_uri;
 
 pub const mimeTypeEssence = data_uri.mediaTypeEssence;
+pub const parseMediaType = data_uri.parseMediaType;
+pub const mediaTypesCompatible = data_uri.mediaTypesCompatible;
 
 pub const Task = enum {
     read,
@@ -79,7 +81,30 @@ pub const Modalities = packed struct(u8) {
 /// MIME families are part of model admission. Modalities alone are too broad:
 /// an image model that accepts PNG/JPEG must not be handed an arbitrary
 /// `image/*` payload (or a raw PDF) merely because both are media.
-pub const MimeTypes = packed struct(u16) {
+pub const max_additional_mime_types: usize = 16;
+pub const max_mime_essence_bytes: usize = 63;
+
+const StoredMimeEssence = struct {
+    len: u8 = 0,
+    bytes: [max_mime_essence_bytes]u8 = [_]u8{0} ** max_mime_essence_bytes,
+
+    fn init(essence: []const u8) !StoredMimeEssence {
+        if (essence.len == 0 or essence.len > max_mime_essence_bytes)
+            return error.InvalidInferenceCapabilities;
+        var result = StoredMimeEssence{ .len = @intCast(essence.len) };
+        for (essence, 0..) |byte, i| result.bytes[i] = std.ascii.toLower(byte);
+        return result;
+    }
+
+    fn slice(self: *const StoredMimeEssence) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// A bounded, value-semantic MIME set suitable for the checked native ABI.
+/// Common types retain cheap flags; validated extension essences allow new
+/// models and formats without changing this structure for every MIME value.
+pub const MimeTypes = struct {
     text_plain: bool = false,
     application_json: bool = false,
     application_pdf: bool = false,
@@ -88,7 +113,43 @@ pub const MimeTypes = packed struct(u16) {
     image_webp: bool = false,
     audio_wav: bool = false,
     audio_mpeg: bool = false,
-    _reserved: u8 = 0,
+    additional_count: u8 = 0,
+    additional: [max_additional_mime_types]StoredMimeEssence = [_]StoredMimeEssence{.{}} ** max_additional_mime_types,
+
+    pub fn add(self: *MimeTypes, content_type: []const u8) !void {
+        const parsed = data_uri.parseMediaType(content_type) catch
+            return error.InvalidInferenceCapabilities;
+        if (parsed.parameters.len != 0 or !std.mem.eql(u8, parsed.essence, content_type))
+            return error.InvalidInferenceCapabilities;
+        for (content_type) |byte| if (std.ascii.isUpper(byte))
+            return error.InvalidInferenceCapabilities;
+        if (knownMimeName(parsed.essence)) |canonical| {
+            if (!std.mem.eql(u8, canonical, parsed.essence))
+                return error.InvalidInferenceCapabilities;
+        }
+        if (setKnownMime(self, parsed.essence)) return;
+        for (self.additional[0..self.additional_count]) |*stored| {
+            if (std.ascii.eqlIgnoreCase(stored.slice(), parsed.essence)) return;
+        }
+        if (self.additional_count == self.additional.len)
+            return error.InvalidInferenceCapabilities;
+        self.additional[self.additional_count] = try StoredMimeEssence.init(parsed.essence);
+        self.additional_count += 1;
+    }
+
+    pub fn validate(self: MimeTypes) !void {
+        if (self.additional_count > self.additional.len) return error.InvalidInferenceCapabilities;
+        for (self.additional[0..self.additional_count], 0..) |*stored, index| {
+            const value = stored.slice();
+            const parsed = data_uri.parseMediaType(value) catch return error.InvalidInferenceCapabilities;
+            if (parsed.parameters.len != 0 or knownMimeName(parsed.essence) != null)
+                return error.InvalidInferenceCapabilities;
+            for (self.additional[0..index]) |*prior| {
+                if (std.ascii.eqlIgnoreCase(prior.slice(), value))
+                    return error.InvalidInferenceCapabilities;
+            }
+        }
+    }
 
     pub fn accepts(self: MimeTypes, content_type: []const u8) bool {
         const essence = data_uri.mediaTypeEssence(content_type) catch return false;
@@ -100,9 +161,64 @@ pub const MimeTypes = packed struct(u16) {
         if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return self.image_webp;
         if (std.ascii.eqlIgnoreCase(essence, "audio/wav") or std.ascii.eqlIgnoreCase(essence, "audio/x-wav")) return self.audio_wav;
         if (std.ascii.eqlIgnoreCase(essence, "audio/mpeg")) return self.audio_mpeg;
+        for (self.additional[0..self.additional_count]) |*stored| {
+            if (std.ascii.eqlIgnoreCase(stored.slice(), essence)) return true;
+        }
         return false;
     }
+
+    pub fn count(self: MimeTypes) usize {
+        var total: usize = self.additional_count;
+        inline for (known_mime_fields) |known| {
+            if (@field(self, known.field)) total += 1;
+        }
+        return total;
+    }
+
+    pub fn valueAt(self: *const MimeTypes, requested_index: usize) ?[]const u8 {
+        var index = requested_index;
+        inline for (known_mime_fields) |known| {
+            if (@field(self.*, known.field)) {
+                if (index == 0) return known.value;
+                index -= 1;
+            }
+        }
+        if (index >= self.additional_count) return null;
+        return self.additional[index].slice();
+    }
 };
+
+const KnownMimeField = struct { field: []const u8, value: []const u8 };
+const known_mime_fields = [_]KnownMimeField{
+    .{ .field = "text_plain", .value = "text/plain" },
+    .{ .field = "application_json", .value = "application/json" },
+    .{ .field = "application_pdf", .value = "application/pdf" },
+    .{ .field = "image_png", .value = "image/png" },
+    .{ .field = "image_jpeg", .value = "image/jpeg" },
+    .{ .field = "image_webp", .value = "image/webp" },
+    .{ .field = "audio_wav", .value = "audio/wav" },
+    .{ .field = "audio_mpeg", .value = "audio/mpeg" },
+};
+
+fn knownMimeName(essence: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(essence, "image/jpg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(essence, "audio/x-wav")) return "audio/wav";
+    inline for (known_mime_fields) |known| {
+        if (std.ascii.eqlIgnoreCase(essence, known.value)) return known.value;
+    }
+    return null;
+}
+
+fn setKnownMime(self: *MimeTypes, essence: []const u8) bool {
+    const canonical = knownMimeName(essence) orelse return false;
+    inline for (known_mime_fields) |known| {
+        if (std.mem.eql(u8, canonical, known.value)) {
+            @field(self, known.field) = true;
+            return true;
+        }
+    }
+    unreachable;
+}
 
 pub const BatchCapabilities = struct {
     mode: BatchMode = .none,
@@ -182,9 +298,53 @@ fn clampOptionalManifestLimit(current: anytype, requested: std.meta.Child(@TypeO
 pub const InvocationShape = struct {
     item_count: usize,
     modalities: Modalities = .{},
+    /// Aggregate logical text retained by the invocation, excluding encoded
+    /// media. `max_text_bytes_per_item` captures the largest logical item.
+    text_bytes: usize = 0,
+    max_text_bytes_per_item: usize = 0,
+    /// Exact token counts when a planner has the resolved tokenizer; zero means
+    /// unknown and is checked by the concrete executor before model work.
+    max_input_tokens_per_item: usize = 0,
+    requested_output_tokens_per_item: usize = 0,
+    max_candidates_per_request: usize = 0,
+    schema_bytes: usize = 0,
     encoded_media_bytes: usize = 0,
     decoded_pixels: u64 = 0,
     max_media_parts_per_item: usize = 0,
+};
+
+/// Versioned, task-neutral resource dimensions. Unknown limits remain null and
+/// must be enforced by the concrete executor; published limits are consumed by
+/// both planners and direct invocation boundaries.
+pub const TaskResourceLimits = struct {
+    max_text_bytes_per_item: ?usize = null,
+    max_input_tokens_per_item: ?usize = null,
+    max_output_tokens_per_item: ?usize = null,
+    max_candidates_per_request: ?usize = null,
+    max_schema_bytes: ?usize = null,
+
+    pub fn validate(self: TaskResourceLimits) !void {
+        inline for (std.meta.fields(TaskResourceLimits)) |field| {
+            if (@field(self, field.name)) |value| if (value == 0)
+                return error.InvalidInferenceCapabilities;
+        }
+    }
+
+    pub fn applyManifestCapability(self: *TaskResourceLimits, capability: []const u8) !void {
+        inline for ([_]struct { field: []const u8, prefix: []const u8 }{
+            .{ .field = "max_text_bytes_per_item", .prefix = "inference.limits.max_text_bytes_per_item=" },
+            .{ .field = "max_input_tokens_per_item", .prefix = "inference.limits.max_input_tokens_per_item=" },
+            .{ .field = "max_output_tokens_per_item", .prefix = "inference.limits.max_output_tokens_per_item=" },
+            .{ .field = "max_candidates_per_request", .prefix = "inference.limits.max_candidates_per_request=" },
+            .{ .field = "max_schema_bytes", .prefix = "inference.limits.max_schema_bytes=" },
+        }) |mapping| {
+            if (std.mem.startsWith(u8, capability, mapping.prefix)) {
+                const value = try parseManifestLimit(usize, capability[mapping.prefix.len..]);
+                @field(self, mapping.field) = if (@field(self, mapping.field)) |current| @min(current, value) else value;
+                return;
+            }
+        }
+    }
 };
 
 /// Physical representation selected by the concrete executor boundary.
@@ -332,10 +492,11 @@ pub const InvocationAllocatorOwner = enum {
     /// through the supplied allocator (for example, an HTTP JSON adapter).
     caller,
     /// The concrete executor owns callback admission and hard internal caps.
-    /// The public boundary still bounds its preparation work and validates the
-    /// returned values, but must not impose an incomplete outer estimate on a
-    /// decoder/model allocator. In-process inference nodes use this contract
-    /// for the same reason as distributed inference nodes.
+    /// The allocator supplied to the callback remains boundary-bounded; the
+    /// executor must keep decoder/model allocations on its own admitted
+    /// allocator. In-process inference nodes use the same split as distributed
+    /// nodes, where request/result serialization and model work are naturally
+    /// separated by the transport boundary.
     executor,
 };
 
@@ -343,9 +504,8 @@ pub const InvocationMemoryPlan = struct {
     attachment_transport: AttachmentTransport,
     fixed_bytes: usize,
     /// Hard ceiling for allocations owned by this public boundary. With caller
-    /// ownership it wraps the complete callback; with executor ownership it is
-    /// the caller-side planning ceiling while the executor applies its own
-    /// admission and hard caps and returned results are validated separately.
+    /// ownership it wraps the complete callback. Executor ownership excludes
+    /// only internal model allocations that never use the supplied allocator.
     allocator_limit_bytes: usize = 0,
     allocator_owner: InvocationAllocatorOwner = .caller,
     /// Maximum bytes retained by any one successful logical result.
@@ -360,7 +520,10 @@ pub const InvocationMemoryPlan = struct {
             self.max_result_bytes_per_item > self.max_result_bytes or
             self.max_result_bytes > self.fixed_bytes)
             return error.InvalidInferenceInvocationMemory;
-        if (self.allocator_owner == .caller and self.max_result_bytes > self.allocator_limit_bytes)
+        // Request/result allocations always cross the bounded public
+        // allocator. Executor ownership excludes only model-internal working
+        // memory, never the returned result.
+        if (self.max_result_bytes > self.allocator_limit_bytes)
             return error.InvalidInferenceInvocationMemory;
     }
 };
@@ -437,6 +600,22 @@ pub const BoundedInvocationAllocator = struct {
     }
 };
 
+test "executor-owned invocation plans keep public results inside the bounded allocator" {
+    const valid = InvocationMemoryPlan{
+        .attachment_transport = .borrowed_binary,
+        .fixed_bytes = 4096,
+        .allocator_limit_bytes = 2048,
+        .allocator_owner = .executor,
+        .max_result_bytes_per_item = 1024,
+        .max_result_bytes = 2048,
+    };
+    try valid.validate();
+
+    var invalid = valid;
+    invalid.max_result_bytes = 2049;
+    try std.testing.expectError(error.InvalidInferenceInvocationMemory, invalid.validate());
+}
+
 test "bounded invocation allocator enforces peak live bytes and credits frees" {
     var bounded = BoundedInvocationAllocator.init(std.testing.allocator, 8);
     const alloc = bounded.allocator();
@@ -472,7 +651,8 @@ pub fn validateCanonicalStandardBase64(data: []const u8) !usize {
 /// Parse an inline data URI without materializing its decoded bytes. Both
 /// standard base64 and RFC 2397 percent-encoded payloads are accepted because
 /// the inference-node downloader supports both forms. Capability checks use
-/// the media-type essence rather than parameters such as `charset`.
+/// admission uses the validated essence while declaration checks retain the
+/// complete media type and its parameters.
 pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     const parsed = data_uri.parse(uri) catch return error.InvalidDataURI;
     const value = parsed orelse return null;
@@ -480,7 +660,7 @@ pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     // media types default to text/plain and are intentionally rejected here.
     if (!value.has_explicit_media_type) return error.InvalidDataURI;
     return .{
-        .mime_type = value.media_type_essence,
+        .mime_type = value.media_type,
         .payload = value.payload,
         .decoded_size = value.decodedSize() catch return error.InvalidDataURI,
         .encoding = value.encoding,
@@ -517,6 +697,7 @@ pub const InferenceCapabilities = struct {
     accepted_mime_types: MimeTypes = .{},
     input_granularity: InputGranularity,
     batch: BatchCapabilities = .{},
+    task_limits: TaskResourceLimits = .{},
     output: OutputKind,
     result_cardinality: ResultCardinality = .one_per_item,
     prompt_policy: PromptPolicy = .explicit,
@@ -527,7 +708,16 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        try self.accepted_mime_types.validate();
+        try self.task_limits.validate();
         if (@as(u8, @bitCast(self.input_modalities)) == 0) return error.InvalidInferenceCapabilities;
+        var mime_index: usize = 0;
+        while (self.accepted_mime_types.valueAt(mime_index)) |mime_type| : (mime_index += 1) {
+            const required_modality = modalityForMimeType(mime_type) orelse
+                return error.InvalidInferenceCapabilities;
+            if (!self.input_modalities.contains(required_modality))
+                return error.InvalidInferenceCapabilities;
+        }
         const expected_output: OutputKind = switch (self.task) {
             .read => .read_result,
             .generate => .generated_text,
@@ -563,9 +753,10 @@ pub const InferenceCapabilities = struct {
     pub fn validateInvocation(self: InferenceCapabilities, task: Task, shape: InvocationShape) !void {
         try self.validate();
         if (self.task != task) return error.InferenceTaskMismatch;
-        if (shape.item_count == 0) return;
-        if (!self.batch.acceptsItems(shape.item_count)) return error.InferenceBatchTooLarge;
-        if (!self.supports(shape.modalities)) return error.UnsupportedInferenceModality;
+        if (shape.item_count > 0 and !self.batch.acceptsItems(shape.item_count))
+            return error.InferenceBatchTooLarge;
+        if (@as(u8, @bitCast(shape.modalities)) != 0 and !self.supports(shape.modalities))
+            return error.UnsupportedInferenceModality;
         if (self.batch.max_encoded_media_bytes) |limit| {
             if (shape.encoded_media_bytes > limit) return error.InferenceEncodedBytesExceeded;
         }
@@ -578,12 +769,37 @@ pub const InferenceCapabilities = struct {
         {
             return error.InferenceMediaPartLimitExceeded;
         }
+        if (self.task_limits.max_text_bytes_per_item) |limit| {
+            if (shape.max_text_bytes_per_item > limit) return error.InferenceTextBytesExceeded;
+        }
+        if (self.task_limits.max_input_tokens_per_item) |limit| {
+            if (shape.max_input_tokens_per_item > limit) return error.InferenceInputTokensExceeded;
+        }
+        if (self.task_limits.max_output_tokens_per_item) |limit| {
+            if (shape.requested_output_tokens_per_item > limit) return error.InferenceOutputTokensExceeded;
+        }
+        if (self.task_limits.max_candidates_per_request) |limit| {
+            if (shape.max_candidates_per_request > limit) return error.InferenceCandidateLimitExceeded;
+        }
+        if (self.task_limits.max_schema_bytes) |limit| {
+            if (shape.schema_bytes > limit) return error.InferenceSchemaBytesExceeded;
+        }
     }
 
     pub fn validateMimeType(self: InferenceCapabilities, content_type: []const u8) !void {
         if (!self.acceptsMimeType(content_type)) return error.UnsupportedInferenceMimeType;
     }
 };
+
+fn modalityForMimeType(content_type: []const u8) ?Modalities {
+    const essence = data_uri.mediaTypeEssence(content_type) catch return null;
+    if (std.mem.startsWith(u8, essence, "text/") or std.mem.eql(u8, essence, "application/json"))
+        return .{ .text = true };
+    if (std.mem.startsWith(u8, essence, "image/")) return .{ .image = true };
+    if (std.mem.startsWith(u8, essence, "audio/")) return .{ .audio = true };
+    if (std.mem.startsWith(u8, essence, "application/")) return .{ .document = true };
+    return null;
+}
 
 /// Stable identity follows an item through rendering, inference, fallback, and
 /// persistence. It is never inferred from completion order.
@@ -735,11 +951,34 @@ test "inference capabilities distinguish native and compatibility batches" {
     try std.testing.expect(!compatibility.batch.executesNatively(8));
 }
 
-test "inference capabilities MIME admission uses a validated parameter-insensitive essence" {
+test "inference capabilities MIME admission supports validated extensions" {
     const accepted = MimeTypes{ .image_png = true };
     try std.testing.expect(accepted.accepts(" Image/PNG ; charset=binary"));
     try std.testing.expect(!accepted.accepts("image/png\r\nX-Evil: yes"));
     try std.testing.expect(!accepted.accepts("image"));
+
+    var extended = MimeTypes{};
+    try extended.add("image/tiff");
+    try extended.add("audio/flac");
+    try extended.validate();
+    try std.testing.expect(extended.accepts("image/tiff; profile=baseline"));
+    try std.testing.expect(extended.accepts("AUDIO/FLAC"));
+    try std.testing.expectEqual(@as(usize, 2), extended.count());
+    try std.testing.expectError(error.InvalidInferenceCapabilities, extended.add("image/avif; codecs=av1"));
+    try std.testing.expectError(error.InvalidInferenceCapabilities, extended.add("image/png;"));
+    try std.testing.expectError(error.InvalidInferenceCapabilities, extended.add("IMAGE/AVIF"));
+    try std.testing.expectError(error.InvalidInferenceCapabilities, extended.add("image/jpg"));
+
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        (InferenceCapabilities{
+            .task = .embed,
+            .input_modalities = .{ .text = true },
+            .accepted_mime_types = extended,
+            .input_granularity = .item,
+            .output = .embedding,
+        }).validate(),
+    );
 
     try (Attachment{
         .bytes = &.{1},
@@ -784,7 +1023,7 @@ test "inline data URI parser validates canonical metadata" {
     try std.testing.expectEqual(@as(usize, 3), parsed.decoded_size);
     try std.testing.expectEqual(.base64, parsed.encoding);
     const parameterized = (try parseInlineDataUri("data:image/png;charset=binary;base64,AQID")).?;
-    try std.testing.expectEqualStrings("image/png", parameterized.mime_type);
+    try std.testing.expectEqualStrings("image/png;charset=binary", parameterized.mime_type);
     const percent = (try parseInlineDataUri("data:image/png,%89PNG")).?;
     try std.testing.expectEqual(@as(usize, 4), percent.decoded_size);
     try std.testing.expectEqual(.percent, percent.encoding);
@@ -835,6 +1074,13 @@ test "inference capabilities enforce invocation resource limits" {
             .max_decoded_pixels = 4096,
             .max_media_parts_per_item = 1,
         },
+        .task_limits = .{
+            .max_text_bytes_per_item = 64,
+            .max_input_tokens_per_item = 16,
+            .max_output_tokens_per_item = 8,
+            .max_candidates_per_request = 4,
+            .max_schema_bytes = 32,
+        },
         .output = .embedding,
     };
     try capabilities.validateInvocation(.embed, .{
@@ -843,6 +1089,11 @@ test "inference capabilities enforce invocation resource limits" {
         .encoded_media_bytes = 512,
         .decoded_pixels = 2048,
         .max_media_parts_per_item = 1,
+        .max_text_bytes_per_item = 32,
+        .max_input_tokens_per_item = 8,
+        .requested_output_tokens_per_item = 4,
+        .max_candidates_per_request = 2,
+        .schema_bytes = 16,
     });
     try capabilities.validateMimeType("image/png");
     try std.testing.expectError(
@@ -852,6 +1103,30 @@ test "inference capabilities enforce invocation resource limits" {
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
         capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .encoded_media_bytes = 1025 }),
+    );
+    try std.testing.expectError(
+        error.InferenceTextBytesExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .max_text_bytes_per_item = 65 }),
+    );
+    try std.testing.expectError(
+        error.InferenceInputTokensExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .max_input_tokens_per_item = 17 }),
+    );
+    try std.testing.expectError(
+        error.InferenceOutputTokensExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .requested_output_tokens_per_item = 9 }),
+    );
+    try std.testing.expectError(
+        error.InferenceCandidateLimitExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .max_candidates_per_request = 5 }),
+    );
+    try std.testing.expectError(
+        error.InferenceSchemaBytesExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .schema_bytes = 33 }),
+    );
+    try std.testing.expectError(
+        error.InferenceSchemaBytesExceeded,
+        capabilities.validateInvocation(.embed, .{ .item_count = 0, .schema_bytes = 33 }),
     );
     try std.testing.expectError(error.UnsupportedInferenceMimeType, capabilities.validateMimeType("image/webp"));
 }

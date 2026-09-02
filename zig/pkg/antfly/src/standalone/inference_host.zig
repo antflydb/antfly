@@ -233,7 +233,7 @@ fn decodeProviderEmbeddingParts(
                 .content_type = payload.content_type.slice(),
             };
             try attachment.validate();
-            if (!mimeEssencesEqual(binary.mime_type, attachment.content_type)) return error.InvalidArguments;
+            if (!mimeDeclarationsCompatible(binary.mime_type, attachment.content_type)) return error.InvalidArguments;
             decoded.* = .{ .binary = .{
                 .mime_type = attachment.content_type,
                 .data = attachment.bytes,
@@ -771,6 +771,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rerank, parsed.value.documents, parsed.value.query.len, parsed.value.documents.len, 0);
             const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -778,6 +779,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .generate_text => blk: {
             var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .generate, parsed.value.contents, 0, 0, 0);
             const result = try state.node.generateTextDirect(alloc, parsed.value.model, parsed.value.roles, parsed.value.contents);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -876,6 +878,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            const transcribe_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .transcribe);
+            try transcribe_capabilities.validateInvocation(.transcribe, .{
+                .item_count = 1,
+                .modalities = .{ .audio = true },
+            });
             var result = try state.node.transcribeAudioDirect(alloc, parsed.value.model, parsed.value.request);
             defer antfly.transcribing.deinitResponse(alloc, &result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -896,6 +903,24 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer alloc.free(attachments);
             var request = parsed.value.request;
             request.attachments = attachments;
+            var extract_shape = antfly.inference.work.InvocationShape{
+                .item_count = request.inputs.len,
+                .modalities = if (attachments.len > 0) .{ .image = true } else .{ .text = true },
+                .schema_bytes = request.schema_json.len,
+                .max_media_parts_per_item = if (attachments.len > 0) 1 else 0,
+            };
+            for (request.inputs) |input| {
+                extract_shape.text_bytes = std.math.add(usize, extract_shape.text_bytes, input.content_json.len) catch
+                    return error.InferenceTextBytesExceeded;
+                extract_shape.max_text_bytes_per_item = @max(extract_shape.max_text_bytes_per_item, input.content_json.len);
+            }
+            for (attachments) |attachment| extract_shape.encoded_media_bytes = std.math.add(
+                usize,
+                extract_shape.encoded_media_bytes,
+                attachment.bytes.len,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            const extract_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .extract);
+            try extract_capabilities.validateInvocation(.extract, extract_shape);
             var result = try state.node.extractDirect(alloc, parsed.value.model, request);
             defer result.deinit();
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
@@ -914,12 +939,36 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     try validateProviderAttachmentRefs(1, context.attachment_refs, context.attachment_refs_len);
                     const ref = providerAttachmentRefForItem(context.attachment_refs.?, 1, 0) orelse return error.InvalidArguments;
                     const payload = context.binary_payloads.?[ref.attachment_index];
-                    if (binary.data.len != 0 or !mimeEssencesEqual(binary.mime_type, payload.content_type.slice()))
+                    if (binary.data.len != 0 or !mimeDeclarationsCompatible(binary.mime_type, payload.content_type.slice()))
                         return error.InvalidArguments;
                     binary.data = payload.bytes.slice();
                 },
             }
             const cfg = parsed.value.config;
+            const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
+            var chunk_shape = antfly.inference.work.InvocationShape{ .item_count = 1 };
+            switch (input) {
+                .text => |text_value| {
+                    chunk_shape.modalities.text = true;
+                    chunk_shape.text_bytes = text_value.len;
+                    chunk_shape.max_text_bytes_per_item = text_value.len;
+                    try chunk_capabilities.validateMimeType("text/plain");
+                },
+                .binary => |binary| {
+                    chunk_shape.encoded_media_bytes = binary.data.len;
+                    chunk_shape.max_media_parts_per_item = 1;
+                    const essence = antfly.inference.work.mimeTypeEssence(binary.mime_type) catch
+                        return error.UnsupportedInferenceMimeType;
+                    if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
+                        chunk_shape.modalities.audio = true
+                    else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
+                        chunk_shape.modalities.image = true
+                    else
+                        chunk_shape.modalities.document = true;
+                    try chunk_capabilities.validateMimeType(binary.mime_type);
+                },
+            }
+            try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
             const result = try state.node.chunkInputDirect(alloc, parsed.value.model, input, .{
                 .model = if (cfg.model.len > 0) cfg.model else "fixed",
                 .max_chunks = if (cfg.max_chunks > 0) @intCast(cfg.max_chunks) else 50,
@@ -960,6 +1009,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rewrite_texts => blk: {
             var parsed = try std.json.parseFromSlice(RewriteTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rewrite, parsed.value.inputs, 0, 0, 0);
             const result = try state.node.rewriteTextsDirect(alloc, parsed.value.model, parsed.value.inputs);
             defer {
                 for (result) |item| alloc.free(item);
@@ -971,6 +1021,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ClassifyTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const request = parsed.value.request;
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .classify, request.texts, 0, request.labels.len, 0);
             const result = try state.node.classifyTextsDirect(
                 alloc,
                 parsed.value.model,
@@ -1474,8 +1525,11 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     const capabilities = try localModelCapabilities(node, io, model, .embed);
     var shape = antfly.inference.work.InvocationShape{ .item_count = parts.len };
     for (parts) |part| switch (part) {
-        .text => {
+        .text => |text| {
             shape.modalities.text = true;
+            shape.text_bytes = std.math.add(usize, shape.text_bytes, text.len) catch
+                return error.InferenceTextBytesExceeded;
+            shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, text.len);
             try capabilities.validateMimeType("text/plain");
         },
         .media_url => {
@@ -1632,7 +1686,41 @@ fn validateLocalGenerateCapabilities(
         },
         .encoded_media_bytes = preflight.encoded_media_bytes,
         .max_media_parts_per_item = preflight.media_count,
+        .text_bytes = preflight.text_bytes,
+        .max_text_bytes_per_item = preflight.text_bytes,
+        .requested_output_tokens_per_item = 256,
     });
+}
+
+fn validateLinkedTextInvocation(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    items: []const []const u8,
+    additional_text_bytes: usize,
+    candidates: usize,
+    schema_bytes: usize,
+) !void {
+    const capabilities = try localModelCapabilities(node, io, model, task);
+    try capabilities.validateMimeType("text/plain");
+    var shape = antfly.inference.work.InvocationShape{
+        .item_count = if (task == .generate) 1 else switch (capabilities.result_cardinality) {
+            .one_per_item => items.len,
+            .one_per_request => 1,
+        },
+        .modalities = .{ .text = true },
+        .text_bytes = additional_text_bytes,
+        .max_text_bytes_per_item = additional_text_bytes,
+        .max_candidates_per_request = candidates,
+        .schema_bytes = schema_bytes,
+    };
+    for (items) |item| {
+        shape.text_bytes = std.math.add(usize, shape.text_bytes, item.len) catch
+            return error.InferenceTextBytesExceeded;
+        shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, item.len);
+    }
+    try capabilities.validateInvocation(task, shape);
 }
 
 fn localModelCapabilities(
@@ -1774,6 +1862,13 @@ fn localModelCapabilities(
             .max_media_parts_per_item = resolved_batch.max_media_parts_per_item,
             .per_item_failures = resolved_batch.per_item_failures,
         },
+        .task_limits = .{
+            .max_text_bytes_per_item = resolved_batch.max_text_bytes_per_item,
+            .max_input_tokens_per_item = resolved_batch.max_input_tokens_per_item,
+            .max_output_tokens_per_item = resolved_batch.max_output_tokens_per_item,
+            .max_candidates_per_request = resolved_batch.max_candidates_per_request,
+            .max_schema_bytes = resolved_batch.max_schema_bytes,
+        },
         .output = output,
         .result_cardinality = std.meta.stringToEnum(
             antfly.inference.work.ResultCardinality,
@@ -1785,6 +1880,11 @@ fn localModelCapabilities(
         ).?,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
     };
+    for (manifest.capabilities) |capability| {
+        const prefix = "inference.mime_type=";
+        if (std.mem.startsWith(u8, capability, prefix))
+            try result.accepted_mime_types.add(capability[prefix.len..]);
+    }
     try result.validate();
     return result;
 }
@@ -1869,7 +1969,7 @@ fn inspectLocalGenerateDataUri(
         const parsed = (try antfly.inference.work.parseInlineDataUri(raw)) orelse
             return error.UnsupportedGeneratorProvider;
         if (declared_mime_type) |declared| {
-            if (!mimeEssencesEqual(declared, parsed.mime_type))
+            if (!mimeDeclarationsCompatible(declared, parsed.mime_type))
                 return error.UnsupportedGeneratorProvider;
         }
         mime_type = parsed.mime_type;
@@ -1893,6 +1993,10 @@ fn mimeEssencesEqual(a: []const u8, b: []const u8) bool {
     const a_essence = antfly.inference.work.mimeTypeEssence(a) catch return false;
     const b_essence = antfly.inference.work.mimeTypeEssence(b) catch return false;
     return std.ascii.eqlIgnoreCase(a_essence, b_essence);
+}
+
+fn mimeDeclarationsCompatible(declared: []const u8, attachment: []const u8) bool {
+    return antfly.inference.work.mediaTypesCompatible(declared, attachment);
 }
 
 fn mimeEssenceStartsWith(value: []const u8, prefix: []const u8) bool {
@@ -1952,7 +2056,7 @@ fn preflightLocalGenerateMessagesInternal(
                         if (attachment_index >= attachments.?.len) return error.InvalidArguments;
                         const attachment = attachments.?[attachment_index];
                         try attachment.validate();
-                        if (media.mime_type.len > 0 and !mimeEssencesEqual(media.mime_type, attachment.content_type))
+                        if (media.mime_type.len > 0 and !mimeDeclarationsCompatible(media.mime_type, attachment.content_type))
                             return error.InvalidArguments;
                         try addLocalGenerateMediaPreflight(&preflight, .{
                             .payload = attachment.bytes,
@@ -2079,7 +2183,7 @@ fn convertLocalGenerateParts(
                     if (attachment_index.* >= attachments.?.len) return error.InvalidArguments;
                     const attachment = attachments.?[attachment_index.*];
                     try attachment.validate();
-                    if (media.mime_type.len > 0 and !mimeEssencesEqual(media.mime_type, attachment.content_type))
+                    if (media.mime_type.len > 0 and !mimeDeclarationsCompatible(media.mime_type, attachment.content_type))
                         return error.InvalidArguments;
                     try decode_budget.reserve(attachment.bytes.len);
                     if (mimeEssenceStartsWith(attachment.content_type, "image/")) {
@@ -2168,7 +2272,7 @@ pub fn decodeLocalGenerateDataUri(
         var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, raw);
         errdefer decoded.deinit(alloc);
         if (decoded.data.len != descriptor.decoded_bytes or
-            !mimeEssencesEqual(decoded.mime_type, descriptor.mime_type))
+            !mimeDeclarationsCompatible(descriptor.mime_type, decoded.mime_type))
             return error.InvalidGenerationAdmission;
         alloc.free(decoded.mime_type);
         const data = decoded.data;
