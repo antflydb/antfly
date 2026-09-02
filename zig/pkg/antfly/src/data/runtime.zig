@@ -646,6 +646,10 @@ const IndexRepairQueueEntry = struct {
 };
 
 const IndexRepairQueueWake = enum {
+    /// Ensure durable debt has a queue entry without changing an existing
+    /// causal wake or owner-selected deadline. A newly observed entry is
+    /// runnable so lost notifications remain recoverable.
+    observed,
     immediate,
     retained,
     parked,
@@ -653,9 +657,11 @@ const IndexRepairQueueWake = enum {
 
 fn indexRepairQueueWakeFromAggregate(wake: antfly.db.DB.IndexRepairWake) IndexRepairQueueWake {
     return switch (wake) {
-        // Pending debt paired with an empty aggregate is an inconsistent/lost
-        // wake observation. Fail toward a bounded audit instead of parking it.
-        .immediate, .empty => .immediate,
+        .immediate => .immediate,
+        // `empty` is handled by indexRepairQueueScheduleFromResult, where a
+        // realtime fallback deadline can be attached. Keep this conservative
+        // mapping for callers which are only projecting the tagged state.
+        .empty => .retained,
         .at_realtime_ms => .retained,
         .parked => .parked,
     };
@@ -670,16 +676,27 @@ fn indexRepairQueueScheduleFromResult(
     aggregate_wake: antfly.db.DB.IndexRepairWake,
     retry_at_realtime_ms: u64,
     busy: bool,
+    made_progress: bool,
     realtime_now_ms: u64,
 ) IndexRepairQueueSchedule {
-    // A resident writer can temporarily own the lifecycle fence while its
-    // enrichment/derived workers make exactly the progress repair is waiting
-    // for. With no durable DB deadline, treating that cooperative contention
-    // as an immediate wake creates a node-level hot loop. Retain a bounded
-    // audit instead; an exact visibility/progress callback still replaces the
-    // queue generation with an immediate wake as soon as useful work lands.
-    if (busy and retry_at_realtime_ms == 0 and
-        (aggregate_wake == .empty or aggregate_wake == .immediate))
+    // An empty aggregate means the DB's exact intent directory has no runnable
+    // wake even though a broader group-level audit still reported pending.
+    // This occurs while a resident initial build owns normal coverage or a
+    // status handoff awaits its final observation. Retrying immediately would
+    // make that coarse level-trigger spin independently of the exact owner.
+    // Attach a bounded audit deadline; any causally newer visibility edge
+    // replaces the selected queue generation and wakes it immediately.
+    //
+    // A resident writer can likewise temporarily own the lifecycle fence while
+    // its enrichment/derived workers make the exact progress repair awaits.
+    // More generally, a pending runnable result may only self-reschedule
+    // immediately after a material quantum. Ownership changes, cancellation,
+    // stale scheduler observations, and other no-op deferrals must wait for a
+    // causally newer event or this bounded audit; otherwise one group can hot
+    // poll and starve normal backfill on the shared maintenance worker.
+    if (retry_at_realtime_ms == 0 and
+        (aggregate_wake == .empty or
+            (aggregate_wake == .immediate and (busy or !made_progress))))
     {
         return .{
             .retry_at_realtime_ms = realtime_now_ms +| provisioned_index_repair_interval_ms,
@@ -694,7 +711,7 @@ fn indexRepairQueueScheduleFromResult(
 
 test "data runtime preserves tagged aggregate index repair wake semantics" {
     try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
-    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.empty));
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, indexRepairQueueWakeFromAggregate(.empty));
     try std.testing.expectEqual(IndexRepairQueueWake.parked, indexRepairQueueWakeFromAggregate(.parked));
     try std.testing.expectEqual(
         IndexRepairQueueWake.retained,
@@ -703,18 +720,30 @@ test "data runtime preserves tagged aggregate index repair wake semantics" {
 }
 
 test "cooperative writer contention uses a preemptible bounded repair audit" {
-    const scheduled = indexRepairQueueScheduleFromResult(.empty, 0, true, 1_000);
+    const empty = indexRepairQueueScheduleFromResult(.empty, 0, false, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), empty.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, empty.wake);
+
+    const scheduled = indexRepairQueueScheduleFromResult(.empty, 0, true, false, 1_000);
     try std.testing.expectEqual(@as(u64, 6_000), scheduled.retry_at_realtime_ms);
     try std.testing.expectEqual(IndexRepairQueueWake.retained, scheduled.wake);
 
     // Runnable debt discovered behind the resident writer is still
     // cooperative contention. The selected queue generation applies this
     // delay only if no newer progress/visibility callback replaced it.
-    const runnable = indexRepairQueueScheduleFromResult(.immediate, 0, true, 1_000);
+    const runnable = indexRepairQueueScheduleFromResult(.immediate, 0, true, false, 1_000);
     try std.testing.expectEqual(@as(u64, 6_000), runnable.retry_at_realtime_ms);
     try std.testing.expectEqual(IndexRepairQueueWake.retained, runnable.wake);
 
-    const durable = indexRepairQueueScheduleFromResult(.{ .at_realtime_ms = 9_000 }, 9_000, true, 1_000);
+    const no_progress = indexRepairQueueScheduleFromResult(.immediate, 0, false, false, 1_000);
+    try std.testing.expectEqual(@as(u64, 6_000), no_progress.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.retained, no_progress.wake);
+
+    const progressed = indexRepairQueueScheduleFromResult(.immediate, 0, false, true, 1_000);
+    try std.testing.expectEqual(@as(u64, 0), progressed.retry_at_realtime_ms);
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, progressed.wake);
+
+    const durable = indexRepairQueueScheduleFromResult(.{ .at_realtime_ms = 9_000 }, 9_000, true, false, 1_000);
     try std.testing.expectEqual(@as(u64, 9_000), durable.retry_at_realtime_ms);
     try std.testing.expectEqual(IndexRepairQueueWake.retained, durable.wake);
 }
@@ -2176,6 +2205,8 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_started_total", "counter", "Node-local index repair scans started", self.data_server.provisioned_index_repair_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_completed_total", "counter", "Node-local index repair scans completed", self.data_server.provisioned_index_repair_completed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_failed_total", "counter", "Node-local index repair group scans that failed", self.data_server.provisioned_index_repair_failed.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_debt_events_total", "counter", "Durable repair-debt visibility edges received by the node-local scheduler", self.data_server.provisioned_index_repair_debt_events.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runnable_wake_events_total", "counter", "Exact progress or released-control-plane edges that requested immediate repair admission", self.data_server.provisioned_index_repair_runnable_wake_events.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_attempts_total", "counter", "Durable index reconstruction attempts admitted by this node", self.data_server.provisioned_index_repair_attempted.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repairs_completed_total", "counter", "Indexes reconstructed and validated by this node", self.data_server.provisioned_index_repair_repaired.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_queue_depth", "gauge", "Known local groups with durable index repair debt", self.data_server.provisioned_index_repair_queue_depth.load(.monotonic));
@@ -5287,6 +5318,8 @@ pub const DataServer = struct {
     provisioned_index_repair_started: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_completed: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_failed: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_debt_events: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_runnable_wake_events: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_attempted: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_repaired: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_queue_depth: std.atomic.Value(u64) = .init(0),
@@ -9685,6 +9718,11 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
             .enqueue, .enqueue_runnable => {
+                if (action == .enqueue_runnable) {
+                    _ = self.provisioned_index_repair_runnable_wake_events.fetchAdd(1, .monotonic);
+                } else {
+                    _ = self.provisioned_index_repair_debt_events.fetchAdd(1, .monotonic);
+                }
                 self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.provisioned_index_repair_dirty.store(true, .release);
@@ -13667,8 +13705,10 @@ pub const DataServer = struct {
                 if (wake == .immediate) {
                     entry.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
                 }
-                entry.transient_failure_count = 0;
-                entry.next_retry_at_ms = next_retry_at_ms;
+                if (wake != .observed) {
+                    entry.transient_failure_count = 0;
+                    entry.next_retry_at_ms = next_retry_at_ms;
+                }
                 if (wake == .immediate and !entry.immediate_wake_pending) {
                     entry.immediate_wake_pending = true;
                     _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
@@ -13726,8 +13766,10 @@ pub const DataServer = struct {
         if (gop.found_existing and wake == .immediate) {
             gop.value_ptr.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
         }
-        gop.value_ptr.transient_failure_count = 0;
-        gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        if (!gop.found_existing or wake != .observed) {
+            gop.value_ptr.transient_failure_count = 0;
+            gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        }
         if (wake == .immediate and !gop.value_ptr.immediate_wake_pending) {
             gop.value_ptr.immediate_wake_pending = true;
             _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
@@ -13866,6 +13908,13 @@ pub const DataServer = struct {
 
     fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
         _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate, .unguarded);
+    }
+
+    /// Record a periodic level observation of durable repair debt. Unlike a
+    /// causal enqueue, observing already-known debt cannot wake the owner or
+    /// replace its exact retry/backoff decision.
+    fn observeProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .observed, .unguarded);
     }
 
     fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
@@ -14274,7 +14323,11 @@ pub const DataServer = struct {
                 };
                 stats.group_count += 1;
                 if (result.index_repair_pending) {
-                    self.enqueueProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
+                    // Startup catch-up is a periodic level observation, not a
+                    // causal progress edge. It may recover a lost queue entry,
+                    // but must not erase the exact repair owner's deadline or
+                    // manufacture a new immediate wake once debt is known.
+                    self.observeProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
                         _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned index repair enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
                         self.provisioned_index_repair_dirty.store(true, .release);
@@ -14726,6 +14779,7 @@ pub const DataServer = struct {
                     result.index_repair_wake,
                     result.index_repair_retry_at_ms,
                     result.busy,
+                    result.made_progress,
                     platform_clock.Clock.real().nowRealtimeMs(),
                 );
                 _ = self.enqueueProvisionedIndexRepairWithRetryForTable(
@@ -28129,11 +28183,24 @@ test "data runtime repair failures preserve durable backoff and increase retry d
     try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
     const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const selected_generation = entry.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    try std.testing.expect(!entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     entry.next_retry_at_ms = std.math.maxInt(u64);
     const deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
     try std.testing.expect(deferral.applied);
     try std.testing.expectEqual(std.math.maxInt(u64), deferral.retry_at_ms);
     try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
+
+    // Periodic startup/status observation is level-triggered. It may restore a
+    // lost entry, but must not turn known debt into a new causal wake or erase
+    // the exact owner's retry policy.
+    try server.observeProvisionedIndexRepairForTable("docs", 7001);
+    try std.testing.expectEqual(selected_generation, entry.wake_generation);
+    try std.testing.expectEqual(std.math.maxInt(u64), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
+    try std.testing.expect(!entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
 
     // An explicit/durable wake replaces node-local failure state rather than
     // leaving a recovered group parked behind stale scheduler backoff.

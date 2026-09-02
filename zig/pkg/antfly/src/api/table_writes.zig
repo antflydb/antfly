@@ -13828,7 +13828,7 @@ pub const ProvisionedTableWriteSource = struct {
             // debt afterwards or the repair lane can never consume the intent.
             const generated_coverage_handoff = try managedDbNeedsGeneratedCoverageReplay(alloc, db);
             live_broad_recovery = generated_coverage_handoff or
-                try managedDbHasNonRepairCatchUpDebt(alloc, db);
+                try managedDbHasNonRepairCatchUpDebt(alloc, db, .live_writer);
             if (live_broad_recovery) {
                 // Broad recovery must exclude readers, but the live repair
                 // admission above deliberately allows them. Drop that guard
@@ -13906,7 +13906,7 @@ pub const ProvisionedTableWriteSource = struct {
                     result.busy = true;
                     result.index_repair_pending = true;
                 }
-            } else if (try managedDbHasNonRepairCatchUpDebt(alloc, db)) {
+            } else if (try managedDbHasNonRepairCatchUpDebt(alloc, db, .live_writer)) {
                 // Keep the exact route alive even if its original index intent
                 // completed concurrently. With a resident writer this same
                 // owner is the only path that can continue broad recovery.
@@ -13963,7 +13963,11 @@ pub const ProvisionedTableWriteSource = struct {
         );
         result.automatic_index_repair_discovery_pending = final_automatic_discovery_pending;
         const final_restore_repair_needed = try db.restoreRuntimeRepairNeeded();
-        const final_broad_debt = metadata.advance_index_repairs and try managedDbHasNonRepairCatchUpDebt(alloc, db);
+        const final_broad_debt = metadata.advance_index_repairs and try managedDbHasNonRepairCatchUpDebt(
+            alloc,
+            db,
+            if (managed_owner_is_live_writer) .live_writer else .isolated,
+        );
         result.index_repair_paused = false;
         result.terminal_degraded = false;
         if (final_restore_repair_needed and final_index_load_failure) {
@@ -24773,7 +24777,7 @@ test "resident writer repair state distinguishes clean and metadata-pending writ
     {
         var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
         defer cached.deinit(alloc);
-        try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
+        try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .isolated));
         const repaired = try catchUpManagedDb(
             &source,
             alloc,
@@ -29009,6 +29013,16 @@ fn managedDbNeedsGeneratedCoverageReplay(alloc: std.mem.Allocator, db: *db_mod.D
     if (!db.core.hasGeneratedEnrichmentTargets()) return false;
     const enrichment = db.pendingWorkStats().enrichment;
     if (enrichment.applied_sequence < enrichment.target_sequence) return false;
+    // A resident producer and its exact durable initial-build intent already
+    // own this convergence. Seeding the same coverage gap through broad
+    // startup recovery would reacquire the read-exclusive lifecycle fence and
+    // synchronously wait on provider work which is deliberately asynchronous.
+    if (enrichment.worker_started and
+        !enrichment.worker_failed and
+        try db.generatedCoverageRecoveryOwnedByInitialBuild(alloc))
+    {
+        return false;
+    }
     return try db.generatedCoverageReplayNeeded(alloc);
 }
 
@@ -29054,19 +29068,35 @@ test "startup generated coverage replay uses terminal source outcomes rather tha
 /// coverage is intentionally absent: catchUpManagedDb converts it to exact
 /// durable repair intents while it owns the exclusive seeding phase, after
 /// which the bounded repair scheduler owns progress.
-fn managedDbHasNonRepairCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+fn managedDbHasNonRepairCatchUpDebt(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    owner: ManagedCatchUpOwner,
+) !bool {
+    const pending_work = db.pendingWorkStats();
+    // The resident executor is the sole producer for ordinary derived replay.
+    // Its lag is build activity, not startup repair, and must remain compatible
+    // with readers. Cold/isolated owners still need the broad replay path.
+    const resident_owns_derived = owner == .live_writer and pending_work.has_async_indexes;
     const replay_debt = try db.listDerivedReplayDebt(alloc);
     defer {
         for (replay_debt) |*status| status.deinit(alloc);
         alloc.free(replay_debt);
     }
     for (replay_debt) |status| {
-        if (status.catch_up_required) return true;
+        if (status.catch_up_required and !resident_owns_derived) return true;
     }
-    const pending_work = db.pendingWorkStats();
     if (pending_work.repair_metadata_rebuild_pending) return true;
     const enrichment = pending_work.enrichment;
-    if (enrichment.enabled and enrichment.applied_sequence < enrichment.target_sequence) return true;
+    const resident_owns_enrichment = owner == .live_writer and
+        enrichment.worker_started and
+        !enrichment.worker_failed;
+    if (enrichment.enabled and
+        enrichment.applied_sequence < enrichment.target_sequence and
+        !resident_owns_enrichment)
+    {
+        return true;
+    }
     if (try db.restoreRuntimeRepairNeeded()) return true;
     return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
@@ -29131,19 +29161,26 @@ fn catchUpManagedDb(
         alloc.free(before);
     }
 
+    const pending_work_before = db.pendingWorkStats();
+    const resident_owns_derived = owner == .live_writer and pending_work_before.has_async_indexes;
+    const resident_enrichment = pending_work_before.enrichment;
+    const resident_owns_enrichment = owner == .live_writer and
+        resident_enrichment.worker_started and
+        !resident_enrichment.worker_failed;
     var had_debt = generated_coverage_replay_needed;
     var derived_replay_debt = false;
     for (before) |status| {
         if (!status.catch_up_required) continue;
+        if (resident_owns_derived) continue;
         had_debt = true;
         derived_replay_debt = true;
         break;
     }
-    const pending_work_before = db.pendingWorkStats();
     const repair_metadata_rebuild_pending = pending_work_before.repair_metadata_rebuild_pending;
     const enrichment_before = pending_work_before.enrichment;
     if (enrichment_before.enabled and
-        enrichment_before.applied_sequence < enrichment_before.target_sequence)
+        enrichment_before.applied_sequence < enrichment_before.target_sequence and
+        !resident_owns_enrichment)
     {
         had_debt = true;
     }
@@ -48534,7 +48571,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
         cached.db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
     _ = try ReplaySeed.appendDenseReplay(alloc, cached.db, "doc:a", "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}", &[_]f32{ 1, 0 });
-    try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
+    try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .isolated));
     var queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
         .target = .index,
         .artifact_kind = .embedding,
@@ -48579,7 +48616,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     try std.testing.expect(!try cached.db.hasPendingIndexRepairIntents(alloc));
     var repaired_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 3), repaired_dense.index.stats().active_count);
-    try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db));
+    try std.testing.expect(!try managedDbHasNonRepairCatchUpDebt(alloc, cached.db, .isolated));
 
     var search = try cached.db.search(alloc, .{
         .index_name = "dense_idx",
@@ -51405,30 +51442,45 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     defer tmp.cleanup();
 
     const FakeEmbeddingProvider = struct {
-        var request_count: std.atomic.Value(u32) = .init(0);
+        request_count: std.atomic.Value(u32) = .init(0),
 
-        fn executor() http_common.RequestExecutor {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{ .execute = execute },
-            };
+        fn dense(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            model: []const u8,
+            texts: []const []const u8,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("test-embed", model);
+            try std.testing.expect(texts.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, texts[0], "alpha body") != null);
+            _ = self.request_count.fetchAdd(1, .monotonic);
+
+            const vectors = try allocator.alloc([]f32, texts.len);
+            errdefer allocator.free(vectors);
+            for (vectors, 0..) |*vector, i| {
+                vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
+                    for (vectors[0..i]) |owned| allocator.free(owned);
+                    return err;
+                };
+            }
+            return vectors;
         }
 
-        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
-            _ = request_count.fetchAdd(1, .monotonic);
+        fn sparse(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+        ) anyerror![]db_embedder.SparseEmbedding {
+            return try allocator.alloc(db_embedder.SparseEmbedding, 0);
+        }
 
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
-            defer parsed_req.deinit();
-            try std.testing.expect(jsonValueContainsText(parsed_req.value.input, "alpha body"));
-
+        fn interface(self: *@This()) managed_embedder.AntflyProvider {
             return .{
-                .status = 200,
-                .content_type = try arena.dupe(u8, "application/json"),
-                .body = try arena.dupe(u8,
-                    \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[1,0,0]}],"model":"test-embed","usage":{"prompt_tokens":1,"total_tokens":1}}
-                ),
+                .ptr = self,
+                .embed_dense_texts = dense,
+                .embed_sparse_texts = sparse,
             };
         }
     };
@@ -51493,24 +51545,18 @@ test "provisioned create installs managed enrichment despite a matching stale fi
         }
     };
 
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
-    defer listener.deinit();
-    try listener.start();
-    const base_uri = try listener.baseUri(alloc);
-    defer alloc.free(base_uri);
-
-    const managed_indexes_json = try std.fmt.allocPrint(alloc,
-        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"enrichments":[{{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128}},{{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{{\"provider\":\"openai\",\"model\":\"test-embed\",\"url\":\"{s}\"}}"}}],"title_body":{{"name":"title_body","type":"embeddings","template":"{{{{title}}}} {{{{body}}}}","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}},"artifact_vectors":{{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{{"artifact":"body_dense_v1"}}]}}}}
-    , .{ base_uri, base_uri });
-    defer alloc.free(managed_indexes_json);
+    const managed_indexes_json =
+        \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"enrichments":[{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128},{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"test-embed\"}"}],"title_body":{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","dimension":3,"embedder":{"provider":"antfly","model":"test-embed"}},"artifact_vectors":{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{"artifact":"body_dense_v1"}]}}
+    ;
     Catalog.indexes_json_buf = tables_api.default_indexes_json;
-    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+    var provider = FakeEmbeddingProvider{};
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     defer source.deinit();
     source.write_cache = &write_cache;
+    _ = source.withAntflyProvider(provider.interface());
 
     {
         var stale_owner = try write_cache.getOrOpenLockedMode(
@@ -51554,7 +51600,7 @@ test "provisioned create installs managed enrichment despite a matching stale fi
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
         .sync_level = .full_index,
     });
-    try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+    try std.testing.expect(provider.request_count.load(.monotonic) > 0);
     try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
     try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
 

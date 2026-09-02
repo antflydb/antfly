@@ -1901,6 +1901,9 @@ class InferenceEmbeddingServer:
         self._delay_released = threading.Event()
         self._malformed_embedding_lock = threading.Lock()
         self._malformed_embedding_model: str | None = None
+        self._transient_embedding_lock = threading.Lock()
+        self._transient_embedding_model: str | None = None
+        self._transient_embedding_requests = 0
 
         outer = self
 
@@ -1974,6 +1977,21 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
                     model = payload.get("model", "")
+                    is_dimension_probe = (
+                        "antfly embedding dimension probe"
+                        in json.dumps(payload.get("input", ""))
+                    )
+                    with outer._transient_embedding_lock:
+                        transient = (
+                            outer._transient_embedding_model is not None
+                            and outer._transient_embedding_model in model
+                            and not is_dimension_probe
+                        )
+                        if transient:
+                            outer._transient_embedding_requests += 1
+                    if transient:
+                        self.send_error(503, "transient embedding fixture")
+                        return
                     with outer._malformed_embedding_lock:
                         malformed = (
                             outer._malformed_embedding_model is not None
@@ -2001,7 +2019,11 @@ class InferenceEmbeddingServer:
                         self.end_headers()
                         self.wfile.write(body)
                         return
-                    if outer._delay_enabled.is_set():
+                    # Corpus work can be held to exercise lifecycle and
+                    # scheduling edges without turning the control-plane
+                    # dimension probe into the same long-running batch. The
+                    # probe is a separate, bounded admission class.
+                    if outer._delay_enabled.is_set() and not is_dimension_probe:
                         outer._embedding_request_active.set()
                         outer._delay_released.wait(outer.response_delay_s)
                     input_value = payload.get("input", [])
@@ -2096,6 +2118,20 @@ class InferenceEmbeddingServer:
         """Give the next request for ``model`` a wrong-dimension vector."""
         with self._malformed_embedding_lock:
             self._malformed_embedding_model = model
+
+    def arm_transient_embedding_failures(self, model: str) -> None:
+        with self._transient_embedding_lock:
+            self._transient_embedding_requests = 0
+            self._transient_embedding_model = model
+
+    def release_transient_embedding_failures(self) -> None:
+        with self._transient_embedding_lock:
+            self._transient_embedding_model = None
+
+    @property
+    def transient_embedding_requests(self) -> int:
+        with self._transient_embedding_lock:
+            return self._transient_embedding_requests
 
     def release_delay(self) -> None:
         self._delay_enabled.clear()

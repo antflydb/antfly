@@ -194,6 +194,12 @@ Activity explains why counters are moving; it never proves readiness or
 failure, and losing volatile activity state on restart must not make an index
 less queryable.
 
+A terminal failure for one source is coverage health, not query-admission
+failure. It can prevent `complete` under the configured coverage policy, but an
+exact, already published snapshot remains queryable and can satisfy a
+`searchable-artifacts` threshold. Only an incarnation-wide runtime/load failure
+or a query-blocking repair fence revokes that serving proof.
+
 Initial materialization and corruption recovery share a crash-resumable,
 bounded generation scheduler, but remain distinct durable work classes. A
 normal initial build is exposed through backfill, coverage, publication, and

@@ -35,7 +35,8 @@ class EmbeddingsIndexStats:
     Attributes:
         index_type (EmbeddingsIndexStatsIndexType): Discriminator for the index stats variant.
         readiness (IndexReadinessStatus | Unset):
-        incarnation (str | Unset): Opaque identity of the desired embeddings index incarnation.
+        incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision (int | Unset):
         published_revision (int | Unset):
         milestones (IndexMilestones | Unset):

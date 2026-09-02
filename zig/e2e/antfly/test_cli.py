@@ -235,6 +235,10 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--index",
             inline_index,
         )
+        # Hold the first generated batch open. Full-text publication is already
+        # complete and must remain independently readable while the resident
+        # embeddings owner is waiting on its provider.
+        embedder_server.arm_delay()
         cli(
             "load",
             "--table",
@@ -247,7 +251,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "full_text",
             "--no-checkpoint",
         )
+        assert embedder_server.wait_for_embedding_request(10.0)
 
+        full_text_started = time.monotonic()
         full_text_query = cli(
             "query",
             "--table",
@@ -258,11 +264,52 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "title,body",
             "--limit",
             "2",
+            timeout_s=5.0,
+        )
+        assert time.monotonic() - full_text_started < 3.0, (
+            "a ready full-text read queued behind generated-index backfill"
         )
         full_text_hits = parse_json(full_text_query.stdout)["responses"][0]["hits"][
             "hits"
         ]
         assert full_text_hits[0]["_id"] == "doc:alpha"
+        embedder_server.release_delay()
+
+        # `searchable-artifacts` is intentionally index-type neutral. Exercise
+        # it against the real default full-text index so the CLI cannot regress
+        # to requiring an embeddings-only incarnation projection.
+        listed_indexes = parse_json(
+            cli("index", "list", "--table", table, "--output", "json").stdout
+        )
+        full_text_index = next(
+            item for item in listed_indexes if item["config"]["type"] == "full_text"
+        )
+        full_text_name = full_text_index["config"]["name"]
+        full_text_incarnation = full_text_index["status"]["incarnation"]
+        assert full_text_incarnation
+        assert (
+            full_text_index["status"]["readiness"]["incarnation"]
+            == full_text_incarnation
+        )
+        full_text_wait = cli(
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            full_text_name,
+            "--until",
+            "searchable-artifacts=1",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
+        )
+        assert (
+            f"Index {full_text_name} (full_text) reached searchable-artifacts=1:"
+            in full_text_wait.stdout
+        )
 
         text_wait = cli(
             "index",
@@ -303,6 +350,26 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
         assert text_hits[0]["_id"] == "doc:alpha"
 
+        # Reproduce the documented live-add path while another managed index
+        # is actively awaiting inference. Activation/control work must bypass
+        # the corpus lane and acknowledge the new incarnation without restart.
+        embedder_server.arm_delay()
+        cli(
+            "insert",
+            "--table",
+            table,
+            "--key",
+            "doc:concurrent",
+            "--document",
+            json.dumps(
+                {
+                    "title": "Concurrent",
+                    "body": "embedding build remains active during image activation",
+                }
+            ),
+        )
+        assert embedder_server.wait_for_embedding_request(10.0)
+        image_create_started = time.monotonic()
         cli(
             "index",
             "create",
@@ -316,8 +383,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "partial",
             "--template",
             "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-            "--dimension",
-            "3",
             "--embedder",
             json.dumps(
                 {
@@ -326,7 +391,122 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                     "api_url": embedder_url,
                 }
             ),
+            timeout_s=8.0,
         )
+        assert time.monotonic() - image_create_started < 5.0, (
+            "second-index activation queued behind provider execution"
+        )
+
+        def thumbnail_is_owned() -> dict | None:
+            index = parse_json(
+                cli(
+                    "index",
+                    "get",
+                    "--table",
+                    table,
+                    "--index",
+                    "thumbnail",
+                ).stdout
+            )
+            assert index["config"]["dimension"] == 3
+            status = index["status"]
+            if (
+                status["incarnation"]
+                and status["readiness"]["state"] != "runtime_unavailable"
+            ):
+                return status
+            return None
+
+        image_activation = wait_until(
+            thumbnail_is_owned, timeout_s=5.0, interval_s=0.025
+        )
+        assert image_activation is not None, cli(
+            "index", "get", "--table", table, "--index", "thumbnail"
+        ).stdout
+
+        def generated_coverage_is_observed() -> dict | None:
+            statuses = {
+                name: parse_json(
+                    cli("index", "get", "--table", table, "--index", name).stdout
+                )["status"]
+                for name in ("title_body", "thumbnail")
+            }
+            if all(
+                status["source_coverage"]["observation_complete"]
+                for status in statuses.values()
+            ):
+                return statuses
+            return None
+
+        observed_coverage = wait_until(
+            generated_coverage_is_observed, timeout_s=5.0, interval_s=0.025
+        )
+        assert observed_coverage is not None, cli(
+            "index", "list", "--table", table, "--output", "json"
+        ).stdout
+
+        # An incomplete generated corpus is owned by ordinary initial-build
+        # work. Keep the provider blocked across multiple periodic startup
+        # observations and prove they neither synthesize repair debt, invalidate
+        # runtime observations, nor overwrite the exact repair owner's bounded
+        # wake with a hot immediate loop. This is the live quickstart
+        # regression: a second index is activated while its sibling already has
+        # pending generated coverage.
+        rebuild_log_counts = {
+            name: cli_server.debug_logs().count(
+                f"dense startup artifact rebuild planned index={name} "
+            )
+            for name in ("title_body", "thumbnail")
+        }
+        repair_pass_log = "provisioned index repair begin group="
+        repair_passes_before = sum(
+            1
+            for line in cli_server.debug_logs().splitlines()
+            if repair_pass_log in line and f"table={table} " in line
+        )
+        status_stability_deadline = time.monotonic() + 2.25
+        while time.monotonic() < status_stability_deadline:
+            for name in ("title_body", "thumbnail"):
+                status = parse_json(
+                    cli("index", "get", "--table", table, "--index", name).stdout
+                )["status"]
+                assert status["readiness"]["state"] != "runtime_unavailable", (
+                    json.dumps(status, indent=2)
+                )
+                source_coverage = status["source_coverage"]
+                if source_coverage["observation_complete"]:
+                    assert source_coverage["pending"] > 0, json.dumps(status, indent=2)
+                else:
+                    # A concurrent runtime-status publication may temporarily
+                    # make the census freshness unknown. That is explicit and
+                    # must never be represented as authoritative zero work.
+                    assert source_coverage["pending"] is None
+                    assert source_coverage["observation_incomplete_reasons"]
+                assert source_coverage["failed"] == 0
+                assert status.get("repair") is None, json.dumps(status, indent=2)
+                assert status["enrichment_runtime"]["worker_failed"] is False
+            time.sleep(0.025)
+        logs_while_building = cli_server.debug_logs()
+        repair_passes_after = sum(
+            1
+            for line in logs_while_building.splitlines()
+            if repair_pass_log in line and f"table={table} " in line
+        )
+        assert repair_passes_after - repair_passes_before <= 1, (
+            "periodic startup observation repeatedly promoted known repair "
+            "debt to an immediate wake"
+        )
+        for name, before_count in rebuild_log_counts.items():
+            assert (
+                logs_while_building.count(
+                    f"dense startup artifact rebuild planned index={name} "
+                )
+                == before_count
+            ), (
+                f"ordinary generated coverage for {name} was misclassified as "
+                "artifact repair"
+            )
+        embedder_server.release_delay()
         text_status_after_index_create = parse_json(
             cli("index", "get", "--table", table, "--index", "title_body").stdout
         )
@@ -360,12 +540,12 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_status = parse_json(
             cli("index", "get", "--table", table, "--index", "thumbnail").stdout
         )
-        image_coverage = image_status["status"]["coverage"]
+        image_coverage = image_status["status"]["source_coverage"]
         assert image_coverage["policy"] == "partial"
-        assert image_coverage["source_total"] == 2
-        assert image_coverage["produced"] == 1
-        assert image_coverage["skipped"] == 1
-        assert image_coverage["terminal_failed"] == 0
+        assert image_coverage["total"] == 3
+        assert image_coverage["covered"] == 1
+        assert image_coverage["skipped"] == 2
+        assert image_coverage["failed"] == 0
         assert image_coverage["complete"] is True, json.dumps(image_status, indent=2)
         assert image_coverage["healthy"] is True
 
@@ -384,11 +564,11 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
 
-        # An invalid ClipClap response is a per-source terminal outcome, not
-        # a terminal generation failure while a later source is still embedded.
-        # Hold that later request open so the CLI observes and waits through
-        # the exact status boundary exercised by the documented quickstart.
-        embedder_server.arm_malformed_embedding_response("antflydb/clipclap")
+        # A retry-exhausted ClipClap request is a per-source terminal outcome,
+        # not a table-wide worker failure. This is the production quickstart
+        # edge: the text and image indexes share one resident enrichment owner
+        # while the thumbnail provider repeatedly returns 503.
+        embedder_server.arm_transient_embedding_failures("antflydb/clipclap")
         insert_started = time.monotonic()
         cli(
             "insert",
@@ -418,11 +598,22 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             return None
 
         settled_failure = wait_until(
-            isolated_failure_is_settled, timeout_s=10.0, interval_s=0.025
+            isolated_failure_is_settled, timeout_s=30.0, interval_s=0.05
         )
         assert settled_failure is not None, cli(
             "index", "get", "--table", table, "--index", "thumbnail"
         ).stdout
+        embedder_server.release_transient_embedding_failures()
+        assert embedder_server.transient_embedding_requests > 1
+        assert settled_failure["enrichment_runtime"]["worker_failed"] is False
+        text_after_media_failure = parse_json(
+            cli("index", "get", "--table", table, "--index", "title_body").stdout
+        )["status"]
+        assert text_after_media_failure["readiness"]["queryable"] is True
+        assert text_after_media_failure["enrichment_runtime"]["worker_failed"] is False
+
+        # Hold a later healthy request open so the CLI observes and waits
+        # through the exact degraded-but-progressing boundary.
         embedder_server.arm_delay()
         insert_started = time.monotonic()
         cli(
@@ -507,6 +698,54 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "Index thumbnail (embeddings) reached searchable-artifacts=2:"
             in later_stdout
         )
+
+        # A partial published generation is the restart availability unit. The
+        # same exact incarnations must be admitted promptly after reopen while
+        # any remaining source coverage continues in the background.
+        before_restart = {
+            name: parse_json(
+                cli("index", "get", "--table", table, "--index", name).stdout
+            )["status"]["incarnation"]
+            for name in ("title_body", "thumbnail")
+        }
+        cli_server.restart()
+
+        def same_incarnations_are_queryable() -> dict | None:
+            statuses = {
+                name: parse_json(
+                    cli("index", "get", "--table", table, "--index", name).stdout
+                )["status"]
+                for name in before_restart
+            }
+            if all(
+                status["incarnation"] == before_restart[name]
+                and status["readiness"]["queryable"] is True
+                for name, status in statuses.items()
+            ):
+                return statuses
+            return None
+
+        restarted = wait_until(
+            same_incarnations_are_queryable, timeout_s=8.0, interval_s=0.05
+        )
+        if restarted is None:
+            restart_diagnostics = {}
+            for name, expected_incarnation in before_restart.items():
+                status = parse_json(
+                    cli("index", "get", "--table", table, "--index", name).stdout
+                )["status"]
+                restart_diagnostics[name] = {
+                    "expected_incarnation": expected_incarnation,
+                    "incarnation": status.get("incarnation"),
+                    "readiness": status.get("readiness"),
+                    "source_coverage": status.get("source_coverage"),
+                    "publication": status.get("publication"),
+                    "searchable_vectors": status.get("searchable_vectors"),
+                    "runtime_present": status.get("runtime_present"),
+                    "runtime_fresh": status.get("runtime_fresh"),
+                    "repair": status.get("repair"),
+                }
+            pytest.fail(json.dumps(restart_diagnostics, indent=2, sort_keys=True))
 
         rag = cli(
             "agents",

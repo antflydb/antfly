@@ -3577,6 +3577,9 @@ test "serviceable full text replacement remains queryable while rebuilding" {
         .kind = .full_text,
         .doc_count = 10,
         .term_count = 40,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
         .backfill_active = true,
         .backfill_progress = 0.3,
         .index_lifecycle_work_class = .repair,
@@ -3593,8 +3596,8 @@ test "serviceable full text replacement remains queryable while rebuilding" {
         10,
         .external,
         false,
-        0,
-        0,
+        42,
+        99,
         .{},
         null,
         null,
@@ -4068,6 +4071,9 @@ test "target-scoped stale full text observation cannot publish old readiness" {
         .runtime_observation_stale = true,
         .doc_count = 8,
         .term_count = 24,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
@@ -4078,8 +4084,8 @@ test "target-scoped stale full text observation cannot publish old readiness" {
         &runtimes,
         "search_idx",
         &.{7},
-        0,
-        0,
+        42,
+        99,
         null,
     ) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
@@ -4096,8 +4102,8 @@ test "target-scoped stale full text observation cannot publish old readiness" {
         aggregate.table_doc_count,
         .strict,
         false,
-        0,
-        0,
+        42,
+        99,
         aggregate.async_indexing,
         aggregate.enrichment,
         aggregate.resolution,
@@ -4108,7 +4114,7 @@ test "target-scoped stale full text observation cannot publish old readiness" {
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"replay\"]}}",
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"incarnation_pending\",\"backfill\",\"replay\"]}}",
         encoded.items,
     );
 }
@@ -5810,23 +5816,32 @@ fn appendIndexReadinessStatus(
         item.expected_group_count == item.fresh_group_count
     else
         true;
-    const incarnation_current = index_type != .embeddings or
-        (coverage_generation != 0 and authority.incarnation_current);
+    // Incarnation fencing is common to every public index kind. The catalog
+    // assigns one identity per semantic definition and storage reports the
+    // exact identity it installed; accepting a same-name observation without
+    // comparing both would let a replaced full-text, graph, or algebraic index
+    // satisfy a wait with stale cardinality.
+    const incarnation_current = coverage_generation != 0 and authority.incarnation_current;
     const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
     const globally_failed = terminal_load_failure or repair_failed or terminal_enrichment_global_failure;
+    // Search admission owns this exact-incarnation proof. It is deliberately
+    // independent of cardinality: zero is a valid published result set, while
+    // a newly installed but still gated empty generation remains false.
+    const serving_snapshot_ready = index_type == .embeddings and
+        (if (@hasField(Item, "serving_snapshot_ready")) item.serving_snapshot_ready else false);
     const aggregate_query_blocked = if (@hasField(Item, "query_blocking_group_count"))
         item.query_blocking_group_count != 0
     else
         false;
+    // A per-source terminal outcome makes completion degraded, but cannot
+    // revoke an already admitted immutable snapshot. Load/repair failures have
+    // their own active-generation fence; enrichment uses the exact serving
+    // snapshot proof so threshold waits can still consume published results.
     const serving_failed = aggregate_query_blocked or
-        ((terminal_load_failure or terminal_enrichment_failure or repair_failed) and
-            (!active_generation_serviceable or repair_blocks_queryable));
-    // Search admission owns this proof. It is deliberately independent of
-    // cardinality: zero is a valid published result set, while a newly installed
-    // but still gated empty generation remains false.
-    const serving_snapshot_ready = index_type == .embeddings and
-        (if (@hasField(Item, "serving_snapshot_ready")) item.serving_snapshot_ready else false);
+        ((terminal_load_failure or repair_failed) and
+            (!active_generation_serviceable or repair_blocks_queryable)) or
+        (terminal_enrichment_failure and !serving_snapshot_ready);
     const publication_pending = index_type == .embeddings and incarnation_current and
         (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or
             !serving_snapshot_ready);
@@ -5869,7 +5884,7 @@ fn appendIndexReadinessStatus(
     const queryable = queryable_partial or !pending and !failed;
     const complete = !pending and !failed;
 
-    if (index_type == .embeddings and coverage_generation != 0) {
+    if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
         try out.appendSlice(alloc, ",\"incarnation\":");
@@ -5930,7 +5945,7 @@ fn appendIndexReadinessStatus(
     try out.appendSlice(alloc, if (queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"complete\":");
     try out.appendSlice(alloc, if (complete) "true" else "false");
-    if (index_type == .embeddings and coverage_generation != 0) {
+    if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
         try out.appendSlice(alloc, ",\"incarnation\":");
@@ -5990,6 +6005,52 @@ fn appendIndexReadinessStatus(
         }
     }
     try out.append(alloc, '}');
+}
+
+test "published embeddings snapshot remains queryable after isolated source failure" {
+    const alloc = std.testing.allocator;
+    const item = db_mod.types.DBIndexStats{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, "{\"index_type\":\"embeddings\"");
+    try appendIndexReadinessStatus(
+        alloc,
+        &encoded,
+        .embeddings,
+        item,
+        .partial,
+        42,
+        .{
+            .runtime_present = true,
+            .incarnation_current = true,
+            .freshness_authoritative = true,
+            .readiness_authoritative = true,
+            .coverage_authoritative = true,
+        },
+        false,
+        false,
+        true,
+        false,
+        null,
+        false,
+        false,
+        false,
+        2,
+        2,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    try encoded.append(alloc, '}');
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"milestones":{"queryable":{"reached":true,"blockers":[]},"complete":{"reached":false,"blockers":["failure","source_coverage"]}},"readiness":{"state":"failed","queryable":true,"complete":false,"incarnation":"g-000000000000002a","pending_reasons":["enrichment_failure","coverage"]}}
+    , encoded.items);
 }
 
 fn indexSourcesComplete(
@@ -7682,6 +7743,15 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "search_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
+    const incarnation = try std.fmt.allocPrint(std.testing.allocator, "g-{x:0>16}", .{identity.incarnation});
+    defer std.testing.allocator.free(incarnation);
+    const expected_identity = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"status\":{{\"incarnation\":\"{s}\",\"readiness\":{{\"incarnation\":\"{s}\"}}}}}}",
+        .{ incarnation, incarnation },
+    );
+    defer std.testing.allocator.free(expected_identity);
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator, expected_identity, encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":7") != null);
     // Shard 7's candidate-only 2 -> 5 debt is hidden by its serviceable
     // active generation. Shard 8's independent 5 -> 8 debt must survive both
@@ -7691,6 +7761,50 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.400") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{") != null);
+}
+
+test "full text status rejects a stale same-name runtime incarnation" {
+    const alloc = std.testing.allocator;
+    const config_json = "{\"type\":\"full_text\",\"_index_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .doc_count = 12,
+        .term_count = 24,
+        .coverage_generation = identity.incarnation - 1,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    }};
+    var local_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .doc_count = 12, .index_count = 1, .indexes = indexes[0..] },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"status":{"incarnation":"g-000000000000002a","total_indexed":0,"milestones":{"queryable":{"reached":false}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a"}},"shard_status":{"7":{"incarnation":"g-000000000000002a","milestones":{"queryable":{"reached":false,"blockers":["incarnation"]}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a","pending_reasons":["incarnation_pending"]}}}}
+    , encoded);
 }
 
 test "full text aggregate preserves explicit current backfill state" {

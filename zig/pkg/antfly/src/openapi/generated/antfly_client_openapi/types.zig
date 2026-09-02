@@ -890,6 +890,8 @@ pub const AlgebraicIndexStats = struct {
     index_type: AlgebraicIndexStatsIndexType,
     /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
     target_revision: ?i64 = null,
     published_revision: ?i64 = null,
     milestones: ?IndexMilestones = null,
@@ -988,6 +990,7 @@ pub const AlgebraicIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
         .{ "target_revision", "target_revision", true },
         .{ "published_revision", "published_revision", true },
         .{ "milestones", "milestones", true },
@@ -1074,6 +1077,10 @@ pub const AlgebraicIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
             try jw.write(value);
         }
         if (self.target_revision) |value| {
@@ -9169,7 +9176,7 @@ pub const EmbeddingsIndexStats = struct {
     index_type: EmbeddingsIndexStatsIndexType,
     /// Deprecated compatibility projection. Use milestones and the explicit status dimensions.
     readiness: ?IndexReadinessStatus = null,
-    /// Opaque identity of the desired embeddings index incarnation.
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
     target_revision: ?i64 = null,
     published_revision: ?i64 = null,
@@ -12132,6 +12139,8 @@ pub const FullTextIndexStats = struct {
     index_type: FullTextIndexStatsIndexType,
     /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
     target_revision: ?i64 = null,
     published_revision: ?i64 = null,
     milestones: ?IndexMilestones = null,
@@ -12207,6 +12216,7 @@ pub const FullTextIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
         .{ "target_revision", "target_revision", true },
         .{ "published_revision", "published_revision", true },
         .{ "milestones", "milestones", true },
@@ -12270,6 +12280,10 @@ pub const FullTextIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
             try jw.write(value);
         }
         if (self.target_revision) |value| {
@@ -14248,6 +14262,8 @@ pub const GraphIndexStats = struct {
     index_type: GraphIndexStatsIndexType,
     /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
     target_revision: ?i64 = null,
     published_revision: ?i64 = null,
     milestones: ?IndexMilestones = null,
@@ -14324,6 +14340,7 @@ pub const GraphIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
         .{ "target_revision", "target_revision", true },
         .{ "published_revision", "published_revision", true },
         .{ "milestones", "milestones", true },
@@ -14389,6 +14406,10 @@ pub const GraphIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
             try jw.write(value);
         }
         if (self.target_revision) |value| {

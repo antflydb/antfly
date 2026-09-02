@@ -32,6 +32,8 @@ class GraphIndexStats:
     Attributes:
         index_type (GraphIndexStatsIndexType): Discriminator for the index stats variant.
         readiness (IndexReadinessStatus | Unset):
+        incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision (int | Unset):
         published_revision (int | Unset):
         milestones (IndexMilestones | Unset):
@@ -92,6 +94,7 @@ class GraphIndexStats:
 
     index_type: GraphIndexStatsIndexType
     readiness: IndexReadinessStatus | Unset = UNSET
+    incarnation: str | Unset = UNSET
     target_revision: int | Unset = UNSET
     published_revision: int | Unset = UNSET
     milestones: IndexMilestones | Unset = UNSET
@@ -149,6 +152,8 @@ class GraphIndexStats:
         readiness: dict[str, Any] | Unset = UNSET
         if not isinstance(self.readiness, Unset):
             readiness = self.readiness.to_dict()
+
+        incarnation = self.incarnation
 
         target_revision = self.target_revision
 
@@ -275,6 +280,8 @@ class GraphIndexStats:
         )
         if readiness is not UNSET:
             field_dict["readiness"] = readiness
+        if incarnation is not UNSET:
+            field_dict["incarnation"] = incarnation
         if target_revision is not UNSET:
             field_dict["target_revision"] = target_revision
         if published_revision is not UNSET:
@@ -398,6 +405,8 @@ class GraphIndexStats:
             readiness = UNSET
         else:
             readiness = IndexReadinessStatus.from_dict(_readiness)
+
+        incarnation = d.pop("incarnation", UNSET)
 
         target_revision = d.pop("target_revision", UNSET)
 
@@ -545,6 +554,7 @@ class GraphIndexStats:
         graph_index_stats = cls(
             index_type=index_type,
             readiness=readiness,
+            incarnation=incarnation,
             target_revision=target_revision,
             published_revision=published_revision,
             milestones=milestones,

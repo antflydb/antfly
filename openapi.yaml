@@ -20270,6 +20270,11 @@ components:
           $ref: '#/components/schemas/IndexReadinessStatus'
           deprecated: true
           description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -20886,7 +20891,8 @@ components:
         incarnation:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Opaque identity of the desired embeddings index incarnation.
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -21171,6 +21177,11 @@ components:
           $ref: '#/components/schemas/IndexReadinessStatus'
           deprecated: true
           description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -21406,6 +21417,11 @@ components:
           $ref: '#/components/schemas/IndexReadinessStatus'
           deprecated: true
           description: Deprecated compatibility projection. Use milestones and revision fields.
+        incarnation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
         target_revision:
           x-go-type-skip-optional-pointer: true
           type: integer

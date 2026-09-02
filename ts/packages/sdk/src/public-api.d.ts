@@ -10377,6 +10377,8 @@ export interface components {
              * @description Deprecated compatibility projection. Use milestones and revision fields.
              */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** @description Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
+            incarnation?: string;
             /** Format: uint64 */
             target_revision?: number;
             /** Format: uint64 */
@@ -10752,7 +10754,7 @@ export interface components {
              * @description Deprecated compatibility projection. Use milestones and the explicit status dimensions.
              */
             readiness?: components["schemas"]["IndexReadinessStatus"];
-            /** @description Opaque identity of the desired embeddings index incarnation. */
+            /** @description Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
             /** Format: uint64 */
             target_revision?: number;
@@ -10932,6 +10934,8 @@ export interface components {
              * @description Deprecated compatibility projection. Use milestones and revision fields.
              */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** @description Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
+            incarnation?: string;
             /** Format: uint64 */
             target_revision?: number;
             /** Format: uint64 */
@@ -11085,6 +11089,8 @@ export interface components {
              * @description Deprecated compatibility projection. Use milestones and revision fields.
              */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** @description Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
+            incarnation?: string;
             /** Format: uint64 */
             target_revision?: number;
             /** Format: uint64 */

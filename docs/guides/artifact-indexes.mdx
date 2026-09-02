@@ -145,6 +145,12 @@ lag from chunk-vector lag without inspecting internal replay state. Internal
 replay watermarks remain diagnostics; use `queryable` and `complete` as the
 serving and convergence authorities.
 
+Every index kind reports a catalog-assigned `incarnation` at both the status
+root and in `readiness`. A waiter succeeds only from a runtime observation for
+that same semantic definition, so dropping and recreating a full-text, graph,
+algebraic, or embeddings index under the same name cannot reuse stale
+readiness or searchable counts.
+
 Changing source membership, projection fields, analyzer semantics, embedding
 space, or graph mapping changes index semantics and requires a new materialized
 generation. Execution batching fields tune work but do not change artifact

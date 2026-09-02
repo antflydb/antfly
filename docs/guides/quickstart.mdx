@@ -800,8 +800,7 @@ antfly index create --table wikipedia \
   --type embeddings \
   --coverage-policy partial \
   --template "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}" \
-  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
-  --dimension 512
+  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}'
 ```
   </TabsContent>
 
@@ -817,7 +816,6 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia/indexes/thumbnail \
       "provider": "antfly",
       "model": "antflydb/clipclap"
     },
-    "dimension": 512,
     "distance_metric": "cosine"
   }'
 ```
@@ -833,7 +831,6 @@ const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
     provider: 'antfly',
     model: 'antflydb/clipclap',
   },
-  dimension: 512,
   distance_metric: 'cosine',
 });
 ```
@@ -857,7 +854,6 @@ created_index = client.indexes.create(
         coverage_policy=DerivedCoveragePolicy.PARTIAL,
         template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
         embedder=antfly_embedder('antflydb/clipclap'),
-        dimension=512,
         distance_metric=DistanceMetric.COSINE,
     ),
 )
@@ -874,7 +870,6 @@ request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
 	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
 	Embedder:       *embedder,
-	Dimension:      512,
 	DistanceMetric: antfly.DistanceMetricCosine,
 })
 if err != nil { log.Fatal(err) }
@@ -887,13 +882,11 @@ fmt.Printf("%+v\n", createdIndex)
   <TabsContent value="rust">
 ```rust
 use antfly_sdk::types;
-use std::num::NonZeroU64;
 
 let request = types::CreateEmbeddingsIndexRequest {
     coverage_policy: Some(types::DerivedCoveragePolicy::Partial),
     template: Some("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}".into()),
     embedder: Some(antfly_sdk::antfly_embedder("antflydb/clipclap")),
-    dimension: NonZeroU64::new(512),
     distance_metric: Some(types::DistanceMetric::Cosine),
     ..Default::default()
 };
@@ -905,6 +898,10 @@ let created_index = client
 ```
   </TabsContent>
 </Tabs>
+
+Antfly probes the selected embedding model during creation and stores its
+dimension in the normalized index definition. Specify `dimension` only when
+you also want creation to verify an explicit expected size.
 
 Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index has published at least one searchable artifact before continuing:
 

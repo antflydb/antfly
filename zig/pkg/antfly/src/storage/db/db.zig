@@ -1134,6 +1134,30 @@ const IndexRepairSchedulerDirectory = struct {
         return true;
     }
 
+    /// Defer a runnable lifecycle intent to its bounded audit deadline without
+    /// arming an applied-watermark waiter. Once replay has already reached its
+    /// durable target, later watermark increments are ordinary producer
+    /// progress and cannot prove corpus-wide coverage complete; waking the
+    /// lifecycle owner for every increment would turn a long initial build
+    /// into a maintenance hot loop.
+    fn deferForAudit(
+        self: *@This(),
+        repair_id: u128,
+        expected_revision: u64,
+        fallback_at_ms: u64,
+    ) bool {
+        const record_index = self.by_id.get(repair_id) orelse return false;
+        const record = &self.records.items[record_index];
+        if (record.revision != expected_revision or record.class != .runnable) return false;
+        if (record.progress_wait_until_sequence != null) {
+            record.progress_wait_until_sequence = null;
+            self.progress_waiters -= 1;
+        }
+        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
+        self.rescheduleRunnable(repair_id);
+        return true;
+    }
+
     /// Wake only the waiting repair for the exact index whose durable applied
     /// watermark advanced. Returns true when the outer group owner must be
     /// nudged; repeated notifications at the same sequence are coalesced.
@@ -11916,6 +11940,61 @@ pub const DB = struct {
         return armed;
     }
 
+    fn deferIndexRepairForAudit(
+        self: *DB,
+        repair_id: u128,
+        expected_revision: u64,
+    ) bool {
+        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+            progressive_index_repair_audit_interval_ms;
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        defer self.async_context.index_repair_scheduler_mutex.unlock();
+        if (!self.async_context.index_repair_scheduler.initialized) return false;
+        const deferred = self.async_context.index_repair_scheduler.deferForAudit(
+            repair_id,
+            expected_revision,
+            fallback_at_ms,
+        );
+        if (deferred) publishIndexRepairProgressWaitHint(self.async_context);
+        return deferred;
+    }
+
+    /// Park an initial-build intent on the one watermark that can change the
+    /// current replay proof. Once that target is already visible, later index
+    /// publications cannot by themselves prove source-coverage completion;
+    /// use the bounded audit deadline instead of waking repair for every newly
+    /// generated artifact.
+    fn deferIndexRepairUntilTargetOrAudit(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        expected_revision: u64,
+        index_name: []const u8,
+        observed_sequence: u64,
+        target_sequence: u64,
+    ) !bool {
+        if (observed_sequence >= target_sequence) {
+            return self.deferIndexRepairForAudit(repair_id, expected_revision);
+        }
+        if (!self.deferIndexRepairForProgress(
+            repair_id,
+            expected_revision,
+            target_sequence,
+        )) return false;
+
+        // Arm-then-recheck closes the lost-wakeup window between observing the
+        // watermark and installing the revision-scoped resident wait.
+        const current_sequence = try self.managedIndexAppliedSequence(alloc, index_name);
+        if (current_sequence >= target_sequence) {
+            _ = wakeIndexRepairForProgressContext(
+                self.async_context,
+                index_name,
+                current_sequence,
+            );
+        }
+        return true;
+    }
+
     fn wakeIndexRepairForProgressContext(
         ctx: *AsyncContext,
         index_name: []const u8,
@@ -15393,30 +15472,19 @@ pub const DB = struct {
         // it once coverage and replay converge.
         if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
             const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-            const wake_at_sequence = @max(
-                observed_sequence +| 1,
-                try self.projectionStatsTargetSequence(alloc, cfg_ptr.*, observed_sequence),
-            );
-            if (!self.deferIndexRepairForProgress(
+            if (!try self.deferIndexRepairUntilTargetOrAudit(
+                alloc,
                 repair_id,
                 entry.intent.revision,
-                wake_at_sequence,
+                entry.intent.index_name,
+                observed_sequence,
+                entry.intent.target_sequence,
             )) {
                 // A concurrent durable transition invalidated this observation.
                 // Consume one bounded slot and let its newer schedule decide
                 // the next wake instead of publishing a stale progress wait.
                 result.busy = true;
                 return result;
-            }
-            // Arm-then-recheck closes the lost-wakeup window between proving
-            // partial serviceability and installing the resident wait.
-            const current_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-            if (current_sequence >= wake_at_sequence) {
-                _ = wakeIndexRepairForProgressContext(
-                    self.async_context,
-                    entry.intent.index_name,
-                    current_sequence,
-                );
             }
             result.deferred = true;
             return result;
@@ -15435,27 +15503,22 @@ pub const DB = struct {
                     // The source-discovery owner has durably queued all work;
                     // provider execution and derived publication now own the
                     // next progress edge. Park this exact intent instead of
-                    // polling it on every repair scheduler turn. Derived
-                    // publication wakes it immediately; the bounded fallback
-                    // audit covers terminal/skipped enrichment that produces
-                    // no index watermark edge.
+                    // polling it on every repair scheduler turn. A derived
+                    // publication wakes it only when the durable target has
+                    // not yet been reached; after that, the bounded audit owns
+                    // coverage completion, including terminal/skipped output
+                    // which produces no index watermark edge.
                     const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-                    const wake_at_sequence = @max(entry.intent.target_sequence, observed_sequence +| 1);
-                    if (!self.deferIndexRepairForProgress(
+                    if (!try self.deferIndexRepairUntilTargetOrAudit(
+                        alloc,
                         repair_id,
                         entry.intent.revision,
-                        wake_at_sequence,
+                        entry.intent.index_name,
+                        observed_sequence,
+                        entry.intent.target_sequence,
                     )) {
                         result.busy = true;
                         return result;
-                    }
-                    const current_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-                    if (current_sequence >= wake_at_sequence) {
-                        _ = wakeIndexRepairForProgressContext(
-                            self.async_context,
-                            entry.intent.index_name,
-                            current_sequence,
-                        );
                     }
                     result.deferred = true;
                     return result;
@@ -24355,7 +24418,35 @@ pub const DB = struct {
             candidates.deinit(alloc);
         }
 
+        const incomplete_generated_configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
+        defer {
+            for (incomplete_generated_configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(incomplete_generated_configs);
+        }
+        var incomplete_generated_hashes = std.StringHashMapUnmanaged(u64).empty;
+        defer incomplete_generated_hashes.deinit(alloc);
+        for (incomplete_generated_configs) |cfg| {
+            try incomplete_generated_hashes.put(alloc, cfg.name, types.indexConfigHash(cfg));
+        }
+
+        // Initial materialization and artifact repair share physical
+        // validation helpers, but they are distinct durable job classes. An
+        // exact admission intent already owns this incarnation; independently
+        // planning its temporary cardinality gap here duplicates work and can
+        // move a resident writer into read-exclusive startup recovery.
+        var repair_state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => null,
+            else => return err,
+        };
+        defer if (repair_state) |*state| state.deinit(alloc);
+
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+            if (repair_state) |*state| {
+                if (self.currentInitialBuildIntentMatches(state, entry.config)) {
+                    clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
+                    continue;
+                }
+            }
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             const generation_repair_pending = entry.index.generationRepairPending();
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
@@ -24395,6 +24486,30 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
+            const active_repair_owns_incarnation = if (repair_state) |*state|
+                self.currentNonInitialRepairIntentMatches(state, entry.config)
+            else
+                false;
+            const incomplete_generated_hash = incomplete_generated_hashes.get(entry.config.name);
+            const ordinary_generated_build = incomplete_generated_hash != null and
+                incomplete_generated_hash.? == config_hash and
+                !active_repair_owns_incarnation and
+                !watermark_regressed and
+                !generation_repair_pending and
+                !checkpoint_config_mismatch and
+                (projection_checkpoint.status == .clean or projection_checkpoint.status == .rebuilding);
+            if (ordinary_generated_build) {
+                // Coverage lag is owned by generated-index replay. It is not
+                // evidence that the physical dense generation is corrupt,
+                // even after the admission intent has completed. A cursor
+                // left by an older misclassification is cleanup-only.
+                if (persisted_resume) |buf| {
+                    try rebuild_state_cleanups.append(alloc, dense_index_idx);
+                    alloc.free(buf);
+                }
+                clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
+                continue;
+            }
             // Progressive managed admission owns one canonical generation.
             // The physical checkpoint can be clean while the separate durable
             // generation intent remains open for corpus convergence, or it can
@@ -28102,6 +28217,59 @@ pub const DB = struct {
             alloc.free(configs);
         }
         return configs.len != 0;
+    }
+
+    /// Returns true when every incomplete generated projection is already
+    /// represented by an exact, live initial-build intent. This is the durable
+    /// ownership proof used by a resident writer: ordinary provider/backfill
+    /// latency must not be reclassified as broad startup repair merely because
+    /// the enrichment watermark is momentarily idle.
+    pub fn generatedCoverageRecoveryOwnedByInitialBuild(self: *DB, alloc: Allocator) !bool {
+        const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        if (configs.len == 0) return false;
+
+        var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => return false,
+            else => return err,
+        };
+        defer state.deinit(alloc);
+        for (configs) |cfg| {
+            if (!self.currentInitialBuildIntentMatches(&state, cfg)) return false;
+        }
+        return true;
+    }
+
+    fn currentInitialBuildIntentMatches(
+        self: *const DB,
+        state: *const index_repair_state.State,
+        cfg: types.IndexConfig,
+    ) bool {
+        const index = state.findIndex(cfg.name) orelse return false;
+        const intent = state.entries.items[index].intent;
+        return intent.work_class == .initial_build and
+            intent.phase != .terminal and
+            intent.automation != .paused and
+            intent.root_generation == self.core.root_generation and
+            intent.group_id == self.localRepairGroupId() and
+            intent.config_hash == types.indexConfigHash(cfg);
+    }
+
+    fn currentNonInitialRepairIntentMatches(
+        self: *const DB,
+        state: *const index_repair_state.State,
+        cfg: types.IndexConfig,
+    ) bool {
+        const index = state.findIndex(cfg.name) orelse return false;
+        const intent = state.entries.items[index].intent;
+        return intent.work_class != .initial_build and
+            intent.phase != .terminal and
+            intent.root_generation == self.core.root_generation and
+            intent.group_id == self.localRepairGroupId() and
+            intent.config_hash == types.indexConfigHash(cfg);
     }
 
     /// Converts an idle-watermark/source-coverage mismatch into the existing
@@ -79109,7 +79277,15 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
     // attached, while the current generation still has zero terminal source
     // outcomes for one durable primary document.
     try std.testing.expect(try db.generatedCoverageReplayNeeded(alloc));
+    // An incomplete generated projection is ordinary initial-build work, not
+    // generic dense artifact repair. The recovery owner below persists the
+    // exact job class when no live producer owns the gap.
+    try std.testing.expect(!(try db.denseArtifactRebuildMaintenanceNeeded(alloc)));
     try std.testing.expectEqual(@as(usize, 1), try db.ensureGeneratedCoverageRecoveryIntents(alloc));
+    try std.testing.expect(try db.generatedCoverageRecoveryOwnedByInitialBuild(alloc));
+    // The exact initial-build job owns this temporary zero-vector state. The
+    // generic artifact planner must not enqueue a duplicate repair job.
+    try std.testing.expect(!(try db.denseArtifactRebuildMaintenanceNeeded(alloc)));
     const repair_id = (try db.indexRepairIdForIndex(alloc, "semantic")) orelse return error.TestUnexpectedResult;
     var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
     defer entry.deinit(alloc);
@@ -84704,6 +84880,15 @@ test "resident index repair progress waits are revision scoped and event driven"
     try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
     // A delayed event from the prior revision cannot wake the new schedule.
     try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 12));
+
+    // Once replay is at its durable target, corpus coverage—not another
+    // watermark increment—is the remaining completion proof. The bounded
+    // audit must therefore ignore arbitrarily high progress notifications.
+    try std.testing.expect(directory.deferForAudit(17, 2, 800));
+    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
+    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
 }
 
 test "index repair intent string replacement is allocation failure safe" {
@@ -85056,6 +85241,18 @@ test "db progressive managed admission serves a checkpointed partial generation"
     try std.testing.expectEqual(@as(usize, 1), scheduler_pass.attempted);
     try std.testing.expectEqual(@as(usize, 2), scheduler_pass.inspected);
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) != null);
+    {
+        lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+        defer db.async_context.index_repair_scheduler_mutex.unlock();
+        const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+            return error.TestUnexpectedResult;
+        const partial_record = db.async_context.index_repair_scheduler.records.items[partial_record_index];
+        // The durable admission fence is already published. The live derived
+        // target continues moving as normal embeddings arrive, but that must
+        // not arm a next-sequence repair wake for each batch.
+        try std.testing.expectEqual(@as(?u64, null), partial_record.progress_wait_until_sequence);
+        try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
+    }
     if (try db.indexRepairIdForIndex(alloc, "damaged_idx")) |remaining_repair_id| {
         try std.testing.expectEqual(damaged_repair_id, remaining_repair_id);
         var damaged_repair = try db.loadIndexRepairEntryById(alloc, damaged_repair_id);

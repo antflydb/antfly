@@ -1581,27 +1581,52 @@ fn pipelineFailureFingerprint(_: anyerror) u64 {
     return finishFailureFingerprint(&hasher);
 }
 
-fn workerLoopRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+const WorkerRetryScope = enum {
+    request,
+    pipeline,
+};
+
+fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
 
-    // Only shouldYieldRequestError may authorize reuse of a request identity.
-    // Any other error reaching the worker boundary is a pipeline failure, even
-    // if a previously completed request left its fingerprint active.
-    if (!runtime.retry_error_has_request_identity or runtime.active_failure_fingerprint == 0)
-        runtime.active_failure_fingerprint = pipelineFailureFingerprint(err);
+    // Request-owned failures have already been admitted by
+    // shouldYieldRequestError against their exact durable identity budget.
+    // They must not also consume the table-wide pipeline budget: otherwise a
+    // bad source can stop every sibling index before the next pass parks that
+    // source in the repair ledger. Errors without that one-shot authorization
+    // are pipeline failures and retain the generation-wide no-progress cap.
+    const request_owned = runtime.retry_error_has_request_identity and
+        runtime.active_failure_fingerprint != 0;
     runtime.retry_error_has_request_identity = false;
+    if (request_owned) {
+        const request_prior_attempts = requestPriorAttempts(
+            runtime.active_failure_fingerprint,
+            runtime.retry_failure_fingerprint,
+            runtime.retry_failure_count,
+        );
+        return if (retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+            .request
+        else
+            null;
+    }
+
+    runtime.active_failure_fingerprint = pipelineFailureFingerprint(err);
     const request_prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
         runtime.retry_failure_count,
     );
-    // One durable no-progress ceiling covers request and pipeline failures.
-    // The identity budget additionally prevents one bad document from
-    // consuming every retry in otherwise progressing work.
-    return retryBudgetAllowsYield(runtime.consecutive_retry_count, runtime.config.worker_retry_max_attempts) and
-        retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts);
+    return if (retryBudgetAllowsYield(runtime.consecutive_retry_count, runtime.config.worker_retry_max_attempts) and
+        retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+        .pipeline
+    else
+        null;
+}
+
+fn workerLoopRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+    return workerLoopRetryScopeIfAllowed(runtime, err) != null;
 }
 
 fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
@@ -1782,7 +1807,7 @@ test "pipeline failure replaces stale request retry identity" {
     try std.testing.expectEqual(pipeline_fingerprint, runtime.active_failure_fingerprint);
 }
 
-test "mixed request and pipeline failures exhaust one no-progress budget" {
+test "request-owned retries do not inherit unrelated pipeline debt" {
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
         .io_impl = null,
@@ -1811,7 +1836,11 @@ test "mixed request and pipeline failures exhaust one no-progress budget" {
 
     runtime.active_failure_fingerprint = 101;
     runtime.retry_error_has_request_identity = true;
-    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
+    try std.testing.expectEqual(
+        WorkerRetryScope.request,
+        workerLoopRetryScopeIfAllowed(&runtime, error.EmbedRateLimited).?,
+    );
+    try std.testing.expectEqual(@as(u32, 2), runtime.consecutive_retry_count);
 }
 
 test "worker retry preserves only an explicitly authorized request identity" {
@@ -3866,19 +3895,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifyStatusHook();
     }
 
-    fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
-        std.log.warn("enrichment worker transient failure, will retry: {s}", .{@errorName(err)});
+    fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror, scope: WorkerRetryScope) void {
+        std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
         self.error_count += 1;
         self.retryable_error_count += 1;
-        self.consecutive_retry_count +|= 1;
+        if (scope == .pipeline) self.consecutive_retry_count +|= 1;
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
         }
         self.retry_failure_count +|= 1;
-        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
+        const retry_ordinal = if (scope == .request)
+            self.retry_failure_count
+        else
+            self.consecutive_retry_count;
+        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(retry_ordinal);
         self.retrying = true;
         markScheduledIndexEmbeddingRetryAssumeLocked(self);
         self.retry_error_has_request_identity = false;
@@ -4130,11 +4163,11 @@ test "foreground enrichment rejects providers without a bounded-operation contra
 
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-    if (enrichmentErrorDisposition(err) == .retryable_request and
-        workerLoopRetryBudgetAllowsYield(runtime, err))
-    {
-        runtime.recordRetryableError(io, err);
-        return;
+    if (enrichmentErrorDisposition(err) == .retryable_request) {
+        if (workerLoopRetryScopeIfAllowed(runtime, err)) |scope| {
+            runtime.recordRetryableError(io, err, scope);
+            return;
+        }
     }
     runtime.recordError(io, err);
 }
