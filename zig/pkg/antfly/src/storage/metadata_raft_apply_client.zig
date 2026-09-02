@@ -587,7 +587,21 @@ pub const RaftApplyStore = struct {
         const registration: *ListenerRegistration = @ptrCast(@alignCast(context orelse return));
         const listener = registration.projection orelse return;
         listener.onProjectionSignal(.{
-            .kind = @enumFromInt(@intFromEnum(signal.kind)),
+            .kind = switch (signal.kind) {
+                .metadata_incarnation => .metadata_incarnation,
+                .table => .table,
+                .range => .range,
+                .store => .store,
+                .placement_intent => .placement_intent,
+                .reconcile_lease => .reconcile_lease,
+                .shuffle_join_lease => .shuffle_join_lease,
+                .split_transition => .split_transition,
+                .merge_transition => .merge_transition,
+                .schema_progress => .schema_progress,
+                .restore_progress => .restore_progress,
+                .restore_job => .restore_job,
+                .replication_source_status => .replication_source_status,
+            },
             .metadata_group_id = signal.metadata_group_id,
             .table_name = if (signal.table_name.len == 0) null else signal.table_name.slice(),
             .table_id = signal.table_id,
@@ -595,6 +609,18 @@ pub const RaftApplyStore = struct {
             .store_id = signal.store_id,
             .node_id = signal.node_id,
         });
+    }
+
+    fn beforeProjectionCommitCallback(context: ?*anyopaque) callconv(.c) void {
+        const registration: *ListenerRegistration = @ptrCast(@alignCast(context orelse return));
+        const listener = registration.projection orelse return;
+        listener.beginCommitBarrier();
+    }
+
+    fn afterProjectionCommitCallback(context: ?*anyopaque) callconv(.c) void {
+        const registration: *ListenerRegistration = @ptrCast(@alignCast(context orelse return));
+        const listener = registration.projection orelse return;
+        listener.endCommitBarrier();
     }
 
     fn committedKeyCallback(context: ?*anyopaque, group_id: u64, key: abi.BorrowedBytes) callconv(.c) void {
@@ -608,10 +634,29 @@ pub const RaftApplyStore = struct {
         const registration = try self.alloc.create(ListenerRegistration);
         errdefer self.alloc.destroy(registration);
         registration.* = .{ .projection = projection_listener, .committed_key = committed_listener };
+        const commit_barrier_kind = if (projection_listener) |listener| listener.commit_barrier_kind else null;
         try statusToError(abi.antfly_metadata_apply_store_add_listeners(self.handle, &.{
             .context = registration,
             .projection_fn = if (projection_listener != null) projectionCallback else null,
             .committed_key_fn = if (committed_listener != null) committedKeyCallback else null,
+            .commit_barrier_kind = if (commit_barrier_kind) |kind| switch (kind) {
+                .metadata_incarnation => .metadata_incarnation,
+                .table => .table,
+                .range => .range,
+                .store => .store,
+                .placement_intent => .placement_intent,
+                .reconcile_lease => .reconcile_lease,
+                .shuffle_join_lease => .shuffle_join_lease,
+                .split_transition => .split_transition,
+                .merge_transition => .merge_transition,
+                .schema_progress => .schema_progress,
+                .restore_progress => .restore_progress,
+                .restore_job => .restore_job,
+                .replication_source_status => .replication_source_status,
+            } else .table,
+            .has_commit_barrier_kind = @intFromBool(commit_barrier_kind != null),
+            .before_projection_commit_fn = if (commit_barrier_kind != null) beforeProjectionCommitCallback else null,
+            .after_projection_commit_fn = if (commit_barrier_kind != null) afterProjectionCommitCallback else null,
         }));
         self.listeners.appendAssumeCapacity(registration);
     }

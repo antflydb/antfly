@@ -193,11 +193,60 @@ const MetadataPreparedSnapshotHandle = struct {
 const MetadataListenerBridge = struct {
     request: kernel_owner_abi.MetadataListenerRequest,
 
+    const projection_vtable = metadata_raft_apply.ProjectionListener.VTable{
+        .on_projection_signal = onProjection,
+    };
+    const projection_barrier_vtable = metadata_raft_apply.ProjectionListener.VTable{
+        .on_projection_signal = onProjection,
+        .before_projection_commit = beforeProjectionCommit,
+        .after_projection_commit = afterProjectionCommit,
+    };
+    const committed_key_vtable = metadata_raft_apply.CommittedKeyListener.VTable{
+        .matches_key = matchesKey,
+        .on_committed_key = onCommittedKey,
+    };
+
+    fn projectionKindToAbi(kind: metadata_raft_apply.ProjectionSignalKind) kernel_owner_abi.MetadataProjectionSignalKind {
+        return switch (kind) {
+            .metadata_incarnation => .metadata_incarnation,
+            .table => .table,
+            .range => .range,
+            .store => .store,
+            .placement_intent => .placement_intent,
+            .reconcile_lease => .reconcile_lease,
+            .shuffle_join_lease => .shuffle_join_lease,
+            .split_transition => .split_transition,
+            .merge_transition => .merge_transition,
+            .schema_progress => .schema_progress,
+            .restore_progress => .restore_progress,
+            .restore_job => .restore_job,
+            .replication_source_status => .replication_source_status,
+        };
+    }
+
+    fn projectionKindFromAbi(kind: kernel_owner_abi.MetadataProjectionSignalKind) metadata_raft_apply.ProjectionSignalKind {
+        return switch (kind) {
+            .metadata_incarnation => .metadata_incarnation,
+            .table => .table,
+            .range => .range,
+            .store => .store,
+            .placement_intent => .placement_intent,
+            .reconcile_lease => .reconcile_lease,
+            .shuffle_join_lease => .shuffle_join_lease,
+            .split_transition => .split_transition,
+            .merge_transition => .merge_transition,
+            .schema_progress => .schema_progress,
+            .restore_progress => .restore_progress,
+            .restore_job => .restore_job,
+            .replication_source_status => .replication_source_status,
+        };
+    }
+
     fn onProjection(ptr: *anyopaque, signal: metadata_raft_apply.ProjectionSignal) void {
         const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
         const callback = self.request.projection_fn orelse return;
         const value = kernel_owner_abi.MetadataProjectionSignal{
-            .kind = @enumFromInt(@intFromEnum(signal.kind)),
+            .kind = projectionKindToAbi(signal.kind),
             .metadata_group_id = signal.metadata_group_id,
             .table_name = .fromSlice(signal.table_name orelse ""),
             .table_id = signal.table_id,
@@ -206,6 +255,16 @@ const MetadataListenerBridge = struct {
             .node_id = signal.node_id,
         };
         callback(self.request.context, &value);
+    }
+
+    fn beforeProjectionCommit(ptr: *anyopaque) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        if (self.request.before_projection_commit_fn) |callback| callback(self.request.context);
+    }
+
+    fn afterProjectionCommit(ptr: *anyopaque) void {
+        const self: *MetadataListenerBridge = @ptrCast(@alignCast(ptr));
+        if (self.request.after_projection_commit_fn) |callback| callback(self.request.context);
     }
 
     fn matchesKey(_: *anyopaque, _: metadata_raft_apply.CommittedKeySignal) bool {
@@ -2889,18 +2948,30 @@ pub fn metadataApplyStoreAddListeners(
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     if (request.projection_fn == null and request.committed_key_fn == null) return .invalid_argument;
+    const has_commit_barrier = request.has_commit_barrier_kind != 0;
+    if ((request.before_projection_commit_fn != null) != has_commit_barrier or
+        (request.after_projection_commit_fn != null) != has_commit_barrier or
+        (has_commit_barrier and request.projection_fn == null)) return .invalid_argument;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     handle.listener_bridges.ensureUnusedCapacity(handle.alloc, 1) catch return .out_of_memory;
     const bridge = handle.alloc.create(MetadataListenerBridge) catch return .out_of_memory;
     errdefer handle.alloc.destroy(bridge);
     bridge.* = .{ .request = request.* };
-    const projection = metadata_raft_apply.ProjectionListener{ .ptr = bridge, .vtable = &.{
-        .on_projection_signal = MetadataListenerBridge.onProjection,
-    } };
-    const committed = metadata_raft_apply.CommittedKeyListener{ .ptr = bridge, .vtable = &.{
-        .matches_key = MetadataListenerBridge.matchesKey,
-        .on_committed_key = MetadataListenerBridge.onCommittedKey,
-    } };
+    const projection = metadata_raft_apply.ProjectionListener{
+        .ptr = bridge,
+        .vtable = if (has_commit_barrier)
+            &MetadataListenerBridge.projection_barrier_vtable
+        else
+            &MetadataListenerBridge.projection_vtable,
+        .commit_barrier_kind = if (has_commit_barrier)
+            MetadataListenerBridge.projectionKindFromAbi(request.commit_barrier_kind)
+        else
+            null,
+    };
+    const committed = metadata_raft_apply.CommittedKeyListener{
+        .ptr = bridge,
+        .vtable = &MetadataListenerBridge.committed_key_vtable,
+    };
     if (request.projection_fn != null and request.committed_key_fn != null)
         handle.store.addLifecycleListeners(projection, committed) catch |err| return storageOwnerStatusFromError(err)
     else if (request.projection_fn != null)

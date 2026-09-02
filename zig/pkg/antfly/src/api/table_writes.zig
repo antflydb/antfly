@@ -23371,8 +23371,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        route_fence: metadata_api.CatalogRouteFence,
     ) !http_client.BatchResponse {
         var client = self.httpClient(alloc);
+        const encoded_route_fence = try std.json.Stringify.valueAlloc(alloc, route_fence, .{});
+        defer alloc.free(encoded_route_fence);
         return client.fetchGroupBatchWithForwarding(
             base_uri,
             group_id,
@@ -23385,7 +23388,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .campaign_allowed = true,
             },
             null,
-            null,
+            encoded_route_fence,
         ) catch |err| switch (err) {
             // A mixed-version peer returns 404 before admission when it does
             // not expose the routed endpoint. Only that proven pre-proposal
@@ -24052,26 +24055,27 @@ pub const HostedProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
+            alloc,
+            self.catalog,
+            table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
 
         for (req.writes) |write| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(write.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(transform.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.transforms.append(alloc, transform);
         }
 
@@ -24133,6 +24137,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             group.group_id,
                             table_name,
                             body,
+                            group.route_fence orelse return error.CatalogRouteFenceRequired,
                         );
                         response.deinit(alloc);
                     },
@@ -40093,6 +40098,9 @@ test "provisioned batch keeps routing and delegates one group-local physical wri
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -56042,6 +56050,9 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -56112,9 +56123,21 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
         requests: usize = 0,
         routed_requests: usize = 0,
         legacy_requests: usize = 0,
+        saw_route_fence: bool = false,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn ownedAckHeaders(allocator: std.mem.Allocator) ![]http_common.Header {
+            const headers = try allocator.alloc(http_common.Header, 1);
+            errdefer allocator.free(headers);
+            const name = try allocator.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, metadata_api.catalog_route_fence_ack_value);
+            errdefer allocator.free(value);
+            headers[0] = .{ .name = name, .value = value };
+            return headers;
         }
 
         fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -56127,7 +56150,23 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
                 try std.testing.expectEqual(internal_batch_forwarding.max_remaining_ms, forwarding.remaining_ms);
                 try std.testing.expectEqual(internal_batch_forwarding.max_forwards, forwarding.forwards_remaining);
                 try std.testing.expect(forwarding.campaign_allowed);
+                for (req.headers) |header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) continue;
+                    var parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, allocator, header.value, .{});
+                    defer parsed.deinit();
+                    try parsed.value.validate();
+                    try std.testing.expectEqual(@as(u64, 1), parsed.value.metadata_group_id);
+                    try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
+                    try std.testing.expectEqual(@as(u64, 7001), parsed.value.route.group_id);
+                    self.saw_route_fence = true;
+                }
+                try std.testing.expect(self.saw_route_fence);
                 if (self.reject_routed) return .{ .status = 404, .body = try allocator.dupe(u8, "not found") };
+                return .{
+                    .status = 201,
+                    .headers = try ownedAckHeaders(allocator),
+                    .body = try allocator.dupe(u8, "{}"),
+                };
             } else {
                 self.legacy_requests += 1;
                 try std.testing.expect(std.mem.endsWith(u8, req.uri, http_routes.Routes.batch_suffix));
@@ -56146,6 +56185,7 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
     try std.testing.expectEqual(@as(usize, 1), routed_executor.requests);
     try std.testing.expectEqual(@as(usize, 1), routed_executor.routed_requests);
     try std.testing.expectEqual(@as(usize, 0), routed_executor.legacy_requests);
+    try std.testing.expect(routed_executor.saw_route_fence);
 
     var legacy_executor = Executor{ .reject_routed = true };
     var legacy_source = HostedProvisionedTableWriteSource.init("unused", Catalog.iface(), Router.iface(), legacy_executor.iface());
@@ -56153,6 +56193,7 @@ test "hosted remote batch prefers routed Raft protocol with safe legacy fallback
     try std.testing.expectEqual(@as(usize, 2), legacy_executor.requests);
     try std.testing.expectEqual(@as(usize, 1), legacy_executor.routed_requests);
     try std.testing.expectEqual(@as(usize, 1), legacy_executor.legacy_requests);
+    try std.testing.expect(legacy_executor.saw_route_fence);
 }
 
 test "publishing a provisioned write adapter does not start pointer-capturing recovery work" {

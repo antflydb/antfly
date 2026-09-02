@@ -561,6 +561,7 @@ pub const MetadataProjectionSignalKind = enum(u32) {
     restore_progress = 9,
     restore_job = 10,
     replication_source_status = 11,
+    metadata_incarnation = 12,
 };
 
 pub const MetadataProjectionSignal = extern struct {
@@ -585,12 +586,21 @@ pub const MetadataCommittedKeySignalFn = *const fn (
     key: BorrowedBytes,
 ) callconv(.c) void;
 
+pub const MetadataProjectionCommitBarrierFn = *const fn (
+    context: ?*anyopaque,
+) callconv(.c) void;
+
 pub const MetadataListenerRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     context: ?*anyopaque = null,
     projection_fn: ?MetadataProjectionSignalFn = null,
     committed_key_fn: ?MetadataCommittedKeySignalFn = null,
+    commit_barrier_kind: MetadataProjectionSignalKind = .table,
+    has_commit_barrier_kind: u8 = 0,
+    _reserved1: [3]u8 = @splat(0),
+    before_projection_commit_fn: ?MetadataProjectionCommitBarrierFn = null,
+    after_projection_commit_fn: ?MetadataProjectionCommitBarrierFn = null,
 };
 
 /// One complete local replica-root provisioning round. The JSON envelope owns
