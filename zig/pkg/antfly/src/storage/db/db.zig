@@ -99608,7 +99608,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                     }
                 },
                 .invalidate => self.invalidate_calls += 1,
-                .activity, .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
+                .activity, .target_advanced, .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
             }
         }
     };

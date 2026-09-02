@@ -37281,9 +37281,9 @@ test "provisioned table write source invalidates cached query db after managed d
     const path = "/tmp/antfly-api-provisioned-managed-dense-query-visibility";
 
     const FakeEmbeddingProvider = struct {
-        var request_count: std.atomic.Value(u32) = .init(0);
-        var rate_limited_count: std.atomic.Value(u32) = .init(0);
-        var allow_all: std.atomic.Value(bool) = .init(false);
+        request_count: std.atomic.Value(u32) = .init(0),
+        rate_limited_count: std.atomic.Value(u32) = .init(0),
+        allow_all: std.atomic.Value(bool) = .init(false),
 
         fn vectorForInput(input: std.json.Value) []const u8 {
             if (jsonValueContainsText(input, "alpha")) return "[1,0,0]";
@@ -37318,25 +37318,26 @@ test "provisioned table write source invalidates cached query db after managed d
             return try out.toOwnedSlice(arena);
         }
 
-        fn executor() http_common.RequestExecutor {
+        fn executor(self: *@This()) http_common.RequestExecutor {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute = execute,
                 },
             };
         }
 
-        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        fn execute(ptr: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.POST, req.method);
             try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
 
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
             defer parsed_req.deinit();
 
-            _ = request_count.fetchAdd(1, .monotonic);
-            if (!allow_all.load(.acquire)) {
-                _ = rate_limited_count.fetchAdd(1, .monotonic);
+            _ = self.request_count.fetchAdd(1, .monotonic);
+            if (!self.allow_all.load(.acquire)) {
+                _ = self.rate_limited_count.fetchAdd(1, .monotonic);
                 const body = try arena.dupe(u8,
                     \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
                 );
@@ -37355,8 +37356,8 @@ test "provisioned table write source invalidates cached query db after managed d
             };
         }
 
-        fn allowAll() void {
-            allow_all.store(true, .release);
+        fn allowAll(self: *@This()) void {
+            self.allow_all.store(true, .release);
         }
     };
 
@@ -37408,7 +37409,8 @@ test "provisioned table write source invalidates cached query db after managed d
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    var embedding_provider = FakeEmbeddingProvider{};
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, embedding_provider.executor());
     defer listener.deinit();
     try listener.start();
     const base_uri = try listener.baseUri(alloc);
@@ -37419,13 +37421,11 @@ test "provisioned table write source invalidates cached query db after managed d
     , .{base_uri});
     defer alloc.free(FakeCatalog.indexes_json_buf);
 
-    FakeEmbeddingProvider.request_count.store(0, .monotonic);
-    FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
-    FakeEmbeddingProvider.allow_all.store(false, .monotonic);
-
     var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
 
@@ -37433,6 +37433,7 @@ test "provisioned table write source invalidates cached query db after managed d
     defer source.deinit();
     source.read_cache = &read_cache;
     source.write_cache = &write_cache;
+    source.backend_runtime = backend_runtime.ptr();
 
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{
@@ -37444,10 +37445,10 @@ test "provisioned table write source invalidates cached query db after managed d
     });
 
     var attempts: usize = 0;
-    while (attempts < 100 and FakeEmbeddingProvider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
+    while (attempts < 100 and embedding_provider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
         sleepNs(50 * std.time.ns_per_ms);
     }
-    try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
+    try std.testing.expect(embedding_provider.rate_limited_count.load(.monotonic) > 0);
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
@@ -37467,7 +37468,7 @@ test "provisioned table write source invalidates cached query db after managed d
         try std.testing.expect(initial.total_hits < 3);
     }
 
-    FakeEmbeddingProvider.allowAll();
+    embedding_provider.allowAll();
 
     var ready = false;
     attempts = 0;
