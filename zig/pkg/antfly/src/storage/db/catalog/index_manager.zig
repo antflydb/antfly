@@ -3995,7 +3995,7 @@ pub const IndexManager = struct {
         applied_sequence: u64,
         options: NativePostingStableTipOptions,
     ) !bool {
-        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (!self.densePostingSidecarEnabledForEntry(entry)) return false;
         if (options.validate_payloads) {
             const posting_steps = try drainDensePostingMaintenanceEntry(entry, .{
                 .max_postings_per_index = std.math.maxInt(usize),
@@ -4033,6 +4033,22 @@ pub const IndexManager = struct {
     }
 
     fn denseNativeAuthorityPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
+        return self.denseNativeAuthorityTransitionPermitted(
+            entry.native_physical_v2,
+            entry.native_candidate_build_authorized,
+        );
+    }
+
+    /// A published v2 physical pointer is already the durable capability and
+    /// downgrade fence. Legacy roots need both a capable storage adapter and
+    /// the catalog's rolling-upgrade authorization before they may transition.
+    fn denseNativeAuthorityTransitionPermitted(
+        self: *const IndexManager,
+        native_physical_v2: bool,
+        candidate_build_authorized: bool,
+    ) bool {
+        if (native_physical_v2) return true;
+        if (!self.configuredDenseNativePostingStoreSupported()) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -4041,8 +4057,7 @@ pub const IndexManager = struct {
         // negotiation, but still build an inactive candidate and acquire the
         // same versioned pointer/manifest boundary as provisioned storage.
         return self.dense_native_candidate_build_authorized or
-            entry.native_candidate_build_authorized or
-            entry.native_physical_v2;
+            candidate_build_authorized;
     }
 
     fn denseNativeLegacyRetirementPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
@@ -4059,6 +4074,7 @@ pub const IndexManager = struct {
     /// capability floor permits an online v2 rebuild and atomic promotion.
     pub fn denseNativePhysicalMigrationRequired(self: *IndexManager, name: []const u8) !bool {
         if (!densePostingWalMutationStoreEnabled()) return false;
+        if (!self.configuredDenseNativePostingStoreSupported()) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -4633,6 +4649,25 @@ pub const IndexManager = struct {
         index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
         index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
         self.attachVectorBlockResidencyPolicy(&index);
+
+        // Repair/rebuild reopens must restore the same physical-format
+        // capabilities as ordinary startup. In particular, a v2 root may
+        // atomically rebuild its native authority without being mistaken for
+        // an unauthorized v1 migration, and future mutations must remain on
+        // the WAL-backed store after that authority is republished.
+        index.setExperimentalPostingAuthorityTransitionPermitted(
+            self.denseNativeAuthorityTransitionPermitted(
+                entry.native_physical_v2,
+                entry.native_candidate_build_authorized,
+            ),
+        );
+        // A durable v2 pointer cannot be downgraded by a later process-wide
+        // feature toggle. Rebuilds of that physical format must continue to
+        // route mutations through its native WAL even when new v2 admission is
+        // disabled for the deployment.
+        if (entry.native_physical_v2) {
+            try index.enableNativePostingMutationStore();
+        }
 
         entry.index = index;
         entry.vector_loader_context = vector_loader_context;
@@ -11894,6 +11929,22 @@ pub const IndexManager = struct {
             environmentFlag("ANTFLY_HBC_POSTING_SIDECAR", false);
     }
 
+    fn configuredDenseNativePostingStoreSupported(self: *const IndexManager) bool {
+        return hbc_mod.storageBackendSupportsNativePostingStore(self.dense_storage_backend);
+    }
+
+    fn densePostingStoreAvailableForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        // Published v2 indexes open through HBC's dedicated native environment;
+        // legacy/candidate indexes need a configured backend adapter that can
+        // host the native WAL and immutable segment namespace.
+        return entry.native_physical_v2 or self.configuredDenseNativePostingStoreSupported();
+    }
+
+    fn densePostingSidecarEnabledForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        return entry.index.experimentalPostingWalAuthoritative() or
+            (densePostingSidecarEnabled() and self.densePostingStoreAvailableForEntry(entry));
+    }
+
     fn denseVectorBlockStoreEnabled() bool {
         return environmentFlag("ANTFLY_HBC_VECTOR_BLOCK_STORE", true);
     }
@@ -11948,7 +11999,7 @@ pub const IndexManager = struct {
         options: DensePostingCaptureOptions,
     ) !?DensePostingCaptureLease {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
-        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return null;
+        if (!self.densePostingSidecarEnabledForEntry(entry)) return null;
         if (entry.index.experimentalPostingMutationCaptureActive()) {
             switch (entry.index.experimentalPostingMutationCaptureOwner()) {
                 .source => if (options.borrow_active_source and entry.index.lsmSessionBatchingActive()) {
@@ -12076,7 +12127,7 @@ pub const IndexManager = struct {
     ) !void {
         if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
         const entry = try self.validateDensePostingCaptureLease(name, lease);
-        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
+        if (!self.densePostingSidecarEnabledForEntry(entry)) return;
         try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{
             .consume_owned_source_capture = true,
             .capture_lease = lease.capture,
@@ -12089,7 +12140,7 @@ pub const IndexManager = struct {
     /// replay batch legitimately joins its already-open source session.
     pub fn densePostingSidecarCaptureRequiredByName(self: *IndexManager, name: []const u8) bool {
         const entry = self.denseIndex(name) orelse return false;
-        return densePostingSidecarEnabled() or entry.index.experimentalPostingWalAuthoritative();
+        return self.densePostingSidecarEnabledForEntry(entry);
     }
 
     pub fn densePostingCoverageIncludesByName(self: *IndexManager, name: []const u8, sequence: u64) bool {
@@ -12128,7 +12179,7 @@ pub const IndexManager = struct {
         options: DensePostingPersistOptions,
     ) !void {
         const entry = self.denseIndex(name) orelse return;
-        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
+        if (!self.densePostingSidecarEnabledForEntry(entry)) return;
         if (options.consume_owned_source_capture and
             entry.index.experimentalPostingMutationCaptureActive())
         {
@@ -15031,6 +15082,7 @@ pub const IndexManager = struct {
     fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) bool {
         if (cfg.kind != .dense_vector or builtin.os.tag == .freestanding) return false;
         if (!densePostingWalMutationStoreEnabled()) return false;
+        if (!self.configuredDenseNativePostingStoreSupported()) return false;
         // Fresh-v2 publication currently stages a host directory and commits
         // it through the host ACTIVE_ROOT pointer. A backend-local namespace
         // (Lite, object storage, modeled devices) may use the native posting
@@ -15220,6 +15272,32 @@ pub const IndexManager = struct {
         // an empty corpus this writes only CURRENT plus its empty WAL and
         // scoped coverage certificate; physical shard files stay lazy.
         try self.ensureVectorBlockBaseAtAppliedSequence(cfg.name, ready_sequence);
+
+        // Bootstrap the complete projection certificate inside the
+        // unpublished generation. Native posting coverage owns the advancing
+        // source sequence, while this metadata owns lifecycle/config identity;
+        // both must exist before the v2 pointer makes the generation visible.
+        // This remains O(1) for an empty index.
+        const projection_checkpoint: apply_state.ProjectionCheckpoint = .{
+            .applied_sequence = ready_sequence,
+            .status = .clean,
+            .generation = 1,
+            .config_hash = types.indexConfigHash(cfg),
+        };
+        try entry.index.saveProjectionCheckpointMetadata(.{
+            .applied_sequence = projection_checkpoint.applied_sequence,
+            .status = @intFromEnum(projection_checkpoint.status),
+            .generation = projection_checkpoint.generation,
+            .config_hash = projection_checkpoint.config_hash,
+        });
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            self.alloc,
+            self.checkpointIo(),
+            store,
+            self.applied_sequence_checkpoint_path,
+            cfg.name,
+            projection_checkpoint,
+        );
         try index_generation_manifest.writeReadyForPhysicalFormat(
             self.alloc,
             generation.index_path,
@@ -16256,15 +16334,13 @@ pub const IndexManager = struct {
                 if (self.resource_manager) |manager| {
                     index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
                 }
-                const native_catalog_floor_permitted = if (self.dense_native_migration_policy_source) |source|
-                    source.authorityPermitted()
-                else
-                    true;
+                const configured_native_posting_store_supported =
+                    hbc_mod.storageBackendSupportsNativePostingStore(self.dense_storage_backend);
                 index.setExperimentalPostingAuthorityTransitionPermitted(
-                    native_catalog_floor_permitted and
-                        (self.dense_native_candidate_build_authorized or
-                            authorize_dense_native_candidate or
-                            native_physical_v2),
+                    self.denseNativeAuthorityTransitionPermitted(
+                        native_physical_v2,
+                        authorize_dense_native_candidate,
+                    ),
                 );
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
@@ -16292,7 +16368,10 @@ pub const IndexManager = struct {
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
                 self.attachVectorBlockResidencyPolicy(&index);
-                if (densePostingSidecarEnabled() or index.experimentalPostingWalAuthoritative()) {
+                if (index.experimentalPostingWalAuthoritative() or
+                    (densePostingSidecarEnabled() and
+                        (native_physical_v2 or configured_native_posting_store_supported)))
+                {
                     var posting_sequence: u64 = 0;
                     if (index.experimentalPostingWalAuthoritative()) {
                         // Native coverage is the dense applied watermark. The
@@ -16354,10 +16433,10 @@ pub const IndexManager = struct {
                 // by an incompatible v2 pointer. Enabling WAL-only routing on
                 // every v1 index makes an inverse delete join the same aborted
                 // capture it is supposed to roll back.
-                const native_mutation_store_permitted = native_catalog_floor_permitted and
-                    (self.dense_native_candidate_build_authorized or
-                        authorize_dense_native_candidate or
-                        native_physical_v2);
+                const native_mutation_store_permitted = self.denseNativeAuthorityTransitionPermitted(
+                    native_physical_v2,
+                    authorize_dense_native_candidate,
+                );
                 if (index.experimentalPostingWalAuthoritative() or
                     (densePostingWalMutationStoreEnabled() and native_mutation_store_permitted))
                 {
@@ -27157,6 +27236,11 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
         try std.testing.expect(entry.native_physical_v2);
         try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
         try std.testing.expect(entry.index.nativePostingMutationStoreEnabled());
+        const projection_checkpoint = manager.denseProjectionCheckpointMetadata(cfg.name) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, projection_checkpoint.status);
+        try std.testing.expectEqual(@as(u64, 0), projection_checkpoint.applied_sequence);
+        try std.testing.expectEqual(types.indexConfigHash(cfg), projection_checkpoint.config_hash);
         try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
         const canonical_path = try manager.indexPath(cfg.name);
         defer alloc.free(canonical_path);
@@ -27240,6 +27324,36 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     try writeFileAtomicallyDurable(alloc, std.testing.io, marker_path, stale_marker);
     _ = try reopened.cleanupInactiveRepairShadowRootsPage();
     try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+}
+
+test "fresh dense admission stays legacy when its backend cannot host the native mutation store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .dense_storage_backend = .lmdb,
+    });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const cfg: types.IndexConfig = .{
+        .name = "dv_lmdb",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    try manager.addManaged(&store, cfg, null);
+    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!entry.native_physical_v2);
+    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
+    try std.testing.expect(!entry.index.nativePostingMutationStoreEnabled());
+    try std.testing.expect(!manager.densePostingSidecarEnabledForEntry(entry));
+    try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
 }
 
 test "native pointer validation reads authority through configured storage" {

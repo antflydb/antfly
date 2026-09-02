@@ -47,8 +47,11 @@ const CatchUpSessionTokenType = struct {
         return self.value == 0;
     }
 };
+const CatchUpFinishResultType = struct {
+    applied_sequence_persisted: bool = false,
+};
 const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!CatchUpSessionTokenType;
-const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionTokenType, applied_sequence: u64, success: bool) anyerror!void;
+const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionTokenType, applied_sequence: u64, success: bool) anyerror!CatchUpFinishResultType;
 const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
@@ -58,6 +61,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const PersistFn = PersistFnType;
     pub const TruncateFn = TruncateFnType;
     pub const CatchUpSessionToken = CatchUpSessionTokenType;
+    pub const CatchUpFinishResult = CatchUpFinishResultType;
     pub const BeginCatchUpFn = BeginCatchUpFnType;
     pub const FinishCatchUpFn = FinishCatchUpFnType;
     pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
@@ -182,6 +186,7 @@ pub const ApplyFn = async_runtime_mod.ApplyFn;
 pub const PersistFn = async_runtime_mod.PersistFn;
 pub const TruncateFn = async_runtime_mod.TruncateFn;
 pub const CatchUpSessionToken = async_runtime_mod.CatchUpSessionToken;
+pub const CatchUpFinishResult = async_runtime_mod.CatchUpFinishResult;
 pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
 pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
@@ -452,8 +457,11 @@ const ManualRuntime = struct {
         else
             CatchUpSessionToken{};
         var catch_up_open = true;
-        errdefer if (catch_up_open) if (self.finish_catch_up_fn) |finish_catch_up|
-            finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
+        errdefer {
+            if (catch_up_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                _ = finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
+            };
+        }
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
@@ -477,8 +485,11 @@ const ManualRuntime = struct {
 
             const result = try self.catchUpWorker(worker);
             var session_open = true;
-            defer if (session_open) if (self.finish_catch_up_fn) |finish_catch_up|
-                finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
             const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
@@ -489,12 +500,16 @@ const ManualRuntime = struct {
             else
                 worker.applied_sequence;
             session_open = false;
-            if (self.finish_catch_up_fn) |finish_catch_up|
-                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true);
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
@@ -518,8 +533,11 @@ const ManualRuntime = struct {
 
             const result = try self.catchUpWorker(worker);
             var session_open = true;
-            defer if (session_open) if (self.finish_catch_up_fn) |finish_catch_up|
-                finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
             const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
@@ -530,12 +548,16 @@ const ManualRuntime = struct {
             else
                 worker.applied_sequence;
             session_open = false;
-            if (self.finish_catch_up_fn) |finish_catch_up|
-                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true);
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);

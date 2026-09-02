@@ -1303,6 +1303,11 @@ const AsyncDenseCatchUpSession = struct {
     index_name: []u8,
     index_incarnation: u64,
     lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
+    /// Covers the complete derived transaction, including native WAL commit,
+    /// immutable-generation publication, and lifecycle checkpointing. A
+    /// snapshot capture must never observe the replay apply as drained while
+    /// its durable query generation is still being published.
+    snapshot_replay: ?snapshot_admission_mod.SnapshotAdmission.MutationLease,
 };
 
 const AsyncContext = struct {
@@ -1389,6 +1394,7 @@ const AsyncContext = struct {
                     lease,
                 ) catch {};
             };
+            if (entry.value_ptr.snapshot_replay) |*lease| lease.release();
             alloc.free(entry.value_ptr.index_name);
         }
         self.dense_catch_up_sessions.deinit(alloc);
@@ -18458,6 +18464,17 @@ pub const DB = struct {
                 checkpoint.config_hash != types.indexConfigHash(cfg) or
                 checkpoint.applied_sequence != capture_target_sequence)
             {
+                std.log.warn(
+                    "native backup projection is not quiescent index={s} status={s} checkpoint_sequence={} target_sequence={} checkpoint_config_hash={x} expected_config_hash={x}",
+                    .{
+                        cfg.name,
+                        @tagName(checkpoint.status),
+                        checkpoint.applied_sequence,
+                        capture_target_sequence,
+                        checkpoint.config_hash,
+                        types.indexConfigHash(cfg),
+                    },
+                );
                 return error.NativeBackupProjectionNotQuiescent;
             }
             const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.name, cfg.kind);
@@ -41792,7 +41809,8 @@ test "async dense catch-up tokens bind one exact session" {
     };
     defer ctx.deinit(std.testing.allocator);
 
-    const first_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 11, null);
+    var no_snapshot: ?snapshot_admission_mod.SnapshotAdmission.MutationLease = null;
+    const first_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 11, null, &no_snapshot);
     try std.testing.expect(!first_token.isNone());
     try std.testing.expectError(
         error.DenseCatchUpSessionSuperseded,
@@ -41802,7 +41820,7 @@ test "async dense catch-up tokens bind one exact session" {
     defer ctx.alloc.free(first.index_name);
     try std.testing.expectEqual(@as(u64, 11), first.index_incarnation);
 
-    const second_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 12, null);
+    const second_token = try installAsyncDenseCatchUpSession(&ctx, "vec", 12, null, &no_snapshot);
     try std.testing.expect(second_token.value > first_token.value);
     try std.testing.expectError(
         error.DenseCatchUpSessionSuperseded,
@@ -41811,6 +41829,32 @@ test "async dense catch-up tokens bind one exact session" {
     const second = try takeAsyncDenseCatchUpSession(&ctx, "vec", second_token);
     defer ctx.alloc.free(second.index_name);
     try std.testing.expectEqual(@as(u64, 12), second.index_incarnation);
+}
+
+test "async dense catch-up token owns snapshot admission through close" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var snapshot_admission: snapshot_admission_mod.SnapshotAdmission = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    var mutation: ?snapshot_admission_mod.SnapshotAdmission.MutationLease = snapshot_admission.acquireMutation();
+    const token = try installAsyncDenseCatchUpSession(&ctx, "vec", 17, null, &mutation);
+    try std.testing.expect(mutation == null);
+    try std.testing.expect(!snapshot_admission.lock.tryLockExclusive());
+
+    var session = try takeAsyncDenseCatchUpSession(&ctx, "vec", token);
+    defer ctx.alloc.free(session.index_name);
+    try std.testing.expect(!snapshot_admission.lock.tryLockExclusive());
+    if (session.snapshot_replay) |*lease| lease.release();
+    session.snapshot_replay = null;
+
+    try std.testing.expect(snapshot_admission.lock.tryLockExclusive());
+    snapshot_admission.lock.unlockExclusive();
 }
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
@@ -51165,6 +51209,7 @@ fn installAsyncDenseCatchUpSession(
     index_name: []const u8,
     index_incarnation: u64,
     lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
+    snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease,
 ) !derived_executor_mod.CatchUpSessionToken {
     if (lease) |value| if (!value.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
     const owned_name = try ctx.alloc.dupe(u8, index_name);
@@ -51187,7 +51232,9 @@ fn installAsyncDenseCatchUpSession(
         .index_name = owned_name,
         .index_incarnation = index_incarnation,
         .lease = lease,
+        .snapshot_replay = snapshot_replay.*,
     };
+    snapshot_replay.* = null;
     return .{ .value = session_id };
 }
 
@@ -51209,6 +51256,11 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     ctx: *AsyncContext,
     index_ref: index_manager_mod.ManagedIndexRef,
 ) !derived_executor_mod.CatchUpSessionToken {
+    // Acquire before any derived mutation and transfer the lease into the
+    // opaque catch-up token. Per-batch leases remain nested fast paths, while
+    // this outer lease closes the old apply/finish publication gap.
+    var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     const capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
@@ -51221,7 +51273,13 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
         ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
     errdefer ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
-    const token = try installAsyncDenseCatchUpSession(ctx, index_ref.name, index_incarnation, capture);
+    const token = try installAsyncDenseCatchUpSession(
+        ctx,
+        index_ref.name,
+        index_incarnation,
+        capture,
+        &snapshot_replay,
+    );
     capture_transferred = true;
     return token;
 }
@@ -51257,16 +51315,17 @@ fn finishDerivedCatchUpSessionAsync(
     token: derived_executor_mod.CatchUpSessionToken,
     applied_sequence: u64,
     success: bool,
-) !void {
-    if (index_ref.kind != .dense_vector) return;
+) !derived_executor_mod.CatchUpFinishResult {
+    if (index_ref.kind != .dense_vector) return .{};
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
     if (!success) {
         // A delayed close cannot act on a newer session. Its exact token has
         // already been retired, so even coalescer cleanup must happen only
         // after this callback proves ownership of the exact session.
-        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch return;
+        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch return .{};
         defer ctx.alloc.free(session.index_name);
+        defer if (session.snapshot_replay) |*lease| lease.release();
         defer if (session.lease) |lease| if (lease.ownsLifecycle())
             ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
         _ = ctx.stats.dense_catch_up.abort_calls.fetchAdd(1, .monotonic);
@@ -51279,11 +51338,11 @@ fn finishDerivedCatchUpSessionAsync(
             var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
             defer index_apply_guard.unlock();
             ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, session.index_incarnation) catch |err| switch (err) {
-                error.PostingWalCaptureSuperseded, error.IndexNotFound => return,
+                error.PostingWalCaptureSuperseded, error.IndexNotFound => return .{},
             };
             if (session.lease) |lease| if (lease.ownsLifecycle()) {
                 ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
-                    error.PostingWalCaptureSuperseded => return,
+                    error.PostingWalCaptureSuperseded => return .{},
                     error.ExperimentalPostingCaptureNotActive => {},
                     else => return err,
                 };
@@ -51294,10 +51353,11 @@ fn finishDerivedCatchUpSessionAsync(
         catch_up_tracked = false;
         const lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name);
         if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
-        return;
+        return .{};
     }
     var session = try takeAsyncDenseCatchUpSession(ctx, index_ref.name, token);
     defer ctx.alloc.free(session.index_name);
+    defer if (session.snapshot_replay) |*lease| lease.release();
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
     errdefer if (session.lease) |lease| if (lease.ownsLifecycle())
@@ -51307,6 +51367,10 @@ fn finishDerivedCatchUpSessionAsync(
         abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref, session.index_incarnation);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
+    const capture_advances_applied_sequence = if (session.lease) |lease|
+        lease.ownsLifecycle() and applied_sequence > lease.capture.base_coverage
+    else
+        false;
 
     // Keep async dense catch-up finishes bounded and durable, but leave LSM maintenance
     // to the explicit maintenance paths instead of paying it on every replay catch-up finish.
@@ -51334,6 +51398,12 @@ fn finishDerivedCatchUpSessionAsync(
     }
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
+    // The owned posting-WAL commit is itself the authoritative dense applied
+    // watermark. Report that fact explicitly to the executor instead of
+    // replaying the same boundary through the capability-free coalescer. The
+    // lifecycle finalizer below remains the sole readiness/publication pass.
+    const applied_sequence_persisted = capture_advances_applied_sequence and
+        ctx.index_manager.densePostingCoverageIncludesByName(index_ref.name, applied_sequence);
     var lifecycle_completed = false;
     _ = blk: {
         var seq_lock = lockAtomicWithBackoffProfiled(
@@ -51375,6 +51445,7 @@ fn finishDerivedCatchUpSessionAsync(
     // the idle observation and durable lifecycle completion.
     lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name) or lifecycle_completed;
     if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
+    return .{ .applied_sequence_persisted = applied_sequence_persisted };
 }
 
 fn storeHasReplayRecordForHintAfter(
@@ -52381,6 +52452,26 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         error.VectorBlockSnapshotAdvancedWithoutWal,
         error.VectorBlockGenerationReservationLost,
         => return false,
+        // Corrupt or obsolete source artifacts are producer-repair debt, not
+        // a reason for the optional native exact-vector projection to fail the
+        // replay worker. Keep the rebuilding checkpoint fenced; enrichment or
+        // index repair will republish the authoritative artifact and request
+        // this stable-tip transition again.
+        error.InvalidArtifactHeader,
+        error.InvalidArtifactMagic,
+        error.UnsupportedArtifactCodecVersion,
+        error.InvalidArtifactKind,
+        error.InvalidArtifactPayload,
+        error.InvalidVectorDimensions,
+        error.InvalidSparseEmbedding,
+        => {
+            std.log.warn("dense native acceleration deferred for recoverable artifact index={s} sequence={} err={s}", .{
+                index_name,
+                applied_sequence,
+                @errorName(err),
+            });
+            return false;
+        },
         else => return err,
     };
 
@@ -102790,10 +102881,16 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     };
     const SnapshotWorker = struct {
         db: *DB,
+        canceled: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.db.snapshotNative("fenced-native") catch |err| {
+            defer self.done.store(true, .release);
+            _ = self.db.snapshotNativeWithCancellation(
+                "fenced-native",
+                types.CancellationToken.fromAtomic(&self.canceled),
+            ) catch |err| {
                 self.err = err;
                 return;
             };
@@ -102845,7 +102942,16 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
     const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
-    while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
+    const capture_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!fence.entered.load(.acquire) and
+        !worker.done.load(.acquire) and
+        monotonicTimeNs() < capture_deadline) std.Thread.yield() catch {};
+    if (!fence.entered.load(.acquire)) {
+        worker.canceled.store(true, .release);
+        snapshot_thread.join();
+        if (worker.err) |err| return err;
+        return error.SnapshotCaptureFenceTimeout;
+    }
 
     // Maintenance-owned replay production is not a client mutation and must
     // remain able to finish after primary admission closes. The capture drain
@@ -102862,7 +102968,20 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     for (0..1024) |_| std.Thread.yield() catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
-    while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
+    const copy_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!fence.copy_entered.load(.acquire) and
+        !worker.done.load(.acquire) and
+        monotonicTimeNs() < copy_deadline) std.Thread.yield() catch {};
+    if (!fence.copy_entered.load(.acquire)) {
+        worker.canceled.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        snapshot_thread.join();
+        writer_thread.join();
+        if (worker.err) |err| return err;
+        if (writer.err) |err| return err;
+        return error.SnapshotCopyFenceTimeout;
+    }
 
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
@@ -102872,7 +102991,21 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     for (0..1024) |_| std.Thread.yield() catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
-    while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
+    const materialize_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!fence.materialize_entered.load(.acquire) and
+        !worker.done.load(.acquire) and
+        monotonicTimeNs() < materialize_deadline) std.Thread.yield() catch {};
+    if (!fence.materialize_entered.load(.acquire)) {
+        worker.canceled.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        snapshot_thread.join();
+        maintenance_thread.join();
+        writer_thread.join();
+        if (worker.err) |err| return err;
+        if (maintenance.err) |err| return err;
+        if (writer.err) |err| return err;
+        return error.SnapshotMaterializeFenceTimeout;
+    }
     // Every corpus-sized generated and primary read is outside both mutation
     // fences. Foreground writes and index maintenance must finish even while
     // artifact materialization is deliberately held.

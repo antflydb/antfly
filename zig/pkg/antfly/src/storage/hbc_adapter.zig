@@ -100,6 +100,15 @@ var test_before_durable_snapshot_capture_hook: ?TestBeforeDurableSnapshotCapture
 pub const HBCConfig = vectorindex_types.HBCConfig;
 pub const StorageBackend = vectorindex_types.StorageBackend;
 pub const BulkBuildAlgo = vectorindex_types.BulkBuildAlgo;
+
+/// Whether an index opened on this configured backend can bootstrap the native
+/// posting WAL/segment authority. Once a v2 generation is published it opens
+/// through the dedicated `.native` environment instead; this capability is
+/// specifically for sidecar and migration construction from a legacy backend.
+pub fn storageBackendSupportsNativePostingStore(backend: StorageBackend) bool {
+    return backend == .lsm;
+}
+
 pub const LsmWriteStats = lsm_backend.Backend.WriteStats;
 pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
 pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
