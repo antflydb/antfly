@@ -2457,11 +2457,9 @@ fn requestUsesMaterializedChunkArtifact(
 }
 
 const StaleEmbeddingDeletes = struct {
-    vector_keys: [][]u8 = &.{},
     artifact_delete_keys: [][]u8 = &.{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        freeKeyList(alloc, self.vector_keys);
         freeKeyList(alloc, self.artifact_delete_keys);
         self.* = .{};
     }
@@ -9546,7 +9544,6 @@ fn flushChunkedDenseItems(
     }
 
     for (batch_items, vectors, 0..) |item, vector, idx| {
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, item.chunk_key);
         try writeEmbeddingArtifact(runtime, .{
             .base_key = item.chunk_key,
             .parent_doc_key = item.parent_doc_key,
@@ -9780,9 +9777,6 @@ fn processMaterializedChunkDenseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -9999,9 +9993,6 @@ fn processMaterializedChunkSparseRequest(
 
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &window.deleted_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
@@ -10563,8 +10554,6 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
     stale: *StaleEmbeddingDeletes,
 ) !void {
     errdefer stale.deinit(runtime.alloc);
-    try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale.vector_keys);
-    stale.vector_keys = &.{};
     try mergeOwnedArtifactDeleteKeysIntoWindow(runtime, window, stale.artifact_delete_keys);
     stale.artifact_delete_keys = &.{};
 }
@@ -10764,9 +10753,6 @@ fn processDenseEmbedding(
             return;
         }
 
-        for (chunk_embeddings) |embedding| {
-            if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
-        }
         try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, request.producer_json, embedding_artifact_name, chunk_embeddings);
         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
@@ -13029,8 +13015,6 @@ fn deleteStaleChunkEmbeddingArtifacts(
     defer backend_scan.freeResults(runtime.alloc, existing);
     if (existing.len == 0) return .{};
 
-    var stale_vector_keys = std.ArrayListUnmanaged([]u8).empty;
-    errdefer freeKeyList(runtime.alloc, stale_vector_keys.items);
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys.items);
 
@@ -13038,13 +13022,9 @@ fn deleteStaleChunkEmbeddingArtifacts(
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
         if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
         if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
-        if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, entry.key)) |base_key| {
-            try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, base_key);
-        }
         try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
     }
     return .{
-        .vector_keys = try stale_vector_keys.toOwnedSlice(runtime.alloc),
         .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(runtime.alloc),
     };
 }
