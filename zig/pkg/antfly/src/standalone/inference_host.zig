@@ -927,6 +927,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 extract_shape.max_text_bytes_per_item = @max(extract_shape.max_text_bytes_per_item, input.content_json.len);
             }
             const extract_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .extract);
+            if (extract_capabilities.task_limits.max_input_tokens_per_item != null)
+                extract_shape.max_input_tokens_per_item = extract_shape.max_text_bytes_per_item;
             for (attachments) |attachment| {
                 try extract_capabilities.validateMimeType(attachment.mime_type);
                 extract_shape.encoded_media_bytes = std.math.add(
@@ -1787,6 +1789,7 @@ fn validateEncodedReadCapabilities(
         .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
         .text_bytes = prompt_bytes,
         .max_text_bytes_per_item = prompt_bytes,
+        .max_input_tokens_per_item = if (capabilities.task_limits.max_input_tokens_per_item != null) prompt_bytes else 0,
         .requested_output_tokens_per_item = output_tokens,
     });
 }

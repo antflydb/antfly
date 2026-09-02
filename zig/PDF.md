@@ -1074,6 +1074,35 @@ document. They are architectural requirements, not Florence-specific cleanup:
     first. Only an item that fits the current invocation may allocate scratch to
     inspect physical dimensions; the subsequent pixel check remains independent.
     This ordering applies to both singleton validation and cumulative windows.
+110. **Distributed model-specific limits were enforced only by generation.**
+    Capability discovery normalized task limits for every family, but the
+    inference HTTP node consumed that resolved manifest contract only in
+    `/generate` and `/generate/batch`. A direct HTTP caller could therefore
+    bypass a classifier candidate ceiling, extractor schema ceiling, or a
+    stricter embed, rerank, read, rewrite, or transcribe limit while the remote
+    planner correctly advertised it. The inference node now resolves one
+    task-neutral executor contract from the lightweight manifest and applies
+    one validator and error taxonomy at every manifest-backed HTTP boundary.
+    Task adapters still construct typed invocation shapes: rerankers count
+    candidates, extractors count schemas, generators/readers count requested
+    output, and media consumers inspect physical encoded bytes and pixels.
+    Byte and modality checks precede model loading; exact tokenizer counts are
+    checked after tokenizer acquisition. Reader and composed extractor paths
+    retain a conservative request-text proxy where their several concrete
+    pipelines do not yet expose one uniform tokenizer surface, so a published
+    token ceiling is never silently omitted. Fixed
+    chunking remains an explicit built-in executor with no model manifest and
+    therefore keeps its existing hard-coded contract.
+111. **A remote exact MIME set could exceed the local physical codec set.**
+    Version 4 capability parsing accepted any bounded syntactically valid
+    `image/*` essence, even though the same client later had to identify and
+    measure that image before dispatch. A remote node could advertise TIFF and
+    pass planning, only for local physical admission to reject it. Exact remote
+    image capabilities now intersect the shared inference codec registry while
+    parsing. Unsupported image essences invalidate the snapshot; supported
+    extensions such as GIF retain value-semantic round-trip behavior. This
+    keeps catalog publication, distributed planning, and physical execution on
+    one codec authority.
 
 ### Post-review implementation contract
 
@@ -1355,6 +1384,15 @@ The hardening above follows these long-term rules:
     repair uses an exactly sized allocation and accounts its coexisting
     structures; and validated MIME essence handling is shared across
     capability, host, linked, and inference-node boundaries.
+36. **Implemented after executor-parity review:** the inference node derives a
+    generic resolved executor contract for reader, generator, embedder,
+    reranker, extractor, rewriter, classifier, and transcriber routes. Typed
+    adapters populate the common item, text/token, output, candidate, schema,
+    media-part, encoded-byte, and decoded-pixel dimensions; model-specific
+    limits are hard execution checks rather than discovery-only hints.
+37. **Implemented after remote-codec review:** version 4 remote image MIME
+    extensions must be measurable by the local shared inference codec registry
+    before the capability snapshot can become routable.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

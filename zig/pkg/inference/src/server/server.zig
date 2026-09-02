@@ -1966,6 +1966,17 @@ fn countTokenizerTexts(
     return total;
 }
 
+fn maxTokenizerTextTokens(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    texts: []const []const u8,
+) !usize {
+    var maximum: usize = 0;
+    for (texts) |text| maximum = @max(maximum, try countTokenizerTokens(allocator, io, tokenizer, text));
+    return maximum;
+}
+
 fn countParsedDenseEmbedTextTokens(
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -5286,6 +5297,9 @@ pub const Node = struct {
         // extractText/extractImages below.
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
+        defer admission_manifest.deinit();
+        const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
 
         // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
@@ -5300,6 +5314,35 @@ pub const Node = struct {
         defer parsed_inputs.deinit();
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
         if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
+        var encoded_media_bytes: usize = 0;
+        var decoded_pixels: u64 = 0;
+        for (parsed_inputs.images.items) |image_bytes| {
+            encoded_media_bytes = std.math.add(usize, encoded_media_bytes, image_bytes.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            const physical_mime = image_pipeline.mimeEssenceForEncoded(image_bytes) orelse
+                return error.InvalidInferenceMedia;
+            if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+                return error.UnsupportedInferenceMimeType;
+            const info = image_pipeline.inspectEncodedForInference(image_bytes, null) catch
+                return error.InvalidInferenceMedia;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = request.inputs.len,
+            .text_bytes_per_item = std.math.add(
+                usize,
+                maxTextBytes(parsed_inputs.texts.items),
+                if (parsed_inputs.prompt) |prompt| prompt.len else 0,
+            ) catch return error.InferenceTextBytesExceeded,
+            .output_tokens_per_item = parsed_inputs.max_tokens orelse 0,
+            .encoded_media_bytes = encoded_media_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = if (parsed_inputs.images.items.len > 0) 1 else 0,
+            .schema_bytes = request.schema_json.len,
+            .has_text = parsed_inputs.texts.items.len > 0,
+            .has_image = parsed_inputs.images.items.len > 0,
+        });
         if (parsed_inputs.images.items.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
@@ -5364,6 +5407,18 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
         defer allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+        const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
+        defer allocator.free(schema_json);
+        try validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            @max(maxTextBytes(schema.entities orelse &.{}), maxTextBytes(relation_labels)),
+            0,
+            @max(if (schema.entities) |labels| labels.len else 0, relation_labels.len),
+            schema_json.len,
+        );
         if (rebel_mod.isRebelModel(allocator, model_path)) {
             try rebel_mod.validateSchemaSupport(request.labels, request.relation_labels);
             var failure_stage: RebelExtractionFailureStage = .model_layout;
@@ -5460,6 +5515,16 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveClassificationRequestModelPath(allocator, io_impl.io(), model_name);
         defer allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+        const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
+        defer allocator.free(schema_json);
+        var max_candidates: usize = 0;
+        var schema_text_bytes: usize = 0;
+        for (schema.classifications orelse &.{}) |classification_schema| {
+            max_candidates = @max(max_candidates, classification_schema.labels.len);
+            schema_text_bytes = @max(schema_text_bytes, maxTextBytes(classification_schema.labels));
+        }
+        try validateTextExecutorInvocation(executor_contract, texts.len, texts, schema_text_bytes, 0, max_candidates, schema_json.len);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
@@ -6175,6 +6240,8 @@ pub const Node = struct {
         var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
+        const executor_contract = resolvedInferenceExecutorContract(self, "embed", &admission_manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (admission_manifest.hasCapability("sparse")) {
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
@@ -6188,6 +6255,8 @@ pub const Node = struct {
             if (sparse_texts.len == 0) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
             }
+            validateTextExecutorInvocation(executor_contract, sparse_texts.len, sparse_texts, 0, 0, 0, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
             if (requested_dimensions != null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -6201,6 +6270,7 @@ pub const Node = struct {
                 texts: []const []const u8,
                 vectors: ?[]DirectSparseEmbedding = null,
                 prompt_tokens: usize = 0,
+                executor_contract: ResolvedInferenceExecutorContract,
 
                 fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                     const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
@@ -6212,6 +6282,8 @@ pub const Node = struct {
                         .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
                         .execution_lock = model.embeddingExecutionLock(),
                     };
+                    const max_input_tokens = try maxTokenizerTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.texts);
+                    try validateTextExecutorInvocation(attempt.executor_contract, attempt.texts.len, attempt.texts, 0, max_input_tokens, 0, 0);
                     const vectors = try pipeline.embed(attempt.texts);
                     errdefer {
                         for (vectors) |*item| item.deinit(attempt.allocator);
@@ -6225,9 +6297,12 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .executor_contract = executor_contract,
             };
-            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err|
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err| {
+                if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                 return inferenceFailureResponse(ctx, err);
+            };
             const sparse_vecs = attempt.vectors.?;
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
@@ -6258,7 +6333,6 @@ pub const Node = struct {
         if (inputs.total_count == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
         }
-
         var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
 
         if (inputs.images.items.len > 0) {
@@ -6278,6 +6352,9 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
+        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
         const ExecutionResult = union(EmbedErrorPolicy) {
             fail_fast: [][]f32,
@@ -6291,6 +6368,8 @@ pub const Node = struct {
             audio_decode_working_bytes: usize,
             result: ?ExecutionResult = null,
             prompt_tokens: usize = 0,
+            executor_contract: ResolvedInferenceExecutorContract,
+            admission_manifest: *const manifest_mod.ModelManifest,
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
@@ -6309,6 +6388,11 @@ pub const Node = struct {
                     countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs)
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
+                var max_input_tokens: usize = 0;
+                for (attempt.inputs.texts.items) |item| {
+                    max_input_tokens = @max(max_input_tokens, try countTokenizerTokens(attempt.allocator, attempt.io, model.getTokenizer(), item.text));
+                }
+                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens);
 
                 attempt.result = switch (attempt.request.error_policy) {
                     .fail_fast => .{ .fail_fast = try embedDenseInputs(
@@ -6337,12 +6421,15 @@ pub const Node = struct {
             .inputs = &inputs,
             .request = request,
             .audio_decode_working_bytes = audio_decode_working_bytes,
+            .executor_contract = executor_contract,
+            .admission_manifest = &admission_manifest,
         };
         var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .failure_stage = &failure_stage,
         }, &attempt, Attempt.run) catch |err| {
+            if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (err == error.UnsupportedEmbeddingTaskType) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -6503,11 +6590,22 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "rerank") catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, 0, body.prompts.len, 0) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        const query_tokens = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        const prompt_tokens_per_item = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.prompts) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        const input_tokens_per_item = std.math.add(usize, query_tokens, prompt_tokens_per_item) catch std.math.maxInt(usize);
+        validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, input_tokens_per_item, body.prompts.len, 0) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
@@ -6541,13 +6639,15 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer admission_manifest.deinit();
+        const executor_contract = resolvedInferenceExecutorContract(self, "rerank", &admission_manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         // Reject a text-only model from its lightweight manifest before
         // fetching request media or loading weights and accelerator sessions.
         if (media_shape.image_count > 0) {
-            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            defer admission_manifest.deinit();
             if (!(admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
                 return ctx.status(400).json(.{
                     .@"error" = "MODEL_NOT_SUPPORTED",
@@ -6563,6 +6663,9 @@ pub const Node = struct {
         }
 
         var image_count: usize = 0;
+        var max_doc_images: usize = 0;
+        var max_doc_text_bytes: usize = 0;
+        var decoded_pixels: u64 = 0;
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.documents) |doc| {
             const parsed = parseChatMessageContentToTextAndImagesWithBudget(self, ctx.allocator, doc.content, &media_budget) catch |err| switch (err) {
@@ -6578,9 +6681,23 @@ pub const Node = struct {
                 else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
             };
             image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
+            max_doc_images = @max(max_doc_images, parsed.images.len);
+            max_doc_text_bytes = @max(max_doc_text_bytes, parsed.text.len);
+            for (parsed.images) |image| {
+                const mime_type = image_pipeline.mimeEssenceForEncoded(image) orelse
+                    return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+                if (!manifestAcceptsExecutorMime(&admission_manifest, mime_type))
+                    return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
+                const info = image_pipeline.inspectEncodedForInference(image, null) catch
+                    return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+                decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+                    return inferenceExecutorContractFailureResponse(ctx, error.InferenceDecodedPixelsExceeded);
+            }
             try parsed_docs.append(ctx.allocator, parsed);
         }
 
+        const rerank_text_bytes = std.math.add(usize, body.query.len, max_doc_text_bytes) catch
+            return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
         if (image_count > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed_docs.items) |doc| for (doc.images) |image| decoded_budget.addImage(image) catch |err|
@@ -6589,11 +6706,40 @@ pub const Node = struct {
             if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
             reserved_units = required_units;
         }
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .text_bytes_per_item = rerank_text_bytes,
+            .encoded_media_bytes = media_budget.used_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = max_doc_images,
+            .candidates_per_request = body.documents.len,
+            .has_text = true,
+            .has_image = image_count > 0,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        var doc_texts_for_limit = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
+        defer ctx.allocator.free(doc_texts_for_limit);
+        for (parsed_docs.items, 0..) |doc, idx| doc_texts_for_limit[idx] = doc.text;
+        const query_tokens_for_limit = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        const doc_tokens_for_limit = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc_texts_for_limit) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        const input_tokens_for_limit = std.math.add(usize, query_tokens_for_limit, doc_tokens_for_limit) catch std.math.maxInt(usize);
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .text_bytes_per_item = rerank_text_bytes,
+            .input_tokens_per_item = input_tokens_for_limit,
+            .encoded_media_bytes = media_budget.used_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = max_doc_images,
+            .candidates_per_request = body.documents.len,
+            .has_text = true,
+            .has_image = image_count > 0,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (image_count == 0) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
@@ -6778,6 +6924,7 @@ pub const Node = struct {
         };
         validateGenerateExecutorInvocation(executor_contract, .{
             .text_bytes_per_item = estimateGenerateRequestTextBytes(body),
+            .has_text = true,
             .output_tokens_per_item = @intCast(numeric.max_tokens),
             .encoded_media_bytes = media_shape.inline_bytes +| media_shape.borrowed_bytes,
             .media_parts_per_item = media_shape.media_count,
@@ -6817,6 +6964,7 @@ pub const Node = struct {
         }
         validateGenerateExecutorInvocation(executor_contract, .{
             .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages.messages),
+            .has_text = true,
             .output_tokens_per_item = @intCast(numeric.max_tokens),
             .encoded_media_bytes = media_budget.used_bytes,
             .decoded_pixels = measureGenerateDecodedImages(&admission_manifest, owned_messages.decoded_images) catch |err| {
@@ -9009,6 +9157,7 @@ pub const Node = struct {
             const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
             validateGenerateExecutorInvocation(executor_contract, .{
                 .text_bytes_per_item = estimateGenerateRequestTextBytes(item.body),
+                .has_text = true,
                 .output_tokens_per_item = max_tokens,
                 .encoded_media_bytes = item_media_shape.inline_bytes +| item_media_shape.borrowed_bytes,
                 .media_parts_per_item = item_media_shape.media_count,
@@ -9154,6 +9303,7 @@ pub const Node = struct {
                     256;
                 validateGenerateExecutorInvocation(executor_contract, .{
                     .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
+                    .has_text = true,
                     .output_tokens_per_item = max_tokens,
                     .encoded_media_bytes = item_encoded_media_bytes[idx],
                     .decoded_pixels = item_pixels,
@@ -10679,6 +10829,7 @@ pub const Node = struct {
         include_confidence: bool = false,
         include_spans: bool = false,
         input_ids: []const ?[]const u8,
+        schema_bytes: usize = 0,
     };
 
     fn extractEntitiesAndRelations(
@@ -10692,6 +10843,22 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "extract") catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        const entity_candidates = @max(
+            if (body.labels) |labels| labels.len else 0,
+            if (body.relation_labels) |labels| labels.len else 0,
+        );
+        validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            @max(maxTextBytes(body.labels orelse &.{}), maxTextBytes(body.relation_labels orelse &.{})),
+            0,
+            entity_candidates,
+            body.schema_bytes,
+        ) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
             rebel_mod.validateSchemaSupport(body.labels, body.relation_labels) catch |err|
@@ -11021,11 +11188,36 @@ pub const Node = struct {
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
             defer ctx.allocator.free(model_path);
+            const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "classify") catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
+            const hypothesis: []const u8 = body.hypothesis_template orelse "This example is {}.";
+            const hypothesis_bytes = hypothesis.len;
+            const label_and_template_bytes = std.math.add(usize, maxTextBytes(body.labels), hypothesis_bytes) catch
+                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
+            validateTextExecutorInvocation(
+                executor_contract,
+                body.texts.len,
+                body.texts,
+                label_and_template_bytes,
+                0,
+                body.labels.len,
+                0,
+            ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
+
+            const text_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            const label_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            const hypothesis_tokens = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), hypothesis) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            const input_tokens = std.math.add(usize, std.math.add(usize, text_tokens, label_tokens) catch std.math.maxInt(usize), hypothesis_tokens) catch std.math.maxInt(usize);
+            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
 
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
@@ -11063,11 +11255,26 @@ pub const Node = struct {
 
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
             defer ctx.allocator.free(model_path);
+            const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "classify") catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
+            const hypothesis: []const u8 = body.hypothesis_template orelse "This example is {}.";
+            const hypothesis_bytes = hypothesis.len;
+            const label_and_template_bytes = std.math.add(usize, maxTextBytes(body.labels), hypothesis_bytes) catch
+                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
+            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, 0, body.labels.len, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
+            const text_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            const label_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            const input_tokens = std.math.add(usize, text_tokens, label_tokens) catch std.math.maxInt(usize);
+            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
@@ -11359,6 +11566,10 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rewriters") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "rewrite") catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        validateTextExecutorInvocation(executor_contract, body.inputs.len, body.inputs, 0, 0, 0, 0) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
 
         // Check if this is an encoder-decoder model and find ONNX file paths
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -11402,6 +11613,14 @@ pub const Node = struct {
         var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer hf_tok.deinitSelf();
+        const max_input_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), body.inputs) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = body.inputs.len,
+            .text_bytes_per_item = maxTextBytes(body.inputs),
+            .input_tokens_per_item = max_input_tokens,
+            .output_tokens_per_item = std.math.cast(usize, dec_config.max_length) orelse std.math.maxInt(usize),
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         const rewriting = @import("../pipelines/rewriting.zig");
         var pipeline = rewriting.RewritingPipeline{
@@ -11495,6 +11714,20 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "readers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer admission_manifest.deinit();
+        const executor_contract = resolvedInferenceExecutorContract(self, "read", &admission_manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        const read_prompt_bytes = if (body.prompt) |prompt| prompt.len else 0;
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = body.images.len,
+            .text_bytes_per_item = read_prompt_bytes,
+            .input_tokens_per_item = if (executor_contract.batch.max_input_tokens_per_item != null) read_prompt_bytes else 0,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -11539,11 +11772,28 @@ pub const Node = struct {
             };
             decoded_budget.addImage(item.data) catch |err|
                 return readImageErrorResponse(ctx, err);
+            const physical_mime = image_pipeline.mimeEssenceForEncoded(item.data) orelse
+                return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+            validateEncodedImageMime(item.content_type, item.data) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
+            if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+                return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
             downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
             item_owned = false;
         }
+
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = body.images.len,
+            .text_bytes_per_item = read_prompt_bytes,
+            .input_tokens_per_item = if (executor_contract.batch.max_input_tokens_per_item != null) read_prompt_bytes else 0,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .encoded_media_bytes = batch_bytes,
+            .decoded_pixels = @intCast(decoded_budget.used_pixels),
+            .media_parts_per_item = 1,
+            .has_image = true,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
         if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
@@ -11737,6 +11987,23 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, transcribe_model_name, "transcribers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer admission_manifest.deinit();
+        const executor_contract = resolvedInferenceExecutorContract(self, "transcribe", &admission_manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        if (decoded_audio.mime_type) |declared_mime| {
+            const essence = data_uri_mod.mediaTypeEssence(declared_mime) catch
+                return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
+            if (!manifestAcceptsExecutorMime(&admission_manifest, essence))
+                return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
+        }
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .encoded_media_bytes = media_budget.used_bytes,
+            .media_parts_per_item = 1,
+            .has_audio = true,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -11871,6 +12138,8 @@ pub const Node = struct {
             error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
             error.MixedExtractionOperations => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" }),
         };
+        const schema_contract_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
+        defer ctx.allocator.free(schema_contract_json);
         if (body.schema.entities) |labels| {
             for (labels) |label| if (!isCanonicalLabelSegment(label)) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity labels must be non-empty and cannot contain '::'" });
@@ -11927,6 +12196,7 @@ pub const Node = struct {
             .include_confidence = options.include_confidence orelse false,
             .include_spans = options.include_spans orelse false,
             .input_ids = try canonicalInputIds(ctx.allocator, body.inputs),
+            .schema_bytes = schema_contract_json.len,
         };
         defer ctx.allocator.free(entity_request.input_ids);
         return self.extractEntitiesAndRelations(ctx, entity_request, direct_inputs.texts.items, has_relations);
@@ -11967,6 +12237,22 @@ pub const Node = struct {
         const model_path = self.resolveClassificationRequestModelPath(ctx.allocator, ctx.io, body.model) catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "extract") catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        const schema_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
+        defer ctx.allocator.free(schema_json);
+        var max_candidates: usize = 0;
+        var schema_text_bytes: usize = 0;
+        for (body.schema.classifications orelse &.{}) |schema| {
+            max_candidates = @max(max_candidates, schema.labels.len);
+            schema_text_bytes = @max(schema_text_bytes, maxTextBytes(schema.labels));
+            schema_text_bytes = std.math.add(usize, schema_text_bytes, schema.name.len) catch
+                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
+            if (schema.hypothesis_template) |template| schema_text_bytes = std.math.add(usize, schema_text_bytes, template.len) catch
+                return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
+        }
+        validateTextExecutorInvocation(executor_contract, texts.len, texts, schema_text_bytes, 0, max_candidates, schema_json.len) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
@@ -13261,6 +13547,8 @@ fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) voi
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isInferenceExecutorContractError(err))
+        return inferenceExecutorContractFailureResponse(ctx, err);
     return switch (err) {
         error.QueueFull => transientCapacityFailureResponse(
             ctx,
@@ -14741,18 +15029,20 @@ pub fn resolveInferenceBatchCapabilities(
     };
 }
 
-/// The exact generation contract used by both catalog publication and the
-/// concrete HTTP executor. It is deliberately derived from the loaded
-/// manifest at the execution boundary so a caller cannot bypass a planner by
-/// constructing `/generate` or `/generate/batch` requests directly.
-const ResolvedGenerateExecutorContract = struct {
+/// The exact task-neutral contract used by both catalog publication and every
+/// concrete HTTP executor. It is deliberately derived from the lightweight
+/// manifest at the execution boundary so direct callers cannot bypass the
+/// planner's resource and modality checks.
+const ResolvedInferenceExecutorContract = struct {
+    task: []const u8,
     batch: ResolvedInferenceBatchCapabilities,
     accepts_text: bool,
     accepts_image: bool,
     accepts_audio: bool,
+    accepts_document: bool,
 };
 
-const GenerateExecutorInvocationShape = struct {
+const InferenceExecutorInvocationShape = struct {
     item_count: usize = 1,
     text_bytes_per_item: usize = 0,
     input_tokens_per_item: usize = 0,
@@ -14760,36 +15050,26 @@ const GenerateExecutorInvocationShape = struct {
     encoded_media_bytes: usize = 0,
     decoded_pixels: u64 = 0,
     media_parts_per_item: usize = 0,
+    candidates_per_request: usize = 0,
+    schema_bytes: usize = 0,
+    has_text: bool = false,
     has_image: bool = false,
     has_audio: bool = false,
+    has_document: bool = false,
 };
 
-fn resolvedGenerateExecutorContract(
+fn resolvedInferenceExecutorContract(
     node: *Node,
+    resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
-) !ResolvedGenerateExecutorContract {
-    var manifest_text = false;
-    var manifest_image = false;
-    var manifest_audio = false;
-    var manifest_document = false;
-    for (manifest.inputs) |input| {
-        if (std.mem.eql(u8, input, "text")) manifest_text = true;
-        if (std.mem.eql(u8, input, "image")) manifest_image = true;
-        if (std.mem.eql(u8, input, "audio")) manifest_audio = true;
-        if (std.mem.eql(u8, input, "document") or std.mem.eql(u8, input, "pdf"))
-            manifest_document = true;
-    }
-    if (!manifest_text and !manifest_image and !manifest_audio and !manifest_document) {
-        manifest_text = true;
-        // A metadata-free legacy directory has no exact modality contract yet.
-        // Preserve the HTTP executor's parser-level compatibility and let model
-        // loading provide the final architecture check; explicit manifests and
-        // resolved projector metadata remain exact.
-        manifest_image = true;
-        manifest_audio = true;
-    }
+) !ResolvedInferenceExecutorContract {
+    const manifest_text = model_caps.modelAcceptsInput(manifest, "text");
+    const manifest_image = model_caps.modelAcceptsInput(manifest, "image");
+    const manifest_audio = model_caps.modelAcceptsInput(manifest, "audio");
+    const manifest_document = model_caps.modelAcceptsInput(manifest, "document") or
+        model_caps.modelAcceptsInput(manifest, "pdf");
     const modalities = resolvedExecutorModalities(
-        "generate",
+        resolved_task,
         manifest_text,
         manifest_image,
         manifest_audio,
@@ -14806,16 +15086,13 @@ fn resolvedGenerateExecutorContract(
             false,
         );
     }
-    const max_images = if (modalities.image)
-        std.math.mul(usize, max_generate_batch_items, max_generate_media_parts_per_item) catch
-            std.math.maxInt(usize)
-    else
-        0;
+    const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
     return .{
+        .task = resolved_task,
         .batch = try resolveInferenceBatchCapabilities(
-            "generate",
+            resolved_task,
             manifest.capabilities,
-            false,
+            manifest.native_arch_hint == .florence,
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,
@@ -14825,16 +15102,42 @@ fn resolvedGenerateExecutorContract(
         .accepts_text = modalities.text,
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
+        .accepts_document = modalities.document,
     };
 }
 
-fn manifestAcceptsGenerateImageMime(
+fn resolvedInferenceExecutorContractFromDir(
+    node: *Node,
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    resolved_task: []const u8,
+) !ResolvedInferenceExecutorContract {
+    var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer manifest.deinit();
+    return resolvedInferenceExecutorContract(node, resolved_task, &manifest);
+}
+
+fn executorMaxImages(resolved_task: []const u8) usize {
+    if (std.mem.eql(u8, resolved_task, "read")) return max_read_batch_images;
+    if (std.mem.eql(u8, resolved_task, "generate"))
+        return std.math.mul(usize, max_generate_batch_items, max_generate_media_parts_per_item) catch
+            std.math.maxInt(usize);
+    if (std.mem.eql(u8, resolved_task, "embed")) return 64;
+    if (std.mem.eql(u8, resolved_task, "extract")) return max_serial_family_batch_items;
+    return 1;
+}
+
+fn manifestAcceptsExecutorMime(
     manifest: *const manifest_mod.ModelManifest,
     mime_type: []const u8,
 ) bool {
-    if (std.mem.eql(u8, mime_type, "image/png") or
+    if (std.mem.eql(u8, mime_type, "text/plain") or
+        std.mem.eql(u8, mime_type, "application/json") or
+        std.mem.eql(u8, mime_type, "image/png") or
         std.mem.eql(u8, mime_type, "image/jpeg") or
-        std.mem.eql(u8, mime_type, "image/webp")) return true;
+        std.mem.eql(u8, mime_type, "image/webp") or
+        std.mem.eql(u8, mime_type, "audio/wav") or
+        std.mem.eql(u8, mime_type, "audio/mpeg")) return true;
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
         if (std.mem.startsWith(u8, capability, prefix) and
@@ -14855,7 +15158,7 @@ fn validateEncodedImageMime(declared_mime_type: []const u8, bytes: []const u8) !
     }
 }
 
-fn measureGenerateDecodedImages(
+fn measureExecutorDecodedImages(
     manifest: *const manifest_mod.ModelManifest,
     images: []const []const u8,
 ) !u64 {
@@ -14863,7 +15166,7 @@ fn measureGenerateDecodedImages(
     for (images) |image| {
         const mime_type = image_pipeline.mimeEssenceForEncoded(image) orelse
             return error.InvalidInferenceMedia;
-        if (!manifestAcceptsGenerateImageMime(manifest, mime_type))
+        if (!manifestAcceptsExecutorMime(manifest, mime_type))
             return error.UnsupportedInferenceMimeType;
         const info = image_pipeline.inspectEncodedForInference(image, null) catch
             return error.InvalidInferenceMedia;
@@ -14873,17 +15176,19 @@ fn measureGenerateDecodedImages(
     return pixels;
 }
 
-fn validateGenerateExecutorInvocation(
-    contract: ResolvedGenerateExecutorContract,
-    shape: GenerateExecutorInvocationShape,
+fn validateInferenceExecutorInvocation(
+    contract: ResolvedInferenceExecutorContract,
+    shape: InferenceExecutorInvocationShape,
 ) !void {
     if (shape.item_count == 0 or shape.item_count > contract.batch.max_items)
         return error.InferenceBatchTooLarge;
-    if (shape.text_bytes_per_item > 0 and !contract.accepts_text)
+    if (shape.has_text and !contract.accepts_text)
         return error.UnsupportedInferenceModality;
     if (shape.has_image and !contract.accepts_image)
         return error.UnsupportedInferenceModality;
     if (shape.has_audio and !contract.accepts_audio)
+        return error.UnsupportedInferenceModality;
+    if (shape.has_document and !contract.accepts_document)
         return error.UnsupportedInferenceModality;
     if (shape.encoded_media_bytes > contract.batch.max_encoded_media_bytes)
         return error.InferenceEncodedBytesExceeded;
@@ -14901,6 +15206,24 @@ fn validateGenerateExecutorInvocation(
     if (contract.batch.max_output_tokens_per_item) |limit| {
         if (shape.output_tokens_per_item > limit) return error.InferenceOutputTokensExceeded;
     }
+    if (contract.batch.max_candidates_per_request) |limit| {
+        if (shape.candidates_per_request > limit) return error.InferenceCandidateLimitExceeded;
+    }
+    if (contract.batch.max_schema_bytes) |limit| {
+        if (shape.schema_bytes > limit) return error.InferenceSchemaBytesExceeded;
+    }
+}
+
+fn resolvedGenerateExecutorContract(node: *Node, manifest: *const manifest_mod.ModelManifest) !ResolvedInferenceExecutorContract {
+    return resolvedInferenceExecutorContract(node, "generate", manifest);
+}
+
+fn validateGenerateExecutorInvocation(contract: ResolvedInferenceExecutorContract, shape: InferenceExecutorInvocationShape) !void {
+    return validateInferenceExecutorInvocation(contract, shape);
+}
+
+fn measureGenerateDecodedImages(manifest: *const manifest_mod.ModelManifest, images: []const []const u8) !u64 {
+    return measureExecutorDecodedImages(manifest, images);
 }
 
 const GenerateExecutorContractFailure = struct {
@@ -14938,6 +15261,10 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
                 "INPUT_TOKEN_LIMIT_EXCEEDED"
             else if (err == error.InferenceOutputTokensExceeded)
                 "OUTPUT_TOKEN_LIMIT_EXCEEDED"
+            else if (err == error.InferenceCandidateLimitExceeded)
+                "CANDIDATE_LIMIT_EXCEEDED"
+            else if (err == error.InferenceSchemaBytesExceeded)
+                "SCHEMA_LIMIT_EXCEEDED"
             else
                 "MODEL_RESOURCE_LIMIT",
             .message = if (invalid_contract)
@@ -14949,6 +15276,72 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
             .retryable = false,
         },
     };
+}
+
+fn inferenceExecutorContractFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    const failure = generateExecutorContractError(err);
+    return ctx.status(failure.status).json(.{
+        .@"error" = failure.batch.code,
+        .message = failure.batch.message,
+        .retryable = failure.batch.retryable,
+    });
+}
+
+fn isInferenceExecutorContractError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidInferenceCapabilities,
+        error.UnsupportedInferenceMimeType,
+        error.UnsupportedInferenceModality,
+        error.InvalidInferenceMedia,
+        error.InferenceDecodedPixelsExceeded,
+        error.InferenceEncodedBytesExceeded,
+        error.InferenceBatchTooLarge,
+        error.InferenceMediaPartLimitExceeded,
+        error.InferenceTextBytesExceeded,
+        error.InferenceInputTokensExceeded,
+        error.InferenceOutputTokensExceeded,
+        error.InferenceCandidateLimitExceeded,
+        error.InferenceSchemaBytesExceeded,
+        => true,
+        else => false,
+    };
+}
+
+fn maxTextBytes(items: []const []const u8) usize {
+    var result: usize = 0;
+    for (items) |item| result = @max(result, item.len);
+    return result;
+}
+
+fn validateTextExecutorInvocation(
+    contract: ResolvedInferenceExecutorContract,
+    item_count: usize,
+    items: []const []const u8,
+    additional_text_bytes_per_item: usize,
+    input_tokens_per_item: usize,
+    candidates_per_request: usize,
+    schema_bytes: usize,
+) !void {
+    const text_bytes = std.math.add(usize, maxTextBytes(items), additional_text_bytes_per_item) catch
+        return error.InferenceTextBytesExceeded;
+    // Structured extraction spans several concrete recognizer/reader
+    // implementations. Until each exposes its tokenizer uniformly, retain a
+    // conservative request-text proxy so the executor never silently drops a
+    // published input-token ceiling at this boundary.
+    const effective_input_tokens = if (input_tokens_per_item == 0 and
+        std.mem.eql(u8, contract.task, "extract") and
+        contract.batch.max_input_tokens_per_item != null)
+        text_bytes
+    else
+        input_tokens_per_item;
+    return validateInferenceExecutorInvocation(contract, .{
+        .item_count = item_count,
+        .text_bytes_per_item = text_bytes,
+        .input_tokens_per_item = effective_input_tokens,
+        .candidates_per_request = candidates_per_request,
+        .schema_bytes = schema_bytes,
+        .has_text = items.len > 0 or additional_text_bytes_per_item > 0,
+    });
 }
 
 fn minOptionalLimit(current: ?usize, requested: usize) ?usize {
@@ -15067,8 +15460,9 @@ test "standalone inference catalog validates extensible MIME against executor co
     );
 }
 
-test "generation executor contract enforces every resolved resource dimension" {
-    const contract = ResolvedGenerateExecutorContract{
+test "task-neutral executor contract enforces every resolved resource dimension" {
+    const contract = ResolvedInferenceExecutorContract{
+        .task = "extract",
         .batch = .{
             .mode = .serial_compatibility,
             .preferred_items = 1,
@@ -15080,12 +15474,15 @@ test "generation executor contract enforces every resolved resource dimension" {
             .max_text_bytes_per_item = 8,
             .max_input_tokens_per_item = 4,
             .max_output_tokens_per_item = 3,
+            .max_candidates_per_request = 2,
+            .max_schema_bytes = 16,
         },
         .accepts_text = true,
         .accepts_image = true,
         .accepts_audio = false,
+        .accepts_document = false,
     };
-    try validateGenerateExecutorInvocation(contract, .{
+    try validateInferenceExecutorInvocation(contract, .{
         .item_count = 2,
         .text_bytes_per_item = 8,
         .input_tokens_per_item = 4,
@@ -15093,16 +15490,40 @@ test "generation executor contract enforces every resolved resource dimension" {
         .encoded_media_bytes = 32,
         .decoded_pixels = 6,
         .media_parts_per_item = 1,
+        .candidates_per_request = 2,
+        .schema_bytes = 16,
         .has_image = true,
     });
-    try std.testing.expectError(error.InferenceBatchTooLarge, validateGenerateExecutorInvocation(contract, .{ .item_count = 3 }));
-    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateGenerateExecutorInvocation(contract, .{ .encoded_media_bytes = 33 }));
-    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, validateGenerateExecutorInvocation(contract, .{ .decoded_pixels = 7 }));
-    try std.testing.expectError(error.InferenceMediaPartLimitExceeded, validateGenerateExecutorInvocation(contract, .{ .media_parts_per_item = 2 }));
-    try std.testing.expectError(error.InferenceTextBytesExceeded, validateGenerateExecutorInvocation(contract, .{ .text_bytes_per_item = 9 }));
-    try std.testing.expectError(error.InferenceInputTokensExceeded, validateGenerateExecutorInvocation(contract, .{ .input_tokens_per_item = 5 }));
-    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateGenerateExecutorInvocation(contract, .{ .output_tokens_per_item = 4 }));
-    try std.testing.expectError(error.UnsupportedInferenceModality, validateGenerateExecutorInvocation(contract, .{ .has_audio = true }));
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateInferenceExecutorInvocation(contract, .{ .item_count = 3 }));
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .encoded_media_bytes = 33 }));
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, validateInferenceExecutorInvocation(contract, .{ .decoded_pixels = 7 }));
+    try std.testing.expectError(error.InferenceMediaPartLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .media_parts_per_item = 2 }));
+    try std.testing.expectError(error.InferenceTextBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .text_bytes_per_item = 9 }));
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .input_tokens_per_item = 5 }));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = 4 }));
+    try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
+    try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
+    try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+}
+
+test "executor modality resolution uses the shared manifest authority" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    var text_embedder = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+    };
+    const text_contract = try resolvedInferenceExecutorContract(&node, "embed", &text_embedder);
+    try std.testing.expect(text_contract.accepts_text);
+    try std.testing.expect(!text_contract.accepts_image);
+    try std.testing.expect(!text_contract.accepts_audio);
+
+    text_embedder.visual_model_path = "visual.onnx";
+    text_embedder.audio_model_path = "audio.onnx";
+    const multimodal_contract = try resolvedInferenceExecutorContract(&node, "embed", &text_embedder);
+    try std.testing.expect(multimodal_contract.accepts_text);
+    try std.testing.expect(multimodal_contract.accepts_image);
+    try std.testing.expect(multimodal_contract.accepts_audio);
 }
 
 test "normalized inference capabilities cover every model family" {
@@ -16717,6 +17138,10 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         .data = "{\"type\":\"embedder\",\"inputs\":[\"image\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/generate/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "models/rerankers/owner/rerank/model_manifest.json",
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\"],\"inputs\":[\"text\",\"image\"]}",
     });
@@ -16881,6 +17306,41 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     try std.testing.expectEqual(@as(u16, 200), bytes_batch_response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, bytes_batch_response.body.?, "ENCODED_MEDIA_EXCEEDED") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes_batch_response.body.?, "INVALID_MEDIA_BASE64") == null);
+}
+
+test "classification HTTP enforces resolved candidate limit before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/classifiers/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/classifiers/owner/model/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/classifiers/owner/model/model_manifest.json",
+        .data =
+        \\{"type":"classifier","inputs":["text"],"capabilities":["inference.limits.max_candidates_per_request=1"]}
+        ,
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/classify");
+    defer request.deinit();
+    try request.setJson(
+        "{\"model\":\"owner/model\",\"texts\":[\"page\"],\"labels\":[\"invoice\",\"receipt\"]}",
+    );
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.classifyText(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "CANDIDATE_LIMIT_EXCEEDED") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
 }
 
 test "sparse embed validates text-only input before model loading" {
@@ -17105,6 +17565,10 @@ test "read image preflight maps malformed dimension and aggregate errors before 
     try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
     // Enough for path resolution; reaching model load would fail this test with 500.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/model/model_manifest.json",
+        .data = "{\"type\":\"reader\",\"inputs\":[\"image\"]}",
+    });
     const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
@@ -19390,6 +19854,52 @@ const ParsedDenseEmbedInputs = struct {
         self.parse_errors.deinit(allocator);
     }
 };
+
+fn validateDenseEmbedExecutorInvocation(
+    contract: ResolvedInferenceExecutorContract,
+    manifest: *const manifest_mod.ModelManifest,
+    inputs: *const ParsedDenseEmbedInputs,
+    max_input_tokens: usize,
+) !void {
+    var encoded_media_bytes: usize = 0;
+    var decoded_pixels: u64 = 0;
+    var max_text_bytes: usize = 0;
+    for (inputs.texts.items) |item| max_text_bytes = @max(max_text_bytes, item.text.len);
+    for (inputs.images.items) |item| {
+        encoded_media_bytes = std.math.add(usize, encoded_media_bytes, item.bytes.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        const physical_mime = image_pipeline.mimeEssenceForEncoded(item.bytes) orelse
+            return error.InvalidInferenceMedia;
+        if (item.mime_type) |declared| try validateEncodedImageMime(declared, item.bytes);
+        if (!manifestAcceptsExecutorMime(manifest, physical_mime))
+            return error.UnsupportedInferenceMimeType;
+        const info = image_pipeline.inspectEncodedForInference(item.bytes, null) catch
+            return error.InvalidInferenceMedia;
+        decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+            return error.InferenceDecodedPixelsExceeded;
+    }
+    for (inputs.audio.items) |item| {
+        encoded_media_bytes = std.math.add(usize, encoded_media_bytes, item.bytes.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        if (item.mime_type) |declared| {
+            const essence = data_uri_mod.mediaTypeEssence(declared) catch
+                return error.UnsupportedInferenceMimeType;
+            if (!manifestAcceptsExecutorMime(manifest, essence))
+                return error.UnsupportedInferenceMimeType;
+        }
+    }
+    return validateInferenceExecutorInvocation(contract, .{
+        .item_count = inputs.total_count,
+        .text_bytes_per_item = max_text_bytes,
+        .input_tokens_per_item = max_input_tokens,
+        .encoded_media_bytes = encoded_media_bytes,
+        .decoded_pixels = decoded_pixels,
+        .media_parts_per_item = if (inputs.images.items.len + inputs.audio.items.len > 0) 1 else 0,
+        .has_text = inputs.texts.items.len > 0,
+        .has_image = inputs.images.items.len > 0,
+        .has_audio = inputs.audio.items.len > 0,
+    });
+}
 
 fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
     if (body != .object) return error.RequestBodyMustBeObject;

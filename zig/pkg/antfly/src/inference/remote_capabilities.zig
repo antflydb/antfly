@@ -603,6 +603,9 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
             return error.InvalidInferenceCapabilities;
         for (value.string) |byte| if (std.ascii.isUpper(byte))
             return error.InvalidInferenceCapabilities;
+        if (std.mem.startsWith(u8, parsed.essence, "image/") and
+            !work.supportsEncodedImageMimeEssence(parsed.essence))
+            return error.InvalidInferenceCapabilities;
         try mime_types.add(value.string);
     }
     const input_granularity: work.InputGranularity = std.meta.stringToEnum(
@@ -912,10 +915,10 @@ test "remote Antfly capability v3 preserves exact task contract" {
 
 test "remote Antfly capability v4 preserves extensible MIME and task limits" {
     const payload =
-        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/tiff","image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"task_limits":{"max_text_bytes_per_item":4096,"max_input_tokens_per_item":1024,"max_output_tokens_per_item":512,"max_candidates_per_request":null,"max_schema_bytes":8192},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
+        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/gif","image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"task_limits":{"max_text_bytes_per_item":4096,"max_input_tokens_per_item":1024,"max_output_tokens_per_item":512,"max_candidates_per_request":null,"max_schema_bytes":8192},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
     ;
     const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract)).?;
-    try std.testing.expect(capabilities.acceptsMimeType("image/tiff; profile=baseline"));
+    try std.testing.expect(capabilities.acceptsMimeType("image/gif; profile=baseline"));
     try std.testing.expect(capabilities.acceptsMimeType("image/png"));
     try std.testing.expectEqual(@as(?usize, 4096), capabilities.task_limits.max_text_bytes_per_item);
     try std.testing.expectEqual(@as(?usize, 1024), capabilities.task_limits.max_input_tokens_per_item);
@@ -929,6 +932,16 @@ test "remote Antfly capability v4 preserves extensible MIME and task limits" {
             .modalities = .{ .image = true },
             .schema_bytes = 8193,
         }),
+    );
+}
+
+test "remote Antfly exact capabilities reject image MIME unsupported by local codec" {
+    const payload =
+        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/tiff"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"task_limits":{"max_text_bytes_per_item":null,"max_input_tokens_per_item":null,"max_output_tokens_per_item":null,"max_candidates_per_request":null,"max_schema_bytes":null},"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+    ;
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract),
     );
 }
 

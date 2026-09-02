@@ -378,6 +378,16 @@ pub const Extractor = union(enum) {
         }
     }
 
+    /// Concrete model selected by the resolver. Executor-boundary admission
+    /// uses this path to derive the same manifest contract published in model
+    /// discovery before any task-specific inference begins.
+    pub fn modelPath(self: *const Extractor) []const u8 {
+        return switch (self.*) {
+            .recognizer => |recognizer| recognizer.model_path,
+            .reader => |reader| reader.model_path,
+        };
+    }
+
     pub fn extractText(
         self: *Extractor,
         ctx: Context,

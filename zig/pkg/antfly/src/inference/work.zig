@@ -15,6 +15,14 @@ pub const mimeTypeEssence = data_uri.mediaTypeEssence;
 pub const parseMediaType = data_uri.parseMediaType;
 pub const mediaTypesCompatible = data_uri.mediaTypesCompatible;
 
+/// Whether this process can physically inspect/decode an encoded image with
+/// the declared MIME essence. Remote capability documents are execution
+/// inputs, not trusted metadata: planners must not retain an image MIME that
+/// their own admission boundary cannot measure.
+pub fn supportsEncodedImageMimeEssence(essence: []const u8) bool {
+    return antfly_image.inferenceFormatForMimeEssence(essence) != null;
+}
+
 pub const Task = enum {
     read,
     generate,
