@@ -172,7 +172,9 @@ Release promotion does not hold a workflow-wide GitHub concurrency lock.
 Immutable R2 sealing and the journal `begin` operation each use the same short
 job-level lock as retention, while the compare-and-swapped R2 journal is the
 durable per-channel transaction coordinator between jobs. The
-`container-publish` preflight approval happens before `begin`; the only waits
+digest-addressed container candidate is staged without a deployment gate because
+it cannot change a public alias. The single `container-publish` preflight
+approval happens after staging and before `begin`; the only waits
 afterward are the npm and PyPI trusted-publisher environments required by those
 registries. A wait or interrupted job leaves the exact pending identity
 protected and resumable, without blocking retention or promotions for other
@@ -196,6 +198,19 @@ the supplied ledger and every byte it names before it is accepted. If R2
 repairs a missing or corrupt GitHub payload, the controller restores the
 verified bytes and removes unledgered assets before publishing the release.
 Nightly uses R2 as its only policy-selected source.
+
+The `container-publish` environment follows the versioned contract in
+`scripts/release/github-environments.json`: it accepts the default `main`
+branch plus the legacy release-tag patterns, copies the required-reviewer set
+from the `npm` environment, and prevents self-review. Release preflight and
+retention planning audit the live GitHub configuration before any mutable or
+destructive operation. An administrator applies intentional contract changes
+with:
+
+```bash
+python3 scripts/release/github_environment.py apply \
+  --repository antflydb/antfly
+```
 
 `.github/workflows/antfly-container.yml` has only a `workflow_call` entry point.
 It accepts only the default-branch promotion controller's normal `workflow_run`

@@ -191,6 +191,16 @@ continue. The container approval is completed during preflight, and container,
 object-storage, GitHub, and completion jobs do not wait on another environment
 after the journal is reserved.
 
+Container staging writes only digest-addressed candidates and therefore runs
+before approval without selecting a public alias. `container-publish` is used
+exactly once, by the preflight job, as the human gate before the transaction is
+reserved. Its required reviewers and allowed `main`/legacy tag refs are
+declared in `scripts/release/github-environments.json`. Both release preflight
+and GC planning compare the live environment with that contract. Apply an
+intentional configuration change with `python3
+scripts/release/github_environment.py apply --repository antflydb/antfly` using
+a repository-administrator GitHub token.
+
 Release retention plans are approval artifacts, not advisory previews. Their
 canonical SHA-256 covers policy, retained and expired identities, R2 keys,
 container digests, and per-ledger container records. Apply recomputes under the

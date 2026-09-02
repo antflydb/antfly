@@ -228,6 +228,9 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("gh attestation verify", release_workflow)
         self.assertIn("actions/attest-build-provenance@", release_workflow)
         self.assertIn("--immutable-assets", release_workflow)
+        self.assertNotIn("environment: container-publish", container_workflow)
+        self.assertEqual(release_workflow.count("environment: container-publish"), 1)
+        self.assertIn("github_environment.py check", release_workflow)
         self.assertIn("--content-addressed-prefix", release_workflow)
         self.assertEqual(release_workflow.count("--exact-prefix"), 2)
         self.assertIn("--signer-workflow", release_workflow)
@@ -392,6 +395,8 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertEqual(release_gc_workflow.count("--approved-plan"), 1)
         self.assertIn("name: release-gc-plan", release_gc_workflow)
         self.assertIn("environment: container-publish", release_gc_workflow)
+        self.assertEqual(release_gc_workflow.count("environment: container-publish"), 1)
+        self.assertIn("github_environment.py check", release_gc_workflow)
         self.assertIn("group: antfly-release-storage", release_gc_workflow)
         self.assertIn("uses: google-github-actions/setup-gcloud@", release_gc_workflow)
         self.assertLess(
@@ -434,6 +439,9 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("run: make ", release_job)
         self.assertNotIn("scripts/release/test_", release_job)
         self.assertIn('python-version: "3.13"', release_job)
+        self.assertIn("sudo apt-get install -y xz-utils", release_job)
+        self.assertIn("uses: mlugg/setup-zig@", release_job)
+        self.assertIn("version: 0.16.0", release_job)
         self.assertIn("release-scripting-test:", makefile)
         self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(

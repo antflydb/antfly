@@ -225,6 +225,17 @@ jobs:
         with:
           python-version: "3.13"
 
+      # setup-zig downloads an .xz archive, and the release suite executes the
+      # real completion generator. Keep both dependencies explicit so a clean
+      # runner behaves the same as a developer machine.
+      - name: Install release test tools
+        run: sudo apt-get update && sudo apt-get install -y xz-utils
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
       - name: Test release packaging and scripts
         run: scripts/release/test.sh
 

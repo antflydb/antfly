@@ -54,7 +54,6 @@ env:
 jobs:
   stage:
     runs-on: arc-antfly-publish
-    environment: container-publish
     outputs:
       image_ref: ${{ steps.identity.outputs.image_ref }}
       image_digest: ${{ steps.identity.outputs.image_digest }}
