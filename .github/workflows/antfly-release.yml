@@ -2,6 +2,9 @@ name: Release promotion
 
 # The default-branch build controller produces immutable inputs;
 # repository_dispatch is the exact-ledger recovery path.
+# The R2 channel journal is the durable per-channel transaction coordinator.
+# Job-level concurrency is used only while sealing immutable R2 state or
+# reserving a journal identity, never while a protected environment waits.
 on:
   workflow_run:
     workflows: ["Release build"]
@@ -11,12 +14,6 @@ on:
 
 permissions:
   contents: read
-
-# Release channel state is compare-and-swapped, and a single promotion controller
-# keeps external registries from racing between that preflight and commit.
-concurrency:
-  group: antfly-release-promotion
-  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -31,6 +28,11 @@ jobs:
     name: Authenticate, seal, and restore release bundle
     if: ${{ github.event_name == 'repository_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: arc-antfly-standard
+    # Coordinate immutable R2 publication with retention. Human approvals and
+    # registry publication happen later and never hold this global storage lock.
+    concurrency:
+      group: antfly-release-storage
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
@@ -758,6 +760,9 @@ jobs:
       - preflight-publication
       - stage-container
     runs-on: arc-antfly-standard
+    concurrency:
+      group: antfly-release-storage
+      cancel-in-progress: false
     permissions:
       contents: read
     outputs:
@@ -841,7 +846,6 @@ jobs:
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
           needs.stage-container.result == 'success' }}
     runs-on: arc-antfly-standard
-    environment: container-publish
     permissions:
       contents: read
       packages: write
@@ -1016,7 +1020,6 @@ jobs:
           needs.stage-container.result == 'success' &&
           (needs.publish-github-release.result == 'success' || needs.publish-github-release.result == 'skipped') }}
     runs-on: arc-antfly-standard
-    environment: container-publish
     permissions:
       contents: read
       packages: read

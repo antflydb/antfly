@@ -66,6 +66,8 @@ class MemoryStore:
         artifacts: dict[str, str] | None = None,
         *,
         legacy: bool = False,
+        container_digest: str | None = None,
+        with_container_identity: bool = True,
     ) -> str:
         artifacts = artifacts or {
             "antfly.tar.gz": hashlib.sha256(tag.encode()).hexdigest()
@@ -88,7 +90,7 @@ class MemoryStore:
         for name, digest in artifacts.items():
             self.put(f"{gc.CONTENT_ROOT}{digest}/{name}", b"artifact", modified)
         ledger_digest = hashlib.sha256(ledger_body).hexdigest()
-        container_digest = (
+        container_digest = container_digest or (
             "sha256:" + hashlib.sha256((tag + "-container").encode()).hexdigest()
         )
         self.container_digests[tag] = container_digest
@@ -97,24 +99,25 @@ class MemoryStore:
             if gc.NIGHTLY_PATTERN.fullmatch(tag)
             else "next" if "-" in tag else "stable"
         )
-        self.put(
-            f"{gc.CONTAINER_IDENTITY_ROOT}{ledger_digest}.json",
-            (
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "tag": tag,
-                        "channel": channel,
-                        "commit": "a" * 40,
-                        "ledger_sha256": ledger_digest,
-                        "container_digest": container_digest,
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode(),
-            modified,
-        )
+        if with_container_identity:
+            self.put(
+                f"{gc.CONTAINER_IDENTITY_ROOT}{ledger_digest}.json",
+                (
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "tag": tag,
+                            "channel": channel,
+                            "commit": "a" * 40,
+                            "ledger_sha256": ledger_digest,
+                            "container_digest": container_digest,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode(),
+                modified,
+            )
         return ledger_digest
 
     def add_completion(self, tag: str, ledger: str, age_days: int) -> None:
@@ -203,10 +206,35 @@ class ReleaseGCTests(unittest.TestCase):
             f"{gc.CONTAINER_IDENTITY_ROOT}{nightly_digest}.json",
             {item["record_key"] for item in plan["container_deletions"]},
         )
-        self.assertNotIn(
+        self.assertIn(
             f"{gc.CONTAINER_IDENTITY_ROOT}{nightly_digest}.json",
             plan["delete_keys"],
         )
+
+    def test_expired_release_record_is_deleted_when_container_digest_is_shared(
+        self,
+    ) -> None:
+        store = MemoryStore()
+        shared_digest = f"sha256:{'7' * 64}"
+        stable = store.add_release("v1.2.3", 200, container_digest=shared_digest)
+        store.add_completion("v1.2.3", stable, 200)
+        expired = store.add_release("v1.2.3-rc.1", 200, container_digest=shared_digest)
+
+        plan = gc.plan_gc(store, now=NOW, prerelease_grace_days=90)
+
+        record_key = f"{gc.CONTAINER_IDENTITY_ROOT}{expired}.json"
+        self.assertEqual(plan["container_deletions"], [])
+        self.assertEqual(plan["container_record_deletions"], [record_key])
+        self.assertIn(record_key, plan["delete_keys"])
+
+    def test_schema_four_release_without_container_identity_is_retained(self) -> None:
+        store = MemoryStore()
+        store.add_release("v0.0.0-dev.1", 200, with_container_identity=False)
+        store.add_release("v0.0.0-dev.2", 1)
+
+        plan = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
+
+        self.assertEqual(plan["retained"]["v0.0.0-dev.1"], "missing-container-identity")
 
     def test_recent_and_newest_nightlies_are_both_retained(self) -> None:
         store = MemoryStore()
@@ -311,14 +339,58 @@ class ReleaseGCTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "delete_keys": ["antfly/channels/stable.json"],
                         "container_deletions": [],
+                        "container_record_deletions": [],
                         "snapshots": {},
+                        "approval_sha256": "0" * 64,
                     }
                 )
             )
             with self.assertRaisesRegex(SystemExit, "mutable namespace"):
+                gc.load_plan(path)
+
+    def test_fresh_plan_must_match_the_approved_deletion_contract(self) -> None:
+        store = MemoryStore()
+        store.add_release("v0.0.0-dev.1", 100)
+        store.add_release("v0.0.0-dev.2", 1)
+        approved = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
+        fresh = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
+
+        fresh["planned_at"] = "2099-01-01T00:00:00Z"
+        fresh["snapshots"] = {"antfly/channels/nightly.json": '"new-etag"'}
+        gc.verify_approved_plan(approved, fresh)
+        fresh["delete_keys"] = []
+
+        with self.assertRaisesRegex(SystemExit, "changed after approval"):
+            gc.verify_approved_plan(approved, fresh)
+
+    def test_saved_plan_rejects_a_tampered_approval_contract(self) -> None:
+        store = MemoryStore()
+        store.add_release("v0.0.0-dev.1", 100)
+        store.add_release("v0.0.0-dev.2", 1)
+        plan = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
+        plan["expired"] = {}
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "plan.json"
+            path.write_text(json.dumps(plan))
+            with self.assertRaisesRegex(SystemExit, "approval digest"):
+                gc.load_plan(path)
+
+    def test_saved_plan_validates_container_deletion_identity(self) -> None:
+        store = MemoryStore()
+        store.add_release("v0.0.0-dev.1", 100)
+        store.add_release("v0.0.0-dev.2", 1)
+        plan = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
+        plan["container_deletions"][0]["container_digest"] = "not-a-digest"
+        plan["approval_sha256"] = gc.approval_sha256(plan)
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "plan.json"
+            path.write_text(json.dumps(plan))
+            with self.assertRaisesRegex(SystemExit, "malformed container deletion"):
                 gc.load_plan(path)
 
     def test_r2_deletion_removes_release_commit_markers_last(self) -> None:

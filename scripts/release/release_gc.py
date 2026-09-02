@@ -7,9 +7,10 @@ Other prereleases are retained until their matching stable release has existed
 for the configured grace period. Channel current and pending identities always
 win over retention policy.
 
-The default is a read-only plan. Pass --apply to delete the exact keys in the
-freshly computed plan. Run this under the release-promotion concurrency group so
-immutable uploads and channel journal updates cannot race the sweep.
+The default is a read-only plan. An approved plan may be matched against a fresh
+plan before applying its exact keys. Run planning/application under the release
+storage concurrency group so immutable uploads cannot race the sweep; journal
+snapshots protect concurrent channel projection changes.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ class Release:
     keys: frozenset[str]
     ledger_sha256: str
     content_keys: frozenset[str]
+    schema_version: int | None
 
 
 class ObjectStore(Protocol):
@@ -219,6 +221,7 @@ def load_releases(
             keys=frozenset(keys),
             ledger_sha256=ledger_digest,
             content_keys=frozenset(content_keys),
+            schema_version=schema,
         )
     return releases, all_content_keys, all_container_keys
 
@@ -385,6 +388,8 @@ def plan_gc(
                 retained[tag] = "newest-nightly-count"
             elif release.published_at >= nightly_cutoff:
                 retained[tag] = "nightly-age-window"
+            elif release.schema_version == 4 and tag not in container_records:
+                retained[tag] = "missing-container-identity"
             else:
                 expired[tag] = "nightly-retention-expired"
         else:
@@ -393,6 +398,8 @@ def plan_gc(
                 retained[tag] = "awaiting-matching-stable"
             elif now < matching_stable_completed_at + prerelease_grace:
                 retained[tag] = "matching-stable-grace-window"
+            elif release.schema_version == 4 and tag not in container_records:
+                retained[tag] = "missing-container-identity"
             else:
                 expired[tag] = "prerelease-grace-expired"
 
@@ -417,21 +424,28 @@ def plan_gc(
         if tag in container_records
     }
     container_deletions: list[dict[str, str]] = []
+    container_record_deletions: list[str] = []
     for tag in expired:
         record = container_records.get(tag)
-        if record is None or record["container_digest"] in retained_container_digests:
+        if record is None:
+            continue
+        record_key = f"{CONTAINER_IDENTITY_ROOT}{record['ledger_sha256']}.json"
+        container_record_deletions.append(record_key)
+        if record["container_digest"] in retained_container_digests:
             continue
         container_deletions.append(
             {
                 "tag": tag,
                 "ledger_sha256": str(record["ledger_sha256"]),
                 "container_digest": str(record["container_digest"]),
-                "record_key": f"{CONTAINER_IDENTITY_ROOT}{record['ledger_sha256']}.json",
+                "record_key": record_key,
             }
         )
 
-    return {
-        "schema_version": 1,
+    delete_keys.update(container_record_deletions)
+
+    plan = {
+        "schema_version": 2,
         "planned_at": now.isoformat().replace("+00:00", "Z"),
         "policy": {
             "nightly_days": nightly_days,
@@ -445,9 +459,43 @@ def plan_gc(
         "container_deletions": sorted(
             container_deletions, key=lambda item: item["tag"]
         ),
+        "container_record_deletions": sorted(container_record_deletions),
         "delete_keys": sorted(delete_keys),
         "snapshots": snapshots,
     }
+    plan["approval_sha256"] = approval_sha256(plan)
+    return plan
+
+
+APPROVAL_FIELDS = (
+    "schema_version",
+    "policy",
+    "protected_tags",
+    "retained",
+    "expired",
+    "container_deletions",
+    "container_record_deletions",
+    "delete_keys",
+)
+
+
+def approval_contract(plan: dict[str, Any]) -> dict[str, Any]:
+    return {field: plan.get(field) for field in APPROVAL_FIELDS}
+
+
+def approval_sha256(plan: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        approval_contract(plan), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def verify_approved_plan(approved: dict[str, Any], fresh: dict[str, Any]) -> None:
+    if approval_contract(approved) != approval_contract(fresh):
+        raise SystemExit(
+            "release-GC deletion set changed after approval; inspect and approve a new plan "
+            f"(approved {approval_sha256(approved)}, fresh {approval_sha256(fresh)})"
+        )
 
 
 def verify_snapshots(store: ObjectStore, snapshots: dict[str, str | None]) -> None:
@@ -465,10 +513,12 @@ def load_plan(path: Path) -> dict[str, Any]:
         raise SystemExit(f"cannot read release-GC plan: {path}") from exc
     if (
         not isinstance(plan, dict)
-        or plan.get("schema_version") != 1
+        or plan.get("schema_version") != 2
         or not isinstance(plan.get("delete_keys"), list)
         or not isinstance(plan.get("container_deletions"), list)
+        or not isinstance(plan.get("container_record_deletions"), list)
         or not isinstance(plan.get("snapshots"), dict)
+        or not isinstance(plan.get("approval_sha256"), str)
     ):
         raise SystemExit("malformed release-GC plan")
     for key in plan["delete_keys"]:
@@ -503,11 +553,30 @@ def load_plan(path: Path) -> dict[str, Any]:
             or item["record_key"] != f"{CONTAINER_IDENTITY_ROOT}{ledger}.json"
         ):
             raise SystemExit("release-GC plan contains a malformed container deletion")
+    expected_record_keys = {item["record_key"] for item in plan["container_deletions"]}
+    for key in plan["container_record_deletions"]:
+        if (
+            not isinstance(key, str)
+            or re.fullmatch(
+                rf"{re.escape(CONTAINER_IDENTITY_ROOT)}[0-9a-f]{{64}}\.json", key
+            )
+            is None
+            or key not in plan["delete_keys"]
+        ):
+            raise SystemExit(
+                "release-GC plan contains an invalid container record deletion"
+            )
+    if not expected_record_keys <= set(plan["container_record_deletions"]):
+        raise SystemExit("release-GC plan omits a container record deletion")
     if any(
         not isinstance(key, str) or etag is not None and not isinstance(etag, str)
         for key, etag in plan["snapshots"].items()
     ):
         raise SystemExit("release-GC plan contains invalid channel snapshots")
+    if plan["approval_sha256"] != approval_sha256(plan):
+        raise SystemExit(
+            "release-GC plan approval digest does not match its deletion contract"
+        )
     return plan
 
 
@@ -592,13 +661,19 @@ def main() -> int:
     parser.add_argument("--prerelease-grace-days", type=int)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--apply-plan", type=Path)
+    parser.add_argument("--approved-plan", type=Path)
     parser.add_argument("--containers-cleaned", action="store_true")
     parser.add_argument("--plan-out", type=Path)
     args = parser.parse_args()
 
     store = S3ObjectStore(args.endpoint, args.bucket)
-    if args.apply and args.apply_plan:
-        parser.error("--apply and --apply-plan are mutually exclusive")
+    if (
+        sum(bool(value) for value in (args.apply, args.apply_plan, args.approved_plan))
+        > 1
+    ):
+        parser.error(
+            "--apply, --apply-plan, and --approved-plan are mutually exclusive"
+        )
     if args.apply_plan and any(
         value is not None
         for value in (
@@ -618,17 +693,15 @@ def main() -> int:
             prerelease_grace_days=args.prerelease_grace_days,
         )
     )
+    if args.approved_plan:
+        approved_plan = load_plan(args.approved_plan)
+        verify_approved_plan(approved_plan, plan)
     applying = args.apply or args.apply_plan is not None
     if applying:
-        if plan["container_deletions"] and not args.containers_cleaned:
+        if plan["container_record_deletions"] and not args.containers_cleaned:
             raise SystemExit(
                 "container cleanup is required before R2 deletion; pass --containers-cleaned after it succeeds"
             )
-        if args.containers_cleaned:
-            plan["delete_keys"].extend(
-                item["record_key"] for item in plan["container_deletions"]
-            )
-            plan["delete_keys"] = sorted(set(plan["delete_keys"]))
         verify_snapshots(store, plan["snapshots"])
     elif args.containers_cleaned:
         parser.error("--containers-cleaned requires --apply or --apply-plan")

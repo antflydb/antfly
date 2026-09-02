@@ -182,6 +182,22 @@ similarly named branch. Both environments require approval from a repository
 administrator and prevent the triggering administrator from approving their
 own deployment.
 
+Promotion uses no workflow-wide concurrency lock. Immutable R2 sealing and the
+journal reservation share a short job-level lock with retention; protected
+environment waits do not hold it. The R2 journal is the durable per-channel
+transaction boundary after reservation, so an interrupted npm or PyPI approval
+wait preserves one exact resumable identity while unrelated channels and GC
+continue. The container approval is completed during preflight, and container,
+object-storage, GitHub, and completion jobs do not wait on another environment
+after the journal is reserved.
+
+Release retention plans are approval artifacts, not advisory previews. Their
+canonical SHA-256 covers policy, retained and expired identities, R2 keys,
+container digests, and per-ledger container records. Apply recomputes under the
+release-storage lock and aborts unless that contract is unchanged. Container
+records are collected independently from their shared OCI digest, while a new
+release missing its required record is retained for repair.
+
 Linux releases have two libc variants. The unsuffixed archive is the portable,
 CPU-only musl build used by musl hosts and direct portable downloads. The
 `_gnu` archive is the glibc build used for glibc hosts and runtime-loaded

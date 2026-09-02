@@ -168,6 +168,18 @@ provenance attestations all verify against the immutable R2 copy. GitHub
 release visibility is also one-way: a retry may repair assets on a published
 release but never returns it to draft state.
 
+Release promotion does not hold a workflow-wide GitHub concurrency lock.
+Immutable R2 sealing and the journal `begin` operation each use the same short
+job-level lock as retention, while the compare-and-swapped R2 journal is the
+durable per-channel transaction coordinator between jobs. The
+`container-publish` preflight approval happens before `begin`; the only waits
+afterward are the npm and PyPI trusted-publisher environments required by those
+registries. A wait or interrupted job leaves the exact pending identity
+protected and resumable, without blocking retention or promotions for other
+channels. Container aliases, object aliases, GitHub visibility, final
+verification, and journal completion do not introduce additional approval
+gates after the transaction starts.
+
 Normal registry promotion is triggered by `workflow_run`; the explicit
 `promote-release-channel` `repository_dispatch` event is the general recovery
 path (`promote-cli-release` remains as a compatible stable/next event name).
@@ -349,14 +361,24 @@ R2 metadata alias, are always protected.
 without deleting anything. To inspect a plan immediately, dispatch `Release
 object retention` with its default `apply=false`. To apply retention, dispatch
 it with `apply=true`. The protected `container-publish` approval job finishes
-before the apply job enters the short release-promotion concurrency section.
-Inside that lock, application recomputes the plan, removes only container
-digests with no retained or channel references, checks the journal and alias
-ETags, and then removes R2 objects. The GC never deletes stable releases,
-shared content-addressed objects, or npm/PyPI versions. Immutable completion
-receipts remain as compact audit history after payload deletion. Existing
-`termite/` objects are deliberately outside this Antfly release policy and are
-retained until that retired namespace receives an explicit migration or bucket
+before the apply job enters the short release-storage concurrency section.
+Each archived plan carries a SHA-256 approval contract over its policy,
+retained identities, deletion sets, and container records. Inside the lock,
+application recomputes the plan and proceeds only when that complete contract
+still matches; a newly published or newly expired release therefore requires a
+new plan and approval. Fresh journal and alias ETags protect the actual sweep.
+
+Registry cleanup removes only container digests with no retained or channel
+references. Per-ledger container identity records have an independent
+lifecycle: every expired record is removed after registry validation even when
+its image digest is shared with a retained release. Conversely, a schema-v4
+release missing its immutable container record is retained for repair rather
+than partially collected. R2 payloads and identity records are deleted only
+after registry cleanup succeeds. The GC never deletes stable releases, shared
+content-addressed objects, or npm/PyPI versions. Immutable completion receipts
+remain as compact audit history after payload deletion. Existing `termite/`
+objects are deliberately outside this Antfly release policy and are retained
+until that retired namespace receives an explicit migration or bucket
 lifecycle decision.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same

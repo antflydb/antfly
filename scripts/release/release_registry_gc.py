@@ -26,7 +26,7 @@ def run(args: Sequence[str], runner: Runner) -> subprocess.CompletedProcess[str]
 
 def load_deletions(path: Path) -> list[dict[str, str]]:
     document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if not isinstance(document, dict) or document.get("schema_version") != 2:
         raise SystemExit("unsupported release-GC plan")
     raw = document.get("container_deletions")
     if not isinstance(raw, list):
