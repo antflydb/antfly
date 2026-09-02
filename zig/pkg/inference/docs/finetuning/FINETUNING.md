@@ -114,11 +114,12 @@ antfly inference finetune smoke-fast
 
 ### Gemma4 CUDA DPO/GRPO qualification
 
-Use `scripts/run_gemma4_cuda_preference_smoke.py` for a bounded real-checkpoint
-CUDA policy-training gate. It accepts mounted Gemma4 BF16 SafeTensors model
-directories and never downloads or converts weights. GGUF deployment bundles,
-including 26B-A4B Q4_0, fail preflight because this gate qualifies the
-SafeTensors autodiff trainer rather than the separate quantized inference path.
+Use `scripts/gemma4/run_gemma4_cuda_preference_smoke.py` for a bounded
+real-checkpoint CUDA policy-training gate. It accepts mounted Gemma4 BF16
+SafeTensors model directories and never downloads or converts weights. GGUF
+deployment bundles, including 26B-A4B Q4_0, fail preflight because this gate
+qualifies the SafeTensors autodiff trainer rather than the separate quantized
+inference path.
 
 The runner does not accept a successful process as proof of GPU training. Each
 DPO and GRPO report must attest all of the following:
@@ -168,7 +169,7 @@ Run a one-update DPO/GRPO smoke with:
 
 ```sh
 cd zig/pkg/inference
-python3 scripts/run_gemma4_cuda_preference_smoke.py \
+python3 scripts/gemma4/run_gemma4_cuda_preference_smoke.py \
   --model e2b=/models/gemma-4-E2B-it-bf16 \
   --grpo-target e2b=qualification-sequence-hash-v1 \
   --antfly-bin zig-out/bin/antfly-inference \
@@ -194,7 +195,7 @@ the loss averages token losses within each completion before averaging the
 completion batch.
 
 ```sh
-python3 scripts/run_gemma4_cuda_preference_smoke.py \
+python3 scripts/gemma4/run_gemma4_cuda_preference_smoke.py \
   --model e2b=/models/gemma-4-E2B-it-bf16 \
   --grpo-target e2b=qualification-sequence-hash-v1 \
   --benchmark \

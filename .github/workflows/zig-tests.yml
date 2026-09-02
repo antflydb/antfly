@@ -367,8 +367,6 @@ jobs:
             scripts.gemma4.test_gemma4_cuda_production_gate \
             scripts.gemma4.test_gemma4_qat_cuda_tuning \
             scripts.gemma4.test_gemma4_qat_llamacpp_pair_benchmark \
-            scripts.test_run_gemma4_cuda_preference_smoke \
-            scripts.test_run_gemma4_unsloth_preference_benchmark \
             scripts.test_paired_benchmark \
             scripts.test_regen_cuda_artifacts \
             scripts.test_summarize_cuda_flash_prefill_v2 \

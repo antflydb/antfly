@@ -948,7 +948,7 @@ def main(argv: list[str] | None = None) -> int:
 
         objectives = list(dict.fromkeys(args.objective or ["dpo", "grpo"]))
         validate_grpo_targets(models, targets, objectives, args.benchmark)
-        package_root = pathlib.Path(__file__).resolve().parent.parent
+        package_root = pathlib.Path(__file__).resolve().parents[2]
         antfly_bin = (args.antfly_bin or package_root / "zig-out/bin/antfly-inference").resolve()
         if not antfly_bin.is_file() or not os.access(antfly_bin, os.X_OK):
             raise QualificationError(f"inference binary is not executable: {antfly_bin}")
