@@ -1216,6 +1216,192 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     )
 
 
+def test_adding_artifact_embedding_index_preserves_populated_full_text_across_restarts(
+    stateful_api, openai_embedder
+):
+    """A vector backfill must not publish chunk deletes to a sibling text index."""
+
+    table_name = f"artifact_embedding_add_preserves_text_{time.time_ns()}"
+    doc_key = "existing-artifact-document"
+    canary = "artifactcollapsecanary"
+
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.create_index(
+        table_name,
+        "document_text",
+        {
+            "name": "document_text",
+            "type": "full_text",
+            "field": "text",
+            "artifact_name": "document_chunks_v1",
+            "enrichments": [
+                {
+                    "name": DOCUMENT_UNITS_ARTIFACT,
+                    "kind": "asset",
+                    "field": "url",
+                    "content_type": "application/json",
+                    "producer_json": json.dumps(
+                        {
+                            "type": "document_extraction",
+                            "config": {"ocr": {"enabled": False}},
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "name": "document_chunks_v1",
+                    "kind": "chunk",
+                    "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
+                    "field": "text",
+                    "chunk_size": 512,
+                    "chunk_overlap": 0,
+                    "full_text_index": True,
+                },
+            ],
+        },
+    )
+
+    source = f"A stable document containing {canary}.".encode()
+    merged = stateful_api.batch_write(
+        table_name,
+        inserts={
+            doc_key: {
+                "filename": "canary.txt",
+                "mime_type": "text/plain",
+                "version": "1",
+                "url": "data:text/plain;base64,"
+                + base64.b64encode(source).decode(),
+            }
+        },
+        sync_level="full_index",
+    )
+    assert merged["inserted"] == 1
+
+    def text_projection_intact() -> dict | None:
+        detail = stateful_api.get_index(table_name, "document_text")
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "full_text_index": "document_text",
+                "full_text_search": {"field": "text", "match": canary},
+                "limit": 5,
+            },
+        )
+        if detail.get("status", {}).get("doc_count") != 1:
+            return None
+        if doc_key not in _query_hit_ids(result):
+            return None
+        return {"detail": detail, "result": result}
+
+    before_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert before_restart is not None
+    text_incarnation = before_restart["detail"]["status"]["readiness"]["incarnation"]
+
+    stateful_api.restart_server()
+    baseline_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert baseline_restart is not None
+    assert (
+        baseline_restart["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+    stateful_api.create_index(
+        table_name,
+        "document_vectors",
+        {
+            "name": "document_vectors",
+            "type": "embeddings",
+            "field": "embedding",
+            "dimension": 3,
+            "distance_metric": "cosine",
+            "embedding_name": "document_chunk_dense_v1",
+            "source_artifact_name": "document_chunks_v1",
+            "embedder": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": openai_embedder,
+            },
+            "enrichments": [
+                {
+                    "name": "document_chunk_dense_v1",
+                    "kind": "embedding",
+                    "field": "text",
+                    "source_artifact_name": "document_chunks_v1",
+                    "expected_dims": 3,
+                }
+            ],
+        },
+    )
+    vector_ready = wait_until(
+        lambda: (
+            detail
+            if (detail := stateful_api.get_index(table_name, "document_vectors"))
+            .get("status", {})
+            .get("readiness", {})
+            .get("queryable")
+            is True
+            and detail["status"].get("doc_count") == 1
+            else None
+        ),
+        timeout_s=120.0,
+        interval_s=0.5,
+    )
+    assert vector_ready is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_vectors"),
+        indent=2,
+        sort_keys=True,
+    )
+    assert (
+        wait_until(
+            lambda: (
+                result
+                if doc_key
+                in _query_hit_ids(
+                    result := stateful_api.query_table(
+                        table_name,
+                        {
+                            "semantic_search": canary,
+                            "indexes": ["document_vectors"],
+                            "limit": 5,
+                        },
+                    )
+                )
+                else None
+            ),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+
+    after_embedding_add = text_projection_intact()
+    assert after_embedding_add is not None
+    assert (
+        after_embedding_add["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+    stateful_api.restart_server()
+    after_final_restart = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert after_final_restart is not None
+    assert (
+        after_final_restart["detail"]["status"]["readiness"]["incarnation"]
+        == text_incarnation
+    )
+
+
 def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     stateful_api, openai_embedder
 ):
