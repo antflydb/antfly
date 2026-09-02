@@ -44528,13 +44528,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         };
         var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
         defer publication_context.deinit();
-        const delete_keys = try collectTextReplayDeleteKeys(
-            ctx.alloc,
-            batch,
-            index_ref.name,
-            publication_context.chunk_backed,
-        );
-        defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
         var collected = try collectTextDocumentWritesForIndex(
             ctx.alloc,
             ctx.store,
@@ -44591,10 +44584,21 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 if (before_apply == .projection_changed) {
                     replan_suffix = true;
                 } else {
+                    const delete_keys = if (applied_first_chunk)
+                        &.{}
+                    else
+                        try collectTextReplayDeleteKeys(
+                            ctx.alloc,
+                            ctx.index_manager,
+                            batch,
+                            index_ref.name,
+                            publication_context,
+                        );
+                    defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
                     try ctx.index_manager.applyTextBatchByNameWithOptions(
                         ctx.store,
                         index_ref.name,
-                        if (applied_first_chunk) &.{} else delete_keys,
+                        delete_keys,
                         write_chunk,
                         text_replay_options,
                     );
@@ -44652,7 +44656,21 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.validateDenseEmbeddingArtifactsByName(ctx.store, index_ref.name, dense_embeddings.writes);
 
             const dense_delete_start_ns = monotonicTimeNs();
+            const targeted_delete_keys = try collectTargetedDocumentDeleteKeys(
+                ctx.alloc,
+                batch.documents,
+                .dense_vector,
+                index_ref.name,
+            );
+            defer if (targeted_delete_keys.len > 0) ctx.alloc.free(targeted_delete_keys);
+            // A dense upsert is a replacement only inside the index named by
+            // the embedding write. Deriving the delete after per-index
+            // filtering keeps that intent out of the batch-wide delete lane.
+            const replacement_keys = try collectDenseEmbeddingReplacementKeys(ctx.alloc, dense_embeddings.writes);
+            defer if (replacement_keys.len > 0) ctx.alloc.free(replacement_keys);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, targeted_delete_keys, batch_options);
+            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replacement_keys, batch_options);
             const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
                 entry.chunk_name != null
             else
@@ -44731,7 +44749,15 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.validateSparseEmbeddingArtifactsByName(ctx.store, index_ref.name, sparse_embeddings.writes);
 
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+            const targeted_delete_keys = try collectTargetedDocumentDeleteKeys(
+                ctx.alloc,
+                batch.documents,
+                .sparse_vector,
+                index_ref.name,
+            );
+            defer if (targeted_delete_keys.len > 0) ctx.alloc.free(targeted_delete_keys);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
+            try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, targeted_delete_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
@@ -44890,15 +44916,25 @@ fn managedIndexBatchApplicability(
     index_ref: index_manager_mod.ManagedIndexRef,
 ) ManagedIndexBatchApplicability {
     switch (index_ref.kind) {
-        .full_text, .algebraic => {
+        .full_text => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
-                if (doc.action == .upsert) return .relevant;
+                if (doc.action == .upsert or documentTargetsManagedIndex(doc, .full_text, index_ref.name)) return .relevant;
+            }
+            return .irrelevant;
+        },
+        .algebraic => {
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (doc.action == .upsert or documentTargetsManagedIndex(doc, .algebraic, index_ref.name)) return .relevant;
             }
             return .irrelevant;
         },
         .dense_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (documentTargetsManagedIndex(doc, .dense_vector, index_ref.name)) return .relevant;
+            }
             const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -44916,6 +44952,9 @@ fn managedIndexBatchApplicability(
         },
         .sparse_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (documentTargetsManagedIndex(doc, .sparse_vector, index_ref.name)) return .relevant;
+            }
             const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -45010,6 +45049,10 @@ fn batchAdvancesManagedIndexApplyState(
     switch (index_ref.kind) {
         .dense_vector, .sparse_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
+            const target_kind: derived_types.DerivedTarget = if (index_ref.kind == .dense_vector) .dense_vector else .sparse_vector;
+            for (batch.documents) |doc| {
+                if (doc.action == .delete and documentTargetsManagedIndex(doc, target_kind, index_ref.name)) return true;
+            }
             const artifact_backed_dense = if (index_ref.kind == .dense_vector)
                 if (index_manager.denseIndex(index_ref.name)) |entry| denseIndexIsArtifactBacked(entry) else false
             else
@@ -45603,19 +45646,26 @@ fn appendUniqueBorrowedKeyWithSet(
 
 fn collectTextReplayDeleteKeys(
     alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
     index_name: []const u8,
-    chunk_backed: bool,
+    publication_context: index_manager_mod.TextPublicationContext,
 ) ![]const []const u8 {
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer keys.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
 
-    for (batch.deleted_keys) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
-    for (batch.overwritten_doc_keys) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    for (batch.deleted_keys) |key| {
+        if (!try index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    }
+    for (batch.overwritten_doc_keys) |key| {
+        if (!try index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    }
     for (batch.documents) |doc| {
-        if (doc.action == .delete and !documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
+        if (!documentTargetsTextIndex(doc, index_name, publication_context.chunk_backed)) continue;
         try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, doc.key);
     }
 
@@ -45837,6 +45887,52 @@ fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []co
         if (!is_chunk_index and std.mem.eql(u8, target.index_name, "*")) return true;
     }
     return false;
+}
+
+fn documentTargetsManagedIndex(
+    doc: derived_types.DerivedDocument,
+    kind: derived_types.DerivedTarget,
+    index_name: []const u8,
+) bool {
+    for (doc.targets) |target| {
+        if (target.kind != kind) continue;
+        if (std.mem.eql(u8, target.index_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn collectTargetedDocumentDeleteKeys(
+    alloc: Allocator,
+    documents: []const derived_types.DerivedDocument,
+    kind: derived_types.DerivedTarget,
+    index_name: []const u8,
+) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (documents) |doc| {
+        if (doc.action != .delete) continue;
+        if (!documentTargetsManagedIndex(doc, kind, index_name)) continue;
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, doc.key);
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn collectDenseEmbeddingReplacementKeys(
+    alloc: Allocator,
+    embeddings: []const mapper.DenseEmbeddingWrite,
+) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (embeddings) |embedding| {
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, embedding.doc_key);
+    }
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn collectDenseEmbeddingWrites(alloc: Allocator, embeddings: []const derived_types.DerivedDenseEmbeddingWrite, index_name: []const u8) ![]mapper.DenseEmbeddingWrite {
@@ -72358,6 +72454,96 @@ test "db preflight classifies canonical artifact full-text sources consistently"
     var publication = try db.core.index_manager.acquireTextPublicationContext(alloc, "artifact_text");
     defer publication.deinit();
     try std.testing.expect(publication.chunk_backed);
+}
+
+test "artifact text replay deletes only keys owned by its source projection" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+    });
+    try db.addEnrichment(.{
+        .name = "notes_chunks_v1",
+        .kind = .chunk,
+        .field = "notes",
+        .chunk_size = 64,
+    });
+    try db.addIndex(.{
+        .name = "body_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    const body_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "body_chunks_v1", 0);
+    defer alloc.free(body_key);
+    const notes_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "notes_chunks_v1", 0);
+    defer alloc.free(notes_key);
+
+    const body_target = [_]derived_types.DerivedTargetRef{.{
+        .kind = .full_text,
+        .index_name = "body_text",
+    }};
+    const other_target = [_]derived_types.DerivedTargetRef{.{
+        .kind = .full_text,
+        .index_name = "notes_text",
+    }};
+    const replay_deletes = [_][]const u8{ body_key, notes_key, "doc-a" };
+    const replay_overwrites = [_][]const u8{ notes_key, "doc-b" };
+    const replay_documents = [_]derived_types.DerivedDocument{
+        .{ .key = body_key, .action = .upsert, .targets = &body_target },
+        .{ .key = notes_key, .action = .upsert, .targets = &other_target },
+    };
+
+    var publication = try db.core.index_manager.acquireTextPublicationContext(alloc, "body_text");
+    defer publication.deinit();
+    var apply_guard = try db.core.index_manager.lockManagedIndexApply(.{
+        .name = "body_text",
+        .kind = .full_text,
+    });
+    defer apply_guard.unlock();
+    const keys = try collectTextReplayDeleteKeys(
+        alloc,
+        db.core.index_manager,
+        .{
+            .deleted_keys = &replay_deletes,
+            .overwritten_doc_keys = &replay_overwrites,
+            .documents = &replay_documents,
+        },
+        "body_text",
+        publication,
+    );
+    defer alloc.free(keys);
+
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings(body_key, keys[0]);
+
+    const dense_delete_target = [_]derived_types.DerivedTargetRef{.{
+        .kind = .dense_vector,
+        .index_name = "document_vectors",
+    }};
+    const targeted_delete = [_]derived_types.DerivedDocument{.{
+        .key = body_key,
+        .action = .delete,
+        .targets = &dense_delete_target,
+    }};
+    var record = try change_journal_mod.recordFromDerivedBatch(alloc, .{
+        .documents = &targeted_delete,
+    }, 7);
+    defer change_journal_mod.deinitRecord(alloc, &record);
+    try std.testing.expectEqual(@as(usize, 1), record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings(body_key, record.deleted_doc_keys[0]);
+    try std.testing.expect(journalRecordHasHint(record, .dense_vector));
+    try std.testing.expect(!journalRecordHasHint(record, .full_text));
 }
 
 test "db preflightSearchRequest validates live lane bindings" {
