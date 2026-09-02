@@ -419,6 +419,16 @@ type inferenceBackendPolicy struct {
 }
 
 func inferenceBackendPolicyForPool(pool *antflyaiv1alpha1.InferencePool) inferenceBackendPolicy {
+	switch pool.Spec.Hardware.InferenceBackend {
+	case antflyaiv1alpha1.InferenceRuntimeBackendCPU:
+		return inferenceBackendPolicy{preferred: "native", required: "native"}
+	case antflyaiv1alpha1.InferenceRuntimeBackendCUDA:
+		return inferenceBackendPolicy{preferred: "cuda", required: "cuda"}
+	case antflyaiv1alpha1.InferenceRuntimeBackendPJRT:
+		return inferenceBackendPolicy{preferred: "pjrt", required: "pjrt"}
+	}
+	// Empty and auto retain the pre-field behavior for existing objects. The
+	// admission policy validates explicit contracts for new configurations.
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		return inferenceBackendPolicy{preferred: "pjrt"}
 	}

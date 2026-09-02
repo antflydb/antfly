@@ -175,6 +175,30 @@ func TestInferenceBackendPolicy(t *testing.T) {
 			name: "cpu",
 			pool: &antflyaiv1alpha1.InferencePool{},
 		},
+		{
+			name: "explicit cpu",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendCPU},
+			}},
+			expectedPreferred: "native",
+			expectedRequired:  "native",
+		},
+		{
+			name: "explicit cuda",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendCUDA},
+			}},
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
+		},
+		{
+			name: "explicit pjrt",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendPJRT},
+			}},
+			expectedPreferred: "pjrt",
+			expectedRequired:  "pjrt",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

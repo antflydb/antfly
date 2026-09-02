@@ -86,11 +86,45 @@ func (r *InferencePool) ValidateInferencePool() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateInferenceBackend(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if len(allErrors) > 0 {
 		return fmt.Errorf("InferencePool validation failed:\n  - %s",
 			strings.Join(allErrors, "\n  - "))
 	}
 
+	return nil
+}
+
+func (r *InferencePool) validateInferenceBackend() error {
+	backend := r.Spec.Hardware.InferenceBackend
+	if backend == "" || backend == InferenceRuntimeBackendAuto {
+		return nil
+	}
+	hasGPU := r.hasGPUResources()
+	isTPU := strings.Contains(strings.ToLower(r.Spec.Hardware.Accelerator), "tpu")
+	hasAccelerator := strings.TrimSpace(r.Spec.Hardware.Accelerator) != ""
+	switch backend {
+	case InferenceRuntimeBackendCPU:
+		if hasGPU || hasAccelerator {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cpu cannot be combined with accelerator resources or spec.hardware.accelerator")
+		}
+	case InferenceRuntimeBackendCUDA:
+		if isTPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cuda cannot use a TPU accelerator")
+		}
+		if !hasGPU && !hasAccelerator {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cuda requires GPU resources or spec.hardware.accelerator")
+		}
+	case InferenceRuntimeBackendPJRT:
+		if !isTPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=pjrt requires a TPU accelerator")
+		}
+	default:
+		return fmt.Errorf("spec.hardware.inferenceBackend must be one of auto, cpu, cuda, or pjrt")
+	}
 	return nil
 }
 

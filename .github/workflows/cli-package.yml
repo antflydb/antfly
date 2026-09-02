@@ -18,6 +18,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_VERSION: 0.16.0
+  ZIG_X86_64_LINUX_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 
 jobs:
   package:
@@ -61,6 +62,7 @@ jobs:
           curl --fail --location --retry 3 \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_X86_64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"

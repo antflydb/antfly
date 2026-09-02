@@ -99,12 +99,27 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIsNotNone(minimum_match)
         minimum_glibc = minimum_match.group(1)
 
+        release_build_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-release-build.yml"
+        ).read_text()
         release_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-release.yml").read_text()
         container_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-container.yml").read_text()
         dev_publish = (REPO_ROOT / "scripts" / "publish-zig-runtime-dev.sh").read_text()
-        for source in (release_workflow, container_workflow, dev_publish):
-            gnu_floors = set(re.findall(r"(?:x86_64|aarch64)-linux-gnu\.([0-9]+\.[0-9]+)", source))
-            self.assertEqual(gnu_floors, {minimum_glibc})
+        platform_policy = json.loads((REPO_ROOT / "scripts" / "release" / "platforms.json").read_text())
+        self.assertEqual(platform_policy["glibc_minimum"], minimum_glibc)
+        gnu_floors = {
+            match
+            for platform in platform_policy["platforms"]
+            for match in re.findall(
+                r"(?:x86_64|aarch64)-linux-gnu\.([0-9]+\.[0-9]+)",
+                platform["zig_target"],
+            )
+        }
+        self.assertEqual(gnu_floors, {minimum_glibc})
+        self.assertEqual(
+            set(re.findall(r"(?:x86_64|aarch64)-linux-gnu\.([0-9]+\.[0-9]+)", dev_publish)),
+            {minimum_glibc},
+        )
 
         wheel_floor = minimum_glibc.replace(".", "_")
         gnu_platforms = [platform for platform in package_cli_release.PLATFORMS if platform.npm_libc == "glibc"]
@@ -126,11 +141,23 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("source_commit:", package_workflow)
         self.assertIn("antfly-cli-snapshot", package_workflow)
         self.assertIn("publish_npm_package.sh", release_workflow)
-        self.assertIn("uses: ./.github/workflows/cli-package.yml", release_workflow)
+        self.assertIn("uses: ./.github/workflows/cli-package.yml", release_build_workflow)
+        self.assertIn('tags:\n      - "v*"', release_build_workflow)
+        self.assertIn("permissions:\n  contents: read", release_build_workflow)
+        self.assertNotIn("contents: write", release_build_workflow)
+        self.assertNotIn("id-token: write", release_build_workflow)
+        self.assertNotIn("environment:", release_build_workflow)
+        self.assertNotIn("publish_objectstorage.py", release_build_workflow)
         self.assertNotIn("workflow_dispatch:", release_workflow)
+        self.assertNotIn('tags:\n      - "v*"', release_workflow)
+        self.assertIn("workflow_run:", release_workflow)
+        self.assertIn('workflows: ["Release build"]', release_workflow)
         self.assertIn("repository_dispatch:", release_workflow)
         self.assertIn("promote-cli-release", release_workflow)
+        self.assertIn("release_platforms.py github-matrix", release_build_workflow)
         self.assertIn("verify_release_ledger.py", release_workflow)
+        self.assertIn("--scope cli", release_workflow)
+        self.assertIn("--scope runtime", release_workflow)
         self.assertIn("gh attestation verify", release_workflow)
         self.assertIn("actions/attest-build-provenance@v3", release_workflow)
         self.assertIn("--immutable-assets", release_workflow)
@@ -139,11 +166,24 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("prepare_pypi_promotion.py", release_workflow)
         self.assertNotIn("--replace-assets", release_workflow)
         self.assertNotIn("skip-existing:", release_workflow)
+        self.assertIn("--require-hashes -r scripts/release/requirements.lock", release_workflow)
+        self.assertNotIn("workflow_dispatch:", container_workflow)
+        self.assertNotIn("release:\n", container_workflow)
+        self.assertIn("workflow_call:", container_workflow)
+        self.assertIn("workflow_run|repository_dispatch", container_workflow)
+        self.assertIn("antfly-release-runtime-archives", container_workflow)
+        self.assertIn("consumer-matrix container", container_workflow)
+        self.assertIn("needs: prepare-release-promotion", release_workflow)
+        sdk_npm_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
+        ).read_text()
+        self.assertIn("NPM_VERSION: 11.19.1", sdk_npm_workflow)
+        self.assertIn('npm install -g "npm@$NPM_VERSION"', sdk_npm_workflow)
         platform_publish = [
-            release_workflow.index(f"@antfly/cli-{name} \"$version\"")
+            release_workflow.index(f"@antfly/cli-{name} \"$VERSION\"")
             for name in ("darwin-arm64", "linux-arm64", "linux-x64")
         ]
-        selector_publish = release_workflow.index('@antfly/cli "$version"')
+        selector_publish = release_workflow.index('@antfly/cli "$VERSION"')
         self.assertLess(max(platform_publish), selector_publish)
 
         cloud_build = (REPO_ROOT / "zig" / "cloudbuild.runtime.yaml").read_text()

@@ -48,6 +48,14 @@ def artifact_kind(path: Path) -> str:
     return "support"
 
 
+def artifact_scope(kind: str) -> str:
+    if kind == "runtime-archive":
+        return "runtime"
+    if kind in {"cli-manifest", "python-wheel", "npm-package"}:
+        return "cli"
+    return "support"
+
+
 def generated_at(repo_root: Path, commit: str) -> str:
     raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if raw_epoch is None:
@@ -141,15 +149,18 @@ def main() -> int:
     copied.append(copy_payload_file(repo_root / "openapi.yaml", out_dir))
 
     release_generated_at = generated_at(repo_root, args.commit)
-    artifacts = [
-        {
-            "name": path.name,
-            "kind": artifact_kind(path),
-            "size": path.stat().st_size,
-            "sha256": sha256(path),
-        }
-        for path in copied
-    ]
+    artifacts = []
+    for path in copied:
+        kind = artifact_kind(path)
+        artifacts.append(
+            {
+                "name": path.name,
+                "kind": kind,
+                "scope": artifact_scope(kind),
+                "size": path.stat().st_size,
+                "sha256": sha256(path),
+            }
+        )
     metadata = {
         "tag": tag,
         "version": version,
@@ -165,16 +176,26 @@ def main() -> int:
     metadata_path.write_text(
         json.dumps(metadata, separators=(",", ":")) + "\n", encoding="utf-8"
     )
+    ledger_artifacts = [
+        *artifacts,
+        {
+            "name": metadata_path.name,
+            "kind": "support",
+            "scope": "support",
+            "size": metadata_path.stat().st_size,
+            "sha256": sha256(metadata_path),
+        },
+    ]
     artifacts_path.write_text(
         json.dumps(
             {
                 "tag": tag,
                 "version": version,
                 "commit": args.commit,
-                "schema_version": 1,
+                "schema_version": 2,
                 "generated_at": release_generated_at,
                 "registry_versions": registry_versions,
-                "artifacts": artifacts,
+                "artifacts": ledger_artifacts,
             },
             indent=2,
         )

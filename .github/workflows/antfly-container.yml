@@ -1,28 +1,22 @@
-name: Container
+name: Container promotion
 
+# This workflow is deliberately callable only. The default-branch release
+# controller authenticates and restores the release bundle before invoking it.
 on:
-  release:
-    types: [published]
   workflow_call:
     inputs:
       tag_name:
-        description: "The release tag name (e.g., v1.0.0)"
+        description: "Authenticated release tag (for example v1.0.0)"
         required: true
         type: string
-      artifact_source:
-        description: "Where Linux runtime archives come from: build or github"
-        required: false
-        default: build
-        type: string
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: "The release tag name (e.g., v1.0.0)"
+      source_commit:
+        description: "Authenticated release source commit"
         required: true
-      artifact_source:
-        description: "Where Linux runtime archives come from: build or github"
-        required: false
-        default: build
+        type: string
+      ledger_sha256:
+        description: "Digest of the authenticated release ledger"
+        required: true
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -32,111 +26,10 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.16.0
-  # Keep the glibc-linked host compiler reproducible. Container artifacts use
-  # GNU libc on both architectures so the multi-arch image has one runtime ABI.
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
 
 jobs:
-  build-artifact:
-    name: Build ${{ matrix.arch }} artifact
-    if: ${{ inputs.artifact_source != 'github' }}
-    runs-on: ${{ matrix.runner }}
-    environment: container-publish
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: arc-antfly-publish
-            zig_arch: x86_64
-            zig_target: x86_64-linux-gnu.2.28
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - arch: arm64
-            runner: arc-antfly-publish-arm64
-            zig_arch: aarch64
-            zig_target: aarch64-linux-gnu.2.28
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
-
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Verify runner architecture
-        run: |
-          case "$(uname -m)" in
-            x86_64) actual=amd64 ;;
-            aarch64) actual=arm64 ;;
-            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          if [[ "$actual" != "${{ matrix.arch }}" ]]; then
-            echo "expected ${{ matrix.arch }} runner, got ${actual}" >&2
-            exit 1
-          fi
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
-
-      - name: Install glibc-linked Zig
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
-
-      - name: Build runtime artifact
-        run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
-          VERSION="${VERSION#v}"
-          jobs_arg=()
-          if [ -n "${{ matrix.zig_jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
-          fi
-          scripts/packaging/build_zig_release_archive.sh \
-            --version "$VERSION" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "antfly-zig-${{ matrix.arch }}-gnu.tar.gz" \
-            --out-dir "$RUNNER_TEMP" \
-            --metal false \
-            --system-blas false
-
-      - name: Upload runtime artifact to GCS
-        run: |
-          gsutil cp \
-            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}-gnu.tar.gz" \
-            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}-gnu.tar.gz"
-
   publish:
     runs-on: arc-antfly-publish
-    needs: build-artifact
-    if: ${{ always() && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
     environment: container-publish
     permissions:
       contents: read
@@ -145,7 +38,50 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
           submodules: true
+
+      - name: Revalidate trusted caller and release identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            workflow_run|repository_dispatch) ;;
+            *) echo "untrusted container caller event: $GITHUB_EVENT_NAME" >&2; exit 2 ;;
+          esac
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 2
+          fi
+          [[ "$LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-release-runtime-archives
+          path: dist/release-archives
+
+      - name: Select the canonical GNU container archives
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/container-artifacts"
+          while IFS= read -r entry; do
+            arch="$(jq -r .container_arch <<<"$entry")"
+            archive_pattern="$(jq -r .archive_pattern <<<"$entry")"
+            mapfile -t archives < <(compgen -G "dist/release-archives/$archive_pattern")
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "expected one $archive_pattern archive, found ${#archives[@]}" >&2
+              exit 1
+            fi
+            cp "${archives[0]}" "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}-gnu.tar.gz"
+          done < <(python scripts/release/release_platforms.py consumer-matrix container | jq -c '.include[]')
 
       - name: Authenticate to Google Cloud
         id: auth
@@ -158,35 +94,23 @@ jobs:
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
 
-      - name: Download release runtime archives
-        if: ${{ inputs.artifact_source == 'github' }}
-        uses: actions/download-artifact@v6
-        with:
-          pattern: antfly-zig-linux-*-gnu
-          merge-multiple: true
-          path: dist/release-archives
-
-      - name: Upload release runtime archives to GCS
-        if: ${{ inputs.artifact_source == 'github' }}
+      - name: Upload verified runtime archives to immutable build inputs
+        env:
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/container-artifacts"
-          cp dist/release-archives/antfly_*_Linux_x86_64_gnu.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-amd64-gnu.tar.gz"
-          cp dist/release-archives/antfly_*_Linux_arm64_gnu.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-arm64-gnu.tar.gz"
           for arch in amd64 arm64; do
             gsutil cp \
               "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}-gnu.tar.gz" \
-              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}-gnu.tar.gz"
+              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz"
           done
 
-      - name: Extract version
-        id: version
-        run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name }}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Extracted version: ${VERSION}"
-
-      - name: Package GAR images with Cloud Build
+      - name: Package architecture images with Cloud Build
+        env:
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+          VERSION: ${{ inputs.tag_name }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -202,17 +126,18 @@ jobs:
               sleep "${sleep_seconds}"
             done
           }
-          VERSION="${{ steps.version.outputs.version }}"
           for arch in amd64 arm64; do
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
-      - name: Create GAR multi-arch manifest with Cloud Build
+      - name: Create the multi-architecture manifest last
+        env:
+          VERSION: ${{ inputs.tag_name }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -224,68 +149,54 @@ jobs:
                 return 1
               fi
               sleep_seconds=$((attempt * 15))
-              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
               sleep "${sleep_seconds}"
             done
           }
-          VERSION="${{ steps.version.outputs.version }}"
-          ALIAS_TAG=latest
-          if [[ "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
-            ALIAS_TAG=__skip_alias__
-          fi
           submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
 
-      - name: Mirror image GAR -> GHCR
+      - name: Mirror the immutable version from GAR to GHCR
+        env:
+          VERSION: ${{ inputs.tag_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
-          fi
-          for tag in "${TAGS[@]}"; do
-            crane copy \
-              "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${tag}" \
-              "ghcr.io/antflydb/antfly:${tag}"
-          done
+          crane copy \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}" \
+            "ghcr.io/antflydb/antfly:${VERSION}"
 
       - uses: sigstore/cosign-installer@v3
 
-      - name: Sign GHCR images
+      - name: Sign the immutable GAR and GHCR image digests
+        env:
+          VERSION: ${{ inputs.tag_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
-          fi
-          for tag in "${TAGS[@]}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              "ghcr.io/antflydb/antfly:${tag}"
-          done
+          cosign sign --yes \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ inputs.source_commit }}" \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}"
+          cosign sign --yes \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ inputs.source_commit }}" \
+            "ghcr.io/antflydb/antfly:${VERSION}"
 
-      - name: Sign GAR images
+      - name: Commit stable container aliases last
+        if: ${{ !contains(inputs.tag_name, '-') && !startsWith(inputs.tag_name, 'v0.1.') }}
+        env:
+          VERSION: ${{ inputs.tag_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
-          fi
-          for tag in "${TAGS[@]}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/antfly:${tag}"
-          done
+          crane copy \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}" \
+            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:latest"
+          crane copy \
+            "ghcr.io/antflydb/antfly:${VERSION}" \
+            "ghcr.io/antflydb/antfly:latest"

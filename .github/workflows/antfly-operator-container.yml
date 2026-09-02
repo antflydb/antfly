@@ -103,7 +103,7 @@ jobs:
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
-              ghcr.io/antflydb/antfly-operator:${tag}
+              "ghcr.io/antflydb/antfly-operator:${tag}"
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \

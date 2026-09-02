@@ -48,6 +48,18 @@ const (
 	LoadingStrategyBounded LoadingStrategy = "bounded" // LRU eviction
 )
 
+// InferenceRuntimeBackend is the runtime contract for a pool. Auto preserves
+// legacy accelerator-based selection; new pools should choose an explicit
+// backend so scheduling and runtime failover cannot disagree.
+type InferenceRuntimeBackend string
+
+const (
+	InferenceRuntimeBackendAuto InferenceRuntimeBackend = "auto"
+	InferenceRuntimeBackendCPU  InferenceRuntimeBackend = "cpu"
+	InferenceRuntimeBackendCUDA InferenceRuntimeBackend = "cuda"
+	InferenceRuntimeBackendPJRT InferenceRuntimeBackend = "pjrt"
+)
+
 // ActivationLeasePoolLabel identifies the InferencePool controlled by a
 // request-driven activation Lease. The Lease has the same name and namespace
 // as its pool and uses the pool UID as its holder identity.
@@ -63,8 +75,8 @@ type InferencePoolSpec struct {
 	// Config is the Inference configuration as a JSON string.
 	// This is merged with auto-generated configuration and passed to inference via --config.
 	// Supports Zig runtime options such as admission, prompt_cache, kernel_jit,
-	// keep_alive_ms, and max_loaded_models. Accelerator backends are selected
-	// automatically from spec.hardware.
+	// keep_alive_ms, and max_loaded_models. Runtime selection comes from
+	// spec.hardware.inferenceBackend; auto retains legacy accelerator inference.
 	// Example: {"admission": {"inference": {"max_concurrent_requests": 8}}}
 	// +optional
 	Config string `json:"config,omitempty"`
@@ -218,6 +230,14 @@ type PerModelReplica struct {
 
 // HardwareConfig defines TPU/accelerator configuration
 type HardwareConfig struct {
+	// InferenceBackend is the required runtime class. CPU maps to Antfly's native
+	// backend, CUDA requires an NVIDIA-compatible GPU, and PJRT requires a TPU.
+	// Auto retains legacy inference from accelerator fields for existing pools.
+	// +kubebuilder:validation:Enum=auto;cpu;cuda;pjrt
+	// +kubebuilder:default=auto
+	// +optional
+	InferenceBackend InferenceRuntimeBackend `json:"inferenceBackend,omitempty"`
+
 	// Accelerator is the accelerator type label (empty = no accelerator/CPU only)
 	// +optional
 	Accelerator string `json:"accelerator,omitempty"`

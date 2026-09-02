@@ -251,7 +251,7 @@ class ReleasePromotionTests(unittest.TestCase):
             ):
                 self.assertEqual(payload.main(), 0)
             ledger = json.loads((output / "artifacts.json").read_text())
-            self.assertEqual(ledger["schema_version"], 1)
+            self.assertEqual(ledger["schema_version"], 2)
             self.assertEqual(ledger["generated_at"], "1970-01-01T00:00:00Z")
             self.assertEqual(
                 ledger["registry_versions"], {"npm": "1.2.3", "python": "1.2.3"}
@@ -260,6 +260,8 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertIn("runtime-archive", kinds)
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
+            scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
+            self.assertEqual(scopes, {"runtime", "cli", "support"})
 
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"
@@ -278,6 +280,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 str(output / "artifacts.json"),
                 "--payload-dir",
                 str(promotion),
+                "--scope",
+                "cli",
                 "--tag",
                 "v1.2.3",
                 "--commit",
@@ -287,6 +291,17 @@ class ReleasePromotionTests(unittest.TestCase):
             ]
             with mock.patch.object(sys, "argv", verify_argv):
                 self.assertEqual(verifier.main(), 0)
+
+            # Control-plane files live in the ledger scope, never beside CLI
+            # payload bytes. This covers the production recovery layout.
+            misplaced_ledger = promotion / "artifacts.json"
+            misplaced_ledger.write_bytes((output / "artifacts.json").read_bytes())
+            with (
+                mock.patch.object(sys, "argv", verify_argv),
+                self.assertRaisesRegex(SystemExit, "release cli scope mismatch"),
+            ):
+                verifier.main()
+            misplaced_ledger.unlink()
 
             promoted_package.write_bytes(b"drift")
             with (

@@ -42,19 +42,24 @@ consumers.
    artifacts from that same run and builds all npm tarballs and Python wheels
    once.
 3. The workflow records their hashes, source commit, npm version, and PEP 440
-   Python version in `cli-snapshot.json`. The top-level workflow merges that
-   snapshot with the native archives into a deterministic `artifacts.json`
-   ledger and attests every exact payload file.
+   Python version in `cli-snapshot.json`. The tag workflow has read-only
+   permissions and stops after uploading the runtime archives, CLI snapshot,
+   and release identity as Actions artifacts.
 4. GitHub Release assets and versioned object-storage objects are immutable:
-   retries accept an existing object only when its digest matches. Object
-   storage also retains content-addressed objects under `sha256/<digest>/`.
-5. The tag run sends the version and ledger digest through a
-   `promote-cli-release` repository dispatch. GitHub always loads that promotion
-   path from the default branch; top-level trusted-publisher jobs then promote
-   the exact snapshot bytes to PyPI and npm. They skip an existing version only
-   after comparing the registry digest, so retries cannot conceal drift. Native
-   archives remain available under
-   `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
+   the default-branch promotion workflow combines the build outputs into a
+   schema-versioned `artifacts.json` ledger whose entries belong to explicit
+   `runtime`, `cli`, or `support` scopes, verifies it, and attests every exact
+   payload file. Retries accept an existing object only when its digest matches.
+   Object storage also retains content-addressed objects under
+   `sha256/<digest>/`.
+5. GitHub starts that promotion through `workflow_run`, so the privileged code
+   is always loaded from the default branch. The controller verifies the
+   complete release bundle before promoting its CLI scope to PyPI and npm, its
+   GNU runtime scope to the single container image, and stable archives to
+   Homebrew. Mutable channel aliases and GitHub release visibility are
+   committed last. Registry jobs skip an existing version only after comparing
+   its digest, so retries cannot conceal drift. Native archives remain available
+   under `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
 
 For recovery, send the same repository dispatch with an existing release tag
 and the SHA-256 of its `artifacts.json` asset:
@@ -66,12 +71,12 @@ gh api --method POST repos/antflydb/antfly/dispatches \
   -f 'client_payload[ledger_sha256]=<64-character-sha256>'
 ```
 
-Recovery downloads the saved ledger, npm tarballs, wheels, and manifest from
-the GitHub release; verifies every GitHub attestation against the expected
-release-workflow signer, tag ref, repository, and source-commit digest; binds
-the promotion to the supplied ledger digest; verifies every artifact hash; and
-promotes those exact bytes. It never checks out historical or operator-selected
-source to rebuild or publish registry artifacts.
+Recovery downloads the complete saved payload from the GitHub release;
+verifies every GitHub attestation against the expected release-workflow signer,
+tag ref, repository, and source-commit digest; binds the promotion to the
+supplied ledger digest; verifies every typed scope and artifact hash; and
+promotes those exact bytes. It never checks out operator-selected source to
+rebuild or publish registry artifacts.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub

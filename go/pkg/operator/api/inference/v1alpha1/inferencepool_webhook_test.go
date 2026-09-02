@@ -300,6 +300,45 @@ func TestValidateInferencePool_AutopilotGPURequiresAcceleratorClass(t *testing.T
 	}
 }
 
+func TestValidateInferencePool_ExplicitInferenceBackend(t *testing.T) {
+	tests := []struct {
+		name        string
+		backend     InferenceRuntimeBackend
+		accelerator string
+		gpu         bool
+		wantError   string
+	}{
+		{name: "cpu", backend: InferenceRuntimeBackendCPU},
+		{name: "cpu rejects accelerator", backend: InferenceRuntimeBackendCPU, accelerator: "nvidia-l4", wantError: "cannot be combined"},
+		{name: "cuda", backend: InferenceRuntimeBackendCUDA, accelerator: "nvidia-l4"},
+		{name: "cuda resource", backend: InferenceRuntimeBackendCUDA, gpu: true},
+		{name: "cuda requires hardware", backend: InferenceRuntimeBackendCUDA, wantError: "requires GPU resources"},
+		{name: "cuda rejects tpu", backend: InferenceRuntimeBackendCUDA, accelerator: "tpu-v5-lite-podslice", wantError: "cannot use a TPU"},
+		{name: "pjrt", backend: InferenceRuntimeBackendPJRT, accelerator: "tpu-v5-lite-podslice"},
+		{name: "pjrt requires tpu", backend: InferenceRuntimeBackendPJRT, accelerator: "nvidia-l4", wantError: "requires a TPU"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := validPool()
+			pool.Spec.Hardware.InferenceBackend = test.backend
+			pool.Spec.Hardware.Accelerator = test.accelerator
+			if test.gpu {
+				pool.Spec.Resources = &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+					"nvidia.com/gpu": resource.MustParse("1"),
+				}}
+			}
+			err := pool.ValidateInferencePool()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected validation error: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("expected error containing %q, got %v", test.wantError, err)
+			}
+		})
+	}
+}
+
 func TestValidateInferencePool_ScaleToZeroContract(t *testing.T) {
 	idle := metav1.Duration{Duration: 10 * time.Minute}
 	wait := metav1.Duration{Duration: 4 * time.Minute}

@@ -12,12 +12,18 @@ import json
 import re
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from email.message import Message
 from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "release"))
+from release_platforms import load_policy  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -41,15 +47,25 @@ class Platform:
             raise ValueError(f"non-npm platform {self.key} must not declare npm libc")
 
 
-PLATFORMS = (
-    Platform("darwin-arm64", "cli-darwin-arm64", "Darwin", "arm64", "macosx_11_0_arm64"),
-    Platform("linux-arm64-gnu", "cli-linux-arm64", "Linux", "arm64", "manylinux_2_28_aarch64", "gnu", "glibc"),
-    Platform("linux-x64-gnu", "cli-linux-x64", "Linux", "x86_64", "manylinux_2_28_x86_64", "gnu", "glibc"),
-    # Portable musl archives are standalone distributions. npm and Python use
-    # the GNU builds supported by their standard Linux runtimes.
-    Platform("linux-arm64-musl", None, "Linux", "arm64", None),
-    Platform("linux-x64-musl", None, "Linux", "x86_64", None),
-)
+def release_platforms() -> tuple[Platform, ...]:
+    platforms: list[Platform] = []
+    for entry in load_policy()["platforms"]:
+        suffix = entry["archive_suffix"]
+        platforms.append(
+            Platform(
+                entry["id"],
+                entry.get("npm_package_dir"),
+                entry["archive_os"],
+                entry["archive_arch"],
+                entry.get("wheel_platform"),
+                suffix.removeprefix("_") or None,
+                entry.get("npm_libc"),
+            )
+        )
+    return tuple(platforms)
+
+
+PLATFORMS = release_platforms()
 
 PACKAGE_PLATFORMS = tuple(platform for platform in PLATFORMS if platform.npm_package_dir)
 

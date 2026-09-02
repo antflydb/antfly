@@ -49,56 +49,59 @@ SDK and enables Metal and Accelerate.
 
 ## Pipeline Ownership
 
-`.github/workflows/antfly-release.yml` is the tag release pipeline.
+Release is deliberately split across two workflows so code loaded from an
+untrusted tag never receives publication credentials.
 
-1. `build-zig-runtime-archives` builds the canonical Zig archives on the
-   appropriate native or cross-compilation runners and uploads them as GitHub
-   Actions artifacts.
-2. `package-cli-artifacts` calls `.github/workflows/cli-package.yml` to build the
-   `antfly-cli` wheels and `@antfly/cli` npm packages directly from the native
-   Actions artifacts. It creates one source-commit-bound manifest for those
-   exact bytes.
-3. `publish-release-assets` combines the native archives and CLI snapshot into
-   one deterministic artifact ledger, attests every payload file, and stores the
-   exact bytes on the draft GitHub Release and under immutable, content-addressed
-   object-storage keys. Immutable S3-compatible writes use a conditional create,
-   and the stable `metadata.json` channel pointer is updated only after every
-   immutable object and compatibility alias succeeds. The tag run then requests
-   a default-branch registry promotion with the release tag and ledger digest.
-   Top-level trusted-publisher jobs verify and promote those same CLI bytes. A
-   recovery repository dispatch follows the identical path without rebuilding.
-4. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
-   Zig archive checksums. RC tags do not update the stable tap formula.
-5. `publish-container` calls `.github/workflows/antfly-container.yml` with
-   `artifact_source: github`, so the container image uses the Linux archives
-   already built by the release.
+1. `.github/workflows/antfly-release-build.yml` is the tag workflow. With only
+   read permission, it builds the canonical Zig archives, calls
+   `.github/workflows/cli-package.yml`, and uploads the native archives, CLI
+   snapshot, and source-commit-bound release request as Actions artifacts.
+2. Completion triggers `.github/workflows/antfly-release.yml` through
+   `workflow_run`. GitHub loads this privileged promotion workflow from the
+   default branch. It checks the tag and source commit, combines the build
+   outputs into one schema-versioned artifact ledger, verifies it, attests
+   every payload file, and stores the exact bytes on a draft GitHub Release and
+   under immutable, content-addressed object-storage keys.
+3. The promotion controller separates the complete payload into
+   ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
+   exact scope membership, and every digest.
+4. npm, PyPI, Homebrew, and the single multi-architecture container image
+   consume those verified scopes. The container publisher is callable only by
+   this controller and consumes the GNU runtime archives built in step 1.
+5. Stable container aliases move only after the registry and Homebrew versioned
+   publications succeed. `promote-release-channel` then updates object-storage
+   aliases and publishes the draft GitHub Release. RC releases skip stable
+   aliases and Homebrew.
 
-After the unified release payload is published, package registry publishes,
-Homebrew, and container publishing fan out independently. A PyPI or npm publish
-failure must not block the container image for the same tag. npm platform
-packages publish before the top-level selector, and existing npm or PyPI files
-are skipped only when their registry digest matches, so a partial publication
-is safe to retry without hiding content drift. Existing GitHub release assets
-are likewise accepted only when byte-identical; release automation never
-replaces a saved artifact.
+npm platform packages publish before the top-level selector, and existing npm
+or PyPI files are skipped only when their registry digest matches, so a partial
+publication is safe to retry without hiding content drift. Existing GitHub
+release assets are likewise accepted only when byte-identical; release
+automation never replaces a saved artifact.
 
-Registry promotion is triggered only by the `promote-cli-release`
-`repository_dispatch` event, so GitHub loads the workflow from the default
-branch rather than an operator-selected ref. The `pypi` and `npm` environments
-admit this CLI promotion from `main`; typed tag rules preserve pre-transition
-`v*` releases and the existing SDK publishers without allowing similarly named
-branches. Both environments require review with self-approval disabled.
-Recovery requests include the exact `artifacts.json` SHA-256; the promotion
-verifies that digest, its attestation, tag and source commit before granting
-either registry job access.
+Normal registry promotion is triggered by `workflow_run`; the explicit
+`promote-cli-release` `repository_dispatch` event is only the recovery path.
+Both entry points load the promotion workflow from the default branch rather
+than an operator-selected ref. The `pypi` and `npm` environments admit this CLI
+promotion from `main`; typed tag rules preserve pre-transition `v*` releases
+and the existing SDK publishers without allowing similarly named branches.
+Both environments require review with self-approval disabled. Recovery
+requests include the exact `artifacts.json` SHA-256; the promotion verifies
+that digest, its attestation, tag and source commit before granting either
+registry job access.
 
-`.github/workflows/antfly-container.yml` still supports standalone container
-publishes. In standalone mode it builds the GNU Linux archives on native Linux
-runners, uploads them to the container artifact bucket, and packages images from
-those tarballs. In release mode it skips the redundant build and uploads the
-already-built GNU release archives to the same bucket path expected by Cloud
-Build. Cloud Build requires an explicit immutable artifact URI; the config does
-not carry a mutable or ABI-ambiguous default artifact.
+`.github/workflows/antfly-container.yml` has only a `workflow_call` entry point.
+It accepts only the default-branch promotion controller's normal `workflow_run`
+or recovery dispatch events, rechecks source ancestry and the release-ledger
+digest, and consumes the verified GNU archives. Cloud Build uses an immutable
+source-commit-and-ledger-addressed artifact URI and has no mutable or
+ABI-ambiguous default input.
+
+The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
+in `scripts/release/platforms.json`. Release jobs, CLI packaging, and Homebrew
+read that policy instead of maintaining independent platform tables. Python
+dependencies used by the release control plane are exact and hash-locked in
+`scripts/release/requirements.lock`; Node and npm versions are exact as well.
 
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:

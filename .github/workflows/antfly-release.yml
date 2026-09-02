@@ -1,12 +1,11 @@
-name: Release
+name: Release promotion
 
+# Both entry points load this workflow from the default branch. Completed tag
+# builds are promoted automatically; repository_dispatch is the recovery path.
 on:
-  push:
-    tags:
-      - "v*" # Triggers on tags like v1.0.0, v0.0.0-dev10
-  # Registry promotion always loads this workflow from the default branch.
-  # Tag builds and operators request promotion through the repository API;
-  # there is deliberately no ref-selectable workflow_dispatch entry point.
+  workflow_run:
+    workflows: ["Release build"]
+    types: [completed]
   repository_dispatch:
     types: [promote-cli-release]
 
@@ -15,397 +14,302 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.16.0
-  BOTO3_VERSION: 1.43.86
   NPM_VERSION: 11.19.1
-  # Keep the glibc-linked host compiler reproducible. Linux release artifacts
-  # include portable musl builds and GNU builds for containers and plugins.
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
-  MACOS_SDK_VERSION: "15.5"
-  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
 jobs:
-  authorize-release-source:
-    name: Authorize release source
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+  prepare-release-promotion:
+    name: Authenticate, seal, and restore release bundle
+    if: ${{ github.event_name == 'repository_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: arc-antfly-standard
     permissions:
-      contents: read
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      commit: ${{ steps.identity.outputs.commit }}
+      ledger_sha256: ${{ steps.ledger.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Require the tagged commit to be on the default branch
-        env:
-          RELEASE_COMMIT: ${{ github.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-
-  build-zig-runtime-archives:
-    name: Build Zig archive (${{ matrix.artifact_name }})
-    if: ${{ github.event_name == 'push' }}
-    needs: authorize-release-source
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - artifact_name: antfly-zig-linux-amd64
-            runner: arc-antfly-publish
-            os: linux
-            zig_arch: x86_64
-            zig_target: x86_64-linux-musl
-            archive_os: Linux
-            archive_arch: x86_64
-            archive_suffix: ""
-            macos_sdk: "false"
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - artifact_name: antfly-zig-linux-amd64-gnu
-            runner: arc-antfly-publish
-            os: linux
-            zig_arch: x86_64
-            zig_target: x86_64-linux-gnu.2.28
-            archive_os: Linux
-            archive_arch: x86_64
-            archive_suffix: _gnu
-            macos_sdk: "false"
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - artifact_name: antfly-zig-linux-arm64
-            # Zig supplies the musl libc and target linker, so this artifact
-            # does not need a native ARM64 runner.
-            runner: arc-antfly-publish
-            os: linux
-            zig_arch: x86_64
-            zig_target: aarch64-linux-musl
-            archive_os: Linux
-            archive_arch: arm64
-            archive_suffix: ""
-            macos_sdk: "false"
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - artifact_name: antfly-zig-linux-arm64-gnu
-            runner: arc-antfly-publish-arm64
-            os: linux
-            zig_arch: aarch64
-            zig_target: aarch64-linux-gnu.2.28
-            archive_os: Linux
-            archive_arch: arm64
-            archive_suffix: _gnu
-            macos_sdk: "false"
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - artifact_name: antfly-zig-darwin-arm64
-            # The v0.1.x release used this same Linux-to-Darwin Zig toolchain.
-            # Metal and Accelerate are target framework links; they do not run
-            # on the build host.
-            runner: arc-antfly-publish
-            os: linux
-            zig_arch: x86_64
-            zig_target: aarch64-macos
-            archive_os: Darwin
-            archive_arch: arm64
-            archive_suffix: ""
-            macos_sdk: "true"
-            metal: "true"
-            system_blas: "true"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Linux build dependencies
-        if: ${{ matrix.os == 'linux' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
-
-      - name: Install Nix
-        if: ${{ matrix.os == 'linux' }}
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
-
-      - name: Install glibc-linked Zig (Linux)
-        if: ${{ matrix.os == 'linux' }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
-
-      - name: Install pinned macOS cross-compilation SDK
-        if: ${{ matrix.macos_sdk == 'true' }}
-        run: |
-          set -euo pipefail
-          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
-          sdk_stage="$RUNNER_TEMP/macos-sdk"
-          curl --fail --location --retry 3 \
-            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
-            -o "$sdk_archive"
-          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
-          mkdir -p "$sdk_stage"
-          tar -xJf "$sdk_archive" -C "$sdk_stage"
-
-          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
-          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
-          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
-          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
-          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
-
-      - name: Test reproducible archive packaging
-        run: python3 scripts/packaging/test_reproducible_tar.py
-
-      - name: Build archive
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
-          jobs_arg=()
-          if [ -n "${{ matrix.zig_jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
-          fi
-          scripts/packaging/build_zig_release_archive.sh \
-            --version "$version" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "$archive" \
-            --out-dir dist/release-archives \
-            --metal "${{ matrix.metal }}" \
-            --system-blas "${{ matrix.system_blas }}"
-
-      - name: Upload archive
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/release-archives/*.tar.gz
-          if-no-files-found: error
-
-  publish-release-assets:
-    name: Publish release assets
-    needs:
-      - build-zig-runtime-archives
-      - package-cli-artifacts
-    runs-on: arc-antfly-standard
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Download native Zig runtime archives
+      - name: Download runtime archives from the completed build
+        if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/download-artifact@v6
         with:
           pattern: antfly-zig-*
           merge-multiple: true
           path: dist/release-archives
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download immutable CLI snapshot
+      - name: Download CLI snapshot from the completed build
+        if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download release identity from the completed build
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-release-request
+          path: dist/release-request
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve and validate requested release identity
+        id: identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          BUILD_EVENT: ${{ github.event.workflow_run.event }}
+          RAW_RECOVERY_VERSION: ${{ github.event.client_payload.version }}
+          RECOVERY_LEDGER_SHA256: ${{ github.event.client_payload.ledger_sha256 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          expected_ledger=""
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            test "$BUILD_EVENT" = push
+            request=dist/release-request/release-request.json
+            test "$(jq -r .schema_version "$request")" = 1
+            raw="$(jq -r .tag "$request")"
+            commit="$(jq -r .commit "$request")"
+            test "$commit" = "$BUILD_COMMIT"
+          else
+            raw="$RAW_RECOVERY_VERSION"
+            expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
+            test -n "$expected_ledger"
+          fi
+          if ! [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release version: $raw" >&2
+            exit 2
+          fi
+          version="${raw#v}"
+          tag="v${version}"
+          if [ "$EVENT_NAME" != workflow_run ]; then
+            commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "expected_ledger=$expected_ledger"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require the tag and commit to be immutable default-branch history
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install object storage dependencies
+      - name: Install hash-locked object storage client
+        if: ${{ github.event_name == 'workflow_run' }}
         run: |
-          python -m pip install "boto3==$BOTO3_VERSION"
-          test "$(python -c 'import boto3; print(boto3.__version__)')" = "$BOTO3_VERSION"
+          python -m pip install --require-hashes -r scripts/release/requirements.lock
+          python -m pip check
 
-      - name: Build release payload
+      - name: Build the schema-versioned release payload
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
           python scripts/release/verify_cli_snapshot.py \
             --snapshot-dir dist/cli-snapshot \
-            --version "$GITHUB_REF_NAME" \
-            --commit "$GITHUB_SHA"
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT"
           python scripts/release/build_release_payload.py \
-            --tag "$GITHUB_REF_NAME" \
-            --commit "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
             --archive-dir dist/release-archives \
             --extra-dir dist/cli-snapshot \
             --out-dir dist/release-payload
 
-      - name: Attest immutable release ledger and artifacts
+      - name: Verify the newly assembled release ledger before sealing
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+        run: |
+          set -euo pipefail
+          ledger_sha256="$(sha256sum dist/release-payload/artifacts.json | cut -d' ' -f1)"
+          python scripts/release/verify_release_ledger.py \
+            --ledger dist/release-payload/artifacts.json \
+            --payload-dir dist/release-payload \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$ledger_sha256"
+
+      - name: Attest the immutable release bundle
+        if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist/release-payload/*
 
-      - name: Create GitHub draft release
+      - name: Save immutable assets on a draft GitHub release
+        if: ${{ github.event_name == 'workflow_run' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
           python scripts/release/create_github_release.py \
             --repo "$GITHUB_REPOSITORY" \
-            --tag "$GITHUB_REF_NAME" \
-            --commit "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
             --draft \
             --immutable-assets \
             --asset 'dist/release-payload/*'
 
-      - name: Publish release payload to object storage
+      - name: Seal immutable object-storage keys
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
           python scripts/release/publish_objectstorage.py \
             --provider s3 \
             --endpoint "$AWS_ENDPOINT_URL" \
             --bucket antfly-releases \
-            --prefix "antfly/${GITHUB_REF_NAME}" \
+            --prefix "antfly/${RELEASE_TAG}" \
             --content-addressed-prefix antfly/artifacts \
-            --latest-prefix antfly/latest \
-            --publish-latest-if-stable "$GITHUB_REF_NAME" \
             dist/release-payload/*
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
 
-      - name: Request trusted registry promotion
+      - name: Recover the complete immutable payload from GitHub
+        if: ${{ github.event_name == 'repository_dispatch' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
-          ledger_sha256="$(sha256sum dist/release-payload/artifacts.json | cut -d' ' -f1)"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" \
-            -f event_type=promote-cli-release \
-            -f "client_payload[version]=$GITHUB_REF_NAME" \
-            -f "client_payload[ledger_sha256]=$ledger_sha256"
-
-  package-cli-artifacts:
-    name: Build immutable CLI package snapshot
-    needs: build-zig-runtime-archives
-    if: ${{ github.event_name == 'push' }}
-    uses: ./.github/workflows/cli-package.yml
-    with:
-      version: ${{ github.ref_name }}
-      source_commit: ${{ github.sha }}
-
-  restore-cli-artifacts:
-    name: Restore immutable CLI package snapshot
-    if: ${{ github.event_name == 'repository_dispatch' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      attestations: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-
-      - name: Resolve release tag
-        id: version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAW_VERSION: ${{ github.event.client_payload.version }}
-          LEDGER_SHA256: ${{ github.event.client_payload.ledger_sha256 }}
-        run: |
-          test -n "$RAW_VERSION"
-          test -n "$LEDGER_SHA256"
-          raw="$RAW_VERSION"
-          version="${raw#v}"
-          tag="v${version}"
-          commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
-          {
-            echo "version=${version}"
-            echo "tag=${tag}"
-            echo "commit=${commit}"
-            echo "ledger_sha256=${LEDGER_SHA256,,}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Require the release commit to be on the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
-        run: git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-
-      - name: Download exact package snapshot from the GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          mkdir -p dist/cli-snapshot
+          mkdir -p dist/release-payload
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern artifacts.json \
-            --pattern '*.tgz' \
-            --pattern '*.whl' \
-            --pattern cli-snapshot.json \
-            --dir dist/cli-snapshot
+            --dir dist/release-payload
 
-      - name: Verify release attestations and snapshot manifest
+      - name: Verify recovered GitHub attestations
+        if: ${{ github.event_name == 'repository_dispatch' }}
         env:
-          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
-          RELEASE_LEDGER_SHA256: ${{ steps.version.outputs.ledger_sha256 }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for artifact in dist/cli-snapshot/*; do
+          while IFS= read -r artifact; do
             gh attestation verify "$artifact" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/antfly-release.yml" \
-              --source-ref "refs/tags/$RELEASE_TAG" \
-              --source-digest "$RELEASE_COMMIT"
-          done
+              --source-ref "refs/heads/${{ github.event.repository.default_branch }}"
+          done < <(find dist/release-payload -type f -print | sort)
+
+      - name: Bind and verify the complete release ledger
+        id: ledger
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          EXPECTED_LEDGER: ${{ steps.identity.outputs.expected_ledger }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum dist/release-payload/artifacts.json | cut -d' ' -f1)"
+          if [ -n "$EXPECTED_LEDGER" ] && [ "$actual" != "$EXPECTED_LEDGER" ]; then
+            echo "release ledger digest differs" >&2
+            echo "expected: $EXPECTED_LEDGER" >&2
+            echo "actual:   $actual" >&2
+            exit 1
+          fi
           python scripts/release/verify_release_ledger.py \
-            --ledger dist/cli-snapshot/artifacts.json \
-            --payload-dir dist/cli-snapshot \
+            --ledger dist/release-payload/artifacts.json \
+            --payload-dir dist/release-payload \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
-            --ledger-sha256 "$RELEASE_LEDGER_SHA256"
+            --ledger-sha256 "$actual"
+          echo "sha256=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize and verify typed bundle scopes
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          LEDGER_SHA256: ${{ steps.ledger.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release-ledger dist/release-runtime dist/verified-cli-snapshot
+          cp dist/release-payload/artifacts.json dist/release-ledger/artifacts.json
+          cp dist/release-payload/antfly_*.tar.gz dist/release-runtime/
+          cp dist/release-payload/*.tgz dist/release-payload/*.whl \
+            dist/release-payload/cli-snapshot.json dist/verified-cli-snapshot/
+          python scripts/release/verify_release_ledger.py \
+            --ledger dist/release-ledger/artifacts.json \
+            --payload-dir dist/release-runtime \
+            --scope runtime \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256"
+          python scripts/release/verify_release_ledger.py \
+            --ledger dist/release-ledger/artifacts.json \
+            --payload-dir dist/verified-cli-snapshot \
+            --scope cli \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256"
           python scripts/release/verify_cli_snapshot.py \
-            --snapshot-dir dist/cli-snapshot \
+            --snapshot-dir dist/verified-cli-snapshot \
             --version "$RELEASE_VERSION" \
             --commit "$RELEASE_COMMIT"
 
-      - name: Upload recovered CLI snapshot
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v6
         with:
           name: antfly-cli-snapshot
-          path: dist/cli-snapshot/
+          path: dist/verified-cli-snapshot/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antfly-release-runtime-archives
+          path: dist/release-runtime/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antfly-release-payload
+          path: dist/release-payload/
           if-no-files-found: error
 
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
-    needs:
-      - restore-cli-artifacts
-    if: ${{ needs.restore-cli-artifacts.result == 'success' }}
+    needs: prepare-release-promotion
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/antfly-cli
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
-
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot
-
       - name: Select digest-verified Python distributions
         id: pypi
         run: |
@@ -413,7 +317,6 @@ jobs:
             --project antfly-cli \
             --snapshot-dir dist/cli-snapshot \
             --out-dir dist/pypi
-
       - name: Publish wheels
         if: ${{ steps.pypi.outputs.has_packages == 'true' }}
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -422,9 +325,7 @@ jobs:
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm
-    needs:
-      - restore-cli-artifacts
-    if: ${{ needs.restore-cli-artifacts.result == 'success' }}
+    needs: prepare-release-promotion
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -434,86 +335,63 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
-
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
           path: dist/cli-snapshot
-
       - uses: actions/setup-node@v6
         with:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
-
-      - name: Upgrade npm for OIDC support
-        # npm 12.0.0 omitted sigstore from its published bundle: npm/cli#9722.
+      - name: Install exact npm trusted-publishing client
         run: |
           npm install -g "npm@$NPM_VERSION"
           test "$(npm --version)" = "$NPM_VERSION"
-
-      - name: Publish npm packages
+      - name: Publish npm packages in dependency order
         env:
-          RAW_VERSION: ${{ github.event.client_payload.version }}
+          VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
         run: |
           set -euo pipefail
-          raw="$RAW_VERSION"
-          version="${raw#v}"
-          npm_tag="latest"
-          case "$version" in
-            *-*) npm_tag="next" ;;
-          esac
-          echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
-          sh scripts/packaging/publish_npm_package.sh \
-            @antfly/cli-darwin-arm64 "$version" "$npm_tag" \
-            "./dist/cli-snapshot/antfly-cli-darwin-arm64-${version}.tgz"
-          sh scripts/packaging/publish_npm_package.sh \
-            @antfly/cli-linux-arm64 "$version" "$npm_tag" \
-            "./dist/cli-snapshot/antfly-cli-linux-arm64-${version}.tgz"
-          sh scripts/packaging/publish_npm_package.sh \
-            @antfly/cli-linux-x64 "$version" "$npm_tag" \
-            "./dist/cli-snapshot/antfly-cli-linux-x64-${version}.tgz"
-          # Publish the top-level selector only after every platform package is
-          # present, so users never receive a version with missing dependencies.
-          sh scripts/packaging/publish_npm_package.sh \
-            @antfly/cli "$version" "$npm_tag" \
-            "./dist/cli-snapshot/antfly-cli-${version}.tgz"
+          npm_tag=latest
+          case "$VERSION" in *-*) npm_tag=next ;; esac
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-darwin-arm64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-darwin-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-arm64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-linux-arm64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli-linux-x64 "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-linux-x64-${VERSION}.tgz"
+          sh scripts/packaging/publish_npm_package.sh @antfly/cli "$VERSION" "$npm_tag" "./dist/cli-snapshot/antfly-cli-${VERSION}.tgz"
 
   publish-zig-homebrew:
     name: Publish antfly Homebrew formula
-    needs:
-      - build-zig-runtime-archives
-      - publish-release-assets
-    if: ${{ !contains(github.ref_name, '-') }}
+    needs: prepare-release-promotion
+    if: ${{ !contains(needs.prepare-release-promotion.outputs.version, '-') }}
     runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
-
-      - name: Download release archives
-        uses: actions/download-artifact@v6
         with:
-          pattern: antfly-zig-*
-          merge-multiple: true
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-release-runtime-archives
           path: dist/release-archives
-
       - name: Render formula
+        env:
+          VERSION: ${{ needs.prepare-release-promotion.outputs.version }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
         run: |
           python scripts/packaging/test_cabi_packaging.py
-          version="${GITHUB_REF_NAME#v}"
           python scripts/packaging/render_homebrew_antfly_formula.py \
-            --version "$version" \
-            --tag "$GITHUB_REF_NAME" \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
             --archive-dir dist/release-archives \
             --out "$RUNNER_TEMP/antfly.rb"
-
-      - name: Checkout Homebrew tap
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: antflydb/homebrew-taps
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-taps
           fetch-depth: 1
-
-      - name: Push formula to tap
+      - name: Compare-or-publish formula
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
         run: |
           set -euo pipefail
           tap_dir="$GITHUB_WORKSPACE/homebrew-taps"
@@ -521,27 +399,90 @@ jobs:
           cd "$tap_dir"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/antfly.rb; then
-            echo "Formula unchanged"
-            exit 0
-          fi
+          if git diff --quiet -- Formula/antfly.rb; then exit 0; fi
           git add Formula/antfly.rb
-          git commit -m "Update antfly to ${GITHUB_REF_NAME}"
+          git commit -m "Update antfly to ${RELEASE_TAG}"
           git push origin HEAD:main
 
-  # Build and publish container images after release
   publish-container:
     needs:
-      - build-zig-runtime-archives
-      - publish-release-assets
+      - prepare-release-promotion
+      - publish-cli-pypi
+      - publish-cli-npm
+      - publish-zig-homebrew
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.publish-cli-pypi.result == 'success' &&
+          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-zig-homebrew.result == 'success' || needs.publish-zig-homebrew.result == 'skipped') }}
     permissions:
       contents: read
       packages: write
       id-token: write
     uses: ./.github/workflows/antfly-container.yml
     with:
-      tag_name: ${{ github.ref_name }}
-      # Reuse the GNU release artifacts; the unsuffixed musl archives remain
-      # the portable CLI/install defaults.
-      artifact_source: github
+      tag_name: ${{ needs.prepare-release-promotion.outputs.tag }}
+      source_commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+      ledger_sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
     secrets: inherit
+
+  promote-release-channel:
+    name: Commit mutable release channels last
+    needs:
+      - prepare-release-promotion
+      - publish-cli-pypi
+      - publish-cli-npm
+      - publish-zig-homebrew
+      - publish-container
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.publish-cli-pypi.result == 'success' &&
+          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-zig-homebrew.result == 'success' || needs.publish-zig-homebrew.result == 'skipped') &&
+          needs.publish-container.result == 'success' }}
+    runs-on: arc-antfly-standard
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-release-payload
+          path: dist/release-payload
+      - name: Install hash-locked object storage client
+        run: |
+          python -m pip install --require-hashes -r scripts/release/requirements.lock
+          python -m pip check
+      - name: Commit object-storage channel aliases
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+        run: |
+          python scripts/release/publish_objectstorage.py \
+            --provider s3 \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --prefix "antfly/${RELEASE_TAG}" \
+            --content-addressed-prefix antfly/artifacts \
+            --latest-prefix antfly/latest \
+            --publish-latest-if-stable "$RELEASE_TAG" \
+            dist/release-payload/*
+      - name: Publish the verified GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+        run: |
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --latest
+          fi

@@ -19,6 +19,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NPM_VERSION: 11.19.1
 
 jobs:
   publish:
@@ -57,7 +58,9 @@ jobs:
       - name: Upgrade npm for OIDC support
         # npm 12.0.0 omitted sigstore from its published bundle: npm/cli#9722.
         # Keep every trusted-publishing workflow on the same supported major.
-        run: npm install -g npm@11
+        run: |
+          npm install -g "npm@$NPM_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
 
       - name: Publish SDK
         if: startsWith(github.ref, 'refs/tags/ts/antfly/sdk/v')

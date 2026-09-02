@@ -686,6 +686,14 @@ spec:
                 properties:
                   accelerator:
                     type: string
+                  inferenceBackend:
+                    default: auto
+                    enum:
+                    - auto
+                    - cpu
+                    - cuda
+                    - pjrt
+                    type: string
                   machineType:
                     type: string
                   spot:
