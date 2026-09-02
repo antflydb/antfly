@@ -131,6 +131,9 @@ class CAbiPackagingTests(unittest.TestCase):
         channel_policy = json.loads(
             (REPO_ROOT / "scripts" / "release" / "channels.json").read_text()
         )
+        environment_policy = json.loads(
+            (REPO_ROOT / "scripts" / "release" / "github-environments.json").read_text()
+        )
         self.assertEqual(platform_policy["glibc_minimum"], minimum_glibc)
         gnu_floors = {
             match
@@ -229,8 +232,10 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("actions/attest-build-provenance@", release_workflow)
         self.assertIn("--immutable-assets", release_workflow)
         self.assertNotIn("environment: container-publish", container_workflow)
-        self.assertEqual(release_workflow.count("environment: container-publish"), 1)
+        self.assertNotIn("environment: container-publish", release_workflow)
+        self.assertEqual(release_workflow.count("environment: release-promotion"), 1)
         self.assertIn("github_environment.py check", release_workflow)
+        self.assertIn("--environment release-promotion", release_workflow)
         self.assertIn("--content-addressed-prefix", release_workflow)
         self.assertEqual(release_workflow.count("--exact-prefix"), 2)
         self.assertIn("--signer-workflow", release_workflow)
@@ -394,15 +399,33 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertEqual(release_gc_workflow.count("--apply-plan"), 1)
         self.assertEqual(release_gc_workflow.count("--approved-plan"), 1)
         self.assertIn("name: release-gc-plan", release_gc_workflow)
-        self.assertIn("environment: container-publish", release_gc_workflow)
-        self.assertEqual(release_gc_workflow.count("environment: container-publish"), 1)
+        self.assertNotIn("environment: container-publish", release_gc_workflow)
+        self.assertEqual(release_gc_workflow.count("environment: release-promotion"), 1)
         self.assertIn("github_environment.py check", release_gc_workflow)
+        self.assertIn(
+            'test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"',
+            release_gc_workflow,
+        )
         self.assertIn("group: antfly-release-storage", release_gc_workflow)
         self.assertIn("uses: google-github-actions/setup-gcloud@", release_gc_workflow)
         self.assertLess(
-            release_gc_workflow.index("environment: container-publish"),
+            release_gc_workflow.index("environment: release-promotion"),
             release_gc_workflow.index("group: antfly-release-storage"),
         )
+        environments = environment_policy["environments"]
+        self.assertEqual(set(environments), {"container-publish", "release-promotion"})
+        container_refs = {
+            (policy["name"], policy["type"])
+            for policy in environments["container-publish"]["branch_policies"]
+        }
+        release_refs = {
+            (policy["name"], policy["type"])
+            for policy in environments["release-promotion"]["branch_policies"]
+        }
+        self.assertNotIn(("main", "branch"), container_refs)
+        self.assertTrue(container_refs)
+        self.assertTrue(all(policy_type == "tag" for _, policy_type in container_refs))
+        self.assertEqual(release_refs, {("main", "branch")})
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()

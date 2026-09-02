@@ -619,7 +619,7 @@ jobs:
         run: >-
           python scripts/release/github_environment.py check
           --repository "$GITHUB_REPOSITORY"
-          --environment container-publish
+          --environment release-promotion
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
@@ -686,7 +686,7 @@ jobs:
           needs.stage-container.result == 'success' &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') }}
     runs-on: arc-antfly-standard
-    environment: container-publish
+    environment: release-promotion
     permissions:
       contents: read
       id-token: write

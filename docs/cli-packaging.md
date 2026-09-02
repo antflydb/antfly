@@ -117,7 +117,7 @@ stable release's immutable completion receipt. Merely uploading stable bytes or
 creating a draft does not start that clock. Channel `current` and `pending`
 identities always override those windows. `Release object retention` emits a
 read-only plan every Monday. A manual dispatch with `apply=true`, protected by the
-`container-publish` environment, completes before the short release/GC lock is
+`release-promotion` environment, completes before the short release/GC lock is
 acquired. The apply phase recomputes the plan, verifies that no channel still
 reaches an expired container digest, removes its GAR and GHCR images, checks
 that channel journals and aliases did not change, and only then removes version
@@ -192,12 +192,13 @@ object-storage, GitHub, and completion jobs do not wait on another environment
 after the journal is reserved.
 
 Container staging writes only digest-addressed candidates and therefore runs
-before approval without selecting a public alias. `container-publish` is used
-exactly once, by the preflight job, as the human gate before the transaction is
-reserved. Its required reviewers and allowed `main`/legacy tag refs are
-declared in `scripts/release/github-environments.json`. Both release preflight
-and GC planning compare the live environment with that contract. Apply an
-intentional configuration change with `python3
+before approval without selecting a public alias. `release-promotion` is used
+exactly once, by the preflight job, as the main-only human gate before the
+transaction is reserved. The separate `container-publish` environment remains
+tag-only for legacy and operator publishers. Their required reviewers and
+allowed refs are declared in `scripts/release/github-environments.json`. Both
+release preflight and GC planning compare the live environments with that
+contract. Apply an intentional configuration change with `python3
 scripts/release/github_environment.py apply --repository antflydb/antfly` using
 a repository-administrator GitHub token.
 

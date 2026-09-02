@@ -173,7 +173,7 @@ Immutable R2 sealing and the journal `begin` operation each use the same short
 job-level lock as retention, while the compare-and-swapped R2 journal is the
 durable per-channel transaction coordinator between jobs. The
 digest-addressed container candidate is staged without a deployment gate because
-it cannot change a public alias. The single `container-publish` preflight
+it cannot change a public alias. The single `release-promotion` preflight
 approval happens after staging and before `begin`; the only waits
 afterward are the npm and PyPI trusted-publisher environments required by those
 registries. A wait or interrupted job leaves the exact pending identity
@@ -199,13 +199,14 @@ repairs a missing or corrupt GitHub payload, the controller restores the
 verified bytes and removes unledgered assets before publishing the release.
 Nightly uses R2 as its only policy-selected source.
 
-The `container-publish` environment follows the versioned contract in
-`scripts/release/github-environments.json`: it accepts the default `main`
-branch plus the legacy release-tag patterns, copies the required-reviewer set
-from the `npm` environment, and prevents self-review. Release preflight and
-retention planning audit the live GitHub configuration before any mutable or
-destructive operation. An administrator applies intentional contract changes
-with:
+The deployment environments follow the versioned contract in
+`scripts/release/github-environments.json`. `release-promotion` accepts only the
+default `main` branch and protects release preflight plus retention approval;
+`container-publish` accepts only the legacy release and operator tag patterns.
+Both copy the required-reviewer set from the `npm` environment and prevent
+self-review. Release preflight and retention planning audit the live GitHub
+configuration before any mutable or destructive operation. An administrator
+applies intentional contract changes with:
 
 ```bash
 python3 scripts/release/github_environment.py apply \
@@ -375,7 +376,7 @@ R2 metadata alias, are always protected.
 `.github/workflows/antfly-release-gc.yml` computes and archives a plan weekly
 without deleting anything. To inspect a plan immediately, dispatch `Release
 object retention` with its default `apply=false`. To apply retention, dispatch
-it with `apply=true`. The protected `container-publish` approval job finishes
+it with `apply=true`. The protected `release-promotion` approval job finishes
 before the apply job enters the short release-storage concurrency section.
 Each archived plan carries a SHA-256 approval contract over its policy,
 retained identities, deletion sets, and container records. Inside the lock,
