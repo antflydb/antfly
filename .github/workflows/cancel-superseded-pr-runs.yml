@@ -1,0 +1,215 @@
+name: Cancel Superseded PR Runs
+
+on:
+  pull_request_target:
+    branches: ["main"]
+    types: [synchronize, closed, reopened]
+
+concurrency:
+  group: cancel-superseded-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# This privileged workflow intentionally never checks out or executes pull
+# request code. It only reconciles Actions runs using trusted default-branch
+# JavaScript from actions/github-script.
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-superseded:
+    runs-on: arc-antfly-standard
+    timeout-minutes: 5
+    steps:
+      - name: Cancel obsolete PR workflow runs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const eventPull = context.payload.pull_request;
+            const isClosedEvent = context.payload.action === "closed";
+            const activeStatuses = new Set([
+              "in_progress",
+              "pending",
+              "queued",
+              "requested",
+              "waiting",
+            ]);
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: eventPull.number,
+            });
+            if (isClosedEvent && pull.state !== "closed") {
+              core.info(
+                `Skipping cleanup because PR #${pull.number} has been reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && pull.head.sha !== eventPull.head.sha) {
+              core.info(
+                `Skipping cleanup for ${eventPull.head.sha}; ` +
+                `PR #${pull.number} is now at ${pull.head.sha}`,
+              );
+              return;
+            }
+            const pullHeadRepo =
+              pull.head.repo?.full_name ?? eventPull.head.repo?.full_name;
+            if (!pullHeadRepo) {
+              core.warning(
+                `Skipping cleanup because PR #${pull.number} has no head repository`,
+              );
+              return;
+            }
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                event: "pull_request",
+                branch: eventPull.head.ref,
+                per_page: 100,
+              },
+            );
+            const obsoleteRuns = runs.filter((run) => {
+              const associatedWithPull = (run.pull_requests ?? []).some(
+                (candidate) => candidate.number === pull.number,
+              );
+              const matchesPullHead =
+                run.head_repository?.full_name === pullHeadRepo &&
+                run.head_branch === eventPull.head.ref;
+              const belongsToClosedHead =
+                matchesPullHead && run.head_sha === eventPull.head.sha;
+              const isObsolete = isClosedEvent
+                ? associatedWithPull || belongsToClosedHead
+                : run.head_sha !== pull.head.sha &&
+                  (associatedWithPull || matchesPullHead);
+
+              return activeStatuses.has(run.status) && isObsolete;
+            });
+
+            if (obsoleteRuns.length === 0) {
+              core.info("No obsolete PR workflow runs are active");
+              return;
+            }
+
+            // Close the window between the first live-head check and pagination.
+            // Per-PR concurrency cancels this job once a newer cleanup starts, and
+            // this check also protects the new head before that cancellation lands.
+            const { data: latestPull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pull.number,
+            });
+            if (isClosedEvent && latestPull.state !== "closed") {
+              core.info(
+                `Skipping cleanup because PR #${pull.number} has been reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && latestPull.head.sha !== pull.head.sha) {
+              core.info(
+                `Skipping cleanup for ${pull.head.sha}; ` +
+                `PR #${pull.number} is now at ${latestPull.head.sha}`,
+              );
+              return;
+            }
+
+            const reason = isClosedEvent ? "closed" : "superseded";
+            for (const run of obsoleteRuns) {
+              core.info(
+                `Requesting cancellation of ${reason} PR ${run.name} run ${run.id}`,
+              );
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+              } catch (error) {
+                if (error.status !== 409) throw error;
+              }
+            }
+
+            // Give ordinary cancellation a short, bounded opportunity to land.
+            // Holding a standard runner for two minutes also lets obsolete heavy
+            // jobs consume scarce ARC capacity longer than necessary.
+            const pollIntervalMs = 5_000;
+            const pollCount = 3;
+            const stableChecksRequired = 3;
+            const activeRuns = new Map(
+              obsoleteRuns.map((run) => [
+                run.id,
+                { run, lastStatus: run.status, stableChecks: 0 },
+              ]),
+            );
+
+            for (let poll = 1; poll <= pollCount && activeRuns.size > 0; poll++) {
+              await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+              for (const [runId, candidate] of activeRuns) {
+                const current = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: runId,
+                });
+                const status = current.data.status;
+                if (!activeStatuses.has(status)) {
+                  activeRuns.delete(runId);
+                  continue;
+                }
+
+                candidate.stableChecks =
+                  status === candidate.lastStatus ? candidate.stableChecks + 1 : 1;
+                candidate.lastStatus = status;
+                core.info(
+                  `${reason} PR ${candidate.run.name} run ${runId} remains ${status} ` +
+                  `(poll ${poll}/${pollCount})`,
+                );
+              }
+            }
+
+            // A close cleanup can race a reopen, while a synchronize cleanup can
+            // race another push or a head reversion. Revalidate immediately before
+            // the irreversible escalation so current PR work is never force-cancelled.
+            const { data: forcePull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pull.number,
+            });
+            if (isClosedEvent && forcePull.state !== "closed") {
+              core.info(
+                `Skipping force cancellation because PR #${pull.number} was reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && forcePull.head.sha !== pull.head.sha) {
+              core.info(
+                `Skipping force cancellation for ${pull.head.sha}; ` +
+                `PR #${pull.number} is now at ${forcePull.head.sha}`,
+              );
+              return;
+            }
+
+            for (const [runId, candidate] of activeRuns) {
+              if (candidate.stableChecks < stableChecksRequired) {
+                core.warning(
+                  `Leaving ${reason} PR ${candidate.run.name} run ${runId} to ` +
+                  `ordinary cancellation because its status changed recently`,
+                );
+                continue;
+              }
+
+              core.warning(
+                `Force-cancelling stuck ${reason} PR ${candidate.run.name} run ${runId}`,
+              );
+              try {
+                await github.request(
+                  "POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel",
+                  { owner, repo, run_id: runId },
+                );
+              } catch (error) {
+                if (error.status !== 409) throw error;
+              }
+            }
