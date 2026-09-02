@@ -440,6 +440,14 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/pypi
+      - name: Verify exact PyPI release contents
+        run: |
+          python scripts/release/prepare_pypi_promotion.py \
+            --project antfly-cli \
+            --snapshot-dir dist/cli-snapshot \
+            --verify-complete \
+            --attempts 30 \
+            --retry-seconds 10
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm

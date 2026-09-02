@@ -32,16 +32,34 @@ def write_wheel(path: Path) -> None:
 
 
 class PyPIPromotionTests(unittest.TestCase):
-    def run_promotion(self, module, snapshot: Path, output: Path) -> int:
+    def run_promotion(
+        self,
+        module,
+        snapshot: Path,
+        output: Path | None = None,
+        *,
+        verify_complete: bool = False,
+        attempts: int = 1,
+    ) -> int:
         argv = [
             str(SCRIPT),
             "--project",
             "antfly-cli",
             "--snapshot-dir",
             str(snapshot),
-            "--out-dir",
-            str(output),
         ]
+        if output is not None:
+            argv.extend(("--out-dir", str(output)))
+        if verify_complete:
+            argv.extend(
+                (
+                    "--verify-complete",
+                    "--attempts",
+                    str(attempts),
+                    "--retry-seconds",
+                    "0",
+                )
+            )
         with mock.patch.object(sys, "argv", argv):
             return module.main()
 
@@ -76,6 +94,118 @@ class PyPIPromotionTests(unittest.TestCase):
                 self.assertRaisesRegex(SystemExit, "different contents"),
             ):
                 self.run_promotion(module, snapshot, output)
+
+    def test_untracked_registry_file_fails(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            snapshot, output = root / "snapshot", root / "output"
+            snapshot.mkdir()
+            wheel = snapshot / "antfly_cli-1.2.3-py3-none-any.whl"
+            write_wheel(wheel)
+            registry_files = {
+                wheel.name: module.sha256(wheel),
+                "antfly_cli-1.2.3.tar.gz": "a" * 64,
+            }
+            with (
+                mock.patch.object(
+                    module, "pypi_release_files", return_value=registry_files
+                ),
+                self.assertRaisesRegex(SystemExit, "absent from the release ledger"),
+            ):
+                self.run_promotion(module, snapshot, output)
+
+    def test_partial_registry_release_prepares_only_missing_files(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            snapshot, output = root / "snapshot", root / "output"
+            snapshot.mkdir()
+            existing = snapshot / "antfly_cli-1.2.3-py3-none-first.whl"
+            missing = snapshot / "antfly_cli-1.2.3-py3-none-second.whl"
+            write_wheel(existing)
+            write_wheel(missing)
+            with mock.patch.object(
+                module,
+                "pypi_release_files",
+                return_value={existing.name: module.sha256(existing)},
+            ):
+                self.assertEqual(self.run_promotion(module, snapshot, output), 0)
+            self.assertEqual([path.name for path in output.iterdir()], [missing.name])
+
+    def test_complete_registry_release_is_verified(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            snapshot = Path(raw_tmp) / "snapshot"
+            snapshot.mkdir()
+            wheel = snapshot / "antfly_cli-1.2.3-py3-none-any.whl"
+            write_wheel(wheel)
+            with mock.patch.object(
+                module,
+                "pypi_release_files",
+                return_value={wheel.name: module.sha256(wheel)},
+            ):
+                self.assertEqual(
+                    self.run_promotion(module, snapshot, verify_complete=True), 0
+                )
+
+    def test_complete_verification_waits_for_registry_visibility(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            snapshot = Path(raw_tmp) / "snapshot"
+            snapshot.mkdir()
+            wheel = snapshot / "antfly_cli-1.2.3-py3-none-any.whl"
+            write_wheel(wheel)
+            with (
+                mock.patch.object(
+                    module,
+                    "pypi_release_files",
+                    side_effect=[{}, {wheel.name: module.sha256(wheel)}],
+                ) as lookup,
+                mock.patch.object(module.time, "sleep") as sleep,
+            ):
+                self.assertEqual(
+                    self.run_promotion(
+                        module, snapshot, verify_complete=True, attempts=2
+                    ),
+                    0,
+                )
+            self.assertEqual(lookup.call_count, 2)
+            sleep.assert_called_once_with(0.0)
+
+    def test_complete_verification_rejects_missing_file(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            snapshot = Path(raw_tmp) / "snapshot"
+            snapshot.mkdir()
+            wheel = snapshot / "antfly_cli-1.2.3-py3-none-any.whl"
+            write_wheel(wheel)
+            with (
+                mock.patch.object(module, "pypi_release_files", return_value={}),
+                self.assertRaisesRegex(SystemExit, "missing release-ledger files"),
+            ):
+                self.run_promotion(module, snapshot, verify_complete=True)
+
+    def test_malformed_registry_file_metadata_fails_closed(self) -> None:
+        module = load_module()
+        malformed_payloads = (
+            {},
+            {"urls": [None]},
+            {"urls": [{"filename": "artifact.whl", "digests": {}}]},
+            {"urls": [{"filename": "artifact.whl", "digests": {"sha256": "bad"}}]},
+        )
+        for payload in malformed_payloads:
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(SystemExit, "malformed"),
+            ):
+                module.parse_pypi_release_files(payload)
+
+    def test_duplicate_registry_filename_fails_closed(self) -> None:
+        module = load_module()
+        entry = {"filename": "artifact.whl", "digests": {"sha256": "a" * 64}}
+        with self.assertRaisesRegex(SystemExit, "duplicate release file"):
+            module.parse_pypi_release_files({"urls": [entry, entry]})
 
 
 if __name__ == "__main__":

@@ -120,9 +120,11 @@ Container tags are aliases copied only from digest-pinned sources and then
 digest-verified through the same interface. The OCI digest is the immutable
 container identity.
 
-npm platform packages publish before the top-level selector, and existing npm
-or PyPI files are skipped only when their registry digest matches, so a partial
-publication is safe to retry without hiding content drift. An existing npm
+npm platform packages publish before the top-level selector. Existing npm or
+PyPI files are skipped only when their registry digest matches, and PyPI must
+contain exactly the ledger-defined filename-to-digest set before channel
+promotion can continue, so a partial publication is safe to retry without
+hiding content drift or accepting untracked distributions. An existing npm
 version is resumable only if its requested dist-tag also points to that exact
 version; trusted-publishing recovery otherwise stops with an explicit dist-tag
 repair requirement. Existing GitHub
