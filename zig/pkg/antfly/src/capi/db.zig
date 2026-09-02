@@ -2948,6 +2948,7 @@ pub fn metadataApplyStoreAddListeners(
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     if (request.projection_fn == null and request.committed_key_fn == null) return .invalid_argument;
+    if (request.has_commit_barrier_kind > 1) return .invalid_argument;
     const has_commit_barrier = request.has_commit_barrier_kind != 0;
     if ((request.before_projection_commit_fn != null) != has_commit_barrier or
         (request.after_projection_commit_fn != null) != has_commit_barrier or

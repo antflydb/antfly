@@ -1341,3 +1341,111 @@ test "opaque metadata apply owner preserves semantic error identity" {
         snapshots.prepareSnapshot(91, 8),
     );
 }
+
+test "opaque metadata listener boundary preserves incarnation commit ordering" {
+    const path = "/tmp/antfly-storage-kernel-metadata-listener-ordering";
+    cleanup(path);
+    defer cleanup(path);
+
+    var store = try metadata_apply_client.RaftApplyStore.init(std.testing.allocator, .{
+        .root_dir = path,
+        .no_sync = true,
+    });
+    defer store.deinit();
+
+    const Capture = struct {
+        barrier_active: bool = false,
+        ordering_violation: bool = false,
+        began: usize = 0,
+        ended: usize = 0,
+        signals: usize = 0,
+        last_kind: ?metadata_apply_client.ProjectionSignalKind = null,
+        last_group_id: u64 = 0,
+
+        fn begin(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.barrier_active) self.ordering_violation = true;
+            self.barrier_active = true;
+            self.began += 1;
+        }
+
+        fn end(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.barrier_active) self.ordering_violation = true;
+            self.barrier_active = false;
+            self.ended += 1;
+        }
+
+        fn onProjection(ptr: *anyopaque, signal: metadata_apply_client.ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.barrier_active) self.ordering_violation = true;
+            self.signals += 1;
+            self.last_kind = signal.kind;
+            self.last_group_id = signal.metadata_group_id;
+        }
+    };
+    const RawCallbacks = struct {
+        fn projection(_: ?*anyopaque, _: *const abi.MetadataProjectionSignal) callconv(.c) void {}
+        fn barrier(_: ?*anyopaque) callconv(.c) void {}
+    };
+
+    // ABI booleans are canonical 0/1 values. Rejecting other bit patterns
+    // keeps foreign callers from accidentally selecting a different contract
+    // than the storage owner installed.
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_add_listeners(
+        store.handle,
+        &.{
+            .projection_fn = RawCallbacks.projection,
+            .has_commit_barrier_kind = 2,
+            .before_projection_commit_fn = RawCallbacks.barrier,
+            .after_projection_commit_fn = RawCallbacks.barrier,
+        },
+    ));
+
+    var capture = Capture{};
+    try std.testing.expectError(error.InvalidProjectionCommitBarrier, store.addProjectionListener(.{
+        .ptr = &capture,
+        .commit_barrier_kind = .metadata_incarnation,
+        .vtable = &.{ .on_projection_signal = Capture.onProjection },
+    }));
+    try store.addProjectionListener(.{
+        .ptr = &capture,
+        .commit_barrier_kind = .metadata_incarnation,
+        .vtable = &.{
+            .on_projection_signal = Capture.onProjection,
+            .before_projection_commit = Capture.begin,
+            .after_projection_commit = Capture.end,
+        },
+    });
+
+    // Keep this fixture at the actual compiled-owner wire. The transition is
+    // `initialize_metadata_incarnation` (tag 45), wrapped in one normal Raft
+    // entry using the stable committed-entry envelope.
+    const transition = "afmd1\x2d0123456789abcdef0123456789abcdef";
+    var encoded: [4 + 8 + 8 + 1 + 4 + transition.len]u8 = undefined;
+    var pos: usize = 0;
+    std.mem.writeInt(u32, encoded[pos..][0..4], 1, .little);
+    pos += 4;
+    std.mem.writeInt(u64, encoded[pos..][0..8], 1, .little);
+    pos += 8;
+    std.mem.writeInt(u64, encoded[pos..][0..8], 1, .little);
+    pos += 8;
+    encoded[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u32, encoded[pos..][0..4], transition.len, .little);
+    pos += 4;
+    @memcpy(encoded[pos..], transition);
+
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 91,
+        .commit_index = 1,
+        .entries_bytes = &encoded,
+    });
+    try std.testing.expectEqual(@as(usize, 1), capture.began);
+    try std.testing.expectEqual(@as(usize, 1), capture.signals);
+    try std.testing.expectEqual(@as(usize, 1), capture.ended);
+    try std.testing.expectEqual(metadata_apply_client.ProjectionSignalKind.metadata_incarnation, capture.last_kind.?);
+    try std.testing.expectEqual(@as(u64, 91), capture.last_group_id);
+    try std.testing.expect(!capture.barrier_active);
+    try std.testing.expect(!capture.ordering_violation);
+}

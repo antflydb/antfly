@@ -630,6 +630,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn addListeners(self: *RaftApplyStore, projection_listener: ?ProjectionListener, committed_listener: ?CommittedKeyListener) !void {
+        if (projection_listener) |listener| try listener.validate();
         try self.listeners.ensureUnusedCapacity(self.alloc, 1);
         const registration = try self.alloc.create(ListenerRegistration);
         errdefer self.alloc.destroy(registration);
