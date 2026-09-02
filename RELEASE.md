@@ -217,9 +217,11 @@ to `read` and kept there; explicit job-level grants are the only supported way
 to obtain write access.
 
 Release metadata and object-storage publishing are implemented as explicit
-scripts under `scripts/release/`. `make release-scripting-test` is the single CI
-entry point for release packaging, installer, recovery, registry, and workflow
-contract tests; its test discovery intentionally picks up new `test_*.py` files.
+scripts under `scripts/release/`. `scripts/release/test.sh` is the portable,
+single CI entry point for release packaging, installer, recovery, registry, and
+workflow contract tests; its test discovery intentionally picks up new
+`test_*.py` files. `make release-scripting-test` delegates to the same script as
+a local convenience.
 
 - `stage_release_source.py` extracts release support files from the exact Git
   commit and records their digests in `source-snapshot.json`.

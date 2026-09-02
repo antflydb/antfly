@@ -342,6 +342,7 @@ class CAbiPackagingTests(unittest.TestCase):
 
     def test_release_scripting_target_discovers_the_complete_suite(self) -> None:
         makefile = (REPO_ROOT / "Makefile").read_text()
+        test_script = (REPO_ROOT / "scripts" / "release" / "test.sh").read_text()
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "zig-tests.yml"
         ).read_text()
@@ -349,19 +350,21 @@ class CAbiPackagingTests(unittest.TestCase):
             "\n  backup-s3-integration:", 1
         )[0]
 
-        self.assertIn("run: make release-scripting-test", release_job)
+        self.assertIn("run: scripts/release/test.sh", release_job)
+        self.assertNotIn("run: make ", release_job)
         self.assertNotIn("scripts/release/test_", release_job)
         self.assertIn('python-version: "3.13"', release_job)
         self.assertIn("release-scripting-test:", makefile)
+        self.assertIn("scripts/release/test.sh", makefile)
         self.assertIn(
             "python3 -m unittest discover -s scripts/packaging -p 'test_*.py'",
-            makefile,
+            test_script,
         )
         self.assertIn(
             "python3 -m unittest discover -s scripts/release -p 'test_*.py'",
-            makefile,
+            test_script,
         )
-        self.assertIn("sh -n scripts/release/install_bootstrap.sh", makefile)
+        self.assertIn("sh -n scripts/release/install_bootstrap.sh", test_script)
 
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {

@@ -146,9 +146,10 @@ gh api --method POST repos/antflydb/antfly/dispatches \
 
 The channel contract is centralized in `scripts/release/channels.json` rather
 than encoded as version-string tests throughout the workflows.
-`make release-scripting-test` is the canonical local and CI suite for packaging,
+`scripts/release/test.sh` is the canonical local and CI suite for packaging,
 installer, registry, recovery, and release-workflow contracts; it discovers all
 `test_*.py` modules under both `scripts/packaging` and `scripts/release`.
+`make release-scripting-test` is a convenience wrapper for the same script.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub

@@ -226,7 +226,7 @@ jobs:
           python-version: "3.13"
 
       - name: Test release packaging and scripts
-        run: make release-scripting-test
+        run: scripts/release/test.sh
 
   backup-s3-integration:
     name: backup-s3-integration

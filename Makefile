@@ -90,14 +90,7 @@ build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 release-scripting-test:
-	scripts/test_install_download_markers.sh
-	scripts/test_quickstart_docs.py
-	python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
-	python3 -m unittest discover -s scripts/release -p 'test_*.py'
-	python3 scripts/release/validate_workflow_actions.py
-	sh -n scripts/install.sh
-	sh -n scripts/release/install_bootstrap.sh
-	bash -n scripts/test_install_download_markers.sh
+	scripts/release/test.sh
 
 generate: graph-identifier-generate build-docs tidy
 	$(MAKE) zig-openapi-generate
