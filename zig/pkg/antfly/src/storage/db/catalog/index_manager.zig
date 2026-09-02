@@ -6220,7 +6220,7 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
-            if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
+            if (try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
@@ -12958,7 +12958,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13134,7 +13134,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13700,7 +13700,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -13717,7 +13717,7 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -20834,7 +20834,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     };
 }
 
-fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) bool {
+fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.source_field, b.source_field) and
@@ -20847,7 +20847,7 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -24700,12 +24700,13 @@ test "dense index unions multiple embedding artifact sources without overwriting
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}";
+    const producer_json_reordered = "{ \"dimensions\": 3, \"model\": \"test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_dense_v1",
         .kind = .embedding,
         .field = "title",
         .expected_dims = 3,
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "document_chunks_v1",
@@ -24740,7 +24741,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
     for (generated) |request| {
         if (request.kind != .dense_embedding) continue;
         embedding_request_count += 1;
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
         try std.testing.expectEqual(
             if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
                 enrichment_types.EmbeddingInputKind.inline_chunks
@@ -24817,11 +24818,12 @@ test "sparse multi-source requests carry semantic producer identity" {
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}";
+    const producer_json_reordered = "{ \"model\": \"sparse-test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_sparse_v1",
         .kind = .embedding,
         .field = "title",
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "body_sparse_v1",
@@ -24843,7 +24845,7 @@ test "sparse multi-source requests carry semantic producer identity" {
     try std.testing.expectEqual(@as(usize, 2), generated.len);
     for (generated) |request| {
         try std.testing.expect(request.kind == .sparse_embedding);
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
         try std.testing.expectEqual(enrichment_types.EmbeddingInputKind.document, request.input_kind);
     }
 

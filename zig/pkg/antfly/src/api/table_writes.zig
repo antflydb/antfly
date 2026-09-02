@@ -24268,12 +24268,12 @@ pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
     index_json: []const u8,
     options: managed_embedder.InitOptions,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
-    defer parsed.deinit();
-    if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, index_name, parsed.value, options)) |normalized| {
-        return normalized;
-    }
-    return try alloc.dupe(u8, index_json);
+    return try table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        alloc,
+        index_name,
+        index_json,
+        options,
+    );
 }
 
 pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -24281,34 +24281,11 @@ pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
     indexes_json: []const u8,
     options: managed_embedder.InitOptions,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var first = true;
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (!first) try out.append(alloc, ',');
-        first = false;
-        try appendJsonString(alloc, &out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, entry.key_ptr.*, entry.value_ptr.*, options)) |normalized| {
-            defer alloc.free(normalized);
-            try out.appendSlice(alloc, normalized);
-        } else {
-            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-            defer alloc.free(encoded);
-            try out.appendSlice(alloc, encoded);
-        }
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        alloc,
+        indexes_json,
+        options,
+    );
 }
 
 test "table write index parser extracts expanded algebraic capability config" {
@@ -51523,8 +51500,8 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     defer alloc.free(base_uri);
 
     const managed_indexes_json = try std.fmt.allocPrint(alloc,
-        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"title_body":{{"name":"title_body","type":"embeddings","template":"{{{{title}}}} {{{{body}}}}","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
-    , .{base_uri});
+        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"enrichments":[{{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128}},{{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{{\"provider\":\"openai\",\"model\":\"test-embed\",\"url\":\"{s}\"}}"}}],"title_body":{{"name":"title_body","type":"embeddings","template":"{{{{title}}}} {{{{body}}}}","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}},"artifact_vectors":{{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{{"artifact":"body_dense_v1"}}]}}}}
+    , .{ base_uri, base_uri });
     defer alloc.free(managed_indexes_json);
     Catalog.indexes_json_buf = tables_api.default_indexes_json;
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
@@ -51569,6 +51546,7 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     const entry = write_cache.entries.items[0];
     try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
     try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
     const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
     try std.testing.expect(runtime.stats().worker_started);
 
@@ -51578,6 +51556,7 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     });
     try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
     try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
 
     const query_vec = [_]f32{ 1, 0, 0 };
     var result = try entry.db.search(alloc, .{
@@ -51588,6 +51567,15 @@ test "provisioned create installs managed enrichment despite a matching stale fi
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    var artifact_result = try entry.db.search(alloc, .{
+        .index_name = "artifact_vectors",
+        .dense = .{ .vector = query_vec[0..], .k = 1 },
+        .limit = 1,
+    });
+    defer artifact_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifact_result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
 }
 
 test "runtime status refreshes aged live writer publications" {

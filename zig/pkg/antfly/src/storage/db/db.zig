@@ -37764,12 +37764,7 @@ fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []co
 }
 
 fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(source_field) orelse return null;
-    if (source != .string or source.string.len == 0) return null;
-    return try alloc.dupe(u8, source.string);
+    return try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field);
 }
 
 fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
