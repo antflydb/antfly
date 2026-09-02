@@ -313,6 +313,7 @@ test {
     _ = raft_vopr;
     _ = @import("raft/reconciler.zig");
     _ = extensions;
+    _ = @import("extensions/lifecycle.zig");
     _ = metadata;
     _ = vopr;
     _ = metadata_api;

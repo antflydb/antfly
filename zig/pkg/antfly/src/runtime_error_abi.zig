@@ -297,6 +297,14 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    // A locally committed RemoteApply write can cross the independently
+    // generated storage/runtime boundary before its standby acknowledgement
+    // is available. Preserve the exact reason so the public API can return
+    // its explicit pending-durability contract instead of a generic 500.
+    ha_sync_commit_would_block,
+    ha_sync_commit_wait_limit_exceeded,
+    ha_sync_commit_wait_missing_context,
+    ha_sync_commit_wait_standby_not_in_policy,
     deadline_exceeded,
     pre_decision_deadline_exceeded,
     graph_distinct_budget_exceeded,
@@ -307,6 +315,9 @@ pub const Detail = enum(c_int) {
     graph_min_weight_domain_violation,
     graph_max_weight_domain_violation,
     graph_path_weight_overflow,
+    /// A metadata mutation may already be committed. Callers must observe the
+    /// durable catalog state before deciding whether a retry is safe.
+    metadata_mutation_outcome_unknown,
 };
 
 pub const Status = extern struct {
@@ -383,6 +394,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
         error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
+        error.HASyncCommitWouldBlock => status(.unavailable, .ha_sync_commit_would_block),
+        error.HASyncCommitWaitLimitExceeded => status(.unavailable, .ha_sync_commit_wait_limit_exceeded),
+        error.HASyncCommitWaitMissingContext => status(.unavailable, .ha_sync_commit_wait_missing_context),
+        error.HASyncCommitWaitStandbyNotInPolicy => status(.unavailable, .ha_sync_commit_wait_standby_not_in_policy),
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
@@ -472,6 +487,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.LeaderTransferInProgress => status(.retryable, .leader_transfer_in_progress),
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
+        error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -905,6 +921,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .ha_sync_commit_would_block => "HASyncCommitWouldBlock",
+        .ha_sync_commit_wait_limit_exceeded => "HASyncCommitWaitLimitExceeded",
+        .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
+        .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
@@ -915,6 +935,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
         .graph_path_weight_overflow => "GraphPathWeightOverflow",
+        .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
     };
 }
 
@@ -936,6 +957,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -943,6 +965,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
     try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
     try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
+    try std.testing.expectEqual(error.HASyncCommitWouldBlock, errorFromStatus(statusFromError(error.HASyncCommitWouldBlock)));
+    try std.testing.expectEqual(error.HASyncCommitWaitLimitExceeded, errorFromStatus(statusFromError(error.HASyncCommitWaitLimitExceeded)));
+    try std.testing.expectEqual(error.HASyncCommitWaitMissingContext, errorFromStatus(statusFromError(error.HASyncCommitWaitMissingContext)));
+    try std.testing.expectEqual(error.HASyncCommitWaitStandbyNotInPolicy, errorFromStatus(statusFromError(error.HASyncCommitWaitStandbyNotInPolicy)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

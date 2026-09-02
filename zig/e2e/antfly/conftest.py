@@ -312,6 +312,54 @@ def _created_table_from_path(path: str) -> str | None:
     return unquote(parts[1])
 
 
+class IndexReadinessProtocolError(AssertionError):
+    """The server advertised canonical readiness with an invalid shape."""
+
+
+def _canonical_index_readiness(status: dict[str, Any]) -> dict[str, Any] | None:
+    if "readiness" not in status:
+        return None
+    readiness = status["readiness"]
+    if not isinstance(readiness, dict):
+        raise IndexReadinessProtocolError(
+            "status.readiness must be an object when present, "
+            f"got {type(readiness).__name__}"
+        )
+    state = readiness.get("state")
+    if state not in {"pending", "queryable_partial", "ready", "failed"}:
+        raise IndexReadinessProtocolError(
+            f"status.readiness.state has unsupported value {state!r}"
+        )
+    for field in ("queryable", "complete"):
+        if type(readiness.get(field)) is not bool:
+            raise IndexReadinessProtocolError(
+                f"status.readiness.{field} must be a boolean"
+            )
+    pending_reasons = readiness.get("pending_reasons")
+    if not isinstance(pending_reasons, list) or not all(
+        isinstance(reason, str) for reason in pending_reasons
+    ):
+        raise IndexReadinessProtocolError(
+            "status.readiness.pending_reasons must be an array of strings"
+        )
+    published_revision = readiness.get("published_revision")
+    target_revision = readiness.get("target_revision")
+    for field, value in (
+        ("published_revision", published_revision),
+        ("target_revision", target_revision),
+    ):
+        if value is not None and type(value) is not int:
+            raise IndexReadinessProtocolError(
+                f"status.readiness.{field} must be an integer when present"
+            )
+    if (published_revision is None) != (target_revision is None):
+        raise IndexReadinessProtocolError(
+            "status.readiness.published_revision and target_revision "
+            "must be provided together"
+        )
+    return readiness
+
+
 def ready_index_status(
     index_info: dict[str, Any], *, require_query_fresh: bool = False
 ) -> dict[str, Any] | None:
@@ -322,12 +370,31 @@ def ready_index_status(
         return None
     if status.get("error"):
         return None
+    # `readiness` is the authoritative, incarnation-scoped contract. Prefer
+    # it over the legacy activity flags so a polling client cannot mistake a
+    # queryable or still-running generation for complete readiness.
+    readiness = _canonical_index_readiness(status)
+    if readiness is not None:
+        if readiness.get("state") != "ready":
+            return None
+        if readiness.get("queryable") is not True or readiness.get("complete") is not True:
+            return None
+        published_revision = readiness.get("published_revision")
+        target_revision = readiness.get("target_revision")
+        # Revision receipts are optional for immutable serverless artifacts
+        # that do not expose a replay domain. When a receipt is present, the
+        # parser above guarantees a complete integer pair and readiness must
+        # still fail closed until the published revision reaches its target.
+        if published_revision is not None and published_revision < target_revision:
+            return None
+    elif "backfill_state" in status and status.get("backfill_state") != "ready":
+        # Compatibility for older servers that predate canonical readiness.
+        # Presence of the field is meaningful: running/retrying/degraded are
+        # all incomplete, not merely non-terminal alternatives to `failed`.
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
-        return None
-    backfill_state = status.get("backfill_state")
-    if backfill_state is not None and backfill_state != "ready":
         return None
     if isinstance(status.get("repair"), dict):
         return None
@@ -1539,10 +1606,15 @@ class OpenAiEmbeddingServer:
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
         lowered = text.lower()
-        if "alpha" in lowered or "concept" in lowered:
+        # Keep named concepts distinct even when both inputs contain the
+        # generic word "concept".  Returning the alpha vector for
+        # "beta concept" makes ranking a nondeterministic exact tie.
+        if "alpha" in lowered:
             return [1.0, 0.0, 0.0]
         if "beta" in lowered:
             return [0.0, 1.0, 0.0]
+        if "concept" in lowered:
+            return [1.0, 0.0, 0.0]
         if "retrieval" in lowered or "semantic" in lowered:
             return [0.8, 0.2, 0.0]
         return [0.0, 0.0, 1.0]

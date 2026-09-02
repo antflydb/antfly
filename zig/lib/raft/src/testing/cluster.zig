@@ -451,6 +451,7 @@ pub const Cluster = struct {
                     .to = from,
                     .term = dropped.term,
                     .reject = true,
+                    .log_index = dropped.snapshot.?.metadata.index,
                 });
                 try self.collectReady(from);
                 return;

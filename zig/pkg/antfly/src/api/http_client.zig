@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -575,6 +576,100 @@ pub const ApiHttpClient = struct {
         };
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
         return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &headers, &delivery_tracker);
+    }
+
+    pub fn fetchBackupShardFenced(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backup_contract.TableBackupFence,
+        control: backup_contract.BackupOperationControl,
+    ) !TablesResponse {
+        try control.ensureActive();
+        const client_timeout_ms = try control.remainingTimeoutMs();
+        if (client_timeout_ms <= backup_contract.backup_server_response_reserve_ms)
+            return error.Timeout;
+        const server_budget_ms = @min(
+            backup_contract.max_backup_server_budget_ms,
+            client_timeout_ms - backup_contract.backup_server_response_reserve_ms,
+        );
+        var metadata_group_id_buffer: [20]u8 = undefined;
+        const metadata_group_id = try std.fmt.bufPrint(&metadata_group_id_buffer, "{d}", .{fence.metadata_group_id});
+        var table_id_buffer: [20]u8 = undefined;
+        const table_id = try std.fmt.bufPrint(&table_id_buffer, "{d}", .{fence.table_id});
+        var topology_count_buffer: [20]u8 = undefined;
+        const topology_count = try std.fmt.bufPrint(&topology_count_buffer, "{d}", .{fence.topology_range_count});
+        const definition_digest = std.fmt.bytesToHex(fence.definition_digest, .lower);
+        const topology_digest = std.fmt.bytesToHex(fence.topology_digest, .lower);
+        var writer_not_after_buffer: [20]u8 = undefined;
+        const writer_not_after = try std.fmt.bufPrint(
+            &writer_not_after_buffer,
+            "{d}",
+            .{fence.writer_not_after_unix_ns orelse return error.InvalidBackupFence},
+        );
+        var remaining_ms_buffer: [10]u8 = undefined;
+        const remaining_ms = try std.fmt.bufPrint(&remaining_ms_buffer, "{d}", .{server_budget_ms});
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_fence_metadata_group_id_header, .value = metadata_group_id },
+            .{ .name = backup_contract.backup_fence_metadata_incarnation_header, .value = &fence.metadata_incarnation },
+            .{ .name = backup_contract.backup_fence_table_id_header, .value = table_id },
+            .{ .name = backup_contract.backup_fence_definition_header, .value = &definition_digest },
+            .{ .name = backup_contract.backup_fence_topology_count_header, .value = topology_count },
+            .{ .name = backup_contract.backup_fence_topology_header, .value = &topology_digest },
+            .{ .name = backup_contract.backup_writer_not_after_header, .value = writer_not_after },
+            .{ .name = backup_contract.backup_remaining_ms_header, .value = remaining_ms },
+        };
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.backup_shard_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{
+            routes.Routes.internal_groups_prefix,
+            group_id,
+            suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        var cancellation = http_common.RequestCancellation{
+            .borrowed_context = control.cancellation.ptr,
+            .borrowed_is_cancelled = control.cancellation.is_cancelled_fn,
+        };
+        var resp = self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = &headers,
+            .content_type = "application/json",
+            .body = body,
+            .delivery_tracker = &delivery_tracker,
+            .timeout_ms = client_timeout_ms,
+            .cancellation = &cancellation,
+        }) catch |err| {
+            const delivery = delivery_tracker.load();
+            if (delivery != .not_sent and !(delivery == .unknown and err == error.ConnectionRefused))
+                return error.BackupOutcomeAmbiguous;
+            return err;
+        };
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => error.NotFound,
+            409 => error.CatalogChanged,
+            408, 504 => if (resp.header(backup_contract.backup_outcome_header)) |outcome|
+                if (std.mem.eql(u8, outcome, backup_contract.backup_outcome_stopped_v1))
+                    error.Timeout
+                else
+                    error.BackupOutcomeAmbiguous
+            else
+                error.BackupOutcomeAmbiguous,
+            else => error.UnexpectedHttpStatus,
+        };
     }
 
     fn fetchBackupTableWithHeaders(
@@ -2683,7 +2778,19 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, cancellation);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, null, cancellation);
+    }
+
+    pub fn fetchGroupTxnResolveWithControlAndTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, timeout_ms, cancellation);
     }
 
     pub fn fetchGroupTxnAcknowledge(
@@ -2693,7 +2800,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
     }
 
     pub fn fetchGroupTxnStatus(
@@ -2703,6 +2810,33 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return try self.fetchGroupTxnStatusWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupTxnStatusWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
+        const server_budget_ms = if (timeout_ms) |value| blk: {
+            if (value <= txn_contract.status_server_response_reserve_ms) return error.Timeout;
+            break :blk @min(
+                txn_contract.max_status_server_budget_ms,
+                value - txn_contract.status_server_response_reserve_ms,
+            );
+        } else null;
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_value = if (server_budget_ms) |value|
+            try std.fmt.bufPrint(&timeout_buffer, "{d}", .{value})
+        else
+            null;
+        const headers = if (timeout_value) |value|
+            &[_]http_common.RequestHeader{.{ .name = txn_contract.status_remaining_ms_header, .value = value }}
+        else
+            &[_]http_common.RequestHeader{};
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2719,6 +2853,8 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
@@ -2798,6 +2934,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         suffix_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
@@ -2816,6 +2953,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
@@ -2973,7 +3111,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 204) return error.UnexpectedHttpStatus;
+        if (resp.status != 204 and resp.status != 202) return error.UnexpectedHttpStatus;
         return .{};
     }
 
@@ -3058,6 +3196,11 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 503 and std.mem.indexOf(
+                u8,
+                resp.body,
+                "\"error\":\"index_probe_unavailable\"",
+            ) != null) return error.ProbeUnavailable;
             std.debug.print("createTableIndex unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
             return error.UnexpectedHttpStatus;
         }
@@ -3084,6 +3227,58 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 };
+
+test "transaction status keeps client-side response reserve" {
+    const CaptureExecutor = struct {
+        expected_client_timeout_ms: u32,
+        expected_server_budget_ms: u32,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(?u32, self.expected_client_timeout_ms), req.timeout_ms);
+            var saw_budget = false;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, txn_contract.status_remaining_ms_header)) continue;
+                var expected_buffer: [10]u8 = undefined;
+                try std.testing.expectEqualStrings(
+                    try std.fmt.bufPrint(&expected_buffer, "{d}", .{self.expected_server_budget_ms}),
+                    header.value,
+                );
+                saw_budget = true;
+            }
+            try std.testing.expect(saw_budget);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+
+    var capture = CaptureExecutor{
+        .expected_client_timeout_ms = 250,
+        .expected_server_budget_ms = 200,
+    };
+    var client = ApiHttpClient.init(std.testing.allocator, capture.iface());
+    var response = try client.fetchGroupTxnStatusWithTimeout(
+        "http://127.0.0.1:7777",
+        7,
+        "docs",
+        "{}",
+        capture.expected_client_timeout_ms,
+    );
+    response.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.Timeout,
+        client.fetchGroupTxnStatusWithTimeout(
+            "http://127.0.0.1:7777",
+            7,
+            "docs",
+            "{}",
+            txn_contract.status_server_response_reserve_ms,
+        ),
+    );
+}
 
 const EncodedTransitionAction = struct {
     kind: enum {
@@ -4366,6 +4561,81 @@ test "fenced backup forwarding treats post-send transport failure as ambiguous" 
             .writer_not_after_unix_ns = 123,
         },
     ));
+
+    const ControlledExecutor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expect(req.timeout_ms != null and req.timeout_ms.? > 0);
+            try std.testing.expect(req.cancellation != null);
+            var saw_budget = false;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, backup_contract.backup_remaining_ms_header)) continue;
+                const server_budget_ms = try std.fmt.parseUnsigned(u32, header.value, 10);
+                try std.testing.expect(server_budget_ms + backup_contract.backup_server_response_reserve_ms <= req.timeout_ms.?);
+                saw_budget = true;
+            }
+            try std.testing.expect(saw_budget);
+            req.delivery_tracker.?.markMayHaveBeenSent();
+            return error.Timeout;
+        }
+    };
+    var controlled_client = ApiHttpClient.init(std.testing.allocator, ControlledExecutor.iface());
+    try std.testing.expectError(error.BackupOutcomeAmbiguous, controlled_client.fetchBackupShardFenced(
+        "http://127.0.0.1:7777",
+        7001,
+        "docs",
+        "{}",
+        .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+            .writer_not_after_unix_ns = 123,
+        },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    ));
+
+    const StoppedExecutor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const name = try alloc.dupe(u8, backup_contract.backup_outcome_header);
+            errdefer alloc.free(name);
+            const value = try alloc.dupe(u8, backup_contract.backup_outcome_stopped_v1);
+            errdefer alloc.free(value);
+            headers[0] = .{
+                .name = name,
+                .value = value,
+            };
+            return .{ .status = 504, .headers = headers, .body = try alloc.dupe(u8, "backup deadline exceeded") };
+        }
+    };
+    var stopped_client = ApiHttpClient.init(std.testing.allocator, StoppedExecutor.iface());
+    try std.testing.expectError(error.Timeout, stopped_client.fetchBackupShardFenced(
+        "http://127.0.0.1:7777",
+        7001,
+        "docs",
+        "{}",
+        .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+            .writer_not_after_unix_ns = 123,
+        },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    ));
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {
@@ -5146,6 +5416,7 @@ test "api http client maps group txn resolve decision conflicts" {
 test "api http client transports txn resolve cancellation and visibility reason" {
     const ResolveExecutor = struct {
         body: []const u8,
+        expected_timeout_ms: ?u32 = null,
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -5154,6 +5425,7 @@ test "api http client transports txn resolve cancellation and visibility reason"
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(req.cancellation != null);
+            try std.testing.expectEqual(self.expected_timeout_ms, req.timeout_ms);
             return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
         }
     };
@@ -5169,5 +5441,10 @@ test "api http client transports txn resolve cancellation and visibility reason"
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
         client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
+    executor.expected_timeout_ms = 137;
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        client.fetchGroupTxnResolveWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 137, &cancellation),
     );
 }

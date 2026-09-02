@@ -36,6 +36,17 @@ pub const StdHttpExecutorConfig = struct {
     /// connection cancels the remaining attempts. This transport avoids that
     /// cancellation path and is required for long-lived HA replication loops.
     resolve_before_connect: bool = false,
+    /// Retain a successfully connected DNS result across requests. Keep this
+    /// disabled for Kubernetes headless Services: an old Pod can remain
+    /// connectable after the Service authority has moved to a new endpoint.
+    cache_resolved_addresses: bool = false,
+    /// Default end-to-end request deadline, including DNS lookup and connect,
+    /// when the individual request does not provide a tighter deadline. Zero
+    /// preserves the caller's unbounded behavior.
+    request_timeout_ms: u32 = 0,
+    /// Independent DNS-and-connect deadline for the resolved transport.
+    /// Unlike request_timeout_ms, this does not expire an established request.
+    connect_timeout_ms: u32 = 30_000,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -163,8 +174,17 @@ pub const StdHttpExecutor = struct {
             .ptr = self,
             .vtable = &.{
                 .execute = execute,
+                .supports_concurrent_requests = supportsConcurrentRequests,
             },
         };
+    }
+
+    fn supportsConcurrentRequests(ptr: *const anyopaque) bool {
+        const self: *const StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        // Persistent clients intentionally serialize mutable connection state.
+        // Non-persistent calls use request-local clients and can safely power
+        // bounded parallel range transfers.
+        return !self.cfg.keep_alive;
     }
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -173,12 +193,16 @@ pub const StdHttpExecutor = struct {
         try self.beginRequest();
         defer self.endRequest();
 
-        if (req.cancellation) |cancellation| {
+        var effective_req = req;
+        if (effective_req.timeout_ms == null and self.cfg.request_timeout_ms > 0) {
+            effective_req.timeout_ms = self.cfg.request_timeout_ms;
+        }
+        if (effective_req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
-        if (req.timeout_ms != null or req.cancellation != null)
-            return try self.executeWithControl(alloc, req);
-        return try self.executeTransport(alloc, req);
+        if (effective_req.timeout_ms != null or effective_req.cancellation != null)
+            return try self.executeWithControl(alloc, effective_req);
+        return try self.executeTransport(alloc, effective_req);
     }
 
     fn executeTransport(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -188,8 +212,16 @@ pub const StdHttpExecutor = struct {
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const io = self.io_impl.io();
-        try self.resolved_client_mutex.lock(io);
-        defer self.resolved_client_mutex.unlock(io);
+        // Controlled callers rely on interruptible queueing before the opaque
+        // resolved exchange. Uncontrolled non-persistent transfers use
+        // request-local clients and may overlap safely.
+        const serialize = self.cfg.keep_alive or req.timeout_ms != null or req.cancellation != null;
+        if (serialize) try self.resolved_client_mutex.lock(io);
+        defer if (serialize) self.resolved_client_mutex.unlock(io);
+
+        var local_client = httpx.Client.initWithConfig(std.heap.page_allocator, io, resolvedClientConfig(self.cfg));
+        defer if (!self.cfg.keep_alive) local_client.deinit();
+        const client = if (self.cfg.keep_alive) &self.resolved_client else &local_client;
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
             @as(usize, @intFromBool(req.authorization != null));
@@ -220,7 +252,7 @@ pub const StdHttpExecutor = struct {
         // header construction above can still prove `not_sent`; once this
         // boundary is crossed, any error must conservatively assume delivery.
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        var response = try self.resolved_client.request(method, req.uri, .{
+        var response = try client.request(method, req.uri, .{
             .headers = header_pairs,
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
@@ -278,15 +310,16 @@ pub const StdHttpExecutor = struct {
     fn resolvedClientConfig(cfg: StdHttpExecutorConfig) httpx.ClientConfig {
         return .{
             .timeouts = .{
-                .connect_ms = 30_000,
+                .connect_ms = cfg.connect_timeout_ms,
                 .read_ms = 30_000,
                 .write_ms = 30_000,
+                .request_ms = cfg.request_timeout_ms,
             },
             .retry_policy = .{ .max_retries = 0 },
             .redirect_policy = .{ .follow_redirects = false },
             .max_response_size = cfg.max_response_bytes,
             .keep_alive = false,
-            .cache_resolved_addresses = true,
+            .cache_resolved_addresses = cfg.cache_resolved_addresses,
         };
     }
 
@@ -458,7 +491,7 @@ pub const StdHttpExecutor = struct {
         // client must be serialized; non-persistent requests use request-local
         // state so callers can execute concurrently without sacrificing reuse.
         var local_client: std.http.Client = .{
-            .allocator = self.alloc,
+            .allocator = std.heap.page_allocator,
             .io = io,
             .read_buffer_size = self.cfg.read_buffer_size,
             .write_buffer_size = self.cfg.write_buffer_size,
@@ -655,6 +688,35 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "resolved executor does not retain DNS authority unless explicitly enabled" {
+    try std.testing.expect(!StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+    }).cache_resolved_addresses);
+    try std.testing.expect(StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+        .cache_resolved_addresses = true,
+    }).cache_resolved_addresses);
+}
+
+test "executor request deadline bounds resolved transport by default" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .request_timeout_ms = 7_500,
+    };
+    try std.testing.expectEqual(@as(u64, 7_500), StdHttpExecutor.resolvedClientConfig(cfg).timeouts.request_ms);
+}
+
+test "executor connect deadline is independent of whole request deadline" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .connect_timeout_ms = 7_500,
+        .request_timeout_ms = 0,
+    };
+    const resolved = StdHttpExecutor.resolvedClientConfig(cfg);
+    try std.testing.expectEqual(@as(u64, 7_500), resolved.timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u64, 0), resolved.timeouts.request_ms);
 }
 
 test "std http executor owns a finite controlled request worker budget" {

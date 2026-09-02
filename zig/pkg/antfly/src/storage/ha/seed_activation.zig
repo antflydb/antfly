@@ -23,6 +23,7 @@
 //! returned generation path as its data root.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -215,7 +216,11 @@ pub fn pruneActivatedGenerations(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    const checkpoint_stat = std.Io.Dir.cwd().statFile(io, request.slot_activation_receipt_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    // Kubernetes projected ConfigMap volumes expose keys through a symlink to
+    // the current immutable generation. Follow that operator-owned, read-only
+    // projection when validating the checkpoint; rejecting the link itself
+    // makes every production gc-target Job fail before JSON validation.
+    const checkpoint_stat = std.Io.Dir.cwd().statFile(io, request.slot_activation_receipt_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.SeedActivationCheckpointMissing,
         else => return err,
     };
@@ -1680,6 +1685,31 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
     defer pruned.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
     try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
+
+    // Match Kubernetes' projected ConfigMap layout: the mounted key points at
+    // ..data, which points at one immutable generation directory.
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        const projected_dir = try std.fs.path.join(alloc, &.{ root, "..2026_01" });
+        defer alloc.free(projected_dir);
+        try fs_paths.createDirPathPortable(std.testing.io, projected_dir);
+        const projected_checkpoint_path = try std.fs.path.join(alloc, &.{ projected_dir, "seeded-slot-activation.json" });
+        defer alloc.free(projected_checkpoint_path);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), checkpoint_path, std.Io.Dir.cwd(), projected_checkpoint_path, std.testing.io);
+        const data_link = try std.fs.path.join(alloc, &.{ root, "..data" });
+        defer alloc.free(data_link);
+        try std.Io.Dir.cwd().symLink(std.testing.io, "..2026_01", data_link, .{ .is_directory = true });
+        try std.Io.Dir.cwd().symLink(std.testing.io, "..data/seeded-slot-activation.json", checkpoint_path, .{});
+        const projected_stat = try std.Io.Dir.cwd().statFile(std.testing.io, checkpoint_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.sym_link, projected_stat.kind);
+
+        var projected_pruned = try pruneActivatedGenerations(alloc, .{
+            .target_root = target_root,
+            .slot_activation_receipt_path = checkpoint_path,
+            .retain_generations = 1,
+        });
+        defer projected_pruned.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), projected_pruned.deleted_generations);
+    }
 }
 
 test "storage.ha materialized activation gc deletes raw and live generations as one lifecycle pair" {

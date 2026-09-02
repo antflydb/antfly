@@ -307,6 +307,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     .promoted_node_id = "standby-a",
                     .new_timeline_id = 2,
                     .new_epoch = 2,
+                    .generation = 1,
                     .required_lsn = required,
                     .observed_lsn = progress.applied_lsn,
                     .force = progress.applied_lsn < required,

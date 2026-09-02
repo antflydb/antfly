@@ -1412,6 +1412,62 @@ pub const Client = struct {
     }
 
     fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+        const timeout_ms = self.config.timeouts.connect_ms;
+        if (timeout_ms == 0) return self.connectHostDirect(host, port);
+
+        const ConnectResult = anyerror!Socket;
+        const SelectResult = union(enum) {
+            connect: ConnectResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
+        };
+        const Task = struct {
+            fn connectTask(client: *Self, target_host: []const u8, target_port: u16) ConnectResult {
+                return client.connectHostDirect(target_host, target_port);
+            }
+
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), connect_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, connect_timeout_ms);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .connect => |connect_result| if (connect_result) |socket_value| {
+                        var socket = socket_value;
+                        socket.close();
+                    } else |_| {},
+                    .watchdog => {},
+                }
+            }
+        };
+
+        var select_buffer: [2]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
+        try select.concurrent(.connect, Task.connectTask, .{ self, host, port });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer while (select.cancel()) |late| Task.drainLateResult(late);
+
+        const first = try select.await();
+        switch (first) {
+            .connect => |connect_result| {
+                stopRequestWatchdog(self.io, &watchdog_stop, null);
+                select.cancelDiscard();
+                return try connect_result;
+            },
+            .watchdog => |watchdog_result| {
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
+            },
+        }
+    }
+
+    fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
         if (self.config.address_filter != null) {
             const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
             return try Socket.connect(address, self.io);

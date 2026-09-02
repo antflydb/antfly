@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const api_operation = @import("../api/operation.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
@@ -75,8 +76,22 @@ pub const MetadataControlLoop = struct {
     /// callers should go through metadata service `runRound()` or a
     /// service/simulation helper that first checks reconcile lease ownership.
     pub fn reconcileOnce(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
         try self.state.syncProjected(service);
-        return try self.reconcilePrepared(service);
+        return try self.reconcilePreparedCatalogLocked(service);
+    }
+
+    /// Refresh projection, derive the legacy desired topology, and apply the
+    /// resulting plan under one catalog-mutation critical section. Lifecycle
+    /// callers must use this boundary so a concurrent DDL or membership
+    /// mutation cannot be observed by only the later half of the round.
+    pub fn reconcileSeededFromProjected(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
+        try self.state.syncProjected(service);
+        try self.state.seedDesiredFromProjected();
+        return try self.reconcilePreparedCatalogLocked(service);
     }
 
     /// Reconcile using the caller's prepared projected/desired state.
@@ -85,6 +100,37 @@ pub const MetadataControlLoop = struct {
     /// avoid racing a second projected refresh between seeding and plan
     /// computation.
     pub fn reconcilePrepared(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
+        return try self.reconcilePreparedCatalogLocked(service);
+    }
+
+    /// Reconcile a projected/desired state prepared while the caller owns the
+    /// service catalog-mutation lock. This is the only lock-free reconciliation
+    /// entry point: synchronous catalog workflows use it to keep projection
+    /// refresh, desired mutation, plan construction, and proposal admission in
+    /// one critical section without recursively acquiring the lock.
+    pub fn reconcilePreparedCatalogLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        return self.reconcilePreparedCatalogLockedImpl(service, null);
+    }
+
+    /// Request-scoped catalog workflows need proof that the final command in a
+    /// legacy multi-entry plan applied before inspecting the projection. Real
+    /// services provide one terminal Raft receipt; small embedders and control
+    /// loop test doubles retain the original synchronous seam.
+    pub fn reconcilePreparedCatalogLockedWithContext(
+        self: *MetadataControlLoop,
+        service: anytype,
+        request: api_operation.RequestContext,
+    ) !ReconcileSummary {
+        return self.reconcilePreparedCatalogLockedImpl(service, request);
+    }
+
+    fn reconcilePreparedCatalogLockedImpl(
+        self: *MetadataControlLoop,
+        service: anytype,
+        request: ?api_operation.RequestContext,
+    ) !ReconcileSummary {
         self.installMedianKeyLookup(service);
         var current = try self.state.captureCurrent(service);
         defer current.deinit(self.alloc);
@@ -116,7 +162,20 @@ pub const MetadataControlLoop = struct {
             .split_steps = plan.split_steps.len,
             .merge_steps = plan.merge_steps.len,
         };
-        try service.applyReconciliationPlan(&plan);
+        if (request) |request_context| {
+            const Service = switch (@typeInfo(@TypeOf(service))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(service),
+            };
+            if (@hasDecl(Service, "applyReconciliationPlanAndWaitAppliedWithContext")) {
+                try service.applyReconciliationPlanAndWaitAppliedWithContext(&plan, request_context);
+            } else {
+                try request_context.ensureActive();
+                try service.applyReconciliationPlan(&plan);
+            }
+        } else {
+            try service.applyReconciliationPlan(&plan);
+        }
         return summary;
     }
 
@@ -149,6 +208,25 @@ pub const MetadataControlLoop = struct {
         }
     }
 };
+
+fn lockCatalogMutation(service: anytype) bool {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    if (!@hasDecl(Service, "lockCatalogMutation")) return false;
+    service.lockCatalogMutation();
+    return true;
+}
+
+fn unlockCatalogMutation(service: anytype, locked: bool) void {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    if (@hasDecl(Service, "unlockCatalogMutation") and locked)
+        service.unlockCatalogMutation();
+}
 
 test "metadata control loop proposes desired transitions through the service seam" {
     const FakeService = struct {
@@ -284,8 +362,20 @@ test "metadata control loop plans placement intents from desired topology and ca
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         placement_upserts: usize = 0,
+        catalog_locked: bool = false,
+
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.catalog_locked);
+            self.catalog_locked = true;
+        }
+
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.catalog_locked);
+            self.catalog_locked = false;
+        }
 
         pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             const out = try alloc.alloc(metadata_table_manager.TableRecord, self.tables.len);
             errdefer alloc.free(out);
             for (self.tables, 0..) |record, i| out[i] = .{
@@ -325,8 +415,14 @@ test "metadata control loop plans placement intents from desired topology and ca
             alloc.free(records);
         }
 
-        pub fn listProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+        pub fn listProjectedPlacementIntents(self: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn getProjectedReallocationRequest(self: *@This()) !?@import("reallocation_request.zig").ReallocationRequestRecord {
+            if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
+            return null;
         }
 
         pub fn freeProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
@@ -358,6 +454,7 @@ test "metadata control loop plans placement intents from desired topology and ca
         }
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
+            if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             self.placement_upserts += plan.placement_upserts.len;
         }
     };
@@ -377,9 +474,10 @@ test "metadata control loop plans placement intents from desired topology and ca
     try loop.stateRef().tableManager().replaceTopology(&tables, &ranges);
 
     var fake = FakeService{ .tables = &tables, .ranges = &ranges };
-    const summary = try loop.reconcileOnce(&fake);
+    const summary = try loop.reconcileSeededFromProjected(&fake);
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 3), fake.placement_upserts);
+    try std.testing.expect(!fake.catalog_locked);
 }
 
 test "metadata control loop installs service median key lookup for automatic split planning" {

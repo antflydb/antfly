@@ -23,6 +23,7 @@ const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_service = @import("../metadata/service.zig");
+const metadata_runtime = @import("../metadata/runtime.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const data_runtime = @import("../data/runtime.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -69,6 +70,65 @@ fn runMetadataUntilIncarnationReady(svc: *metadata_service.MetadataService) !voi
     return error.MetadataIncarnationUnavailable;
 }
 
+fn createTableIndexWithProbeRetry(
+    client: *http_client.ApiHttpClient,
+    wait_io: std.Io,
+    base_uri: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+    body: []const u8,
+) !http_client.TablesResponse {
+    for (0..600) |_| {
+        return client.createTableIndex(base_uri, table_name, index_name, body) catch |err| switch (err) {
+            // Index validation has not mutated catalog state. Retry only the
+            // server's explicit pre-admission saturation contract; all other
+            // transport and HTTP failures remain terminal and visible.
+            error.ProbeUnavailable => {
+                try wait_io.sleep(.fromMilliseconds(50), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return error.EmbeddingProbeUnavailable;
+}
+
+fn queryResponseTotal(body: []const u8) !i64 {
+    var parsed = try std.json.parseFromSlice(
+        metadata_openapi.QueryResponses,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+    if (parsed.value.responses == null or parsed.value.responses.?.len != 1)
+        return error.TestUnexpectedResult;
+    const hits = parsed.value.responses.?[0].hits orelse return error.TestUnexpectedResult;
+    const total = hits.total orelse return error.TestUnexpectedResult;
+    return total.value;
+}
+
+fn fetchQueryUntilTotal(
+    client: *http_client.ApiHttpClient,
+    wait_io: std.Io,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_total: i64,
+) !http_client.QueryResponse {
+    for (0..600) |_| {
+        var response = try client.fetchQuery(base_uri, table_name, body);
+        const observed_total = queryResponseTotal(response.body) catch |err| {
+            response.deinit(std.testing.allocator);
+            return err;
+        };
+        if (observed_total == expected_total) return response;
+        response.deinit(std.testing.allocator);
+        try wait_io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.QueryVisibilityTimeout;
+}
+
 fn metadataServiceRaftProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
     return .{
         .ptr = svc,
@@ -91,6 +151,31 @@ fn metadataServiceControlProgressSource(svc: *metadata_service.MetadataService) 
 fn runMetadataServiceControlProgress(ptr: *anyopaque) !void {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     try svc.runControlRoundOnly();
+}
+
+fn metadataRuntimeRaftProgressSource(server: *metadata_runtime.Server) raft_mod.ProgressSource {
+    return .{
+        .ptr = server,
+        .run_once = runMetadataRuntimeRaftProgress,
+    };
+}
+
+fn runMetadataRuntimeRaftProgress(ptr: *anyopaque) !void {
+    const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
+    try server.runRaftRoundOnly();
+}
+
+fn metadataRuntimeControlProgressSource(server: *metadata_runtime.Server) raft_mod.ProgressSource {
+    return .{
+        .ptr = server,
+        .run_once = runMetadataRuntimeControlProgress,
+    };
+}
+
+fn runMetadataRuntimeControlProgress(ptr: *anyopaque) !void {
+    const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
+    try server.runControlRoundOnly();
+    try server.runCdcRound();
 }
 
 fn dataServerRaftProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
@@ -929,7 +1014,19 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{ "title", "body" }, 5);
     defer std.testing.allocator.free(query_body);
-    var query = try client.fetchQuery(base_uri, "docs", query_body);
+    // Batch acknowledgement precedes asynchronous full-text generation
+    // publication. Wait on the observable query contract instead of assuming
+    // an unloaded scheduler makes the first query see the new generation.
+    var query_visibility_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer query_visibility_io.deinit();
+    var query = try fetchQueryUntilTotal(
+        &client,
+        query_visibility_io.io(),
+        base_uri,
+        "docs",
+        query_body,
+        2,
+    );
     defer query.deinit(std.testing.allocator);
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, query.body, .{});
     defer query_responses.deinit();
@@ -2564,6 +2661,8 @@ test "public api split e2e backs up drops and restores a table" {
 }
 
 test "public api standalone-like e2e backs up drops and restores a table" {
+    const internal_service_secret = "standalone-e2e-internal-service-secret-v1";
+    const internal_service_issuer = "standalone-e2e";
     const process_alloc = platform.allocator.processAllocator(std.testing.allocator);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2574,6 +2673,10 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     defer std.testing.allocator.free(data_replica_root);
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
+    const data_replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-data-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(data_replica_catalog_path);
+    const metadata_snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(metadata_snapshot_root);
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
@@ -2581,14 +2684,18 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_snapshot_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    std.Io.Dir.cwd().deleteFile(io_impl.io(), data_replica_catalog_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io_impl.io(), backup_root);
     const backup_root_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), backup_root, std.testing.allocator);
     defer std.testing.allocator.free(backup_root_absolute);
     defer {
         std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
         std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_snapshot_root) catch {};
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+        std.Io.Dir.cwd().deleteFile(io_impl.io(), data_replica_catalog_path) catch {};
     }
     const node_config_json = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -2608,72 +2715,68 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     var node_config = try common_config.Config.parseFromSlice(std.testing.allocator, node_config_json);
     defer node_config.deinit();
 
-    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
-    defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-
-    var svc = try metadata_service.MetadataService.init(std.testing.allocator, .{
-        .host = .{
-            .local_node_id = 1,
-            .metadata_group_id = 2116,
-            .replica_root_dir = metadata_replica_root,
-            .replica_catalog_path = replica_catalog_path,
-        },
-    }, .{
-        .host = .{
-            .host = .{
-                .descriptor_factory = factory.iface(),
-            },
-        },
-    }, .{
-        .observe_local_replica_root = true,
-    });
-    defer svc.deinit();
-
-    _ = try svc.ensureMetadataReplica(.{
-        .group_id = 2116,
-        .replica_id = 1,
+    var metadata_server = try metadata_runtime.Server.init(process_alloc, .{
         .local_node_id = 1,
-        .bootstrap_mode = .empty,
+        .metadata_group_id = 2116,
+        .replica_root_dir = metadata_replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = metadata_snapshot_root,
+        // The metadata runtime owns reconciliation. Its node id is deliberately
+        // distinct from the data node below, so it never treats a data
+        // placement as a colocated replica-root responsibility.
+        .observe_local_replica_root = true,
+        .api_server_cfg = .{
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
+            .internal_service_auth_capability = "v1; mode=enforce",
+        },
     });
-    try svc.campaignMetadataGroup();
-    try runMetadataUntilIncarnationReady(&svc);
-
-    var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
-    const metadata_api = try startMetadataAdminListener(
-        std.testing.allocator,
-        &svc,
-        &metadata_admin_server,
-        &metadata_admin_listener,
-    );
-    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
-
+    defer metadata_server.deinit();
+    try metadata_server.start();
+    try metadata_server.bootstrapLocal(2116, 1);
     var metadata_raft_progress = raft_mod.ManagedProgressDriver.init(
         io_impl.io(),
-        metadataServiceRaftProgressSource(&svc),
+        metadataRuntimeRaftProgressSource(&metadata_server),
         std.time.ns_per_ms,
     );
     defer metadata_raft_progress.deinit();
     try metadata_raft_progress.start();
     var metadata_control_progress = raft_mod.ManagedProgressDriver.init(
         io_impl.io(),
-        metadataServiceControlProgressSource(&svc),
+        metadataRuntimeControlProgressSource(&metadata_server),
         std.time.ns_per_ms,
     );
     defer metadata_control_progress.deinit();
     try metadata_control_progress.start();
+    var metadata_incarnation_ready = false;
+    for (0..600) |_| {
+        if (try metadata_server.server.svc.metadataIncarnation() != null) {
+            metadata_incarnation_ready = true;
+            break;
+        }
+        try io_impl.io().sleep(.fromMilliseconds(10), .awake);
+    }
+    if (!metadata_incarnation_ready) return error.MetadataIncarnationUnavailable;
+    const metadata_api = try metadata_server.adminBaseUri(std.testing.allocator);
+    defer std.testing.allocator.free(metadata_api);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = data_replica_root,
+        .replica_catalog_path = data_replica_catalog_path,
         .store_registration = .{
-            .node_id = 1,
-            .store_id = 1,
+            .node_id = 9,
+            .store_id = 9,
             .role = "data",
         },
         .api_server_cfg = .{
-            .deployment_mode = .standalone,
+            // This fixture has distinct metadata and data runtimes. Exercise
+            // the metadata-owned atomic topology restore path even though
+            // both processes happen to live in this test binary.
+            .deployment_mode = .distributed,
             .node_config = &node_config,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
+            .internal_service_auth_capability = "v1; mode=enforce",
         },
     }, metadata_api);
     defer data_server.deinit();
@@ -2696,8 +2799,8 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     );
     defer data_control_progress.deinit();
     try data_control_progress.start();
-    svc.setLocalGroupStatusProvider(data_server.localGroupStatusProvider());
-    defer svc.setLocalGroupStatusProvider(null);
+    metadata_server.server.svc.setLocalGroupStatusProvider(data_server.localGroupStatusProvider());
+    defer metadata_server.server.svc.setLocalGroupStatusProvider(null);
 
     const base_uri = try data_server.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
@@ -2713,13 +2816,38 @@ test "public api standalone-like e2e backs up drops and restores a table" {
 
     const batch_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/db/v1/tables/docs/batch");
     defer std.testing.allocator.free(batch_uri);
-    var batch_resp = try executor.executor().execute(std.testing.allocator, .{
-        .method = .POST,
-        .uri = batch_uri,
-        .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
-    });
+    const batch_deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s;
+    var batch_resp = while (true) {
+        try metadata_raft_progress.check();
+        try metadata_control_progress.check();
+        try data_raft_progress.check();
+        try data_control_progress.check();
+        var response = try executor.executor().execute(std.testing.allocator, .{
+            .method = .POST,
+            .uri = batch_uri,
+            .content_type = "application/json",
+            .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        });
+        if (response.status == 201) break response;
+        if (response.status != 503 or platform.time.monotonicNs() >= batch_deadline_ns) break response;
+        response.deinit(std.testing.allocator);
+        try io_impl.io().sleep(.fromMilliseconds(10), .awake);
+    };
     defer batch_resp.deinit(std.testing.allocator);
+    if (batch_resp.status != 201) {
+        var snapshot = try metadata_server.server.svc.adminSnapshot();
+        defer metadata_server.server.svc.freeAdminSnapshot(&snapshot);
+        std.debug.print(
+            "standalone-like initial batch status={d} body={s} stores={d} placements={d} ranges={d}\n",
+            .{ batch_resp.status, batch_resp.body, snapshot.stores.len, snapshot.placement_intents.len, snapshot.ranges.len },
+        );
+        for (snapshot.stores) |store| {
+            std.debug.print(
+                "initial store id={d} node={d} live={} health={s} capacity={d} available={d}\n",
+                .{ store.store_id, store.node_id, store.live, store.health_class, store.capacity_bytes, store.available_bytes },
+            );
+        }
+    }
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
 
     var query_resp = try client.fetchQuery(base_uri, "docs",
@@ -2793,14 +2921,18 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     defer std.testing.allocator.free(restore_job_uri);
 
     var restore_succeeded = false;
-    for (0..30_000) |_| {
+    const restore_deadline_ns = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < restore_deadline_ns) {
         try metadata_raft_progress.check();
-        try metadata_control_progress.checkFailure();
+        try metadata_control_progress.check();
         try data_raft_progress.check();
-        try data_control_progress.checkFailure();
+        try data_control_progress.check();
         var job_resp = try executor.executor().execute(std.testing.allocator, .{
             .method = .GET,
             .uri = restore_job_uri,
+            // Keep a wedged status handler from multiplying the acceptance
+            // deadline by the number of polls.
+            .timeout_ms = 1_000,
         });
         defer job_resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), job_resp.status);
@@ -2824,9 +2956,58 @@ test "public api standalone-like e2e backs up drops and restores a table" {
             );
             return error.RestoreJobFailed;
         }
-        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+        try io_impl.io().sleep(.fromMilliseconds(10), .awake);
     }
-    if (!restore_succeeded) return error.RestoreJobTimeout;
+    if (!restore_succeeded) {
+        var snapshot = try metadata_server.server.svc.adminSnapshot();
+        defer metadata_server.server.svc.freeAdminSnapshot(&snapshot);
+        std.debug.print(
+            "standalone-like restore timeout ranges={d} progress={d}\n",
+            .{ snapshot.ranges.len, snapshot.restore_progresses.len },
+        );
+        for (snapshot.ranges) |range| {
+            std.debug.print(
+                "restore range table={d} group={d} backup={s} artifact={s} location={s} completed={s}\n",
+                .{
+                    range.table_id,
+                    range.group_id,
+                    range.restore_backup_id,
+                    range.restore_artifact_backup_id,
+                    range.restore_location,
+                    range.completed_restore_fingerprint,
+                },
+            );
+            const group_path = try metadata_mod.groupDbPathFromReplicaRoot(
+                std.testing.allocator,
+                data_replica_root,
+                range.group_id,
+            );
+            defer std.testing.allocator.free(group_path);
+            if (try db_mod.DB.readRestoreStateForPathWithIo(std.testing.allocator, io_impl.io(), group_path)) |state_value| {
+                var state = state_value;
+                defer state.deinit(std.testing.allocator);
+                std.debug.print(
+                    "local restore group={d} phase={s} primary={} repaired={} backup={s}\n",
+                    .{ range.group_id, state.phase, state.primary_restored, state.runtime_repair_complete, state.backup_id },
+                );
+            } else {
+                std.debug.print("local restore group={d} state=missing\n", .{range.group_id});
+            }
+        }
+        for (snapshot.restore_progresses) |progress| {
+            std.debug.print(
+                "restore progress table={d} node={d} group={d} backup={s}\n",
+                .{ progress.table_id, progress.node_id, progress.group_id, progress.backup_id },
+            );
+        }
+        for (snapshot.placement_intents) |intent| {
+            std.debug.print(
+                "restore placement group={d} node={d} store={d}\n",
+                .{ intent.record.group_id, intent.record.local_node_id, intent.store_id },
+            );
+        }
+        return error.RestoreJobTimeout;
+    }
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);
@@ -3383,6 +3564,13 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
     defer provisioned_write_source.deinit();
+    // This integration test issues real embedding validation requests. Give
+    // it the same dedicated executor ownership as production so unrelated
+    // parallel tests cannot exhaust the process-global fallback executor.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    provisioned_write_source.backend_runtime = backend_runtime.ptr();
+    const probe_retry_io = backend_runtime.ptr().controlIo() orelse return error.BackendRuntimeUnavailable;
     const DirectWriterOwner = struct {
         fn metadataMayOpenReplicaRoots(_: *anyopaque) bool {
             return false;
@@ -3396,11 +3584,12 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     defer svc.setLocalReplicaRootReconcilePermitHook(null);
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{ .deployment_mode = .standalone },
+        .{ .deployment_mode = .standalone, .backend_runtime = backend_runtime.ptr() },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3438,7 +3627,14 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
-    var semantic_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_idx", semantic_index_body);
+    var semantic_index_resp = try createTableIndexWithProbeRetry(
+        &client,
+        probe_retry_io,
+        base_uri,
+        "docs",
+        "semantic_idx",
+        semantic_index_body,
+    );
     defer semantic_index_resp.deinit(std.testing.allocator);
 
     rounds = 0;
@@ -3463,7 +3659,14 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     defer dropped.deinit(std.testing.allocator);
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTableIndex(base_uri, "docs", "semantic_idx"));
 
-    var recreated = try client.createTableIndex(base_uri, "docs", "semantic_idx", semantic_index_body);
+    var recreated = try createTableIndexWithProbeRetry(
+        &client,
+        probe_retry_io,
+        base_uri,
+        "docs",
+        "semantic_idx",
+        semantic_index_body,
+    );
     defer recreated.deinit(std.testing.allocator);
 
     // Index creation is accepted before the writer-owned generation has

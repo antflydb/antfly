@@ -1240,6 +1240,59 @@ test "std http executor enforces request timeout while waiting for response" {
     }));
 }
 
+test "std http executor connect deadline does not expire an established request" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const SlowApp = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            // This exceeds the DNS/connect budget by design. Once connected,
+            // only the response idle timeout or an explicit whole-request
+            // deadline may terminate the request.
+            sleepMs(250);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "progressing"),
+            };
+        }
+    };
+
+    var app = SlowApp{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = listener.boundAddress().?;
+    const uri = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://localhost:{d}/replication/start",
+        .{bound.getPort()},
+    );
+    defer std.testing.allocator.free(uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{
+        .resolve_before_connect = true,
+        .connect_timeout_ms = 100,
+        .request_timeout_ms = 0,
+    });
+    defer executor.deinit();
+
+    var response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = uri,
+    });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("progressing", response.body);
+}
+
 test "std http executor cancels an in-flight production request and retires its socket" {
     const std_http_executor = @import("std_http_executor.zig");
 
@@ -1606,12 +1659,13 @@ test "std http listener and executor round-trip snapshot routes" {
     var executor: std_http_executor.StdHttpExecutor = undefined;
     executor.initInPlace(std.testing.allocator, .{});
     defer executor.deinit();
-    var transport = http_snapshot.HttpSnapshotTransport.init(
+    var transport = try http_snapshot.HttpSnapshotTransport.init(
         std.testing.allocator,
         .{ .root_dir = "/tmp" },
         executor.executor(),
         null,
     );
+    defer transport.deinit();
 
     const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-1");
     defer std.testing.allocator.free(upload_path);
