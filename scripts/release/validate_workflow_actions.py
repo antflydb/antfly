@@ -11,7 +11,9 @@ from pathlib import Path
 SHA_REF = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses:\s*([^\s#]+)")
 WRITE_PERMISSION = re.compile(
-    r"(?:^|[{,])\s*(?:actions|attestations|contents|id-token|packages):\s*write\b"
+    r"(?:^|[{,])\s*(?:actions|attestations|checks|contents|deployments|discussions|"
+    r"id-token|issues|packages|pages|pull-requests|repository-projects|"
+    r"security-events|statuses):\s*write\b"
 )
 WRITE_ALL = re.compile(r"^\s*permissions:\s*write-all\s*(?:#.*)?$")
 

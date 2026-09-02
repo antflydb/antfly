@@ -57,6 +57,17 @@ class WorkflowActionPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "vendor/publish@v1"):
                 validate(root)
 
+    def test_every_github_write_scope_is_privileged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.write(
+                root,
+                "future-automation.yml",
+                "permissions:\n  pull-requests: write\njobs:\n  x:\n    steps:\n      - uses: vendor/automation@v1\n",
+            )
+            with self.assertRaisesRegex(SystemExit, "vendor/automation@v1"):
+                validate(root)
+
     def test_pinned_and_local_reusable_workflows_are_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
