@@ -1226,7 +1226,10 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
         // so reopening and replaying is idempotent and preserves visibility.
         error.NoActiveWriteSession => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
+        error.ReplayDocumentNotVisible,
+        error.PostingWalCaptureOwnershipConflict,
+        error.ArtifactRepairRequired,
+        => true,
         else => false,
     };
 }
@@ -1235,6 +1238,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
         error.ReplayDocumentNotVisible,
+        error.PostingWalCaptureOwnershipConflict,
         error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,

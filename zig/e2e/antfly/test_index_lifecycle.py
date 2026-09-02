@@ -903,6 +903,12 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
             or latest_status.get("replay_catch_up_required") is not False
             or latest_status.get("catch_up_active") is not False
             or latest_status.get("catch_up_phase") != "idle"
+            # Replay can settle just before the native exact-vector
+            # generation publishes. That short finalization window is real
+            # readiness work and correctly keeps backfill_active true; wait
+            # for the complete public lifecycle edge instead of asserting on
+            # the first replay-only snapshot.
+            or latest_status.get("backfill_active") is not False
         ):
             return None
         return latest_status

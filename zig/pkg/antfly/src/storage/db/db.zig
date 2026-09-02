@@ -1332,6 +1332,8 @@ const AsyncContext = struct {
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
+    dense_capture_lease_mutex: std.atomic.Mutex = .unlocked,
+    dense_capture_leases: std.StringHashMapUnmanaged(index_manager_mod.IndexManager.DensePostingCaptureLease) = .empty,
     active_dense_catch_up_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1372,6 +1374,17 @@ const AsyncContext = struct {
     fn deinit(self: *@This(), alloc: Allocator) void {
         self.index_repair_scheduler.deinit(alloc);
         self.applied_sequence_coalescer.deinit(alloc);
+        var capture_it = self.dense_capture_leases.iterator();
+        while (capture_it.next()) |entry| {
+            if (entry.value_ptr.ownsLifecycle()) {
+                self.index_manager.cancelDensePostingSidecarCaptureLeaseByName(
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                ) catch {};
+            }
+            alloc.free(@constCast(entry.key_ptr.*));
+        }
+        self.dense_capture_leases.deinit(alloc);
         var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
         while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
         self.pending_dense_projection_finalizations.deinit(alloc);
@@ -5458,6 +5471,13 @@ pub const DB = struct {
                 std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
             };
         }
+        // Async capture leases are capabilities owned by the live index
+        // manager. The executor is stopped above, so no worker can install a
+        // new lease; cancel and release any interrupted catch-up capture while
+        // that manager is still valid. In particular, do not defer this until
+        // after `core.deinit()`, which destroys the manager the leases name.
+        self.async_context.deinit(self.runtime_alloc);
+        self.runtime_alloc.destroy(self.async_context);
         self.core.deinit();
         // Publication locks are opened and closed through the DB runtime's
         // `std.Io`. Release the read generation before destroying an owned
@@ -5466,8 +5486,6 @@ pub const DB = struct {
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
-        self.async_context.deinit(self.runtime_alloc);
-        self.runtime_alloc.destroy(self.async_context);
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
@@ -23638,27 +23656,28 @@ pub const DB = struct {
             }
             if (!has_writes) continue;
 
-            var posting_capture_started = try self.core.index_manager.beginDensePostingSidecarCaptureByName(entry.config.name);
-            if (!posting_capture_started and
+            const posting_capture = try self.core.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(entry.config.name, .{});
+            var posting_capture_owned = if (posting_capture) |lease| lease.ownsLifecycle() else false;
+            if (posting_capture == null and
                 self.core.index_manager.densePostingSidecarCaptureRequiredByName(entry.config.name))
             {
                 return error.PostingWalCaptureOwnershipConflict;
             }
-            errdefer if (posting_capture_started)
-                self.core.index_manager.cancelDensePostingSidecarCaptureByName(entry.config.name);
+            errdefer if (posting_capture_owned) if (posting_capture) |lease|
+                self.core.index_manager.cancelDensePostingSidecarCaptureLeaseByName(entry.config.name, lease) catch {};
             try self.core.index_manager.applyDenseEmbeddingWritesByNameWithOptions(
                 self.core.store,
                 entry.config.name,
                 writes.items,
                 .{ .mode = .bulk_ingest },
             );
-            if (posting_capture_started) {
+            if (posting_capture) |lease| if (posting_capture_owned) {
                 // Repair chunks are independently recoverable. Keep their WAL
                 // bounded, but do not claim source coverage until the complete
                 // scan has succeeded.
-                try self.core.index_manager.finishDensePostingSidecarCaptureByName(entry.config.name, 0);
-                posting_capture_started = false;
-            }
+                try self.core.index_manager.finishDensePostingSidecarCaptureLeaseByName(entry.config.name, lease, 0);
+                posting_capture_owned = false;
+            };
             try mutated_indexes.put(alloc, entry.config.name, {});
         }
     }
@@ -24748,7 +24767,7 @@ pub const DB = struct {
             }
         }
 
-        if (deficit_names.items.len > 0 or (reset_names.items.len > 0 and !self.start_index_workers)) {
+        if (deficit_names.items.len > 0) {
             try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
             var external_session_tracked = true;
             errdefer if (external_session_tracked)
@@ -24757,10 +24776,6 @@ pub const DB = struct {
             for (deficit_names.items) |name| {
                 result.rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
             }
-            if (!self.start_index_workers) for (reset_names.items) |name| {
-                try self.core.index_manager.resetDenseIndexForArtifactRebuild(name);
-                result.rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
-            };
 
             external_session_tracked = false;
             // The restore state machine validates coverage after this bounded
@@ -24768,6 +24783,31 @@ pub const DB = struct {
             // finalizer early; exact-vector publication remains optional and
             // primary artifacts are the exact fallback until validation.
             finishExternalDenseBulkSessionTracked(self.async_context);
+            self.clearDenseHbcCaches();
+            result.made_progress = true;
+        }
+
+        if (reset_names.items.len > 0 and !self.start_index_workers) {
+            // A pointer-selected native-v2 root is a published generation, not
+            // a directory that can be cleared and reopened in place. Besides
+            // invalidating its READY/authority proof, an in-place reset can
+            // leave readers or storage implementations attached to the old
+            // files. Reconstruct surplus coverage through the ordinary shadow
+            // generation protocol even while restore owns a private staged DB:
+            // build from the final primary artifacts, certify native authority,
+            // then atomically replace the active-root pointer.
+            for (reset_names.items) |name| {
+                const cfg_ptr = self.core.index_manager.get(name) orelse return error.IndexNotFound;
+                var cfg = try types.IndexConfig.clone(alloc, cfg_ptr.*);
+                defer cfg.deinit(alloc);
+                // Restore is the synchronous owner of this private generation.
+                // Keep the detected durable intent unchanged until the final
+                // counter/checkpoint proof removes it; scheduler phase leases
+                // are for independently resumed background candidates.
+                const rebuilt = try self.rebuildIndexWithShadowReplacement(alloc, cfg, .{}, null);
+                if (rebuilt.yielded) return error.ShadowIndexCatchUpIncomplete;
+                result.rebuilt +|= @intCast(rebuilt.reprocessed);
+            }
             self.clearDenseHbcCaches();
             result.made_progress = true;
         }
@@ -25176,17 +25216,18 @@ pub const DB = struct {
 
         var mutated_it = mutated_indexes.keyIterator();
         while (mutated_it.next()) |index_name| {
-            var posting_capture_started = try self.core.index_manager.beginDensePostingSidecarCaptureByName(index_name.*);
-            if (!posting_capture_started) {
+            const posting_capture = try self.core.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_name.*, .{});
+            var posting_capture_owned = if (posting_capture) |lease| lease.ownsLifecycle() else false;
+            if (posting_capture == null) {
                 if (self.core.index_manager.densePostingSidecarCaptureRequiredByName(index_name.*))
                     return error.PostingWalCaptureOwnershipConflict;
                 continue;
             }
-            errdefer if (posting_capture_started)
-                self.core.index_manager.cancelDensePostingSidecarCaptureByName(index_name.*);
+            errdefer if (posting_capture_owned) if (posting_capture) |lease|
+                self.core.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name.*, lease) catch {};
             const applied_sequence = try self.core.loadAppliedSequence(alloc, index_name.*);
-            try self.core.index_manager.finishDensePostingSidecarCaptureByName(index_name.*, applied_sequence);
-            posting_capture_started = false;
+            try self.core.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name.*, posting_capture.?, applied_sequence);
+            posting_capture_owned = false;
         }
         if (state.last_flushed_key == null and state.last_matching_key != null) {
             try state.updateOwnedKey(&state.last_flushed_key, state.last_matching_key.?);
@@ -51084,14 +51125,74 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
+fn installAsyncDenseCaptureLease(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    lease: index_manager_mod.IndexManager.DensePostingCaptureLease,
+) !void {
+    if (!lease.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
+    const owned_name = try ctx.alloc.dupe(u8, index_name);
+    errdefer ctx.alloc.free(owned_name);
+    lockAtomicWithBackoff(&ctx.dense_capture_lease_mutex);
+    defer ctx.dense_capture_lease_mutex.unlock();
+    const entry = try ctx.dense_capture_leases.getOrPut(ctx.alloc, owned_name);
+    if (entry.found_existing) return error.PostingWalCaptureOwnershipConflict;
+    entry.key_ptr.* = owned_name;
+    entry.value_ptr.* = lease;
+}
+
+fn takeAsyncDenseCaptureLease(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+) ?index_manager_mod.IndexManager.DensePostingCaptureLease {
+    lockAtomicWithBackoff(&ctx.dense_capture_lease_mutex);
+    defer ctx.dense_capture_lease_mutex.unlock();
+    const removed = ctx.dense_capture_leases.fetchRemove(index_name) orelse return null;
+    defer ctx.alloc.free(@constCast(removed.key));
+    return removed.value;
+}
+
+fn cancelAsyncDenseCaptureLease(ctx: *AsyncContext, index_name: []const u8) void {
+    const lease = takeAsyncDenseCaptureLease(ctx, index_name) orelse return;
+    if (!lease.ownsLifecycle()) return;
+    ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
+}
+
+fn finishAsyncDenseCaptureLeaseOrEnsureCoverage(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    applied_sequence: u64,
+) !void {
+    if (takeAsyncDenseCaptureLease(ctx, index_name)) |lease| {
+        errdefer if (lease.ownsLifecycle())
+            ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
+        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, applied_sequence);
+        return;
+    }
+    // Generic checkpoint/status work never acquires ownership by observing an
+    // active source capture. It may only ensure an uncovered boundary after
+    // the owning replay session has already closed.
+    try ctx.index_manager.persistDensePostingSidecarByName(index_name, applied_sequence);
+}
+
 fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     ctx: *AsyncContext,
     index_ref: index_manager_mod.ManagedIndexRef,
 ) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
-    const started_capture = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
-    errdefer if (started_capture) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    const capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
+    var capture_installed = false;
+    errdefer if (capture) |lease| {
+        if (capture_installed)
+            cancelAsyncDenseCaptureLease(ctx, index_ref.name)
+        else if (lease.ownsLifecycle())
+            ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
+    };
+    if (capture) |lease| {
+        try installAsyncDenseCaptureLease(ctx, index_ref.name, lease);
+        capture_installed = true;
+    }
     try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -51118,7 +51219,7 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
     try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
-    errdefer ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer cancelAsyncDenseCaptureLease(ctx, index_ref.name);
     errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
 }
@@ -51132,7 +51233,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
-        ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+        cancelAsyncDenseCaptureLease(ctx, index_ref.name);
         abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
         const lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name);
         if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
@@ -51140,7 +51241,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
-    errdefer ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer cancelAsyncDenseCaptureLease(ctx, index_ref.name);
     var streaming_session_finished = false;
     errdefer if (!streaming_session_finished) abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     const finish_start_ns = monotonicTimeNs();
@@ -51646,10 +51747,12 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
     defer ctx.alloc.free(lower);
 
     const resumable = ctx.repair_options.yield_check != null;
-    var posting_capture_started = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_name);
-    if (!posting_capture_started and ctx.index_manager.densePostingSidecarCaptureRequiredByName(index_name))
+    const posting_capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_name, .{});
+    var posting_capture_owned = if (posting_capture) |lease| lease.ownsLifecycle() else false;
+    if (posting_capture == null and ctx.index_manager.densePostingSidecarCaptureRequiredByName(index_name))
         return error.PostingWalCaptureOwnershipConflict;
-    errdefer if (posting_capture_started) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_name);
+    errdefer if (posting_capture_owned) if (posting_capture) |lease|
+        ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
     if (resumable) {
         try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_name);
     } else {
@@ -51749,10 +51852,10 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
         try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseRepairFinishOptions(ctx));
     }
     session_open = false;
-    if (posting_capture_started) {
-        try ctx.index_manager.finishDensePostingSidecarCaptureByName(index_name, ctx.store.lastReplaySequence(0));
-        posting_capture_started = false;
-    }
+    if (posting_capture) |lease| if (posting_capture_owned) {
+        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, ctx.store.lastReplaySequence(0));
+        posting_capture_owned = false;
+    };
     const owned_resume_key = state.resume_key;
     state.resume_key = null;
     return .{ .rebuilt = state.rebuilt, .resume_key = owned_resume_key };
@@ -51799,10 +51902,12 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
     defer ctx.alloc.free(lower);
 
     const resumable = ctx.repair_options.yield_check != null;
-    var posting_capture_started = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_name);
-    if (!posting_capture_started and ctx.index_manager.densePostingSidecarCaptureRequiredByName(index_name))
+    const posting_capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_name, .{});
+    var posting_capture_owned = if (posting_capture) |lease| lease.ownsLifecycle() else false;
+    if (posting_capture == null and ctx.index_manager.densePostingSidecarCaptureRequiredByName(index_name))
         return error.PostingWalCaptureOwnershipConflict;
-    errdefer if (posting_capture_started) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_name);
+    errdefer if (posting_capture_owned) if (posting_capture) |lease|
+        ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_name, lease) catch {};
     if (resumable) {
         try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_name);
     } else {
@@ -51925,10 +52030,10 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
         try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseRepairFinishOptions(ctx));
     }
     session_open = false;
-    if (posting_capture_started) {
-        try ctx.index_manager.finishDensePostingSidecarCaptureByName(index_name, ctx.store.lastReplaySequence(0));
-        posting_capture_started = false;
-    }
+    if (posting_capture) |lease| if (posting_capture_owned) {
+        try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_name, lease, ctx.store.lastReplaySequence(0));
+        posting_capture_owned = false;
+    };
     const owned_resume_key = state.resume_key;
     state.resume_key = null;
     return .{ .rebuilt = state.rebuilt, .resume_key = owned_resume_key };
@@ -52358,7 +52463,7 @@ fn flushFinishedDenseAppliedSequenceLocked(
             // generation, but do not rewrite the generic checkpoint or source
             // LSM status row for every replay window.
             const posting_started = monotonicTimeNs();
-            try ctx.index_manager.finishDensePostingSidecarCaptureByName(pending.owned_name, pending.sequence);
+            try finishAsyncDenseCaptureLeaseOrEnsureCoverage(ctx, pending.owned_name, pending.sequence);
             posting_publish_ns +|= elapsedSince(posting_started);
         } else {
             const metadata_started = monotonicTimeNs();
@@ -52442,7 +52547,7 @@ fn flushPendingAppliedSequencesLocked(
         for (enriched_updates) |update| {
             if (ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name)) {
                 const posting_started = monotonicTimeNs();
-                try ctx.index_manager.finishDensePostingSidecarCaptureByName(update.index_name, update.sequence);
+                try finishAsyncDenseCaptureLeaseOrEnsureCoverage(ctx, update.index_name, update.sequence);
                 posting_publish_ns +|= elapsedSince(posting_started);
             } else {
                 generic_updates.appendAssumeCapacity(update);
@@ -87628,23 +87733,37 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
         const stable_vector_id = denseTestVectorId("doc:b");
         try std.testing.expect(stable_vector_id != @as(u64, ordinal));
         try std.testing.expectEqual(@as(?u64, stable_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", "doc:b"));
+
+        // Exercise the production reconstruction path. New dense indexes are
+        // pointer-selected native generations, so deleting the legacy
+        // canonical directory is no longer a meaningful rebuild trigger.
+        const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+        const repair_id = try db.createGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .operator_generation_rebuild,
+            0,
+            0,
+            null,
+        );
+        var repaired: DB.IndexRepairAdvanceResult = undefined;
+        var documents_reprocessed: u64 = 0;
+        for (0..4) |_| {
+            repaired = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            documents_reprocessed +|= repaired.documents_reprocessed;
+            if (repaired.repaired) break;
+            try std.testing.expect(repaired.deferred or repaired.busy);
+        }
+        try std.testing.expect(repaired.repaired);
+        try std.testing.expectEqual(@as(u64, 2), documents_reprocessed);
+        try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
     }
 
-    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
-    defer alloc.free(dense_index_path);
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
-
     var reopened = try DB.open(alloc, std.mem.span(path), .{
-        .open_mode = .writer_no_replay,
+        .open_mode = .query_readonly,
         .start_index_workers = false,
     });
     defer reopened.close();
-
-    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
-    try std.testing.expectEqual(@as(usize, 2), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
-    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 
     var txn = try reopened.core.store.beginProbeTxn();
     defer txn.abort();

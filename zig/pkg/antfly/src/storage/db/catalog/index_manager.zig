@@ -3339,7 +3339,16 @@ pub const IndexManager = struct {
         if (compacted.store.covered_source_sequence != covered_source_sequence or
             coverage == null or coverage.?.vector_count != entry.index.stats().active_count)
         {
-            return error.VectorBlockPublishedGenerationNotReady;
+            // The shared empty generation can predate this index's artifact
+            // scope. Delta compaction preserves only scopes already declared
+            // by its base manifest, so it remains exact as a mutation store
+            // but cannot certify the new logical projection. Likewise, a
+            // cardinality mismatch is repair debt rather than permission to
+            // install the compacted layout. Keep it unpublished and let the
+            // caller's pinned-primary snapshot path rebuild the complete scope
+            // set at this same stable source boundary.
+            self.vector_block_projection_dirty.store(true, .release);
+            return false;
         }
         const generation = try SharedVectorBlockGeneration.create(self.alloc, compacted);
         compacted_owned = false;
@@ -14772,6 +14781,12 @@ pub const IndexManager = struct {
     fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) bool {
         if (cfg.kind != .dense_vector or builtin.os.tag == .freestanding) return false;
         if (!densePostingWalMutationStoreEnabled()) return false;
+        // Fresh-v2 publication currently stages a host directory and commits
+        // it through the host ACTIVE_ROOT pointer. A backend-local namespace
+        // (Lite, object storage, modeled devices) may use the native posting
+        // format, but cannot safely share that locator unless it explicitly
+        // proves its logical paths are the host paths being published.
+        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
         if (self.dense_native_migration_policy_source) |source| return source.authorityPermitted();
         return true;
     }
@@ -14934,6 +14949,13 @@ pub const IndexManager = struct {
             ready_sequence,
             .{ .validate_payloads = true, .flatten = true },
         );
+        // The fresh-generation commit is already an exclusive, stable source
+        // boundary. Publish the exact-vector authority here as well so an
+        // empty index is born queryable and accelerated, rather than making
+        // the next startup discover and repair generation-missing debt. For
+        // an empty corpus this writes only CURRENT plus its empty WAL and
+        // scoped coverage certificate; physical shard files stay lazy.
+        try self.ensureVectorBlockBaseAtAppliedSequence(cfg.name, ready_sequence);
         try index_generation_manifest.writeReadyForPhysicalFormat(
             self.alloc,
             generation.index_path,
@@ -15088,16 +15110,33 @@ pub const IndexManager = struct {
         if (manifest.physical_format != .dense_native_v2) return false;
         const marker_path = try std.fs.path.join(
             self.alloc,
-            &.{ index_path, "posting-segments", "AUTHORITY" },
+            &.{ index_path, "posting-segments", posting_segment_store_mod.authority_name },
         );
         defer self.alloc.free(marker_path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().access(io_impl.io(), marker_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
+        const authority = if (self.dense_lsm_storage) |storage|
+            storage.readFileAlloc(
+                self.alloc,
+                marker_path,
+                posting_segment_store_mod.authority_value.len + 1,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                else => return err,
+            }
+        else blk: {
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            break :blk std.Io.Dir.cwd().readFileAlloc(
+                io_impl.io(),
+                marker_path,
+                self.alloc,
+                .limited(posting_segment_store_mod.authority_value.len + 1),
+            ) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                else => return err,
+            };
         };
-        return true;
+        defer self.alloc.free(authority);
+        return std.mem.eql(u8, authority, posting_segment_store_mod.authority_value);
     }
 
     /// Algebraic data lives in the primary store, so its physical namespace
@@ -26686,6 +26725,49 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     try writeFileAtomicallyDurable(alloc, std.testing.io, marker_path, stale_marker);
     _ = try reopened.cleanupInactiveRepairShadowRootsPage();
     try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+}
+
+test "native pointer validation reads authority through configured storage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var dense_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer dense_storage.deinit();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .dense_lsm_storage = dense_storage.storage(),
+    });
+    defer manager.deinit();
+
+    const index_name = "dv_v2";
+    const relative = ".repair-shadow-configured/indexes/dv_v2";
+    const active_path = try std.fs.path.join(alloc, &.{ path, relative });
+    defer alloc.free(active_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
+    try index_generation_manifest.writeReadyForPhysicalFormat(
+        alloc,
+        active_path,
+        17,
+        index_name,
+        23,
+        29,
+        .dense_native_v2,
+    );
+    const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
+    defer alloc.free(posting_path);
+    try dense_storage.storage().createDirPath(posting_path);
+    const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
+    defer alloc.free(authority_path);
+    try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
+
+    const canonical_path = try manager.indexPath(index_name);
+    defer alloc.free(canonical_path);
+    try manager.writeActiveIndexRootPointer(canonical_path, relative);
+    const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings(relative, selected);
 }
 
 test "fresh dense admission remains legacy before the native capability floor" {

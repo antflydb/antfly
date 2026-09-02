@@ -32204,6 +32204,9 @@ test "data runtime background maintenance is due for dense posting cadence witho
 
     try std.testing.expectEqual(@as(u64, 0), server.write_source.lsmMaintenanceScoreBestEffort());
 
+    // Isolate posting cadence from the independently scheduled vector-block
+    // publisher, whose zero-initialized deadline is immediately due.
+    server.vector_block_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
     server.dense_posting_maintenance_next_eligible_ns.store(100, .release);
     try std.testing.expect(server.backgroundMaintenanceDue(100));
     try std.testing.expect(server.backgroundMaintenanceDue(101));
