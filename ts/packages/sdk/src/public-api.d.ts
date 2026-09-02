@@ -922,7 +922,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Perform batch inserts and deletes on a table */
+        /**
+         * Perform batch inserts and deletes on a table
+         * @description Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt and may be safely replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured transaction-session retention period; callers must not reuse a key after that period. Requests without this header retain legacy behavior.
+         */
         post: operations["batchWrite"];
         delete?: never;
         options?: never;
@@ -5203,13 +5206,27 @@ export interface components {
              *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_pending" | "committed_repair_required";
+            status?: "committed" | "committed_pending" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+            /** @description Stable transaction receipt ID returned for keyed batches. */
+            transaction_id?: string | null;
+            /** @description Transaction-session status path for this keyed batch. */
+            reconcile?: string | null;
+        };
+        IdempotentBatchError: {
+            /** @enum {string} */
+            status: "not_applied" | "aborted" | "unknown";
+            code: string;
+            message: string;
+            retryable: boolean;
+            transaction_id: string;
+            /** @description Transaction-session status path for this keyed batch. */
+            reconcile: string;
         };
         /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
         DenseRepairBackpressureError: {
@@ -5453,6 +5470,9 @@ export interface components {
             savepoint_limit?: number | null;
             remaining_savepoints?: number | null;
             durable: boolean;
+            /** @enum {string|null} */
+            outcome?: "not_applied" | "aborted" | "unknown" | "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required" | null;
+            repair_required?: boolean;
         };
         TransactionSessionTableDetail: {
             table?: string;
@@ -16401,6 +16421,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description A previously committed keyed batch was replayed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
             /** @description Batch operation successful */
             201: {
                 headers: {
@@ -16425,13 +16454,16 @@ export interface operations {
              * @description The atomic batch conflicted, the serving replica is fenced, or the
              *     server could not determine whether a single-group Raft command
              *     committed. An ambiguous outcome is not safe to replay blindly when
-             *     the request contains non-idempotent transforms.
+             *     the request contains non-idempotent transforms. Keyed requests
+             *     instead return a typed `not_applied` or `unknown` receipt with a
+             *     stable transaction ID and retry guidance.
              */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
                     "text/plain": string;
                 };
             };

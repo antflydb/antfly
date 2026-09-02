@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.transaction_session_status_outcome import TransactionSessionStatusOutcome
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TransactionSessionStatus")
@@ -31,6 +32,8 @@ class TransactionSessionStatus:
         durable (bool):
         savepoint_limit (int | None | Unset):
         remaining_savepoints (int | None | Unset):
+        outcome (TransactionSessionStatusOutcome | Unset):
+        repair_required (bool | Unset):
     """
 
     transaction_id: str
@@ -49,6 +52,8 @@ class TransactionSessionStatus:
     durable: bool
     savepoint_limit: int | None | Unset = UNSET
     remaining_savepoints: int | None | Unset = UNSET
+    outcome: TransactionSessionStatusOutcome | Unset = UNSET
+    repair_required: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +97,12 @@ class TransactionSessionStatus:
         else:
             remaining_savepoints = self.remaining_savepoints
 
+        outcome: str | Unset = UNSET
+        if not isinstance(self.outcome, Unset):
+            outcome = self.outcome.value
+
+        repair_required = self.repair_required
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -116,6 +127,10 @@ class TransactionSessionStatus:
             field_dict["savepoint_limit"] = savepoint_limit
         if remaining_savepoints is not UNSET:
             field_dict["remaining_savepoints"] = remaining_savepoints
+        if outcome is not UNSET:
+            field_dict["outcome"] = outcome
+        if repair_required is not UNSET:
+            field_dict["repair_required"] = repair_required
 
         return field_dict
 
@@ -168,6 +183,15 @@ class TransactionSessionStatus:
 
         remaining_savepoints = _parse_remaining_savepoints(d.pop("remaining_savepoints", UNSET))
 
+        _outcome = d.pop("outcome", UNSET)
+        outcome: TransactionSessionStatusOutcome | Unset
+        if isinstance(_outcome, Unset):
+            outcome = UNSET
+        else:
+            outcome = TransactionSessionStatusOutcome(_outcome)
+
+        repair_required = d.pop("repair_required", UNSET)
+
         transaction_session_status = cls(
             transaction_id=transaction_id,
             owner_node_id=owner_node_id,
@@ -185,6 +209,8 @@ class TransactionSessionStatus:
             durable=durable,
             savepoint_limit=savepoint_limit,
             remaining_savepoints=remaining_savepoints,
+            outcome=outcome,
+            repair_required=repair_required,
         )
 
         transaction_session_status.additional_properties = d

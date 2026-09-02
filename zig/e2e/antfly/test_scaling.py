@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -1883,6 +1884,11 @@ def _insert_docs(
     min_group_count: int = 1,
 ) -> None:
     last_error: str | None = None
+    request_payload = {"inserts": docs, "sync_level": "write"}
+    payload_digest = hashlib.sha256(
+        json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
+    operation_generation = 0
 
     def route_ready() -> str | None:
         try:
@@ -1909,7 +1915,7 @@ def _insert_docs(
     )
 
     def post_once() -> bool | None:
-        nonlocal api_url, last_error
+        nonlocal api_url, last_error, operation_generation
         next_api_url = route_ready()
         if next_api_url is None:
             last_error = "no live write route"
@@ -1918,7 +1924,10 @@ def _insert_docs(
         try:
             response = requests.post(
                 f"{api_url}/tables/{table_name}/batch",
-                json={"inserts": docs, "sync_level": "write"},
+                json=request_payload,
+                headers={
+                    "Idempotency-Key": f"scaling-seed:{table_name}:{payload_digest}:{operation_generation}"
+                },
                 timeout=30,
             )
         except requests.RequestException as exc:
@@ -1927,6 +1936,20 @@ def _insert_docs(
         if response.ok:
             return True
         last_error = f"{response.status_code}: {response.text}"
+        if response.status_code == 409:
+            try:
+                receipt = response.json()
+            except json.JSONDecodeError:
+                response.raise_for_status()
+            outcome = receipt.get("status")
+            if outcome == "unknown":
+                # The stable key is the only safe retry after a lost decision.
+                return None
+            if outcome in {"not_applied", "aborted"}:
+                # The receipt proves this generation had no effect. A new
+                # operation identity may safely retry against refreshed routes.
+                operation_generation += 1
+                return None
         if response.status_code in {429, 500, 503}:
             return None
         response.raise_for_status()

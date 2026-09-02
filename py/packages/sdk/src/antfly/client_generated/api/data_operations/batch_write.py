@@ -10,6 +10,7 @@ from ...models.batch_request import BatchRequest
 from ...models.batch_response import BatchResponse
 from ...models.dense_repair_backpressure_error import DenseRepairBackpressureError
 from ...models.error import Error
+from ...models.idempotent_batch_error import IdempotentBatchError
 from ...types import Response
 
 
@@ -37,7 +38,12 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> BatchResponse | DenseRepairBackpressureError | Error | str | None:
+) -> BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str | None:
+    if response.status_code == 200:
+        response_200 = BatchResponse.from_dict(response.json())
+
+        return response_200
+
     if response.status_code == 201:
         response_201 = BatchResponse.from_dict(response.json())
 
@@ -59,7 +65,8 @@ def _parse_response(
         return response_404
 
     if response.status_code == 409:
-        response_409 = response.text
+        response_409 = IdempotentBatchError.from_dict(response.json())
+
         return response_409
 
     if response.status_code == 429:
@@ -84,7 +91,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[BatchResponse | DenseRepairBackpressureError | Error | str]:
+) -> Response[BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -98,8 +105,14 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: BatchRequest,
-) -> Response[BatchResponse | DenseRepairBackpressureError | Error | str]:
+) -> Response[BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str]:
     """Perform batch inserts and deletes on a table
+
+     Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the
+    authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt
+    and may be safely replayed after timeouts, lost responses, topology changes, or process restarts.
+    Receipts use the configured transaction-session retention period; callers must not reuse a key after
+    that period. Requests without this header retain legacy behavior.
 
     Args:
         table_name (str):
@@ -142,7 +155,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BatchResponse | DenseRepairBackpressureError | Error | str]
+        Response[BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str]
     """
 
     kwargs = _get_kwargs(
@@ -162,8 +175,14 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: BatchRequest,
-) -> BatchResponse | DenseRepairBackpressureError | Error | str | None:
+) -> BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str | None:
     """Perform batch inserts and deletes on a table
+
+     Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the
+    authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt
+    and may be safely replayed after timeouts, lost responses, topology changes, or process restarts.
+    Receipts use the configured transaction-session retention period; callers must not reuse a key after
+    that period. Requests without this header retain legacy behavior.
 
     Args:
         table_name (str):
@@ -206,7 +225,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BatchResponse | DenseRepairBackpressureError | Error | str
+        BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str
     """
 
     return sync_detailed(
@@ -221,8 +240,14 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: BatchRequest,
-) -> Response[BatchResponse | DenseRepairBackpressureError | Error | str]:
+) -> Response[BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str]:
     """Perform batch inserts and deletes on a table
+
+     Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the
+    authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt
+    and may be safely replayed after timeouts, lost responses, topology changes, or process restarts.
+    Receipts use the configured transaction-session retention period; callers must not reuse a key after
+    that period. Requests without this header retain legacy behavior.
 
     Args:
         table_name (str):
@@ -265,7 +290,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BatchResponse | DenseRepairBackpressureError | Error | str]
+        Response[BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str]
     """
 
     kwargs = _get_kwargs(
@@ -283,8 +308,14 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: BatchRequest,
-) -> BatchResponse | DenseRepairBackpressureError | Error | str | None:
+) -> BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str | None:
     """Perform batch inserts and deletes on a table
+
+     Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the
+    authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt
+    and may be safely replayed after timeouts, lost responses, topology changes, or process restarts.
+    Receipts use the configured transaction-session retention period; callers must not reuse a key after
+    that period. Requests without this header retain legacy behavior.
 
     Args:
         table_name (str):
@@ -327,7 +358,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BatchResponse | DenseRepairBackpressureError | Error | str
+        BatchResponse | DenseRepairBackpressureError | Error | IdempotentBatchError | str
     """
 
     return (

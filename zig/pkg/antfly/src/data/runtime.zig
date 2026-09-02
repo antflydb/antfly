@@ -5638,6 +5638,23 @@ pub const DataServer = struct {
             }
             api_server_cfg.incoming_graph_route_store = &self.owned_incoming_graph_route_store.?;
         }
+        var owned_session_store_path: ?[]u8 = null;
+        defer if (owned_session_store_path) |path| self.alloc.free(path);
+        // Transaction receipts are engine state. Provision a durable local
+        // namespace for every stateful runtime that was not given a shared
+        // store explicitly; keyed batch admission must never silently fall
+        // back to process memory.
+        if (api_server_cfg.session_store_path == null and
+            api_server_cfg.session_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            owned_session_store_path = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/api-transaction-sessions",
+                .{self.write_source.replica_root_dir},
+            );
+            api_server_cfg.session_store_path = owned_session_store_path;
+        }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
         // Runtimes that do not supply engine-owned persistence keep API job

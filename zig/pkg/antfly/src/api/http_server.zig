@@ -3630,6 +3630,28 @@ pub const ApiHttpServer = struct {
         return !self.haMutationPolicy().failover_safe_mutations_only;
     }
 
+    fn finishRejectedSessionRecovery(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        idempotent_receipt: bool,
+        status: transactions_api.TerminalCommitStatus,
+    ) void {
+        if (!idempotent_receipt) {
+            _ = self.txn_sessions.remove(self.alloc, txn_id);
+            return;
+        }
+        _ = (self.txn_sessions.recordTerminalCommit(
+            self.alloc,
+            txn_id,
+            status,
+            null,
+            null,
+        ) catch |err| {
+            std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+            return;
+        }) orelse return;
+    }
+
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
         const source = self.table_writes orelse return;
         const pending = try self.txn_sessions.listPendingRecoveryIds(self.alloc, limit);
@@ -3704,13 +3726,17 @@ pub const ApiHttpServer = struct {
                         error.InvalidGraphEdges,
                         error.UnsupportedTransformOperation,
                         error.TopologyChanged,
-                        error.DecisionConflict,
-                        error.DocIdentityNamespaceMismatch,
                         error.UnsupportedOperation,
                         error.TableNotFound,
                         error.UnknownGroup,
                         => {
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .not_applied);
+                            continue;
+                        },
+                        error.DecisionConflict,
+                        error.DocIdentityNamespaceMismatch,
+                        => {
+                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
                             continue;
                         },
                         else => {
@@ -3722,7 +3748,7 @@ pub const ApiHttpServer = struct {
                         .conflict => {
                             // A replayed transaction ID can only conflict when
                             // the coordinator durably chose abort.
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, .aborted);
                         },
                         .committed => |committed| {
                             const repair_required = commit.repair_required or committed.visibility_repair_required;
@@ -9867,17 +9893,26 @@ pub const ApiHttpServer = struct {
         target: []const u8,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8 = null,
+        idempotency_key: ?[]const u8 = null,
         content_type: ?[]const u8,
         body: []const u8,
     };
 
-    fn sessionTrustedPrincipalHeaders(
-        token: ?[]const u8,
-        storage: *[1]http_common.RequestHeader,
+    fn sessionForwardHeaders(
+        trusted_principal: ?[]const u8,
+        idempotency_key: ?[]const u8,
+        storage: *[2]http_common.RequestHeader,
     ) []const http_common.RequestHeader {
-        const value = token orelse return storage[0..0];
-        storage[0] = .{ .name = trusted_principal_header, .value = value };
-        return storage[0..1];
+        var count: usize = 0;
+        if (trusted_principal) |value| {
+            storage[count] = .{ .name = trusted_principal_header, .value = value };
+            count += 1;
+        }
+        if (idempotency_key) |value| {
+            storage[count] = .{ .name = "idempotency-key", .value = value };
+            count += 1;
+        }
+        return storage[0..count];
     }
 
     pub fn forwardSessionOperation(
@@ -9885,10 +9920,11 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
     ) !?contextual_operations.OwnedResponse {
-        var trusted_header_storage: [1]http_common.RequestHeader = undefined;
-        const trusted_headers = sessionTrustedPrincipalHeaders(
+        var header_storage: [2]http_common.RequestHeader = undefined;
+        const forwarded_headers = sessionForwardHeaders(
             request.trusted_principal,
-            &trusted_header_storage,
+            request.idempotency_key,
+            &header_storage,
         );
         var response = (try self.forwardSessionRequest(txn_id, .{
             .method = switch (request.method) {
@@ -9898,7 +9934,7 @@ pub const ApiHttpServer = struct {
                 .delete => .DELETE,
             },
             .uri = request.target,
-            .headers = trusted_headers,
+            .headers = forwarded_headers,
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,

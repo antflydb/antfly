@@ -252,6 +252,8 @@ pub const SessionInfo = struct {
 };
 
 pub const TerminalCommitStatus = enum {
+    not_applied,
+    aborted,
     committed,
     committed_visibility_pending,
     committed_recovery_pending,
@@ -347,6 +349,9 @@ pub const PendingSessionRecovery = union(enum) {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         sync_level: db_mod.types.SyncLevel,
+        /// Stable keyed batches retain a terminal non-application receipt
+        /// instead of deleting their session when recovery proves an abort.
+        idempotent_receipt: bool = false,
         /// A prior visibility attempt reached durable repair debt. Recovery
         /// should finish participant propagation at write durability without
         /// polling the failed provider again.
@@ -383,6 +388,10 @@ pub const SessionStatus = struct {
     savepoint_limit: ?usize = null,
     remaining_savepoints: ?usize = null,
     durable: bool,
+    /// Durable application outcome for an idempotent commit. Null means the
+    /// transaction has not reached a terminal API receipt yet.
+    outcome: ?[]const u8 = null,
+    repair_required: bool = false,
 };
 
 pub const StageReadSnapshot = struct {
@@ -465,6 +474,8 @@ pub const SessionStatusResponse = struct {
     savepoint_limit: ?usize = null,
     remaining_savepoints: ?usize = null,
     durable: bool,
+    outcome: ?[]const u8 = null,
+    repair_required: bool = false,
 };
 
 pub const SessionReadSnapshotResponse = struct {
@@ -499,6 +510,8 @@ pub const SessionDetailsResponse = struct {
     savepoint_limit: ?usize = null,
     remaining_savepoints: ?usize = null,
     durable: bool,
+    outcome: ?[]const u8 = null,
+    repair_required: bool = false,
     tables: []const SessionTableDetailResponse,
     read_snapshots: []const SessionReadSnapshotResponse,
     savepoint_ids: []const u64,
@@ -630,6 +643,9 @@ pub const Session = struct {
     /// invoking 2PC. Once true, background maintenance owns completion even if
     /// the initiating process disappears.
     commit_execution_started: bool = false,
+    /// Marks sessions whose identity is derived from an external idempotency
+    /// key. Recovery must preserve their terminal non-application receipt.
+    idempotent_receipt: bool = false,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
@@ -666,6 +682,7 @@ pub const Session = struct {
             .next_savepoint_id = self.next_savepoint_id,
             .commit_body_digest = self.commit_body_digest,
             .commit_execution_started = self.commit_execution_started,
+            .idempotent_receipt = self.idempotent_receipt,
         };
         errdefer out.deinit(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
@@ -1403,6 +1420,91 @@ pub const SessionRegistry = struct {
         return session.info();
     }
 
+    /// Creates or returns the durable transaction session assigned to an
+    /// external idempotency key. The caller derives `txn_id` from the
+    /// authenticated principal, resource, and key. The exact mutation body is
+    /// sealed separately by `cloneCommitRequest`, so reusing the key for a
+    /// different body is rejected before 2PC is entered.
+    pub fn beginIdempotentForPrincipal(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        req: BeginRequest,
+        owner_node_id: u64,
+        principal: ?[]const u8,
+    ) !SessionInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        if (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) |existing_value| {
+            var existing = existing_value;
+            defer existing.deinit(alloc);
+            if (!principalsEqual(existing.principal, principal) or existing.sync_level != req.sync_level)
+                return error.IdempotencyConflict;
+            return existing.info();
+        }
+
+        const now = nextTxnTimestamp();
+        var session: Session = .{
+            .txn_id = txn_id,
+            .owner_node_id = owner_node_id,
+            .principal = if (principal) |value| try alloc.dupe(u8, value) else null,
+            .begin_timestamp = now,
+            .last_touched_timestamp = now,
+            .sync_level = req.sync_level,
+            .idempotent_receipt = true,
+        };
+        var session_owned = true;
+        errdefer if (session_owned) session.deinit(alloc);
+
+        try self.initializeDurableSessionCount();
+        self.mutex.lock();
+        self.ensureSessionCapacityLocked() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.reserved_session_count += 1;
+        self.mutex.unlock();
+        var reservation_active = true;
+        defer if (reservation_active) {
+            self.mutex.lock();
+            self.reserved_session_count -= 1;
+            self.mutex.unlock();
+        };
+
+        if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
+            const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
+            if (!(try self.durable.?.saveWithLease(session, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) {
+                // Another API node won the create race. Load the immutable
+                // binding and return it only when it is the same operation.
+                var existing = (try self.durable.?.load(txn_id)) orelse return error.SessionLeaseLost;
+                defer existing.deinit(self.durable.?.alloc);
+                if (!principalsEqual(existing.principal, principal) or existing.sync_level != req.sync_level)
+                    return error.IdempotencyConflict;
+                session.deinit(alloc);
+                session_owned = false;
+                return existing.info();
+            }
+        } else {
+            try self.persistLocked(session);
+            try self.renewLeaseLocked(txn_id, owner_node_id);
+        }
+
+        self.mutex.lock();
+        self.sessions.putAssumeCapacity(txn_id, session);
+        self.reserved_session_count -= 1;
+        if (self.known_durable_session_count) |count| self.known_durable_session_count = count + 1;
+        self.mutex.unlock();
+        reservation_active = false;
+        session_owned = false;
+        return session.info();
+    }
+
     pub const PrincipalAccess = enum {
         missing,
         allowed,
@@ -1834,6 +1936,7 @@ pub const SessionRegistry = struct {
         }
 
         if (candidate.terminal_commit) |terminal| {
+            if (terminal.status == .not_applied or terminal.status == .aborted) return null;
             // A pending terminal response is not the API/storage handoff. Keep
             // replaying the exact sealed request under the original ID until
             // every phase-two delivery and requested visibility barrier has
@@ -1859,6 +1962,7 @@ pub const SessionRegistry = struct {
                         // use write durability once to recover missing coordinator
                         // metadata; maintenance selects that fallback explicitly.
                         .sync_level = candidate.sync_level,
+                        .idempotent_receipt = candidate.idempotent_receipt,
                         .repair_required = terminal.repair_required,
                         .repair_handoff_needs_coordinator = repair_handoff_needs_coordinator,
                         .request = try request.clone(alloc),
@@ -1881,6 +1985,7 @@ pub const SessionRegistry = struct {
             .txn_id = txn_id,
             .begin_timestamp = candidate.begin_timestamp,
             .sync_level = candidate.sync_level,
+            .idempotent_receipt = candidate.idempotent_receipt,
             .repair_required = false,
             .repair_handoff_needs_coordinator = false,
             .request = try request.clone(alloc),
@@ -2543,6 +2648,8 @@ pub fn buildSessionStatusResponse(alloc: std.mem.Allocator, status: SessionStatu
         .savepoint_limit = status.savepoint_limit,
         .remaining_savepoints = status.remaining_savepoints,
         .durable = status.durable,
+        .outcome = status.outcome,
+        .repair_required = status.repair_required,
     };
 }
 
@@ -2599,6 +2706,8 @@ pub fn buildSessionDetailsResponse(alloc: std.mem.Allocator, details: SessionDet
         .savepoint_limit = status.savepoint_limit,
         .remaining_savepoints = status.remaining_savepoints,
         .durable = status.durable,
+        .outcome = status.outcome,
+        .repair_required = status.repair_required,
         .tables = tables,
         .read_snapshots = read_snapshots,
         .savepoint_ids = savepoint_ids,
@@ -2814,6 +2923,29 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len;
     if (operation_count == 0) return error.InvalidTransactionCommitRequest;
     return req;
+}
+
+/// Promotes the legacy one-table batch contract into the durable transaction
+/// request used by idempotent batch execution. All bytes are cloned because
+/// the session store seals and persists the request beyond the HTTP body's
+/// lifetime.
+pub fn ownedRequestFromBatch(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    batch: batch_api.OwnedBatchRequest,
+) !OwnedTransactionCommitRequest {
+    var request: OwnedTransactionCommitRequest = .{ .sync_level = batch.req.sync_level };
+    errdefer request.deinit(alloc);
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    var owned_batch = try cloneBatchRequest(alloc, batch);
+    errdefer owned_batch.deinit(alloc);
+    request.tables = try alloc.alloc(TableCommitRequest, 1);
+    request.tables[0] = .{
+        .table_name = owned_table_name,
+        .batch = owned_batch,
+    };
+    return request;
 }
 
 pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![]u8 {
@@ -3796,7 +3928,42 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .savepoint_limit = self.max_savepoints,
         .remaining_savepoints = if (self.max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
         .durable = self.durable != null,
+        .outcome = if (session.terminal_commit) |terminal|
+            terminalCommitResponseStatus(terminal.status, terminal.repair_required)
+        else if (session.commit_execution_started)
+            "unknown"
+        else
+            "not_applied",
+        .repair_required = if (session.terminal_commit) |terminal| terminal.repair_required else false,
     };
+}
+
+/// Stable, non-secret transaction identity for a public idempotency scope.
+/// Length-prefixing prevents ambiguous concatenations. Payload bytes are not
+/// included: the durable session's sealed request detects key reuse with a
+/// different mutation.
+pub fn idempotentTransactionId(
+    principal: ?[]const u8,
+    table_name: []const u8,
+    idempotency_key: []const u8,
+) db_mod.types.TxnId {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly:batch-idempotency:v1");
+    hashIdentityComponent(&hasher, principal orelse "");
+    hashIdentityComponent(&hasher, table_name);
+    hashIdentityComponent(&hasher, idempotency_key);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var txn_id: db_mod.types.TxnId = undefined;
+    @memcpy(&txn_id, digest[0..txn_id.len]);
+    return txn_id;
+}
+
+fn hashIdentityComponent(hasher: anytype, value: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, value.len, .big);
+    hasher.update(&len);
+    hasher.update(value);
 }
 
 fn sessionReadSnapshots(alloc: std.mem.Allocator, session: *const Session) ![]SessionReadSnapshot {
@@ -3916,6 +4083,7 @@ fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) 
 
 fn sessionNeedsRecovery(session: Session) bool {
     if (session.terminal_commit) |terminal| {
+        if (terminal.status == .not_applied or terminal.status == .aborted) return false;
         return terminal.status != .committed or
             (terminal.repair_required and terminal.coordinator_group_id == null) or
             (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
@@ -3983,6 +4151,8 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     }
     try out.appendSlice(alloc, ",\"commit_execution_started\":");
     try out.appendSlice(alloc, if (session.commit_execution_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"idempotent_receipt\":");
+    try out.appendSlice(alloc, if (session.idempotent_receipt) "true" else "false");
     try out.appendSlice(alloc, ",\"terminal_commit\":");
     if (session.terminal_commit) |terminal| {
         try out.appendSlice(alloc, "{\"status\":");
@@ -4103,6 +4273,10 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     }
     session.commit_execution_started = if (obj.get("commit_execution_started")) |value| switch (value) {
         .bool => |started| started,
+        else => return error.InvalidTransactionSessionRecord,
+    } else false;
+    session.idempotent_receipt = if (obj.get("idempotent_receipt")) |value| switch (value) {
+        .bool => |enabled| enabled,
         else => return error.InvalidTransactionSessionRecord,
     } else false;
     if (obj.get("terminal_commit")) |terminal_value| {
@@ -5303,6 +5477,57 @@ test "transaction session commit response includes retry hints for doc identity 
     try std.testing.expectEqual(@as(?u32, 100), conflict.retry_after_ms);
     try std.testing.expectEqualStrings("doc_identity", conflict.retry_scope.?);
     try std.testing.expect(conflict.participant == null);
+}
+
+test "idempotent batch identities are scoped and session bodies are sealed" {
+    const alloc = std.testing.allocator;
+    const alice_docs = idempotentTransactionId("alice", "docs", "load-42");
+    const alice_docs_replay = idempotentTransactionId("alice", "docs", "load-42");
+    const bob_docs = idempotentTransactionId("bob", "docs", "load-42");
+    const alice_other = idempotentTransactionId("alice", "other", "load-42");
+    try std.testing.expectEqualSlices(u8, &alice_docs, &alice_docs_replay);
+    try std.testing.expect(!std.mem.eql(u8, &alice_docs, &bob_docs));
+    try std.testing.expect(!std.mem.eql(u8, &alice_docs, &alice_other));
+
+    var registry: SessionRegistry = .{};
+    defer registry.deinit(alloc);
+    const first = try registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .write }, 7, "alice");
+    const replay = try registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .write }, 7, "alice");
+    try std.testing.expectEqual(first.begin_timestamp, replay.begin_timestamp);
+    try std.testing.expectError(
+        error.IdempotencyConflict,
+        registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .full_index }, 7, "alice"),
+    );
+
+    var first_batch = try batch_api.parseBatchRequest(alloc,
+        \\{"inserts":{"one":{"value":1}},"sync_level":"write"}
+    );
+    defer first_batch.deinit(alloc);
+    var first_request = try ownedRequestFromBatch(alloc, "docs", first_batch);
+    defer first_request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, alice_docs, &first_request)).?;
+    sealed.deinit(alloc);
+
+    var changed_batch = try batch_api.parseBatchRequest(alloc,
+        \\{"inserts":{"one":{"value":2}},"sync_level":"write"}
+    );
+    defer changed_batch.deinit(alloc);
+    var changed_request = try ownedRequestFromBatch(alloc, "docs", changed_batch);
+    defer changed_request.deinit(alloc);
+    try std.testing.expectError(
+        error.TransactionCommitRequestMismatch,
+        registry.cloneCommitRequest(alloc, alice_docs, &changed_request),
+    );
+    _ = (try registry.markCommitExecutionStarted(alloc, alice_docs)).?;
+    var recovery = (try registry.claimPendingRecovery(alloc, alice_docs, 7, nextTxnTimestamp())).?;
+    defer recovery.deinit(alloc);
+    try std.testing.expect(recovery.commit.idempotent_receipt);
+    _ = (try registry.recordTerminalCommit(alloc, alice_docs, .aborted, null, null)).?;
+    const status = (try registry.getStatus(alloc, alice_docs)).?;
+    try std.testing.expectEqualStrings("aborted", status.outcome.?);
+    const pending = try registry.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
 }
 
 test "transaction commit response includes participant group diagnostics" {

@@ -6185,6 +6185,7 @@ pub fn build(b: *std.Build) void {
             "transaction request parsers reject invalid unsigned integers and accept legacy epochs",
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
+            "idempotent batch identities are scoped and session bodies are sealed",
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",

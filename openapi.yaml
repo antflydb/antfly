@@ -3978,6 +3978,12 @@ paths:
       tags:
         - data_operations
       operationId: batchWrite
+      description: >
+        Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to
+        the authenticated principal and table. Keyed batches use a durable, payload-sealed transaction
+        receipt and may be safely replayed after timeouts, lost responses, topology changes, or process
+        restarts. Receipts use the configured transaction-session retention period; callers must not reuse
+        a key after that period. Requests without this header retain legacy behavior.
       requestBody:
         required: true
         content:
@@ -3985,6 +3991,12 @@ paths:
             schema:
               $ref: '#/components/schemas/BatchRequest'
       responses:
+        '200':
+          description: A previously committed keyed batch was replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
         '201':
           description: Batch operation successful
           content:
@@ -4009,8 +4021,15 @@ paths:
 
             committed. An ambiguous outcome is not safe to replay blindly when
 
-            the request contains non-idempotent transforms.
+            the request contains non-idempotent transforms. Keyed requests
+
+            instead return a typed `not_applied` or `unknown` receipt with a
+
+            stable transaction ID and retry guidance.
           content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
             text/plain:
               schema:
                 type: string
@@ -11986,6 +12005,8 @@ components:
           enum:
             - committed
             - committed_pending
+            - committed_visibility_pending
+            - committed_recovery_pending
             - committed_repair_required
           description: >
             Durable commit outcome. `committed_pending` means requested visibility or
@@ -12004,6 +12025,42 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        transaction_id:
+          type: string
+          nullable: true
+          description: Stable transaction receipt ID returned for keyed batches.
+        reconcile:
+          type: string
+          nullable: true
+          description: Transaction-session status path for this keyed batch.
+    IdempotentBatchError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - code
+        - message
+        - retryable
+        - transaction_id
+        - reconcile
+      properties:
+        status:
+          type: string
+          enum:
+            - not_applied
+            - aborted
+            - unknown
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        transaction_id:
+          type: string
+        reconcile:
+          type: string
+          description: Transaction-session status path for this keyed batch.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard
@@ -12432,6 +12489,19 @@ components:
           type: integer
           nullable: true
         durable:
+          type: boolean
+        outcome:
+          type: string
+          nullable: true
+          enum:
+            - not_applied
+            - aborted
+            - unknown
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
+            - committed_repair_required
+        repair_required:
           type: boolean
     TransactionSessionTableDetail:
       type: object

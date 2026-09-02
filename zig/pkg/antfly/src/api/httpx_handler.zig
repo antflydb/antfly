@@ -4808,6 +4808,15 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
+        if (ctx.header("idempotency-key")) |idempotency_key| {
+            return try self.idempotentBatchWrite(
+                ctx,
+                decoded_table_name,
+                body_data,
+                idempotency_key,
+                authenticated_identity,
+            );
+        }
         return try handleTableBatchOffEventLoop(
             ctx,
             self.api_server.cfg.backend_runtime,
@@ -4815,6 +4824,248 @@ pub const AntflyApiHandler = struct {
             body_data,
             self.api_server.tableApi(operationContext(ctx, authenticated_identity)),
         );
+    }
+
+    /// Compatibility path for callers that need a retry-safe batch without
+    /// adopting the multi-call transaction-session API. It deliberately uses
+    /// the same durable session and retained-2PC machinery as that API; the
+    /// legacy header-free batch fast path remains unchanged.
+    fn idempotentBatchWrite(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        body_data: []const u8,
+        idempotency_key: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !httpx.Response {
+        if (idempotency_key.len == 0 or idempotency_key.len > 256) {
+            return respondJsonErrorBody(ctx, 400, "{\"error\":\"invalid idempotency key\",\"code\":\"invalid_idempotency_key\",\"message\":\"Idempotency-Key must contain 1 to 256 bytes\",\"retryable\":false}");
+        }
+
+        const alloc = self.api_server.alloc;
+        var parsed_batch = batch_api.parseBatchRequest(alloc, body_data) catch |err| switch (err) {
+            error.ValueTooLong => return respondApiResponseBody(ctx, 413, "value too large"),
+            error.InvalidBatchRequest => return respondApiResponseBody(ctx, 400, "invalid batch request"),
+            else => return err,
+        };
+        defer parsed_batch.deinit(alloc);
+        var supplied = try transactions_api.ownedRequestFromBatch(alloc, table_name, parsed_batch);
+        defer supplied.deinit(alloc);
+
+        const principal = http_server_mod.transactionPrincipal(authenticated_identity);
+        const txn_id = transactions_api.idempotentTransactionId(principal, table_name, idempotency_key);
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        if (!self.api_server.txn_sessions.hasDurableStore()) {
+            return respondJsonErrorBody(ctx, 503, "{\"error\":\"durable idempotency storage is not configured\",\"code\":\"idempotency_unavailable\",\"message\":\"durable idempotency storage is not configured\",\"retryable\":true}");
+        }
+        const session = self.api_server.txn_sessions.beginIdempotentForPrincipal(
+            alloc,
+            txn_id,
+            .{ .sync_level = parsed_batch.req.sync_level },
+            self.api_server.localSessionNodeId(),
+            principal,
+        ) catch |err| switch (err) {
+            error.IdempotencyConflict => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to incompatible request options", false, &txn_hex),
+            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return respondJsonErrorBody(ctx, 429, "{\"error\":\"durable idempotency capacity is exhausted\",\"code\":\"idempotency_capacity_exhausted\",\"message\":\"durable idempotency capacity is exhausted\",\"retryable\":true}"),
+            else => return err,
+        };
+
+        const owner_node_id = (try self.api_server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse sessionOwner: {
+            break :sessionOwner self.api_server.localSessionNodeId();
+        };
+        if (owner_node_id != 0 and owner_node_id != self.api_server.localSessionNodeId()) {
+            var forwarded = (try self.api_server.forwardSessionOperation(txn_id, .{
+                .method = .post,
+                .target = ctx.request.uri.raw,
+                .authorization = ctx.header("authorization"),
+                .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+                .idempotency_key = idempotency_key,
+                .content_type = ctx.header("content-type"),
+                .body = body_data,
+            })) orelse return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_unavailable", "the durable operation owner is temporarily unavailable", true, &txn_hex);
+            return try respondOwnedContextualResponse(ctx, &forwarded, alloc);
+        }
+
+        var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, &supplied) catch |err| switch (err) {
+            error.TransactionCommitRequestMismatch => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key was reused for a different batch body", false, &txn_hex),
+            error.SessionLeaseLost => return try idempotentBatchError(ctx, 409, "unknown", "idempotency_owner_changed", "the durable operation owner changed; retry the same request", true, &txn_hex),
+            else => return err,
+        }) orelse return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
+        defer commit_req.deinit(alloc);
+
+        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
+            var terminal = terminal_value;
+            defer terminal.deinit(alloc);
+            return try self.respondIdempotentBatchTerminal(ctx, txn_id, &commit_req, &terminal);
+        }
+
+        const distributed_tables = try commit_req.distributedTables(alloc);
+        defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
+        self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation => {
+                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                return try idempotentBatchError(ctx, 409, "not_applied", "invalid_batch_request", "invalid batch request", false, &txn_hex);
+            },
+            else => return err,
+        };
+        const source = self.api_server.table_writes orelse {
+            _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+            return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
+        };
+        _ = (try self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse
+            return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
+        const request = operationContext(ctx, authenticated_identity);
+        const topology_retry_deadline_ns = request.deadline_ns orelse
+            (platform_time.monotonicNs() +| 2 * std.time.ns_per_s);
+        var attempt: u8 = 0;
+        const outcome = while (true) : (attempt += 1) {
+            request.ensureActive() catch {
+                return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "request ended after durable execution began; retry with the same Idempotency-Key or query the transaction", true, &txn_hex);
+            };
+            break source.commitTransactionWithIdAndCancellation(
+                alloc,
+                txn_id,
+                session.begin_timestamp,
+                distributed_tables,
+                session.sync_level,
+                request.cancellation,
+            ) catch |err| switch (err) {
+                error.TopologyChanged, error.UnknownGroup => {
+                    // These errors establish that no commit decision was
+                    // returned. Re-entering retained 2PC under the same ID is
+                    // safe and lets a refreshed route absorb a split/move.
+                    if (platform_time.monotonicNs() < topology_retry_deadline_ns) {
+                        const delay_ms: i64 = @as(i64, 1) << @intCast(@min(attempt, 5));
+                        ctx.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                        continue;
+                    }
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    return try idempotentBatchError(ctx, 409, "not_applied", "topology_changed", "topology did not stabilize before the retry budget expired", true, &txn_hex);
+                },
+                error.CommitDecisionUnknown => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "transaction recovery is reconciling the retained decision", true, &txn_hex),
+                error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_visibility_pending, null, null);
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                },
+                error.CommitPropagationIncomplete => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_recovery_pending, null, null);
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                },
+                error.EnrichmentWorkerFailed => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommitWithRepair(alloc, txn_id, .committed, true, null, null);
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
+                },
+                error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    return try idempotentBatchError(ctx, 409, "not_applied", "invalid_batch_request", "invalid batch request", false, &txn_hex);
+                },
+                error.TableNotFound => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
+                },
+                error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "transaction recovery has not established a durable decision", true, &txn_hex),
+                error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => {
+                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .aborted, null, null);
+                    return try idempotentBatchError(ctx, 409, "aborted", "transaction_aborted", "transaction was durably aborted", false, &txn_hex);
+                },
+                else => return err,
+            } orelse {
+                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
+            };
+        };
+
+        switch (outcome) {
+            .conflict => {
+                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .aborted, null, null);
+                return try idempotentBatchError(ctx, 409, "aborted", "transaction_conflict", "batch transaction conflicted and was durably aborted", false, &txn_hex);
+            },
+            .committed => |committed| {
+                var terminal_status = transactions_api.terminalCommitStatusForOutcome(
+                    committed.propagation_pending,
+                    committed.visibility_pending,
+                    committed.visibility_retry_pending,
+                    committed.visibility_repair_required,
+                );
+                _ = try self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                    alloc,
+                    txn_id,
+                    terminal_status,
+                    committed.visibility_repair_required,
+                    committed.coordinator_group_id,
+                    committed.coordinator_table_name,
+                );
+                if (terminal_status == .committed) if (committed.coordinator_group_id) |group_id| {
+                    const coordinator_table = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                    if ((source.acknowledgeTransactionCommit(alloc, txn_id, group_id, coordinator_table) catch null) != null) {
+                        if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch null) == null)
+                            terminal_status = .committed_recovery_pending;
+                    } else terminal_status = .committed_recovery_pending;
+                };
+                const status = transactions_api.terminalCommitResponseStatus(terminal_status, committed.visibility_repair_required);
+                return try idempotentBatchSuccess(ctx, if (terminal_status == .committed and !committed.visibility_repair_required) 201 else 202, txn_id, status, commit_req.tables);
+            },
+        }
+    }
+
+    fn respondIdempotentBatchTerminal(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        request: *transactions_api.OwnedTransactionCommitRequest,
+        terminal: *transactions_api.TerminalCommit,
+    ) !httpx.Response {
+        _ = self;
+        const status = transactions_api.terminalCommitResponseStatus(terminal.status, terminal.repair_required);
+        if (terminal.status == .not_applied or terminal.status == .aborted) {
+            const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+            return try idempotentBatchError(ctx, 409, status, "transaction_not_applied", "the durable batch transaction was not applied", false, &txn_hex);
+        }
+        return try idempotentBatchSuccess(ctx, if (terminal.status == .committed and !terminal.repair_required) 200 else 202, txn_id, status, request.tables);
+    }
+
+    fn idempotentBatchSuccess(
+        ctx: *httpx.Context,
+        status_code: u16,
+        txn_id: db_mod.types.TxnId,
+        status: []const u8,
+        tables: []const transactions_api.TableCommitRequest,
+    ) !httpx.Response {
+        const result = tables[0].result();
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        const reconcile = try std.fmt.allocPrint(ctx.allocator, "/db/v1/transactions/{s}", .{&txn_hex});
+        defer ctx.allocator.free(reconcile);
+        _ = ctx.status(status_code);
+        return ctx.json(.{
+            .status = status,
+            .inserted = result.inserted,
+            .deleted = result.deleted,
+            .transformed = result.transformed,
+            .transaction_id = &txn_hex,
+            .reconcile = reconcile,
+        });
+    }
+
+    fn idempotentBatchError(
+        ctx: *httpx.Context,
+        status_code: u16,
+        outcome: []const u8,
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+        transaction_id: []const u8,
+    ) !httpx.Response {
+        const reconcile = try std.fmt.allocPrint(ctx.allocator, "/db/v1/transactions/{s}", .{transaction_id});
+        defer ctx.allocator.free(reconcile);
+        _ = ctx.status(status_code);
+        return ctx.json(.{
+            .status = outcome,
+            .code = code,
+            .message = message,
+            .retryable = retryable,
+            .transaction_id = transaction_id,
+            .reconcile = reconcile,
+        });
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
