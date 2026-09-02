@@ -1417,7 +1417,7 @@ fn verifyMergePublicTraffic(
     ));
 
     if (cfg.expect_profile) {
-        try expectHelloCountProfile(client, client_base, table_name, 3, 1, true);
+        try expectHelloCountProfile(client, client_base, table_name, 3, 1, false);
     }
 }
 
@@ -4628,6 +4628,25 @@ fn applyDropIndexMutation(
     try target.runRound();
 }
 
+fn applyReplaceTableDefinitionMutation(
+    node: MetadataHttpNodeSimulation,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !void {
+    const target = currentMetadataMutationNode(node);
+    var snapshot = try target.adminSnapshot();
+    defer target.freeAdminSnapshot(&snapshot);
+    const current = api_tables.findTableByName(&snapshot, replacement.name) orelse
+        return error.TableNotFound;
+    if (replacement.table_id != expected.table_id or
+        !metadata_table_manager.tableDefinitionsEqual(current.*, expected))
+    {
+        return error.TableGenerationChanged;
+    }
+    try target.upsertTable(replacement);
+    try target.runRound();
+}
+
 const PublicApiLinearizableReadDriver = struct {
     cluster: ?*MetadataHttpClusterSimulation = null,
     node_index: usize,
@@ -4708,6 +4727,7 @@ const PublicApiStatusSource = struct {
     }
 
     fn iface(self: *@This()) api_http_server.StatusSource {
+        const RoutingAdapter = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
         return .{
             .ptr = self,
             .vtable = &.{
@@ -4716,7 +4736,11 @@ const PublicApiStatusSource = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = RoutingAdapter.routingSnapshot,
+                .linearizable_routing_snapshot = RoutingAdapter.linearizableSnapshot,
+                .free_routing_snapshot = RoutingAdapter.freeRoutingSnapshot,
                 .create_table = createTable,
+                .replace_table_definition = replaceTableDefinition,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -4766,6 +4790,15 @@ const PublicApiStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
+    }
+
+    fn replaceTableDefinition(
+        ptr: *anyopaque,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyReplaceTableDefinitionMutation(self.node, expected, replacement);
     }
 
     fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -4924,11 +4957,15 @@ const PublicApiCatalogSource = struct {
     }
 
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        const RoutingAdapter = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot);
         return .{
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = RoutingAdapter.routingSnapshot,
+                .linearizable_routing_snapshot = RoutingAdapter.linearizableSnapshot,
+                .free_routing_snapshot = RoutingAdapter.freeRoutingSnapshot,
             },
         };
     }
@@ -6173,7 +6210,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
-    try std.testing.expectEqual(true, query_result.profile.?.object.get("merge") != null);
+    try std.testing.expectEqual(false, query_result.profile.?.object.get("merge") != null);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:a"]}
@@ -6717,7 +6754,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try std.testing.expect(std.mem.indexOf(u8, query.body, "\"_id\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, query.body, "\"_id\":\"doc:z\"") != null);
 
-    try expectHelloCountProfile(&client, client_base, "docs", 2, 1, true);
+    try expectHelloCountProfile(&client, client_base, "docs", 2, 1, false);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:z"]}
@@ -9815,29 +9852,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         }
     };
 
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
 
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
@@ -10074,7 +10089,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     try std.testing.expect(std.mem.indexOf(u8, regexp_query.body, "\"_id\":\"doc:y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, regexp_query.body, "\"_id\":\"doc:w\"") == null);
 
-    try expectCountProfile(&client, client_base, "docs", "forwarded", 3, 1, true);
+    try expectCountProfile(&client, client_base, "docs", "forwarded", 3, 1, false);
 
     var deleted = try client.fetchBatch(client_base, "docs",
         \\{"deletes":["doc:z","doc:y","doc:w"]}
@@ -10104,20 +10119,7 @@ test "metadata http cluster simulation forwards public table io across split ran
             self.node.freeAdminSnapshot(snapshot);
         }
     };
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
-        }
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
         cluster: *MetadataHttpClusterSimulation,
@@ -10385,20 +10387,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
             self.node.freeAdminSnapshot(snapshot);
         }
     };
-    const TestCatalogSource = struct {
-        node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
-            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
-        }
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.node.adminSnapshot();
-        }
-        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.node.freeAdminSnapshot(snapshot);
-        }
-    };
+    const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
         node: MetadataHttpNodeSimulation,
         cluster: *MetadataHttpClusterSimulation,

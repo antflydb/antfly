@@ -36196,7 +36196,72 @@ test "api http server reports exhausted table mutation authority consistently" {
     try std.testing.expectEqual(@as(u16, 503), mcp_drop.status);
     try std.testing.expectEqualStrings("1", mcp_drop.headers[0].value);
     try std.testing.expectEqual(@as(usize, 3), source.create_calls);
-    try std.testing.expectEqual(@as(usize, 2), source.drop_calls);
+    try std.testing.expectEqual(@as(usize, 3), source.drop_calls);
+}
+
+test "api http server retries only pre-admission public table drop failures" {
+    const alloc = std.testing.allocator;
+    const FailureMode = enum { transient_then_success, ambiguous };
+    const FakeSource = struct {
+        mode: FailureMode,
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .drop_table_exact = dropTableExact,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn dropTableExact(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            _: []const u8,
+        ) !metadata_table_topology_mutations.DropResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drop_calls += 1;
+            switch (self.mode) {
+                .transient_then_success => if (self.drop_calls == 1) return error.NotLeader,
+                .ambiguous => return error.MetadataMutationOutcomeUnknown,
+            }
+            return .{
+                .table_id = 7,
+                .expected_transition_generation = 1,
+                .group_ids = try result_alloc.alloc(u64, 0),
+            };
+        }
+    };
+
+    var recovered_source = FakeSource{ .mode = .transient_then_success };
+    var recovered_server = ApiHttpServer.init(alloc, .{}, recovered_source.iface(), null, null);
+    recovered_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
+    var recovered = try executeHttpxTestRequest(&recovered_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 204), recovered.status);
+    try std.testing.expectEqual(@as(usize, 2), recovered_source.drop_calls);
+
+    var ambiguous_source = FakeSource{ .mode = .ambiguous };
+    var ambiguous_server = ApiHttpServer.init(alloc, .{}, ambiguous_source.iface(), null, null);
+    ambiguous_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
+    var ambiguous = try executeHttpxTestRequest(&ambiguous_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer ambiguous.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), ambiguous.status);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        ambiguous.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse
+            return error.MissingMutationOutcomeHeader,
+    );
+    try std.testing.expectEqual(@as(usize, 1), ambiguous_source.drop_calls);
 }
 
 test "schema projection expectation uses backend committed generation" {
