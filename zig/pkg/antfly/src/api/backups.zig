@@ -4531,6 +4531,29 @@ fn tableManifestRecordExistsForReconciliationWithCancellation(
     };
 }
 
+/// Checks the canonical commit point while charging the same bounded quantum
+/// as reservation inspection and cleanup. Collision handling uses this after
+/// reading an exact generation so a durable winner is reported as committed
+/// instead of as an ambiguous in-flight attempt.
+pub fn tableBackupAttemptCommittedAtLocationWithBudgetAndCancellation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    operation_budget: *usize,
+    cancellation: CancellationToken,
+) !bool {
+    try cancellation.check();
+    try consumeBackupCleanupOperation(operation_budget);
+    return try tableManifestRecordExistsForReconciliationWithCancellation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        cancellation,
+    );
+}
+
 fn reserveReclaimOperations(
     location: *const BackupLocation,
     operation_budget: *usize,
@@ -4581,7 +4604,30 @@ pub fn advanceExpiredTableBackupAttemptAtLocationWithCancellation(
         backup_id,
         inspection.artifact_backup_id,
         cancellation,
-    )) return .replaced;
+    )) {
+        // The generation is no longer the logical owner. Current writers also
+        // carry a delivery deadline, so once that deadline has passed the
+        // cleanup tombstone installed above has no remaining safety role. Do
+        // not orphan one lease object per replacement race. Legacy attempts
+        // have no such proof and deliberately retain their permanent fence.
+        if (inspection.writer_not_after_unix_ns) |writer_not_after_unix_ns| {
+            if (now_unix_ns >= writer_not_after_unix_ns) {
+                releaseTableBackupCleanupFenceWithRootBudgetAndCancellation(
+                    alloc,
+                    io,
+                    location,
+                    inspection.artifact_backup_id,
+                    operation_budget,
+                    null,
+                    cancellation,
+                ) catch |err| switch (err) {
+                    error.BackupCleanupBudgetExceeded => return .incomplete,
+                    else => return err,
+                };
+            }
+        }
+        return .replaced;
+    }
 
     try consumeBackupCleanupOperation(operation_budget);
     if (try tableManifestRecordExistsForReconciliationWithCancellation(
@@ -15989,6 +16035,16 @@ test "stale table reclaim reports a concurrently replaced generation" {
         "logical",
         "artifact-b",
     ));
+    const replaced_lease_suffix = try tableBackupWriterLeasePath(alloc, "", "artifact-a");
+    defer alloc.free(replaced_lease_suffix);
+    try std.testing.expectError(
+        error.FileNotFound,
+        location.remote.readBytesAllocLimited(
+            alloc,
+            trimLeftSlash(replaced_lease_suffix),
+            max_backup_attempt_lease_bytes,
+        ),
+    );
 }
 
 test "stale table reclaim honors cancellation before storage mutation" {
@@ -16042,6 +16098,47 @@ test "stale table reclaim honors cancellation before storage mutation" {
         "logical",
         "artifact",
     ));
+}
+
+test "table backup collision commit check is bounded and exact" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try location.remote.writeBytes(
+        alloc,
+        "logical-metadata.json",
+        "{}",
+        "application/json",
+    );
+    var budget: usize = 1;
+    try std.testing.expect(try tableBackupAttemptCommittedAtLocationWithBudgetAndCancellation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        &budget,
+        .none,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), budget);
+    try std.testing.expectError(
+        error.BackupCleanupBudgetExceeded,
+        tableBackupAttemptCommittedAtLocationWithBudgetAndCancellation(
+            alloc,
+            io,
+            &location,
+            "logical",
+            &budget,
+            .none,
+        ),
+    );
 }
 
 test "table backup writer lease fences cleanup until the storage owner expires" {

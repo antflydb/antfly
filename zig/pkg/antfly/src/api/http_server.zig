@@ -529,6 +529,16 @@ fn trimBackupMaintenanceLocationTrailingSlash(value: []const u8) []const u8 {
     return value[0..end];
 }
 
+fn tableBackupReclaimRetryAtUnixNs(
+    eligible_at_unix_ns: ?u64,
+    now_unix_ns: u64,
+) u64 {
+    if (eligible_at_unix_ns) |eligible_at| {
+        if (eligible_at > now_unix_ns) return eligible_at;
+    }
+    return now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+}
+
 const BackupRepositoryMaintenanceTarget = struct {
     const TableReclaim = struct {
         backup_id: []u8,
@@ -879,6 +889,22 @@ test "backup maintenance target coalesces exact table reclaim intent" {
     try std.testing.expectEqualStrings("docs", target.nextDueTableReclaim(140).?);
     target.finishTableReclaim(alloc, "docs", null);
     try std.testing.expectEqual(@as(usize, 0), target.table_reclaims.items.len);
+}
+
+test "table backup reclaim retry uses exact future eligibility" {
+    const now_unix_ns: u64 = 100;
+    try std.testing.expectEqual(
+        @as(u64, 101),
+        tableBackupReclaimRetryAtUnixNs(101, now_unix_ns),
+    );
+    try std.testing.expectEqual(
+        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+        tableBackupReclaimRetryAtUnixNs(now_unix_ns, now_unix_ns),
+    );
+    try std.testing.expectEqual(
+        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
+        tableBackupReclaimRetryAtUnixNs(null, now_unix_ns),
+    );
 }
 
 test "cluster backup maintenance queue rotates repositories without allocation" {
@@ -3949,13 +3975,10 @@ pub const ApiHttpServer = struct {
                                 break :generation;
                             },
                             .active => {
-                                const retry_at = if (inspection.reclaimNotBeforeUnixNs()) |eligible_at|
-                                    @max(
-                                        eligible_at,
-                                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns,
-                                    )
-                                else
-                                    now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+                                const retry_at = tableBackupReclaimRetryAtUnixNs(
+                                    inspection.reclaimNotBeforeUnixNs(),
+                                    now_unix_ns,
+                                );
                                 self.finishTableReclaim(backup_id, retry_at);
                                 break :generation;
                             },
@@ -8193,6 +8216,33 @@ pub const ApiHttpServer = struct {
                     defer inspection.deinit(self.alloc);
                     if (receipt) |execution_receipt|
                         execution_receipt.recordArtifactBackupId(inspection.artifact_backup_id);
+                    if (backups_api.tableBackupAttemptCommittedAtLocationWithBudgetAndCancellation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        &reclaim_budget,
+                        operation_control.token(),
+                    ) catch |read_err| {
+                        const normalized_err = operation_control.normalizeInterruption(read_err);
+                        if (isBackupInterruption(normalized_err)) return normalized_err;
+                        return error.BackupOutcomeAmbiguous;
+                    }) {
+                        if (writer_lease_role.ownsCommittedRetirement()) {
+                            self.scheduleTableBackupAttemptCleanup(
+                                location_uri,
+                                connection,
+                                backup_id,
+                                inspection.artifact_backup_id,
+                                inspection.format,
+                                .committed_logical_state,
+                                .preserve,
+                            ) catch |schedule_err| {
+                                std.log.warn("committed table backup collision reconciliation scheduling deferred class={s}", .{@errorName(schedule_err)});
+                            };
+                        }
+                        return error.BackupAlreadyExists;
+                    }
                     const eligible_at_unix_ns = inspection.reclaimNotBeforeUnixNs() orelse
                         return error.BackupOutcomeAmbiguous;
                     const now_unix_ns: u64 = @intCast(
@@ -8247,10 +8297,10 @@ pub const ApiHttpServer = struct {
                             },
                         }
                     }
-                    const retry_at = if (eligible_at_unix_ns > now_unix_ns)
-                        eligible_at_unix_ns
-                    else
-                        now_unix_ns +| backups_api.backup_attempt_lease_renew_interval_ns;
+                    const retry_at = tableBackupReclaimRetryAtUnixNs(
+                        eligible_at_unix_ns,
+                        now_unix_ns,
+                    );
                     self.scheduleTableBackupReclamation(
                         location_uri,
                         connection,
