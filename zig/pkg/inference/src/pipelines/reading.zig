@@ -125,6 +125,23 @@ pub const ReadingPipeline = struct {
         };
     }
 
+    /// Count the exact textual tokens consumed by the reader encoder. Models
+    /// without a textual reader input return zero; Florence uses the same
+    /// normalization and BOS/EOS construction as every execution path below.
+    pub fn inputTokenCount(self: *ReadingPipeline) !usize {
+        if (expectsFlattenedPatches(self.vision_encoder)) return 0;
+        const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return 0;
+        const prompt_text = self.config.prompt orelse "<OCR>";
+        const prompt_ids = try buildFlorencePromptIds(
+            self.allocator,
+            self.tokenizer,
+            florence_cfg,
+            prompt_text,
+        );
+        defer self.allocator.free(prompt_ids);
+        return prompt_ids.len;
+    }
+
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
@@ -1398,7 +1415,10 @@ fn compactDecoderInputIds(
     return out;
 }
 
-fn nativeFlorenceReadBatchSize() usize {
+/// Effective native reader microbatch ceiling for this process. Capability
+/// publication and execution must call this same authority so a node never
+/// advertises native batching that its configured executor will serialize.
+pub fn nativeFlorenceReadBatchSize() usize {
     const parsed = platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse return 8;
     return std.math.clamp(parsed, 1, 64);
 }

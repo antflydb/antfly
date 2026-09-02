@@ -502,8 +502,12 @@ document. They are architectural requirements, not Florence-specific cleanup:
 35. **The distributed proxy retained request bodies without a ceiling.** The
     proxy needs the body for nested-model routing and bounded failover, but now
     rejects declared and streaming bodies beyond a configurable retained-byte
-    limit (256 MiB by default) before forwarding. Inference nodes still apply
-    their stricter decoded-media and model admission independently.
+    limit (256 MiB by default) before forwarding. A process-wide weighted body
+    admission budget (512 MiB by default) is acquired before reading and held
+    through retries, so concurrent requests cannot multiply that per-request
+    ceiling into unbounded proxy memory. Waiting observes request cancellation.
+    Inference nodes still apply their stricter decoded-media and model admission
+    independently.
 36. **Cluster catalog fan-out multiplied memory by node count.** Discovery now
     permits at most eight simultaneous upstream catalog bodies, caps each at
     8 MiB, bounds the merged descriptor set at 32 MiB, and drains every worker
@@ -1087,12 +1091,13 @@ document. They are architectural requirements, not Florence-specific cleanup:
     candidates, extractors count schemas, generators/readers count requested
     output, and media consumers inspect physical encoded bytes and pixels.
     Byte and modality checks precede model loading; exact tokenizer counts are
-    checked after tokenizer acquisition. Reader and composed extractor paths
-    retain a conservative request-text proxy where their several concrete
-    pipelines do not yet expose one uniform tokenizer surface, so a published
-    token ceiling is never silently omitted. Fixed
-    chunking remains an explicit built-in executor with no model manifest and
-    therefore keeps its existing hard-coded contract.
+    checked after tokenizer acquisition. Florence/VLM readers, NER, GLiNER,
+    REBEL, zero-shot classification, and composed reader/recognizer extractors
+    expose concrete input-token measurement at the executor boundary. GLiNER
+    relation extraction admits the larger of its entity and conditional
+    composite-relation rows. No character- or byte-count proxy stands in for a
+    model tokenizer. Fixed chunking remains an explicit built-in executor with
+    no model manifest and therefore keeps its existing hard-coded contract.
 111. **A remote exact MIME set could exceed the local physical codec set.**
     Version 4 capability parsing accepted any bounded syntactically valid
     `image/*` essence, even though the same client later had to identify and
@@ -1103,6 +1108,28 @@ document. They are architectural requirements, not Florence-specific cleanup:
     extensions such as GIF retain value-semantic round-trip behavior. This
     keeps catalog publication, distributed planning, and physical execution on
     one codec authority.
+112. **Audio capability publication exceeded the linked decoder surface.**
+    Audio MIME values are now accepted and advertised only when the compiled
+    audio registry can decode that exact essence. Optional codecs such as MP3
+    therefore disappear from the effective model contract when their build
+    support is absent, and arbitrary `audio/*` extensions fail catalog
+    validation instead of surviving until execution.
+113. **Native reader capability ignored the executor's batch-size override.**
+    The Florence executor and capability resolver now share one effective
+    `ANTFLY_INFERENCE_READ_BATCH_SIZE` authority. A value of one publishes
+    serial compatibility, while larger values clamp both preferred and maximum
+    item counts. Local and distributed planners can no longer dispatch a batch
+    that the selected node has already configured itself to serialize.
+114. **Linked text-family wrappers were treated as the final trust boundary.**
+    Early linked-ABI checks are useful for cheap rejection, but another
+    in-process caller could invoke the node directly. Dense and sparse
+    embedding, reranking, rewriting, classification, generation, transcription,
+    reading, and extraction now resolve and enforce their model contract again
+    inside the concrete node executor. Tokenizer-dependent limits are measured
+    there after model acquisition; media and schema limits remain available for
+    pre-load rejection. The same invariant therefore holds behind HTTP, the
+    linked runtime, and a distributed proxy: adapters may narrow work, but only
+    the executor grants final admission.
 
 ### Post-review implementation contract
 

@@ -708,6 +708,17 @@ pub const GenerateResult = struct {
     }
 };
 
+/// Count the exact tokens produced by the OGA tokenizer used for execution.
+pub fn inputTokenCount(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: []const u8) !usize {
+    const prompt_z = try allocator.dupeZ(u8, prompt);
+    defer allocator.free(prompt_z);
+    var sequences: ?*c.OgaSequences = null;
+    try check(c.OgaCreateSequences(&sequences));
+    defer c.OgaDestroySequences(sequences.?);
+    try check(c.OgaTokenizerEncode(model.tokenizer, prompt_z.ptr, sequences.?));
+    return c.OgaSequencesGetSequenceCount(sequences.?, 0);
+}
+
 pub const FirstTokenDebug = struct {
     token_id: i32,
     text: []const u8,

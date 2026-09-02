@@ -495,6 +495,11 @@ const ReaderExtractor = struct {
         );
         defer reader.deinit();
 
+        if (config.max_input_tokens_per_item) |limit| {
+            const input_tokens = try reader.inputTokenCount(read_options);
+            if (input_tokens > limit) return error.InferenceInputTokensExceeded;
+        }
+
         const results = try reader.readBatch(image_datas, read_options);
         defer {
             for (results) |*result| result.deinit();

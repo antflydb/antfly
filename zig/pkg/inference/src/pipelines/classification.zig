@@ -95,6 +95,33 @@ pub const ClassificationPipeline = struct {
         return self.classifyBatchWithPromptTokens(texts, labels, &prompt_tokens);
     }
 
+    /// Returns the largest exact non-padding model row in this request. Each
+    /// row is a text paired with one fully formatted label hypothesis.
+    pub fn maxInputTokensPerItem(
+        self: *ClassificationPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+    ) !usize {
+        var result: usize = 0;
+        for (labels) |label| {
+            const hypothesis = try self.formatHypothesis(label);
+            defer self.allocator.free(hypothesis);
+            for (texts) |text| {
+                var encoded = try self.tok.encodeForPair(
+                    self.allocator,
+                    text,
+                    hypothesis,
+                    self.config.max_length,
+                );
+                defer encoded.deinit();
+                var count: usize = 0;
+                for (encoded.attention_mask) |mask| count += @intFromBool(mask != 0);
+                result = @max(result, count);
+            }
+        }
+        return result;
+    }
+
     /// Classify a batch and report the exact number of non-padding tokens sent
     /// to the NLI model across every text-label hypothesis pair.
     pub fn classifyBatchWithPromptTokens(
@@ -398,6 +425,10 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     const texts = [_][]const u8{ "first", "second", "third" };
     const labels = [_][]const u8{ "negative", "positive" };
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try pipeline.maxInputTokensPerItem(&texts, &labels),
+    );
     var prompt_tokens: usize = 0;
     const results = try pipeline.classifyBatchWithPromptTokens(&texts, &labels, &prompt_tokens);
     defer {

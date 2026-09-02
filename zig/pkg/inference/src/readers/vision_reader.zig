@@ -207,6 +207,11 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.readDecoded(img);
     }
 
+    pub fn inputTokenCount(self: *LoadedVisionReader, options: reader_types.ReadOptions) !usize {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.inputTokenCount();
+    }
+
     pub fn snapshotMetalGeneratedQuantStats(self: *LoadedVisionReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
         var stats = metal_generated_quant_stats.snapshotForSession(allocator, self.encoder_session);
         if (self.decoder_session.ptr != self.encoder_session.ptr or self.decoder_session.vtable != self.encoder_session.vtable) {

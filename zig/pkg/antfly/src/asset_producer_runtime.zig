@@ -28,7 +28,6 @@ const remote_capabilities = @import("inference/remote_capabilities.zig");
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
-const default_local_reader_batch_images: usize = 8;
 const max_asset_provider_timeout_ms: u64 = 300_000;
 const default_asset_provider_response_bytes: usize = 64 << 20;
 const max_asset_http_response_bytes: usize = 64 << 20;
@@ -1952,9 +1951,7 @@ fn readerResultMatchesImageIdentity(result: readers.Result, image: readers.Encod
 /// from being silently repartitioned into differently attributed inner
 /// chunks. The server retains the same hard ceiling independently.
 fn localReaderBatchMaxImages() usize {
-    const configured = platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse
-        return default_local_reader_batch_images;
-    return std.math.clamp(configured, 1, local_reader_batch_ceiling);
+    return inference.server.effectiveNativeReadBatchSize();
 }
 
 fn readerBatchEnd(fingerprints: []const ?[]const u8, start: usize, max_images: usize) usize {

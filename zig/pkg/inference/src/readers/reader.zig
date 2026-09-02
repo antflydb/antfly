@@ -35,6 +35,7 @@ pub const Region = reader_types.Region;
 pub const Result = reader_types.Result;
 pub const ReadOptions = reader_types.ReadOptions;
 pub const StructuredValue = reader_types.StructuredValue;
+pub const nativeFlorenceReadBatchSize = @import("../pipelines/reading.zig").nativeFlorenceReadBatchSize;
 
 pub const BatchExecutionMode = enum { native, serial, fallback };
 
@@ -131,6 +132,17 @@ const VisionLoadedReader = struct {
             .fallback_reason = raw_batch.fallback_reason,
         };
     }
+
+    pub fn inputTokenCount(self: *VisionLoadedReader, options: ReadOptions) !usize {
+        try validateVisionReadOptions(self.parser_kind, options);
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        return self.core.inputTokenCount(.{
+            .prompt = normalized_prompt,
+            .max_tokens = options.max_tokens,
+            .cache_dtype = options.cache_dtype,
+            .source_fingerprint = options.source_fingerprint,
+        });
+    }
 };
 
 const VlmLoadedReader = struct {
@@ -175,6 +187,15 @@ const VlmLoadedReader = struct {
 
     pub fn readBatch(self: *VlmLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         return readBatchSerial(VlmLoadedReader, self, image_datas, options);
+    }
+
+    pub fn inputTokenCount(self: *VlmLoadedReader, options: ReadOptions) !usize {
+        const prompt = switch (self.parser_kind) {
+            .moondream => try moondream_mod.buildSingleImagePrompt(self.allocator, options.prompt),
+            else => return error.InvalidModelForReading,
+        };
+        defer self.allocator.free(prompt);
+        return self.pipeline.inputTokenCount(prompt);
     }
 };
 
@@ -241,6 +262,16 @@ const GenAiLoadedReader = struct {
 
     pub fn readBatch(self: *GenAiLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         return readBatchSerial(GenAiLoadedReader, self, image_datas, options);
+    }
+
+    pub fn inputTokenCount(self: *GenAiLoadedReader, options: ReadOptions) !usize {
+        if (!build_options.enable_onnx) return error.OnnxNotEnabled;
+        const prompt = switch (self.parser_kind) {
+            .moondream => try moondream_mod.buildSingleImagePrompt(self.allocator, options.prompt),
+            else => return error.InvalidModelForReading,
+        };
+        defer self.allocator.free(prompt);
+        return ortgenai.inputTokenCount(self.allocator, &self.model, prompt);
     }
 };
 
@@ -335,6 +366,19 @@ pub const LoadedReader = union(enum) {
         }
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         return batch;
+    }
+
+    /// Return the exact per-item textual input length produced by this loaded
+    /// reader. Multi-stage OCR has no text input; every generative reader uses
+    /// the same prompt builder and tokenizer as execution.
+    pub fn inputTokenCount(self: *LoadedReader, options: ReadOptions) !usize {
+        try validateReadOptions(options);
+        return switch (self.*) {
+            .vision => |*reader| reader.inputTokenCount(options),
+            .genai => |*reader| reader.inputTokenCount(options),
+            .vlm => |*reader| reader.inputTokenCount(options),
+            .multistage => 0,
+        };
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {

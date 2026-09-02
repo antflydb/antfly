@@ -97,6 +97,42 @@ pub const RerankingPipeline = struct {
         };
     }
 
+    /// Returns the largest exact non-padding token footprint for a scored
+    /// query/document item using the same encoding mode as `rerank`.
+    pub fn maxInputTokensPerItem(
+        self: *RerankingPipeline,
+        query: []const u8,
+        documents: []const []const u8,
+    ) !usize {
+        var result: usize = 0;
+        switch (self.config.mode) {
+            .cross_encoder => for (documents) |document| {
+                var encoded = try self.tok.encodeForPair(
+                    self.allocator,
+                    query,
+                    document,
+                    self.config.max_length,
+                );
+                defer encoded.deinit();
+                result = @max(result, activeTokenLength(encoded.attention_mask));
+            },
+            .late_interaction => {
+                var query_encoded = try self.encodeSingleText(query);
+                defer query_encoded.deinit();
+                const query_tokens = activeTokenLength(query_encoded.attention_mask);
+                for (documents) |document| {
+                    var document_encoded = try self.encodeSingleText(document);
+                    defer document_encoded.deinit();
+                    result = @max(
+                        result,
+                        @max(query_tokens, activeTokenLength(document_encoded.attention_mask)),
+                    );
+                }
+            },
+        }
+        return result;
+    }
+
     fn rerankCrossEncoder(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
@@ -500,6 +536,10 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
         .{ .max_length = 8 },
     );
     const documents = [_][]const u8{ "first", "second" };
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try dynamic_pipeline.maxInputTokensPerItem("query", &documents),
+    );
     const dynamic_scores = try dynamic_pipeline.rerank("query", &documents);
     defer allocator.free(dynamic_scores);
     try std.testing.expectEqual(@as(usize, 2), dynamic_scores.len);

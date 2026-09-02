@@ -76,6 +76,17 @@ pub const NerPipeline = struct {
         };
     }
 
+    /// Returns the exact non-padding sequence length that `recognize` sends
+    /// to the token-classification model for one input.
+    pub fn inputTokenCount(self: *NerPipeline, text: []const u8) !usize {
+        var enc = try self.tok.encodeForModel(self.allocator, text, self.config.max_length);
+        defer enc.deinit();
+
+        var count: usize = 0;
+        for (enc.attention_mask) |mask| count += @intFromBool(mask != 0);
+        return count;
+    }
+
     /// Recognize entities in a single text. Caller owns the returned slice.
     pub fn recognize(self: *NerPipeline, text: []const u8) ![]Entity {
         const alloc = self.allocator;

@@ -3657,16 +3657,35 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
+        try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
+            io: std.Io,
             deadline_ns: ?u64,
             texts: []const []const u8,
+            executor_contract: ResolvedInferenceExecutorContract,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                const input_tokens = try maxTokenizerTextTokens(
+                    attempt.allocator,
+                    attempt.io,
+                    model.getTokenizer(),
+                    attempt.texts,
+                );
+                try validateTextExecutorInvocation(
+                    attempt.executor_contract,
+                    attempt.texts.len,
+                    attempt.texts,
+                    0,
+                    input_tokens,
+                    0,
+                    0,
+                );
                 var asset_lease = model.acquireEmbeddingAssetLease(false);
                 defer asset_lease.release();
                 const vectors = try embedDenseTextsOnLoadedModel(
@@ -3683,8 +3702,10 @@ pub const Node = struct {
         };
         var attempt = Attempt{
             .allocator = allocator,
+            .io = io,
             .deadline_ns = deadline_ns,
             .texts = texts,
+            .executor_contract = executor_contract,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -3719,14 +3740,33 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "embed");
+        try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
         const Attempt = struct {
             allocator: std.mem.Allocator,
+            io: std.Io,
             texts: []const []const u8,
+            executor_contract: ResolvedInferenceExecutorContract,
             vectors: ?[]DirectSparseEmbedding = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                const input_tokens = try maxTokenizerTextTokens(
+                    attempt.allocator,
+                    attempt.io,
+                    model.getTokenizer(),
+                    attempt.texts,
+                );
+                try validateTextExecutorInvocation(
+                    attempt.executor_contract,
+                    attempt.texts.len,
+                    attempt.texts,
+                    0,
+                    input_tokens,
+                    0,
+                    0,
+                );
                 var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                     .allocator = attempt.allocator,
                     .session = model.session,
@@ -3737,7 +3777,12 @@ pub const Node = struct {
                 attempt.vectors = try pipeline.embed(attempt.texts);
             }
         };
-        var attempt = Attempt{ .allocator = allocator, .texts = texts };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .io = io_impl.io(),
+            .texts = texts,
+            .executor_contract = executor_contract,
+        };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
     }
@@ -3759,10 +3804,23 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
+        defer self.allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rerank");
+        try validateTextExecutorInvocation(executor_contract, 1, documents, query.len, 0, documents.len, 0);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
+        const input_tokens = try pipeline.maxInputTokensPerItem(query, documents);
+        try validateTextExecutorInvocation(
+            executor_contract,
+            1,
+            documents,
+            query.len,
+            input_tokens,
+            documents.len,
+            0,
+        );
         return try pipeline.rerank(query, documents);
     }
 
@@ -3801,6 +3859,8 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rewriters");
         defer self.allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rewrite");
+        try validateTextExecutorInvocation(executor_contract, inputs.len, inputs, 0, 0, 0, 0);
 
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
@@ -3825,6 +3885,14 @@ pub const Node = struct {
         defer allocator.free(tok_bytes);
         var hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
         defer hf_tok.deinitSelf();
+        const input_tokens = try maxTokenizerTextTokens(allocator, io_impl.io(), hf_tok.tokenizer(), inputs);
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = inputs.len,
+            .text_bytes_per_item = maxTextBytes(inputs),
+            .input_tokens_per_item = input_tokens,
+            .output_tokens_per_item = std.math.cast(usize, dec_config.max_length) orelse std.math.maxInt(usize),
+            .has_text = true,
+        });
 
         const rewriting = @import("../pipelines/rewriting.zig");
         var pipeline = rewriting.RewritingPipeline{
@@ -3882,6 +3950,19 @@ pub const Node = struct {
         };
         if (classifier_path) |model_path| {
             defer self.allocator.free(model_path);
+            const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "classify");
+            const hypothesis = hypothesis_template orelse "This example is {}.";
+            const additional_text_bytes = std.math.add(usize, maxTextBytes(labels), hypothesis.len) catch
+                return error.InferenceTextBytesExceeded;
+            try validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                additional_text_bytes,
+                0,
+                labels.len,
+                0,
+            );
             var model_handle = try self.model_manager.acquireFromDir(model_path);
             defer model_handle.release();
             const model = model_handle.get();
@@ -3897,6 +3978,16 @@ pub const Node = struct {
                 .multi_label = multi_label,
                 .entailment_index = entailment_idx,
             });
+            const input_tokens = try pipeline.maxInputTokensPerItem(texts, labels);
+            try validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                additional_text_bytes,
+                input_tokens,
+                labels.len,
+                0,
+            );
             const results = try pipeline.classifyBatch(texts, labels);
             defer {
                 for (results) |item| allocator.free(item);
@@ -3907,11 +3998,31 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), requested, "extractors");
         defer self.allocator.free(model_path);
+        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "classify");
+        try validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            maxTextBytes(labels),
+            0,
+            labels.len,
+            0,
+        );
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
         var pipeline = model.glinerPipeline(allocator);
+        const input_tokens = try pipeline.maxClassificationInputTokens(texts, labels);
+        try validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            maxTextBytes(labels),
+            input_tokens,
+            labels.len,
+            0,
+        );
         const results = try pipeline.classifyBatch(texts, labels, .{
             .threshold = 0.0,
             .multi_label = multi_label,
@@ -4156,6 +4267,25 @@ pub const Node = struct {
         };
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        const executor_contract = try resolvedGenerateExecutorContract(self, &admission_manifest);
+        const decoded_pixels = try measureDirectGenerateDecodedPixels(&admission_manifest, messages);
+        const encoded_media_bytes = if (admission.expected.encoded_media_bytes > 0)
+            admission.expected.encoded_media_bytes
+        else
+            admission.expected.decoded_media_bytes;
+        try validateGenerateExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .text_bytes_per_item = admission.expected.text_bytes,
+            .output_tokens_per_item = @intCast(max_tokens),
+            .encoded_media_bytes = encoded_media_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = admission.expected.media_count,
+            .has_text = admission.expected.text_bytes > 0,
+            .has_image = admission.expected.image_count > 0,
+            .has_audio = admission.expected.has_audio,
+        });
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
                 try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
@@ -4209,6 +4339,18 @@ pub const Node = struct {
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
+        try validateGenerateExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .text_bytes_per_item = admission.expected.text_bytes,
+            .input_tokens_per_item = prompt_tokens,
+            .output_tokens_per_item = @intCast(max_tokens),
+            .encoded_media_bytes = encoded_media_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = admission.expected.media_count,
+            .has_text = admission.expected.text_bytes > 0,
+            .has_image = admission.expected.image_count > 0,
+            .has_audio = admission.expected.has_audio,
+        });
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
                 .backend = backend_kind,
@@ -4702,6 +4844,7 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
         try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
@@ -4716,11 +4859,14 @@ pub const Node = struct {
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
             allocator,
+            io,
             model_path,
             media_admission,
+            &admission_manifest,
             &parsed,
             &reserved_units,
             deadline_ns,
+            executor_contract,
         );
     }
 
@@ -4777,6 +4923,7 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         var parsed = try parseDirectDenseEmbedInputsWithContext(
@@ -4790,22 +4937,28 @@ pub const Node = struct {
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
             allocator,
+            io,
             model_path,
             media_admission,
+            &admission_manifest,
             &parsed,
             &reserved_units,
             deadline_ns,
+            executor_contract,
         );
     }
 
     fn embedParsedDenseInputsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
+        io: std.Io,
         model_path: []const u8,
         media_admission: ReadRequestAdmission,
+        admission_manifest: *const manifest_mod.ModelManifest,
         parsed: *ParsedDenseEmbedInputs,
         reserved_units: *usize,
         deadline_ns: ?u64,
+        executor_contract: ResolvedInferenceExecutorContract,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -4828,16 +4981,40 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
+        // Preserve the generic request-security errors above, then apply any
+        // narrower model-specific media and item ceilings before acquisition.
+        try validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, parsed, 0);
+
         const Attempt = struct {
             allocator: std.mem.Allocator,
+            io: std.Io,
             parsed: *ParsedDenseEmbedInputs,
             audio_decode_working_bytes: usize,
             deadline_ns: ?u64,
+            executor_contract: ResolvedInferenceExecutorContract,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var max_input_tokens: usize = 0;
+                for (attempt.parsed.texts.items) |item| {
+                    max_input_tokens = @max(
+                        max_input_tokens,
+                        try countTokenizerTokens(
+                            attempt.allocator,
+                            attempt.io,
+                            model.getTokenizer(),
+                            item.text,
+                        ),
+                    );
+                }
+                try validateDenseEmbedExecutorInvocation(
+                    attempt.executor_contract,
+                    &model.manifest,
+                    attempt.parsed,
+                    max_input_tokens,
+                );
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
                 defer asset_lease.release();
                 try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
@@ -4864,9 +5041,11 @@ pub const Node = struct {
         };
         var attempt = Attempt{
             .allocator = allocator,
+            .io = io,
             .parsed = parsed,
             .audio_decode_working_bytes = audio_decode_working_bytes,
             .deadline_ns = deadline_ns,
+            .executor_contract = executor_contract,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -5035,8 +5214,44 @@ pub const Node = struct {
         max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
     ) !readers_api.BatchResult {
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        const executor_contract = try resolvedInferenceExecutorContract(self, "read", &admission_manifest);
+        const normalized_prompt = normalizeReadPrompt(prompt);
+        var encoded_media_bytes: usize = 0;
+        for (image_datas, 0..) |image_data, index| {
+            encoded_media_bytes = std.math.add(usize, encoded_media_bytes, image_data.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            if (encoded_images) |images| try validateEncodedImageMime(images[index].mime_type, image_data);
+        }
+        const decoded_pixels = try measureExecutorDecodedImages(&admission_manifest, image_datas);
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = image_datas.len,
+            .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .encoded_media_bytes = encoded_media_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+
         var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
         defer reader.deinit();
+        const exact_prompt_tokens = try reader.inputTokenCount(.{
+            .prompt = normalized_prompt,
+            .max_tokens = max_tokens,
+            .source_fingerprint = source_fingerprint,
+        });
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = image_datas.len,
+            .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
+            .input_tokens_per_item = exact_prompt_tokens,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .encoded_media_bytes = encoded_media_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
 
         const out = try allocator.alloc(readers_api.Result, image_datas.len);
         var initialized: usize = 0;
@@ -5046,7 +5261,7 @@ pub const Node = struct {
         }
 
         const batch = try reader.readBatchReported(image_datas, .{
-            .prompt = normalizeReadPrompt(prompt),
+            .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
         });
@@ -5121,10 +5336,34 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
         defer self.allocator.free(model_path);
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        const executor_contract = try resolvedInferenceExecutorContract(self, "transcribe", &admission_manifest);
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .media_parts_per_item = 1,
+            .has_audio = true,
+        });
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         var downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, request.url, &media_budget);
         defer downloaded.deinit(allocator);
+        if (downloaded.content_type.len > 0) {
+            const essence = data_uri_mod.mediaTypeEssence(downloaded.content_type) catch
+                return error.UnsupportedInferenceMimeType;
+            // Generic remote content types are not physical audio claims; the
+            // bounded decoder sniffs those below. Explicit audio declarations
+            // must be part of the resolved model/codec contract.
+            if (std.mem.startsWith(u8, essence, "audio/") and
+                !manifestAcceptsExecutorMime(&admission_manifest, essence))
+                return error.UnsupportedInferenceMimeType;
+        }
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .encoded_media_bytes = downloaded.data.len,
+            .media_parts_per_item = 1,
+            .has_audio = true,
+        });
         const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
         const resident_bytes = if (data_uri_mod.hasScheme(request.url))
             std.math.add(usize, media_budget.used_bytes, downloaded.data.len) catch std.math.maxInt(usize)
@@ -5274,7 +5513,7 @@ pub const Node = struct {
         const media_admission = requestMediaAdmission(self, media_shape);
         try self.growAdmissionUnits(reserved_units, media_admission.units);
         reserved_units = media_admission.units;
-        const config = extraction_mod.ExtractionConfig{
+        var config = extraction_mod.ExtractionConfig{
             .threshold = options.threshold orelse 0.3,
             .flat_ner = options.flat_ner orelse true,
             .include_confidence = options.include_confidence orelse false,
@@ -5300,6 +5539,7 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
         defer admission_manifest.deinit();
         const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
+        config.max_input_tokens_per_item = executor_contract.batch.max_input_tokens_per_item;
 
         // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
@@ -5425,6 +5665,7 @@ pub const Node = struct {
             return self.extractRebelJsonAlloc(
                 allocator,
                 model_path,
+                executor_contract,
                 request,
                 texts,
                 want_relations,
@@ -5456,6 +5697,20 @@ pub const Node = struct {
                     relation_labels,
                 );
                 defer if (relation_entity_labels) |values| allocator.free(values);
+                const input_tokens = try pipeline.maxExtractionInputTokens(
+                    texts,
+                    relation_entity_labels,
+                    relation_labels,
+                );
+                try validateTextExecutorInvocation(
+                    executor_contract,
+                    texts.len,
+                    texts,
+                    @max(maxTextBytes(schema.entities orelse &.{}), maxTextBytes(relation_labels)),
+                    input_tokens,
+                    @max(if (schema.entities) |values| values.len else 0, relation_labels.len),
+                    schema_json.len,
+                );
                 const extracted = try pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels);
                 defer {
                     freeBorrowedLabelEntityBatches(allocator, extracted.entities);
@@ -5473,6 +5728,16 @@ pub const Node = struct {
                 return try entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
             }
 
+            const input_tokens = try pipeline.maxExtractionInputTokens(texts, labels, null);
+            try validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                maxTextBytes(schema.entities orelse &.{}),
+                input_tokens,
+                if (schema.entities) |values| values.len else 0,
+                schema_json.len,
+            );
             const all_entities = try pipeline.recognizeBatch(texts, labels);
             defer freeBorrowedLabelEntityBatches(allocator, all_entities);
             const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
@@ -5489,6 +5754,16 @@ pub const Node = struct {
         if (want_relations) return error.UnsupportedRelationExtraction;
         var pipeline = model.nerPipeline(allocator);
         pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
+        const input_tokens = try maxNerInputTokens(&pipeline, texts);
+        try validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            0,
+            input_tokens,
+            0,
+            schema_json.len,
+        );
         const all_entities = try pipeline.recognizeBatch(texts);
         defer freeBorrowedLabelEntityBatches(allocator, all_entities);
         const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
@@ -5543,6 +5818,16 @@ pub const Node = struct {
 
             if (model.isGlinerModel()) {
                 var pipeline = model.glinerPipeline(allocator);
+                const input_tokens = try pipeline.maxClassificationInputTokens(texts, classification_schema.labels);
+                try validateTextExecutorInvocation(
+                    executor_contract,
+                    texts.len,
+                    texts,
+                    maxTextBytes(classification_schema.labels),
+                    input_tokens,
+                    classification_schema.labels.len,
+                    schema_json.len,
+                );
                 const multi_label = classification_schema.multi_label orelse false;
                 const results = try pipeline.classifyBatch(texts, classification_schema.labels, .{
                     .threshold = options.threshold orelse 0.0,
@@ -5568,6 +5853,16 @@ pub const Node = struct {
                 .multi_label = classification_schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
+            const input_tokens = try pipeline.maxInputTokensPerItem(texts, classification_schema.labels);
+            try validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                maxTextBytes(classification_schema.labels),
+                input_tokens,
+                classification_schema.labels.len,
+                schema_json.len,
+            );
             var schema_prompt_tokens: usize = 0;
             const results = try pipeline.classifyBatchWithPromptTokens(texts, classification_schema.labels, &schema_prompt_tokens);
             defer freeClassificationBatch(allocator, results);
@@ -6599,15 +6894,12 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
-        const query_tokens = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch |err|
+        var pipeline = model.rerankingPipeline(ctx.allocator);
+        const input_tokens_per_item = pipeline.maxInputTokensPerItem(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
-        const prompt_tokens_per_item = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.prompts) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        const input_tokens_per_item = std.math.add(usize, query_tokens, prompt_tokens_per_item) catch std.math.maxInt(usize);
         validateTextExecutorInvocation(executor_contract, 1, body.prompts, body.query.len, input_tokens_per_item, body.prompts.len, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
-        var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
@@ -6721,25 +7013,6 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
-        var doc_texts_for_limit = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
-        defer ctx.allocator.free(doc_texts_for_limit);
-        for (parsed_docs.items, 0..) |doc, idx| doc_texts_for_limit[idx] = doc.text;
-        const query_tokens_for_limit = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        const doc_tokens_for_limit = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc_texts_for_limit) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        const input_tokens_for_limit = std.math.add(usize, query_tokens_for_limit, doc_tokens_for_limit) catch std.math.maxInt(usize);
-        validateInferenceExecutorInvocation(executor_contract, .{
-            .item_count = 1,
-            .text_bytes_per_item = rerank_text_bytes,
-            .input_tokens_per_item = input_tokens_for_limit,
-            .encoded_media_bytes = media_budget.used_bytes,
-            .decoded_pixels = decoded_pixels,
-            .media_parts_per_item = max_doc_images,
-            .candidates_per_request = body.documents.len,
-            .has_text = true,
-            .has_image = image_count > 0,
-        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (image_count == 0) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
@@ -6747,6 +7020,15 @@ pub const Node = struct {
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
+            const input_tokens = pipeline.maxInputTokensPerItem(body.query, flat_texts) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            validateInferenceExecutorInvocation(executor_contract, .{
+                .item_count = 1,
+                .text_bytes_per_item = rerank_text_bytes,
+                .input_tokens_per_item = input_tokens,
+                .candidates_per_request = body.documents.len,
+                .has_text = true,
+            }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
@@ -6797,6 +7079,28 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             .{ .distributed = runtime.distributed.configFromEnv() },
         );
+
+        var input_tokens_for_limit: usize = 0;
+        for (parsed_docs.items) |doc| {
+            const item_tokens = if (doc.images.len == 0) tokens: {
+                var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                break :tokens text_pipeline.maxInputTokensPerItem(body.query, &.{doc.text}) catch |err|
+                    return inferenceFailureResponse(ctx, err);
+            } else mm_pipeline.maxInputTokensPerItem(body.query, doc.text, doc.images) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            input_tokens_for_limit = @max(input_tokens_for_limit, item_tokens);
+        }
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .text_bytes_per_item = rerank_text_bytes,
+            .input_tokens_per_item = input_tokens_for_limit,
+            .encoded_media_bytes = media_budget.used_bytes,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = max_doc_images,
+            .candidates_per_request = body.documents.len,
+            .has_text = true,
+            .has_image = true,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -10863,7 +11167,7 @@ pub const Node = struct {
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
             rebel_mod.validateSchemaSupport(body.labels, body.relation_labels) catch |err|
                 return rebelSchemaFailureResponse(ctx, err);
-            return self.extractRebel(ctx, model_path, body, texts, want_relations);
+            return self.extractRebel(ctx, model_path, executor_contract, body, texts, want_relations);
         }
 
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
@@ -10883,7 +11187,7 @@ pub const Node = struct {
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
-            return self.extractGliner(ctx, model, body, texts, want_relations);
+            return self.extractGliner(ctx, model, executor_contract, body, texts, want_relations);
         }
 
         if (want_relations) {
@@ -10892,6 +11196,17 @@ pub const Node = struct {
 
         var pipeline = model.nerPipeline(ctx.allocator);
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
+        const input_tokens = maxNerInputTokens(&pipeline, texts) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            0,
+            input_tokens,
+            0,
+            body.schema_bytes,
+        ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
@@ -10913,6 +11228,7 @@ pub const Node = struct {
         self: *Node,
         ctx: *httpx.Context,
         model_path: []const u8,
+        executor_contract: ResolvedInferenceExecutorContract,
         body: EntityExtractionRequest,
         texts: []const []const u8,
         want_relations: bool,
@@ -10921,12 +11237,15 @@ pub const Node = struct {
         const json = self.extractRebelJsonAlloc(
             ctx.allocator,
             model_path,
+            executor_contract,
             body,
             texts,
             want_relations,
             &failure_stage,
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
+            if (isInferenceExecutorContractError(err))
+                return inferenceExecutorContractFailureResponse(ctx, err);
             return switch (failure_stage) {
                 .model_layout => ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
@@ -10965,6 +11284,7 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         model_path: []const u8,
+        executor_contract: ResolvedInferenceExecutorContract,
         request: EntityExtractionRequest,
         texts: []const []const u8,
         want_relations: bool,
@@ -11020,6 +11340,19 @@ pub const Node = struct {
         defer pipeline.deinit();
 
         failure_stage.* = .inference;
+        const input_tokens = try maxRebelInputTokens(&pipeline, texts);
+        try validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            @max(maxTextBytes(request.labels orelse &.{}), maxTextBytes(request.relation_labels orelse &.{})),
+            input_tokens,
+            @max(
+                if (request.labels) |labels| labels.len else 0,
+                if (request.relation_labels) |labels| labels.len else 0,
+            ),
+            request.schema_bytes,
+        );
         if (want_relations) {
             const relation_labels = request.relation_labels orelse return error.InvalidRelationSchema;
             const extracted = try pipeline.extractRelationsBatch(texts, request.labels, relation_labels);
@@ -11060,6 +11393,7 @@ pub const Node = struct {
         self: *Node,
         ctx: *httpx.Context,
         model: *model_manager_mod.LoadedModel,
+        executor_contract: ResolvedInferenceExecutorContract,
         body: EntityExtractionRequest,
         texts: []const []const u8,
         want_relations: bool,
@@ -11089,6 +11423,20 @@ pub const Node = struct {
                 relation_labels,
             );
             defer if (relation_entity_labels) |values| ctx.allocator.free(values);
+            const input_tokens = pipeline.maxExtractionInputTokens(
+                texts,
+                relation_entity_labels,
+                relation_labels,
+            ) catch |err| return inferenceFailureResponse(ctx, err);
+            validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                @max(maxTextBytes(body.labels orelse &.{}), maxTextBytes(relation_labels)),
+                input_tokens,
+                @max(if (body.labels) |values| values.len else 0, relation_labels.len),
+                body.schema_bytes,
+            ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             const extracted = pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer {
@@ -11110,6 +11458,17 @@ pub const Node = struct {
             return self.buildEntityExtractionResponse(ctx, body, extracted.entities, extracted.relations, texts);
         }
 
+        const input_tokens = pipeline.maxExtractionInputTokens(texts, labels, null) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        validateTextExecutorInvocation(
+            executor_contract,
+            texts.len,
+            texts,
+            maxTextBytes(body.labels orelse &.{}),
+            input_tokens,
+            if (body.labels) |values| values.len else 0,
+            body.schema_bytes,
+        ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
         const all_entities = pipeline.recognizeBatch(texts, labels) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
@@ -11209,16 +11568,6 @@ pub const Node = struct {
             defer model_handle.release();
             const model = model_handle.get();
 
-            const text_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            const label_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            const hypothesis_tokens = countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), hypothesis) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            const input_tokens = std.math.add(usize, std.math.add(usize, text_tokens, label_tokens) catch std.math.maxInt(usize), hypothesis_tokens) catch std.math.maxInt(usize);
-            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
-
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
                 for (labels, 0..) |label, i| {
@@ -11236,6 +11585,10 @@ pub const Node = struct {
                 .entailment_index = entailment_idx,
             };
             var pipeline = model.classificationPipeline(ctx.allocator, config);
+            const input_tokens = pipeline.maxInputTokensPerItem(body.texts, body.labels) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -11268,18 +11621,15 @@ pub const Node = struct {
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
-            const text_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            const label_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            const input_tokens = std.math.add(usize, text_tokens, label_tokens) catch std.math.maxInt(usize);
-            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
-                return inferenceExecutorContractFailureResponse(ctx, err);
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
 
             var pipeline = model.glinerPipeline(ctx.allocator);
+            const input_tokens = pipeline.maxClassificationInputTokens(body.texts, body.labels) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            validateTextExecutorInvocation(executor_contract, body.texts.len, body.texts, label_and_template_bytes, input_tokens, body.labels.len, 0) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
             const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
@@ -11723,7 +12073,7 @@ pub const Node = struct {
         validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = body.images.len,
             .text_bytes_per_item = read_prompt_bytes,
-            .input_tokens_per_item = if (executor_contract.batch.max_input_tokens_per_item != null) read_prompt_bytes else 0,
+            .input_tokens_per_item = 0,
             .output_tokens_per_item = max_tokens orelse 0,
             .media_parts_per_item = 1,
             .has_image = true,
@@ -11787,7 +12137,7 @@ pub const Node = struct {
         validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = body.images.len,
             .text_bytes_per_item = read_prompt_bytes,
-            .input_tokens_per_item = if (executor_contract.batch.max_input_tokens_per_item != null) read_prompt_bytes else 0,
+            .input_tokens_per_item = 0,
             .output_tokens_per_item = max_tokens orelse 0,
             .encoded_media_bytes = batch_bytes,
             .decoded_pixels = @intCast(decoded_budget.used_pixels),
@@ -11821,6 +12171,21 @@ pub const Node = struct {
         };
         defer reader.deinit();
 
+        const exact_prompt_tokens = reader.inputTokenCount(.{
+            .prompt = normalizeReadPrompt(body.prompt),
+            .max_tokens = max_tokens,
+        }) catch |err| return inferenceFailureResponse(ctx, err);
+        validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = body.images.len,
+            .text_bytes_per_item = read_prompt_bytes,
+            .input_tokens_per_item = exact_prompt_tokens,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .encoded_media_bytes = batch_bytes,
+            .decoded_pixels = @intCast(decoded_budget.used_pixels),
+            .media_parts_per_item = 1,
+            .has_image = true,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+
         const read_batch = reader.readBatchReported(image_datas, .{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
@@ -11850,7 +12215,8 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = if (normalizeReadPrompt(body.prompt)) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
+        const prompt_tokens = std.math.mul(usize, exact_prompt_tokens, body.images.len) catch
+            std.math.maxInt(usize);
         return ctx.json(api.ReadResponse{
             .object = "list",
             .data = results_out,
@@ -12283,6 +12649,17 @@ pub const Node = struct {
 
             if (model.isGlinerModel()) {
                 var pipeline = model.glinerPipeline(ctx.allocator);
+                const input_tokens = pipeline.maxClassificationInputTokens(texts, schema.labels) catch |err|
+                    return inferenceFailureResponse(ctx, err);
+                validateTextExecutorInvocation(
+                    executor_contract,
+                    texts.len,
+                    texts,
+                    maxTextBytes(schema.labels),
+                    input_tokens,
+                    schema.labels.len,
+                    schema_json.len,
+                ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
                 const multi_label = schema.multi_label orelse false;
                 const results = pipeline.classifyBatch(texts, schema.labels, .{
                     .threshold = options.threshold orelse 0.0,
@@ -12311,6 +12688,17 @@ pub const Node = struct {
                 .multi_label = schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
+            const input_tokens = pipeline.maxInputTokensPerItem(texts, schema.labels) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            validateTextExecutorInvocation(
+                executor_contract,
+                texts.len,
+                texts,
+                maxTextBytes(schema.labels),
+                input_tokens,
+                schema.labels.len,
+                schema_json.len,
+            ) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             var schema_prompt_tokens: usize = 0;
             const results = pipeline.classifyBatchWithPromptTokens(texts, schema.labels, &schema_prompt_tokens) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -14510,7 +14898,8 @@ fn appendModelInfo(
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
-    const inferred_native_batch_read = native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
+    const effective_native_batch_read = native_batch_read and effectiveNativeReadBatchSize() > 1;
+    const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio") or
@@ -14541,6 +14930,9 @@ fn appendModelInfo(
         // them serially under the shared model lock. Do not leak a model-owned
         // aspiration as a resolved node capability.
         if (std.mem.eql(u8, cap, "native_batch_generate_multimodal")) continue;
+        // An explicit model capability cannot override this process's reader
+        // executor setting. A one-item microbatch is serial in practice.
+        if (std.mem.eql(u8, cap, "native_batch_read") and !effective_native_batch_read) continue;
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, cap);
         cap_index += 1;
@@ -14614,7 +15006,7 @@ fn appendModelInfo(
         allocator,
         task,
         capabilities,
-        native_batch_read,
+        effective_native_batch_read,
         request_media_max_bytes,
         request_media_max_decoded_pixels,
         accepts_text,
@@ -14768,8 +15160,8 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_image, "image/png" },
         .{ accepts_image, "image/jpeg" },
         .{ accepts_image, "image/webp" },
-        .{ accepts_audio, "audio/wav" },
-        .{ accepts_audio, "audio/mpeg" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/wav"), "audio/wav" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/mpeg"), "audio/mpeg" },
         .{ accepts_document, "application/pdf" },
     }) |mime| {
         if (!mime[0]) continue;
@@ -14896,7 +15288,7 @@ fn validateResolvedInferenceMimeCapability(
     else if (std.mem.startsWith(u8, value, "image/"))
         accepts_image and image_pipeline.supportsMimeEssence(value)
     else if (std.mem.startsWith(u8, value, "audio/"))
-        accepts_audio
+        accepts_audio and audio_mod.canDecodeMime(value)
     else if (std.mem.startsWith(u8, value, "application/"))
         accepts_document
     else
@@ -14953,6 +15345,12 @@ pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
         1;
 }
 
+/// Process-local native reader ceiling shared by catalog publication, linked
+/// capability resolution, and the concrete Florence executor.
+pub fn effectiveNativeReadBatchSize() usize {
+    return readers_mod.nativeFlorenceReadBatchSize();
+}
+
 pub fn resolveInferenceBatchCapabilities(
     resolved_task: []const u8,
     manifest_capabilities: []const []const u8,
@@ -14965,6 +15363,10 @@ pub fn resolveInferenceBatchCapabilities(
 ) !ResolvedInferenceBatchCapabilities {
     var max_items = resolvedTaskMaxItems(resolved_task);
     var preferred_items = @min(@as(usize, 8), max_items);
+    if (std.mem.eql(u8, resolved_task, "read") and native_batch_read) {
+        max_items = @min(max_items, effectiveNativeReadBatchSize());
+        preferred_items = @min(preferred_items, max_items);
+    }
     const accepts_media = accepts_image or accepts_audio or accepts_document;
     var max_encoded_media_bytes = if (!accepts_media)
         0
@@ -15012,7 +15414,7 @@ pub fn resolveInferenceBatchCapabilities(
     }
     preferred_items = @min(preferred_items, max_items);
     const native = std.mem.eql(u8, resolved_task, "embed") or
-        (std.mem.eql(u8, resolved_task, "read") and native_batch_read);
+        (std.mem.eql(u8, resolved_task, "read") and native_batch_read and max_items > 1);
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,
@@ -15132,16 +15534,25 @@ fn manifestAcceptsExecutorMime(
     mime_type: []const u8,
 ) bool {
     if (std.mem.eql(u8, mime_type, "text/plain") or
-        std.mem.eql(u8, mime_type, "application/json") or
-        std.mem.eql(u8, mime_type, "image/png") or
+        std.mem.eql(u8, mime_type, "application/json")) return true;
+    if ((std.mem.eql(u8, mime_type, "image/png") or
         std.mem.eql(u8, mime_type, "image/jpeg") or
-        std.mem.eql(u8, mime_type, "image/webp") or
-        std.mem.eql(u8, mime_type, "audio/wav") or
-        std.mem.eql(u8, mime_type, "audio/mpeg")) return true;
+        std.mem.eql(u8, mime_type, "image/webp")) and
+        image_pipeline.supportsMimeEssence(mime_type)) return true;
+    if ((std.mem.eql(u8, mime_type, "audio/wav") or
+        std.mem.eql(u8, mime_type, "audio/mpeg")) and
+        audio_mod.canDecodeMime(mime_type)) return true;
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
         if (std.mem.startsWith(u8, capability, prefix) and
-            std.mem.eql(u8, capability[prefix.len..], mime_type)) return true;
+            std.mem.eql(u8, capability[prefix.len..], mime_type))
+        {
+            if (std.mem.startsWith(u8, mime_type, "image/"))
+                return image_pipeline.supportsMimeEssence(mime_type);
+            if (std.mem.startsWith(u8, mime_type, "audio/"))
+                return audio_mod.canDecodeMime(mime_type);
+            return true;
+        }
     }
     return false;
 }
@@ -15224,6 +15635,26 @@ fn validateGenerateExecutorInvocation(contract: ResolvedInferenceExecutorContrac
 
 fn measureGenerateDecodedImages(manifest: *const manifest_mod.ModelManifest, images: []const []const u8) !u64 {
     return measureExecutorDecodedImages(manifest, images);
+}
+
+fn measureDirectGenerateDecodedPixels(
+    manifest: *const manifest_mod.ModelManifest,
+    messages: []const generation.Message,
+) !u64 {
+    var decoded_pixels: u64 = 0;
+    for (messages) |message| {
+        for (message.image_bytes orelse &.{}) |image_bytes| {
+            const physical_mime = image_pipeline.mimeEssenceForEncoded(image_bytes) orelse
+                return error.InvalidInferenceMedia;
+            if (!manifestAcceptsExecutorMime(manifest, physical_mime))
+                return error.UnsupportedInferenceMimeType;
+            const info = image_pipeline.inspectEncodedForInference(image_bytes, null) catch
+                return error.InvalidInferenceMedia;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+    }
+    return decoded_pixels;
 }
 
 const GenerateExecutorContractFailure = struct {
@@ -15313,6 +15744,24 @@ fn maxTextBytes(items: []const []const u8) usize {
     return result;
 }
 
+fn maxNerInputTokens(
+    pipeline: *@import("../pipelines/ner.zig").NerPipeline,
+    texts: []const []const u8,
+) !usize {
+    var result: usize = 0;
+    for (texts) |text| result = @max(result, try pipeline.inputTokenCount(text));
+    return result;
+}
+
+fn maxRebelInputTokens(
+    pipeline: *rebel_mod.RebelPipeline,
+    texts: []const []const u8,
+) !usize {
+    var result: usize = 0;
+    for (texts) |text| result = @max(result, try pipeline.inputTokenCount(text));
+    return result;
+}
+
 fn validateTextExecutorInvocation(
     contract: ResolvedInferenceExecutorContract,
     item_count: usize,
@@ -15324,20 +15773,10 @@ fn validateTextExecutorInvocation(
 ) !void {
     const text_bytes = std.math.add(usize, maxTextBytes(items), additional_text_bytes_per_item) catch
         return error.InferenceTextBytesExceeded;
-    // Structured extraction spans several concrete recognizer/reader
-    // implementations. Until each exposes its tokenizer uniformly, retain a
-    // conservative request-text proxy so the executor never silently drops a
-    // published input-token ceiling at this boundary.
-    const effective_input_tokens = if (input_tokens_per_item == 0 and
-        std.mem.eql(u8, contract.task, "extract") and
-        contract.batch.max_input_tokens_per_item != null)
-        text_bytes
-    else
-        input_tokens_per_item;
     return validateInferenceExecutorInvocation(contract, .{
         .item_count = item_count,
         .text_bytes_per_item = text_bytes,
-        .input_tokens_per_item = effective_input_tokens,
+        .input_tokens_per_item = input_tokens_per_item,
         .candidates_per_request = candidates_per_request,
         .schema_bytes = schema_bytes,
         .has_text = items.len > 0 or additional_text_bytes_per_item > 0,
@@ -15379,7 +15818,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         alloc,
         "read",
         "",
-        &.{},
+        &.{"native_batch_read"},
         &.{"image"},
         false,
         false,
@@ -15399,11 +15838,22 @@ test "standalone inference model catalog publishes resolved native reader batchi
     for (capabilities.array.items) |capability| {
         if (capability == .string and std.mem.eql(u8, capability.string, "native_batch_read")) found = true;
     }
-    try std.testing.expect(found);
+    const expected_native = effectiveNativeReadBatchSize() > 1;
+    try std.testing.expectEqual(expected_native, found);
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 4), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
-    try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
+    try std.testing.expectEqualStrings(
+        if (expected_native) "native" else "serial_compatibility",
+        resolved.object.get("batch").?.object.get("mode").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(i64, @intCast(if (expected_native)
+            @min(max_read_batch_images, effectiveNativeReadBatchSize())
+        else
+            max_read_batch_images)),
+        resolved.object.get("batch").?.object.get("max_items").?.integer,
+    );
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
     const task_limits = resolved.object.get("task_limits").?.object;
@@ -15458,6 +15908,25 @@ test "standalone inference catalog validates extensible MIME against executor co
             false,
         ),
     );
+
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        validateResolvedInferenceMimeCapability("audio/unknown", false, false, true, false),
+    );
+    if (audio_mod.canDecodeMime("audio/mpeg")) {
+        try validateResolvedInferenceMimeCapability("audio/mpeg", false, false, true, false);
+    } else {
+        try std.testing.expectError(
+            error.InvalidInferenceCapabilities,
+            validateResolvedInferenceMimeCapability("audio/mpeg", false, false, true, false),
+        );
+    }
+    var unsupported_audio_capabilities = [_][]const u8{"inference.mime_type=audio/unknown"};
+    const unsupported_audio_manifest = manifest_mod.ModelManifest{
+        .allocator = alloc,
+        .capabilities = &unsupported_audio_capabilities,
+    };
+    try std.testing.expect(!manifestAcceptsExecutorMime(&unsupported_audio_manifest, "audio/unknown"));
 }
 
 test "task-neutral executor contract enforces every resolved resource dimension" {

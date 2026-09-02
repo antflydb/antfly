@@ -1096,9 +1096,11 @@ type Proxy struct {
 	defaultPool         string
 	listenAddr          string
 	maxRequestBodyBytes int64
+	bodyAdmission       *byteAdmission
 }
 
 const defaultMaxProxyRequestBodyBytes int64 = 256 << 20
+const defaultMaxProxyRetainedBodyBytes int64 = 512 << 20
 
 // Config holds proxy configuration
 type Config struct {
@@ -1110,6 +1112,7 @@ type Config struct {
 	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
 	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
 	MaxRequestBodyBytes   int64       // Optional retained request-body ceiling; defaults to 256 MiB
+	MaxRetainedBodyBytes  int64       // Optional process-wide retained request-body ceiling; defaults to 512 MiB
 	Logger                *zap.Logger // Optional logger (defaults to production logger)
 }
 
@@ -1135,6 +1138,14 @@ func NewProxy(cfg Config) *Proxy {
 	if p.maxRequestBodyBytes <= 0 {
 		p.maxRequestBodyBytes = defaultMaxProxyRequestBodyBytes
 	}
+	maxRetainedBodyBytes := cfg.MaxRetainedBodyBytes
+	if maxRetainedBodyBytes <= 0 {
+		maxRetainedBodyBytes = defaultMaxProxyRetainedBodyBytes
+	}
+	if maxRetainedBodyBytes < p.maxRequestBodyBytes {
+		maxRetainedBodyBytes = p.maxRequestBodyBytes
+	}
+	p.bodyAdmission = newByteAdmission(maxRetainedBodyBytes)
 
 	// Initialize RouteWatcher if enabled
 	if cfg.EnableRouteWatching {
@@ -2154,6 +2165,19 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	// The request body must remain replayable for the full retry loop. Reserve
+	// its worst-case retained footprint before reading so concurrent PDF/media
+	// requests cannot multiply the per-request ceiling into unbounded process
+	// memory. Unknown-length bodies reserve the complete request allowance.
+	retainedBytes := p.maxRequestBodyBytes
+	if r.ContentLength >= 0 {
+		retainedBytes = r.ContentLength
+	}
+	if err := p.bodyAdmission.Acquire(r.Context(), retainedBytes); err != nil {
+		http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
+		return
+	}
+	defer p.bodyAdmission.Release(retainedBytes)
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.maxRequestBodyBytes+1))
 	if err != nil {
 		http.Error(w, "failed to read request", http.StatusBadRequest)

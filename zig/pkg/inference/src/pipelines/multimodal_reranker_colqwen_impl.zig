@@ -119,6 +119,58 @@ pub const Pipeline = struct {
         );
     }
 
+    /// Returns the largest exact non-padding text-model row used by a
+    /// query/document score, including expanded visual placeholder tokens.
+    pub fn maxInputTokensPerItem(
+        self: *const Pipeline,
+        query: []const u8,
+        document_text: []const u8,
+        images: []const []const u8,
+    ) !usize {
+        if (images.len == 0) return error.NoImages;
+        const full_query = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}",
+            .{ self.config.prompt.query_prefix, query },
+        );
+        defer self.allocator.free(full_query);
+        var encoded_query = try self.tok.encodeForGenerationConfigured(
+            self.allocator,
+            full_query,
+            self.max_length,
+            self.add_bos_token,
+        );
+        defer encoded_query.deinit();
+
+        var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
+        defer {
+            for (prepared_images.items) |*image| image.deinit();
+            prepared_images.deinit(self.allocator);
+        }
+        for (images) |image| {
+            try prepared_images.append(
+                self.allocator,
+                try qwen2vl.prepareImage(self.allocator, image, self.prep_cfg),
+            );
+        }
+        var prepared_document = try prepareDocumentPrompt(
+            self.allocator,
+            self.tok,
+            self.config.prompt,
+            self.gpt_cfg,
+            prepared_images.items,
+            document_text,
+            self.max_length,
+            self.add_bos_token,
+        );
+        defer prepared_document.deinit();
+
+        return @max(
+            activeTokenLength(encoded_query.attention_mask),
+            activeTokenLength(prepared_document.attention_mask),
+        );
+    }
+
     pub fn scoreDocumentText(self: *const Pipeline, query: EncodedSequence, document_text: []const u8, images: []const []const u8) !f32 {
         return scoreDocument(
             self.cb,
@@ -136,6 +188,17 @@ pub const Pipeline = struct {
         );
     }
 };
+
+fn activeTokenLength(mask: []const i32) usize {
+    var last_active: usize = 0;
+    var found = false;
+    for (mask, 0..) |value, index| {
+        if (value == 0) continue;
+        last_active = index;
+        found = true;
+    }
+    return if (found) last_active + 1 else 0;
+}
 
 pub fn encodeQuery(
     cb: *const ComputeBackend,

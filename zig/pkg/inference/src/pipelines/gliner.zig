@@ -132,9 +132,70 @@ pub const GlinerPipeline = struct {
         text: []const u8,
         labels: []const []const u8,
     ) !usize {
-        var prepared = try self.prepareGlinerInput(text, labels, self.config.token_e);
+        return self.encoderTokenCount(text, labels, self.config.token_e);
+    }
+
+    fn encoderTokenCount(
+        self: *GlinerPipeline,
+        text: []const u8,
+        labels: []const []const u8,
+        label_token: i32,
+    ) !usize {
+        var prepared = try self.prepareGlinerInput(text, labels, label_token);
         defer prepared.deinit(self.allocator);
         return prepared.input_ids.len;
+    }
+
+    /// Returns the largest exact classification row. Empty texts are handled
+    /// without inference by `classifySingle` and therefore contribute zero.
+    pub fn maxClassificationInputTokens(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+    ) !usize {
+        const label_token = if (self.config.token_c != 0) self.config.token_c else self.config.token_e;
+        var result: usize = 0;
+        for (texts) |text| {
+            if (text.len == 0) continue;
+            result = @max(result, try self.encoderTokenCount(text, labels, label_token));
+        }
+        return result;
+    }
+
+    /// Returns a conservative exact-token upper bound for every encoder row
+    /// this extraction can execute. Relation extraction conditionally runs a
+    /// second pass, so its composite-label row is included before inference.
+    pub fn maxExtractionInputTokens(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        entity_labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
+    ) !usize {
+        const use_entity_labels = entity_labels orelse self.config.default_labels;
+        if (use_entity_labels.len == 0) return error.NoLabelsProvided;
+
+        var result: usize = 0;
+        for (texts) |text| {
+            result = @max(result, try self.entityEncoderTokenCount(text, use_entity_labels));
+        }
+
+        const use_relation_labels = relation_labels orelse self.config.relation_labels;
+        if (use_relation_labels.len == 0) return result;
+        var composite_labels = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (composite_labels.items) |label| self.allocator.free(label);
+            composite_labels.deinit(self.allocator);
+        }
+        try appendRelationCandidateLabels(
+            self.allocator,
+            &composite_labels,
+            use_entity_labels,
+            use_relation_labels,
+        );
+        for (texts) |text| {
+            result = @max(result, try self.entityEncoderTokenCount(text, composite_labels.items));
+        }
+        return result;
     }
 
     pub fn extractRelationsBatch(

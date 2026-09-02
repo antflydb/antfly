@@ -466,6 +466,21 @@ pub const Pipeline = struct {
         };
     }
 
+    /// Encode through the same tokenizer/configuration used by generatePrompt
+    /// and return the non-padding model input length.
+    pub fn inputTokenCount(self: *Pipeline, prompt: []const u8) !usize {
+        var encoded = try generation.encodePromptForGeneration(
+            self.hf_tok.tokenizer(),
+            self.allocator,
+            prompt,
+            4096,
+            self.manifest.add_bos_token,
+            self.manifest.bos_token,
+        );
+        defer encoded.deinit();
+        return countPromptTokens(encoded.attention_mask);
+    }
+
     pub fn generateStreaming(
         self: *Pipeline,
         messages: []const generation.Message,
