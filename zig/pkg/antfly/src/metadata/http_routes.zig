@@ -82,6 +82,7 @@ pub const Routes = struct {
     pub const raft_mutation_outcome_committed_repair_required = "committed-repair-required-v1";
     pub const table_mutation_error_header = "X-Antfly-Table-Mutation-Error";
     pub const table_mutation_error_extension_owned = "extension-owned-v1";
+    pub const table_mutation_error_artifact_dependency = "artifact-dependency-v1";
     pub const table_restore_error_already_exists = "restore-already-exists-v1";
     pub const table_restore_error_transition_active = "restore-transition-active-v1";
     pub const extension_lifecycle_error_header = "X-Antfly-Extension-Lifecycle-Error";

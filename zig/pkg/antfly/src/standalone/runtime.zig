@@ -1224,6 +1224,8 @@ const LocalStandaloneMetadata = struct {
 
         const current = self.findTableByNameLocked(replacement.name) orelse return error.TableNotFound;
         if (!antfly.metadata.table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
         const previous = try antfly.metadata.table_manager.cloneTable(self.alloc, current.*);
         defer antfly.metadata.table_manager.freeTable(self.alloc, previous);
         const previous_epoch = self.epoch;
@@ -1253,6 +1255,8 @@ const LocalStandaloneMetadata = struct {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, table.indexes_json);
         const ranges = try antfly.public_api.backups.deriveRestoreRanges(
             alloc,
             table.table_id,
@@ -1342,6 +1346,7 @@ const LocalStandaloneMetadata = struct {
         updated.indexes_json = try antfly.public_api.indexes.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
@@ -1356,6 +1361,8 @@ const LocalStandaloneMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const indexes_json = (try antfly.public_api.indexes.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         var mutation = try self.beginCatalogMutationLocked();
@@ -1374,6 +1381,7 @@ const LocalStandaloneMetadata = struct {
         updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated.indexes_json);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
@@ -1389,6 +1397,7 @@ const LocalStandaloneMetadata = struct {
         const indexes_json = (try antfly.public_api.indexes.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         var mutation = try self.beginCatalogMutationLocked();

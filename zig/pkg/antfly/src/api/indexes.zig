@@ -31,6 +31,7 @@ const chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const credential_safety = @import("../common/credential_safety.zig");
 const table_index_config = @import("table_index_config.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -371,7 +372,7 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
-    try validateArtifactIndexReferences(parsed.value, enrichments);
+    try validateArtifactIndexReferences(alloc, parsed.value, enrichments);
 }
 
 /// Validate only properties that can be decided from one create-index request.
@@ -416,13 +417,14 @@ fn validateArtifactEnrichmentConfigDefinitions(
         try enrichment_config_validation.validatePublicConfig(alloc, cfg);
         for (configs[0..i]) |prior| {
             if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-            if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
+            if (!try artifactEnrichmentConfigsEqual(alloc, prior, cfg)) return error.ConflictingEnrichmentConfig;
         }
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
     }
 }
 
 fn validateArtifactIndexReferences(
+    alloc: std.mem.Allocator,
     root: std.json.Value,
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
@@ -441,7 +443,7 @@ fn validateArtifactIndexReferences(
         if (std.mem.eql(u8, index_type, "embeddings")) {
             const external = if (object.get("external")) |value| value == .bool and value.bool else false;
             if (!external) {
-                try validateEmbeddingArtifactReferences(object, configs);
+                try validateEmbeddingArtifactReferences(alloc, object, configs);
             }
         } else if (std.mem.eql(u8, index_type, "full_text")) {
             if (object.get("artifact_name")) |value| {
@@ -489,6 +491,7 @@ fn graphArtifactConfigExists(
 }
 
 fn validateEmbeddingArtifactReferences(
+    alloc: std.mem.Allocator,
     object: anytype,
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
@@ -536,7 +539,8 @@ fn validateEmbeddingArtifactReferences(
             saw_implicit = true;
             if (cfg.producer_json.len == 0) return error.InvalidEnrichmentConfig;
             if (implicit_producer) |expected| {
-                if (!std.mem.eql(u8, expected, cfg.producer_json)) return error.InvalidEnrichmentConfig;
+                if (!try enrichment_config_validation.producerJsonValuesEqual(alloc, expected, cfg.producer_json))
+                    return error.InvalidEnrichmentConfig;
             } else {
                 implicit_producer = cfg.producer_json;
             }
@@ -607,7 +611,7 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                 const type_value = object.get("type") orelse break :blk null;
                 if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) break :blk null;
                 if (object.get("embedder") == null) break :blk null;
-                break :blk managed_embedder.embeddingSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options) catch |err| switch (err) {
+                break :blk managed_embedder.embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidEnrichmentConfig,
                 };
@@ -660,7 +664,11 @@ fn findArtifactEnrichmentConfig(
     return null;
 }
 
-fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) bool {
+fn artifactEnrichmentConfigsEqual(
+    alloc: std.mem.Allocator,
+    a: db_mod.types.EnrichmentConfig,
+    b: db_mod.types.EnrichmentConfig,
+) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.field, b.field) and
@@ -673,7 +681,7 @@ fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.ty
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.meta.eql(a.execution, b.execution);
 }
 
@@ -1320,61 +1328,16 @@ fn appendCanonicalSingleGraphSource(
 }
 
 fn isSensitivePublicConfigField(field: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(field, "authorization") or
-        std.ascii.eqlIgnoreCase(field, "proxy-authorization") or
-        std.ascii.eqlIgnoreCase(field, "cookie") or
-        std.ascii.eqlIgnoreCase(field, "set-cookie") or
-        std.ascii.eqlIgnoreCase(field, "credentials_path") or
-        std.ascii.eqlIgnoreCase(field, "private_key") or
-        std.ascii.eqlIgnoreCase(field, "secret")) return true;
-    return normalizedCredentialNameIsSensitive(field);
-}
-
-fn normalizedCredentialNameIsSensitive(name: []const u8) bool {
-    var normalized_buffer: [128]u8 = undefined;
-    if (name.len > normalized_buffer.len) return true;
-    var normalized_len: usize = 0;
-    for (name) |byte| {
-        if (!std.ascii.isAlphanumeric(byte)) continue;
-        normalized_buffer[normalized_len] = std.ascii.toLower(byte);
-        normalized_len += 1;
-    }
-    const normalized = normalized_buffer[0..normalized_len];
-    if (normalized.len == 0) return true;
-    const exact_sensitive = [_][]const u8{
-        "auth", "code", "cookie", "credentials", "key", "password", "secret", "sig", "token", "xauth",
-    };
-    for (exact_sensitive) |candidate| {
-        if (std.mem.eql(u8, normalized, candidate)) return true;
-    }
-    const sensitive_components = [_][]const u8{
-        "apikey",
-        "accesskey",
-        "secretkey",
-        "privatekey",
-        "subscriptionkey",
-        "authtoken",
-        "authkey",
-    };
-    for (sensitive_components) |component| {
-        if (std.mem.indexOf(u8, normalized, component) != null) return true;
-    }
-    const sensitive_suffixes = [_][]const u8{
-        "password", "passwd", "secret", "token", "credential", "signature", "authorization",
-    };
-    for (sensitive_suffixes) |suffix| {
-        if (std.mem.endsWith(u8, normalized, suffix)) return true;
-    }
-    return false;
+    return credential_safety.fieldNameIsSensitive(field);
 }
 
 fn isSensitivePublicConfigValue(field: []const u8, value: std.json.Value) bool {
     if (value != .string) return false;
     // Secret-store references are implementation details and can disclose
     // credential inventory even when they do not contain the secret value.
-    if (std.mem.indexOf(u8, value.string, "${secret:") != null) return true;
+    if (credential_safety.containsSecretReference(value.string)) return true;
     if (!isPublicProviderUrlField(field)) return false;
-    return urlContainsCredentials(value.string);
+    return credential_safety.urlContainsCredentials(value.string);
 }
 
 fn isPublicProviderUrlField(field: []const u8) bool {
@@ -1383,69 +1346,6 @@ fn isPublicProviderUrlField(field: []const u8) bool {
         std.ascii.eqlIgnoreCase(field, "base_url") or
         std.ascii.eqlIgnoreCase(field, "endpoint") or
         std.ascii.eqlIgnoreCase(field, "endpoint_url");
-}
-
-fn urlContainsCredentials(url: []const u8) bool {
-    const authority_start = if (std.mem.indexOf(u8, url, "://")) |scheme_end|
-        scheme_end + 3
-    else if (std.mem.startsWith(u8, url, "//"))
-        @as(usize, 2)
-    else
-        null;
-    if (authority_start) |start| {
-        var authority_end = url.len;
-        for (url[start..], start..) |byte, index| {
-            if (byte == '/' or byte == '?' or byte == '#') {
-                authority_end = index;
-                break;
-            }
-        }
-        if (std.mem.indexOfScalar(u8, url[start..authority_end], '@') != null) return true;
-    }
-
-    const fragment_start = std.mem.indexOfScalar(u8, url, '#');
-    if (std.mem.indexOfScalar(u8, url, '?')) |query_marker| {
-        if (fragment_start == null or query_marker < fragment_start.?) {
-            const query_end = fragment_start orelse url.len;
-            if (urlParameterListContainsCredentials(url[query_marker + 1 .. query_end])) return true;
-        }
-    }
-    if (fragment_start) |marker| {
-        return urlParameterListContainsCredentials(url[marker + 1 ..]);
-    }
-    return false;
-}
-
-fn urlParameterListContainsCredentials(encoded_parameters: []const u8) bool {
-    var parameters = std.mem.tokenizeAny(u8, encoded_parameters, "&;");
-    while (parameters.next()) |parameter| {
-        const key = parameter[0 .. std.mem.indexOfScalar(u8, parameter, '=') orelse parameter.len];
-        if (urlQueryKeyIsSensitive(key)) return true;
-    }
-    return false;
-}
-
-fn urlQueryKeyIsSensitive(encoded: []const u8) bool {
-    var decoded_buffer: [128]u8 = undefined;
-    if (encoded.len > decoded_buffer.len) return true;
-    var decoded_len: usize = 0;
-    var index: usize = 0;
-    while (index < encoded.len) {
-        if (encoded[index] == '%') {
-            if (index + 2 >= encoded.len) return true;
-            const high = std.fmt.charToDigit(encoded[index + 1], 16) catch return true;
-            const low = std.fmt.charToDigit(encoded[index + 2], 16) catch return true;
-            decoded_buffer[decoded_len] = @intCast((high << 4) | low);
-            decoded_len += 1;
-            index += 3;
-            continue;
-        }
-        decoded_buffer[decoded_len] = if (encoded[index] == '+') ' ' else encoded[index];
-        decoded_len += 1;
-        index += 1;
-    }
-    const key = std.mem.trim(u8, decoded_buffer[0..decoded_len], &std.ascii.whitespace);
-    return isSensitivePublicConfigField(key);
 }
 
 fn appendPublicConfigValue(
@@ -6490,6 +6390,16 @@ test "merged index metadata validates artifact consumer references" {
     try std.testing.expectError(
         error.InvalidEnrichmentConfig,
         validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, incompatible_vectors),
+    );
+
+    try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"title_dense_v1","kind":"embedding","field":"title","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"embed-v1\"}"},
+        \\    {"name":"body_dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":"{ \"model\" : \"embed-v1\", \"provider\" : \"antfly\" }"}
+        \\  ],
+        \\  "document_vectors":{"type":"embeddings","dimension":3,"sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}]}
+        \\}
     );
 
     const dense_sparse_mismatch = try addIndexToTableIndexesJson(

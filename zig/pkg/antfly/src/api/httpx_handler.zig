@@ -57,6 +57,7 @@ const public_table_http = @import("public_table_http.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
+const table_index_config = @import("table_index_config.zig");
 const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
 const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
@@ -4414,6 +4415,18 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
+            error.MissingEmbeddingArtifactEnrichment => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index source has no matching embedding enrichment");
+            },
+            error.EmbeddingArtifactDimensionRequired => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment must declare positive expected_dims");
+            },
+            error.ConflictingEmbeddingArtifactDimensions => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index sources declare different dimensions");
+            },
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
@@ -4426,6 +4439,49 @@ pub const AntflyApiHandler = struct {
         tables_api.validatePublicAlgebraicIndexesJson(alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
+        };
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .io = self.api_server.inferenceIo(),
+                .secret_store = self.api_server.cfg.secret_store,
+                .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.EmbeddingProbeUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("table index validation probe unavailable");
+            },
+            error.InvalidCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported table index configuration");
+            },
+            error.MissingEmbeddingArtifactEnrichment => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index source has no matching embedding enrichment");
+            },
+            error.MissingEmbeddingArtifactProducer => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment has no producer configuration");
+            },
+            error.InvalidEmbeddingArtifactProducer => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment producer is not runnable");
+            },
+            error.EmbeddingArtifactDimensionRequired => {
+                _ = ctx.status(400);
+                return ctx.text("embedding enrichment must declare positive expected_dims");
+            },
+            error.ConflictingEmbeddingArtifactDimensions => {
+                _ = ctx.status(400);
+                return ctx.text("embedding index sources declare different dimensions");
+            },
+            else => return err,
         };
         const destinations_allowed = (replicationDestinationsAllowed(
             alloc,

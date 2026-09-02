@@ -39,6 +39,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
         error.InvalidCreateTableRequest,
         error.CreateTableShardCountOutOfRange,
         error.InvalidCreateTableSchemaRequest,
+        error.TableEnrichmentsRequireArtifactEndpoint,
         error.SchemaVersionManagedByBackend,
         error.InvalidSchemaUpdateRequest,
         error.SyntaxError,
@@ -74,6 +75,9 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         .object => |object| object,
         else => return error.InvalidCreateTableRequest,
     };
+    if (raw_root.get("enrichments") != null or raw_root.get("artifact_enrichments") != null) {
+        return error.TableEnrichmentsRequireArtifactEndpoint;
+    }
     if (raw_root.get("indexes")) |indexes_value| {
         if (indexes_value != .null) try validateCreateTableIndexesValue(indexes_value);
     }
@@ -275,6 +279,9 @@ pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u
     if (err == error.SchemaVersionManagedByBackend) {
         return "schema.version is managed by Antfly; omit it";
     }
+    if (err == error.TableEnrichmentsRequireArtifactEndpoint) {
+        return "table-level enrichments must be registered with PUT /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment";
+    }
     if (std.mem.indexOf(u8, body, "\"doc_values\"") != null) {
         return "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings";
     }
@@ -394,6 +401,10 @@ fn normalizeIndexConfigJson(
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
             if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+                try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
@@ -401,11 +412,44 @@ fn normalizeIndexConfigJson(
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
             if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+                try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendNormalizedInlineEnrichmentsField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    first_root_field: *bool,
+) !void {
+    if (value == .null) {
+        try appendField(alloc, out, "enrichments", value, first_root_field);
+        return;
+    }
+    if (value != .array) return error.InvalidCreateIndexRequest;
+    if (!first_root_field.*) try out.append(alloc, ',');
+    first_root_field.* = false;
+    try out.appendSlice(alloc, "\"enrichments\":[");
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidCreateIndexRequest;
+        const name = item.object.get("name") orelse return error.InvalidCreateIndexRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidCreateIndexRequest;
+        const normalized = normalizeArtifactEnrichmentConfigJson(alloc, item.object, name.string) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCreateIndexRequest,
+        };
+        defer alloc.free(normalized);
+        if (i > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, normalized);
+    }
+    try out.append(alloc, ']');
 }
 
 fn indexObjectGet(object: anytype, key: []const u8) ?std.json.Value {
@@ -669,10 +713,26 @@ fn normalizeArtifactEnrichmentConfigJson(
 
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
-        while (it.next()) |entry| try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
+                const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
+                defer alloc.free(producer_json);
+                try appendField(alloc, &out, entry.key_ptr.*, .{ .string = producer_json }, &first);
+            } else {
+                try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
+            }
+        }
     } else {
         var it = object.iterator();
-        while (it.next()) |entry| try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
+                const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
+                defer alloc.free(producer_json);
+                try appendField(alloc, &out, entry.key_ptr.*, .{ .string = producer_json }, &first);
+            } else {
+                try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
+            }
+        }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -697,7 +757,7 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
     if (value == .null) return;
     if (std.mem.eql(u8, field, "producer_json")) {
-        if (value != .string) return error.InvalidArtifactEnrichmentRequest;
+        if (value != .string and value != .object) return error.InvalidArtifactEnrichmentRequest;
         return;
     }
     if (!public_index_contract.createdFieldValueMatches(.enrichment, field, value))
@@ -1519,6 +1579,17 @@ test "table contract preserves artifact-backed public full text indexes" {
 
 test "table contract rejects invalid inline artifact enrichments before admission" {
     try std.testing.expectError(
+        error.TableEnrichmentsRequireArtifactEndpoint,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512}]}",
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "table-level enrichments must be registered with PUT /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment",
+        createTableRequestErrorMessage(error.TableEnrichmentsRequireArtifactEndpoint, "{}"),
+    );
+    try std.testing.expectError(
         error.InvalidCreateTableRequest,
         parseCreateTableRequest(
             std.testing.allocator,
@@ -1594,6 +1665,34 @@ test "table contract normalizes public artifact enrichment request" {
     try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"name\":\"document_units_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"kind\":\"asset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"full_text_index\":true") != null);
+
+    const embedding_config_json = try parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "document_dense_v1",
+        "{\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384,\"producer_json\":{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\",\"url\":\"http://127.0.0.1:8080/ai/v1\"}}",
+    );
+    defer std.testing.allocator.free(embedding_config_json);
+    var parsed_embedding = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, embedding_config_json, .{});
+    defer parsed_embedding.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\",\"url\":\"http://127.0.0.1:8080/ai/v1\"}",
+        parsed_embedding.value.object.get("producer_json").?.string,
+    );
+
+    const inline_index_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":384,\"embedding_name\":\"document_dense_v1\",\"enrichments\":[{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384,\"producer_json\":{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\"}}]}",
+    );
+    defer std.testing.allocator.free(inline_index_json);
+    var parsed_inline = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, inline_index_json, .{});
+    defer parsed_inline.deinit();
+    const inline_producer = parsed_inline.value.object.get("enrichments").?.array.items[0].object.get("producer_json").?;
+    try std.testing.expect(inline_producer == .string);
+    try std.testing.expectEqualStrings(
+        "{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\"}",
+        inline_producer.string,
+    );
 }
 
 test "table contract rejects reserved full text index names on create table" {
