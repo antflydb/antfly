@@ -299,6 +299,7 @@ fn remoteMediaHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     };
     const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credential_name) catch |err| {
+        std.log.warn("remoteMedia fetch failed error={s}", .{@errorName(err)});
         if (latchFatalRenderError(render_ctx, err)) return err;
         const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
@@ -570,8 +571,9 @@ fn remoteFetchDownloadContext(
     security: *const scraping.ContentSecurityConfig,
 ) !?scraping.DownloadContext {
     if (render_ctx.io == null and render_ctx.deadline_ns == null and render_ctx.cancellation == null) return null;
+    const io = render_ctx.io orelse return error.MissingRemoteFetchIo;
     return .{
-        .io = render_ctx.io orelse std.Io.Threaded.global_single_threaded.io(),
+        .io = io,
         // Leave this null when there is no request deadline. HTTP/S3 still
         // apply their configured ceiling; file:// can safely use caller-owned
         // cancellation without pretending std.Io files support a deadline.
@@ -587,17 +589,20 @@ fn remoteFetchDownloadContext(
     };
 }
 
-test "template remote preserves a cancellation-only download context" {
+test "template remote requires explicit IO for cancellable downloads" {
     var canceled = std.atomic.Value(bool).init(false);
     const token = scraping.CancellationToken.fromAtomic(&canceled);
     const security: scraping.ContentSecurityConfig = .{};
-    const render_ctx: RenderContext = .{
+    var render_ctx: RenderContext = .{
         .alloc = std.testing.allocator,
         .pdf_backend = pdf_mod.Backend.system(),
         .cancellation = token,
         .remote_bytes_remaining = default_remote_fetch_max_download_size_bytes,
     };
 
+    try std.testing.expectError(error.MissingRemoteFetchIo, remoteFetchDownloadContext(&render_ctx, &security));
+
+    render_ctx.io = std.Io.Threaded.global_single_threaded.io();
     const context = (try remoteFetchDownloadContext(&render_ctx, &security)) orelse
         return error.TestUnexpectedResult;
     try context.cancellation.?.check();
@@ -703,14 +708,34 @@ pub fn downloadRemoteContentOutcomeAllocWithConfig(
     url: []const u8,
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
-    return try downloadRemoteContentOutcomeAllocWithExecutor(
-        alloc,
-        remote_content,
-        secret_store,
-        url,
-        credential_name,
-        scraping.downloadContentOutcomeAllocWithHeaders,
-    );
+    return try downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, .{
+        .remote_content = remote_content,
+        .secret_store = secret_store,
+    }, url, credential_name);
+}
+
+/// Fetch one document-extraction source under the same execution, security,
+/// credential, cancellation, deadline, and byte-budget contract as template
+/// remote helpers.
+pub fn downloadRemoteContentOutcomeAllocWithRenderConfig(
+    alloc: Allocator,
+    config: RenderConfig,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    var render_ctx = RenderContext{
+        .alloc = alloc,
+        .pdf_backend = config.pdf_backend,
+        .remote_content = config.remote_content,
+        .secret_store = config.secret_store,
+        .io = config.io,
+        .deadline_ns = config.deadline_ns,
+        .cancellation = config.cancellation,
+        .remote_bytes_remaining = remoteByteBudget(config.remote_content),
+        .max_media_parts = config.max_media_parts,
+    };
+    try ensureRenderActive(&render_ctx);
+    return try downloadRemoteContentOutcomeAlloc(&render_ctx, url, credential_name);
 }
 
 const RemoteContentDownloadExecutor = *const fn (

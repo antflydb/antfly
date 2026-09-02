@@ -9717,30 +9717,34 @@ pub const DataServer = struct {
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
-            .enqueue, .enqueue_runnable => {
-                if (action == .enqueue_runnable) {
-                    _ = self.provisioned_index_repair_runnable_wake_events.fetchAdd(1, .monotonic);
-                } else {
-                    _ = self.provisioned_index_repair_debt_events.fetchAdd(1, .monotonic);
-                }
-                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+            .observe_debt => {
+                _ = self.provisioned_index_repair_debt_events.fetchAdd(1, .monotonic);
+                self.observeProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.provisioned_index_repair_dirty.store(true, .release);
-                    std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                    std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
                     return;
                 };
-                if (action == .enqueue_runnable) {
-                    self.maybeRequestProvisionedIndexRepair() catch |err| {
-                        // The exact durable queue remains dirty, and the
-                        // control loop is a lost-wakeup fallback. Admission
-                        // pressure must not turn a successful catalog mutation
-                        // into a failed API request.
-                        std.log.warn("provisioned index repair immediate admission deferred group={} err={s}", .{
-                            group_id,
-                            @errorName(err),
-                        });
-                    };
-                }
+            },
+            .signal_runnable => {
+                _ = self.provisioned_index_repair_runnable_wake_events.fetchAdd(1, .monotonic);
+                const request_admission = self.coalesceProvisionedIndexRepairRunnableForTable(table_name, group_id) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair runnable signal failed group={} err={s}", .{ group_id, @errorName(err) });
+                    return;
+                };
+                if (!request_admission) return;
+                self.maybeRequestProvisionedIndexRepair() catch |err| {
+                    // The exact durable queue remains dirty, and the control
+                    // loop is a lost-wakeup fallback. Admission pressure must
+                    // not turn a successful catalog mutation into a failed API
+                    // request.
+                    std.log.warn("provisioned index repair immediate admission deferred group={} err={s}", .{
+                        group_id,
+                        @errorName(err),
+                    });
+                };
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
@@ -13673,7 +13677,7 @@ pub const DataServer = struct {
         return generation;
     }
 
-    fn enqueueProvisionedIndexRepairWithRetryForTable(
+    fn upsertProvisionedIndexRepairQueueEntry(
         self: *DataServer,
         table_name: ?[]const u8,
         group_id: u64,
@@ -13902,23 +13906,36 @@ pub const DataServer = struct {
         self.provisioned_index_repair_fallback_not_before_ms.store(0, .release);
     }
 
-    fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0, .immediate, .unguarded);
+    fn signalProvisionedIndexRepairRunnable(self: *DataServer, group_id: u64) !void {
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(null, group_id, 0, .immediate, .unguarded);
     }
 
-    fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate, .unguarded);
+    fn signalProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(table_name, group_id, 0, .immediate, .unguarded);
+    }
+
+    /// A progress callback can be emitted by the same resident writer while a
+    /// repair quantum is already inspecting that group. Replacing the selected
+    /// generation in that window prevents the quantum's cooperative deferral
+    /// from applying and turns ordinary build progress into an immediate
+    /// repair loop. The active owner already observes the durable scheduler
+    /// directory; coalesce concurrent edges as level observations and retain a
+    /// bounded audit fallback. Outside an active quantum, the edge remains a
+    /// causal wake and clears stale node-local backoff immediately.
+    fn coalesceProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !bool {
+        if (self.provisioned_index_repair_active.load(.acquire)) {
+            try self.observeProvisionedIndexRepairForTable(table_name, group_id);
+            return false;
+        }
+        try self.signalProvisionedIndexRepairRunnableForTable(table_name, group_id);
+        return true;
     }
 
     /// Record a periodic level observation of durable repair debt. Unlike a
     /// causal enqueue, observing already-known debt cannot wake the owner or
     /// replace its exact retry/backoff decision.
     fn observeProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .observed, .unguarded);
-    }
-
-    fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
-        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained, .unguarded);
+        _ = try self.upsertProvisionedIndexRepairQueueEntry(table_name, group_id, 0, .observed, .unguarded);
     }
 
     fn removeProvisionedIndexRepairLocked(self: *DataServer, group_id: u64, now_ms: u64) void {
@@ -14329,7 +14346,7 @@ pub const DataServer = struct {
                     // manufacture a new immediate wake once debt is known.
                     self.observeProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
                         _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned index repair enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                        std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
                         self.provisioned_index_repair_dirty.store(true, .release);
                     };
                     self.cacheQueuedProvisionedIndexRepairRoute(
@@ -14782,7 +14799,7 @@ pub const DataServer = struct {
                     result.made_progress,
                     platform_clock.Clock.real().nowRealtimeMs(),
                 );
-                _ = self.enqueueProvisionedIndexRepairWithRetryForTable(
+                _ = self.upsertProvisionedIndexRepairQueueEntry(
                     table_name,
                     group_id,
                     queue_schedule.retry_at_realtime_ms,
@@ -14805,7 +14822,7 @@ pub const DataServer = struct {
                 };
             } else {
                 // The result owns only the wake that selected this attempt.
-                // A callback may enqueue newer repair debt while DB/status
+                // A callback may signal newer repair work while DB/status
                 // observation is finishing; never let the older completion
                 // remove that causally later edge.
                 if (!self.removeProvisionedIndexRepairIfUnchanged(group_id, candidate.queue_wake_generation)) {
@@ -28107,19 +28124,32 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
 
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
     try std.testing.expect(server.provisioned_index_repair_dirty.load(.acquire));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_started.load(.monotonic));
+
+    const observed_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const observed_generation = observed_entry.wake_generation;
+    observed_entry.next_retry_at_ms = std.math.maxInt(u64);
+    observed_entry.transient_failure_count = 3;
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
+    try std.testing.expectEqual(observed_generation, observed_entry.wake_generation);
+    try std.testing.expectEqual(std.math.maxInt(u64), observed_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 3), observed_entry.transient_failure_count);
+    try std.testing.expect(!observed_entry.immediate_wake_pending);
 
     // Broad startup discovery must not starve exact, post-reservation debt.
     // Same-group exclusion is enforced by the write source and returns a
     // retained busy result if the discovery worker actually owns this shard.
     server.provisioned_startup_catch_up_active.store(true, .release);
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue_runnable);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .signal_runnable);
+    try std.testing.expect(observed_entry.wake_generation != observed_generation);
+    try std.testing.expectEqual(@as(u64, 0), observed_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), observed_entry.transient_failure_count);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_started.load(.monotonic));
     try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
     server.provisioned_startup_catch_up_active.store(false, .release);
@@ -28129,9 +28159,9 @@ test "data runtime repair debt hook targets the affected group queue" {
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expectEqual(@as(u32, 2), server.provisioned_index_repair_cancel_groups.get(7001).?);
     // Queue state and control-plane lease ownership are independent. Neither
-    // an aggregate audit enqueue nor durable-debt removal can consume an
+    // a level-triggered debt observation nor durable-debt removal can consume an
     // activation owner's cancellation lease.
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
@@ -28140,7 +28170,7 @@ test "data runtime repair debt hook targets the affected group queue" {
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
 
-    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .observe_debt);
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_queue_depth.load(.monotonic));
@@ -28180,7 +28210,8 @@ test "data runtime repair failures preserve durable backoff and increase retry d
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
+    defer server.removeProvisionedIndexRepair(7001);
     const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const selected_generation = entry.wake_generation;
     try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
@@ -28204,10 +28235,47 @@ test "data runtime repair failures preserve durable backoff and increase retry d
 
     // An explicit/durable wake replaces node-local failure state rather than
     // leaving a recovered group parked behind stale scheduler backoff.
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
     server.removeProvisionedIndexRepair(7001);
+}
+
+test "data runtime coalesces repair progress emitted during an active quantum" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
+    defer server.removeProvisionedIndexRepair(7001);
+    const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const selected_generation = entry.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    entry.next_retry_at_ms = 42;
+    entry.transient_failure_count = 3;
+
+    server.provisioned_index_repair_active.store(true, .release);
+    try std.testing.expect(!try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    try std.testing.expectEqual(selected_generation, entry.wake_generation);
+    try std.testing.expectEqual(@as(u64, 42), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 3), entry.transient_failure_count);
+    try std.testing.expect(!entry.immediate_wake_pending);
+
+    server.provisioned_index_repair_active.store(false, .release);
+    try std.testing.expect(try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    try std.testing.expect(entry.wake_generation != selected_generation);
+    try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
+    try std.testing.expect(entry.immediate_wake_pending);
 }
 
 test "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic" {
@@ -28224,7 +28292,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     failing.fail_index = failing.alloc_index;
@@ -28232,7 +28300,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
 
     // Retaining an existing exact wake must not allocate, even when its durable
     // retry deadline changes after a cooperative repair slice.
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         1234,
@@ -28241,7 +28309,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -28258,7 +28326,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // fallback work selected without a queue entry cannot remove it either.
     // Retry and failure outcomes are fenced by the same ownership token, so
     // they cannot restore stale backoff over the immediate wake either.
-    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const newer_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const newer_generation = newer_entry.wake_generation;
     try std.testing.expect(newer_generation != selected_generation);
@@ -28270,7 +28338,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), newer_entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), newer_entry.transient_failure_count);
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         std.math.maxInt(u64),
@@ -28279,7 +28347,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     const stale_deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
     try std.testing.expect(!stale_deferral.applied);
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         std.math.maxInt(u64),
@@ -28299,7 +28367,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // mistaken for retained exact debt.
     try std.testing.expectError(
         error.OutOfMemory,
-        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0, .retained, .{ .selected = null }),
+        server.upsertProvisionedIndexRepairQueueEntry("docs", 7002, 0, .retained, .{ .selected = null }),
     );
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
@@ -28310,7 +28378,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // Destructive lifecycle removal is terminal for every scheduler outcome
     // selected before it. Neither a pending result nor its failure path may
     // recreate the removed route after the group-operation barrier is released.
-    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(!try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -28325,7 +28393,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // Fallback discovery selected no queue owner and independently proved
     // durable debt, so it remains authorized to materialize an absent route.
     server.alloc = alloc;
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    try std.testing.expect(try server.upsertProvisionedIndexRepairQueueEntry(
         "docs",
         7001,
         0,
@@ -28351,7 +28419,7 @@ test "data runtime repair queue links and removes debt in constant time" {
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
-    for (1..42) |group_id| try server.enqueueProvisionedIndexRepair(@intCast(group_id));
+    for (1..42) |group_id| try server.signalProvisionedIndexRepairRunnable(@intCast(group_id));
     try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);
     try std.testing.expectEqual(@as(?u64, 41), server.provisioned_index_repair_queue_tail);
     try std.testing.expectEqual(@as(u64, 41), server.provisioned_index_repair_queue_depth.load(.monotonic));

@@ -314,7 +314,7 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
         if (producer_cfg.type != .document_extraction) continue;
 
         if (entry.source_template.len > 0) {
-            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch |err| switch (err) {
+            const rendered = renderSourceTemplateText(db.alloc, db, entry.source_template, doc_value) catch |err| switch (err) {
                 error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => continue,
             };
@@ -984,6 +984,9 @@ const IndexRepairScheduleRecord = struct {
     repair_id: u128,
     revision: u64,
     index_name: []u8,
+    work_class: index_repair_state.WorkClass,
+    config_hash: u64,
+    root_generation: u64,
     class: IndexRepairScheduleClass,
     phase_terminal: bool,
     /// Durable retry deadline from the checkpoint. Progress waits are a
@@ -1158,19 +1161,34 @@ const IndexRepairSchedulerDirectory = struct {
         return true;
     }
 
+    const ProgressWake = struct {
+        repair_id: u128,
+        revision: u64,
+        work_class: index_repair_state.WorkClass,
+        config_hash: u64,
+        root_generation: u64,
+    };
+
     /// Wake only the waiting repair for the exact index whose durable applied
-    /// watermark advanced. Returns true when the outer group owner must be
-    /// nudged; repeated notifications at the same sequence are coalesced.
-    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) bool {
-        const record_index = self.by_name.get(index_name) orelse return false;
+    /// watermark advanced. Return the exact lifecycle identity so the outer
+    /// owner cannot mistake normal initial-build progress for corruption debt;
+    /// repeated notifications at the same sequence are coalesced.
+    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) ?ProgressWake {
+        const record_index = self.by_name.get(index_name) orelse return null;
         const record = &self.records.items[record_index];
-        const wake_at = record.progress_wait_until_sequence orelse return false;
-        if (applied_sequence < wake_at) return false;
+        const wake_at = record.progress_wait_until_sequence orelse return null;
+        if (applied_sequence < wake_at) return null;
         record.progress_wait_until_sequence = null;
         self.progress_waiters -= 1;
         record.next_retry_at_ms = record.durable_next_retry_at_ms;
         self.rescheduleRunnable(record.repair_id);
-        return true;
+        return .{
+            .repair_id = record.repair_id,
+            .revision = record.revision,
+            .work_class = record.work_class,
+            .config_hash = record.config_hash,
+            .root_generation = record.root_generation,
+        };
     }
 
     fn earliestRetryDeadline(self: *const @This()) u64 {
@@ -1228,6 +1246,9 @@ const IndexRepairSchedulerDirectory = struct {
             if (persisted_revision < record.revision) return;
             if (persisted_revision == record.revision) {
                 if (record.class != class or
+                    record.work_class != intent.work_class or
+                    record.config_hash != intent.config_hash or
+                    record.root_generation != intent.root_generation or
                     record.phase_terminal != (intent.phase == .terminal) or
                     record.durable_next_retry_at_ms != intent.next_retry_at_ms)
                 {
@@ -1249,6 +1270,9 @@ const IndexRepairSchedulerDirectory = struct {
             }
             record.next_retry_at_ms = intent.next_retry_at_ms;
             record.durable_next_retry_at_ms = intent.next_retry_at_ms;
+            record.work_class = intent.work_class;
+            record.config_hash = intent.config_hash;
+            record.root_generation = intent.root_generation;
             if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
             record.progress_wait_until_sequence = null;
             record.phase_terminal = intent.phase == .terminal;
@@ -1273,6 +1297,9 @@ const IndexRepairSchedulerDirectory = struct {
             .repair_id = intent.repair_id,
             .revision = persisted_revision,
             .index_name = owned_name,
+            .work_class = intent.work_class,
+            .config_hash = intent.config_hash,
+            .root_generation = intent.root_generation,
             .class = class,
             .phase_terminal = intent.phase == .terminal,
             .durable_next_retry_at_ms = intent.next_retry_at_ms,
@@ -4849,8 +4876,21 @@ pub const DB = struct {
             else
                 .status,
         );
-        if (wakeIndexRepairForProgressContext(ctx, index_name, applied_sequence)) {
-            notifyQueryVisibilityHook(ctx, .index_repair_progress);
+        if (wakeIndexRepairForProgressContext(ctx, index_name, applied_sequence)) |wake| {
+            notifyQueryVisibilityEvent(ctx, .{
+                .change = .index_repair_progress,
+                .repair = .{
+                    .index_name = index_name,
+                    .work_class = switch (wake.work_class) {
+                        .repair => .repair,
+                        .initial_build => .initial_build,
+                    },
+                    .repair_id = wake.repair_id,
+                    .revision = wake.revision,
+                    .config_hash = wake.config_hash,
+                    .root_generation = wake.root_generation,
+                },
+            });
         }
     }
 
@@ -4951,6 +4991,17 @@ pub const DB = struct {
     fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
 
+        // Producer ownership moves through reconfiguration, but execution and
+        // security capabilities belong to the resident DB. Hydrate every
+        // replacement at this single construction boundary so live index DDL
+        // cannot silently fall back to default remote-content policy or an
+        // unrelated executor when it supplies only a new producer set.
+        var runtime_cfg = enrichment_cfg;
+        if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
+        if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
+        if (runtime_cfg.resource_manager == null) runtime_cfg.resource_manager = self.core.index_manager.resource_manager;
+        if (runtime_cfg.io == null) runtime_cfg.io = self.backend_runtime.inferenceIo();
+
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
         const resources = self.core.batchExecutionResources();
@@ -5001,7 +5052,7 @@ pub const DB = struct {
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
-            enrichment_cfg,
+            runtime_cfg,
         );
         errdefer runtime.deinit();
         // The repair ledger and its sequence marker are committed before the
@@ -11999,13 +12050,13 @@ pub const DB = struct {
         ctx: *AsyncContext,
         index_name: []const u8,
         applied_sequence: u64,
-    ) bool {
-        if (!ctx.index_repair_progress_wait_pending.load(.acquire)) return false;
+    ) ?IndexRepairSchedulerDirectory.ProgressWake {
+        if (!ctx.index_repair_progress_wait_pending.load(.acquire)) return null;
         lockAtomic(&ctx.index_repair_scheduler_mutex);
         defer ctx.index_repair_scheduler_mutex.unlock();
         if (!ctx.index_repair_scheduler.initialized) {
             ctx.index_repair_progress_wait_pending.store(false, .release);
-            return false;
+            return null;
         }
         const woke = ctx.index_repair_scheduler.wakeForIndexProgress(index_name, applied_sequence);
         if (ctx.index_repair_scheduler.progress_waiters == 0) {
@@ -33370,16 +33421,20 @@ fn generatedEmbedBatchBytes() usize {
 }
 
 fn remoteRenderConfig(
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
+    maybe_db: ?*const DB,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
-    if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
-        config.secret_store = secret_store;
-    }
-    if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
-        config.remote_content = remote_content;
+    if (maybe_db) |db| {
+        if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
+            config.secret_store = db.secret_store;
+        }
+        if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
+            config.remote_content = db.remote_content;
+        }
+        if (comptime @hasField(template_remote.RenderConfig, "io")) {
+            config.io = db.backend_runtime.inferenceIo();
+        }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
@@ -33389,8 +33444,7 @@ fn remoteRenderConfig(
 
 fn renderSourceTemplateText(
     alloc: Allocator,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
+    db: ?*const DB,
     template_source: []const u8,
     doc_value: []const u8,
 ) ![]const u8 {
@@ -33399,21 +33453,20 @@ fn renderSourceTemplateText(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content, null),
+            remoteRenderConfig(db, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
         doc_value,
-        remoteRenderConfig(secret_store, remote_content, null),
+        remoteRenderConfig(db, null),
     );
 }
 
 fn renderSourceTemplateParts(
     alloc: Allocator,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
+    db: ?*const DB,
     template_source: []const u8,
     doc_value: []const u8,
     max_media_parts: ?usize,
@@ -33423,7 +33476,7 @@ fn renderSourceTemplateParts(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content, max_media_parts),
+            remoteRenderConfig(db, max_media_parts),
         );
     }
     return try template_remote.renderJsonToParts(alloc, template_source, doc_value);
@@ -33507,7 +33560,7 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -34217,10 +34270,9 @@ fn computeDocumentExtractionAssetRequestDerived(
         }
     }
 
-    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
         alloc,
-        db.remote_content,
-        db.secret_store,
+        remoteRenderConfig(db, null),
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |err| switch (err) {
@@ -36837,7 +36889,7 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
@@ -38490,7 +38542,7 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -38648,7 +38700,7 @@ fn computeSparseRequestDerived(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -39077,7 +39129,7 @@ fn renderSourceParts(
     max_media_parts: ?usize,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
+    const parts = renderSourceTemplateParts(alloc, db, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
         error.PermanentPromptFailure, error.TransientPromptFailure => return err,
         else => return null,
     };
@@ -55125,6 +55177,31 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
     try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
 }
 
+test "db enrichment reconfigure inherits resident execution and security capabilities" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var remote_content = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false },
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .remote_content = &remote_content,
+    });
+    defer db.close();
+
+    var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    try db.reconfigureEnrichmentRuntime(.{
+        .dense_embedder = replacement_embedder.interface(),
+    });
+
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(&remote_content, runtime.config.remote_content.?);
+    try std.testing.expectEqual(db.core.index_manager.resource_manager, runtime.config.resource_manager);
+    try std.testing.expect(runtime.config.io != null);
+}
+
 test "db enrichment reconfigure refreshes durable state after old worker joins" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -56345,7 +56422,6 @@ test "remote template host-rendered parts preserve prompt failures" {
         error.PermanentPromptFailure,
         renderSourceTemplateParts(
             alloc,
-            null,
             null,
             "{{remoteMedia url=this}}",
             "\"https://example.com/photo.png\"",
@@ -84865,12 +84941,17 @@ test "resident index repair progress waits are revision scoped and event driven"
     // An idempotent durable projection must not erase a resident wait.
     try directory.upsert(alloc, intent, intent.revision);
     try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
-    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 10));
-    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 19));
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 20));
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 10) == null);
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 19) == null);
+    const progress_wake = directory.wakeForIndexProgress("semantic_idx", 20) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u128, 17), progress_wake.repair_id);
+    try std.testing.expectEqual(@as(u64, 1), progress_wake.revision);
+    try std.testing.expectEqual(index_repair_state.WorkClass.repair, progress_wake.work_class);
+    try std.testing.expectEqual(@as(u64, 9), progress_wake.config_hash);
+    try std.testing.expectEqual(@as(u64, 1), progress_wake.root_generation);
     try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
     try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-    try std.testing.expect(!directory.wakeForIndexProgress("unrelated", 99));
+    try std.testing.expect(directory.wakeForIndexProgress("unrelated", 99) == null);
 
     try std.testing.expect(directory.deferForProgress(17, 1, 30, 600));
     intent.revision += 1;
@@ -84879,7 +84960,7 @@ test "resident index repair progress waits are revision scoped and event driven"
     try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
     try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
     // A delayed event from the prior revision cannot wake the new schedule.
-    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 12));
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 12) == null);
 
     // Once replay is at its durable target, corpus coverage—not another
     // watermark increment—is the remaining completion proof. The bounded
@@ -84887,7 +84968,7 @@ test "resident index repair progress waits are revision scoped and event driven"
     try std.testing.expect(directory.deferForAudit(17, 2, 800));
     try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
     try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
-    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)));
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)) == null);
     try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
 }
 

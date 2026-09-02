@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,47 @@ from conftest import (
 )
 from helpers import wait_until
 from port_reservations import find_free_port
+
+
+class TinyImageServer:
+    """Local HTTP origin used to exercise remoteMedia's real transport path."""
+
+    _PNG = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c02"
+        "0000000b4944415478da63fcff1f0002eb01f58f59952f0000000049454e44ae426082"
+    )
+
+    def __init__(self, host: str = "127.0.0.1"):
+        self.request_count = 0
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path != "/tiny.png":
+                    self.send_error(404)
+                    return
+                outer.request_count += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(outer._PNG)))
+                self.end_headers()
+                self.wfile.write(outer._PNG)
+
+            def log_message(self, format: str, *args: object) -> None:
+                _ = format
+                _ = args
+        # Bind port zero atomically; probing and then reopening a selected port
+        # leaves an avoidable race with parallel E2E workers.
+        self._server = ThreadingHTTPServer((host, 0), Handler)
+        port = self._server.server_address[1]
+        self.url = f"http://{host}:{port}/tiny.png"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 @pytest.fixture(scope="module")
@@ -54,6 +97,13 @@ def cli_inference_servers():
     reranker.stop()
     generator.stop()
     embedder.stop()
+
+
+@pytest.fixture(scope="module")
+def cli_media_server():
+    server = TinyImageServer()
+    yield server
+    server.stop()
 
 
 @pytest.fixture(scope="module")
@@ -169,7 +219,7 @@ def test_table_create_list_get_drop(cli):
 
 
 def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
-    cli, cli_server, cli_inference_servers, tmp_path
+    cli, cli_server, cli_inference_servers, cli_media_server, tmp_path
 ):
     """Exercise the documented CLI path across parsing, readiness, and retrieval."""
     table = f"cli_quickstart_{time.time_ns()}"
@@ -207,7 +257,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                         "id": "doc:alpha",
                         "title": "Alpha",
                         "body": "alpha concept overview",
-                        "thumbnail_url": tiny_png,
+                        "thumbnail_url": cli_media_server.url,
                     }
                 ),
                 json.dumps(
@@ -464,7 +514,10 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             for line in cli_server.debug_logs().splitlines()
             if repair_pass_log in line and f"table={table} " in line
         )
-        status_stability_deadline = time.monotonic() + 2.25
+        # Span two complete five-second audit periods. A level observation of
+        # known debt must not erase owner backoff or turn the queue into a hot
+        # immediate-repair loop after the first audit fires.
+        status_stability_deadline = time.monotonic() + 10.5
         while time.monotonic() < status_stability_deadline:
             for name in ("title_body", "thumbnail"):
                 status = parse_json(
@@ -485,14 +538,16 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 assert source_coverage["failed"] == 0
                 assert status.get("repair") is None, json.dumps(status, indent=2)
                 assert status["enrichment_runtime"]["worker_failed"] is False
-            time.sleep(0.025)
+            time.sleep(0.2)
         logs_while_building = cli_server.debug_logs()
         repair_passes_after = sum(
             1
             for line in logs_while_building.splitlines()
             if repair_pass_log in line and f"table={table} " in line
         )
-        assert repair_passes_after - repair_passes_before <= 1, (
+        # One bounded pass per five-second audit period (plus a boundary race)
+        # is expected; the regression produced hundreds of immediate passes.
+        assert repair_passes_after - repair_passes_before <= 3, (
             "periodic startup observation repeatedly promoted known repair "
             "debt to an immediate wake"
         )
@@ -548,6 +603,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert image_coverage["failed"] == 0
         assert image_coverage["complete"] is True, json.dumps(image_status, indent=2)
         assert image_coverage["healthy"] is True
+        assert cli_media_server.request_count >= 1, (
+            "the image quickstart path did not exercise remoteMedia over HTTP"
+        )
 
         image_query = cli(
             "query",

@@ -7322,14 +7322,17 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub const LocalIndexRepairDebtAction = enum {
-        enqueue,
+        /// Level-triggered observation of durable debt. A new group must be
+        /// admitted eventually, but observing an existing group cannot replace
+        /// its exact wake generation, retry deadline, or owner backoff.
+        observe_debt,
         /// The caller has released every structural and DB lease that could
         /// conflict with repair, so the runtime may admit the queued work
         /// immediately instead of waiting for its control-loop poll.
-        enqueue_runnable,
+        signal_runnable,
         /// Destructive lifecycle removal after the group path and its durable
         /// repair state are no longer authoritative. Ordinary repair clear
-        /// edges enqueue an aggregate audit instead.
+        /// edges observe aggregate debt instead.
         remove,
         cancel,
         clear_cancel,
@@ -7428,7 +7431,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn publishDeferredRepairDebt(self: *@This(), owner: *ProvisionedTableWriteSource) void {
             for (self.deferred_repair_group_ids.items) |group_id| {
-                owner.notifyLocalIndexRepairDebt(self.table_name, group_id, .enqueue_runnable);
+                owner.notifyLocalIndexRepairDebt(self.table_name, group_id, .signal_runnable);
             }
             self.deferred_repair_group_ids.clearRetainingCapacity();
         }
@@ -10142,7 +10145,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (entry.repair_handoff_status_pending == 0) return;
         // This transition is reserved for the aggregate scheduler owner after
         // its durable repair-state read under the group operation lease. A DB
-        // clear callback may only enqueue that audit: callback invocations copy
+        // clear callback may only observe that debt: callback invocations copy
         // their hook under a mutex and can complete in the opposite order from
         // their durable mutations.
         entry.repair_handoff_clear_observed = true;
@@ -12614,9 +12617,16 @@ pub const ProvisionedTableWriteSource = struct {
         switch (event.change) {
             .index_repair_progress => {
                 // The DB scheduler already matched this edge to an exact
-                // revision-scoped progress wait. Wake the group owner without
-                // invalidating readers or borrowing structural status scope.
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
+                // revision-scoped progress wait. Initial materialization stays
+                // on its resident build lane; waking the corruption-repair
+                // owner for every generated batch would create a group-wide
+                // no-op loop. Exact repair progress still wakes immediately,
+                // while an unknown-scope event remains conservative.
+                self.notifyLocalIndexRepairDebt(
+                    table_name,
+                    group_id,
+                    if (isInitialBuildVisibilityEvent(event)) .observe_debt else .signal_runnable,
+                );
                 return;
             },
             .index_repair_pending => {
@@ -12632,25 +12642,25 @@ pub const ProvisionedTableWriteSource = struct {
                 // wake the owner and status observers without creating repair
                 // handoff authority.
                 if (isInitialBuildVisibilityEvent(event)) {
-                    self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                    self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
                     self.notifyLocalChange(table_name, .data);
                     return;
                 }
                 const targeted_repair = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name, event.repair);
                 if (!targeted_repair) self.markRepairHandoffPendingBestEffort(table_name, group_id);
                 // Preserve every exact debt edge even while structural
-                // reconciliation owns the table status fence. Plain enqueue
-                // only updates the deduplicated exact-debt queue; the structural
-                // owner upgrades its affected groups to runnable after it has
+                // reconciliation owns the table status fence. This level
+                // observation only updates the deduplicated exact-debt queue;
+                // the structural owner emits a runnable signal after it has
                 // transferred status authority and released admission.
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
             .index_repair_cleared => {
                 self.invalidateReadCache(table_name);
                 if (isInitialBuildVisibilityEvent(event)) {
-                    self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                    self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
                     self.notifyLocalChange(table_name, .data);
                     return;
                 }
@@ -12662,7 +12672,7 @@ pub const ProvisionedTableWriteSource = struct {
                 // queued; only the aggregate owner may classify durable repair
                 // state and authorize status publication. Explicit drop remains
                 // the destructive remove path.
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
@@ -13039,7 +13049,7 @@ pub const ProvisionedTableWriteSource = struct {
                 // its installed visibility hook. An existing lease may have
                 // observed the edge before this owner began reconciliation,
                 // so retain the idempotent aggregate-debt audit for that path.
-                self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
+                self.notifyLocalIndexRepairDebt(table.name, group_id, .observe_debt);
             }
             {
                 lockAtomic(&self.local_db_mutex);
@@ -16195,14 +16205,13 @@ pub const ProvisionedTableWriteSource = struct {
                 // same group. Keep the group queued for one aggregate owner
                 // audit; that pass removes it cheaply when only paused debt
                 // remains, or advances another runnable index immediately.
-                .pause_automatic => .enqueue,
-                .resume_automatic, .cancel_current_attempt => .enqueue,
+                .pause_automatic, .resume_automatic, .cancel_current_attempt => .signal_runnable,
             };
         }
         // Index repair requests are named-index operations. Even when that
         // index completes, another intent may remain in the group, so only the
         // aggregate owner-side pass is allowed to remove the group queue key.
-        return .enqueue;
+        return .signal_runnable;
     }
 
     fn changeKindForHARecord(record: db_mod.HAReplicationRecordView) LocalChangeKind {
@@ -16515,7 +16524,7 @@ pub const ProvisionedTableWriteSource = struct {
                 cached.schema_json = entry.schema_json;
             }
             if (reconcile_summary.indexes_pending != 0) {
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
             }
         } else {
             try self.repairRestoredTableRuntimeStateUntilComplete(
@@ -18414,7 +18423,7 @@ pub const ProvisionedTableWriteSource = struct {
         // released, avoiding a second durable-state read and false cold-owner
         // wakes for groups that were already clean.
         for (repair_group_ids.items) |group_id| {
-            self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .signal_runnable);
         }
     }
 
@@ -18542,7 +18551,7 @@ pub const ProvisionedTableWriteSource = struct {
             );
             for (group_ids) |owned_group_id| {
                 self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .clear_cancel);
-                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .enqueue_runnable);
+                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .signal_runnable);
             }
             return error.DropCleanupOwnershipInconclusive;
         }
@@ -38790,8 +38799,8 @@ test "provisioned create index enqueues target-fenced cached-writer activation" 
             switch (action) {
                 .cancel => self.cancel_count += 1,
                 .clear_cancel => self.clear_cancel_count += 1,
-                .enqueue_runnable => self.runnable_count += 1,
-                .enqueue, .remove => {},
+                .signal_runnable => self.runnable_count += 1,
+                .observe_debt, .remove => {},
             }
         }
     };
@@ -41676,22 +41685,22 @@ test "targeted index cache update retains the published sibling snapshot through
 test "structural repair handoff keeps status fenced through final shard visibility" {
     const alloc = std.testing.allocator;
     const DebtCapture = struct {
-        enqueue_calls: usize = 0,
-        regular_enqueue_calls: usize = 0,
-        runnable_enqueue_calls: usize = 0,
-        unrelated_enqueue_calls: usize = 0,
+        notification_count: usize = 0,
+        observation_count: usize = 0,
+        runnable_signal_count: usize = 0,
+        unrelated_observation_count: usize = 0,
 
         fn onDebt(ptr: *anyopaque, _: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (action) {
-                .enqueue => {
-                    self.enqueue_calls += 1;
-                    self.regular_enqueue_calls += 1;
-                    if (group_id == 7003) self.unrelated_enqueue_calls += 1;
+                .observe_debt => {
+                    self.notification_count += 1;
+                    self.observation_count += 1;
+                    if (group_id == 7003) self.unrelated_observation_count += 1;
                 },
-                .enqueue_runnable => {
-                    self.enqueue_calls += 1;
-                    self.runnable_enqueue_calls += 1;
+                .signal_runnable => {
+                    self.notification_count += 1;
+                    self.runnable_signal_count += 1;
                 },
                 else => {},
             }
@@ -41732,10 +41741,10 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_pending,
     );
-    try std.testing.expectEqual(@as(usize, 2), debt_capture.enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 0), debt_capture.runnable_enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.notification_count);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.observation_count);
+    try std.testing.expectEqual(@as(usize, 0), debt_capture.runnable_signal_count);
+    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_observation_count);
 
     // Repair of an early shard may finish while the structural request is
     // still reconciling later shards. Its clear queues an aggregate audit; the
@@ -41759,13 +41768,13 @@ test "structural repair handoff keeps status fenced through final shard visibili
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     request.handoffDeferredRepairDebt(&source);
-    // The clear contributes one regular aggregate-audit wake. It cannot
+    // The clear contributes one level-triggered aggregate audit. It cannot
     // destructively remove either a newer pending edge or the two runnable
     // structural handoffs published below.
-    try std.testing.expectEqual(@as(usize, 5), debt_capture.enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 3), debt_capture.regular_enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 2), debt_capture.runnable_enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 5), debt_capture.notification_count);
+    try std.testing.expectEqual(@as(usize, 3), debt_capture.observation_count);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.runnable_signal_count);
+    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_observation_count);
 
     // Foreground write admission remains independent, while status stays
     // snapshot-only until every affected shard publishes final visibility.
@@ -42406,18 +42415,18 @@ test "structural reconcile publishes durable index repair debt once per group" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
     const DebtCapture = struct {
-        enqueue_calls: usize = 0,
-        runnable_enqueue_calls: usize = 0,
+        notification_count: usize = 0,
+        runnable_signal_count: usize = 0,
 
         fn onDebt(ptr: *anyopaque, table_name: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.debug.assert(std.mem.eql(u8, table_name, "docs"));
             std.debug.assert(group_id == 7001);
             switch (action) {
-                .enqueue => self.enqueue_calls += 1,
-                .enqueue_runnable => {
-                    self.enqueue_calls += 1;
-                    self.runnable_enqueue_calls += 1;
+                .observe_debt => self.notification_count += 1,
+                .signal_runnable => {
+                    self.notification_count += 1;
+                    self.runnable_signal_count += 1;
                 },
                 .remove => {},
                 .cancel, .clear_cancel => unreachable,
@@ -42465,8 +42474,8 @@ test "structural reconcile publishes durable index repair debt once per group" {
     // The structural worker preserves the exact debt edge during its quantum,
     // but must not request runnable repair admission until after releasing its
     // table-wide reservation.
-    try std.testing.expectEqual(@as(usize, 1), capture.enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.runnable_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.notification_count);
+    try std.testing.expectEqual(@as(usize, 0), capture.runnable_signal_count);
     var rebuilding = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer rebuilding.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), rebuilding.items.len);
@@ -42485,8 +42494,8 @@ test "structural reconcile publishes durable index repair debt once per group" {
     reconcile_active = false;
     source.releaseStructuralReconcileStatus("docs");
     request.publishDeferredRepairDebt(&source);
-    try std.testing.expectEqual(@as(usize, 2), capture.enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 1), capture.runnable_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 2), capture.notification_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.runnable_signal_count);
 
     var attempted_repair = false;
     var repaired = false;
@@ -42579,16 +42588,16 @@ test "structural reconcile publishes durable index repair debt once per group" {
     try std.testing.expect(repaired);
     try std.testing.expect(publication_fenced);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
-    // Repair's visibility hook may repeat the idempotent exact-debt enqueue as
+    // Repair's visibility hook may repeat the idempotent debt observation as
     // each bounded pass discovers the durable intent. Only a subsequent
     // structural pass must remain silent after this baseline.
-    const post_repair_enqueue_calls = capture.enqueue_calls;
+    const post_repair_notification_count = capture.notification_count;
 
     try std.testing.expectEqual(
         ProvisionedTableWriteSource.StructuralReconcileOutcome.complete,
         try source.reconcileTableStructureStep(alloc, &request),
     );
-    try std.testing.expectEqual(post_repair_enqueue_calls, capture.enqueue_calls);
+    try std.testing.expectEqual(post_repair_notification_count, capture.notification_count);
     // Queue retirement belongs to the aggregate DataServer scheduler after it
     // verifies that no other named index intent remains in this group.
 }
@@ -43818,13 +43827,13 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, null, .index_repair_pending);
     try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, hooks.debt.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.observe_debt, hooks.debt.?);
 
     try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{ .group_id = 7001, .stats = .{ .repair_degraded = true } });
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, null, .index_repair_cleared);
     try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, hooks.debt.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.observe_debt, hooks.debt.?);
     try std.testing.expectEqual(@as(usize, 2), hooks.changes);
 
     try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{ .group_id = 7001, .stats = .{ .repair_degraded = true } });
@@ -43841,9 +43850,29 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     var preserved = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
     preserved.deinit(alloc);
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue_runnable,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
         hooks.debt.?,
     );
+    try std.testing.expectEqual(changes_before_progress, hooks.changes);
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
+        &source,
+        "docs",
+        7001,
+        null,
+        .{
+            .change = .index_repair_progress,
+            .repair = .{
+                .index_name = "semantic_idx",
+                .work_class = .initial_build,
+            },
+        },
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.observe_debt,
+        hooks.debt.?,
+    );
+    try std.testing.expectEqual(epoch_before_progress, read_cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(changes_before_progress, hooks.changes);
 
     source.retireReadersAfterIndexRepairCompletion("docs", .{ .cleared_debt = true });
@@ -43882,24 +43911,24 @@ test "provisioned named index repair keeps group queued for aggregate debt audit
         .control = .resume_automatic,
     };
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
         ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1, .controls_applied = 1 }).?,
     );
     var pause = base;
     pause.control = .pause_automatic;
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
         ProvisionedTableWriteSource.indexRepairDebtAction(pause, .{ .scanned = 1, .controls_applied = 1 }).?,
     );
     try std.testing.expect(ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1 }) == null);
     var automatic = base;
     automatic.control = null;
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
         ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1, .debt_remaining = true }).?,
     );
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
         ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1 }).?,
     );
 }
@@ -54491,7 +54520,7 @@ test "replica root reconcile enqueues newly admitted managed full text repair" {
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_pending);
     try std.testing.expectEqual(@as(usize, 1), capture.calls);
     try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, capture.action.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.observe_debt, capture.action.?);
 }
 
 test "write cache transfers adoptable provisioned db to raft apply source" {

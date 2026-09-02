@@ -95,6 +95,10 @@ pub const Config = struct {
     enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Runtime-owned execution context for template remote I/O. Production
+    /// runtimes replace this with their backend executor during `init` so
+    /// remote fetches share lifecycle, cancellation, and scheduling policy.
+    io: ?Io = null,
     /// Runtime-owned cancellation propagated through template remote I/O and
     /// provider calls. Set by `start`; callers do not configure this directly.
     cancellation: CancellationToken = .none,
@@ -2898,6 +2902,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -3348,6 +3353,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = backend_runtime.inferenceIo() orelse config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -5587,10 +5593,15 @@ fn processDocumentExtractionAsset(
     defer if (download_budgeted) |*allocator| allocator.deinit();
     const download_alloc = if (download_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
 
-    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
         download_alloc,
-        runtime.config.remote_content,
-        runtime.config.secret_store,
+        remoteRenderConfig(
+            runtime.config.secret_store,
+            runtime.config.remote_content,
+            runtime.config.io,
+            runtime.config.cancellation,
+            null,
+        ),
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |raw_err| {
@@ -14469,6 +14480,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    io: ?Io,
     cancellation: CancellationToken,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
@@ -14482,6 +14494,9 @@ fn remoteRenderConfig(
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
     }
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        config.io = io;
+    }
     if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
         config.cancellation = scraping.CancellationToken.fromCallback(
             cancellation.ptr,
@@ -14489,6 +14504,26 @@ fn remoteRenderConfig(
         );
     }
     return config;
+}
+
+test "enrichment remote render config preserves runtime execution context" {
+    var canceled = std.atomic.Value(bool).init(false);
+    const config = remoteRenderConfig(
+        null,
+        null,
+        std.Io.Threaded.global_single_threaded.io(),
+        CancellationToken.fromAtomic(&canceled),
+        null,
+    );
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        try std.testing.expect(config.io != null);
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        const token = config.cancellation orelse return error.TestUnexpectedResult;
+        try token.check();
+        canceled.store(true, .release);
+        try std.testing.expectError(error.Canceled, token.check());
+    }
 }
 
 /// Extract the source text for an enrichment request from a document.
@@ -14533,14 +14568,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, null),
+            remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, null),
+        remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null),
     );
 }
 
@@ -14591,7 +14626,7 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.cancellation, max_media_parts)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
