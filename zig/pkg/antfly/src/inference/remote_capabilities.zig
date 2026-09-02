@@ -529,6 +529,7 @@ fn requiredStringArray(object: std.json.ObjectMap, name: []const u8) !std.json.A
 }
 
 fn validateStringSet(items: std.json.Array, allowed: []const []const u8) !void {
+    if (items.items.len == 0) return error.InvalidInferenceCapabilities;
     for (items.items, 0..) |item, index| {
         var known = false;
         for (allowed) |candidate| {
@@ -542,6 +543,21 @@ fn validateStringSet(items: std.json.Array, allowed: []const []const u8) !void {
             if (std.mem.eql(u8, prior.string, item.string)) return error.InvalidInferenceCapabilities;
         }
     }
+}
+
+fn resultCardinalityForTask(task: work.Task) work.ResultCardinality {
+    return switch (task) {
+        .rerank, .chunk, .transcribe => .one_per_request,
+        else => .one_per_item,
+    };
+}
+
+fn promptPolicyForTask(task: work.Task) work.PromptPolicy {
+    return switch (task) {
+        .extract => .structured_schema,
+        .chunk, .transcribe => .model_default,
+        else => .explicit,
+    };
 }
 
 fn parseExactWireCapabilities(object: std.json.ObjectMap) !ExactWireCapabilities {
@@ -666,8 +682,8 @@ pub fn parseModelCapabilities(
             .per_item_failures = false,
         },
         .output = if (exact) |value| value.output else outputForTask(task),
-        .result_cardinality = if (exact) |value| value.result_cardinality else .one_per_item,
-        .prompt_policy = if (exact) |value| value.prompt_policy else .explicit,
+        .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
+        .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
         .borrowed_attachments = if (exact) |value| value.borrowed_attachments else false,
     };
     if (resolved == null) if (capability_values) |values| {
@@ -782,6 +798,8 @@ test "remote Antfly capability parser supports every model family" {
         defer std.testing.allocator.free(payload);
         const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "model", case.task)).?;
         try std.testing.expectEqual(case.output, capabilities.output);
+        try std.testing.expectEqual(resultCardinalityForTask(case.task), capabilities.result_cardinality);
+        try std.testing.expectEqual(promptPolicyForTask(case.task), capabilities.prompt_policy);
         if (case.task == .read or case.task == .generate or case.task == .embed) {
             try std.testing.expect(capabilities.input_granularity != .item);
         } else {

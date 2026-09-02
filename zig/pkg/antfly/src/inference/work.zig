@@ -196,6 +196,7 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        if (@as(u8, @bitCast(self.input_modalities)) == 0) return error.InvalidInferenceCapabilities;
         const expected_output: OutputKind = switch (self.task) {
             .read => .read_result,
             .generate => .generated_text,
@@ -208,6 +209,11 @@ pub const InferenceCapabilities = struct {
             .transcribe => .transcription,
         };
         if (self.output != expected_output) return error.InvalidInferenceCapabilities;
+        const expected_cardinality: ResultCardinality = switch (self.task) {
+            .rerank, .chunk, .transcribe => .one_per_request,
+            else => .one_per_item,
+        };
+        if (self.result_cardinality != expected_cardinality) return error.InvalidInferenceCapabilities;
         if (self.input_granularity == .document and !self.input_modalities.document)
             return error.InvalidInferenceCapabilities;
     }

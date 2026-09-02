@@ -1514,6 +1514,7 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 		}
 		for model, descriptor := range models {
 			model = canonicalCatalogModel(category, model)
+			descriptor = sanitizeModelDescriptor(descriptor)
 			if existing, duplicate := target[category][model]; duplicate {
 				target[category][model] = conservativeModelDescriptor(existing, descriptor)
 			} else {
@@ -1537,11 +1538,46 @@ func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, sourc
 		target[scope.Category] = make(map[string]json.RawMessage)
 	}
 	model = canonicalCatalogModel(scope.Category, model)
+	descriptor = sanitizeModelDescriptor(descriptor)
 	if existing, duplicate := target[scope.Category][model]; duplicate {
 		target[scope.Category][model] = conservativeModelDescriptor(existing, descriptor)
 	} else {
 		target[scope.Category][model] = append(json.RawMessage(nil), descriptor...)
 	}
+}
+
+// Exact descriptors are an admission contract, so a malformed descriptor from
+// even one eligible endpoint must poison the merged model instead of being
+// silently weakened into a plausible-looking subset.
+func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
+	var descriptor map[string]any
+	if json.Unmarshal(raw, &descriptor) != nil {
+		return json.RawMessage(`{}`)
+	}
+	capabilities, found := descriptor["inference_capabilities"]
+	if !found {
+		return append(json.RawMessage(nil), raw...)
+	}
+	capabilityMap, ok := capabilities.(map[string]any)
+	if !ok {
+		return json.RawMessage(`{}`)
+	}
+	version, ok := inferenceCapabilitiesVersion(capabilityMap)
+	if !ok {
+		return json.RawMessage(`{}`)
+	}
+	if version >= 3 {
+		normalized, valid := conservativeInferenceCapabilities(capabilityMap, capabilityMap)
+		if !valid {
+			return json.RawMessage(`{}`)
+		}
+		descriptor["inference_capabilities"] = normalized
+	}
+	normalized, err := json.Marshal(descriptor)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return normalized
 }
 
 func conservativeModelDescriptor(left, right json.RawMessage) json.RawMessage {
@@ -1585,6 +1621,10 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	aVersion, aok := inferenceCapabilitiesVersion(a)
 	bVersion, bok := inferenceCapabilitiesVersion(b)
 	if !aok || !bok {
+		return nil, false
+	}
+	if aVersion >= 3 && !validExactInferenceCapabilities(a) ||
+		bVersion >= 3 && !validExactInferenceCapabilities(b) {
 		return nil, false
 	}
 	aBatch, aok := a["batch"].(map[string]any)
@@ -1655,9 +1695,16 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	version := 2
 	result := map[string]any{"version": float64(version), "task": a["task"], "batch": batch}
 	if aVersion >= 3 && bVersion >= 3 {
-		for _, field := range []string{"input_modalities", "accepted_mime_types"} {
-			result[field] = intersectStringValues(a[field], b[field])
+		modalities, ok := intersectValidatedStringValues(a["input_modalities"], b["input_modalities"], exactModalities)
+		if !ok || len(modalities) == 0 {
+			return nil, false
 		}
+		mimes, ok := intersectValidatedStringValues(a["accepted_mime_types"], b["accepted_mime_types"], exactMIMETypes)
+		if !ok || len(mimes) == 0 {
+			return nil, false
+		}
+		result["input_modalities"] = modalities
+		result["accepted_mime_types"] = mimes
 		for _, field := range []string{"input_granularity", "output", "result_cardinality", "prompt_policy"} {
 			if a[field] == nil || !reflect.DeepEqual(a[field], b[field]) {
 				return nil, false
@@ -1671,8 +1718,156 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		}
 		result["borrowed_attachments"] = aBorrowed && bBorrowed
 		result["version"] = float64(3)
+		if !validExactInferenceCapabilities(result) {
+			return nil, false
+		}
 	}
 	return result, true
+}
+
+var exactTasks = map[string]bool{
+	"read": true, "generate": true, "embed": true, "rerank": true, "chunk": true,
+	"extract": true, "rewrite": true, "classify": true, "transcribe": true,
+}
+var exactModalities = map[string]bool{"text": true, "image": true, "audio": true, "document": true}
+var exactMIMETypes = map[string]bool{
+	"text/plain": true, "application/json": true, "image/png": true, "image/jpeg": true, "image/webp": true,
+	"audio/wav": true, "audio/mpeg": true, "application/pdf": true,
+}
+var exactGranularities = map[string]bool{"item": true, "chunk": true, "page": true, "document": true}
+var exactOutputs = map[string]bool{
+	"read_result": true, "generated_text": true, "embedding": true, "ranked_items": true,
+	"chunks": true, "extraction": true, "rewritten_text": true, "classification": true,
+	"transcription": true,
+}
+var exactCardinalities = map[string]bool{"one_per_item": true, "one_per_request": true}
+var exactPromptPolicies = map[string]bool{"explicit": true, "model_default": true, "structured_schema": true}
+
+func validExactInferenceCapabilities(capabilities map[string]any) bool {
+	task, ok := capabilities["task"].(string)
+	if !ok || !exactTasks[task] {
+		return false
+	}
+	modalities, ok := validatedStringValues(capabilities["input_modalities"], exactModalities)
+	if !ok || len(modalities) == 0 {
+		return false
+	}
+	mimes, ok := validatedStringValues(capabilities["accepted_mime_types"], exactMIMETypes)
+	if !ok || len(mimes) == 0 {
+		return false
+	}
+	for field, allowed := range map[string]map[string]bool{
+		"input_granularity":  exactGranularities,
+		"output":             exactOutputs,
+		"result_cardinality": exactCardinalities,
+		"prompt_policy":      exactPromptPolicies,
+	} {
+		value, ok := capabilities[field].(string)
+		if !ok || !allowed[value] {
+			return false
+		}
+	}
+	expectedOutput := map[string]string{
+		"read": "read_result", "generate": "generated_text", "embed": "embedding",
+		"rerank": "ranked_items", "chunk": "chunks", "extract": "extraction",
+		"rewrite": "rewritten_text", "classify": "classification", "transcribe": "transcription",
+	}[task]
+	if capabilities["output"] != expectedOutput {
+		return false
+	}
+	expectedCardinality := "one_per_item"
+	if task == "rerank" || task == "chunk" || task == "transcribe" {
+		expectedCardinality = "one_per_request"
+	}
+	if capabilities["result_cardinality"] != expectedCardinality {
+		return false
+	}
+	modalitySet := make(map[string]bool, len(modalities))
+	for _, modality := range modalities {
+		modalitySet[modality] = true
+	}
+	granularity := capabilities["input_granularity"].(string)
+	if granularity == "document" && !modalitySet["document"] ||
+		granularity == "page" && !modalitySet["image"] ||
+		granularity == "chunk" && !modalitySet["text"] {
+		return false
+	}
+	mimeModalities := make(map[string]bool, len(mimes))
+	for _, mime := range mimes {
+		modality := ""
+		switch {
+		case mime == "text/plain" || mime == "application/json":
+			modality = "text"
+		case mime == "application/pdf":
+			modality = "document"
+		case strings.HasPrefix(mime, "image/"):
+			modality = "image"
+		case strings.HasPrefix(mime, "audio/"):
+			modality = "audio"
+		}
+		if !modalitySet[modality] {
+			return false
+		}
+		mimeModalities[modality] = true
+	}
+	for _, modality := range modalities {
+		if !mimeModalities[modality] {
+			return false
+		}
+	}
+	_, ok = capabilities["borrowed_attachments"].(bool)
+	return ok
+}
+
+func validatedStringValues(value any, allowed map[string]bool) ([]string, bool) {
+	var items []string
+	switch typed := value.(type) {
+	case []string:
+		items = typed
+	case []any:
+		items = make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			items = append(items, text)
+		}
+	default:
+		return nil, false
+	}
+	seen := make(map[string]bool, len(items))
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if !allowed[item] || seen[item] {
+			return nil, false
+		}
+		seen[item] = true
+		result = append(result, item)
+	}
+	return result, true
+}
+
+func intersectValidatedStringValues(left, right any, allowed map[string]bool) ([]string, bool) {
+	a, ok := validatedStringValues(left, allowed)
+	if !ok {
+		return nil, false
+	}
+	b, ok := validatedStringValues(right, allowed)
+	if !ok {
+		return nil, false
+	}
+	rightValues := make(map[string]bool, len(b))
+	for _, value := range b {
+		rightValues[value] = true
+	}
+	intersection := make([]string, 0, len(a))
+	for _, value := range a {
+		if rightValues[value] {
+			intersection = append(intersection, value)
+		}
+	}
+	return intersection, true
 }
 
 func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {

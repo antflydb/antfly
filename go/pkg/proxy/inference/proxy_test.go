@@ -1716,7 +1716,7 @@ func TestConservativeCapabilitiesV3PreservesExactContract(t *testing.T) {
 			},
 		}
 	}
-	left := base([]any{"image", "text"}, []any{"image/png", "image/jpeg"}, true)
+	left := base([]any{"image", "text"}, []any{"image/png", "image/jpeg", "text/plain"}, true)
 	right := base([]any{"image"}, []any{"image/png"}, false)
 	merged, ok := conservativeInferenceCapabilities(left, right)
 	if !ok {
@@ -1725,6 +1725,48 @@ func TestConservativeCapabilitiesV3PreservesExactContract(t *testing.T) {
 	if merged["version"] != float64(3) || !reflect.DeepEqual(merged["input_modalities"], []string{"image"}) ||
 		!reflect.DeepEqual(merged["accepted_mime_types"], []string{"image/png"}) || merged["borrowed_attachments"] != false {
 		t.Fatalf("exact v3 contract was not conservatively preserved: %#v", merged)
+	}
+}
+
+func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
+	valid := func() map[string]any {
+		return map[string]any{
+			"version": float64(3), "task": "extract",
+			"input_modalities": []any{"image"}, "accepted_mime_types": []any{"image/png"},
+			"input_granularity": "page", "output": "extraction",
+			"result_cardinality": "one_per_item", "prompt_policy": "structured_schema",
+			"borrowed_attachments": false,
+			"batch": map[string]any{
+				"mode": "serial_compatibility", "preferred_items": float64(2), "max_items": float64(8),
+				"max_encoded_media_bytes": float64(4096), "max_decoded_pixels": float64(8192),
+				"max_media_parts_per_item": float64(1), "per_item_failures": false,
+			},
+		}
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"unknown modality":    func(value map[string]any) { value["input_modalities"] = []any{"telepathy"} },
+		"duplicate mime":      func(value map[string]any) { value["accepted_mime_types"] = []any{"image/png", "image/png"} },
+		"non-string modality": func(value map[string]any) { value["input_modalities"] = []any{float64(1)} },
+		"unknown scalar":      func(value map[string]any) { value["prompt_policy"] = "sometimes" },
+		"wrong cardinality":   func(value map[string]any) { value["result_cardinality"] = "one_per_request" },
+		"mime without modality": func(value map[string]any) {
+			value["accepted_mime_types"] = []any{"image/png", "text/plain"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			left := valid()
+			mutate(left)
+			if _, ok := conservativeInferenceCapabilities(left, valid()); ok {
+				t.Fatal("malformed v3 descriptor merged")
+			}
+			raw, err := json.Marshal(map[string]any{"inference_capabilities": left})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(sanitizeModelDescriptor(raw)); got != "{}" {
+				t.Fatalf("malformed singleton descriptor was not poisoned: %s", got)
+			}
+		})
 	}
 }
 

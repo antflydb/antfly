@@ -450,7 +450,7 @@ pub const Runtime = struct {
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
         if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
             capabilities.batch.mode == .none) return false;
-        validateExtractorBatchPlan(capabilities, requests) catch return false;
+        validateExtractorBatchPlan(alloc, capabilities, requests) catch return false;
         return true;
     }
 
@@ -637,7 +637,7 @@ pub const Runtime = struct {
         }
 
         const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return error.BatchIncompatible;
-        try validateExtractorBatchCompatibility(capabilities, requests);
+        try validateExtractorBatchCompatibility(alloc, capabilities, requests);
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
         errdefer if (outputs_owned) {
@@ -648,8 +648,8 @@ pub const Runtime = struct {
         var windows: usize = 0;
         var start: usize = 0;
         while (start < requests.len) {
-            const end = try extractorBatchEnd(capabilities, requests, start);
-            try validateExtractorInvocation(capabilities, requests[start..end]);
+            const end = try extractorBatchEnd(alloc, capabilities, requests, start);
+            try validateExtractorInvocation(alloc, capabilities, requests[start..end]);
             const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end]);
             defer alloc.free(chunk_outputs);
             if (chunk_outputs.len != end - start) {
@@ -718,21 +718,7 @@ pub const Runtime = struct {
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
         defer response.deinit();
 
-        const out = try alloc.alloc([]u8, requests.len);
-        errdefer {
-            for (out) |item| {
-                if (item.len > 0) alloc.free(item);
-            }
-            alloc.free(out);
-        }
-        for (out) |*item| item.* = "";
-        for (requests, 0..) |request, i| {
-            out[i] = if (isJsonContentType(request.content_type) or request.content_type.len == 0)
-                try extractionResultJsonAtAlloc(alloc, response.json, i)
-            else
-                try alloc.dupe(u8, response.json);
-        }
-        return out;
+        return try extractionResultsJsonAlloc(alloc, response.json, requests.len);
     }
 
     fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -1381,7 +1367,7 @@ pub const Runtime = struct {
         defer cfg.deinit(alloc);
 
         if (try self.extractorCapabilities(alloc, cfg)) |capabilities| {
-            try validateExtractorInvocation(capabilities, &.{request});
+            try validateExtractorInvocation(alloc, capabilities, &.{request});
         }
 
         const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
@@ -1715,7 +1701,155 @@ fn validateGeneratorInvocation(
     try capabilities.validateInvocation(.generate, invocation);
 }
 
+const ExtractorItemShape = struct {
+    modalities: inference_work.Modalities = .{},
+    encoded_media_bytes: usize = 0,
+    media_parts: usize = 0,
+    prompt: []u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.prompt);
+        self.* = undefined;
+    }
+};
+
+fn addExtractorMediaShape(
+    capabilities: inference_work.InferenceCapabilities,
+    request: asset_producer.Request,
+    shape: *ExtractorItemShape,
+    mime_type: ?[]const u8,
+    encoded_bytes: ?usize,
+    inline_data: bool,
+) !void {
+    if (inline_data and !request.inline_media_trusted) return error.UntrustedInlineMedia;
+    if (mime_type) |mime| {
+        if (!std.ascii.startsWithIgnoreCase(mime, "image/")) return error.UnsupportedInferenceMimeType;
+        try capabilities.validateMimeType(mime);
+    }
+    shape.modalities.image = true;
+    shape.media_parts = std.math.add(usize, shape.media_parts, 1) catch
+        return error.InferenceMediaPartLimitExceeded;
+    if (encoded_bytes) |bytes| shape.encoded_media_bytes = std.math.add(
+        usize,
+        shape.encoded_media_bytes,
+        bytes,
+    ) catch return error.InferenceEncodedBytesExceeded;
+}
+
+fn extractorRequestShape(
+    alloc: Allocator,
+    capabilities: inference_work.InferenceCapabilities,
+    request: asset_producer.Request,
+) !ExtractorItemShape {
+    var shape = ExtractorItemShape{ .prompt = try alloc.dupe(u8, "") };
+    errdefer shape.deinit(alloc);
+    var prompt = std.ArrayListUnmanaged(u8).empty;
+    defer prompt.deinit(alloc);
+    var parsed_parts_array = false;
+    var saw_text_part = false;
+
+    if (request.source_parts_json) |raw_parts| parts: {
+        if (raw_parts.len == 0) break :parts;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) {
+            shape.modalities.text = true;
+            try capabilities.validateMimeType("text/plain");
+            break :parts;
+        }
+        parsed_parts_array = true;
+        for (parsed.value.array.items) |part| {
+            if (part != .object) return error.InvalidExtractionContent;
+            const type_value = part.object.get("type") orelse return error.InvalidExtractionContent;
+            if (type_value != .string) return error.InvalidExtractionContent;
+            if (std.mem.eql(u8, type_value.string, "text")) {
+                const text_value = part.object.get("text") orelse return error.InvalidExtractionContent;
+                if (text_value != .string) return error.InvalidExtractionContent;
+                saw_text_part = true;
+                if (prompt.items.len > 0) try prompt.append(alloc, '\n');
+                try prompt.appendSlice(alloc, text_value.string);
+            } else if (std.mem.eql(u8, type_value.string, "image_url")) {
+                const image_value = part.object.get("image_url") orelse return error.InvalidExtractionContent;
+                const url = if (image_value == .string)
+                    image_value.string
+                else if (image_value == .object)
+                    if (image_value.object.get("url")) |value|
+                        if (value == .string) value.string else return error.InvalidExtractionContent
+                    else
+                        return error.InvalidExtractionContent
+                else
+                    return error.InvalidExtractionContent;
+                const is_inline = dataUriMimeType(url) != null;
+                try addExtractorMediaShape(
+                    capabilities,
+                    request,
+                    &shape,
+                    dataUriMimeType(url),
+                    try dataUriDecodedSize(url),
+                    is_inline,
+                );
+            } else if (std.mem.eql(u8, type_value.string, "media")) {
+                const declared_mime = if (part.object.get("mime_type")) |value|
+                    if (value == .string) value.string else return error.InvalidExtractionContent
+                else
+                    null;
+                if (part.object.get("url")) |url_value| {
+                    if (url_value != .string) return error.InvalidExtractionContent;
+                    const inferred_mime = dataUriMimeType(url_value.string);
+                    try addExtractorMediaShape(
+                        capabilities,
+                        request,
+                        &shape,
+                        declared_mime orelse inferred_mime,
+                        try dataUriDecodedSize(url_value.string),
+                        inferred_mime != null,
+                    );
+                } else if (part.object.get("data")) |data_value| {
+                    if (data_value != .string) return error.InvalidExtractionContent;
+                    const inferred_mime = dataUriMimeType(data_value.string);
+                    const decoded_bytes = (try dataUriDecodedSize(data_value.string)) orelse
+                        (std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
+                            return error.InvalidDataURI);
+                    try addExtractorMediaShape(
+                        capabilities,
+                        request,
+                        &shape,
+                        declared_mime orelse inferred_mime,
+                        decoded_bytes,
+                        true,
+                    );
+                } else return error.InvalidExtractionContent;
+            } else if (!std.mem.eql(u8, type_value.string, "metadata")) {
+                return error.InvalidExtractionContent;
+            }
+        }
+    } else {
+        try prompt.appendSlice(alloc, request.source_text);
+    }
+
+    for (request.media) |media| try addExtractorMediaShape(
+        capabilities,
+        request,
+        &shape,
+        media.mime_type,
+        media.bytes.len,
+        true,
+    );
+
+    if (shape.media_parts == 0) {
+        if (parsed_parts_array and (!saw_text_part or prompt.items.len == 0)) return error.InvalidExtractionContent;
+        shape.modalities.text = true;
+        try capabilities.validateMimeType("text/plain");
+    } else {
+        const owned_prompt = try prompt.toOwnedSlice(alloc);
+        alloc.free(shape.prompt);
+        shape.prompt = owned_prompt;
+    }
+    return shape;
+}
+
 fn validateExtractorInvocation(
+    alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
     requests: []const asset_producer.Request,
 ) !void {
@@ -1724,64 +1858,58 @@ fn validateExtractorInvocation(
     var invocation = inference_work.InvocationShape{ .item_count = requests.len };
     var uses_media: ?bool = null;
     for (requests) |request| {
-        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
-        const item_uses_media = request.media.len > 0;
+        var item = try extractorRequestShape(alloc, capabilities, request);
+        defer item.deinit(alloc);
+        const item_uses_media = item.media_parts > 0;
         if (uses_media) |expected| {
             if (expected != item_uses_media) return error.BatchIncompatible;
         } else uses_media = item_uses_media;
-        if (item_uses_media) {
-            invocation.modalities.image = true;
-            invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, request.media.len);
-            for (request.media) |media| {
-                try capabilities.validateMimeType(media.mime_type);
-                invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, media.bytes.len) catch
-                    return error.InferenceEncodedBytesExceeded;
-            }
-        } else {
-            invocation.modalities.text = true;
-            try capabilities.validateMimeType("text/plain");
-        }
+        mergeInferenceModalities(&invocation.modalities, item.modalities);
+        invocation.max_media_parts_per_item = @max(invocation.max_media_parts_per_item, item.media_parts);
+        invocation.encoded_media_bytes = std.math.add(usize, invocation.encoded_media_bytes, item.encoded_media_bytes) catch
+            return error.InferenceEncodedBytesExceeded;
     }
     try capabilities.validateInvocation(.extract, invocation);
 }
 
 fn validateExtractorBatchCompatibility(
+    alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
     requests: []const asset_producer.Request,
 ) !void {
     if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
         capabilities.batch.mode == .none) return error.InvalidInferenceCapabilities;
     var uses_media: ?bool = null;
-    var media_prompt_text: ?[]const u8 = null;
-    var media_prompt_parts: ?[]const u8 = null;
+    var media_prompt: ?[]u8 = null;
+    defer if (media_prompt) |prompt| alloc.free(prompt);
     for (requests) |request| {
-        if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
-        const item_uses_media = request.media.len > 0;
+        if (request.content_type.len > 0 and !isJsonContentType(request.content_type)) return error.BatchIncompatible;
+        var item = try extractorRequestShape(alloc, capabilities, request);
+        defer item.deinit(alloc);
+        const item_uses_media = item.media_parts > 0;
         if (uses_media) |expected| {
             if (expected != item_uses_media) return error.BatchIncompatible;
         } else uses_media = item_uses_media;
         if (item_uses_media) {
-            if (media_prompt_text) |expected| {
-                if (!std.mem.eql(u8, expected, request.source_text) or
-                    !optionalStringsEqual(media_prompt_parts, request.source_parts_json))
-                    return error.BatchIncompatible;
+            if (media_prompt) |expected| {
+                if (!std.mem.eql(u8, expected, item.prompt)) return error.BatchIncompatible;
             } else {
-                media_prompt_text = request.source_text;
-                media_prompt_parts = request.source_parts_json;
+                media_prompt = try alloc.dupe(u8, item.prompt);
             }
         }
     }
 }
 
 fn validateExtractorBatchPlan(
+    alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
     requests: []const asset_producer.Request,
 ) !void {
-    try validateExtractorBatchCompatibility(capabilities, requests);
+    try validateExtractorBatchCompatibility(alloc, capabilities, requests);
     var start: usize = 0;
     while (start < requests.len) {
-        const end = try extractorBatchEnd(capabilities, requests, start);
-        try validateExtractorInvocation(capabilities, requests[start..end]);
+        const end = try extractorBatchEnd(alloc, capabilities, requests, start);
+        try validateExtractorInvocation(alloc, capabilities, requests[start..end]);
         start = end;
     }
 }
@@ -1857,6 +1985,7 @@ fn generatorBatchEnd(
 }
 
 fn extractorBatchEnd(
+    alloc: Allocator,
     capabilities: inference_work.InferenceCapabilities,
     requests: []const asset_producer.Request,
     start: usize,
@@ -1866,11 +1995,10 @@ fn extractorBatchEnd(
     var end = start;
     var bytes: usize = 0;
     while (end < item_end) : (end += 1) {
-        var item_bytes: usize = 0;
-        for (requests[end].media) |media| item_bytes = std.math.add(usize, item_bytes, media.bytes.len) catch
-            return error.InferenceEncodedBytesExceeded;
-        if (item_bytes > max_encoded_media_bytes) return error.InferenceEncodedBytesExceeded;
-        const next = std.math.add(usize, bytes, item_bytes) catch return error.InferenceEncodedBytesExceeded;
+        var item = try extractorRequestShape(alloc, capabilities, requests[end]);
+        defer item.deinit(alloc);
+        if (item.encoded_media_bytes > max_encoded_media_bytes) return error.InferenceEncodedBytesExceeded;
+        const next = std.math.add(usize, bytes, item.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
         if (next > max_encoded_media_bytes) break;
         bytes = next;
     }
@@ -1893,14 +2021,80 @@ test "asset producer runtime extractor windows obey resolved item and encoded-by
         .output = .extraction,
         .prompt_policy = .structured_schema,
     };
-    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(capabilities, &requests, 0));
-    try validateExtractorInvocation(capabilities, requests[0..1]);
-    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateExtractorInvocation(capabilities, requests[0..2]));
-    try validateExtractorBatchPlan(capabilities, &requests);
+    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, &requests, 0));
+    try validateExtractorInvocation(std.testing.allocator, capabilities, requests[0..1]);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateExtractorInvocation(std.testing.allocator, capabilities, requests[0..2]));
+    try validateExtractorBatchPlan(std.testing.allocator, capabilities, &requests);
 
     var different_prompts = requests;
     different_prompts[1].source_text = "different prompt";
-    try std.testing.expectError(error.BatchIncompatible, validateExtractorBatchPlan(capabilities, &different_prompts));
+    try std.testing.expectError(error.BatchIncompatible, validateExtractorBatchPlan(std.testing.allocator, capabilities, &different_prompts));
+}
+
+test "asset producer runtime extractor admission accounts for inline source parts" {
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .extract,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 2, .max_items = 2, .max_encoded_media_bytes = 4, .max_media_parts_per_item = 1 },
+        .output = .extraction,
+        .prompt_policy = .structured_schema,
+    };
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,AQID\"}]" },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,BAUG\"}]" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, &requests, 0));
+    try validateExtractorBatchPlan(std.testing.allocator, capabilities, &requests);
+
+    var untrusted = requests[0];
+    untrusted.inline_media_trusted = false;
+    try std.testing.expectError(
+        error.UntrustedInlineMedia,
+        validateExtractorInvocation(std.testing.allocator, capabilities, &.{untrusted}),
+    );
+
+    var text_capabilities = capabilities;
+    text_capabilities.input_modalities = .{ .text = true };
+    text_capabilities.accepted_mime_types = .{ .text_plain = true };
+    text_capabilities.input_granularity = .item;
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        validateExtractorInvocation(std.testing.allocator, text_capabilities, requests[0..1]),
+    );
+
+    var plain = requests[0];
+    plain.content_type = "text/plain";
+    try std.testing.expectError(
+        error.BatchIncompatible,
+        validateExtractorBatchCompatibility(std.testing.allocator, capabilities, &.{plain}),
+    );
+}
+
+test "asset producer runtime extractor shape is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const capabilities = inference_work.InferenceCapabilities{
+                .task = .extract,
+                .input_modalities = .{ .image = true },
+                .accepted_mime_types = .{ .image_png = true },
+                .input_granularity = .page,
+                .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1, .max_encoded_media_bytes = 16, .max_media_parts_per_item = 1 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
+            var shape = try extractorRequestShape(alloc, capabilities, .{
+                .producer_type = .extractor,
+                .config_json = "{}",
+                .source_text = "",
+                .inline_media_trusted = true,
+                .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,AQID\"}]",
+            });
+            defer shape.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "asset producer runtime local reader chunks stop at source boundaries before the Florence cap" {
@@ -2120,19 +2314,42 @@ fn extractionContentJsonAlloc(alloc: Allocator, source_text: []const u8, source_
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(source_text, .{})});
 }
 
-fn extractionResultJsonAtAlloc(alloc: Allocator, response_json: []const u8, index: usize) ![]u8 {
+fn extractionResultsJsonAlloc(alloc: Allocator, response_json: []const u8, expected_items: usize) ![][]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_json, .{});
     defer parsed.deinit();
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("data")) |data| {
-            if (data == .array) {
-                if (index >= data.array.items.len) return error.InvalidExtractorResponse;
-                return try std.json.Stringify.valueAlloc(alloc, data.array.items[index], .{});
-            }
-        }
+    if (parsed.value != .object) return error.InvalidExtractorResponse;
+    const data = parsed.value.object.get("data") orelse return error.InvalidExtractorResponse;
+    if (data != .array or data.array.items.len != expected_items) return error.InvalidExtractorResponse;
+
+    const out = try alloc.alloc([]u8, expected_items);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
     }
-    if (index == 0) return try alloc.dupe(u8, response_json);
-    return error.InvalidExtractorResponse;
+    for (data.array.items, 0..) |item, index| {
+        out[index] = try std.json.Stringify.valueAlloc(alloc, item, .{});
+        initialized += 1;
+    }
+    return out;
+}
+
+test "asset producer runtime extractor batch response requires exact cardinality" {
+    const alloc = std.testing.allocator;
+    const exact = try extractionResultsJsonAlloc(alloc, "{\"data\":[{\"a\":1},{\"b\":2}]}", 2);
+    defer {
+        for (exact) |item| alloc.free(item);
+        alloc.free(exact);
+    }
+    try std.testing.expectEqualStrings("{\"a\":1}", exact[0]);
+    try std.testing.expectError(
+        error.InvalidExtractorResponse,
+        extractionResultsJsonAlloc(alloc, "{\"data\":[1,2,3]}", 2),
+    );
+    try std.testing.expectError(
+        error.InvalidExtractorResponse,
+        extractionResultsJsonAlloc(alloc, "{\"data\":[1]}", 2),
+    );
 }
 
 fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {

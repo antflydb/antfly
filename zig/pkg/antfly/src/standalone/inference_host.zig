@@ -1705,6 +1705,20 @@ fn localModelCapabilities(
         .transcribe => modalities.audio = true,
     };
 
+    const executor_modalities = inference.server.resolvedExecutorModalities(
+        @tagName(task),
+        modalities.text,
+        modalities.image,
+        modalities.audio,
+        modalities.document,
+    );
+    modalities = .{
+        .text = executor_modalities.text,
+        .image = executor_modalities.image,
+        .audio = executor_modalities.audio,
+        .document = executor_modalities.document,
+    };
+
     const native_batch_read = task == .read and manifest.native_arch_hint == .florence;
     const task_max_items = inference.server.resolvedTaskMaxItems(@tagName(task));
     const max_images = if (!modalities.image)
@@ -1723,17 +1737,10 @@ fn localModelCapabilities(
         modalities.audio,
         modalities.document,
     );
-    const output: antfly.inference.work.OutputKind = switch (task) {
-        .read => .read_result,
-        .generate => .generated_text,
-        .embed => .embedding,
-        .rerank => .ranked_items,
-        .chunk => .chunks,
-        .extract => .extraction,
-        .rewrite => .rewritten_text,
-        .classify => .classification,
-        .transcribe => .transcription,
-    };
+    const output = std.meta.stringToEnum(
+        antfly.inference.work.OutputKind,
+        inference.server.resolvedTaskOutput(@tagName(task)),
+    ).?;
     var result = antfly.inference.work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
@@ -1768,16 +1775,14 @@ fn localModelCapabilities(
             .per_item_failures = resolved_batch.per_item_failures,
         },
         .output = output,
-        .result_cardinality = if (task == .rerank or task == .chunk or task == .transcribe)
-            .one_per_request
-        else
-            .one_per_item,
-        .prompt_policy = if (task == .extract)
-            .structured_schema
-        else if (task == .chunk or task == .transcribe)
-            .model_default
-        else
-            .explicit,
+        .result_cardinality = std.meta.stringToEnum(
+            antfly.inference.work.ResultCardinality,
+            inference.server.resolvedTaskResultCardinality(@tagName(task)),
+        ).?,
+        .prompt_policy = std.meta.stringToEnum(
+            antfly.inference.work.PromptPolicy,
+            inference.server.resolvedTaskPromptPolicy(@tagName(task)),
+        ).?,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
     };
     try result.validate();

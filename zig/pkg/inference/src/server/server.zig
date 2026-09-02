@@ -14077,11 +14077,26 @@ fn appendModelInfo(
         cap_index += 1;
     }
     try buf.appendSlice(allocator, "],\"inputs\":[");
-    const accepts_text = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text");
-    const accepts_image = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image");
-    const accepts_audio = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
-    const accepts_document = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "document") or
+    const manifest_accepts_text = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text");
+    const manifest_accepts_image = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image");
+    const manifest_accepts_audio = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
+    const manifest_accepts_document = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "document") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "pdf");
+    const resolved_task = normalizedInferenceTask(task);
+    const executor_modalities = if (resolved_task) |value|
+        resolvedExecutorModalities(
+            value,
+            manifest_accepts_text,
+            manifest_accepts_image,
+            manifest_accepts_audio,
+            manifest_accepts_document,
+        )
+    else
+        ResolvedInferenceModalities{};
+    const accepts_text = executor_modalities.text;
+    const accepts_image = executor_modalities.image;
+    const accepts_audio = executor_modalities.audio;
+    const accepts_document = executor_modalities.document;
     var input_index: usize = 0;
     for ([_]struct { bool, []const u8 }{
         .{ accepts_text, "text" },
@@ -14134,6 +14149,75 @@ fn normalizedInferenceTask(task: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const ResolvedInferenceModalities = struct {
+    text: bool = false,
+    image: bool = false,
+    audio: bool = false,
+    document: bool = false,
+};
+
+/// Resolve manifest aspirations against the inputs the concrete executor can
+/// actually decode. Raw documents intentionally remain false: PDF preparation
+/// is a bounded upstream transformation, not a capability of today's model
+/// executors.
+pub fn resolvedExecutorModalities(
+    resolved_task: []const u8,
+    manifest_text: bool,
+    manifest_image: bool,
+    manifest_audio: bool,
+    manifest_document: bool,
+) ResolvedInferenceModalities {
+    _ = manifest_document;
+    if (std.mem.eql(u8, resolved_task, "read")) return .{ .image = manifest_image };
+    if (std.mem.eql(u8, resolved_task, "generate") or std.mem.eql(u8, resolved_task, "embed")) return .{
+        .text = manifest_text,
+        .image = manifest_image,
+        .audio = manifest_audio,
+    };
+    if (std.mem.eql(u8, resolved_task, "rerank")) return .{
+        .text = manifest_text,
+        .image = manifest_image,
+    };
+    if (std.mem.eql(u8, resolved_task, "extract")) return .{
+        .text = manifest_text,
+        .image = manifest_image,
+    };
+    if (std.mem.eql(u8, resolved_task, "chunk") or
+        std.mem.eql(u8, resolved_task, "rewrite") or
+        std.mem.eql(u8, resolved_task, "classify")) return .{ .text = manifest_text };
+    if (std.mem.eql(u8, resolved_task, "transcribe")) return .{ .audio = manifest_audio };
+    return .{};
+}
+
+pub fn resolvedTaskResultCardinality(resolved_task: []const u8) []const u8 {
+    return if (std.mem.eql(u8, resolved_task, "rerank") or
+        std.mem.eql(u8, resolved_task, "chunk") or
+        std.mem.eql(u8, resolved_task, "transcribe"))
+        "one_per_request"
+    else
+        "one_per_item";
+}
+
+pub fn resolvedTaskPromptPolicy(resolved_task: []const u8) []const u8 {
+    return if (std.mem.eql(u8, resolved_task, "extract"))
+        "structured_schema"
+    else if (std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
+        "model_default"
+    else
+        "explicit";
+}
+
+test "executor capability resolution never advertises raw documents" {
+    for ([_][]const u8{ "read", "generate", "embed", "rerank", "chunk", "extract", "rewrite", "classify", "transcribe" }) |task| {
+        const modalities = resolvedExecutorModalities(task, true, true, true, true);
+        try std.testing.expect(!modalities.document);
+    }
+    const extract = resolvedExecutorModalities("extract", true, true, true, true);
+    try std.testing.expect(extract.text and extract.image and !extract.audio);
+    const transcribe = resolvedExecutorModalities("transcribe", true, true, true, true);
+    try std.testing.expect(transcribe.audio and !transcribe.text and !transcribe.image);
+}
+
 fn appendResolvedInferenceCapabilities(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -14148,6 +14232,7 @@ fn appendResolvedInferenceCapabilities(
     accepts_document: bool,
 ) !void {
     const resolved_task = normalizedInferenceTask(task) orelse return;
+    if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document) return;
     const resolved = try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
@@ -14197,18 +14282,9 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, ",\"output\":");
     try jsonEncodeString(buf, allocator, resolvedTaskOutput(resolved_task));
     try buf.appendSlice(allocator, ",\"result_cardinality\":");
-    try jsonEncodeString(buf, allocator, if (std.mem.eql(u8, resolved_task, "rerank") or
-        std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
-        "one_per_request"
-    else
-        "one_per_item");
+    try jsonEncodeString(buf, allocator, resolvedTaskResultCardinality(resolved_task));
     try buf.appendSlice(allocator, ",\"prompt_policy\":");
-    try jsonEncodeString(buf, allocator, if (std.mem.eql(u8, resolved_task, "extract"))
-        "structured_schema"
-    else if (std.mem.eql(u8, resolved_task, "chunk") or std.mem.eql(u8, resolved_task, "transcribe"))
-        "model_default"
-    else
-        "explicit");
+    try jsonEncodeString(buf, allocator, resolvedTaskPromptPolicy(resolved_task));
     try buf.appendSlice(allocator, ",\"borrowed_attachments\":false");
     try buf.appendSlice(allocator, ",\"batch\":{\"mode\":");
     try jsonEncodeString(buf, allocator, @tagName(resolved.mode));
@@ -14242,7 +14318,7 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, limits_suffix);
 }
 
-fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
+pub fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
     if (std.mem.eql(u8, resolved_task, "read")) return "read_result";
     if (std.mem.eql(u8, resolved_task, "generate")) return "generated_text";
     if (std.mem.eql(u8, resolved_task, "embed")) return "embedding";
@@ -20800,16 +20876,25 @@ pub fn requestMediaMaxDecodedPixels(self: *const Node, max_images: usize) u64 {
     return @intCast(pixels);
 }
 
-fn modelCatalogDecodedPixelCap(self: *const Node, task: []const u8) u64 {
-    const max_images: usize = if (std.mem.eql(u8, task, "readers"))
+fn modelCatalogMaxImages(task: []const u8) usize {
+    return if (std.mem.eql(u8, task, "readers"))
         max_read_batch_images
     else if (std.mem.eql(u8, task, "generators"))
         std.math.mul(usize, max_generate_batch_items, max_generate_media_parts_per_item) catch std.math.maxInt(usize)
     else if (std.mem.eql(u8, task, "embedders"))
         64
+    else if (std.mem.eql(u8, task, "extractors"))
+        max_serial_family_batch_items
     else
         1;
-    return requestMediaMaxDecodedPixels(self, max_images);
+}
+
+fn modelCatalogDecodedPixelCap(self: *const Node, task: []const u8) u64 {
+    return requestMediaMaxDecodedPixels(self, modelCatalogMaxImages(task));
+}
+
+test "model catalog pixel ceilings cover extractor batches" {
+    try std.testing.expectEqual(max_serial_family_batch_items, modelCatalogMaxImages("extractors"));
 }
 
 fn downloadRemoteContent(self: *const Node, alloc: std.mem.Allocator, url: []const u8) !scraping.DownloadedContent {

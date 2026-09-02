@@ -620,6 +620,45 @@ document. They are architectural requirements, not Florence-specific cleanup:
     effective content/prompt representation matches. The direct executor also
     rejects conflicting nonempty per-image prompts, so fallback and direct ABI
     callers cannot produce prompt-dependent results under the wrong prompt.
+58. **Manifest document inputs were advertised as executable raw-PDF support.**
+    Resolved modalities are now the intersection of manifest inputs and the
+    concrete task executor. Current read, generate, embed, rerank, extract, and
+    other executors do not decode a PDF container directly, so none advertises
+    `document` or `application/pdf`. PDFs enter inference only after bounded
+    preparation produces page images or text chunks. A future raw-document
+    executor may advertise that modality only when its request parser,
+    admission, and backend implement it end to end.
+59. **Extractor admission inspected borrowed attachments but not media inside
+    `source_parts_json`.** One normalized extractor item-shape parser now drives
+    batch compatibility, executor admission, and window formation. It accounts
+    for inline data and data URLs, validates trust and MIME, tracks unknown
+    remote media until provider-owned download admission, enforces one media
+    part per item, and derives only the prompt text when grouping image work.
+60. **Extraction batch responses accepted missing or extra results and copied
+    a non-JSON batch response to every input.** Batch execution now requires a
+    structured output representation, parses the provider envelope once, and
+    requires exactly one result for every requested item before assigning any
+    output. Non-JSON extraction falls back to independent task executions,
+    where one response has one unambiguous owner.
+61. **The proxy validated numeric batch fields but treated malformed V3 exact
+    sets as a harmless narrower contract.** Every V3 descriptor, including a
+    singleton catalog result, is now normalized before merge. Unknown enum
+    values, non-string members, duplicates, missing booleans, empty exact
+    sets, and empty intersections poison the model descriptor. A malformed
+    eligible endpoint therefore cannot lend apparently valid capabilities to
+    a heterogeneous route.
+62. **Legacy capability parsing assigned generator-like cardinality and prompt
+    defaults to every model family.** V1/V2 compatibility now derives stable
+    operation semantics from the task: rerank, chunk, and transcribe return one
+    result per request; extract requires a structured schema; chunk and
+    transcribe use model-default prompting. The common capability validator
+    enforces task/output/cardinality invariants; exact descriptors retain their
+    resolved model-specific prompt policy rather than inheriting a legacy
+    default.
+63. **The HTTP catalog computed extractor decoded-pixel capacity for one image
+    while advertising a multi-item extraction request.** Catalog pixel
+    admission now uses the extractor executor's full serial-family item cap,
+    matching the linked resolver and its concrete invocation ceiling.
 
 ### Post-review implementation contract
 
@@ -755,8 +794,9 @@ The hardening above follows four long-term rules:
     malformed local reports cannot cancel each other out.
 16. **Implemented after review:** reader URI admission measures decoded base64
     data URIs and validates MIME before local callback or remote adaptation.
-    Generator admission recognizes PDF as the
-    document modality.
+    Generic work contracts can represent a document modality, but current
+    generator and embedder executors deliberately do not advertise raw PDF;
+    the document planner must first produce bounded page images or text chunks.
 17. **Implemented after review:** capability single-flight waiters observe
     cancellation/deadlines, catalog fetches have a finite timeout, and cache
     teardown drains in-flight owners instead of asserting they do not exist.
@@ -807,6 +847,12 @@ The hardening above follows four long-term rules:
     capability-aware extractor windowing, borrowed extractor attachments, and
     shared HTTP/linked validators remove the remaining deployment-specific
     interpretations of the model-work contract.
+30. **Implemented after exact-contract review:** task/executor modality
+    intersection removes false raw-document claims; extraction content has one
+    normalized admission shape and exact batch demultiplexing; proxy V3
+    descriptors are validated before singleton publication or intersection;
+    legacy task semantics and extractor pixel ceilings match the concrete
+    executors.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
