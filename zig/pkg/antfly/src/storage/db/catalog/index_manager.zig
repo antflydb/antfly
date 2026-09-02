@@ -10770,6 +10770,25 @@ pub const IndexManager = struct {
         return .projection_changed;
     }
 
+    /// Return whether `key` belongs to the source projection captured by
+    /// `context`. The caller must hold the catalog shared lock, normally
+    /// through a ManagedIndexApplyGuard. Replay delete lanes are shared by
+    /// all derived index kinds, so an artifact-backed text index must filter
+    /// them by the same source predicate used for indexing writes.
+    pub fn textPublicationContextConsumesKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
     /// Plan the natural segment fan-out before producer admission. Projection
     /// is repeated during publication, but tokenization and segment construction
     /// still happen only once. Using the same source and segment splitters as
