@@ -371,7 +371,7 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
-    try validateArtifactIndexReferences(parsed.value, enrichments);
+    try validateArtifactIndexReferences(alloc, parsed.value, enrichments);
 }
 
 /// Validate only properties that can be decided from one create-index request.
@@ -416,13 +416,14 @@ fn validateArtifactEnrichmentConfigDefinitions(
         try enrichment_config_validation.validatePublicConfig(alloc, cfg);
         for (configs[0..i]) |prior| {
             if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-            if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
+            if (!try artifactEnrichmentConfigsEqual(alloc, prior, cfg)) return error.ConflictingEnrichmentConfig;
         }
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
     }
 }
 
 fn validateArtifactIndexReferences(
+    alloc: std.mem.Allocator,
     root: std.json.Value,
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
@@ -441,7 +442,7 @@ fn validateArtifactIndexReferences(
         if (std.mem.eql(u8, index_type, "embeddings")) {
             const external = if (object.get("external")) |value| value == .bool and value.bool else false;
             if (!external) {
-                try validateEmbeddingArtifactReferences(object, configs);
+                try validateEmbeddingArtifactReferences(alloc, object, configs);
             }
         } else if (std.mem.eql(u8, index_type, "full_text")) {
             if (object.get("artifact_name")) |value| {
@@ -489,6 +490,7 @@ fn graphArtifactConfigExists(
 }
 
 fn validateEmbeddingArtifactReferences(
+    alloc: std.mem.Allocator,
     object: anytype,
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
@@ -536,7 +538,8 @@ fn validateEmbeddingArtifactReferences(
             saw_implicit = true;
             if (cfg.producer_json.len == 0) return error.InvalidEnrichmentConfig;
             if (implicit_producer) |expected| {
-                if (!std.mem.eql(u8, expected, cfg.producer_json)) return error.InvalidEnrichmentConfig;
+                if (!try producerJsonValuesEqual(alloc, expected, cfg.producer_json))
+                    return error.InvalidEnrichmentConfig;
             } else {
                 implicit_producer = cfg.producer_json;
             }
@@ -660,7 +663,22 @@ fn findArtifactEnrichmentConfig(
     return null;
 }
 
-fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) bool {
+fn producerJsonValuesEqual(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8) !bool {
+    if (lhs.len == 0 or rhs.len == 0) return lhs.len == rhs.len;
+    var lhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, lhs, .{}) catch
+        return error.InvalidEnrichmentConfig;
+    defer lhs_parsed.deinit();
+    var rhs_parsed = std.json.parseFromSlice(std.json.Value, alloc, rhs, .{}) catch
+        return error.InvalidEnrichmentConfig;
+    defer rhs_parsed.deinit();
+    return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
+}
+
+fn artifactEnrichmentConfigsEqual(
+    alloc: std.mem.Allocator,
+    a: db_mod.types.EnrichmentConfig,
+    b: db_mod.types.EnrichmentConfig,
+) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.field, b.field) and
@@ -673,7 +691,7 @@ fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.ty
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.meta.eql(a.execution, b.execution);
 }
 
@@ -6490,6 +6508,16 @@ test "merged index metadata validates artifact consumer references" {
     try std.testing.expectError(
         error.InvalidEnrichmentConfig,
         validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, incompatible_vectors),
+    );
+
+    try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"title_dense_v1","kind":"embedding","field":"title","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"embed-v1\"}"},
+        \\    {"name":"body_dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":"{ \"model\" : \"embed-v1\", \"provider\" : \"antfly\" }"}
+        \\  ],
+        \\  "document_vectors":{"type":"embeddings","dimension":3,"sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}]}
+        \\}
     );
 
     const dense_sparse_mismatch = try addIndexToTableIndexesJson(

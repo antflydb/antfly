@@ -97,6 +97,23 @@ def _document_units_index_config() -> dict:
     }
 
 
+def _semantic_embedding_producer(*, model: str, endpoint: str) -> dict:
+    """Return the durable, credential-free embedding producer identity."""
+
+    return {
+        "version": 2,
+        "provider": "openai",
+        "model": model,
+        "endpoint": endpoint,
+        "region": "",
+        "request_format": "",
+        "sparse": False,
+        "multimodal": False,
+        "input_type": "",
+        "truncate": "",
+    }
+
+
 def _manifest_ready(api, table_name: str, doc_key: str) -> dict | None:
     try:
         manifest = api.get(
@@ -1131,6 +1148,10 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     assert coverage is not None, json.dumps(
         stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
+    enrichment_runtime = coverage["status"]["enrichment_runtime"]
+    assert enrichment_runtime["enabled"] is True
+    assert enrichment_runtime["worker_started"] is True
+    assert enrichment_runtime.get("embed_batches_completed", 0) > 0
 
     # Match paged public /merge clients: close the final key range with an
     # empty full-index merge before the process restart. This used to leave a
@@ -1193,6 +1214,79 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     assert coverage_after_restart is not None, json.dumps(
         stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
+
+
+def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
+    stateful_api, openai_embedder
+):
+    """Semantic provenance must resolve to exactly one executable owner."""
+
+    orphan_table = f"embedding_orphan_producer_{time.time_ns()}"
+    stateful_api.create_table(orphan_table, num_shards=1)
+    with pytest.raises(requests.HTTPError) as orphan_error:
+        stateful_api.put(
+            f"{_table_artifact_path(orphan_table, 'orphan_dense_v1')}/enrichment",
+            {
+                "kind": "embedding",
+                "field": "body",
+                "expected_dims": 3,
+                "producer_json": _semantic_embedding_producer(
+                    model="text-embedding-3-small",
+                    endpoint=f"{openai_embedder}/v1",
+                ),
+            },
+        )
+    assert orphan_error.value.response.status_code == 400
+    assert "invalid_embedding_artifact_producer" in orphan_error.value.response.text
+
+    owner_table = f"embedding_owned_producer_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{owner_table}",
+        {
+            "num_shards": 1,
+            "indexes": {
+                "document_vectors": {
+                    "type": "embeddings",
+                    "field": "body",
+                    "dimension": 3,
+                    "embedding_name": "document_dense_v1",
+                    "embedder": {
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "url": openai_embedder,
+                        "dimensions": 3,
+                    },
+                    "enrichments": [
+                        {
+                            "name": "document_dense_v1",
+                            "kind": "embedding",
+                            "field": "body",
+                            "expected_dims": 3,
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    with pytest.raises(requests.HTTPError) as mismatch_error:
+        stateful_api.put(
+            f"{_table_artifact_path(owner_table, 'document_dense_v1')}/enrichment",
+            {
+                "kind": "embedding",
+                "field": "body",
+                "expected_dims": 3,
+                "producer_json": _semantic_embedding_producer(
+                    model="different-model",
+                    endpoint=f"{openai_embedder}/v1",
+                ),
+            },
+        )
+    assert mismatch_error.value.response.status_code == 400
+    assert "invalid_embedding_artifact_producer" in mismatch_error.value.response.text
+
+    # Failed replacement is atomic: the original owner and its artifact remain.
+    detail = stateful_api.get_index(owner_table, "document_vectors")
+    assert detail["config"]["type"] == "embeddings"
 
 
 def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(

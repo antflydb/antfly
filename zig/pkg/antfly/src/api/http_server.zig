@@ -10629,10 +10629,11 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
-        const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
             alloc,
             index_name,
             expanded_index_json,
+            table_before.indexes_json,
             .{
                 .antfly_provider = self.antfly_provider,
                 .io = self.inferenceIo(),
@@ -10643,6 +10644,11 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -10701,6 +10707,28 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expected_indexes_json);
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            expected_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound => return error.ModelNotFound,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
             error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -10879,12 +10907,50 @@ pub const ApiHttpServer = struct {
             return error.InvalidEnrichmentRequest;
         };
         defer alloc.free(enrichment_json);
+        managed_embedder.validateEmbeddingEnrichmentProducerJsonWithOptions(
+            alloc,
+            enrichment_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
 
         const expected_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
             else => return error.InternalFailure,
         };
         defer alloc.free(expected_indexes_json);
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            alloc,
+            expected_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.ModelNotFound, error.EmbeddingProbeUnavailable, error.InvalidCreateTableRequest => return error.InvalidEnrichmentRequest,
+            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+            else => return error.InternalFailure,
+        };
         indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
             error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
             else => return error.InternalFailure,
@@ -12294,12 +12360,38 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
             else => return err,
         };
         if (request.indexes_json) |old| self.alloc.free(old);
         request.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
             return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| return switch (err) {
+            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment has no producer configuration"),
+            error.InvalidEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment producer is not runnable"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
+            else => return err,
+        };
 
         const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
             self.alloc,
@@ -32300,6 +32392,7 @@ test "api http server create index installs exact visible config and defers lagg
         project_create: bool = true,
         mutex: std.atomic.Mutex = .unlocked,
         projection_wait_calls: std.atomic.Value(usize) = .init(0),
+        put_enrichment_calls: usize = 0,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -32311,6 +32404,7 @@ test "api http server create index installs exact visible config and defers lagg
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
                     .drop_index = dropIndex,
+                    .put_artifact_enrichment = putArtifactEnrichment,
                     .wait_table_projection = waitTableProjection,
                 },
             };
@@ -32402,6 +32496,17 @@ test "api http server create index installs exact visible config and defers lagg
             }
         }
 
+        fn putArtifactEnrichment(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.put_enrichment_calls += 1;
+        }
+
         fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
             try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -32459,6 +32564,122 @@ test "api http server create index installs exact visible config and defers lagg
             if (self.enqueue_error) |err| return err;
         }
     };
+
+    // Artifact-backed embedding indexes consume the output owned by the
+    // matching enrichment. They must not require a duplicate index-local
+    // embedder or a document field/template before reaching catalog admission.
+    {
+        var artifact_source = FakeSource{
+            .indexes_json =
+            \\{"enrichments":[{"name":"p1_chunks_v1","kind":"chunk","field":"content","chunk_size":128,"chunk_overlap":16},{"name":"p1_chunkvec_v1","kind":"embedding","field":"content","source_artifact_name":"p1_chunks_v1","expected_dims":384,"producer_json":"{\"provider\":\"antfly\",\"model\":\"BAAI/bge-small-en-v1.5\",\"url\":\"http://127.0.0.1:1/ai/v1\"}"}]}
+            ,
+        };
+        defer artifact_source.deinit(alloc);
+        var artifact_writes = FakeWrites{};
+        var artifact_server = ApiHttpServer.init(
+            alloc,
+            .{ .deployment_mode = .standalone },
+            artifact_source.iface(),
+            null,
+            artifact_writes.source(),
+        );
+        defer artifact_server.deinit();
+
+        const cases = [_]struct {
+            name: []const u8,
+            body: []const u8,
+        }{
+            .{
+                .name = "artifact_sources_idx",
+                .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+            },
+            .{
+                .name = "artifact_compat_idx",
+                .body = "{\"type\":\"embeddings\",\"embedding_name\":\"p1_chunkvec_v1\",\"dimension\":384,\"distance_metric\":\"cosine\"}",
+            },
+            .{
+                .name = "artifact_sources_inferred_idx",
+                .body = "{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+            },
+            .{
+                .name = "artifact_compat_inferred_idx",
+                .body = "{\"type\":\"embeddings\",\"embedding_name\":\"p1_chunkvec_v1\"}",
+            },
+        };
+        for (cases) |case| {
+            const uri = try std.fmt.allocPrint(alloc, "/tables/docs/indexes/{s}", .{case.name});
+            defer alloc.free(uri);
+            var response = try executeHttpxTestRequest(&artifact_server, .{
+                .method = .POST,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = case.body,
+            });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 201), response.status);
+            var stored = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, case.name);
+            defer if (stored) |*found| found.deinit();
+            try std.testing.expect(stored != null);
+            try std.testing.expectEqual(@as(i64, 384), stored.?.config.object.get("dimension").?.integer);
+        }
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+
+        var missing_enrichment = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/missing_enrichment_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"does_not_exist\"}]}",
+        });
+        defer missing_enrichment.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), missing_enrichment.status);
+        try std.testing.expect(std.mem.indexOf(u8, missing_enrichment.body, "missing_embedding_artifact_enrichment") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+
+        var conflicting_dimension = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/conflicting_dimension_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":768,\"sources\":[{\"artifact\":\"p1_chunkvec_v1\"}]}",
+        });
+        defer conflicting_dimension.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), conflicting_dimension.status);
+        try std.testing.expect(std.mem.indexOf(u8, conflicting_dimension.body, "conflicting_embedding_artifact_dimensions") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+
+        const missing_producer = try indexes_api.addEnrichmentToTableIndexesJson(
+            alloc,
+            artifact_source.indexes_json,
+            "missing_producer_v1",
+            "{\"name\":\"missing_producer_v1\",\"kind\":\"embedding\",\"field\":\"content\",\"expected_dims\":384}",
+        );
+        artifact_source.replaceIndexesJson(alloc, missing_producer, true);
+        var rejected = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/missing_producer_idx",
+            .content_type = "application/json",
+            .body = "{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"missing_producer_v1\"}]}",
+        });
+        defer rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected.status);
+        try std.testing.expect(std.mem.indexOf(u8, rejected.body, "missing_embedding_artifact_producer") != null);
+        try std.testing.expectEqual(@as(usize, cases.len), artifact_writes.create_calls);
+        var absent = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, "missing_producer_idx");
+        defer if (absent) |*found| found.deinit();
+        try std.testing.expect(absent == null);
+
+        // Replacing a producer used by an existing index is validated against
+        // the complete post-update catalog before the metadata mutation.
+        var rejected_replacement = try executeHttpxTestRequest(&artifact_server, .{
+            .method = .PUT,
+            .uri = "/tables/docs/artifacts/p1_chunkvec_v1/enrichment",
+            .content_type = "application/json",
+            .body = "{\"kind\":\"embedding\",\"field\":\"content\",\"source_artifact_name\":\"p1_chunks_v1\",\"expected_dims\":384}",
+        });
+        defer rejected_replacement.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected_replacement.status);
+        try std.testing.expect(std.mem.indexOf(u8, rejected_replacement.body, "producer") != null);
+        try std.testing.expectEqual(@as(usize, 0), artifact_source.put_enrichment_calls);
+    }
 
     var source = FakeSource{};
     defer source.deinit(alloc);
@@ -33708,6 +33929,20 @@ test "api http server create table with local writes waits for projected presenc
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expect(!source.created);
+    try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+
+    var invalid_producer_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body =
+        \\{"indexes":{"artifact_vectors":{"type":"embeddings","sources":[{"artifact":"body_dense_v1"}],"enrichments":[{"name":"body_dense_v1","kind":"embedding","field":"body","expected_dims":384}]}}}
+        ,
+    });
+    defer invalid_producer_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_producer_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_producer_resp.body, "producer") != null);
     try std.testing.expect(!source.created);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
 

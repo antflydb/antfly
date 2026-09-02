@@ -234,6 +234,11 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
+        MissingEmbeddingArtifactEnrichment,
+        MissingEmbeddingArtifactProducer,
+        InvalidEmbeddingArtifactProducer,
+        EmbeddingArtifactDimensionRequired,
+        ConflictingEmbeddingArtifactDimensions,
         UnsupportedArtifactIndexSources,
         ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
@@ -260,6 +265,11 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidEnrichmentRequest,
+        MissingEmbeddingArtifactEnrichment,
+        MissingEmbeddingArtifactProducer,
+        InvalidEmbeddingArtifactProducer,
+        EmbeddingArtifactDimensionRequired,
+        ConflictingEmbeddingArtifactDimensions,
         InternalFailure,
     };
 
@@ -1804,6 +1814,11 @@ pub fn handleTableCreateIndex(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
+        error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_enrichment\",\"message\":\"embedding index source has no matching embedding enrichment\",\"retryable\":false}"), .json = true },
+        error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_producer\",\"message\":\"embedding enrichment has no producer configuration\",\"retryable\":false}"), .json = true },
+        error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_embedding_artifact_producer\",\"message\":\"embedding enrichment producer is not runnable\",\"retryable\":false}"), .json = true },
+        error.EmbeddingArtifactDimensionRequired => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"embedding_artifact_dimension_required\",\"message\":\"embedding enrichment must declare positive expected_dims\",\"retryable\":false}"), .json = true },
+        error.ConflictingEmbeddingArtifactDimensions => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"conflicting_embedding_artifact_dimensions\",\"message\":\"embedding index sources declare different dimensions\",\"retryable\":false}"), .json = true },
         error.UnsupportedArtifactIndexSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"), .json = true },
         error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
             .status = 503,
@@ -1860,6 +1875,11 @@ pub fn handlePutArtifactEnrichment(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
+        error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment has no producer configuration") },
+        error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment producer is not runnable") },
+        error.EmbeddingArtifactDimensionRequired => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment must declare positive expected_dims") },
+        error.ConflictingEmbeddingArtifactDimensions => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index sources declare different dimensions") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };

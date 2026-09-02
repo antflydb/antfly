@@ -93,6 +93,34 @@ pub fn validateIndexConfigWithOptions(
     }
 }
 
+/// Validate the complete producer registry for a table before catalog commit.
+/// Per-index parsing cannot prove that artifact-backed embedding indexes have
+/// a runnable producer because their authoritative enrichment may already be
+/// stored at table scope.
+pub fn validateManagedEmbeddingRuntimeConfigJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) !void {
+    var managed = managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+        alloc,
+        indexes_json,
+        options,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ModelNotFound => return err,
+        error.EmbeddingProbeUnavailable => return err,
+        error.MissingEmbeddingArtifactEnrichment,
+        error.MissingEmbeddingArtifactProducer,
+        error.InvalidEmbeddingArtifactProducer,
+        error.EmbeddingArtifactDimensionRequired,
+        error.ConflictingEmbeddingArtifactDimensions,
+        => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+    managed.deinit();
+}
+
 fn validateGraphConfig(alloc: std.mem.Allocator, config_json: []const u8) !void {
     index_manager.validateGraphConfig(alloc, config_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -190,6 +218,29 @@ pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
     return try alloc.dupe(u8, index_json);
 }
 
+pub fn normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+    catalog_indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    var parsed_index = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed_index.deinit();
+    var parsed_catalog = try std.json.parseFromSlice(std.json.Value, alloc, catalog_indexes_json, .{});
+    defer parsed_catalog.deinit();
+    if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+        alloc,
+        index_name,
+        parsed_index.value,
+        parsed_catalog.value,
+        options,
+    )) |normalized| {
+        return normalized;
+    }
+    return try alloc.dupe(u8, index_json);
+}
+
 pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
@@ -212,7 +263,13 @@ pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, entry.key_ptr.*, entry.value_ptr.*, options)) |normalized| {
+        if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+            alloc,
+            entry.key_ptr.*,
+            entry.value_ptr.*,
+            parsed.value,
+            options,
+        )) |normalized| {
             defer alloc.free(normalized);
             try out.appendSlice(alloc, normalized);
         } else {
