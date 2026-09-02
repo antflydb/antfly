@@ -80,8 +80,11 @@ credentials.
    exact scope membership, and every digest.
 4. npm, PyPI, the Homebrew formula, and the single multi-architecture container
    image consume those verified scopes. The container publisher is callable
-   only by this controller and consumes the GNU runtime archives built in step
-   1. It first builds run-scoped images, seals them under the release-ledger
+   only by this controller, checks out the recorded controller commit, and
+   consumes the GNU runtime archives built from the source commit in step 1.
+   Its Dockerfile, Cloud Build configuration, platform policy, and registry
+   code are therefore controller-owned rather than source-provided. It first
+   builds run-scoped images, seals them under the release-ledger
    digest, and then compare-or-creates the version tags. A retry can reuse an
    identical image but cannot overwrite a released version with different
    bytes.
@@ -99,6 +102,11 @@ credentials.
 Channel bootstrap is fail-closed. The discovery controller treats only an
 explicit missing release, package, or dist-tag as empty state; authentication,
 rate-limit, malformed-response, and network failures stop promotion.
+Container and npm operations use the typed adapters under
+`scripts/release/registry/`. Registry lookups return only present or explicitly
+missing; failures are a separate error path and can never authorize creation.
+Immutable container tags are compare-or-created and mutable aliases are copied
+and then digest-verified through the same interface.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
@@ -164,6 +172,10 @@ scripts under `scripts/release/`:
 - `release_channel_state.py` compare-and-swaps each channel journal, prevents
   backward promotion, and makes an interrupted promotion resumable only by the
   same release identity.
+- `registryctl.py` is the workflow-facing command for the typed npm and
+  container adapters. Provider behavior is tested with injected responses for
+  missing objects, content drift, authentication and network failures, and
+  post-copy verification.
 - `download_objectstorage.py` restores a nightly's exact ledger members from
   immutable object storage for recovery; the normal ledger and attestation
   verification still runs before promotion.

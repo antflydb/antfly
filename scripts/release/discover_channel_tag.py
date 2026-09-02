@@ -7,10 +7,12 @@ import argparse
 import json
 import os
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+
+from registry.model import RegistryError
+from registry.npm import dist_tag, version_integrity
 
 OpenURL = Callable[..., Any]
 
@@ -57,50 +59,18 @@ def discover_github_latest(repository: str, token: str, opener: OpenURL) -> str:
 
 
 def discover_npm_tag(package: str, tag: str, opener: OpenURL) -> str:
-    if not package or not tag:
-        raise SystemExit("npm channel discovery requires a package and dist-tag")
-    encoded_package = urllib.parse.quote(package, safe="")
-    document = load_json(
-        f"https://registry.npmjs.org/{encoded_package}",
-        {"Accept": "application/json", "User-Agent": "antfly-release-controller"},
-        opener,
-    )
-    if document is None:
-        return ""
-    dist_tags = document.get("dist-tags")
-    if not isinstance(dist_tags, dict):
-        raise SystemExit("npm package metadata has no dist-tags object")
-    version = dist_tags.get(tag)
-    if version is None:
-        return ""
-    if not isinstance(version, str) or not version:
-        raise SystemExit(f"npm dist-tag {tag} has an invalid version")
-    return f"v{version}"
+    try:
+        version = dist_tag(package, tag, opener)
+    except RegistryError as exc:
+        raise SystemExit(str(exc)) from exc
+    return f"v{version}" if version else ""
 
 
 def discover_npm_integrity(package: str, version: str, opener: OpenURL) -> str:
-    if not package or not version:
-        raise SystemExit("npm version discovery requires a package and version")
-    encoded_package = urllib.parse.quote(package, safe="")
-    document = load_json(
-        f"https://registry.npmjs.org/{encoded_package}",
-        {"Accept": "application/json", "User-Agent": "antfly-release-controller"},
-        opener,
-    )
-    if document is None:
-        return ""
-    versions = document.get("versions")
-    if not isinstance(versions, dict):
-        raise SystemExit("npm package metadata has no versions object")
-    release = versions.get(version)
-    if release is None:
-        return ""
-    if not isinstance(release, dict) or not isinstance(release.get("dist"), dict):
-        raise SystemExit(f"npm version {version} has invalid metadata")
-    integrity = release["dist"].get("integrity")
-    if not isinstance(integrity, str) or not integrity:
-        raise SystemExit(f"npm version {version} has no integrity")
-    return integrity
+    try:
+        return version_integrity(package, version, opener) or ""
+    except RegistryError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def main() -> int:

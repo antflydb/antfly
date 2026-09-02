@@ -13,6 +13,10 @@ on:
         description: "Authenticated release source commit"
         required: true
         type: string
+      controller_commit:
+        description: "Trusted release-controller commit"
+        required: true
+        type: string
       ledger_sha256:
         description: "Digest of the authenticated release ledger"
         required: true
@@ -38,14 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ inputs.controller_commit }}
           fetch-depth: 0
-          submodules: true
 
       - name: Revalidate trusted caller and release identity
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
           RELEASE_COMMIT: ${{ inputs.source_commit }}
+          CONTROLLER_COMMIT: ${{ inputs.controller_commit }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -59,9 +63,11 @@ jobs:
             exit 2
           fi
           [[ "$LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$CONTROLLER_COMMIT"
           git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git cat-file -e "$RELEASE_COMMIT^{commit}"
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
 
       - uses: actions/download-artifact@v6
         with:
@@ -149,27 +155,11 @@ jobs:
           LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          promote_ref() {
-            local source="$1" destination="$2" source_digest destination_digest actual_digest
-            source_digest="$(crane digest "$source")"
-            destination_digest="$(crane digest "$destination" 2>/dev/null || true)"
-            if [ -n "$destination_digest" ]; then
-              if [ "$destination_digest" != "$source_digest" ]; then
-                echo "immutable container tag differs: $destination" >&2
-                echo "existing: $destination_digest" >&2
-                echo "new:      $source_digest" >&2
-                return 1
-              fi
-              echo "immutable container tag already matches: $destination"
-              return 0
-            fi
-            crane copy "$source" "$destination"
-            actual_digest="$(crane digest "$destination")"
-            test "$actual_digest" = "$source_digest"
-          }
           image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
           for arch in amd64 arm64; do
-            promote_ref "${image}:${BUILD_TAG}-${arch}" "${image}:${LEDGER_TAG}-${arch}"
+            python3 scripts/release/registryctl.py container-ensure \
+              --source "${image}:${BUILD_TAG}-${arch}" \
+              --destination "${image}:${LEDGER_TAG}-${arch}"
           done
 
       - name: Create the multi-architecture manifest last
@@ -204,31 +194,21 @@ jobs:
           LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          promote_ref() {
-            local source="$1" destination="$2" source_digest destination_digest actual_digest
-            source_digest="$(crane digest "$source")"
-            destination_digest="$(crane digest "$destination" 2>/dev/null || true)"
-            if [ -n "$destination_digest" ]; then
-              if [ "$destination_digest" != "$source_digest" ]; then
-                echo "immutable container tag differs: $destination" >&2
-                echo "existing: $destination_digest" >&2
-                echo "new:      $source_digest" >&2
-                return 1
-              fi
-              echo "immutable container tag already matches: $destination"
-              return 0
-            fi
-            crane copy "$source" "$destination"
-            actual_digest="$(crane digest "$destination")"
-            test "$actual_digest" = "$source_digest"
-          }
           gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
-          promote_ref "${gar_image}:${BUILD_TAG}" "${gar_image}:${LEDGER_TAG}"
+          python3 scripts/release/registryctl.py container-ensure \
+            --source "${gar_image}:${BUILD_TAG}" \
+            --destination "${gar_image}:${LEDGER_TAG}"
           for arch in amd64 arm64; do
-            promote_ref "${gar_image}:${LEDGER_TAG}-${arch}" "${gar_image}:${VERSION}-${arch}"
+            python3 scripts/release/registryctl.py container-ensure \
+              --source "${gar_image}:${LEDGER_TAG}-${arch}" \
+              --destination "${gar_image}:${VERSION}-${arch}"
           done
-          promote_ref "${gar_image}:${LEDGER_TAG}" "${gar_image}:${VERSION}"
-          promote_ref "${gar_image}:${LEDGER_TAG}" "ghcr.io/antflydb/antfly:${VERSION}"
+          python3 scripts/release/registryctl.py container-ensure \
+            --source "${gar_image}:${LEDGER_TAG}" \
+            --destination "${gar_image}:${VERSION}"
+          python3 scripts/release/registryctl.py container-ensure \
+            --source "${gar_image}:${LEDGER_TAG}" \
+            --destination "ghcr.io/antflydb/antfly:${VERSION}"
 
       - uses: sigstore/cosign-installer@v3
 

@@ -203,6 +203,8 @@ jobs:
             scripts/release/release_channels.py \
             scripts/release/release_platforms.py \
             scripts/release/release_channel_state.py \
+            scripts/release/registryctl.py \
+            ':(glob)scripts/release/registry/**' \
             scripts/release/requirements.lock \
             scripts/release/stage_release_source.py \
             scripts/release/verify_cli_snapshot.py \
@@ -210,6 +212,7 @@ jobs:
             scripts/release/test_cli_snapshot.py \
             scripts/release/test_pypi_promotion.py \
             scripts/release/test_release_promotion.py \
+            scripts/release/test_registry.py \
             py/packages/cli/pyproject.toml \
             ':(glob)ts/packages/cli*/**' \
             docs/cli-packaging.md \
@@ -248,6 +251,7 @@ jobs:
           python3 scripts/release/test_cli_snapshot.py
           python3 scripts/release/test_pypi_promotion.py
           python3 scripts/release/test_release_promotion.py
+          python3 scripts/release/test_registry.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 

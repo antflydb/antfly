@@ -70,6 +70,10 @@ consumers.
    Registry jobs skip an existing version only after comparing its digest; npm
    additionally verifies the requested dist-tag, so retries cannot conceal
    content or channel drift.
+   Every privileged job checks out the `controller_commit` recorded in the
+   release specification. Container assembly uses controller-owned Docker and
+   Cloud Build inputs plus the verified GNU archives; it never executes release
+   tooling from `source_commit`.
    Native archives remain available under
    `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
 

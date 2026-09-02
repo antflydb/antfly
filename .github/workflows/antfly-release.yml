@@ -56,8 +56,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
       - name: Download runtime archives from the completed build
         if: ${{ github.event_name == 'workflow_run' }}
@@ -128,7 +132,7 @@ jobs:
             requested_channel="${RAW_RECOVERY_CHANNEL:-auto}"
             expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
             test -n "$expected_ledger"
-            controller_commit=""
+            controller_commit="$(git rev-parse HEAD)"
             allow_legacy=true
           fi
           if ! [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
@@ -183,10 +187,6 @@ jobs:
             git cat-file -e "$CONTROLLER_COMMIT^{commit}"
             git merge-base --is-ancestor "$CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
           fi
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
 
       - name: Install hash-locked object storage client
         run: |
@@ -392,7 +392,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
@@ -423,7 +423,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
@@ -455,7 +455,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-release-runtime-archives
@@ -497,6 +497,7 @@ jobs:
     with:
       tag_name: ${{ needs.prepare-release-promotion.outputs.tag }}
       source_commit: ${{ needs.prepare-release-promotion.outputs.commit }}
+      controller_commit: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       ledger_sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
     secrets: inherit
 
@@ -511,7 +512,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -582,7 +583,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -638,12 +639,12 @@ jobs:
           set -euo pipefail
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          crane copy \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${RELEASE_TAG}" \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${CONTAINER_ALIAS}"
-          crane copy \
-            "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
-            "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${RELEASE_TAG}" \
+            --destination "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${CONTAINER_ALIAS}"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
+            --destination "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}"
       - name: Commit object-storage channel aliases
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -682,7 +683,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - name: Publish the verified GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -716,7 +717,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -731,9 +732,9 @@ jobs:
         run: |
           set -euo pipefail
           for package in @antfly/cli-darwin-arm64 @antfly/cli-linux-arm64 @antfly/cli-linux-x64 @antfly/cli; do
-            observed="$(python scripts/release/discover_channel_tag.py npm \
-              --npm-package "$package" --npm-tag "$NPM_TAG")"
-            test "$observed" = "v${RELEASE_VERSION}"
+            observed="$(python3 scripts/release/registryctl.py npm-tag \
+              --package "$package" --tag "$NPM_TAG")"
+            test "$observed" = "$RELEASE_VERSION"
           done
       - name: Commit the release channel transaction
         env:

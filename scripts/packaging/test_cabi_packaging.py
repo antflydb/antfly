@@ -195,7 +195,10 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("workflow_run|repository_dispatch", container_workflow)
         self.assertIn("antfly-release-runtime-archives", container_workflow)
         self.assertIn("consumer-matrix container", container_workflow)
-        self.assertIn("immutable container tag differs", container_workflow)
+        self.assertIn("registryctl.py container-ensure", container_workflow)
+        self.assertNotIn('crane digest "$destination" 2>/dev/null || true', container_workflow)
+        self.assertIn("ref: ${{ inputs.controller_commit }}", container_workflow)
+        self.assertNotIn("ref: ${{ inputs.source_commit }}", container_workflow)
         self.assertIn("sha256-${{ inputs.ledger_sha256 }}", container_workflow)
         self.assertNotIn("Commit stable container aliases last", container_workflow)
         self.assertIn("needs: prepare-release-promotion", release_workflow)
@@ -279,13 +282,19 @@ class CAbiPackagingTests(unittest.TestCase):
             npm = fake_bin / "npm"
             npm.write_text(
                 "#!/bin/sh\n"
-                "if [ \"$1\" = view ]; then\n"
-                "  if [ -n \"${FAKE_NPM_INTEGRITY:-}\" ]; then printf '%s\\n' \"$FAKE_NPM_INTEGRITY\"; exit 0; fi\n"
-                "  exit 1\n"
-                "fi\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_NPM_LOG\"\n"
             )
             npm.chmod(0o755)
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *npm-integrity*) printf '%s\\n' \"${FAKE_NPM_INTEGRITY:-}\" ;;\n"
+                "  *npm-tag*) printf '%s\\n' \"${FAKE_NPM_TAG:-}\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n"
+            )
+            python.chmod(0o755)
             tarball = root / "package.tgz"
             tarball.write_bytes(b"npm package")
             digest = base64.b64encode(hashlib.sha512(tarball.read_bytes()).digest()).decode()
@@ -296,6 +305,7 @@ class CAbiPackagingTests(unittest.TestCase):
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "FAKE_NPM_LOG": str(log),
                 "FAKE_NPM_INTEGRITY": integrity,
+                "FAKE_NPM_TAG": "1.2.3",
             }
             command = ["sh", str(helper), "@antfly/cli", "1.2.3", "latest", str(tarball)]
 
@@ -307,7 +317,14 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertNotEqual(mismatch.returncode, 0)
             self.assertIn("exists with different contents", mismatch.stderr)
 
+            env["FAKE_NPM_INTEGRITY"] = integrity
+            env["FAKE_NPM_TAG"] = "1.2.2"
+            alias_drift = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+            self.assertNotEqual(alias_drift.returncode, 0)
+            self.assertIn("dist-tag latest points", alias_drift.stderr)
+
             env["FAKE_NPM_INTEGRITY"] = ""
+            env["FAKE_NPM_TAG"] = "1.2.3"
             subprocess.run(command, check=True, env=env, capture_output=True, text=True)
             self.assertIn("publish", log.read_text())
 
