@@ -281,11 +281,16 @@ class CAbiPackagingTests(unittest.TestCase):
         begin_job = release_workflow.split("  begin-release-channel:", 1)[1].split(
             "\n  promote-channel-aliases:", 1
         )[0]
+        complete_job = release_workflow.split(
+            "  complete-release-channel:", 1
+        )[1]
         self.assertIn("- preflight-release-channel", stage_job)
         self.assertIn("release_channel_state.py preflight", channel_preflight_job)
         self.assertNotIn('--container-digest "$CONTAINER_DIGEST"', channel_preflight_job)
         self.assertIn("- preflight-publication", begin_job)
         self.assertIn('--container-digest "$CONTAINER_DIGEST"', begin_job)
+        self.assertIn("environment: container-publish", complete_job)
+        self.assertIn('--channel "$CHANNEL"', release_workflow)
         self.assertIn("Commit digest-pinned container version", release_workflow)
         self.assertIn('--container-digest "$CONTAINER_DIGEST"', release_workflow)
         self.assertIn("Commit the stable Homebrew formula", release_workflow)
@@ -301,6 +306,12 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertFalse(channels["nightly"]["publish_pypi"])
         self.assertFalse(channels["nightly"]["publish_homebrew"])
         self.assertEqual(channels["nightly"]["github_release"], "none")
+        self.assertEqual(
+            channels["stable"]["object_static_files"],
+            {"install.sh": "scripts/release/install_bootstrap.sh"},
+        )
+        self.assertFalse(channels["next"]["object_static_files"])
+        self.assertFalse(channels["nightly"]["object_static_files"])
         self.assertIn("workflow_dispatch:", nightly_workflow)
         self.assertNotIn("schedule:", nightly_workflow)
         self.assertNotIn("push:", nightly_workflow)
@@ -350,6 +361,7 @@ class CAbiPackagingTests(unittest.TestCase):
             "python3 -m unittest discover -s scripts/release -p 'test_*.py'",
             makefile,
         )
+        self.assertIn("sh -n scripts/release/install_bootstrap.sh", makefile)
 
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {

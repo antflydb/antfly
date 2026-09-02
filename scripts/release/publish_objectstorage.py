@@ -17,10 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
-def is_stable_tag(tag: str) -> bool:
-    version = tag.removeprefix("v")
-    return "-" not in version
+from release_channels import load_policy
 
 
 def clean_prefix(prefix: str) -> str:
@@ -39,6 +36,9 @@ class Publisher:
         raise NotImplementedError
 
     def list_names(self, prefix: str) -> set[str]:
+        raise NotImplementedError
+
+    def delete(self, key: str) -> None:
         raise NotImplementedError
 
 
@@ -158,6 +158,11 @@ class S3Publisher(Publisher):
                 names.add(key.removeprefix(base))
         return names
 
+    def delete(self, key: str) -> None:
+        assert self.client is not None
+        print(f"removing s3://{self.bucket}/{key}")
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+
 
 class GCSPublisher(Publisher):
     def __init__(self, bucket: str) -> None:
@@ -211,6 +216,11 @@ class GCSPublisher(Publisher):
             names.add(url.removeprefix(base))
         return names
 
+    def delete(self, key: str) -> None:
+        destination = f"gs://{self.bucket}/{key}"
+        print(f"removing {destination}")
+        subprocess.run(["gcloud", "storage", "rm", destination], check=True)
+
 
 class LocalPublisher(Publisher):
     def __init__(self, root: Path, bucket: str) -> None:
@@ -255,6 +265,11 @@ class LocalPublisher(Publisher):
             if path.is_file()
         }
 
+    def delete(self, key: str) -> None:
+        destination = self.root / self.bucket / key
+        print(f"removing {destination}")
+        destination.unlink(missing_ok=True)
+
 
 def require_exact_prefix(
     publisher: Publisher, prefix: str, expected_names: set[str]
@@ -266,6 +281,40 @@ def require_exact_prefix(
             f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
         )
     print(f"verified exact object-storage release prefix: {clean_prefix(prefix)}")
+
+
+def prune_prefix(
+    publisher: Publisher,
+    prefix: str,
+    expected_names: set[str],
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        print(f"would prune object-storage prefix: {clean_prefix(prefix)}")
+        return
+    for name in sorted(publisher.list_names(prefix) - expected_names):
+        publisher.delete(f"{clean_prefix(prefix)}/{name}")
+    remaining = publisher.list_names(prefix)
+    unexpected = remaining - expected_names
+    if unexpected:
+        raise SystemExit(
+            "object-storage channel contains unremovable objects: "
+            + ", ".join(sorted(unexpected))
+        )
+
+
+def channel_static_files(channel: str) -> tuple[dict[str, Path], str]:
+    policy = load_policy()
+    channel_policy = policy["channels"][channel]
+    repo_root = Path(__file__).resolve().parents[2]
+    files = {
+        name: repo_root / source
+        for name, source in channel_policy["object_static_files"].items()
+    }
+    missing = sorted(name for name, path in files.items() if not path.is_file())
+    if missing:
+        raise SystemExit(f"channel static files are missing: {missing}")
+    return files, f"antfly/{channel_policy['object_alias']}"
 
 
 def build_publisher(args: argparse.Namespace) -> Publisher:
@@ -295,20 +344,14 @@ def main() -> int:
         help="optional prefix for immutable sha256-addressed objects",
     )
     parser.add_argument(
-        "--latest-prefix", help="object key prefix for the stable latest channel"
+        "--channel",
+        choices=("stable", "next", "nightly"),
+        help="also publish the policy-defined mutable channel projection",
     )
     parser.add_argument(
         "--exact-prefix",
         action="store_true",
         help="require the immutable version prefix to contain exactly the supplied files",
-    )
-    parser.add_argument(
-        "--publish-latest", action="store_true", help="also publish to --latest-prefix"
-    )
-    parser.add_argument(
-        "--publish-latest-if-stable",
-        metavar="TAG",
-        help="publish latest only when TAG is stable",
     )
     parser.add_argument(
         "--local-root",
@@ -325,14 +368,6 @@ def main() -> int:
     files = [path for path in args.files if path.is_file()]
     if not files:
         raise SystemExit("no upload files were provided")
-
-    publish_latest = args.publish_latest
-    if args.publish_latest_if_stable:
-        publish_latest = publish_latest or is_stable_tag(args.publish_latest_if_stable)
-    if publish_latest and not args.latest_prefix:
-        raise SystemExit(
-            "--latest-prefix is required when publishing the latest channel"
-        )
 
     publisher = build_publisher(args)
     sorted_files = sorted(files, key=lambda item: item.name)
@@ -352,22 +387,28 @@ def main() -> int:
         )
     if args.exact_prefix:
         require_exact_prefix(publisher, args.prefix, expected_names)
-    if publish_latest:
-        assert args.latest_prefix is not None
+    if args.channel:
+        static_files, channel_prefix = channel_static_files(args.channel)
         pointers = [path for path in sorted_files if path.name == "metadata.json"]
         if len(pointers) != 1:
             raise SystemExit(
-                "latest publication requires exactly one metadata.json channel pointer"
+                "channel publication requires exactly one metadata.json pointer"
             )
-        for path in sorted_files:
-            if path == pointers[0]:
-                continue
-            publisher.upload(path, storage_key(args.latest_prefix, path), args.dry_run)
+        expected_channel_names = {"metadata.json", *static_files}
+        prune_prefix(publisher, channel_prefix, expected_channel_names, args.dry_run)
+        for name, path in sorted(static_files.items()):
+            publisher.upload(
+                path,
+                f"{channel_prefix}/{name}",
+                args.dry_run,
+            )
         # metadata.json is the channel commit point. Installers read it first
         # and then fetch the immutable versioned payload named by its tag.
         publisher.upload(
-            pointers[0], storage_key(args.latest_prefix, pointers[0]), args.dry_run
+            pointers[0], storage_key(channel_prefix, pointers[0]), args.dry_run
         )
+        if not args.dry_run:
+            require_exact_prefix(publisher, channel_prefix, expected_channel_names)
     return 0
 
 

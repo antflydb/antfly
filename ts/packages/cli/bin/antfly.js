@@ -15,7 +15,9 @@ const packageName = resolvePlatformPackage(process.platform, process.arch);
 if (!packageName) {
   if (process.platform === "linux" && detectLinuxLibc() !== "glibc") {
     console.error("The npm Antfly CLI supports glibc Linux only.");
-    console.error("Install the portable musl build with https://antfly.io/install.sh instead.");
+    console.error(
+      "Install the portable musl build with https://releases.antfly.io/antfly/latest/install.sh instead."
+    );
     process.exit(1);
   }
   console.error(`Unsupported Antfly CLI platform: ${platformKey}`);

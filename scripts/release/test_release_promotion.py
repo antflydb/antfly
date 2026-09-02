@@ -268,6 +268,47 @@ class ReleasePromotionTests(unittest.TestCase):
                 policy,
             )
 
+        class ObjectReader:
+            def __init__(self, objects: dict[str, bytes]) -> None:
+                self.objects = objects
+
+            def read(self, key: str) -> bytes:
+                return self.objects[key]
+
+            def read_optional(self, key: str) -> bytes | None:
+                return self.objects.get(key)
+
+            def list_names(self, prefix: str) -> set[str]:
+                base = f"{prefix}/"
+                return {
+                    key.removeprefix(base)
+                    for key in self.objects
+                    if key.startswith(base)
+                }
+
+        static_files = policy["channels"]["stable"]["object_static_files"]
+        install = (RELEASE_DIR.parents[1] / static_files["install.sh"]).read_bytes()
+        object_reader = ObjectReader(
+            {
+                "antfly/latest/metadata.json": b'{"tag":"v1.2.3"}',
+                "antfly/latest/install.sh": install,
+            }
+        )
+        discovery.require_object_projection(
+            object_reader, "latest", "v1.2.3", static_files
+        )
+        object_reader.objects["antfly/latest/stale.tar.gz"] = b"old"
+        with self.assertRaisesRegex(SystemExit, "member set differs"):
+            discovery.require_object_projection(
+                object_reader, "latest", "v1.2.3", static_files
+            )
+        del object_reader.objects["antfly/latest/stale.tar.gz"]
+        object_reader.objects["antfly/latest/install.sh"] = b"drifted"
+        with self.assertRaisesRegex(SystemExit, "static file differs"):
+            discovery.require_object_projection(
+                object_reader, "latest", "v1.2.3", static_files
+            )
+
         class Response(io.BytesIO):
             def __enter__(self):
                 return self
@@ -1032,9 +1073,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 "versions/v1",
                 "--content-addressed-prefix",
                 "artifacts",
-                "--latest-prefix",
-                "channels/latest",
-                "--publish-latest",
+                "--channel",
+                "stable",
                 str(first),
                 str(second),
                 str(metadata),
@@ -1047,7 +1087,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 storage.main()
 
             self.assertFalse(
-                any(key.startswith("channels/latest/") for key, _ in publisher.calls)
+                any(key.startswith("antfly/latest/") for key, _ in publisher.calls)
             )
             self.assertTrue(all(immutable for _, immutable in publisher.calls))
 
@@ -1059,11 +1099,27 @@ class ReleasePromotionTests(unittest.TestCase):
         class RecordingPublisher:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, bool]] = []
+                self.names = {"metadata.json", "stale-artifact.bin"}
 
             def upload(
                 self, path: Path, key: str, dry_run: bool, immutable: bool = False
             ) -> None:
                 self.calls.append((key, immutable))
+                if key.startswith("antfly/latest/"):
+                    self.names.add(key.removeprefix("antfly/latest/"))
+
+            def list_names(self, prefix: str) -> set[str]:
+                self.assert_prefix(prefix)
+                return set(self.names)
+
+            def delete(self, key: str) -> None:
+                self.calls.append((key, False))
+                self.names.discard(key.removeprefix("antfly/latest/"))
+
+            @staticmethod
+            def assert_prefix(prefix: str) -> None:
+                if prefix != "antfly/latest":
+                    raise AssertionError(prefix)
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
@@ -1079,9 +1135,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 "release",
                 "--prefix",
                 "versions/v1",
-                "--latest-prefix",
-                "channels/latest",
-                "--publish-latest",
+                "--channel",
+                "stable",
                 str(artifact),
                 str(metadata),
             ]
@@ -1092,8 +1147,11 @@ class ReleasePromotionTests(unittest.TestCase):
                 self.assertEqual(storage.main(), 0)
 
             self.assertEqual(
-                publisher.calls[-1], ("channels/latest/metadata.json", False)
+                publisher.calls[-1], ("antfly/latest/metadata.json", False)
             )
+            self.assertIn(("antfly/latest/stale-artifact.bin", False), publisher.calls)
+            self.assertNotIn(("antfly/latest/artifact.bin", False), publisher.calls)
+            self.assertEqual(publisher.names, {"install.sh", "metadata.json"})
             immutable_calls = [call for call in publisher.calls if call[1]]
             self.assertEqual(len(immutable_calls), 2)
 

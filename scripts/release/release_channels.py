@@ -23,6 +23,7 @@ REQUIRED_FIELDS = {
     "publish_homebrew",
     "container_alias",
     "object_alias",
+    "object_static_files",
     "github_release",
     "recovery_sources",
 }
@@ -199,7 +200,7 @@ def compare_version_precedence(left: str, right: str) -> int:
 
 def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     policy = json.loads(path.read_text(encoding="utf-8"))
-    if policy.get("schema_version") != 2:
+    if policy.get("schema_version") != 3:
         raise SystemExit(f"unsupported release-channel schema in {path}")
     channels = policy.get("channels")
     if not isinstance(channels, dict) or set(channels) != CHANNEL_NAMES:
@@ -262,6 +263,21 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         for flag in ("publish_pypi", "publish_homebrew"):
             if not isinstance(channel[flag], bool):
                 raise SystemExit(f"release channel {name} has invalid {flag}")
+        static_files = channel["object_static_files"]
+        if not isinstance(static_files, dict):
+            raise SystemExit(f"release channel {name} has invalid object_static_files")
+        for object_name, source in static_files.items():
+            if (
+                not isinstance(object_name, str)
+                or not object_name
+                or Path(object_name).name != object_name
+                or object_name == "metadata.json"
+                or not isinstance(source, str)
+                or not re.fullmatch(r"scripts/release/[a-z0-9_.-]+", source)
+            ):
+                raise SystemExit(
+                    f"release channel {name} has invalid object_static_files"
+                )
         for sink, field in (
             ("npm", "npm_tag"),
             ("container", "container_alias"),
@@ -296,6 +312,10 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         or nightly["recovery_sources"] != ["object-storage"]
     ):
         raise SystemExit("nightly channel must be snapshot-only")
+    if channels["stable"]["object_static_files"] != {
+        "install.sh": "scripts/release/install_bootstrap.sh"
+    } or any(channels[name]["object_static_files"] for name in ("next", "nightly")):
+        raise SystemExit("only stable may publish the canonical install bootstrap")
     return policy
 
 

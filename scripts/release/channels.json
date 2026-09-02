@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "channels": {
     "stable": {
       "tag_kind": "stable",
@@ -11,6 +11,9 @@
       "publish_homebrew": true,
       "container_alias": "latest",
       "object_alias": "latest",
+      "object_static_files": {
+        "install.sh": "scripts/release/install_bootstrap.sh"
+      },
       "github_release": "latest",
       "recovery_sources": ["github-release", "object-storage"]
     },
@@ -24,6 +27,7 @@
       "publish_homebrew": false,
       "container_alias": "next",
       "object_alias": "next",
+      "object_static_files": {},
       "github_release": "prerelease",
       "recovery_sources": ["github-release", "object-storage"]
     },
@@ -37,6 +41,7 @@
       "publish_homebrew": false,
       "container_alias": "nightly",
       "object_alias": "nightly",
+      "object_static_files": {},
       "github_release": "none",
       "recovery_sources": ["object-storage"]
     }

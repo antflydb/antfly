@@ -89,6 +89,11 @@ consumers.
    when enabled, Homebrew when enabled, the R2 alias, GitHub publication mode,
    and all GAR/GHCR version and channel tags. Any missing or divergent
    projection leaves the transaction pending for exact retry.
+   R2 channels do not mirror a mutable copy of the release payload. They own an
+   exact metadata pointer; stable additionally owns a small controller-defined
+   bootstrap at `latest/install.sh` that resolves the pointer and delegates to
+   the immutable, versioned installer. Legacy alias objects are removed before
+   the metadata pointer moves.
    npm additionally verifies the requested dist-tag, so retries cannot conceal
    content or channel drift. Recovery restores the permanently recorded digest
    from either retention registry and fails if both copies are gone. It never

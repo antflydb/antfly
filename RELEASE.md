@@ -255,8 +255,12 @@ contract tests; its test discovery intentionally picks up new `test_*.py` files.
   standalone mode requires the expected tag, commit, and ledger digest.
 - `publish_objectstorage.py` first writes content-addressed and versioned keys
   with compare-or-fail semantics and seals the version prefix only when it
-  contains exactly the ledger-defined files, then updates mutable channel
-  aliases only after every immutable upload succeeds. The release workflow
+  contains exactly the ledger-defined files. Channel namespaces are exact,
+  policy-defined pointer sets: `next` and `nightly` contain only
+  `metadata.json`, while `latest` also contains the controller-owned,
+  release-independent installer bootstrap. Promotion prunes legacy files before
+  atomically replacing metadata, so interrupted releases cannot expose a mixed
+  channel payload. The release workflow
   currently uses the S3-compatible path for Cloudflare R2, but the script also
   has GCS and local modes for future storage backends and dry-run smoke tests.
 
@@ -282,7 +286,7 @@ Stable releases publish:
 
 - GitHub Release artifacts
 - R2 release artifacts
-- `latest` R2 channel artifacts
+- the `latest` R2 metadata pointer and stable installer bootstrap
 - Zig Homebrew formula `antfly`
 - npm CLI packages with dist-tag `latest`
 - PyPI CLI wheels
@@ -292,7 +296,7 @@ RC releases publish:
 
 - GitHub Release artifacts marked prerelease
 - R2 release artifacts
-- `next` R2 channel artifacts
+- the `next` R2 metadata pointer
 - npm CLI packages with dist-tag `next`
 - PyPI CLI wheels using PEP 440 prerelease versions, for example
   `0.2.0-rc.1` becomes `0.2.0rc1`
@@ -303,7 +307,7 @@ container `latest` tag.
 
 Nightly snapshots publish:
 
-- immutable R2 release artifacts and the `nightly` R2 channel
+- immutable R2 release artifacts and the `nightly` R2 metadata pointer
 - npm CLI packages with dist-tag `nightly`
 - container tags `<version>` and `nightly`
 

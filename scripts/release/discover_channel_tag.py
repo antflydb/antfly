@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from build_cli_snapshot import NPM_PACKAGES
@@ -144,6 +146,36 @@ def discover_object_alias(reader: Reader, alias: str) -> str:
     if not isinstance(tag, str) or not tag:
         raise SystemExit(f"object-storage channel {alias} has no tag")
     return tag
+
+
+def require_object_projection(
+    reader: Reader,
+    alias: str,
+    expected_tag: str,
+    static_files: dict[str, str],
+) -> None:
+    prefix = f"antfly/{alias}"
+    expected_names = {"metadata.json", *static_files}
+    actual_names = reader.list_names(prefix)
+    if actual_names != expected_names:
+        raise SystemExit(
+            f"object-storage channel {alias} member set differs: "
+            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
+        )
+    if discover_object_alias(reader, alias) != expected_tag:
+        raise SystemExit(
+            f"object-storage channel {alias} does not point to {expected_tag}"
+        )
+    repo_root = Path(__file__).resolve().parents[2]
+    for name, source in static_files.items():
+        expected = (repo_root / source).read_bytes()
+        actual = reader.read(f"{prefix}/{name}")
+        if actual != expected:
+            raise SystemExit(
+                f"object-storage channel {alias} static file differs: {name}; "
+                f"expected sha256:{hashlib.sha256(expected).hexdigest()}, "
+                f"got sha256:{hashlib.sha256(actual).hexdigest()}"
+            )
 
 
 def discover_homebrew_tag(opener: OpenURL) -> str:
@@ -386,6 +418,12 @@ def main() -> int:
             if not args.tag:
                 parser.error("require needs --tag")
             current = args.tag
+            require_object_projection(
+                reader,
+                channel_policy["object_alias"],
+                current,
+                channel_policy["object_static_files"],
+            )
             require_channel_observations(args.channel, current, observations, policy)
             require_github_release_mode(
                 args.channel,
