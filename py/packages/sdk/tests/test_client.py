@@ -932,7 +932,17 @@ class TestAntflyClient:
 
     @patch("antfly.client.Client")
     def test_idempotent_batch_uses_distinct_route_and_stable_key(self, mock_client_class: MagicMock) -> None:
-        expected_body = {"inserts": {"user:1": {"name": "Zoë"}}, "deletes": []}
+        expected_body = {
+            "inserts": {"user:1": {"name": "Zoë"}},
+            "deletes": [],
+            "transforms": [
+                {
+                    "key": "counter",
+                    "operations": [{"op": "$inc", "path": "value", "value": 1}],
+                }
+            ],
+            "sync_level": "write",
+        }
         expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         mock_httpx = MagicMock()
@@ -955,6 +965,13 @@ class TestAntflyClient:
             table="users/archive",
             idempotency_key="import-generation-7",
             inserts={"user:1": {"name": "Zoë"}},
+            transforms=[
+                {
+                    "key": "counter",
+                    "operations": [{"op": "$inc", "path": "value", "value": 1}],
+                }
+            ],
+            sync_level="write",
         )
 
         assert receipt.status.value == "committed"

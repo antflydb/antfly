@@ -16562,7 +16562,7 @@ export interface operations {
                 };
             };
             413: components["responses"]["PayloadTooLarge"];
-            /** @description Durable idempotency receipt capacity is exhausted */
+            /** @description Request was not applied because write admission or durable receipt capacity is exhausted */
             429: {
                 headers: {
                     [name: string]: unknown;

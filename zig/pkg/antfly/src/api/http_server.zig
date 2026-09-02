@@ -6617,6 +6617,14 @@ pub const ApiHttpServer = struct {
         return router.localNodeId();
     }
 
+    /// Distributed receipt ownership requires both a unique routable node and
+    /// a transport for forwarding requests to the current owner.
+    pub fn hasRoutableSessionOwner(self: *ApiHttpServer) bool {
+        return self.cfg.session_router != null and
+            self.cfg.session_executor != null and
+            self.localSessionNodeId() != 0;
+    }
+
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
         const ttl_ns = self.cfg.session_ttl_ns orelse return;
         const now_ns = platform_time.realtimeNs();
@@ -32630,6 +32638,66 @@ test "api http server enforces configured savepoint limits and exposes remaining
     defer savepoint_again.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), savepoint_again.status);
     try std.testing.expect(std.mem.indexOf(u8, savepoint_again.body, "savepoint limit exceeded") != null);
+}
+
+test "distributed session ownership requires a nonzero route and executor" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeRouter = struct {
+        local_node_id: u64,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{ .ptr = self, .vtable = &.{
+                .local_node_id = localNodeId,
+                .local_status = localStatus,
+                .node_base_uri = nodeBaseUri,
+            } };
+        }
+
+        fn localNodeId(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.local_node_id;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+    const FakeExecutor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), null, null);
+    defer server.deinit();
+    var zero_router = FakeRouter{ .local_node_id = 0 };
+    var routed = FakeRouter{ .local_node_id = 7 };
+
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_router = zero_router.iface();
+    server.cfg.session_executor = FakeExecutor.iface();
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_router = routed.iface();
+    server.cfg.session_executor = null;
+    try std.testing.expect(!server.hasRoutableSessionOwner());
+    server.cfg.session_executor = FakeExecutor.iface();
+    try std.testing.expect(server.hasRoutableSessionOwner());
 }
 
 test "api http server enforces session adoption timeout when configured" {

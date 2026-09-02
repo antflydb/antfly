@@ -4094,7 +4094,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/IdempotentBatchError'
         '429':
-          description: Durable idempotency receipt capacity is exhausted
+          description: Request was not applied because write admission or durable receipt capacity is
+            exhausted
           content:
             application/json:
               schema:

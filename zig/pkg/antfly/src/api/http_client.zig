@@ -1693,7 +1693,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200, 201, 202, 400, 409, 429, 503 => {},
+            200, 201, 202, 400, 409, 413, 429, 503 => {},
             else => return error.UnexpectedHttpStatus,
         }
         return .{

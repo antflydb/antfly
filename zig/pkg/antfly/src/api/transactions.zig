@@ -20,6 +20,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const lease_mod = @import("../storage/db/lease.zig");
+const platform_process = @import("antfly_platform").process;
 const platform_time = @import("antfly_platform").time;
 
 const session_prefix = "\x00\x00__api_txn_sessions__:";
@@ -27,6 +28,16 @@ const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
+var owner_incarnation_nonce: std.atomic.Value(u64) = .init(1);
+
+fn newOwnerIncarnation() u64 {
+    const material = [3]u64{
+        platform_time.realtimeNs(),
+        platform_process.currentId() orelse 0,
+        owner_incarnation_nonce.fetchAdd(1, .monotonic),
+    };
+    return @max(@as(u64, 1), std.hash.Wyhash.hash(0, std.mem.asBytes(&material)) & std.math.maxInt(i64));
+}
 
 const AtomicMutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -300,6 +311,16 @@ pub fn terminalCommitResponseStatus(status: TerminalCommitStatus, repair_require
     if (status != .committed) return status.text();
     if (repair_required) return "committed_repair_required";
     return status.text();
+}
+
+/// Coordinator acknowledgement is part of the durable API/storage handoff.
+/// Until it is persisted, replay and reconciliation must continue to expose
+/// recovery debt even though the commit decision itself is durable.
+pub fn effectiveTerminalCommitStatus(terminal: TerminalCommit) TerminalCommitStatus {
+    if (terminal.status == .committed and
+        terminal.coordinator_group_id != null and
+        !terminal.coordinator_acknowledged) return .committed_recovery_pending;
+    return terminal.status;
 }
 
 /// A durable API-level terminal result. The coordinator location is retained
@@ -636,6 +657,9 @@ pub const Savepoint = struct {
 pub const Session = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
+    /// Process-incarnation token. Node IDs are stable across restarts, so they
+    /// cannot fence an overlapped old process by themselves.
+    owner_incarnation: u64 = 0,
     /// Stable authenticated subject that created this session. `null` is the
     /// anonymous principal used only when authentication is disabled. The
     /// binding is immutable across node-owner lease transfers.
@@ -687,6 +711,7 @@ pub const Session = struct {
         var out: Session = .{
             .txn_id = self.txn_id,
             .owner_node_id = self.owner_node_id,
+            .owner_incarnation = self.owner_incarnation,
             .principal = if (self.principal) |principal| try alloc.dupe(u8, principal) else null,
             .begin_timestamp = self.begin_timestamp,
             .last_touched_timestamp = self.last_touched_timestamp,
@@ -767,6 +792,7 @@ pub const DurableSessionStore = struct {
         self: *DurableSessionStore,
         session: Session,
         expected_owner: ?u64,
+        expected_incarnation: ?u64,
         now_ms: u64,
         ttl_ms: u64,
         require_expired: bool,
@@ -777,7 +803,7 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, now_ms, ttl_ms, require_expired, max_record_bytes);
+                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes);
                 if (!changed) {
                     txn.abort();
                     break :blk false;
@@ -788,7 +814,7 @@ pub const DurableSessionStore = struct {
             .runtime => |store| blk: {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, now_ms, ttl_ms, require_expired, max_record_bytes);
+                const changed = try saveSessionWithLeaseTxn(self, &txn, session, expected_owner, expected_incarnation, now_ms, ttl_ms, require_expired, max_record_bytes);
                 if (!changed) {
                     txn.abort();
                     break :blk false;
@@ -804,6 +830,7 @@ pub const DurableSessionStore = struct {
         txn: anytype,
         session: Session,
         expected_owner: ?u64,
+        expected_incarnation: ?u64,
         now_ms: u64,
         ttl_ms: u64,
         require_expired: bool,
@@ -822,10 +849,11 @@ pub const DurableSessionStore = struct {
             const raw = current_raw orelse return false;
             var current = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer current.deinit(self.alloc);
-            if (current.owner_node_id != owner) return false;
+            if (current.owner_node_id != owner or
+                current.owner_incarnation != (expected_incarnation orelse return false)) return false;
         } else if (current_raw != null) return false;
 
-        const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id);
+        const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id, session.owner_incarnation);
         defer self.alloc.free(owner_id);
         const lease_raw = txn.get(lease_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -911,6 +939,173 @@ pub const DurableSessionStore = struct {
                 try txn.commit();
             },
         }
+    }
+
+    /// Deletes a session only while the caller's exact process incarnation
+    /// still owns it. The session, indexes, and lease disappear atomically.
+    pub fn deleteWithLease(
+        self: *DurableSessionStore,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        owner_incarnation: u64,
+    ) !bool {
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (!(try deleteSessionWithLeaseTxn(self, &txn, txn_id, owner_node_id, owner_incarnation))) {
+                    txn.abort();
+                    break :blk false;
+                }
+                try txn.commit();
+                break :blk true;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (!(try deleteSessionWithLeaseTxn(self, &txn, txn_id, owner_node_id, owner_incarnation))) {
+                    txn.abort();
+                    break :blk false;
+                }
+                try txn.commit();
+                break :blk true;
+            },
+        };
+    }
+
+    /// Reclaims a receipt left by a dead process without first publishing a
+    /// transient new owner. The immutable state observation, retention test,
+    /// expired lease, indexes, and deletion are one storage transaction.
+    pub fn deleteExpiredWithLease(
+        self: *DurableSessionStore,
+        txn_id: db_mod.types.TxnId,
+        expected_owner_node_id: u64,
+        expected_owner_incarnation: u64,
+        expected_last_touched_timestamp: u64,
+        cutoff_ns: u64,
+        now_ms: u64,
+    ) !bool {
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (!(try deleteExpiredSessionWithLeaseTxn(
+                    self,
+                    &txn,
+                    txn_id,
+                    expected_owner_node_id,
+                    expected_owner_incarnation,
+                    expected_last_touched_timestamp,
+                    cutoff_ns,
+                    now_ms,
+                ))) {
+                    txn.abort();
+                    break :blk false;
+                }
+                try txn.commit();
+                break :blk true;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (!(try deleteExpiredSessionWithLeaseTxn(
+                    self,
+                    &txn,
+                    txn_id,
+                    expected_owner_node_id,
+                    expected_owner_incarnation,
+                    expected_last_touched_timestamp,
+                    cutoff_ns,
+                    now_ms,
+                ))) {
+                    txn.abort();
+                    break :blk false;
+                }
+                try txn.commit();
+                break :blk true;
+            },
+        };
+    }
+
+    fn deleteSessionWithLeaseTxn(
+        self: *DurableSessionStore,
+        txn: anytype,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        owner_incarnation: u64,
+    ) !bool {
+        const key = try makeSessionKey(self.alloc, txn_id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var current = try decodeSessionRecord(self.alloc, txn_id, raw);
+        defer current.deinit(self.alloc);
+        if (current.owner_node_id != owner_node_id or
+            current.owner_incarnation != owner_incarnation) return false;
+
+        const lease_key = try makeSessionLeaseKey(self.alloc, txn_id);
+        defer self.alloc.free(lease_key);
+        const lease_raw = txn.get(lease_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(lease_mod.LeaseRecord, self.alloc, lease_raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
+        defer self.alloc.free(owner_id);
+        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id)) return false;
+
+        try deleteSessionAndExpiryTxn(self, txn, key, txn_id);
+        try txn.delete(lease_key);
+        return true;
+    }
+
+    fn deleteExpiredSessionWithLeaseTxn(
+        self: *DurableSessionStore,
+        txn: anytype,
+        txn_id: db_mod.types.TxnId,
+        expected_owner_node_id: u64,
+        expected_owner_incarnation: u64,
+        expected_last_touched_timestamp: u64,
+        cutoff_ns: u64,
+        now_ms: u64,
+    ) !bool {
+        const key = try makeSessionKey(self.alloc, txn_id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var current = try decodeSessionRecord(self.alloc, txn_id, raw);
+        defer current.deinit(self.alloc);
+        if (current.owner_node_id != expected_owner_node_id or
+            current.owner_incarnation != expected_owner_incarnation or
+            current.last_touched_timestamp != expected_last_touched_timestamp or
+            current.last_touched_timestamp >= cutoff_ns) return false;
+        if (current.terminal_commit) |terminal| {
+            if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) return false;
+        }
+
+        const lease_key = try makeSessionLeaseKey(self.alloc, txn_id);
+        defer self.alloc.free(lease_key);
+        const lease_raw = txn.get(lease_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(lease_mod.LeaseRecord, self.alloc, lease_raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const expected_owner_id = try ownerLeaseId(self.alloc, expected_owner_node_id, expected_owner_incarnation);
+        defer self.alloc.free(expected_owner_id);
+        if (!std.mem.eql(u8, parsed.value.owner_id, expected_owner_id) or
+            parsed.value.expires_at_ms > now_ms) return false;
+
+        try deleteSessionAndExpiryTxn(self, txn, key, txn_id);
+        try txn.delete(lease_key);
+        return true;
     }
 
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session) !void {
@@ -1288,7 +1483,7 @@ pub const SessionLeaseStore = struct {
         return try lease.load(alloc);
     }
 
-    pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64) !bool {
+    pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64, now_ms: u64, ttl_ms: u64) !bool {
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
@@ -1296,12 +1491,12 @@ pub const SessionLeaseStore = struct {
             .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
         };
         defer lease.deinit();
-        const owner_id = try ownerLeaseId(self.alloc, owner_node_id);
+        const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
         defer self.alloc.free(owner_id);
         return try lease.renew(owner_id, now_ms, ttl_ms);
     }
 
-    pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+    pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64) !bool {
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
@@ -1309,7 +1504,7 @@ pub const SessionLeaseStore = struct {
             .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
         };
         defer lease.deinit();
-        const owner_id = try ownerLeaseId(self.alloc, owner_node_id);
+        const owner_id = try ownerLeaseId(self.alloc, owner_node_id, owner_incarnation);
         defer self.alloc.free(owner_id);
         return try lease.release(owner_id);
     }
@@ -1328,6 +1523,7 @@ pub const SessionRegistry = struct {
     max_sessions: ?usize = null,
     max_record_bytes: ?usize = null,
     durable_scope: SessionStoreScope = .node_local,
+    owner_incarnation: u64 = 0,
     known_durable_session_count: ?usize = null,
     reserved_session_count: usize = 0,
     recovery_index_cursor: ?db_mod.types.TxnId = null,
@@ -1357,6 +1553,7 @@ pub const SessionRegistry = struct {
             .max_savepoints = max_savepoints,
             .max_sessions = max_sessions,
             .max_record_bytes = max_record_bytes,
+            .owner_incarnation = newOwnerIncarnation(),
         };
     }
 
@@ -1378,7 +1575,8 @@ pub const SessionRegistry = struct {
         return self.durable != null and
             self.durable_scope == .cluster_shared and
             self.lease_store != null and
-            self.owner_lease_ttl_ns != null;
+            self.owner_lease_ttl_ns != null and
+            self.owner_incarnation != 0;
     }
 
     pub fn durableMissIsAuthoritative(self: *const SessionRegistry) bool {
@@ -1401,6 +1599,7 @@ pub const SessionRegistry = struct {
         var session: Session = .{
             .txn_id = txn_id,
             .owner_node_id = owner_node_id,
+            .owner_incarnation = self.owner_incarnation,
             .principal = if (principal) |value| try alloc.dupe(u8, value) else null,
             .begin_timestamp = now,
             .last_touched_timestamp = now,
@@ -1428,10 +1627,9 @@ pub const SessionRegistry = struct {
         };
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(session, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return error.SessionLeaseLost;
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return error.SessionLeaseLost;
         } else {
             try self.persistLocked(session);
-            try self.renewLeaseLocked(txn_id, owner_node_id);
         }
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1472,6 +1670,7 @@ pub const SessionRegistry = struct {
         var session: Session = .{
             .txn_id = txn_id,
             .owner_node_id = owner_node_id,
+            .owner_incarnation = self.owner_incarnation,
             .principal = if (principal) |value| try alloc.dupe(u8, value) else null,
             .begin_timestamp = now,
             .last_touched_timestamp = now,
@@ -1502,7 +1701,7 @@ pub const SessionRegistry = struct {
 
         if (self.durable != null and self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(session, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) {
+            if (!(try self.durable.?.saveWithLease(session, null, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) {
                 // Another API node won the create race. Load the immutable
                 // binding and return it only when it is the same operation.
                 var existing = (try self.durable.?.load(txn_id)) orelse return error.SessionLeaseLost;
@@ -1515,7 +1714,6 @@ pub const SessionRegistry = struct {
             }
         } else {
             try self.persistLocked(session);
-            try self.renewLeaseLocked(txn_id, owner_node_id);
         }
 
         self.mutex.lock();
@@ -1592,8 +1790,7 @@ pub const SessionRegistry = struct {
             try candidate.staged.?.mergeFrom(alloc, req);
         }
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1638,8 +1835,7 @@ pub const SessionRegistry = struct {
             try candidate.staged.?.mergeFrom(alloc, req);
         }
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1666,8 +1862,7 @@ pub const SessionRegistry = struct {
             var out = try sealed.clone(alloc);
             errdefer out.deinit(alloc);
             touchSession(&candidate);
-            try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-            try self.persistLocked(candidate);
+            try self.persistOwnedLocked(candidate);
             self.mutex.lock();
             defer self.mutex.unlock();
             const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -1690,8 +1885,7 @@ pub const SessionRegistry = struct {
         candidate.staged = try out.clone(alloc);
         candidate.commit_body_digest = body_digest;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -1741,8 +1935,7 @@ pub const SessionRegistry = struct {
         }
         candidate.idempotent_outcome = outcome;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1794,8 +1987,7 @@ pub const SessionRegistry = struct {
             .coordinator_acknowledged = coordinator_acknowledged,
         };
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1821,8 +2013,7 @@ pub const SessionRegistry = struct {
         }
         candidate.commit_execution_started = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -1849,8 +2040,7 @@ pub const SessionRegistry = struct {
         if (terminal.coordinator_acknowledged) return {};
         terminal.coordinator_acknowledged = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1983,23 +2173,27 @@ pub const SessionRegistry = struct {
         };
         defer candidate.deinit(if (self.durable) |durable| durable.alloc else alloc);
 
-        if (candidate.owner_node_id != owner_node_id) {
+        if (candidate.owner_node_id != owner_node_id or
+            candidate.owner_incarnation != self.owner_incarnation)
+        {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
             var adopted = try candidate.clone(alloc);
             var adopted_owned = true;
             defer if (adopted_owned) adopted.deinit(alloc);
             const expected_owner = adopted.owner_node_id;
+            const expected_incarnation = adopted.owner_incarnation;
             adopted.owner_node_id = owner_node_id;
+            adopted.owner_incarnation = self.owner_incarnation;
             touchSession(&adopted);
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try durable.saveWithLease(adopted, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
+            if (!(try durable.saveWithLease(adopted, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
             candidate.deinit(durable.alloc);
             candidate = try adopted.clone(durable.alloc);
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &adopted);
             adopted_owned = false;
         } else if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
-            try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
+            try self.persistOwnedLockedAt(candidate, now_ns);
         }
 
         if (candidate.idempotent_outcome != null) return null;
@@ -2085,8 +2279,7 @@ pub const SessionRegistry = struct {
         try candidate.savepoints.put(alloc, savepoint_id, new_savepoint);
         savepoint_inserted = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2108,8 +2301,7 @@ pub const SessionRegistry = struct {
         deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
         candidate.read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedLocked(candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2237,6 +2429,11 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durable_scope == .cluster_shared) if (self.durable) |durable| {
+            var session = (try durable.load(txn_id)) orelse return null;
+            defer session.deinit(durable.alloc);
+            return session.owner_node_id;
+        };
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const owner_node_id = session.owner_node_id;
@@ -2261,17 +2458,21 @@ pub const SessionRegistry = struct {
         defer persisted.deinit(durable.alloc);
         var candidate = try persisted.clone(alloc);
         errdefer candidate.deinit(alloc);
-        if (candidate.owner_node_id == owner_node_id) {
+        if (candidate.owner_node_id == owner_node_id and
+            candidate.owner_incarnation == self.owner_incarnation)
+        {
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
             return true;
         }
         const expected_owner = candidate.owner_node_id;
+        const expected_incarnation = candidate.owner_incarnation;
         candidate.owner_node_id = owner_node_id;
+        candidate.owner_incarnation = self.owner_incarnation;
         touchSession(&candidate);
         if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const now_ns = nextTxnTimestamp();
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try durable.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
+            if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
         } else try self.persistLocked(candidate);
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
@@ -2298,21 +2499,29 @@ pub const SessionRegistry = struct {
         defer persisted.deinit(durable.alloc);
         var candidate = try persisted.clone(alloc);
         errdefer candidate.deinit(alloc);
-        if (candidate.owner_node_id == owner_node_id) {
+        if (candidate.owner_node_id == owner_node_id and
+            candidate.owner_incarnation == self.owner_incarnation)
+        {
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
             return true;
         }
         const expected_owner = candidate.owner_node_id;
+        const expected_incarnation = candidate.owner_incarnation;
         const effective_now = now_ns orelse nextTxnTimestamp();
         candidate.owner_node_id = owner_node_id;
+        candidate.owner_incarnation = self.owner_incarnation;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try durable.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
+        if (!(try durable.saveWithLease(candidate, expected_owner, expected_incarnation, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
         try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
 
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        return try self.cleanupExpiredAt(alloc, cutoff_ns, nextTxnTimestamp());
+    }
+
+    fn cleanupExpiredAt(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64, now_ns: u64) !usize {
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
         if (self.durable) |durable| {
@@ -2343,8 +2552,7 @@ pub const SessionRegistry = struct {
             if (current.terminal_commit) |terminal| {
                 if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) continue;
             }
-            try self.deletePersistent(txn_id);
-            self.releaseLease(txn_id, current.owner_node_id) catch {};
+            if (!(try self.deleteExpiredPersistent(current, cutoff_ns, now_ns))) continue;
             self.mutex.lock();
             if (self.sessions.fetchRemove(txn_id)) |removed| {
                 var session = removed.value;
@@ -2362,8 +2570,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var current = (self.loadSessionCloneAssumeStripe(alloc, txn_id) catch return false) orelse return false;
         defer current.deinit(alloc);
-        self.deletePersistent(txn_id) catch return false;
-        self.releaseLease(txn_id, current.owner_node_id) catch {};
+        if (!(self.deleteOwnedPersistent(current) catch return false)) return false;
         self.mutex.lock();
         defer self.mutex.unlock();
         const removed = self.sessions.fetchRemove(txn_id) orelse return false;
@@ -2422,6 +2629,31 @@ pub const SessionRegistry = struct {
         if (self.durable) |durable| try durable.save(session, self.max_record_bytes);
     }
 
+    /// Publishes the session mutation and renews its incarnation-specific lease
+    /// in one storage transaction. A process paused past lease expiry can no
+    /// longer overwrite a newer owner's record when it resumes.
+    fn persistOwnedLocked(self: *SessionRegistry, session: Session) !void {
+        return try self.persistOwnedLockedAt(session, nextTxnTimestamp());
+    }
+
+    fn persistOwnedLockedAt(self: *SessionRegistry, session: Session, now_ns: u64) !void {
+        const durable = self.durable orelse return;
+        if (self.lease_store == null or self.owner_lease_ttl_ns == null) {
+            return try durable.save(session, self.max_record_bytes);
+        }
+        if (session.owner_incarnation != self.owner_incarnation) return error.SessionLeaseLost;
+        const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
+        if (!(try durable.saveWithLease(
+            session,
+            session.owner_node_id,
+            session.owner_incarnation,
+            now_ns / std.time.ns_per_ms,
+            ttl_ms,
+            true,
+            self.max_record_bytes,
+        ))) return error.SessionLeaseLost;
+    }
+
     fn deletePersistent(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !void {
         if (self.durable) |durable| {
             try durable.delete(txn_id);
@@ -2429,6 +2661,52 @@ pub const SessionRegistry = struct {
             defer self.mutex.unlock();
             if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
         }
+    }
+
+    fn deleteOwnedPersistent(self: *SessionRegistry, session: Session) !bool {
+        const durable = self.durable orelse return true;
+        if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
+            if (session.owner_incarnation != self.owner_incarnation) return false;
+            if (!(try durable.deleteWithLease(
+                session.txn_id,
+                session.owner_node_id,
+                session.owner_incarnation,
+            ))) return false;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
+            return true;
+        }
+        try self.deletePersistent(session.txn_id);
+        return true;
+    }
+
+    fn deleteExpiredPersistent(self: *SessionRegistry, session: Session, cutoff_ns: u64, now_ns: u64) !bool {
+        const durable = self.durable orelse return true;
+        if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
+            const deleted = if (session.owner_incarnation == self.owner_incarnation)
+                try durable.deleteWithLease(
+                    session.txn_id,
+                    session.owner_node_id,
+                    session.owner_incarnation,
+                )
+            else
+                try durable.deleteExpiredWithLease(
+                    session.txn_id,
+                    session.owner_node_id,
+                    session.owner_incarnation,
+                    session.last_touched_timestamp,
+                    cutoff_ns,
+                    now_ns / std.time.ns_per_ms,
+                );
+            if (!deleted) return false;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
+            return true;
+        }
+        try self.deletePersistent(session.txn_id);
+        return true;
     }
 
     fn ensureSessionCapacityLocked(self: *SessionRegistry) !void {
@@ -2454,6 +2732,30 @@ pub const SessionRegistry = struct {
     /// The caller holds the txn stripe. Durable reads happen without the global
     /// registry mutex; publication is a short double-checked map operation.
     fn loadSessionCloneAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        if (self.durable_scope == .cluster_shared) if (self.durable) |durable| {
+            var loaded = (try durable.load(txn_id)) orelse return null;
+            defer loaded.deinit(durable.alloc);
+            var cached = try loaded.clone(alloc);
+            var cached_owned = true;
+            defer if (cached_owned) cached.deinit(alloc);
+            var result = try loaded.clone(alloc);
+            errdefer result.deinit(alloc);
+
+            // Shared storage is authoritative. Refresh stale process-local
+            // ownership before the caller attempts a fenced mutation.
+            self.mutex.lock();
+            if (self.sessions.getPtr(txn_id)) |current| {
+                self.publishCandidateLocked(alloc, current, &cached);
+            } else {
+                self.sessions.put(alloc, txn_id, cached) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
+            }
+            cached_owned = false;
+            self.mutex.unlock();
+            return result;
+        };
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const cloned = session.clone(alloc) catch |err| {
@@ -2480,11 +2782,6 @@ pub const SessionRegistry = struct {
         return try self.sessions.getPtr(txn_id).?.clone(alloc);
     }
 
-    fn renewLeaseLocked(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64) !void {
-        const now_ns = nextTxnTimestamp();
-        try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
-    }
-
     pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer ids.deinit(self.durable.?.alloc);
@@ -2495,7 +2792,8 @@ pub const SessionRegistry = struct {
         }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.owner_node_id != owner_node_id) continue;
+            if (entry.value_ptr.owner_node_id != owner_node_id or
+                entry.value_ptr.owner_incarnation != self.owner_incarnation) continue;
             ids.append(self.durable.?.alloc, entry.key_ptr.*) catch |err| {
                 self.mutex.unlock();
                 return err;
@@ -2509,26 +2807,26 @@ pub const SessionRegistry = struct {
             session_lock.lock();
             defer session_lock.unlock();
             self.mutex.lock();
-            const still_owned = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id == owner_node_id else false;
+            const incarnation = if (self.sessions.getPtr(txn_id)) |session| blk: {
+                if (session.owner_node_id != owner_node_id or
+                    session.owner_incarnation != self.owner_incarnation) break :blk null;
+                break :blk session.owner_incarnation;
+            } else null;
             self.mutex.unlock();
-            if (!still_owned) continue;
-            try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
+            if (incarnation == null) continue;
+            try self.renewLeaseLockedAt(txn_id, owner_node_id, incarnation.?, now_ns);
             renewed += 1;
         }
         return renewed;
     }
 
-    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ns: u64) !void {
+    fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64, owner_incarnation: u64, now_ns: u64) !void {
         const lease_store = self.lease_store orelse return;
         const ttl_ns = self.owner_lease_ttl_ns orelse return;
         const now_ms = now_ns / std.time.ns_per_ms;
         const ttl_ms = @max(@as(u64, 1), ttl_ns / std.time.ns_per_ms);
-        if (!(try lease_store.renew(txn_id, owner_node_id, now_ms, ttl_ms))) return error.SessionLeaseLost;
-    }
-
-    fn releaseLease(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64) !void {
-        const lease_store = self.lease_store orelse return;
-        _ = try lease_store.release(txn_id, owner_node_id);
+        if (owner_incarnation != self.owner_incarnation) return error.SessionLeaseLost;
+        if (!(try lease_store.renew(txn_id, owner_node_id, owner_incarnation, now_ms, ttl_ms))) return error.SessionLeaseLost;
     }
 
     fn loadLeaseExpiryLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !u64 {
@@ -3998,7 +4296,7 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .outcome = if (session.idempotent_outcome) |outcome|
             outcome.text()
         else if (session.terminal_commit) |terminal|
-            terminalCommitResponseStatus(terminal.status, terminal.repair_required)
+            terminalCommitResponseStatus(effectiveTerminalCommitStatus(terminal), terminal.repair_required)
         else if (session.commit_execution_started)
             "unknown"
         else
@@ -4175,13 +4473,17 @@ fn parseSessionExpiryKey(key: []const u8) ?ParsedSessionExpiryKey {
     };
 }
 
-fn ownerLeaseId(alloc: std.mem.Allocator, owner_node_id: u64) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "node:{d}", .{owner_node_id});
+fn ownerLeaseId(alloc: std.mem.Allocator, owner_node_id: u64, owner_incarnation: u64) ![]u8 {
+    if (owner_incarnation == 0)
+        return try std.fmt.allocPrint(alloc, "node:{d}", .{owner_node_id});
+    return try std.fmt.allocPrint(alloc, "node:{d}:incarnation:{d}", .{ owner_node_id, owner_incarnation });
 }
 
 fn leaseRecordOwnerNodeId(owner_id: []const u8) ?u64 {
     if (!std.mem.startsWith(u8, owner_id, "node:")) return null;
-    return std.fmt.parseUnsigned(u64, owner_id["node:".len..], 10) catch null;
+    const suffix = owner_id["node:".len..];
+    const end = std.mem.indexOfScalar(u8, suffix, ':') orelse suffix.len;
+    return std.fmt.parseUnsigned(u64, suffix[0..end], 10) catch null;
 }
 
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
@@ -4189,6 +4491,8 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"owner_node_id\":");
     try out.print(alloc, "{d}", .{session.owner_node_id});
+    try out.appendSlice(alloc, ",\"owner_incarnation\":");
+    try out.print(alloc, "{d}", .{session.owner_incarnation});
     try out.appendSlice(alloc, ",\"principal\":");
     if (session.principal) |principal| {
         try appendJsonString(alloc, &out, principal);
@@ -4304,6 +4608,13 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             }
         else
             sessionOwnerNodeId(txn_id),
+        .owner_incarnation = if (obj.get("owner_incarnation")) |value|
+            switch (value) {
+                .integer => |v| try nonNegativeRecordInteger(v),
+                else => return error.InvalidTransactionSessionRecord,
+            }
+        else
+            0,
         .principal = if (obj.get("principal")) |value|
             switch (value) {
                 .string => |principal| try alloc.dupe(u8, principal),
@@ -4816,6 +5127,24 @@ test "committed repair session without coordinator replays a write handoff" {
 test "terminal commit response preserves live debt ahead of repair" {
     try std.testing.expectEqual(
         TerminalCommitStatus.committed_recovery_pending,
+        effectiveTerminalCommitStatus(.{
+            .status = .committed,
+            .coordinator_group_id = 7001,
+            .coordinator_table_name = null,
+            .coordinator_acknowledged = false,
+        }),
+    );
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed,
+        effectiveTerminalCommitStatus(.{
+            .status = .committed,
+            .coordinator_group_id = 7001,
+            .coordinator_table_name = null,
+            .coordinator_acknowledged = true,
+        }),
+    );
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed_recovery_pending,
         terminalCommitStatusForOutcome(true, true, true, false),
     );
     try std.testing.expectEqualStrings(
@@ -4968,6 +5297,69 @@ test "cluster-shared idempotency requires atomic owner fencing" {
     defer fenced.deinit(alloc);
     fenced.durable_scope = .cluster_shared;
     try std.testing.expect(fenced.hasAtomicClusterSharedStore());
+}
+
+test "shared session mutations and cleanup reject an adopted owner incarnation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-incarnation-fence", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    const leases = SessionLeaseStore.init(alloc, &store);
+
+    var owner = SessionRegistry.initWithLeaseTtl(&durable, leases, std.time.ns_per_s);
+    defer owner.deinit(alloc);
+    owner.durable_scope = .cluster_shared;
+    const txn_id = idempotentTransactionId("alice", "docs", "fenced-operation");
+    _ = try owner.beginIdempotentForPrincipal(alloc, txn_id, .{ .sync_level = .write }, 7, "alice");
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}},"sync_level":"write"}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try owner.cloneCommitRequest(alloc, txn_id, &request)).?;
+    sealed.deinit(alloc);
+
+    var lease = (try leases.load(alloc, txn_id)).?;
+    defer lease_mod.deinitRecord(alloc, &lease);
+    var adopter = SessionRegistry.initWithLeaseTtl(&durable, leases, std.time.ns_per_s);
+    defer adopter.deinit(alloc);
+    adopter.durable_scope = .cluster_shared;
+    try std.testing.expect(try adopter.adoptIfLeaseExpired(
+        alloc,
+        txn_id,
+        7,
+        lease.expires_at_ms * std.time.ns_per_ms + 1,
+    ));
+    try std.testing.expect(owner.owner_incarnation != adopter.owner_incarnation);
+
+    try std.testing.expectError(
+        error.SessionLeaseLost,
+        owner.cloneCommitRequest(alloc, txn_id, &request),
+    );
+    try std.testing.expectEqual(@as(usize, 0), try owner.cleanupExpired(alloc, std.math.maxInt(u64)));
+    var persisted = (try durable.load(txn_id)).?;
+    try std.testing.expectEqual(adopter.owner_incarnation, persisted.owner_incarnation);
+    persisted.deinit(alloc);
+
+    var adopted_lease = (try leases.load(alloc, txn_id)).?;
+    defer lease_mod.deinitRecord(alloc, &adopted_lease);
+    var reaper = SessionRegistry.initWithLeaseTtl(&durable, leases, std.time.ns_per_s);
+    defer reaper.deinit(alloc);
+    reaper.durable_scope = .cluster_shared;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reaper.cleanupExpiredAt(
+            alloc,
+            std.math.maxInt(u64),
+            adopted_lease.expires_at_ms * std.time.ns_per_ms + 1,
+        ),
+    );
+    try std.testing.expect((try durable.load(txn_id)) == null);
 }
 
 test "durable recovery index tracks only validated commit execution and terminal handoff" {

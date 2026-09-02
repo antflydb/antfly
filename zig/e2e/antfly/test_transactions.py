@@ -330,6 +330,11 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
             "Connection": "close",
         },
     )
+    # Waiting for headers proves that the server reached a durable outcome;
+    # deliberately discard the receipt body to model a client that loses the
+    # response after commit but before it can retain the reconciliation ID.
+    discarded = connection.getresponse()
+    assert discarded.status in (201, 202)
     connection.close()
 
     response = stateful_api.s.post(
@@ -338,7 +343,9 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
         headers={"Idempotency-Key": key},
         timeout=30,
     )
-    assert response.status_code in (200, 201, 202), response.text
+    # 201 would mean this request executed the operation for the first time,
+    # so it must not be accepted as evidence of replay safety.
+    assert response.status_code in (200, 202), response.text
     receipt = response.json()
     assert receipt["status"].startswith("committed")
     transaction_id = receipt["transaction_id"]

@@ -39,6 +39,7 @@ from antfly.client_generated.models import (
     InferenceGenerateRequest,
     InferenceGenerateResponse,
     QueryResponses,
+    SyncLevel,
 )
 from antfly.client_generated.types import UNSET
 
@@ -1321,10 +1322,19 @@ class AntflyClient:
         idempotency_key: str,
         inserts: dict[str, dict[str, Any]] | None = None,
         deletes: list[str] | None = None,
+        transforms: list[dict[str, Any]] | None = None,
+        sync_level: SyncLevel | str | None = None,
     ) -> IdempotentBatchResponse:
         """Perform a durably idempotent batch and return its reconciliation receipt."""
-        batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
-        request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
+        batch_sync_level = SyncLevel(sync_level) if isinstance(sync_level, str) else sync_level or UNSET
+        request_data: dict[str, Any] = {"deletes": deletes or []}
+        if inserts is not None:
+            request_data["inserts"] = inserts
+        if transforms is not None:
+            request_data["transforms"] = transforms
+        if batch_sync_level is not UNSET:
+            request_data["sync_level"] = batch_sync_level.value
+        request = BatchRequest.from_dict(request_data)
         encoded = self._encode_write_request("Idempotent batch", request.to_dict())
 
         result = self._request(
