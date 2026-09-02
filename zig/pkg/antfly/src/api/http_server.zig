@@ -9622,6 +9622,10 @@ pub const ApiHttpServer = struct {
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };
+        managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
             alloc,
             indexes_json,
@@ -12244,7 +12248,7 @@ pub const ApiHttpServer = struct {
         // Opportunistically stamp stable producer identities onto legacy
         // executable owners while the API still has the deployment context
         // needed to resolve implicit endpoints.
-        const expected_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             assembled_indexes_json,
             .{
@@ -12507,7 +12511,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(assembled_indexes_json);
-        const expected_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             assembled_indexes_json,
             .{
@@ -16554,6 +16558,17 @@ test "restore admission rejects an embedding artifact catalog without an executa
         server.validateRestoredManagedEmbeddingCatalog(
             std.testing.allocator,
             "{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}]},\"enrichments\":[{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]}",
+        ),
+    );
+
+    const duplicate_owner_catalog =
+        \\{"owner_a":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"openai","model":"model-a","url":"http://127.0.0.1:1"},"semantic_producer":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"owner_b":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"openai","model":"model-a","url":"http://127.0.0.1:1"},"semantic_producer":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"},"enrichments":[{"name":"dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":"{\"version\":2,\"provider\":\"openai\",\"model\":\"model-a\",\"endpoint\":\"http://127.0.0.1:1/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        server.validateRestoredManagedEmbeddingCatalog(
+            std.testing.allocator,
+            duplicate_owner_catalog,
         ),
     );
 }

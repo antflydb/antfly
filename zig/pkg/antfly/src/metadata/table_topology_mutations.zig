@@ -205,6 +205,8 @@ pub fn restore(
         ranges.len == 0 or ranges.len > topology_protocol.max_initial_ranges or
         ranges.len != @as(usize, table.min_ranges))
         return error.InvalidTableTopologyMutation;
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
+    try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, table.indexes_json);
     metadata_table_manager.validateCompleteKeyspaceRanges(ranges) catch
         return error.InvalidTableTopologyMutation;
     var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;

@@ -1211,6 +1211,8 @@ const LocalStandaloneMetadata = struct {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
+        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, table.indexes_json);
         const ranges = try antfly.public_api.backups.deriveRestoreRanges(
             alloc,
             table.table_id,

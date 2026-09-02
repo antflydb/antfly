@@ -1815,6 +1815,7 @@ fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
     value: std.json.Value,
     catalog_root: std.json.Value,
     options: InitOptions,
+    owner_already_admitted: bool,
 ) !?[]u8 {
     const root = switch (value) {
         .object => |object| object,
@@ -1829,13 +1830,20 @@ fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
     const sparse = cfg.sparse orelse false;
     const validation_value = root.get("validation");
     const validation = try parseDimensionProbeValidation(root);
+    const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
 
-    // A persisted semantic identity proves this owner already crossed the API
-    // admission boundary. Revalidating a whole catalog must not turn every
-    // unrelated mutation into a provider dimension probe; the catalog pass
-    // below still validates the durable identity against the owner config.
-    if (cfg.dimension != null and validation_value == null and root.get("semantic_producer") != null)
+    // Revalidating an already-admitted catalog must not turn an unrelated
+    // mutation into a provider health check. Dense owners with a durable
+    // dimension and sparse owners have no missing shape to discover; the
+    // semantic-producer pass below can stamp or validate their identity
+    // without invoking the provider. New public owners still take the strict
+    // path before they are merged into an admitted catalog.
+    if (validation_value == null and root.get("embedder") != null and
+        (root.get("semantic_producer") != null or owner_already_admitted) and
+        (sparse or declared_dims != null))
+    {
         return null;
+    }
 
     const external = cfg.external orelse false;
     const embedder_value = root.get("embedder");
@@ -1859,7 +1867,6 @@ fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
         return null;
     }
 
-    const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
     if (validation == .defer_probe and declared_dims == null) return error.InvalidCreateTableRequest;
     // Chunker-only dense indexes consume caller-supplied chunk embeddings and
     // have no embedding provider to probe. Their declared dimension remains
@@ -1915,7 +1922,52 @@ pub fn normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(
     catalog_root: std.json.Value,
     options: InitOptions,
 ) !?[]u8 {
-    if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(alloc, index_name, value, catalog_root, options)) |normalized_dimension| {
+    return try normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
+        alloc,
+        index_name,
+        value,
+        catalog_root,
+        options,
+        false,
+    );
+}
+
+/// Normalize an owner that has already crossed public admission. This mode
+/// migrates durable producer identity and resolves artifact-derived dimensions
+/// without re-probing providers whose dense/sparse shape is already durable.
+pub fn normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    catalog_root: std.json.Value,
+    options: InitOptions,
+) !?[]u8 {
+    return try normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
+        alloc,
+        index_name,
+        value,
+        catalog_root,
+        options,
+        true,
+    );
+}
+
+fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    catalog_root: std.json.Value,
+    options: InitOptions,
+    owner_already_admitted: bool,
+) !?[]u8 {
+    if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
+        alloc,
+        index_name,
+        value,
+        catalog_root,
+        options,
+        owner_already_admitted,
+    )) |normalized_dimension| {
         errdefer alloc.free(normalized_dimension);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized_dimension, .{});
         defer parsed.deinit();
@@ -2924,7 +2976,60 @@ fn parseManagedEmbeddingEntry(
 
     const embedder = root.get("embedder") orelse return null;
     const dims = if (sparse) 0 else try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
-    return try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims);
+    var managed = try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims);
+    errdefer managed.deinit(alloc);
+    try bindManagedEntryToCatalogSemanticIdentity(alloc, value, options, &managed);
+    return managed;
+}
+
+/// Bind execution to the endpoint and deployment mode admitted into the
+/// catalog. The raw embedder remains authoritative for credentials and pacing,
+/// while semantic identity prevents each runtime process from re-resolving an
+/// omitted endpoint or Bedrock region from its own environment.
+fn bindManagedEntryToCatalogSemanticIdentity(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    options: InitOptions,
+    entry: *ManagedEmbeddingEntry,
+) !void {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidEmbeddingArtifactProducer,
+    };
+    const semantic = root.get("semantic_producer") orelse return;
+    if (semantic != .string or semantic.string.len == 0)
+        return error.InvalidEmbeddingArtifactProducer;
+
+    var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
+    defer parsed_cfg.deinit();
+    try validateCatalogOwnerSemanticIdentity(alloc, .{
+        .sparse = parsed_cfg.value.sparse orelse false,
+        .dimensions = if (parsed_cfg.value.sparse orelse false) null else entry.dimensions,
+        .semantic_producer_json = semantic.string,
+        .index_value = value,
+    });
+
+    var identity = std.json.parseFromSlice(std.json.Value, alloc, semantic.string, .{}) catch
+        return error.InvalidEmbeddingArtifactProducer;
+    defer identity.deinit();
+    if ((try semanticProducerV2Sparse(identity.value)) == null)
+        return error.InvalidEmbeddingArtifactProducer;
+    const endpoint = try semanticIdentityStringField(identity.value, "endpoint");
+    const region = try semanticIdentityStringField(identity.value, "region");
+    const embedded = std.mem.eql(u8, endpoint, "antfly:embedded");
+    if (embedded and (entry.provider != .antfly or options.antfly_provider == null))
+        return error.InvalidEmbeddingArtifactProducer;
+
+    const bound_base_url = try alloc.dupe(u8, if (embedded) "" else endpoint);
+    errdefer alloc.free(bound_base_url);
+    const bound_region: []u8 = if (region.len > 0) try alloc.dupe(u8, region) else @constCast("");
+    errdefer if (bound_region.len > 0) alloc.free(bound_region);
+
+    alloc.free(entry.base_url);
+    if (entry.region.len > 0) alloc.free(entry.region);
+    entry.base_url = bound_base_url;
+    entry.region = bound_region;
+    entry.antfly_provider = if (embedded) options.antfly_provider else null;
 }
 
 fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
@@ -4305,6 +4410,43 @@ test "managed embedder registers every multi-source embedding artifact name" {
     defer std.testing.allocator.free(sparse_translated);
     try std.testing.expect(std.mem.indexOf(u8, sparse_translated, "\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, sparse_translated, "\"generator\"") == null);
+}
+
+test "managed embedder binds execution to catalog semantic producer identity" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var remote = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"model-a"},"semantic_producer":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"model-a\",\"endpoint\":\"http://identity.example/ai/v1\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}}
+    , .{
+        .antfly_provider = local.provider(),
+        .inference_api_url = "http://runtime-default.example",
+    });
+    defer remote.deinit();
+    try std.testing.expectEqualStrings("http://identity.example/ai/v1", remote.entries[0].base_url);
+    try std.testing.expect(remote.entries[0].antfly_provider == null);
+
+    const embedded_catalog =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"model-a"},"semantic_producer":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"model-a\",\"endpoint\":\"antfly:embedded\",\"region\":\"\",\"request_format\":\"\",\"sparse\":false,\"multimodal\":false,\"input_type\":\"\",\"truncate\":\"\"}"}}
+    ;
+    var embedded = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        embedded_catalog,
+        .{
+            .antfly_provider = local.provider(),
+            .inference_api_url = "http://runtime-default.example",
+        },
+    );
+    defer embedded.deinit();
+    try std.testing.expectEqualStrings("", embedded.entries[0].base_url);
+    try std.testing.expect(embedded.entries[0].antfly_provider != null);
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        ManagedEmbedder.initFromIndexesJsonWithOptions(
+            std.testing.allocator,
+            embedded_catalog,
+            .{ .inference_api_url = "http://runtime-default.example" },
+        ),
+    );
 }
 
 pub fn testMultiSourceEmbeddingContracts() !void {

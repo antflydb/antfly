@@ -3645,6 +3645,7 @@ pub fn build(b: *std.Build) void {
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
         "managed embedder artifact backed embedding translation",
+        "managed embedder binds execution to catalog semantic producer identity",
         "managed embedder catalog ownership rejects orphaned semantic producers",
         "catalog ownership rejects duplicate executable owners and endpoint mismatches",
         "managed embedder preserves coverage policy in storage config",
