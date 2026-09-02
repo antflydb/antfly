@@ -958,13 +958,22 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         {
             "name": index_name,
             "type": "embeddings",
-            "field": "body",
+            "template": "{{title}} {{body}}",
             "dimension": 3,
             "execution": {"embedding": {"batch_items": 1}},
             "embedder": {
                 "provider": "openai",
                 "model": "text-embedding-3-small",
                 "url": progressive_openai_embedder.url,
+            },
+            "chunker": {
+                "provider": "antfly",
+                "model": "fixed-bert-tokenizer",
+                "text": {
+                    "target_tokens": 8,
+                    "overlap_tokens": 2,
+                    "separator": " ",
+                },
             },
         },
     )
@@ -979,7 +988,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         until="complete",
     )
     progressive_openai_embedder.rate_limit_after_next_requests(
-        10, input_substring="progressive publication document"
+        300, input_substring="progressive publication document"
     )
 
     # Match the quickstart's index-before-load ordering. Separate durable write
@@ -987,13 +996,13 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # still being embedded.
     documents = {
         f"doc:{i:03d}": {
-            "title": f"Alpha {i}",
+            "title": f"Document {i}",
             "body": (
-                f"retrieval semantic progressive publication document {i}"
+                f"retrieval semantic progressive publication document {i} context evidence history details"
                 if i < 10
-                else f"alpha concept progressive publication document {i}"
-                if i == 10
-                else f"beta progressive publication document {i}"
+                else f"alpha concept progressive publication document {i} context evidence history details"
+                if i == 90
+                else f"beta progressive publication document {i} context evidence history details"
             ),
         }
         for i in range(100)
@@ -1129,8 +1138,8 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     result = backup_api.query_table(
         table_name,
         {
-            # The first page embeds to [0.8, 0.2, 0.0], while doc:010 in the
-            # unpublished remainder is the exact [1.0, 0.0, 0.0] match. This
+            # The first page embeds to [0.8, 0.2, 0.0], while doc:090 in the
+            # unpublished tail is the exact [1.0, 0.0, 0.0] match. This
             # proves the public query was served by the partial generation
             # while later enrichment remains throttled.
             "embeddings": {index_name: [1.0, 0.0, 0.0]},
@@ -1147,6 +1156,33 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # without waiting behind generic structural/repair work, and the second
     # index must make progress on its independent title inputs.
     second_index_name = "semantic_title_live"
+    first_incarnation = partial_status["readiness"]["incarnation"]
+    first_floor = int(partial_status["searchable_vectors"])
+    first_coverage_floor = int(partial_status["source_coverage"]["covered"])
+    first_last_artifacts = first_floor
+    first_continuity_samples = 0
+
+    def assert_first_serving_continuity() -> dict:
+        nonlocal first_last_artifacts, first_continuity_samples
+        request_started = time.monotonic()
+        status = backup_api.get_index(table_name, index_name)["status"]
+        request_elapsed = time.monotonic() - request_started
+        assert request_elapsed < 1.0, (
+            f"status request for {index_name} took {request_elapsed:.3f}s"
+        )
+        readiness = status.get("readiness") or {}
+        assert readiness.get("state") != "runtime_unavailable", status
+        assert readiness.get("incarnation") == first_incarnation, status
+        assert readiness.get("queryable") is True, status
+        searchable = int(status.get("searchable_vectors", 0))
+        assert searchable >= first_last_artifacts, status
+        first_last_artifacts = searchable
+        covered = int((status.get("source_coverage") or {}).get("covered", 0))
+        assert covered >= first_coverage_floor, status
+        first_continuity_samples += 1
+        return status
+
+    assert_first_serving_continuity()
     activation_started = __import__("time").monotonic()
     second_created = backup_api.create_index(
         table_name,
@@ -1165,10 +1201,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         },
     )
     assert_created_index(second_created, second_index_name, "embeddings")
+    assert_first_serving_continuity()
 
     activation_samples = []
 
     def second_index_has_runtime_observation() -> dict | None:
+        assert_first_serving_continuity()
         status = backup_api.get_index(table_name, second_index_name)["status"]
         activation_samples.append(status)
         assert status.get("repair") is None, status
@@ -1192,6 +1230,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     second_incarnation = activated["readiness"]["incarnation"]
 
     def second_index_has_published_artifact() -> dict | None:
+        assert_first_serving_continuity()
         status = backup_api.get_index(table_name, second_index_name)["status"]
         readiness = status.get("readiness") or {}
         pending_reasons = readiness.get("pending_reasons") or []
@@ -1220,9 +1259,6 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # Status is a bounded immutable-snapshot read. Sample across several owner
     # refresh cycles while both incarnations are active: a missed heartbeat may
     # remove activity, but must never revoke serving authority or zero facts.
-    first_incarnation = partial_status["readiness"]["incarnation"]
-    first_floor = int(partial_status["searchable_vectors"])
-    first_coverage_floor = int(partial_status["source_coverage"]["covered"])
     second_floor = int(second_partial["searchable_vectors"])
     sampling_deadline = time.monotonic() + 3.0
     samples = 0
@@ -1231,6 +1267,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             (index_name, first_incarnation, first_floor, first_coverage_floor),
             (second_index_name, second_incarnation, second_floor, 1),
         ):
+            if sampled_index == index_name:
+                assert_first_serving_continuity()
+                continue
             request_started = time.monotonic()
             sampled = backup_api.get_index(table_name, sampled_index)["status"]
             request_elapsed = time.monotonic() - request_started
@@ -1249,6 +1288,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         samples += 1
         time.sleep(0.05)
     assert samples >= 3
+    assert first_continuity_samples >= 5
 
     progressive_openai_embedder.allow_rate_limited_requests()
     complete = backup_api.wait_index_ready(
@@ -1267,8 +1307,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert complete["source_coverage"]["complete"] is True
     assert complete["milestones"]["complete"]["reached"] is True
     assert complete["milestones"]["complete"]["blockers"] == []
-    assert complete["searchable_vectors"] == 100
-    assert complete["total_indexed"] == 100
+    first_complete_artifacts = complete["searchable_vectors"]
+    assert first_complete_artifacts > 100
+    assert complete["total_indexed"] == first_complete_artifacts
     second_complete = backup_api.wait_index_ready(
         table_name,
         second_index_name,
@@ -1303,7 +1344,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert after_write["readiness"]["queryable"] is True
     assert after_write["readiness"]["complete"] is False
     assert after_write["readiness"]["state"] == "queryable_partial"
-    assert after_write["searchable_vectors"] == 100
+    assert after_write["searchable_vectors"] == first_complete_artifacts
     assert set(after_write["milestones"]["complete"]["blockers"]) & {
         "target_observation",
         "source_coverage",
@@ -1321,7 +1362,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     )
     assert reconverged["readiness"]["complete"] is True
     assert reconverged["source_coverage"]["covered"] == 101
-    assert reconverged["searchable_vectors"] == 101
+    assert reconverged["searchable_vectors"] > first_complete_artifacts
 
 
 def test_live_index_activation_preempts_an_active_enrichment_quantum(
