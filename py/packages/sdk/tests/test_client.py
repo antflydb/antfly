@@ -929,6 +929,32 @@ class TestAntflyClient:
             headers={"Content-Type": "application/json"},
         )
 
+    @patch("antfly.client.Client")
+    def test_idempotent_batch_uses_distinct_route_and_stable_key(self, mock_client_class: MagicMock) -> None:
+        expected_body = {"inserts": {"user:1": {"name": "Zoë"}}, "deletes": []}
+        expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 201, {"inserted": 1})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.idempotent_batch(
+            table="users/archive",
+            idempotency_key="import-generation-7",
+            inserts={"user:1": {"name": "Zoë"}},
+        )
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/users%2Farchive/idempotent-batch",
+            content=expected_content,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": "import-generation-7",
+            },
+        )
+
     def test_request_reads_chunked_json_and_closes(self) -> None:
         stream = ChunkStream([b'{"ok":', b"true}"])
         client = AntflyClient("http://test", max_json_response_bytes=16)

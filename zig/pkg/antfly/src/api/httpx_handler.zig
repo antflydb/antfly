@@ -4822,15 +4822,6 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
-        if (ctx.header("idempotency-key")) |idempotency_key| {
-            return try self.idempotentBatchWrite(
-                ctx,
-                decoded_table_name,
-                body_data,
-                idempotency_key,
-                authenticated_identity,
-            );
-        }
         return try handleTableBatchOffEventLoop(
             ctx,
             self.api_server.cfg.backend_runtime,
@@ -4840,11 +4831,33 @@ pub const AntflyApiHandler = struct {
         );
     }
 
-    /// Compatibility path for callers that need a retry-safe batch without
-    /// adopting the multi-call transaction-session API. It deliberately uses
-    /// the same durable session and retained-2PC machinery as that API; the
-    /// legacy header-free batch fast path remains unchanged.
-    fn idempotentBatchWrite(
+    /// A separately versioned route is intentional: older binaries return 404
+    /// instead of silently accepting and ignoring the idempotency contract
+    /// during a rolling upgrade.
+    pub fn idempotentBatchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        const idempotency_key = ctx.header("idempotency-key") orelse
+            return respondJsonErrorBody(ctx, 400, "{\"error\":\"missing idempotency key\",\"code\":\"missing_idempotency_key\",\"message\":\"Idempotency-Key is required\",\"retryable\":false}");
+        if (try self.acquirePublicOperation(ctx, "idempotentBatchWrite")) |response| return response;
+        defer self.releasePublicOperation("idempotentBatchWrite");
+        return try self.executeIdempotentBatchWrite(
+            ctx,
+            decoded_table_name,
+            body_data,
+            idempotency_key,
+            authenticated_identity,
+        );
+    }
+
+    fn executeIdempotentBatchWrite(
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
         table_name: []const u8,
@@ -4869,8 +4882,11 @@ pub const AntflyApiHandler = struct {
         const principal = http_server_mod.transactionPrincipal(authenticated_identity);
         const txn_id = transactions_api.idempotentTransactionId(principal, table_name, idempotency_key);
         const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-        if (!self.api_server.txn_sessions.hasDurableStore()) {
-            return respondJsonErrorBody(ctx, 503, "{\"error\":\"durable idempotency storage is not configured\",\"code\":\"idempotency_unavailable\",\"message\":\"durable idempotency storage is not configured\",\"retryable\":true}");
+        if (!self.api_server.txn_sessions.hasDurableStore() or
+            (!self.api_server.cfg.deployment_mode.isStandalone() and
+                self.api_server.txn_sessions.durable_scope != .cluster_shared))
+        {
+            return try idempotentBatchError(ctx, 503, "unknown", "idempotency_unavailable", "cluster-shared durable idempotency storage is not configured", true, &txn_hex);
         }
         const session = self.api_server.txn_sessions.beginIdempotentForPrincipal(
             alloc,
@@ -4880,7 +4896,7 @@ pub const AntflyApiHandler = struct {
             principal,
         ) catch |err| switch (err) {
             error.IdempotencyConflict => return try idempotentBatchError(ctx, 409, "not_applied", "idempotency_conflict", "idempotency key is already bound to incompatible request options", false, &txn_hex),
-            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return respondJsonErrorBody(ctx, 429, "{\"error\":\"durable idempotency capacity is exhausted\",\"code\":\"idempotency_capacity_exhausted\",\"message\":\"durable idempotency capacity is exhausted\",\"retryable\":true}"),
+            error.SessionLimitExceeded, error.SessionCapacityUnavailable => return try idempotentBatchError(ctx, 429, "not_applied", "idempotency_capacity_exhausted", "durable idempotency capacity is exhausted", true, &txn_hex),
             else => return err,
         };
 
@@ -4907,6 +4923,9 @@ pub const AntflyApiHandler = struct {
         }) orelse return try idempotentBatchError(ctx, 409, "not_applied", "operation_not_found", "durable batch operation not found", false, &txn_hex);
         defer commit_req.deinit(alloc);
 
+        if (try self.api_server.txn_sessions.getIdempotentOutcome(alloc, txn_id)) |receipt_outcome| {
+            return try respondIdempotentBatchRejection(ctx, txn_id, receipt_outcome);
+        }
         if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
@@ -4917,13 +4936,13 @@ pub const AntflyApiHandler = struct {
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation => {
-                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
                 return try idempotentBatchError(ctx, 409, "not_applied", "invalid_batch_request", "invalid batch request", false, &txn_hex);
             },
             else => return err,
         };
         const source = self.api_server.table_writes orelse {
-            _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+            _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
             return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
         };
         _ = (try self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse
@@ -4953,45 +4972,54 @@ pub const AntflyApiHandler = struct {
                         ctx.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
                         continue;
                     }
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
                     return try idempotentBatchError(ctx, 409, "not_applied", "topology_changed", "topology did not stabilize before the retry budget expired", true, &txn_hex);
                 },
                 error.CommitDecisionUnknown => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "transaction recovery is reconciling the retained decision", true, &txn_hex),
                 error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_visibility_pending, null, null);
+                    _ = (self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_visibility_pending, null, null) catch |persist_err| {
+                        std.log.warn("idempotent batch committed but visibility receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                        return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                    }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                     return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                 },
                 error.CommitPropagationIncomplete => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_recovery_pending, null, null);
+                    _ = (self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .committed_recovery_pending, null, null) catch |persist_err| {
+                        std.log.warn("idempotent batch committed but recovery receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                        return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                    }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                     return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                 },
                 error.EnrichmentWorkerFailed => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommitWithRepair(alloc, txn_id, .committed, true, null, null);
+                    _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(alloc, txn_id, .committed, true, null, null) catch |persist_err| {
+                        std.log.warn("idempotent batch committed but repair receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                        return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
+                    }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
                     return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_repair_required", commit_req.tables);
                 },
                 error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
                     return try idempotentBatchError(ctx, 409, "not_applied", "invalid_batch_request", "invalid batch request", false, &txn_hex);
                 },
                 error.TableNotFound => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                    _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
                     return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
                 },
                 error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try idempotentBatchError(ctx, 409, "unknown", "transaction_outcome_unknown", "transaction recovery has not established a durable decision", true, &txn_hex),
                 error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => {
-                    _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .aborted, null, null);
+                    _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .aborted);
                     return try idempotentBatchError(ctx, 409, "aborted", "transaction_aborted", "transaction was durably aborted", false, &txn_hex);
                 },
                 else => return err,
             } orelse {
-                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .not_applied, null, null);
+                _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .not_applied);
                 return try idempotentBatchError(ctx, 409, "not_applied", "table_not_found", "table not found", false, &txn_hex);
             };
         };
 
         switch (outcome) {
             .conflict => {
-                _ = try self.api_server.txn_sessions.recordTerminalCommit(alloc, txn_id, .aborted, null, null);
+                _ = try self.api_server.txn_sessions.recordIdempotentOutcome(alloc, txn_id, .aborted);
                 return try idempotentBatchError(ctx, 409, "aborted", "transaction_conflict", "batch transaction conflicted and was durably aborted", false, &txn_hex);
             },
             .committed => |committed| {
@@ -5001,14 +5029,17 @@ pub const AntflyApiHandler = struct {
                     committed.visibility_retry_pending,
                     committed.visibility_repair_required,
                 );
-                _ = try self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
                     alloc,
                     txn_id,
                     terminal_status,
                     committed.visibility_repair_required,
                     committed.coordinator_group_id,
                     committed.coordinator_table_name,
-                );
+                ) catch |persist_err| {
+                    std.log.warn("idempotent batch committed but terminal receipt persistence is pending txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                    return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
+                }) orelse return try idempotentBatchSuccess(ctx, 202, txn_id, "committed_pending", commit_req.tables);
                 if (terminal_status == .committed) if (committed.coordinator_group_id) |group_id| {
                     const coordinator_table = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
                     if ((source.acknowledgeTransactionCommit(alloc, txn_id, group_id, coordinator_table) catch null) != null) {
@@ -5031,11 +5062,16 @@ pub const AntflyApiHandler = struct {
     ) !httpx.Response {
         _ = self;
         const status = transactions_api.terminalCommitResponseStatus(terminal.status, terminal.repair_required);
-        if (terminal.status == .not_applied or terminal.status == .aborted) {
-            const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-            return try idempotentBatchError(ctx, 409, status, "transaction_not_applied", "the durable batch transaction was not applied", false, &txn_hex);
-        }
         return try idempotentBatchSuccess(ctx, if (terminal.status == .committed and !terminal.repair_required) 200 else 202, txn_id, status, request.tables);
+    }
+
+    fn respondIdempotentBatchRejection(
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        outcome: transactions_api.IdempotentReceiptOutcome,
+    ) !httpx.Response {
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        return try idempotentBatchError(ctx, 409, outcome.text(), "transaction_not_applied", "the durable batch transaction was not applied", false, &txn_hex);
     }
 
     fn idempotentBatchSuccess(
@@ -7442,6 +7478,108 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     try api_server.runSessionMaintenanceOnce();
     try std.testing.expectEqual(@as(usize, 4), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 3), writes.acknowledge_calls);
+}
+
+test "httpx idempotent batch returns a typed committed handoff when receipt persistence fails" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        durable: ?*transactions_api.DurableSessionStore = null,
+        commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            if (self.commit_calls == 1) self.durable.?.fail_writes_for_test = true;
+            return .{ .committed = .{
+                .participant_count = 1,
+                .coordinator_group_id = 7001,
+                .coordinator_table_name = "docs",
+            } };
+        }
+
+        fn acknowledgeTransactionCommit(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const u8,
+        ) anyerror!?void {
+            return {};
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-httpx-idempotent-batch-post-commit-receipt";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = try ApiHttpServer.initWithConfig(alloc, .{
+        .deployment_mode = .standalone,
+        .session_store_path = session_path,
+    }, status.iface(), null, writes.source());
+    defer api_server.deinit();
+    writes.durable = api_server.opened_session_store.?.durableStore();
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/idempotent-batch", .{base_url});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "Idempotency-Key", "receipt-write-failure" },
+    };
+    const body = "{\"inserts\":{\"counter\":{\"value\":1}},\"sync_level\":\"write\"}";
+
+    var first = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 202), first.status.code);
+    var parsed_first = try std.json.parseFromSlice(std.json.Value, alloc, first.body.?, .{});
+    defer parsed_first.deinit();
+    try std.testing.expectEqualStrings("committed_pending", parsed_first.value.object.get("status").?.string);
+    try std.testing.expect(parsed_first.value.object.get("transaction_id") != null);
+    try std.testing.expect(parsed_first.value.object.get("reconcile") != null);
+
+    writes.durable.?.fail_writes_for_test = false;
+    try api_server.runSessionMaintenanceOnce();
+    var replay = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(u16, 200), replay.status.code);
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
 }
 
 test "httpx MCP route preserves protocol session headers" {

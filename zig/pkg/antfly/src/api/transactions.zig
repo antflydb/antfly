@@ -252,13 +252,22 @@ pub const SessionInfo = struct {
 };
 
 pub const TerminalCommitStatus = enum {
-    not_applied,
-    aborted,
     committed,
     committed_visibility_pending,
     committed_recovery_pending,
 
     pub fn text(self: TerminalCommitStatus) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Additive receipt state kept outside TerminalCommitStatus so session files
+/// remain readable by rollback binaries that know the established commit enum.
+pub const IdempotentReceiptOutcome = enum {
+    not_applied,
+    aborted,
+
+    pub fn text(self: IdempotentReceiptOutcome) []const u8 {
         return @tagName(self);
     }
 };
@@ -646,6 +655,9 @@ pub const Session = struct {
     /// Marks sessions whose identity is derived from an external idempotency
     /// key. Recovery must preserve their terminal non-application receipt.
     idempotent_receipt: bool = false,
+    /// Terminal rejection is deliberately an additive top-level field rather
+    /// than a new TerminalCommitStatus variant for downgrade compatibility.
+    idempotent_outcome: ?IdempotentReceiptOutcome = null,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
@@ -683,6 +695,7 @@ pub const Session = struct {
             .commit_body_digest = self.commit_body_digest,
             .commit_execution_started = self.commit_execution_started,
             .idempotent_receipt = self.idempotent_receipt,
+            .idempotent_outcome = self.idempotent_outcome,
         };
         errdefer out.deinit(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
@@ -1698,6 +1711,36 @@ pub const SessionRegistry = struct {
         );
     }
 
+    pub fn recordIdempotentOutcome(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        outcome: IdempotentReceiptOutcome,
+    ) !?void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        errdefer candidate.deinit(alloc);
+        if (candidate.terminal_commit != null) return error.TransactionOutcomeMismatch;
+        if (candidate.idempotent_outcome) |existing| {
+            if (existing != outcome) return error.TransactionOutcomeMismatch;
+            candidate.deinit(alloc);
+            return {};
+        }
+        candidate.idempotent_outcome = outcome;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return {};
+    }
+
     pub fn recordTerminalCommitWithRepair(
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
@@ -1714,6 +1757,7 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.idempotent_outcome != null) return error.TransactionOutcomeMismatch;
         const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
             const fills_provisional_repair_handoff = terminal.status == .committed and
                 terminal.repair_required and
@@ -1817,6 +1861,19 @@ pub const SessionRegistry = struct {
         defer session.deinit(alloc);
         const terminal = session.terminal_commit orelse return null;
         return try terminal.clone(alloc);
+    }
+
+    pub fn getIdempotentOutcome(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+    ) !?IdempotentReceiptOutcome {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        defer session.deinit(alloc);
+        return session.idempotent_outcome;
     }
 
     /// Returns a bounded, rotating batch of stable transactions that require
@@ -1935,8 +1992,8 @@ pub const SessionRegistry = struct {
             try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
         }
 
+        if (candidate.idempotent_outcome != null) return null;
         if (candidate.terminal_commit) |terminal| {
-            if (terminal.status == .not_applied or terminal.status == .aborted) return null;
             // A pending terminal response is not the API/storage handoff. Keep
             // replaying the exact sealed request under the original ID until
             // every phase-two delivery and requested visibility barrier has
@@ -3928,7 +3985,9 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .savepoint_limit = self.max_savepoints,
         .remaining_savepoints = if (self.max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
         .durable = self.durable != null,
-        .outcome = if (session.terminal_commit) |terminal|
+        .outcome = if (session.idempotent_outcome) |outcome|
+            outcome.text()
+        else if (session.terminal_commit) |terminal|
             terminalCommitResponseStatus(terminal.status, terminal.repair_required)
         else if (session.commit_execution_started)
             "unknown"
@@ -4082,8 +4141,8 @@ fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) 
 }
 
 fn sessionNeedsRecovery(session: Session) bool {
+    if (session.idempotent_outcome != null) return false;
     if (session.terminal_commit) |terminal| {
-        if (terminal.status == .not_applied or terminal.status == .aborted) return false;
         return terminal.status != .committed or
             (terminal.repair_required and terminal.coordinator_group_id == null) or
             (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
@@ -4153,6 +4212,12 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     try out.appendSlice(alloc, if (session.commit_execution_started) "true" else "false");
     try out.appendSlice(alloc, ",\"idempotent_receipt\":");
     try out.appendSlice(alloc, if (session.idempotent_receipt) "true" else "false");
+    try out.appendSlice(alloc, ",\"idempotent_outcome\":");
+    if (session.idempotent_outcome) |outcome| {
+        try appendJsonString(alloc, &out, outcome.text());
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"terminal_commit\":");
     if (session.terminal_commit) |terminal| {
         try out.appendSlice(alloc, "{\"status\":");
@@ -4279,6 +4344,12 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .bool => |enabled| enabled,
         else => return error.InvalidTransactionSessionRecord,
     } else false;
+    if (obj.get("idempotent_outcome")) |value| switch (value) {
+        .string => |text| session.idempotent_outcome = std.meta.stringToEnum(IdempotentReceiptOutcome, text) orelse
+            return error.InvalidTransactionSessionRecord,
+        .null => {},
+        else => return error.InvalidTransactionSessionRecord,
+    };
     if (obj.get("terminal_commit")) |terminal_value| {
         if (terminal_value != .null) {
             const terminal_obj = switch (terminal_value) {
@@ -5489,7 +5560,16 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     try std.testing.expect(!std.mem.eql(u8, &alice_docs, &bob_docs));
     try std.testing.expect(!std.mem.eql(u8, &alice_docs, &alice_other));
 
-    var registry: SessionRegistry = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/idempotent-receipt-store", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
     defer registry.deinit(alloc);
     const first = try registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .write }, 7, "alice");
     const replay = try registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .write }, 7, "alice");
@@ -5522,9 +5602,18 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     var recovery = (try registry.claimPendingRecovery(alloc, alice_docs, 7, nextTxnTimestamp())).?;
     defer recovery.deinit(alloc);
     try std.testing.expect(recovery.commit.idempotent_receipt);
-    _ = (try registry.recordTerminalCommit(alloc, alice_docs, .aborted, null, null)).?;
+    _ = (try registry.recordIdempotentOutcome(alloc, alice_docs, .aborted)).?;
     const status = (try registry.getStatus(alloc, alice_docs)).?;
     try std.testing.expectEqualStrings("aborted", status.outcome.?);
+
+    // Rejections are additive receipt state, not new values in the established
+    // terminal-commit enum. Verify the durable representation is authoritative
+    // after all process-local state is gone.
+    var reloaded = SessionRegistry.init(&durable);
+    defer reloaded.deinit(alloc);
+    const reloaded_status = (try reloaded.getStatus(alloc, alice_docs)).?;
+    try std.testing.expectEqualStrings("aborted", reloaded_status.outcome.?);
+    try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, (try reloaded.getIdempotentOutcome(alloc, alice_docs)).?);
     const pending = try registry.listPendingRecoveryIds(alloc, 8);
     defer alloc.free(pending);
     try std.testing.expectEqual(@as(usize, 0), pending.len);

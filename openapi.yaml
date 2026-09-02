@@ -3978,12 +3978,6 @@ paths:
       tags:
         - data_operations
       operationId: batchWrite
-      description: >
-        Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to
-        the authenticated principal and table. Keyed batches use a durable, payload-sealed transaction
-        receipt and may be safely replayed after timeouts, lost responses, topology changes, or process
-        restarts. Receipts use the configured transaction-session retention period; callers must not reuse
-        a key after that period. Requests without this header retain legacy behavior.
       requestBody:
         required: true
         content:
@@ -3991,12 +3985,6 @@ paths:
             schema:
               $ref: '#/components/schemas/BatchRequest'
       responses:
-        '200':
-          description: A previously committed keyed batch was replayed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/BatchResponse'
         '201':
           description: Batch operation successful
           content:
@@ -4021,15 +4009,8 @@ paths:
 
             committed. An ambiguous outcome is not safe to replay blindly when
 
-            the request contains non-idempotent transforms. Keyed requests
-
-            instead return a typed `not_applied` or `unknown` receipt with a
-
-            stable transaction ID and retry guidance.
+            the request contains non-idempotent transforms.
           content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/IdempotentBatchError'
             text/plain:
               schema:
                 type: string
@@ -4044,6 +4025,86 @@ paths:
                 type: string
         '500':
           $ref: '#/components/responses/StatelessTransactionFailure'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/idempotent-batch:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table for the idempotent batch operation
+        schema:
+          type: string
+    post:
+      summary: Perform a durably idempotent batch operation on a table
+      tags:
+        - data_operations
+      operationId: idempotentBatchWrite
+      description: >
+        Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is
+        rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency
+        contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts,
+        lost responses, topology changes, or process restarts. Receipts use the configured transaction-session
+        retention period; callers must not reuse a key after that period. Distributed deployments fail
+        closed unless the receipt store is cluster-shared.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Stable operation key scoped to the authenticated principal and table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRequest'
+      responses:
+        '200':
+          description: A committed operation was replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '201':
+          description: Operation committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Commit is durable; visibility, recovery, or receipt handoff remains pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Durable non-application or an outcome that must be reconciled by stable key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '429':
+          description: Durable idempotency receipt capacity is exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '503':
+          description: Cluster-safe durable idempotency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdempotentBatchError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []

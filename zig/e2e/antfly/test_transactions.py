@@ -314,7 +314,7 @@ def test_idempotent_batch_survives_lost_response_and_restart(stateful_api):
         "sync_level": "write",
     }
     key = "counter-increment-1"
-    path = f"/tables/{quote(table_name, safe='')}/batch"
+    path = f"/tables/{quote(table_name, safe='')}/idempotent-batch"
 
     # Send the complete request and deliberately discard the response. This is
     # the production ambiguity that previously made a 409 unsafe to replay.

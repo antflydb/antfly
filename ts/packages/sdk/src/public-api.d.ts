@@ -922,11 +922,31 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * Perform batch inserts and deletes on a table
-         * @description Send `Idempotency-Key` with 1 to 256 bytes for exactly-once batch execution. Keys are scoped to the authenticated principal and table. Keyed batches use a durable, payload-sealed transaction receipt and may be safely replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured transaction-session retention period; callers must not reuse a key after that period. Requests without this header retain legacy behavior.
-         */
+        /** Perform batch inserts and deletes on a table */
         post: operations["batchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/idempotent-batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table for the idempotent batch operation */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform a durably idempotent batch operation on a table
+         * @description Executes a batch under a durable, payload-sealed idempotency receipt. The separate endpoint is rolling-upgrade safe because older servers reject it instead of silently ignoring the idempotency contract. Keys are scoped to the authenticated principal and table and may be replayed after timeouts, lost responses, topology changes, or process restarts. Receipts use the configured transaction-session retention period; callers must not reuse a key after that period. Distributed deployments fail closed unless the receipt store is cluster-shared.
+         */
+        post: operations["idempotentBatchWrite"];
         delete?: never;
         options?: never;
         head?: never;
@@ -16421,15 +16441,6 @@ export interface operations {
             };
         };
         responses: {
-            /** @description A previously committed keyed batch was replayed */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BatchResponse"];
-                };
-            };
             /** @description Batch operation successful */
             201: {
                 headers: {
@@ -16454,16 +16465,13 @@ export interface operations {
              * @description The atomic batch conflicted, the serving replica is fenced, or the
              *     server could not determine whether a single-group Raft command
              *     committed. An ambiguous outcome is not safe to replay blindly when
-             *     the request contains non-idempotent transforms. Keyed requests
-             *     instead return a typed `not_applied` or `unknown` receipt with a
-             *     stable transaction ID and retry guidance.
+             *     the request contains non-idempotent transforms.
              */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["IdempotentBatchError"];
                     "text/plain": string;
                 };
             };
@@ -16476,6 +16484,83 @@ export interface operations {
                 };
                 content: {
                     "text/plain": string;
+                };
+            };
+        };
+    };
+    idempotentBatchWrite: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Stable operation key scoped to the authenticated principal and table. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Name of the table for the idempotent batch operation */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchRequest"];
+            };
+        };
+        responses: {
+            /** @description A committed operation was replayed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Operation committed */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility, recovery, or receipt handoff remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Durable non-application or an outcome that must be reconciled by stable key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
+                };
+            };
+            /** @description Durable idempotency receipt capacity is exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Cluster-safe durable idempotency is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdempotentBatchError"];
                 };
             };
         };

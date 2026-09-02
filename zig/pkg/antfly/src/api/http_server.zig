@@ -3634,18 +3634,16 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
         idempotent_receipt: bool,
-        status: transactions_api.TerminalCommitStatus,
+        outcome: transactions_api.IdempotentReceiptOutcome,
     ) void {
         if (!idempotent_receipt) {
             _ = self.txn_sessions.remove(self.alloc, txn_id);
             return;
         }
-        _ = (self.txn_sessions.recordTerminalCommit(
+        _ = (self.txn_sessions.recordIdempotentOutcome(
             self.alloc,
             txn_id,
-            status,
-            null,
-            null,
+            outcome,
         ) catch |err| {
             std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
             return;

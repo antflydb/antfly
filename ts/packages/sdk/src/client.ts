@@ -477,7 +477,8 @@ export class AntflyClient {
     body: unknown,
     options: WriteOptions | undefined,
     errorPrefix: string,
-    marshalErrorPrefix: string
+    marshalErrorPrefix: string,
+    extraHeaders?: Record<string, string>
   ): Promise<{ data?: T; text: string }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string;
@@ -489,7 +490,7 @@ export class AntflyClient {
 
     const response = await fetch(this.url(path), {
       method: "POST",
-      headers: this.requestHeaders(),
+      headers: { ...this.requestHeaders(), ...extraHeaders },
       body: encodedBody,
       signal: opts.signal,
     });
@@ -1116,6 +1117,33 @@ export class AntflyClient {
      */
     batch: async (tableName: string, request: BatchRequest): Promise<BatchResult> => {
       return this.tables.batchWithOptions(tableName, request);
+    },
+
+    /**
+     * Perform a durably idempotent batch operation. This uses a distinct route
+     * so an older server fails closed during rolling upgrades.
+     */
+    idempotentBatch: async (
+      tableName: string,
+      idempotencyKey: string,
+      request: BatchRequest,
+      options?: WriteOptions
+    ): Promise<BatchResult> => {
+      const { data } = await this.postBoundedJSON<BatchResult>(
+        `/db/v1/tables/${encodeURIComponent(tableName)}/idempotent-batch`,
+        request,
+        options,
+        "Idempotent batch operation failed",
+        "marshalling idempotent batch request",
+        { "Idempotency-Key": idempotencyKey }
+      );
+      return (
+        data ?? {
+          inserted: Object.keys(request.inserts ?? {}).length,
+          deleted: request.deletes?.length ?? 0,
+          transformed: request.transforms?.length ?? 0,
+        }
+      );
     },
 
     /**

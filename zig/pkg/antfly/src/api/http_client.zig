@@ -1669,6 +1669,39 @@ pub const ApiHttpClient = struct {
         };
     }
 
+    pub fn fetchIdempotentBatch(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        idempotency_key: []const u8,
+        body: []const u8,
+    ) !BatchResponse {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/idempotent-batch", .{
+            routes.Routes.tables_prefix,
+            table_name,
+        });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = idempotency_key }};
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = &headers,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200, 201, 202, 400, 409, 429, 503 => {},
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{
+            .status = resp.status,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
+    }
+
     pub fn fetchTransactionCommit(
         self: *ApiHttpClient,
         base_uri: []const u8,

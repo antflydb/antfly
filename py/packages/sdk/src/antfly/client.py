@@ -1294,3 +1294,25 @@ class AntflyClient:
             content=encoded,
             headers={"Content-Type": "application/json"},
         )
+
+    def idempotent_batch(
+        self,
+        table: str,
+        idempotency_key: str,
+        inserts: dict[str, dict[str, Any]] | None = None,
+        deletes: list[str] | None = None,
+    ) -> None:
+        """Perform a durably idempotent batch that is safe to replay by key."""
+        batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
+        request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
+        encoded = self._encode_write_request("Idempotent batch", request.to_dict())
+
+        self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/idempotent-batch",
+            content=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
+            },
+        )

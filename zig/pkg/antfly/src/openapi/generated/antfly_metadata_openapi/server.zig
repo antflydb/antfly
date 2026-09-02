@@ -316,6 +316,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// Perform a durably idempotent batch operation on a table
+pub const IdempotentBatchWritePathParams = struct {
+    /// Name of the table for the idempotent batch operation
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for idempotentBatchWrite.
+pub fn parseIdempotentBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -587,6 +598,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/idempotent-batch", .operation_id = "idempotentBatchWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -665,6 +677,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
+        if (!@hasDecl(Impl, "idempotentBatchWrite")) @compileError("ServerRouter: Impl missing required method 'idempotentBatchWrite'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -741,6 +754,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.post("/tables/:tableName/idempotent-batch", httpx.Handler.bind(self.impl, idempotentBatchWrite));
             try server.get("/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listIndexes));
             try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
@@ -1070,6 +1084,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
         }
 
+        /// Perform a durably idempotent batch operation on a table
+        /// POST /tables/{tableName}/idempotent-batch
+        fn idempotentBatchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.idempotentBatchWrite(ctx, table_name);
+        }
+
         /// List all indexes for a table
         /// GET /tables/{tableName}/indexes
         fn listIndexes(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1307,6 +1328,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn idempotentBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

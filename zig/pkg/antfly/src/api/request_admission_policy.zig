@@ -75,6 +75,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "cancelDocumentArtifactReprocessJob", .class = .none },
     .{ .operation_id = "backupTable", .class = .none },
     .{ .operation_id = "batchWrite", .class = .write },
+    .{ .operation_id = "idempotentBatchWrite", .class = .write },
     .{ .operation_id = "scanKeys", .class = .query },
     .{ .operation_id = "lookupKey", .class = .none },
     .{ .operation_id = "listDocumentArtifactManifests", .class = .none },

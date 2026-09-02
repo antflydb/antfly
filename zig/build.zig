@@ -5538,6 +5538,7 @@ pub fn build(b: *std.Build) void {
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
+        "httpx idempotent batch returns a typed committed handoff when receipt persistence fails",
         "httpx shared registrar keeps root probes and rejects removed data aliases",
         "httpx storage maintenance routes call typed operations directly",
         "httpx antfly routes require auth and enforce admin middleware",

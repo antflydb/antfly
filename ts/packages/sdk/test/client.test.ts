@@ -571,6 +571,29 @@ describe("AntflyClient", () => {
       mockFetch.mockRestore();
     });
 
+    it("should send idempotent batches on the fail-closed route with the stable key", async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify({ inserted: 1 }), { status: 201 }));
+
+      await client.tables.idempotentBatch(
+        "products/archive",
+        "import-generation-7",
+        { inserts: { "prod:1": { title: "Notebook" } } },
+        { maxRequestBytes: 1024, maxResponseBytes: 1024 }
+      );
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/db/v1/tables/products%2Farchive/idempotent-batch",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({ "Idempotency-Key": "import-generation-7" }),
+        })
+      );
+
+      mockFetch.mockRestore();
+    });
+
     it("should reject oversized encoded batch requests", async () => {
       const mockFetch = vi.spyOn(globalThis, "fetch");
 
