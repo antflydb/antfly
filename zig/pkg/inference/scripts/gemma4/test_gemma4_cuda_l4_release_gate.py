@@ -267,6 +267,7 @@ class L4ReleaseGateTest(unittest.TestCase):
         repo = pathlib.Path(__file__).resolve().parents[5]
         release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
         release_build = (repo / ".github/workflows/antfly-release-build.yml").read_text(encoding="utf-8")
+        artifact_build = (repo / ".github/workflows/antfly-artifact-build.yml").read_text(encoding="utf-8")
         container = (repo / ".github/workflows/antfly-container.yml").read_text(encoding="utf-8")
         platforms = (repo / "scripts/release/platforms.json").read_text(encoding="utf-8")
         runtime = (repo / "zig/Dockerfile.runtime").read_text(encoding="utf-8")
@@ -280,7 +281,7 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertNotIn("linux-musl", container)
         self.assertNotIn("Dockerfile.runtime-glibc", container)
         self.assertFalse((repo / "zig/Dockerfile.runtime-glibc").exists())
-        self.assertIn("release_platforms.py github-matrix", release_build)
+        self.assertIn("release_platforms.py github-matrix", artifact_build)
         self.assertIn("antfly-zig-linux-amd64-gnu", platforms)
         self.assertIn("antfly-zig-linux-arm64-gnu", platforms)
         self.assertIn("x86_64-linux-gnu.2.28", platforms)

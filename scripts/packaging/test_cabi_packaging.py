@@ -102,6 +102,12 @@ class CAbiPackagingTests(unittest.TestCase):
         release_build_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-release-build.yml"
         ).read_text()
+        build_controller_workflow = (
+            REPO_ROOT
+            / ".github"
+            / "workflows"
+            / "antfly-release-build-controller.yml"
+        ).read_text()
         artifact_build_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-artifact-build.yml"
         ).read_text()
@@ -153,8 +159,13 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/cli-package.yml", artifact_build_workflow)
         self.assertIn(
             "uses: ./.github/workflows/antfly-artifact-build.yml",
-            release_build_workflow,
+            build_controller_workflow,
         )
+        self.assertNotIn("uses: ./.github/workflows/antfly-artifact-build.yml", release_build_workflow)
+        self.assertNotIn("uses: ./.github/workflows/antfly-artifact-build.yml", nightly_workflow)
+        self.assertIn('workflows: ["Release request", "Nightly request"]', build_controller_workflow)
+        self.assertIn('test "$TRIGGER_HEAD_BRANCH" = "$DEFAULT_BRANCH"', build_controller_workflow)
+        self.assertIn("build_controller_commit:", artifact_build_workflow)
         self.assertIn('tags:\n      - "v*"', release_build_workflow)
         self.assertIn("permissions:\n  contents: read", release_build_workflow)
         self.assertNotIn("contents: write", release_build_workflow)
@@ -170,7 +181,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn('tags:\n      - "v*"', release_workflow)
         self.assertIn("workflow_run:", release_workflow)
         self.assertIn(
-            'workflows: ["Release build", "Nightly snapshot"]', release_workflow
+            'workflows: ["Release build"]', release_workflow
         )
         self.assertIn("repository_dispatch:", release_workflow)
         self.assertIn("promote-cli-release", release_workflow)
@@ -196,6 +207,9 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("antfly-release-runtime-archives", container_workflow)
         self.assertIn("consumer-matrix container", container_workflow)
         self.assertIn("registryctl.py container-digest", container_workflow)
+        self.assertIn("registryctl.py container-lookup", container_workflow)
+        self.assertIn("release-ledger-${LEDGER_SHA256}", container_workflow)
+        self.assertIn("expected_digest:", container_workflow)
         self.assertNotIn("registryctl.py container-ensure", container_workflow)
         self.assertNotIn('crane digest "$destination" 2>/dev/null || true', container_workflow)
         self.assertIn("ref: ${{ inputs.promotion_controller_commit }}", container_workflow)
@@ -225,10 +239,8 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertNotIn("schedule:", nightly_workflow)
         self.assertNotIn("push:", nightly_workflow)
         self.assertIn("v0.0.0-dev.${GITHUB_RUN_ID}", nightly_workflow)
-        self.assertIn(
-            "uses: ./.github/workflows/antfly-artifact-build.yml", nightly_workflow
-        )
-        self.assertIn("channel: nightly", nightly_workflow)
+        self.assertIn("name: antfly-build-request", nightly_workflow)
+        self.assertIn('test "$channel" = nightly', build_controller_workflow)
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()

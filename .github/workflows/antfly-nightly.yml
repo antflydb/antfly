@@ -1,7 +1,7 @@
-name: Nightly snapshot
+name: Nightly request
 
-# "nightly" is a channel contract, not a required cadence. A schedule or a
-# main-push trigger can be added later without changing artifact identities.
+# "nightly" is a channel contract, not a required cadence. This workflow emits
+# only an untrusted request; the default-branch build controller validates it.
 on:
   workflow_dispatch:
     inputs:
@@ -18,39 +18,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  resolve:
-    name: Resolve exact nightly snapshot identity
+  request:
+    name: Request a nightly snapshot
     runs-on: ubuntu-latest
-    outputs:
-      commit: ${{ steps.identity.outputs.commit }}
-      tag: ${{ steps.identity.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-      - name: Resolve source commit and sequence
-        id: identity
+      - name: Write untrusted nightly request
         env:
           REQUESTED_COMMIT: ${{ inputs.source_commit }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          set -euo pipefail
-          git fetch --no-tags origin "$DEFAULT_BRANCH"
-          commit="$REQUESTED_COMMIT"
-          if [ -z "$commit" ]; then
-            commit="$(git rev-parse "origin/$DEFAULT_BRANCH")"
-          fi
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          git cat-file -e "$commit^{commit}"
-          git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "tag=v0.0.0-dev.${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: resolve
-    uses: ./.github/workflows/antfly-artifact-build.yml
-    with:
-      tag_name: ${{ needs.resolve.outputs.tag }}
-      source_commit: ${{ needs.resolve.outputs.commit }}
-      channel: nightly
+          mkdir -p dist/build-request
+          jq -n \
+            --arg tag "v0.0.0-dev.${GITHUB_RUN_ID}" \
+            --arg source_commit "$REQUESTED_COMMIT" \
+            '{schema_version: 1, request_kind: "nightly", tag: $tag, source_commit: $source_commit, channel: "nightly"}' \
+            > dist/build-request/build-request.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antfly-build-request
+          path: dist/build-request/build-request.json
+          if-no-files-found: error

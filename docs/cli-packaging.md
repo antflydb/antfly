@@ -37,14 +37,18 @@ consumers.
 
 ## Release Flow
 
-1. Push a stable or RC Antfly tag, or manually dispatch the `Nightly snapshot`
-   workflow. Both entry points call the same read-only reusable artifact build.
+1. Push a stable or RC Antfly tag, or manually dispatch the `Nightly request`
+   workflow on the default branch. Both entry points emit only an untrusted
+   request. A `workflow_run` controller loaded from the default branch validates
+   that request and calls the same read-only reusable artifact build at its
+   exact controller commit.
 2. The reusable CLI packaging workflow consumes the native GitHub Actions
    artifacts from that same build and builds all npm tarballs and Python wheels
    once.
 3. The workflow records their hashes, source commit, npm version, and PEP 440
-   Python version in `cli-snapshot.json`. The tag workflow has read-only
-   permissions and stops after uploading the runtime archives, CLI snapshot,
+   Python version in `cli-snapshot.json`. The tag and manual-request workflows
+   have read-only permissions and stop after uploading their request; the
+   default-branch build controller uploads the runtime archives, CLI snapshot,
    and release identity as Actions artifacts.
 4. GitHub Release assets and versioned object-storage objects are immutable:
    the default-branch promotion workflow combines the build outputs into a
@@ -63,8 +67,9 @@ consumers.
    complete release bundle before promoting its CLI scope to PyPI and npm, its
    GNU runtime scope to the single container image, and stable archives to
    Homebrew. Container images are built under run-scoped staging tags, resolved
-   to OCI digests, and added to the compare-and-swap channel journal before any
-   package or alias is published. Version and channel tags are intentionally
+   to OCI digests, retained by a ledger-addressed alias, and added to the
+   compare-and-swap channel journal before any package or public alias is
+   published. Version and channel tags are intentionally
    mutable aliases of that digest; every copy reads from a digest-pinned source
    and is verified afterward. OCI content digests, not registry tags, are the
    immutable container identity.
@@ -73,8 +78,9 @@ consumers.
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for
    nightlies.
    npm additionally verifies the requested dist-tag, so retries cannot conceal
-   content or channel drift. A retry that rebuilds a different container digest
-   cannot resume the pending journal transaction.
+   content or channel drift. Recovery verifies the journaled digest still
+   exists, or rebuilds it and requires an exact match; a different container
+   digest cannot resume the pending journal transaction.
    Container assembly uses promotion-controller-owned Docker and
    Cloud Build inputs plus the verified GNU archives; it never executes release
    tooling from `source_commit`.

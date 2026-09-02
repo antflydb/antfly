@@ -1,7 +1,7 @@
-name: Release build
+name: Release request
 
-# Tag code has read-only access and only calls the shared immutable artifact
-# build. Privileged promotion is loaded independently from the default branch.
+# Tag code has read-only access and emits only an untrusted identity request.
+# The release-build controller validates it from the default branch.
 on:
   push:
     tags:
@@ -11,9 +11,22 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    uses: ./.github/workflows/antfly-artifact-build.yml
-    with:
-      tag_name: ${{ github.ref_name }}
-      source_commit: ${{ github.sha }}
-      channel: auto
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write untrusted tag request
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p dist/build-request
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg source_commit "$SOURCE_COMMIT" \
+            '{schema_version: 1, request_kind: "tag", tag: $tag, source_commit: $source_commit, channel: "auto"}' \
+            > dist/build-request/build-request.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antfly-build-request
+          path: dist/build-request/build-request.json
+          if-no-files-found: error

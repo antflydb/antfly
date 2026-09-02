@@ -15,6 +15,10 @@ on:
         description: "auto, stable, next, or nightly"
         required: true
         type: string
+      build_controller_commit:
+        description: "Exact default-branch workflow and script controller commit"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -37,11 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ inputs.build_controller_commit }}
           fetch-depth: 0
-      - name: Record release controller
+      - name: Validate pinned release build controller
         id: controller
-        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          BUILD_CONTROLLER_COMMIT: ${{ inputs.build_controller_commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$BUILD_CONTROLLER_COMMIT"
+          test "$WORKFLOW_COMMIT" = "$BUILD_CONTROLLER_COMMIT"
+          echo "commit=$BUILD_CONTROLLER_COMMIT" >> "$GITHUB_OUTPUT"
       - name: Require compatible immutable default-branch source
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}

@@ -222,6 +222,7 @@ jobs:
             .github/workflows/antfly-artifact-build.yml \
             .github/workflows/antfly-container.yml \
             .github/workflows/antfly-nightly.yml \
+            .github/workflows/antfly-release-build-controller.yml \
             .github/workflows/antfly-release-build.yml \
             .github/workflows/antfly-release.yml \
             .github/workflows/cli-package.yml \

@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from registry.container import lookup_digest, promote_alias, verify_digest
+from registry.container import (
+    lookup_digest,
+    optional_digest,
+    promote_alias,
+    verify_digest,
+)
 from registry.model import LookupState, RegistryError
 
 DIGEST = f"sha256:{'a' * 64}"
@@ -38,6 +43,12 @@ class ContainerRegistryTests(unittest.TestCase):
         for detail in ("unauthorized", "dial tcp: timeout", "too many requests"):
             with self.subTest(detail=detail), self.assertRaises(RegistryError):
                 lookup_digest("registry/image:tag", FakeRunner([(1, "", detail)]))
+
+    def test_optional_digest_returns_none_only_for_explicit_missing(self) -> None:
+        runner = FakeRunner([(1, "", "MANIFEST_UNKNOWN: manifest unknown")])
+        self.assertIsNone(optional_digest("registry/image:missing", runner))
+        with self.assertRaises(RegistryError):
+            optional_digest("registry/image:tag", FakeRunner([(1, "", "unauthorized")]))
 
     def test_alias_copy_uses_the_resolved_digest_and_is_verified(self) -> None:
         runner = FakeRunner(

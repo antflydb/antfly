@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import argparse
 
-from registry.container import promote_alias, require_digest, verify_digest
+from registry.container import (
+    optional_digest,
+    promote_alias,
+    require_digest,
+    verify_digest,
+)
 from registry.model import RegistryError
 from registry.npm import dist_tag, version_integrity
 
@@ -29,6 +34,9 @@ def main() -> int:
     command = subparsers.add_parser("container-digest")
     command.add_argument("--ref", required=True)
 
+    command = subparsers.add_parser("container-lookup")
+    command.add_argument("--ref", required=True)
+
     command = subparsers.add_parser("container-verify")
     command.add_argument("--ref", required=True)
     command.add_argument("--digest", required=True)
@@ -43,6 +51,8 @@ def main() -> int:
             print(promote_alias(args.source, args.destination))
         elif args.command == "container-digest":
             print(require_digest(args.ref))
+        elif args.command == "container-lookup":
+            print(optional_digest(args.ref) or "")
         else:
             print(verify_digest(args.ref, args.digest))
     except RegistryError as exc:

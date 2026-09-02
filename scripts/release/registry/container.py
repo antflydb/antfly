@@ -55,6 +55,11 @@ def require_digest(ref: str, runner: Runner = subprocess.run) -> str:
     return lookup.digest
 
 
+def optional_digest(ref: str, runner: Runner = subprocess.run) -> str | None:
+    lookup = lookup_digest(ref, runner)
+    return lookup.digest if lookup.state is LookupState.PRESENT else None
+
+
 def digest_reference(ref: str, digest: str) -> str:
     """Return a repository reference pinned to an already-resolved digest."""
     repository = ref.split("@", 1)[0]

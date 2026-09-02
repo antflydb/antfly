@@ -22,19 +22,18 @@ on:
         description: "Digest of the authenticated release ledger"
         required: true
         type: string
+      expected_digest:
+        description: "Journaled OCI digest that a recovery must reproduce"
+        required: false
+        default: ""
+        type: string
     outputs:
       image_ref:
-        description: "Run-scoped staged multi-architecture image"
+        description: "Verified staged or journaled multi-architecture image"
         value: ${{ jobs.stage.outputs.image_ref }}
       image_digest:
         description: "Digest of the staged multi-architecture image"
         value: ${{ jobs.stage.outputs.image_digest }}
-      amd64_digest:
-        description: "Digest of the staged amd64 image"
-        value: ${{ jobs.stage.outputs.amd64_digest }}
-      arm64_digest:
-        description: "Digest of the staged arm64 image"
-        value: ${{ jobs.stage.outputs.arm64_digest }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -52,8 +51,6 @@ jobs:
     outputs:
       image_ref: ${{ steps.identity.outputs.image_ref }}
       image_digest: ${{ steps.identity.outputs.image_digest }}
-      amd64_digest: ${{ steps.identity.outputs.amd64_digest }}
-      arm64_digest: ${{ steps.identity.outputs.arm64_digest }}
     permissions:
       contents: read
       id-token: write
@@ -125,7 +122,26 @@ jobs:
         run: |
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
 
+      - name: Resolve an existing journaled candidate
+        id: existing
+        env:
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+        run: |
+          set -euo pipefail
+          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          reuse=false
+          if [ -n "$EXPECTED_DIGEST" ]; then
+            observed="$(python3 scripts/release/registryctl.py container-lookup \
+              --ref "${image}@${EXPECTED_DIGEST}")"
+            if [ -n "$observed" ]; then
+              test "$observed" = "$EXPECTED_DIGEST"
+              reuse=true
+            fi
+          fi
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
       - name: Upload verified runtime archives to immutable build inputs
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
         env:
           RELEASE_COMMIT: ${{ inputs.source_commit }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
@@ -138,6 +154,7 @@ jobs:
           done
 
       - name: Package architecture images with Cloud Build
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
         env:
           RELEASE_COMMIT: ${{ inputs.source_commit }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
@@ -167,6 +184,7 @@ jobs:
           done
 
       - name: Create the multi-architecture manifest last
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
         env:
           BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
@@ -194,15 +212,36 @@ jobs:
         id: identity
         env:
           BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          REUSE_EXISTING: ${{ steps.existing.outputs.reuse }}
         run: |
           set -euo pipefail
-          image_ref="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
-          image_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}")"
-          amd64_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}-amd64")"
-          arm64_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}-arm64")"
+          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          image_ref="${image}:${BUILD_TAG}"
+          if [ "$REUSE_EXISTING" = true ]; then
+            image_ref="${image}@${EXPECTED_DIGEST}"
+          fi
+          image_digest="$(python3 scripts/release/registryctl.py container-digest --ref "$image_ref")"
+          if [ -n "$EXPECTED_DIGEST" ] && [ "$image_digest" != "$EXPECTED_DIGEST" ]; then
+            echo "rebuilt container differs from journaled identity" >&2
+            echo "expected: $EXPECTED_DIGEST" >&2
+            echo "actual:   $image_digest" >&2
+            exit 1
+          fi
           {
-            echo "image_ref=${image_ref}:${BUILD_TAG}"
+            echo "image_ref=$image_ref"
             echo "image_digest=$image_digest"
-            echo "amd64_digest=$amd64_digest"
-            echo "arm64_digest=$arm64_digest"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Retain the digest-addressed candidate for recovery
+        env:
+          IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.identity.outputs.image_digest }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+        run: |
+          set -euo pipefail
+          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          observed="$(python3 scripts/release/registryctl.py container-alias \
+            --source "$IMAGE_REF" \
+            --destination "${image}:release-ledger-${LEDGER_SHA256}")"
+          test "$observed" = "$IMAGE_DIGEST"

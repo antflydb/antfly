@@ -49,55 +49,65 @@ SDK and enables Metal and Accelerate.
 
 ## Pipeline Ownership
 
-Release is split into an unprivileged artifact plane and a default-branch
-promotion plane so code loaded from a tag never receives publication
+Release is split into an untrusted request plane, a default-branch artifact
+plane, and a default-branch promotion plane. Code loaded from a tag or manually
+selected workflow ref never controls a builder or receives publication
 credentials.
 
-1. `.github/workflows/antfly-artifact-build.yml` is the sole reusable artifact
-   builder. Its release controller is checked out from the default branch,
-   while the requested source commit supplies the versioned builder inputs.
+1. `.github/workflows/antfly-release-build.yml` and
+   `.github/workflows/antfly-nightly.yml` emit only an untrusted JSON request.
+   They never call a builder. `.github/workflows/antfly-release-build-controller.yml`
+   is loaded through `workflow_run` from the default branch. It requires tag
+   requests to match the pushed tag and commit, and nightly requests to have
+   been dispatched on the default branch.
+2. The build controller pins its exact commit and calls
+   `.github/workflows/antfly-artifact-build.yml`, the sole reusable artifact
+   builder, from that same commit. The requested source commit supplies only
+   the versioned builder inputs.
    The controller first requires that source to declare the supported
    `scripts/release/build-contract.json` schema and all required build paths.
    With only read permission, it builds the canonical Zig archives,
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
-   canonical `ReleaseSpec` (source commit, controller commit, channel, build
-   contract, and all registry versions) as an Actions artifact. The
-   tag-triggered `.github/workflows/antfly-release-build.yml`
-   and manually triggered `.github/workflows/antfly-nightly.yml` are thin
-   callers of this same builder.
-2. Completion of either caller triggers `.github/workflows/antfly-release.yml` through
-   `workflow_run`. GitHub loads this privileged promotion workflow from the
-   default branch. It checks the channel identity and source commit, combines the build
-   outputs into one schema-versioned artifact ledger, verifies it, attests
+   canonical `ReleaseSpec` (source commit, build-controller commit, channel,
+   build contract, and all registry versions) as an Actions artifact. The
+   workflow graph, nested reusable workflows, and controller-owned scripts all
+   share that recorded build-controller identity.
+3. Completion of the build controller triggers
+   `.github/workflows/antfly-release.yml` through `workflow_run`. GitHub loads
+   this privileged promotion workflow from the default branch. It checks the
+   channel identity and source commit, combines the build outputs into one
+   schema-versioned artifact ledger, verifies it, attests
    every payload file, and stores the exact bytes under immutable,
    content-addressed object-storage keys. Stable and next additionally stage
    those bytes on a draft GitHub Release; nightly deliberately does not create
    a GitHub Release.
-3. The promotion controller separates the complete payload into
+4. The promotion controller separates the complete payload into
    ledger, runtime, and CLI scopes, and verifies source ancestry, attestations,
    exact scope membership, and every digest.
-4. npm, PyPI, the Homebrew formula, and the single multi-architecture container
+5. npm, PyPI, the Homebrew formula, and the single multi-architecture container
    image consume those verified scopes. The container publisher is callable
    only by this controller, checks out the recorded controller commit, and
-   consumes the GNU runtime archives built from the source commit in step 1.
+   consumes the GNU runtime archives built from the source commit in step 2.
    Its Dockerfile, Cloud Build configuration, platform policy, and registry
    code are therefore controller-owned rather than source-provided. It first
-   builds run-scoped images, seals them under the release-ledger
-   digest, and then compare-or-creates the version tags. A retry can reuse an
-   identical image but cannot overwrite a released version with different
-   bytes.
-5. Mutable install channels are transactions. The compare-and-swap transaction
-   begins before PyPI, npm, or container publication, so a precedence or
-   identity collision cannot be discovered after publishing a registry
+   builds run-scoped images, resolves the multi-platform OCI digest, and keeps
+   a ledger-addressed retention alias. If recovery already has a journaled
+   digest, staging first verifies that content still exists and otherwise
+   rebuilds it, rejecting any different result. Version and channel tags are
+   transaction-controlled aliases of the digest, not immutable records.
+6. Mutable install channels are transactions. The compare-and-swap transaction
+   begins before PyPI, npm, or public container publication, so a precedence
+   or identity collision cannot be discovered after publishing a registry
    version. `scripts/release/channels.json`
    is the canonical policy for `stable`, `next`, and `nightly`: tag class,
    ordering rule, journal, package-registry eligibility, mutable aliases,
    GitHub visibility, and recovery source. Compare-and-swap journals in R2
    record each channel's `pending` and `current` release identity (tag, source
-   commit, and ledger digest). A failed run must resume the same pending
-   identity, and recovery cannot move a channel backward.
+   commit, release-ledger digest, and OCI image digest). A failed run must
+   resume the same pending identity, and recovery cannot move a channel
+   backward.
 
 Channel bootstrap is fail-closed. The discovery controller treats only an
 explicit missing release, package, or dist-tag as empty state; authentication,
@@ -105,8 +115,9 @@ rate-limit, malformed-response, and network failures stop promotion.
 Container and npm operations use the typed adapters under
 `scripts/release/registry/`. Registry lookups return only present or explicitly
 missing; failures are a separate error path and can never authorize creation.
-Immutable container tags are compare-or-created and mutable aliases are copied
-and then digest-verified through the same interface.
+Container tags are aliases copied only from digest-pinned sources and then
+digest-verified through the same interface. The OCI digest is the immutable
+container identity.
 
 npm platform packages publish before the top-level selector, and existing npm
 or PyPI files are skipped only when their registry digest matches, so a partial
@@ -139,8 +150,9 @@ source-commit-and-ledger-addressed artifact URI and has no mutable or
 ABI-ambiguous default input.
 
 Temporary run-scoped container tags are build staging only. The
-`sha256-<ledger digest>` and `<version>` tags are immutable publication
-records; registry retention may remove staging tags after the release. There
+`release-ledger-<ledger digest>` tag retains the journaled content for recovery;
+`<version>` and channel tags remain transaction-controlled aliases. Registry
+retention may remove run-scoped staging tags after the release. There
 is deliberately no automatic rollback entry point for mutable channels. A
 rollback requires a separately reviewed administrative change to the channel
 journal and aliases, rather than disguising an old-release recovery as a new

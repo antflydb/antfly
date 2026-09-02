@@ -1,10 +1,10 @@
 name: Release promotion
 
-# All entry points load this controller from the default branch. Build workflows
-# produce immutable inputs; repository_dispatch is the exact-ledger recovery path.
+# The default-branch build controller produces immutable inputs;
+# repository_dispatch is the exact-ledger recovery path.
 on:
   workflow_run:
-    workflows: ["Release build", "Nightly snapshot"]
+    workflows: ["Release build"]
     types: [completed]
   repository_dispatch:
     types: [promote-cli-release, promote-release-channel]
@@ -106,7 +106,6 @@ jobs:
         id: identity
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BUILD_COMMIT: ${{ github.event.workflow_run.head_sha }}
           BUILD_EVENT: ${{ github.event.workflow_run.event }}
           RAW_RECOVERY_VERSION: ${{ github.event.client_payload.version }}
           RAW_RECOVERY_CHANNEL: ${{ github.event.client_payload.channel }}
@@ -125,11 +124,7 @@ jobs:
             build_controller_commit="$(jq -r .build_controller_commit "$request")"
             requested_channel="$(jq -r .channel "$request")"
             allow_legacy=false
-            case "$BUILD_EVENT" in
-              push) test "$commit" = "$BUILD_COMMIT" ;;
-              workflow_dispatch) test "$requested_channel" = nightly ;;
-              *) echo "unsupported artifact build event: $BUILD_EVENT" >&2; exit 2 ;;
-            esac
+            test "$BUILD_EVENT" = workflow_run
           else
             raw="$RAW_RECOVERY_VERSION"
             requested_channel="${RAW_RECOVERY_CHANNEL:-auto}"
@@ -516,7 +511,6 @@ jobs:
   stage-container:
     name: Build digest-addressed container candidate
     needs: prepare-release-promotion
-    if: ${{ needs.prepare-release-promotion.outputs.container_digest == '' }}
     permissions:
       contents: read
       id-token: write
@@ -526,6 +520,7 @@ jobs:
       source_commit: ${{ needs.prepare-release-promotion.outputs.commit }}
       promotion_controller_commit: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       ledger_sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+      expected_digest: ${{ needs.prepare-release-promotion.outputs.container_digest }}
     secrets: inherit
 
   begin-release-channel:
@@ -533,10 +528,6 @@ jobs:
     needs:
       - prepare-release-promotion
       - stage-container
-    if: >-
-      ${{ always() &&
-          needs.prepare-release-promotion.result == 'success' &&
-          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') }}
     runs-on: arc-antfly-standard
     permissions:
       contents: read
@@ -577,7 +568,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
-          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+          CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
           CHANNEL: ${{ steps.channel.outputs.name }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           CURRENT_TAG: ${{ steps.channel.outputs.current_tag }}
@@ -618,7 +609,7 @@ jobs:
           needs.publish-cli-npm.result == 'success' &&
           (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
-          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') }}
+          needs.stage-container.result == 'success' }}
     runs-on: arc-antfly-standard
     environment: container-publish
     permissions:
@@ -681,7 +672,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
-          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+          CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
         run: |
           set -euo pipefail
@@ -790,7 +781,7 @@ jobs:
           needs.begin-release-channel.result == 'success' &&
           needs.publish-cli-npm.result == 'success' &&
           needs.promote-channel-aliases.result == 'success' &&
-          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') &&
+          needs.stage-container.result == 'success' &&
           (needs.publish-github-release.result == 'success' || needs.publish-github-release.result == 'skipped') }}
     runs-on: arc-antfly-standard
     permissions:
@@ -823,7 +814,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
-          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+          CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
         run: |
           python3 scripts/release/registryctl.py container-verify \
             --ref "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
@@ -839,7 +830,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
-          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+          CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
           CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           ALLOW_LEGACY: ${{ needs.prepare-release-promotion.outputs.allow_legacy }}
