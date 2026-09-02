@@ -258,6 +258,47 @@ class ReleasePromotionTests(unittest.TestCase):
             ),
             "v1.2.3",
         )
+
+        discovery.require_channel_observations("stable", "v1.2.3", observations, policy)
+        with self.assertRaisesRegex(SystemExit, "unconverged projections"):
+            discovery.require_channel_observations(
+                "stable",
+                "v1.2.3",
+                {**observations, "object-storage": ""},
+                policy,
+            )
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def release_response(document: dict):
+            return Response(json.dumps(document).encode())
+
+        discovery.require_github_release_mode(
+            "stable",
+            "v1.2.3",
+            "antflydb/antfly",
+            "token",
+            policy,
+            lambda *_args, **_kwargs: release_response(
+                {"tag_name": "v1.2.3", "draft": False, "prerelease": False}
+            ),
+        )
+        with self.assertRaisesRegex(SystemExit, "does not match channel mode"):
+            discovery.require_github_release_mode(
+                "stable",
+                "v1.2.3",
+                "antflydb/antfly",
+                "token",
+                policy,
+                lambda *_args, **_kwargs: release_response(
+                    {"tag_name": "v1.2.3", "draft": False, "prerelease": True}
+                ),
+            )
         with self.assertRaisesRegex(SystemExit, "projection npm:@antfly/cli"):
             discovery.reconcile_journal_observations(
                 stored,
@@ -324,22 +365,51 @@ class ReleasePromotionTests(unittest.TestCase):
             root = Path(raw_tmp)
             prefix = root / "release" / "antfly" / "v0.0.0-dev.123"
             prefix.mkdir(parents=True)
+            tag = "v0.0.0-dev.123"
+            metadata = b'{"tag":"v0.0.0-dev.123"}'
+            artifact = b"snapshot"
             ledger = {
-                "schema_version": 2,
+                "schema_version": 1,
+                "tag": tag,
+                "commit": COMMIT,
                 "artifacts": [
-                    {"name": "metadata.json"},
-                    {"name": "artifact.tgz"},
+                    {
+                        "name": "metadata.json",
+                        "size": len(metadata),
+                        "sha256": hashlib.sha256(metadata).hexdigest(),
+                    },
+                    {
+                        "name": "artifact.tgz",
+                        "size": len(artifact),
+                        "sha256": hashlib.sha256(artifact).hexdigest(),
+                    },
                 ],
             }
-            (prefix / "artifacts.json").write_text(json.dumps(ledger))
-            (prefix / "metadata.json").write_text('{"tag":"v0.0.0-dev.123"}')
-            (prefix / "artifact.tgz").write_bytes(b"snapshot")
+            ledger_bytes = json.dumps(ledger).encode()
+            ledger_sha256 = hashlib.sha256(ledger_bytes).hexdigest()
+            (prefix / "artifacts.json").write_bytes(ledger_bytes)
+            (prefix / "metadata.json").write_bytes(metadata)
+            (prefix / "artifact.tgz").write_bytes(artifact)
+            (prefix / "unledgered.bin").write_bytes(b"unexpected")
             out_dir = root / "restored"
 
+            with self.assertRaisesRegex(SystemExit, "member set differs"):
+                download.restore_payload(
+                    download.LocalReader(root, "release"),
+                    "antfly/v0.0.0-dev.123",
+                    out_dir,
+                    tag,
+                    COMMIT,
+                    ledger_sha256,
+                )
+            (prefix / "unledgered.bin").unlink()
             download.restore_payload(
                 download.LocalReader(root, "release"),
                 "antfly/v0.0.0-dev.123",
                 out_dir,
+                tag,
+                COMMIT,
+                ledger_sha256,
             )
 
             self.assertEqual(
@@ -878,6 +948,12 @@ class ReleasePromotionTests(unittest.TestCase):
             artifact.write_bytes(b"different")
             with self.assertRaisesRegex(SystemExit, "immutable object differs"):
                 publisher.upload(artifact, "v1/artifact.bin", False, immutable=True)
+
+            storage.require_exact_prefix(publisher, "v1", {"artifact.bin"})
+            extra = root / "objects" / "releases" / "v1" / "unledgered.bin"
+            extra.write_bytes(b"unexpected")
+            with self.assertRaisesRegex(SystemExit, "member set differs"):
+                storage.require_exact_prefix(publisher, "v1", {"artifact.bin"})
 
     def test_s3_immutable_object_uses_atomic_create_and_compare(self) -> None:
         storage = load_module(

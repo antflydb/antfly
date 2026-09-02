@@ -9,7 +9,6 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
 from create_github_release import (
     GitHubError,
@@ -17,27 +16,13 @@ from create_github_release import (
     get_release_by_tag,
     paginated_github_api,
 )
-from download_objectstorage import S3Reader, payload_names
+from download_objectstorage import (
+    PayloadReader,
+    PrefixedReader,
+    S3Reader,
+    restore_verified_payload,
+)
 from release_channels import load_policy
-from verify_release_ledger import verify_payload
-
-
-class PayloadReader(Protocol):
-    def read(self, name: str) -> bytes: ...
-
-    def list_names(self) -> set[str]: ...
-
-
-class PrefixedReader:
-    def __init__(self, reader: S3Reader, prefix: str) -> None:
-        self.reader = reader
-        self.prefix = prefix.strip("/")
-
-    def read(self, name: str) -> bytes:
-        return self.reader.read(f"{self.prefix}/{name}")
-
-    def list_names(self) -> set[str]:
-        return self.reader.list_names(self.prefix)
 
 
 class GitHubReleaseReader:
@@ -67,29 +52,6 @@ class GitHubReleaseReader:
 
     def list_names(self) -> set[str]:
         return set(self.assets)
-
-
-def restore_verified_payload(
-    reader: PayloadReader,
-    out_dir: Path,
-    tag: str,
-    commit: str,
-    ledger_sha256: str,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ledger_bytes = reader.read("artifacts.json")
-    names = payload_names(ledger_bytes)
-    expected_names = {"artifacts.json", *names}
-    actual_names = reader.list_names()
-    if actual_names != expected_names:
-        raise SystemExit(
-            "release mirror member set differs: "
-            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
-        )
-    (out_dir / "artifacts.json").write_bytes(ledger_bytes)
-    for name in names:
-        (out_dir / name).write_bytes(reader.read(name))
-    verify_payload(out_dir / "artifacts.json", out_dir, tag, commit, ledger_sha256)
 
 
 def recover_payload(

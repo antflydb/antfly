@@ -40,6 +40,7 @@ help:
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
 	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
+	@echo "  release-scripting-test  Test release packaging, installers, and promotion scripts"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
 	@echo "  download-omni-deps Download ONNX Runtime and PJRT archives"
@@ -68,7 +69,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -87,6 +88,15 @@ build: build-antfarm
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
+
+release-scripting-test:
+	scripts/test_install_download_markers.sh
+	scripts/test_quickstart_docs.py
+	python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
+	python3 -m unittest discover -s scripts/release -p 'test_*.py'
+	python3 scripts/release/validate_workflow_actions.py
+	sh -n scripts/install.sh
+	bash -n scripts/test_install_download_markers.sh
 
 generate: graph-identifier-generate build-docs tidy
 	$(MAKE) zig-openapi-generate

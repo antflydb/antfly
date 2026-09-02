@@ -195,6 +195,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("actions/attest-build-provenance@", release_workflow)
         self.assertIn("--immutable-assets", release_workflow)
         self.assertIn("--content-addressed-prefix", release_workflow)
+        self.assertEqual(release_workflow.count("--exact-prefix"), 2)
         self.assertIn("--signer-workflow", release_workflow)
         self.assertIn("prepare_pypi_promotion.py", release_workflow)
         self.assertNotIn("--replace-assets", release_workflow)
@@ -237,6 +238,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("release_channel_state.py begin", release_workflow)
         self.assertIn("release_channel_state.py preflight", release_workflow)
         self.assertIn("release_channel_state.py finish", release_workflow)
+        self.assertIn("discover_channel_tag.py require", release_workflow)
         self.assertIn("release_container_state.py resolve", release_workflow)
         self.assertIn("preflight-release-channel:", release_workflow)
         self.assertIn("preflight-publication:", release_workflow)
@@ -326,6 +328,28 @@ class CAbiPackagingTests(unittest.TestCase):
         for platform in package_cli_release.PLATFORMS:
             expected_archive = package_cli_release.archive_name("<version>", platform)
             self.assertIn(f"`{expected_archive}`", release_design)
+
+    def test_release_scripting_target_discovers_the_complete_suite(self) -> None:
+        makefile = (REPO_ROOT / "Makefile").read_text()
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "zig-tests.yml"
+        ).read_text()
+        release_job = workflow.split("  release-tooling:", 1)[1].split(
+            "\n  backup-s3-integration:", 1
+        )[0]
+
+        self.assertIn("run: make release-scripting-test", release_job)
+        self.assertNotIn("scripts/release/test_", release_job)
+        self.assertIn('python-version: "3.13"', release_job)
+        self.assertIn("release-scripting-test:", makefile)
+        self.assertIn(
+            "python3 -m unittest discover -s scripts/packaging -p 'test_*.py'",
+            makefile,
+        )
+        self.assertIn(
+            "python3 -m unittest discover -s scripts/release -p 'test_*.py'",
+            makefile,
+        )
 
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {

@@ -38,6 +38,9 @@ class Publisher:
     ) -> None:
         raise NotImplementedError
 
+    def list_names(self, prefix: str) -> set[str]:
+        raise NotImplementedError
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -142,6 +145,19 @@ class S3Publisher(Publisher):
             },
         )
 
+    def list_names(self, prefix: str) -> set[str]:
+        assert self.client is not None
+        base = clean_prefix(prefix) + "/"
+        paginator = self.client.get_paginator("list_objects_v2")
+        names: set[str] = set()
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=base):
+            for entry in page.get("Contents", []):
+                key = entry.get("Key") if isinstance(entry, dict) else None
+                if not isinstance(key, str) or not key.startswith(base):
+                    raise SystemExit("object-storage listing returned an invalid key")
+                names.add(key.removeprefix(base))
+        return names
+
 
 class GCSPublisher(Publisher):
     def __init__(self, bucket: str) -> None:
@@ -171,6 +187,29 @@ class GCSPublisher(Publisher):
         if immutable:
             command.append("--if-generation-match=0")
         subprocess.run([*command, str(path), destination], check=True)
+
+    def list_names(self, prefix: str) -> set[str]:
+        base = f"gs://{self.bucket}/{clean_prefix(prefix)}/"
+        result = subprocess.run(
+            ["gcloud", "storage", "ls", "--recursive", f"{base}**"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise SystemExit(
+                "cannot list object-storage release prefix: "
+                + (result.stderr.strip() or result.stdout.strip())
+            )
+        names: set[str] = set()
+        for raw in result.stdout.splitlines():
+            url = raw.strip()
+            if not url or url.endswith("/"):
+                continue
+            if not url.startswith(base):
+                raise SystemExit("object-storage listing returned an invalid URL")
+            names.add(url.removeprefix(base))
+        return names
 
 
 class LocalPublisher(Publisher):
@@ -206,6 +245,28 @@ class LocalPublisher(Publisher):
                 temporary.unlink(missing_ok=True)
         shutil.copy2(path, destination)
 
+    def list_names(self, prefix: str) -> set[str]:
+        directory = self.root / self.bucket / clean_prefix(prefix)
+        if not directory.exists():
+            return set()
+        return {
+            path.relative_to(directory).as_posix()
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
+
+
+def require_exact_prefix(
+    publisher: Publisher, prefix: str, expected_names: set[str]
+) -> None:
+    actual_names = publisher.list_names(prefix)
+    if actual_names != expected_names:
+        raise SystemExit(
+            "object-storage release member set differs: "
+            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
+        )
+    print(f"verified exact object-storage release prefix: {clean_prefix(prefix)}")
+
 
 def build_publisher(args: argparse.Namespace) -> Publisher:
     if args.provider == "s3":
@@ -237,6 +298,11 @@ def main() -> int:
         "--latest-prefix", help="object key prefix for the stable latest channel"
     )
     parser.add_argument(
+        "--exact-prefix",
+        action="store_true",
+        help="require the immutable version prefix to contain exactly the supplied files",
+    )
+    parser.add_argument(
         "--publish-latest", action="store_true", help="also publish to --latest-prefix"
     )
     parser.add_argument(
@@ -253,6 +319,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    if args.exact_prefix and args.dry_run:
+        parser.error("--exact-prefix cannot be combined with --dry-run")
+
     files = [path for path in args.files if path.is_file()]
     if not files:
         raise SystemExit("no upload files were provided")
@@ -267,6 +336,9 @@ def main() -> int:
 
     publisher = build_publisher(args)
     sorted_files = sorted(files, key=lambda item: item.name)
+    expected_names = {path.name for path in sorted_files}
+    if len(expected_names) != len(sorted_files):
+        raise SystemExit("upload files contain duplicate object names")
     for path in sorted_files:
         if args.content_addressed_prefix:
             digest_prefix = (
@@ -278,6 +350,8 @@ def main() -> int:
         publisher.upload(
             path, storage_key(args.prefix, path), args.dry_run, immutable=True
         )
+    if args.exact_prefix:
+        require_exact_prefix(publisher, args.prefix, expected_names)
     if publish_latest:
         assert args.latest_prefix is not None
         pointers = [path for path in sorted_files if path.name == "metadata.json"]

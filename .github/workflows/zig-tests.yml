@@ -221,19 +221,12 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Test release download markers
-        run: |
-          scripts/test_install_download_markers.sh
-          scripts/test_quickstart_docs.py
-          python3 scripts/packaging/test_cabi_packaging.py CAbiPackagingTests
-          python3 scripts/release/test_cli_snapshot.py
-          python3 scripts/release/test_pypi_promotion.py
-          python3 scripts/release/test_release_promotion.py
-          python3 scripts/release/test_registry.py
-          python3 scripts/release/test_workflow_actions.py
-          python3 scripts/release/validate_workflow_actions.py
-          sh -n scripts/install.sh
-          bash -n scripts/test_install_download_markers.sh
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Test release packaging and scripts
+        run: make release-scripting-test
 
   backup-s3-integration:
     name: backup-s3-integration

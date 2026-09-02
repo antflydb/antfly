@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Protocol
 
+from verify_release_ledger import verify_payload
+
 
 def clean_prefix(prefix: str) -> str:
     return prefix.strip("/")
@@ -18,6 +20,24 @@ class Reader(Protocol):
     def read(self, key: str) -> bytes: ...
 
     def list_names(self, prefix: str) -> set[str]: ...
+
+
+class PayloadReader(Protocol):
+    def read(self, name: str) -> bytes: ...
+
+    def list_names(self) -> set[str]: ...
+
+
+class PrefixedReader:
+    def __init__(self, reader: Reader, prefix: str) -> None:
+        self.reader = reader
+        self.prefix = clean_prefix(prefix)
+
+    def read(self, name: str) -> bytes:
+        return self.reader.read(f"{self.prefix}/{name}")
+
+    def list_names(self) -> set[str]:
+        return self.reader.list_names(self.prefix)
 
 
 class S3Reader:
@@ -113,21 +133,47 @@ def payload_names(ledger_bytes: bytes) -> list[str]:
     return names
 
 
-def restore_payload(reader: Reader, prefix: str, out_dir: Path) -> None:
-    prefix = clean_prefix(prefix)
-    if not prefix:
-        raise SystemExit("object-storage release prefix cannot be empty")
+def restore_verified_payload(
+    reader: PayloadReader,
+    out_dir: Path,
+    tag: str,
+    commit: str,
+    ledger_sha256: str,
+) -> None:
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"release payload directory must be empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ledger_key = f"{prefix}/artifacts.json"
-    ledger_bytes = reader.read(ledger_key)
+    ledger_bytes = reader.read("artifacts.json")
     names = payload_names(ledger_bytes)
+    expected_names = {"artifacts.json", *names}
+    actual_names = reader.list_names()
+    if actual_names != expected_names:
+        raise SystemExit(
+            "release mirror member set differs: "
+            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
+        )
     (out_dir / "artifacts.json").write_bytes(ledger_bytes)
     for name in names:
-        (out_dir / name).write_bytes(reader.read(f"{prefix}/{name}"))
-    print(f"restored {len(names) + 1} immutable objects from {prefix}")
+        (out_dir / name).write_bytes(reader.read(name))
+    verify_payload(out_dir / "artifacts.json", out_dir, tag, commit, ledger_sha256)
+
+
+def restore_payload(
+    reader: Reader,
+    prefix: str,
+    out_dir: Path,
+    tag: str,
+    commit: str,
+    ledger_sha256: str,
+) -> None:
+    prefix = clean_prefix(prefix)
+    if not prefix:
+        raise SystemExit("object-storage release prefix cannot be empty")
+    restore_verified_payload(
+        PrefixedReader(reader, prefix), out_dir, tag, commit, ledger_sha256
+    )
+    print(f"restored verified immutable objects from {prefix}")
 
 
 def main() -> int:
@@ -137,6 +183,9 @@ def main() -> int:
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--region", default="auto")
     parser.add_argument("--prefix", required=True)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--ledger-sha256", required=True)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--local-root", type=Path, default=Path("dist/objectstorage"))
     args = parser.parse_args()
@@ -146,7 +195,14 @@ def main() -> int:
         reader = S3Reader(args.endpoint, args.bucket, args.region)
     else:
         reader = LocalReader(args.local_root, args.bucket)
-    restore_payload(reader, args.prefix, args.out_dir)
+    restore_payload(
+        reader,
+        args.prefix,
+        args.out_dir,
+        args.tag,
+        args.commit,
+        args.ledger_sha256,
+    )
     return 0
 
 

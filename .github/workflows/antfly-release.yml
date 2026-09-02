@@ -253,6 +253,7 @@ jobs:
             --bucket antfly-releases \
             --prefix "antfly/${RELEASE_TAG}" \
             --content-addressed-prefix antfly/artifacts \
+            --exact-prefix \
             dist/release-payload/*
 
       - name: Save immutable assets on a draft GitHub release
@@ -955,6 +956,7 @@ jobs:
             --bucket antfly-releases \
             --prefix "antfly/${RELEASE_TAG}" \
             --content-addressed-prefix antfly/artifacts \
+            --exact-prefix \
             --latest-prefix "antfly/${OBJECT_ALIAS}" \
             --publish-latest \
             dist/release-payload/*
@@ -998,6 +1000,7 @@ jobs:
       - prepare-release-promotion
       - begin-release-channel
       - publish-cli-npm
+      - publish-cli-pypi
       - promote-channel-aliases
       - publish-github-release
       - stage-container
@@ -1006,12 +1009,15 @@ jobs:
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
           needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
           needs.promote-channel-aliases.result == 'success' &&
           needs.stage-container.result == 'success' &&
           (needs.publish-github-release.result == 'success' || needs.publish-github-release.result == 'skipped') }}
     runs-on: arc-antfly-standard
     permissions:
       contents: read
+      packages: read
+      id-token: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -1019,6 +1025,18 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+        with:
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot
+      - name: Authenticate to Google Cloud for final container verification
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
       - name: Install crane
         uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
       - name: Install hash-locked object storage client
@@ -1056,18 +1074,65 @@ jobs:
               --package "$package" --tag "$NPM_TAG")"
             test "$observed" = "$NPM_PACKAGE_VERSION"
           done
-      - name: Verify public container aliases before committing the journal
+      - name: Verify exact PyPI release before committing the journal
+        if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+        env:
+          PYTHON_PACKAGE_VERSION: ${{ needs.prepare-release-promotion.outputs.python_version }}
+        run: |
+          python scripts/release/prepare_pypi_promotion.py \
+            --project antfly-cli \
+            --snapshot-dir dist/cli-snapshot \
+            --expected-version "$PYTHON_PACKAGE_VERSION" \
+            --verify-complete \
+            --attempts 3 \
+            --retry-seconds 5
+      - name: Verify every public container projection before committing the journal
         env:
           CONTAINER_VERSION: ${{ needs.prepare-release-promotion.outputs.container_tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
           CONTAINER_DIGEST: ${{ needs.stage-container.outputs.image_digest }}
         run: |
+          set -euo pipefail
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          source="${gar_image}@${CONTAINER_DIGEST}"
+          manifest="$(crane manifest "$source")"
+          amd64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | if length == 1 then .[0].digest else error("expected one linux/amd64 manifest") end' <<<"$manifest")"
+          arm64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected one linux/arm64 manifest") end' <<<"$manifest")"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "${gar_image}:${CONTAINER_VERSION}-amd64" \
+            --digest "$amd64_digest"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "${gar_image}:${CONTAINER_VERSION}-arm64" \
+            --digest "$arm64_digest"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "${gar_image}:${CONTAINER_VERSION}" \
+            --digest "$CONTAINER_DIGEST"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "${gar_image}:${CONTAINER_ALIAS}" \
+            --digest "$CONTAINER_DIGEST"
           python3 scripts/release/registryctl.py container-verify \
             --ref "ghcr.io/antflydb/antfly:${CONTAINER_VERSION}" \
             --digest "$CONTAINER_DIGEST"
           python3 scripts/release/registryctl.py container-verify \
             --ref "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}" \
             --digest "$CONTAINER_DIGEST"
+      - name: Require every channel projection to converge before committing the journal
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
+        run: |
+          python scripts/release/discover_channel_tag.py require \
+            --channel "$CHANNEL" \
+            --tag "$RELEASE_TAG" \
+            --repository "$GITHUB_REPOSITORY" \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases
       - name: Commit the release channel transaction
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover a channel alias while failing closed on registry errors."""
+"""Discover, reconcile, or verify a channel while failing closed on errors."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -61,6 +62,24 @@ def discover_github_latest(repository: str, token: str, opener: OpenURL) -> str:
     if not isinstance(tag, str) or not tag:
         raise SystemExit("GitHub latest release has no tag_name")
     return tag
+
+
+def discover_github_release(
+    repository: str, tag: str, token: str, opener: OpenURL
+) -> dict[str, Any] | None:
+    if not repository or not token:
+        raise SystemExit("GitHub release discovery requires a repository and token")
+    return load_json(
+        "https://api.github.com/repos/"
+        f"{repository}/releases/tags/{urllib.parse.quote(tag, safe='')}",
+        {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "antfly-release-controller",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        opener,
+    )
 
 
 def discover_npm_tag(package: str, tag: str, opener: OpenURL) -> str:
@@ -242,6 +261,50 @@ def reconcile_journal_observations(
     return current or ""
 
 
+def require_channel_observations(
+    channel: str,
+    expected: str,
+    observations: dict[str, str],
+    policy: dict[str, Any],
+) -> None:
+    validate_observed_channel_tag(expected, channel, policy)
+    mismatches = {
+        projection: observed or "missing"
+        for projection, observed in observations.items()
+        if observed != expected
+    }
+    if mismatches:
+        detail = ", ".join(
+            f"{projection}={observed}"
+            for projection, observed in sorted(mismatches.items())
+        )
+        raise SystemExit(
+            f"release channel {channel} has unconverged projections; "
+            f"expected {expected}: {detail}"
+        )
+
+
+def require_github_release_mode(
+    channel: str,
+    tag: str,
+    repository: str,
+    token: str,
+    policy: dict[str, Any],
+    opener: OpenURL,
+) -> None:
+    mode = policy["channels"][channel]["github_release"]
+    if mode == "none":
+        return
+    release = discover_github_release(repository, tag, token, opener)
+    if release is None:
+        raise SystemExit(f"GitHub release is missing: {tag}")
+    if release.get("tag_name") != tag or release.get("draft") is not False:
+        raise SystemExit(f"GitHub release is not published for {tag}")
+    expected_prerelease = mode == "prerelease"
+    if release.get("prerelease") is not expected_prerelease:
+        raise SystemExit(f"GitHub release {tag} does not match channel mode {mode}")
+
+
 def discover_channel_observations(
     channel: str,
     policy: dict[str, Any],
@@ -290,50 +353,68 @@ def discover_bootstrap_channel(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "bootstrap", choices=("reconcile", "github-latest", "npm", "npm-version")
+        "command",
+        choices=("reconcile", "require", "github-latest", "npm", "npm-version"),
     )
     parser.add_argument("--channel", choices=("stable", "next", "nightly"))
     parser.add_argument("--repository")
     parser.add_argument("--npm-package", default="@antfly/cli")
     parser.add_argument("--npm-tag")
     parser.add_argument("--npm-version")
+    parser.add_argument("--tag")
     parser.add_argument("--endpoint")
     parser.add_argument("--bucket", default="antfly-releases")
     args = parser.parse_args()
 
-    if args.bootstrap == "reconcile":
+    if args.command in {"reconcile", "require"}:
         if not args.channel:
-            parser.error("reconcile requires --channel")
+            parser.error(f"{args.command} requires --channel")
         policy = load_policy()
         channel_policy = policy["channels"][args.channel]
-        store = S3ChannelStore(
-            args.endpoint, args.bucket, channel_policy["journal_key"]
-        )
-        stored = store.load()
         reader = S3Reader(args.endpoint, args.bucket, "auto")
+        repository = args.repository or os.environ.get("GITHUB_REPOSITORY", "")
+        token = os.environ.get("GH_TOKEN", "")
         observations = discover_channel_observations(
             args.channel,
             policy,
-            args.repository or os.environ.get("GITHUB_REPOSITORY", ""),
-            os.environ.get("GH_TOKEN", ""),
+            repository,
+            token,
             reader,
             urllib.request.urlopen,
         )
-        if stored.etag is None:
-            current = reconcile_bootstrap_observations(
-                args.channel, observations, policy
+        if args.command == "require":
+            if not args.tag:
+                parser.error("require needs --tag")
+            current = args.tag
+            require_channel_observations(args.channel, current, observations, policy)
+            require_github_release_mode(
+                args.channel,
+                current,
+                repository,
+                token,
+                policy,
+                urllib.request.urlopen,
             )
         else:
-            current = reconcile_journal_observations(
-                stored, args.channel, observations, policy
+            store = S3ChannelStore(
+                args.endpoint, args.bucket, channel_policy["journal_key"]
             )
-    elif args.bootstrap == "github-latest":
+            stored = store.load()
+            if stored.etag is None:
+                current = reconcile_bootstrap_observations(
+                    args.channel, observations, policy
+                )
+            else:
+                current = reconcile_journal_observations(
+                    stored, args.channel, observations, policy
+                )
+    elif args.command == "github-latest":
         current = discover_github_latest(
             args.repository or os.environ.get("GITHUB_REPOSITORY", ""),
             os.environ.get("GH_TOKEN", ""),
             urllib.request.urlopen,
         )
-    elif args.bootstrap == "npm":
+    elif args.command == "npm":
         current = discover_npm_tag(
             args.npm_package, args.npm_tag or "", urllib.request.urlopen
         )

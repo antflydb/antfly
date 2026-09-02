@@ -115,7 +115,11 @@ credentials.
    commit, release-ledger digest, and OCI image digest). Build and preflight
    failures never create a pending transaction. After the commit boundary, a
    failed run must resume the same complete pending identity, and recovery
-   cannot move a channel backward.
+   cannot move a channel backward. Immediately before journal commit, the
+   controller reads every policy-selected channel projection again and requires
+   npm, PyPI, Homebrew, R2, GitHub release state, GAR, and GHCR to agree with the
+   reserved identity. The journal is therefore a record of observed convergence,
+   not merely an assertion that the publication steps ran.
 
 The authenticated channel resolver is the only component that interprets
 release-version syntax. It projects the accepted release identity into exact
@@ -144,7 +148,8 @@ Container tags are copied only from digest-pinned sources and then
 digest-verified through the same interface. Version tags reject an existing
 different digest; channel tags may move only inside the channel transaction.
 The permanent ledger-addressed record and OCI digest form the immutable
-container identity.
+container identity. Final convergence is stricter than bootstrap: a missing
+configured projection is a failed promotion, not empty state.
 
 npm platform packages publish before the top-level selector. Existing npm or
 PyPI files are skipped only when their registry digest matches, and PyPI must
@@ -212,7 +217,9 @@ to `read` and kept there; explicit job-level grants are the only supported way
 to obtain write access.
 
 Release metadata and object-storage publishing are implemented as explicit
-scripts under `scripts/release/`:
+scripts under `scripts/release/`. `make release-scripting-test` is the single CI
+entry point for release packaging, installer, recovery, registry, and workflow
+contract tests; its test discovery intentionally picks up new `test_*.py` files.
 
 - `stage_release_source.py` extracts release support files from the exact Git
   commit and records their digests in `source-snapshot.json`.
@@ -243,13 +250,15 @@ scripts under `scripts/release/`:
   ordered immutable mirrors and accepts a mirror only after the ledger digest,
   tag, commit, exact member set, sizes, and hashes all verify. GitHub release and
   asset listings are fully paginated, including draft releases.
-- `download_objectstorage.py` provides the authenticated R2 reader and exact
-  ledger-member restoration used by bootstrap and recovery.
+- `download_objectstorage.py` provides the authenticated R2 reader and exact,
+  hash-verified ledger-member restoration used by bootstrap and recovery. Its
+  standalone mode requires the expected tag, commit, and ledger digest.
 - `publish_objectstorage.py` first writes content-addressed and versioned keys
-  with compare-or-fail semantics, then updates mutable channel aliases only
-  after every immutable upload succeeds. The release workflow currently uses
-  the S3-compatible path for Cloudflare R2, but the script also has GCS and
-  local modes for future storage backends and dry-run smoke tests.
+  with compare-or-fail semantics and seals the version prefix only when it
+  contains exactly the ledger-defined files, then updates mutable channel
+  aliases only after every immutable upload succeeds. The release workflow
+  currently uses the S3-compatible path for Cloudflare R2, but the script also
+  has GCS and local modes for future storage backends and dry-run smoke tests.
 
 ## Version Behavior
 

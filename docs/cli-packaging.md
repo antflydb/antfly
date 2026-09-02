@@ -84,7 +84,11 @@ consumers.
    npm `latest`, `next`, or `nightly`, plus the channel's container and R2
    aliases and policy-selected GitHub visibility, are committed through
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for
-   nightlies.
+   nightlies. Immediately before committing the journal, the controller reads
+   back every configured projection: all npm dist-tags, the exact PyPI file set
+   when enabled, Homebrew when enabled, the R2 alias, GitHub publication mode,
+   and all GAR/GHCR version and channel tags. Any missing or divergent
+   projection leaves the transaction pending for exact retry.
    npm additionally verifies the requested dist-tag, so retries cannot conceal
    content or channel drift. Recovery restores the permanently recorded digest
    from either retention registry and fails if both copies are gone. It never
@@ -137,6 +141,9 @@ gh api --method POST repos/antflydb/antfly/dispatches \
 
 The channel contract is centralized in `scripts/release/channels.json` rather
 than encoded as version-string tests throughout the workflows.
+`make release-scripting-test` is the canonical local and CI suite for packaging,
+installer, registry, recovery, and release-workflow contracts; it discovers all
+`test_*.py` modules under both `scripts/packaging` and `scripts/release`.
 The reusable `.github/workflows/cli-package.yml` workflow only builds the
 original snapshot and cannot be dispatched directly; both trusted publication
 jobs remain in the top-level release workflow. The `pypi` and `npm` GitHub
