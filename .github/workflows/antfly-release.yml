@@ -242,19 +242,133 @@ jobs:
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
 
   package-cli-artifacts:
-    name: Build CLI package artifacts
-    needs: publish-release-assets
-    if: >-
-      ${{ always() &&
-          (github.event_name == 'workflow_dispatch' ||
-           needs.publish-release-assets.result == 'success') }}
+    name: Build immutable CLI package snapshot
+    needs:
+      - build-zig-runtime-archives
+      - publish-release-assets
+    if: ${{ github.event_name == 'push' }}
     uses: ./.github/workflows/cli-package.yml
     with:
-      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      version: ${{ github.ref_name }}
+      source_commit: ${{ github.sha }}
+
+  restore-cli-artifacts:
+    name: Restore immutable CLI package snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve release tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          raw="$RAW_VERSION"
+          version="${raw#v}"
+          tag="v${version}"
+          commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact package snapshot from the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p dist/cli-snapshot
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tgz' \
+            --pattern '*.whl' \
+            --pattern cli-snapshot.json \
+            --dir dist/cli-snapshot
+
+      - name: Verify release attestations and snapshot manifest
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for artifact in dist/cli-snapshot/*; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
+          python scripts/release/verify_cli_snapshot.py \
+            --snapshot-dir dist/cli-snapshot \
+            --version "$RELEASE_VERSION" \
+            --commit "${{ steps.version.outputs.commit }}"
+
+      - name: Upload recovered CLI snapshot
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot/
+          if-no-files-found: error
+
+  persist-cli-snapshot:
+    name: Attest and persist immutable CLI package snapshot
+    needs: package-cli-artifacts
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot
+
+      - name: Verify immutable CLI snapshot
+        run: |
+          python scripts/release/verify_cli_snapshot.py \
+            --snapshot-dir dist/cli-snapshot \
+            --version "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA"
+
+      - name: Attest immutable CLI package artifacts
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/cli-snapshot/*
+
+      - name: Persist immutable CLI snapshot on the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing_dir="$RUNNER_TEMP/existing-cli-snapshot"
+          mkdir -p "$existing_dir"
+          for artifact in dist/cli-snapshot/*; do
+            name="${artifact##*/}"
+            if gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$name" \
+              --dir "$existing_dir"
+            then
+              cmp --silent "$artifact" "$existing_dir/$name" || {
+                echo "refusing to replace immutable release asset: $name" >&2
+                exit 1
+              }
+            else
+              gh release upload "$GITHUB_REF_NAME" "$artifact" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
 
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
-    needs: package-cli-artifacts
+    needs:
+      - package-cli-artifacts
+      - restore-cli-artifacts
+      - persist-cli-snapshot
+    if: >-
+      ${{ always() &&
+          ((github.event_name == 'push' && needs.persist-cli-snapshot.result == 'success') ||
+           (github.event_name == 'workflow_dispatch' && needs.restore-cli-artifacts.result == 'success')) }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -264,17 +378,30 @@ jobs:
     steps:
       - uses: actions/download-artifact@v6
         with:
-          name: antfly-cli-wheels
-          path: dist/
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot
+
+      - name: Select the attested Python distributions
+        run: |
+          mkdir -p dist/pypi
+          cp dist/cli-snapshot/*.whl dist/pypi/
 
       - name: Publish wheels
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: dist/pypi
           skip-existing: true
 
   publish-cli-npm:
     name: Publish @antfly/cli to npm
-    needs: package-cli-artifacts
+    needs:
+      - package-cli-artifacts
+      - restore-cli-artifacts
+      - persist-cli-snapshot
+    if: >-
+      ${{ always() &&
+          ((github.event_name == 'push' && needs.persist-cli-snapshot.result == 'success') ||
+           (github.event_name == 'workflow_dispatch' && needs.restore-cli-artifacts.result == 'success')) }}
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -285,8 +412,8 @@ jobs:
 
       - uses: actions/download-artifact@v6
         with:
-          name: antfly-cli-npm
-          path: dist/
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot
 
       - uses: actions/setup-node@v6
         with:
@@ -311,18 +438,18 @@ jobs:
           echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
           sh scripts/packaging/publish_npm_package.sh \
             @antfly/cli-darwin-arm64 "$version" "$npm_tag" \
-            "./dist/antfly-cli-darwin-arm64-${version}.tgz"
+            "./dist/cli-snapshot/antfly-cli-darwin-arm64-${version}.tgz"
           sh scripts/packaging/publish_npm_package.sh \
             @antfly/cli-linux-arm64 "$version" "$npm_tag" \
-            "./dist/antfly-cli-linux-arm64-${version}.tgz"
+            "./dist/cli-snapshot/antfly-cli-linux-arm64-${version}.tgz"
           sh scripts/packaging/publish_npm_package.sh \
             @antfly/cli-linux-x64 "$version" "$npm_tag" \
-            "./dist/antfly-cli-linux-x64-${version}.tgz"
+            "./dist/cli-snapshot/antfly-cli-linux-x64-${version}.tgz"
           # Publish the top-level selector only after every platform package is
           # present, so users never receive a version with missing dependencies.
           sh scripts/packaging/publish_npm_package.sh \
             @antfly/cli "$version" "$npm_tag" \
-            "./dist/antfly-cli-${version}.tgz"
+            "./dist/cli-snapshot/antfly-cli-${version}.tgz"
 
   publish-zig-homebrew:
     name: Publish antfly Homebrew formula

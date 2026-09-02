@@ -32,6 +32,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -95,6 +96,7 @@ type InferencePoolReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
 
 // Reconcile handles InferencePool reconciliation
 func (r *InferencePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -502,7 +504,18 @@ func inferenceArtifactSelection(modelRef string) (format, quantization string, o
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
-	replicas := initialInferenceReplicas(pool)
+	var activationLease *coordinationv1.Lease
+	if pool.Spec.ScaleToZero != nil && pool.Spec.ScaleToZero.Enabled {
+		activationLease = &coordinationv1.Lease{}
+		leaseKey := types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}
+		if err := r.Get(ctx, leaseKey, activationLease); err != nil {
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("get activation Lease: %w", err)
+			}
+			activationLease = nil
+		}
+	}
+	replicas := desiredInferenceReplicasAt(pool, activationLease, time.Now())
 
 	// Determine image
 	image := r.AntflyImage
@@ -713,13 +726,9 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 
 const defaultInferenceIdleTimeout = 15 * time.Minute
 
-func initialInferenceReplicas(pool *antflyaiv1alpha1.InferencePool) int32 {
-	return desiredInferenceReplicasAt(pool, time.Now())
-}
-
-func desiredInferenceReplicasAt(pool *antflyaiv1alpha1.InferencePool, now time.Time) int32 {
+func desiredInferenceReplicasAt(pool *antflyaiv1alpha1.InferencePool, activationLease *coordinationv1.Lease, now time.Time) int32 {
 	replicas := pool.Spec.Replicas.Min
-	if scaleToZeroActiveAt(pool, now) {
+	if scaleToZeroActiveAt(pool, activationLease, now) {
 		replicas = 1
 		if pool.Spec.ScaleToZero.WakeReplicas != nil {
 			replicas = *pool.Spec.ScaleToZero.WakeReplicas
@@ -734,22 +743,31 @@ func desiredInferenceReplicasAt(pool *antflyaiv1alpha1.InferencePool, now time.T
 	return replicas
 }
 
-func scaleToZeroActiveAt(pool *antflyaiv1alpha1.InferencePool, now time.Time) bool {
+func scaleToZeroActiveAt(pool *antflyaiv1alpha1.InferencePool, activationLease *coordinationv1.Lease, now time.Time) bool {
 	if pool.Spec.ScaleToZero == nil || !pool.Spec.ScaleToZero.Enabled {
 		return false
 	}
-	requestedAt, err := time.Parse(time.RFC3339Nano, pool.Annotations[antflyaiv1alpha1.ActivationRequestedAtAnnotation])
-	if err != nil || requestedAt.After(now.Add(time.Minute)) {
+	if activationLease == nil || activationLease.Name != pool.Name || activationLease.Namespace != pool.Namespace {
 		return false
 	}
-	if requestedAt.After(now) {
-		requestedAt = now
+	if activationLease.Labels[antflyaiv1alpha1.ActivationLeasePoolLabel] != pool.Name ||
+		activationLease.Spec.HolderIdentity == nil || *activationLease.Spec.HolderIdentity != string(pool.UID) ||
+		activationLease.Spec.RenewTime == nil || activationLease.Spec.LeaseDurationSeconds == nil ||
+		*activationLease.Spec.LeaseDurationSeconds <= 0 {
+		return false
+	}
+	renewedAt := activationLease.Spec.RenewTime.Time
+	if renewedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if renewedAt.After(now) {
+		renewedAt = now
 	}
 	idleTimeout := defaultInferenceIdleTimeout
 	if pool.Spec.ScaleToZero.IdleTimeout != nil {
 		idleTimeout = pool.Spec.ScaleToZero.IdleTimeout.Duration
 	}
-	return now.Before(requestedAt.Add(idleTimeout))
+	return now.Before(renewedAt.Add(idleTimeout))
 }
 
 func inferenceAutoscalingEnabled(pool *antflyaiv1alpha1.InferencePool) bool {
@@ -1857,8 +1875,17 @@ func (r *InferencePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.requestsForActivationLease)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod)).
 		Complete(r)
+}
+
+func (r *InferencePoolReconciler) requestsForActivationLease(_ context.Context, obj client.Object) []reconcile.Request {
+	poolName := obj.GetLabels()[antflyaiv1alpha1.ActivationLeasePoolLabel]
+	if poolName == "" || poolName != obj.GetName() {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: poolName, Namespace: obj.GetNamespace()}}}
 }
 
 func (r *InferencePoolReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {

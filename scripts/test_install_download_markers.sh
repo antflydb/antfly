@@ -258,16 +258,4 @@ assert_installed_payload
 assert_activation_failure_rolls_back
 assert_checksum_failure_preserves_install
 
-publish_workflow="$repo_root/.github/workflows/cli-package.yml"
-for expected in \
-  '--max-redirs 0' \
-  'X-Antfly-Download-Channel: release-automation' \
-  'X-Antfly-Audience: ci'
-do
-  grep -Fq -- "$expected" "$publish_workflow" || {
-    echo "missing release automation marker '$expected' in $publish_workflow" >&2
-    exit 1
-  }
-done
-
 echo "install download, checksum, and transaction tests passed"

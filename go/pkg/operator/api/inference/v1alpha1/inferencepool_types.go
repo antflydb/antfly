@@ -48,10 +48,10 @@ const (
 	LoadingStrategyBounded LoadingStrategy = "bounded" // LRU eviction
 )
 
-// ActivationRequestedAtAnnotation is updated by an inference proxy when a
-// request targets a scale-to-zero pool. The operator treats the RFC3339 value
-// as the beginning of the pool's active window.
-const ActivationRequestedAtAnnotation = "inference.antfly.io/activation-requested-at"
+// ActivationLeasePoolLabel identifies the InferencePool controlled by a
+// request-driven activation Lease. The Lease has the same name and namespace
+// as its pool and uses the pool UID as its holder identity.
+const ActivationLeasePoolLabel = "inference.antfly.io/activation-pool"
 
 // InferencePoolSpec defines the desired state of InferencePool
 type InferencePoolSpec struct {
@@ -83,9 +83,8 @@ type InferencePoolSpec struct {
 	Autoscaling *AutoscalingConfig `json:"autoscaling,omitempty"`
 
 	// ScaleToZero enables request-driven activation for pools whose minimum
-	// replica count is zero. The inference proxy records request activity on
-	// the pool and the operator keeps wakeReplicas running until idleTimeout
-	// elapses.
+	// replica count is zero. The inference proxy renews a namespaced Lease and
+	// the operator keeps wakeReplicas running for the Lease's active window.
 	// +optional
 	ScaleToZero *ScaleToZeroConfig `json:"scaleToZero,omitempty"`
 

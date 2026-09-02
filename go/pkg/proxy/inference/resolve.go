@@ -17,6 +17,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +46,8 @@ type ResolveRequest struct {
 // Activate returns enabled=false for pools that are not managed by the
 // activator. When enabled is true, wait is the maximum cold-start window.
 type PoolActivator interface {
-	Activate(ctx context.Context, pool string) (wait time.Duration, enabled bool, err error)
+	IsEnabled(namespace, pool string) bool
+	Activate(ctx context.Context, namespace, pool string) (wait time.Duration, enabled bool, err error)
 }
 
 // Resolution is the result of routing a request to a specific endpoint.
@@ -317,8 +319,8 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 			}
 		}
 		if dest == nil {
-			activated, activationWait := p.activateRouteDestination(ctx, matchedRoute)
-			if activated {
+			activatedDestination, activationWait := p.activateRouteDestination(ctx, matchedRoute, routeReq)
+			if activatedDestination != nil {
 				dest = p.waitForRouteDestination(ctx, matchedRoute, routeReq, activationWait)
 				if ctx.Err() != nil {
 					return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: ctx.Err().Error()}
@@ -346,7 +348,11 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 		pool = p.defaultPool
 	}
 
-	activationWait, activationEnabled, activationErr := p.activatePool(ctx, pool)
+	namespace := ""
+	if matchedRoute != nil {
+		namespace = routeNamespace(matchedRoute)
+	}
+	activationWait, activationEnabled, activationErr := p.activatePool(ctx, namespace, pool)
 	if activationErr != nil {
 		p.logger.Warn("failed to refresh inference pool activation", zap.String("pool", pool), zap.Error(activationErr))
 	}
@@ -370,28 +376,61 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}, nil
 }
 
-func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route) (bool, time.Duration) {
+func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req *RouteRequest) (*Destination, time.Duration) {
 	if p.activator == nil {
-		return false, 0
+		return nil, 0
 	}
+	namespace := routeNamespace(route)
+	eligible := make([]Destination, 0, len(route.Destinations))
+	totalWeight := int32(0)
 	for _, destination := range route.Destinations {
-		wait, enabled, err := p.activatePool(ctx, destination.Pool)
-		if err != nil {
-			p.logger.Warn("failed to activate inference route destination", zap.String("pool", destination.Pool), zap.Error(err))
-			continue
-		}
-		if enabled {
-			return true, wait
+		if p.activator.IsEnabled(namespace, destination.Pool) {
+			eligible = append(eligible, destination)
+			totalWeight += destination.Weight
 		}
 	}
-	return false, 0
+	if len(eligible) == 0 {
+		return nil, 0
+	}
+	selected := &eligible[0]
+	if len(eligible) > 1 && totalWeight > 0 {
+		selection := weightedSelectionValue(route, req, totalWeight)
+		cumulative := int32(0)
+		for i := range eligible {
+			cumulative += eligible[i].Weight
+			if selection < cumulative {
+				selected = &eligible[i]
+				break
+			}
+		}
+	}
+	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
+	if err != nil {
+		p.logger.Warn("failed to activate inference route destination", zap.String("namespace", namespace), zap.String("pool", selected.Pool), zap.Error(err))
+		return nil, 0
+	}
+	if !enabled {
+		return nil, 0
+	}
+	return selected, wait
 }
 
-func (p *Proxy) activatePool(ctx context.Context, pool string) (time.Duration, bool, error) {
+func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {
 	if p.activator == nil || pool == "" {
 		return 0, false, nil
 	}
-	return p.activator.Activate(ctx, pool)
+	return p.activator.Activate(ctx, namespace, pool)
+}
+
+func routeNamespace(route *Route) string {
+	if route == nil {
+		return ""
+	}
+	namespace, _, found := strings.Cut(route.Name, "/")
+	if !found {
+		return ""
+	}
+	return namespace
 }
 
 func (p *Proxy) waitForRouteDestination(ctx context.Context, route *Route, req *RouteRequest, maxWait time.Duration) *Destination {

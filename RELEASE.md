@@ -58,10 +58,11 @@ SDK and enables Metal and Accelerate.
    draft GitHub Release, uploads the Zig archives and release metadata as GitHub
    Release assets, then publishes the payload to object storage.
 3. `package-cli-artifacts` calls `.github/workflows/cli-package.yml` to build the
-   `antfly-cli` wheels and `@antfly/cli` npm packages from the canonical release
-   archives. Top-level `publish-cli-pypi` and `publish-cli-npm` jobs publish
-   them with trusted publishing/provenance. A manual dispatch of the main
-   workflow uses this same path for recovery.
+   `antfly-cli` wheels and `@antfly/cli` npm packages directly from the native
+   Actions artifacts. It creates one source-commit-bound manifest for those
+   exact bytes; `persist-cli-snapshot` attests them and stores them on the
+   GitHub Release before top-level trusted-publisher jobs promote them. A manual
+   dispatch verifies and promotes that saved snapshot without rebuilding it.
 4. `publish-zig-homebrew` updates the stable `antfly` Homebrew formula from the
    Zig archive checksums. RC tags do not update the stable tap formula.
 5. `publish-container` calls `.github/workflows/antfly-container.yml` with
@@ -73,7 +74,9 @@ publishes, Homebrew, and container publishing fan out independently. A PyPI or
 npm publish failure must not block the container image for the same tag. npm
 platform packages publish before the top-level selector, and existing versions
 are skipped only when their registry integrity matches, so a partial publication
-is safe to retry without hiding content drift.
+is safe to retry without hiding content drift. Existing GitHub package assets
+are likewise accepted only when byte-identical; release automation never
+replaces a saved snapshot.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the GNU Linux archives on native Linux

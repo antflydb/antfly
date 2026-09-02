@@ -7,6 +7,10 @@ on:
         description: "Antfly version to publish, with or without v prefix"
         required: true
         type: string
+      source_commit:
+        description: "Immutable source commit that produced the native archives"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_commit }}
 
       - name: Resolve version
         id: version
@@ -32,25 +38,12 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Download release archives
-        run: |
-          set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          tag="${{ steps.version.outputs.tag }}"
-          base="https://releases.antfly.io/antfly/${tag}"
-          mkdir -p dist/release-archives
-          for archive in \
-            "antfly_${version}_Darwin_arm64.tar.gz" \
-            "antfly_${version}_Linux_arm64_gnu.tar.gz" \
-            "antfly_${version}_Linux_x86_64_gnu.tar.gz"
-          do
-            curl -fsSL \
-              --max-redirs 0 \
-              -H "X-Antfly-Download-Channel: release-automation" \
-              -H "X-Antfly-Audience: ci" \
-              "${base}/${archive}" \
-              -o "dist/release-archives/${archive}"
-          done
+      - name: Download native Zig runtime archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: dist/release-archives
 
       - uses: actions/setup-python@v5
         with:
@@ -97,14 +90,22 @@ jobs:
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
           npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
 
-      - name: Upload Python wheels
-        uses: actions/upload-artifact@v6
-        with:
-          name: antfly-cli-wheels
-          path: dist/cli-packages/python/*.whl
+      - name: Build and verify immutable CLI snapshot
+        run: |
+          python scripts/release/build_cli_snapshot.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ inputs.source_commit }}" \
+            --npm-dir dist/cli-packages/npm \
+            --python-dir dist/cli-packages/python \
+            --out-dir dist/cli-snapshot
+          python scripts/release/verify_cli_snapshot.py \
+            --snapshot-dir dist/cli-snapshot \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ inputs.source_commit }}"
 
-      - name: Upload npm tarballs
+      - name: Upload immutable CLI snapshot
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-cli-npm
-          path: dist/cli-packages/npm/*.tgz
+          name: antfly-cli-snapshot
+          path: dist/cli-snapshot/
+          if-no-files-found: error

@@ -191,6 +191,9 @@ jobs:
             scripts/packaging/render_homebrew_antfly_formula.py \
             scripts/packaging/test_cabi_packaging.py \
             scripts/packaging/build_zig_release_archive.sh \
+            scripts/release/build_cli_snapshot.py \
+            scripts/release/verify_cli_snapshot.py \
+            scripts/release/test_cli_snapshot.py \
             py/packages/cli/pyproject.toml \
             ':(glob)ts/packages/cli*/**' \
             docs/cli-packaging.md \
@@ -223,6 +226,7 @@ jobs:
           scripts/test_install_download_markers.sh
           scripts/test_quickstart_docs.py
           python3 scripts/packaging/test_cabi_packaging.py CAbiPackagingTests
+          python3 scripts/release/test_cli_snapshot.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 

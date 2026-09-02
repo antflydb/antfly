@@ -9,6 +9,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -164,9 +165,6 @@ func TestReconcileStatefulSetFollowsScaleToZeroActivation(t *testing.T) {
 			Name:      "cold-pool",
 			Namespace: "default",
 			UID:       types.UID("cold-pool"),
-			Annotations: map[string]string{
-				antflyaiv1alpha1.ActivationRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
-			},
 		},
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
 			Models:      antflyaiv1alpha1.ModelConfig{Preload: []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}}},
@@ -174,7 +172,16 @@ func TestReconcileStatefulSetFollowsScaleToZeroActivation(t *testing.T) {
 			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool).Build()
+	holder := "cold-pool"
+	duration := int32((10 * time.Minute) / time.Second)
+	renewedAt := metav1.NewMicroTime(time.Now().UTC())
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: pool.Name, Namespace: pool.Namespace, Labels: map[string]string{
+			antflyaiv1alpha1.ActivationLeasePoolLabel: pool.Name,
+		}},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renewedAt},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool, lease).Build()
 	reconciler := &InferencePoolReconciler{Client: client, Scheme: s, AntflyImage: "ghcr.io/antflydb/antfly:zig-test"}
 
 	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())
@@ -184,7 +191,10 @@ func TestReconcileStatefulSetFollowsScaleToZeroActivation(t *testing.T) {
 	g.Expect(client.Get(ctx, key, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 
-	pool.Annotations[antflyaiv1alpha1.ActivationRequestedAtAnnotation] = time.Now().Add(-11 * time.Minute).UTC().Format(time.RFC3339Nano)
+	g.Expect(client.Get(ctx, key, lease)).To(Succeed())
+	expiredAt := metav1.NewMicroTime(time.Now().Add(-11 * time.Minute).UTC())
+	lease.Spec.RenewTime = &expiredAt
+	g.Expect(client.Update(ctx, lease)).To(Succeed())
 	g.Expect(reconciler.reconcileStatefulSet(ctx, pool)).To(Succeed())
 	g.Expect(client.Get(ctx, key, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
@@ -196,6 +206,7 @@ func newInferenceUnitTestScheme(g *WithT) *runtime.Scheme {
 	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
 	g.Expect(autoscalingv2.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(coordinationv1.AddToScheme(s)).To(Succeed())
 	return s
 }
 

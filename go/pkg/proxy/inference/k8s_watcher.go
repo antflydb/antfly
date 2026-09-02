@@ -17,15 +17,17 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -38,6 +40,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -60,22 +63,24 @@ var InferencePoolGVR = schema.GroupVersionResource{
 }
 
 const (
-	activationRequestedAtAnnotation = "inference.antfly.io/activation-requested-at"
-	defaultActivationTimeout        = 5 * time.Minute
-	defaultScaleToZeroIdleTimeout   = 15 * time.Minute
+	defaultActivationTimeout      = 5 * time.Minute
+	defaultScaleToZeroIdleTimeout = 15 * time.Minute
+	activationLeasePoolLabel      = "inference.antfly.io/activation-pool"
 )
 
 type scaleToZeroPool struct {
 	namespace         string
+	uid               string
 	activationTimeout time.Duration
 	idleTimeout       time.Duration
-	lastPatched       time.Time
+	lastRenewed       time.Time
+	renewing          chan struct{}
 }
 
 // K8sWatcher watches Kubernetes endpoints for Inference pods
 type K8sWatcher struct {
 	proxy         *Proxy
-	clientset     *kubernetes.Clientset
+	clientset     kubernetes.Interface
 	dynamicClient dynamic.Interface
 	namespace     string
 
@@ -230,7 +235,7 @@ func (w *K8sWatcher) onInferencePoolDelete(obj any) {
 		return
 	}
 	w.scaleMu.Lock()
-	delete(w.scalePools, u.GetName())
+	delete(w.scalePools, poolKey(u.GetNamespace(), u.GetName()))
 	w.scaleMu.Unlock()
 }
 
@@ -241,71 +246,186 @@ func (w *K8sWatcher) processInferencePool(obj any) {
 	}
 	scaleConfig, found, _ := unstructured.NestedMap(u.Object, "spec", "scaleToZero")
 	enabled, _, _ := unstructured.NestedBool(scaleConfig, "enabled")
+	key := poolKey(u.GetNamespace(), u.GetName())
 	w.scaleMu.Lock()
 	defer w.scaleMu.Unlock()
 	if !found || !enabled {
-		delete(w.scalePools, u.GetName())
+		delete(w.scalePools, key)
 		return
 	}
 
 	activationTimeout := durationFromUnstructured(scaleConfig, "activationTimeout", defaultActivationTimeout)
 	idleTimeout := durationFromUnstructured(scaleConfig, "idleTimeout", defaultScaleToZeroIdleTimeout)
-	previous := w.scalePools[u.GetName()]
-	w.scalePools[u.GetName()] = scaleToZeroPool{
+	previous := w.scalePools[key]
+	uid := string(u.GetUID())
+	if previous.uid != uid {
+		previous.lastRenewed = time.Time{}
+		previous.renewing = nil
+	}
+	w.scalePools[key] = scaleToZeroPool{
 		namespace:         u.GetNamespace(),
+		uid:               uid,
 		activationTimeout: activationTimeout,
 		idleTimeout:       idleTimeout,
-		lastPatched:       previous.lastPatched,
+		lastRenewed:       previous.lastRenewed,
+		renewing:          previous.renewing,
 	}
 }
 
-// Activate records request activity on a scale-to-zero InferencePool. The
-// operator owns the StatefulSet replica count and consumes this annotation,
-// avoiding a fight between the proxy and reconciler.
-func (w *K8sWatcher) Activate(ctx context.Context, poolName string) (time.Duration, bool, error) {
-	now := time.Now().UTC()
+// IsEnabled reports whether the exact namespaced pool is managed by the
+// request-driven activator. An empty namespace is resolved only when unique.
+func (w *K8sWatcher) IsEnabled(namespace, poolName string) bool {
 	w.scaleMu.Lock()
-	pool, enabled := w.scalePools[poolName]
-	if !enabled {
+	defer w.scaleMu.Unlock()
+	_, _, enabled := w.resolveScalePoolLocked(namespace, poolName)
+	return enabled
+}
+
+// Activate renews the pool's activation Lease. The operator remains the sole
+// owner of StatefulSet replica counts and consumes the Lease as desired state.
+func (w *K8sWatcher) Activate(ctx context.Context, namespace, poolName string) (time.Duration, bool, error) {
+	for {
+		now := time.Now().UTC()
+		w.scaleMu.Lock()
+		key, pool, enabled := w.resolveScalePoolLocked(namespace, poolName)
+		if !enabled {
+			w.scaleMu.Unlock()
+			return 0, false, nil
+		}
+		renewAfter := pool.idleTimeout / 3
+		if renewAfter > 30*time.Second {
+			renewAfter = 30 * time.Second
+		}
+		if renewAfter < time.Second {
+			renewAfter = time.Second
+		}
+		if !pool.lastRenewed.IsZero() && now.Sub(pool.lastRenewed) < renewAfter {
+			w.scaleMu.Unlock()
+			return pool.activationTimeout, true, nil
+		}
+		if pool.renewing != nil {
+			renewing := pool.renewing
+			w.scaleMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return 0, true, ctx.Err()
+			case <-renewing:
+				continue
+			}
+		}
+		renewing := make(chan struct{})
+		pool.renewing = renewing
+		w.scalePools[key] = pool
 		w.scaleMu.Unlock()
-		return 0, false, nil
-	}
-	renewAfter := pool.idleTimeout / 3
-	if renewAfter > 30*time.Second {
-		renewAfter = 30 * time.Second
-	}
-	if renewAfter < time.Second {
-		renewAfter = time.Second
-	}
-	if !pool.lastPatched.IsZero() && now.Sub(pool.lastPatched) < renewAfter {
+
+		err := w.renewActivationLease(ctx, poolName, pool, now)
+		w.scaleMu.Lock()
+		current, found := w.scalePools[key]
+		if found && current.renewing == renewing {
+			current.renewing = nil
+			if err == nil {
+				current.lastRenewed = now
+			}
+			w.scalePools[key] = current
+		}
+		close(renewing)
 		w.scaleMu.Unlock()
+		if err != nil {
+			return 0, true, fmt.Errorf("renew activation Lease %s/%s: %w", pool.namespace, poolName, err)
+		}
 		return pool.activationTimeout, true, nil
 	}
-	previousPatch := pool.lastPatched
-	pool.lastPatched = now
-	w.scalePools[poolName] = pool
-	w.scaleMu.Unlock()
+}
 
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{activationRequestedAtAnnotation: now.Format(time.RFC3339Nano)},
-		},
-	})
-	if err != nil {
-		return 0, true, err
+func (w *K8sWatcher) renewActivationLease(ctx context.Context, poolName string, pool scaleToZeroPool, now time.Time) error {
+	durationSeconds := int64(math.Ceil(pool.idleTimeout.Seconds()))
+	if durationSeconds < 1 {
+		durationSeconds = 1
 	}
-	_, err = w.dynamicClient.Resource(InferencePoolGVR).Namespace(pool.namespace).Patch(ctx, poolName, types.MergePatchType, patch, metav1.PatchOptions{})
-	if err != nil {
-		w.scaleMu.Lock()
-		current := w.scalePools[poolName]
-		if current.lastPatched.Equal(now) {
-			current.lastPatched = previousPatch
-			w.scalePools[poolName] = current
+	if durationSeconds > math.MaxInt32 {
+		durationSeconds = math.MaxInt32
+	}
+	leaseDuration := int32(durationSeconds)
+	holder := pool.uid
+	renewTime := metav1.NewMicroTime(now)
+	leases := w.clientset.CoordinationV1().Leases(pool.namespace)
+	return retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
+	}, func() error {
+		lease, err := leases.Get(ctx, poolName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			_, err = leases.Create(ctx, &coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      poolName,
+					Namespace: pool.namespace,
+					Labels: map[string]string{
+						activationLeasePoolLabel: poolName,
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "antfly.io/v1alpha1",
+						Kind:       "InferencePool",
+						Name:       poolName,
+						UID:        types.UID(pool.uid),
+					}},
+				},
+				Spec: coordinationv1.LeaseSpec{
+					HolderIdentity:       &holder,
+					LeaseDurationSeconds: &leaseDuration,
+					AcquireTime:          &renewTime,
+					RenewTime:            &renewTime,
+				},
+			}, metav1.CreateOptions{})
+			return err
 		}
-		w.scaleMu.Unlock()
-		return 0, true, fmt.Errorf("mark InferencePool %s/%s active: %w", pool.namespace, poolName, err)
+		if err != nil {
+			return err
+		}
+		if lease.Labels[activationLeasePoolLabel] != poolName {
+			return fmt.Errorf("Lease %s/%s is not an InferencePool activation Lease", pool.namespace, poolName)
+		}
+		if lease.Labels == nil {
+			lease.Labels = make(map[string]string)
+		}
+		lease.Labels[activationLeasePoolLabel] = poolName
+		lease.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "antfly.io/v1alpha1",
+			Kind:       "InferencePool",
+			Name:       poolName,
+			UID:        types.UID(pool.uid),
+		}}
+		lease.Spec.HolderIdentity = &holder
+		lease.Spec.LeaseDurationSeconds = &leaseDuration
+		lease.Spec.RenewTime = &renewTime
+		_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+		return err
+	})
+}
+
+func poolKey(namespace, name string) string {
+	return namespace + "/" + name
+}
+
+func (w *K8sWatcher) resolveScalePoolLocked(namespace, name string) (string, scaleToZeroPool, bool) {
+	if namespace == "" {
+		namespace = w.namespace
 	}
-	return pool.activationTimeout, true, nil
+	if namespace != "" {
+		key := poolKey(namespace, name)
+		pool, found := w.scalePools[key]
+		return key, pool, found
+	}
+	var foundKey string
+	var foundPool scaleToZeroPool
+	for key, pool := range w.scalePools {
+		if strings.TrimPrefix(key, pool.namespace+"/") != name {
+			continue
+		}
+		if foundKey != "" {
+			return "", scaleToZeroPool{}, false
+		}
+		foundKey, foundPool = key, pool
+	}
+	return foundKey, foundPool, foundKey != ""
 }
 
 func durationFromUnstructured(config map[string]any, field string, fallback time.Duration) time.Duration {

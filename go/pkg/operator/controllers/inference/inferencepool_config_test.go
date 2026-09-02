@@ -21,6 +21,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -246,17 +247,33 @@ func TestDesiredInferenceReplicasHonorsActivationWindow(t *testing.T) {
 	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
 	idle := metav1.Duration{Duration: 10 * time.Minute}
 	pool := &antflyaiv1alpha1.InferencePool{
-		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-			antflyaiv1alpha1.ActivationRequestedAtAnnotation: now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
-		}},
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu", Namespace: "default", UID: types.UID("gpu-uid")},
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
 			Replicas:    antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 1},
 			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
 		},
 	}
+	holder := "gpu-uid"
+	// The operator owns the idle policy and must not trust a proxy-supplied
+	// Lease duration that is longer than the pool configuration.
+	duration := int32((24 * time.Hour) / time.Second)
+	renewedAt := metav1.NewMicroTime(now.Add(-5 * time.Minute))
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu", Namespace: "default", Labels: map[string]string{
+			antflyaiv1alpha1.ActivationLeasePoolLabel: "gpu",
+		}},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renewedAt},
+	}
 
-	g.Expect(desiredInferenceReplicasAt(pool, now)).To(Equal(int32(1)))
-	g.Expect(desiredInferenceReplicasAt(pool, now.Add(6*time.Minute))).To(Equal(int32(0)))
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(1)))
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now.Add(6*time.Minute))).To(Equal(int32(0)))
+	staleHolder := "previous-pool-uid"
+	lease.Spec.HolderIdentity = &staleHolder
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(0)))
+	lease.Spec.HolderIdentity = &holder
+	futureRenewal := metav1.NewMicroTime(now.Add(2 * time.Minute))
+	lease.Spec.RenewTime = &futureRenewal
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(0)))
 }
 
 func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {

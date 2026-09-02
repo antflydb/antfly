@@ -466,11 +466,19 @@ func TestProxyQueueFallbackWaitsForEligibleDestination(t *testing.T) {
 }
 
 type testPoolActivator struct {
-	activate func(context.Context, string) (time.Duration, bool, error)
+	enabled  func(string, string) bool
+	activate func(context.Context, string, string) (time.Duration, bool, error)
 }
 
-func (a testPoolActivator) Activate(ctx context.Context, pool string) (time.Duration, bool, error) {
-	return a.activate(ctx, pool)
+func (a testPoolActivator) IsEnabled(namespace, pool string) bool {
+	if a.enabled == nil {
+		return true
+	}
+	return a.enabled(namespace, pool)
+}
+
+func (a testPoolActivator) Activate(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {
+	return a.activate(ctx, namespace, pool)
 }
 
 func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
@@ -488,7 +496,10 @@ func TestResolveRequestActivatesZeroPoolBeforeRedirectFallback(t *testing.T) {
 	})
 
 	var calls atomic.Int32
-	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, pool string) (time.Duration, bool, error) {
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+		if namespace != "default" {
+			t.Fatalf("activation namespace = %q, want default", namespace)
+		}
 		if pool != "gpu" {
 			return 0, false, nil
 		}
@@ -524,7 +535,7 @@ func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
 		Destinations: []Destination{{Pool: "gpu", Weight: 100}},
 		Fallback:     &Fallback{Action: "redirect", RedirectPool: "cpu"},
 	})
-	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, pool string) (time.Duration, bool, error) {
+	p.SetPoolActivator(testPoolActivator{activate: func(_ context.Context, _ string, pool string) (time.Duration, bool, error) {
 		if pool == "gpu" {
 			return 20 * time.Millisecond, true, nil
 		}
@@ -537,6 +548,47 @@ func TestResolveRequestUsesFallbackAfterActivationTimeout(t *testing.T) {
 	}
 	if resolved.Pool != "cpu" {
 		t.Fatalf("expected CPU fallback after activation timeout, got %q", resolved.Pool)
+	}
+}
+
+func TestColdRouteActivationUsesDestinationWeights(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	counts := map[string]int{}
+	p.SetPoolActivator(testPoolActivator{
+		enabled: func(namespace, _ string) bool { return namespace == "team-a" },
+		activate: func(_ context.Context, namespace, pool string) (time.Duration, bool, error) {
+			if namespace != "team-a" {
+				t.Fatalf("activation namespace = %q, want team-a", namespace)
+			}
+			counts[pool]++
+			return time.Second, true, nil
+		},
+	})
+	route := &Route{
+		Name: "team-a/weighted-cold",
+		Destinations: []Destination{
+			{Pool: "gpu-a", Weight: 80},
+			{Pool: "gpu-b", Weight: 20},
+		},
+	}
+
+	for i := 0; i < 1000; i++ {
+		destination, _ := p.activateRouteDestination(context.Background(), route, &RouteRequest{
+			Operation: OperationType("embed"),
+			Model:     "model-a",
+			Timestamp: time.Unix(0, int64(i)),
+		})
+		if destination == nil {
+			t.Fatal("expected a cold destination to be activated")
+		}
+	}
+	if counts["gpu-a"] < 700 || counts["gpu-a"] > 900 {
+		t.Fatalf("expected weighted cold activation to favor gpu-a, got %v", counts)
+	}
+	if counts["gpu-a"]+counts["gpu-b"] != 1000 {
+		t.Fatalf("expected one activation per request, got %v", counts)
 	}
 }
 
