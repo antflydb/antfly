@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from registry.container import ensure_immutable, promote_alias
+from registry.container import promote_alias, require_digest, verify_digest
 from registry.model import RegistryError
 from registry.npm import dist_tag, version_integrity
 
@@ -22,10 +22,16 @@ def main() -> int:
         else:
             command.add_argument("--tag", required=True)
 
-    for name in ("container-ensure", "container-alias"):
-        command = subparsers.add_parser(name)
-        command.add_argument("--source", required=True)
-        command.add_argument("--destination", required=True)
+    command = subparsers.add_parser("container-alias")
+    command.add_argument("--source", required=True)
+    command.add_argument("--destination", required=True)
+
+    command = subparsers.add_parser("container-digest")
+    command.add_argument("--ref", required=True)
+
+    command = subparsers.add_parser("container-verify")
+    command.add_argument("--ref", required=True)
+    command.add_argument("--digest", required=True)
 
     args = parser.parse_args()
     try:
@@ -33,10 +39,12 @@ def main() -> int:
             print(version_integrity(args.package, args.version) or "")
         elif args.command == "npm-tag":
             print(dist_tag(args.package, args.tag) or "")
-        elif args.command == "container-ensure":
-            print(ensure_immutable(args.source, args.destination))
-        else:
+        elif args.command == "container-alias":
             print(promote_alias(args.source, args.destination))
+        elif args.command == "container-digest":
+            print(require_digest(args.ref))
+        else:
+            print(verify_digest(args.ref, args.digest))
     except RegistryError as exc:
         raise SystemExit(str(exc)) from exc
     return 0

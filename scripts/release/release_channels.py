@@ -48,19 +48,19 @@ class ReleaseSpec:
     tag: str
     channel: str
     source_commit: str
-    controller_commit: str
+    build_controller_commit: str
     npm_version: str
     python_version: str
     container_tag: str
 
     def document(self) -> dict[str, object]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "tag": self.tag,
             "version": self.tag.removeprefix("v"),
             "channel": self.channel,
             "source_commit": self.source_commit,
-            "controller_commit": self.controller_commit,
+            "build_controller_commit": self.build_controller_commit,
             "build_contract_schema": 1,
             "registry_versions": {
                 "npm": self.npm_version,
@@ -147,14 +147,14 @@ def build_release_spec(
     tag: str,
     requested_channel: str,
     source_commit: str,
-    controller_commit: str,
+    build_controller_commit: str,
     policy: dict[str, Any] | None = None,
     *,
     allow_legacy: bool = False,
 ) -> ReleaseSpec:
     for name, commit in (
         ("source", source_commit),
-        ("controller", controller_commit),
+        ("build controller", build_controller_commit),
     ):
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             raise SystemExit(f"invalid {name} commit: {commit}")
@@ -166,7 +166,7 @@ def build_release_spec(
         tag=tag,
         channel=channel_name,
         source_commit=source_commit,
-        controller_commit=controller_commit,
+        build_controller_commit=build_controller_commit,
         npm_version=registry["npm_version"],
         python_version=registry["python_version"],
         container_tag=registry["container_tag"],
@@ -366,7 +366,7 @@ def main() -> int:
     parser.add_argument("--channel", default="auto")
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--source-commit")
-    parser.add_argument("--controller-commit")
+    parser.add_argument("--build-controller-commit")
     parser.add_argument("--allow-legacy", action="store_true")
     args = parser.parse_args()
 
@@ -377,13 +377,13 @@ def main() -> int:
     if not args.tag:
         parser.error("resolve requires --tag")
     if args.command == "spec":
-        if not args.source_commit or not args.controller_commit:
-            parser.error("spec requires --source-commit and --controller-commit")
+        if not args.source_commit or not args.build_controller_commit:
+            parser.error("spec requires --source-commit and --build-controller-commit")
         spec = build_release_spec(
             args.tag,
             args.channel,
             args.source_commit,
-            args.controller_commit,
+            args.build_controller_commit,
             policy,
             allow_legacy=args.allow_legacy,
         )

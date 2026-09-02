@@ -25,13 +25,19 @@ def release_identity(
     channel: str = "stable",
     *,
     allow_legacy: bool = False,
+    container_digest: str | None = None,
 ) -> dict[str, str]:
     validate_channel_tag(tag, channel, load_policy(), allow_legacy=allow_legacy)
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise SystemExit(f"invalid release commit: {commit}")
     if not re.fullmatch(r"[0-9a-f]{64}", ledger_sha256):
         raise SystemExit(f"invalid release ledger digest: {ledger_sha256}")
-    return {"tag": tag, "commit": commit, "ledger_sha256": ledger_sha256}
+    identity = {"tag": tag, "commit": commit, "ledger_sha256": ledger_sha256}
+    if container_digest is not None:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", container_digest):
+            raise SystemExit(f"invalid container digest: {container_digest}")
+        identity["container_digest"] = container_digest
+    return identity
 
 
 def same_identity(left: object, right: dict[str, str]) -> bool:
@@ -141,6 +147,26 @@ def begin_promotion(
         if same_identity(pending, identity):
             print(f"resuming release channel promotion for {identity['tag']}")
             return
+        core_identity = {
+            key: value for key, value in identity.items() if key != "container_digest"
+        }
+        if (
+            "container_digest" in identity
+            and same_identity(pending, core_identity)
+            and isinstance(pending, dict)
+            and pending.get("container_digest") is None
+        ):
+            next_state = {
+                "schema_version": 1,
+                "channel": channel,
+                "current": current,
+                "pending": identity,
+            }
+            store.compare_and_swap(stored, next_state)
+            print(
+                f"bound container digest to release channel promotion for {identity['tag']}"
+            )
+            return
         pending_tag = pending.get("tag") if isinstance(pending, dict) else pending
         raise SystemExit(
             f"release channel promotion for {pending_tag} is incomplete; resume it before {identity['tag']}"
@@ -163,7 +189,9 @@ def begin_promotion(
             raise SystemExit(
                 f"release channel version precedence collision: {current_tag} and {identity['tag']}"
             )
-        for field in ("commit", "ledger_sha256"):
+        for field in ("commit", "ledger_sha256", "container_digest"):
+            if field not in identity:
+                continue
             if current_tag == identity["tag"] and current.get(field) not in {
                 None,
                 identity[field],
@@ -205,9 +233,36 @@ def finish_promotion(
     print(f"committed release channel promotion for {identity['tag']}")
 
 
+def journaled_container_digest(
+    store: S3ChannelStore, identity: dict[str, str], channel: str = "stable"
+) -> str | None:
+    """Return a reusable digest already bound to this exact release identity."""
+    state = store.load().document
+    if state.get("channel") not in {None, channel}:
+        raise SystemExit(f"release channel journal does not belong to {channel}")
+    pending = state.get("pending")
+    if pending is not None and not same_identity(pending, identity):
+        pending_tag = pending.get("tag") if isinstance(pending, dict) else pending
+        raise SystemExit(
+            f"release channel promotion for {pending_tag} is incomplete; resume it before {identity['tag']}"
+        )
+    for stored_identity in (pending, state.get("current")):
+        if not same_identity(stored_identity, identity):
+            continue
+        digest = stored_identity.get("container_digest")
+        if digest is None:
+            return None
+        if not isinstance(digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", digest
+        ):
+            raise SystemExit("release channel has an invalid container digest")
+        return digest
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("begin", "finish"))
+    parser.add_argument("command", choices=("begin", "finish", "resolve-container"))
     parser.add_argument("--endpoint")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--key", default="antfly/channels/stable.json")
@@ -215,6 +270,7 @@ def main() -> int:
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ledger-sha256", required=True)
+    parser.add_argument("--container-digest")
     parser.add_argument("--bootstrap-current")
     parser.add_argument("--allow-legacy-candidate", action="store_true")
     args = parser.parse_args()
@@ -233,9 +289,14 @@ def main() -> int:
         args.ledger_sha256,
         args.channel,
         allow_legacy=args.allow_legacy_candidate,
+        container_digest=args.container_digest,
     )
     store = S3ChannelStore(args.endpoint, args.bucket, args.key)
-    if args.command == "begin":
+    if args.command == "resolve-container":
+        if args.bootstrap_current:
+            parser.error("resolve-container does not accept --bootstrap-current")
+        print(journaled_container_digest(store, identity, args.channel) or "")
+    elif args.command == "begin":
         begin_promotion(store, identity, args.bootstrap_current, args.channel)
     else:
         if args.bootstrap_current:

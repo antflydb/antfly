@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -130,11 +131,13 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise SystemExit("release spec does not match the release identity")
-    controller_commit = document.get("controller_commit")
+    build_controller_commit = document.get("build_controller_commit")
     channel = document.get("channel")
-    if not isinstance(controller_commit, str) or not isinstance(channel, str):
+    if not isinstance(build_controller_commit, str) or not isinstance(channel, str):
         raise SystemExit("release spec does not match the release identity")
-    expected = build_release_spec(tag, channel, commit, controller_commit).document()
+    expected = build_release_spec(
+        tag, channel, commit, build_controller_commit
+    ).document()
     if document != expected:
         raise SystemExit("release spec does not match the release identity")
     return document
@@ -167,6 +170,11 @@ def main() -> int:
         "--out-dir", type=Path, required=True, help="output payload directory"
     )
     parser.add_argument("--release-spec", type=Path, required=True)
+    parser.add_argument(
+        "--promotion-controller-commit",
+        required=True,
+        help="exact default-branch controller running this promotion",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -174,6 +182,10 @@ def main() -> int:
     version = tag.removeprefix("v")
     prerelease = "-" in version
     release_spec = verify_release_spec(args.release_spec, tag, args.commit)
+    if not re.fullmatch(r"[0-9a-f]{40}", args.promotion_controller_commit):
+        raise SystemExit(
+            f"invalid promotion controller commit: {args.promotion_controller_commit}"
+        )
 
     out_dir = args.out_dir.resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -241,7 +253,8 @@ def main() -> int:
         "tag": tag,
         "version": version,
         "commit": args.commit,
-        "controller_commit": release_spec["controller_commit"],
+        "build_controller_commit": release_spec["build_controller_commit"],
+        "promotion_controller_commit": args.promotion_controller_commit,
         "prerelease": prerelease,
         "generated_at": release_generated_at,
         "registry_versions": registry_versions,
@@ -269,8 +282,9 @@ def main() -> int:
                 "tag": tag,
                 "version": version,
                 "commit": args.commit,
-                "controller_commit": release_spec["controller_commit"],
-                "schema_version": 3,
+                "build_controller_commit": release_spec["build_controller_commit"],
+                "promotion_controller_commit": args.promotion_controller_commit,
+                "schema_version": 4,
                 "generated_at": release_generated_at,
                 "registry_versions": registry_versions,
                 "artifacts": ledger_artifacts,

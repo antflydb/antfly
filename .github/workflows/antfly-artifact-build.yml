@@ -33,7 +33,7 @@ jobs:
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       channel: ${{ steps.channel.outputs.channel }}
-      controller_commit: ${{ steps.controller.outputs.commit }}
+      build_controller_commit: ${{ steps.controller.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -167,7 +167,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.release-plan.outputs.controller_commit }}
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
           fetch-depth: 0
       - name: Stage exact source objects
         run: |
@@ -192,12 +192,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.release-plan.outputs.controller_commit }}
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
       - name: Write request
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-          CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.controller_commit }}
+          BUILD_CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.build_controller_commit }}
           RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
         run: |
           mkdir -p dist/release-request
@@ -205,7 +205,7 @@ jobs:
             --tag "$RELEASE_TAG" \
             --channel "$RELEASE_CHANNEL" \
             --source-commit "$SOURCE_COMMIT" \
-            --controller-commit "$CONTROLLER_COMMIT" \
+            --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@v6
         with:

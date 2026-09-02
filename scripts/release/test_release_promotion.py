@@ -299,7 +299,12 @@ class ReleasePromotionTests(unittest.TestCase):
             "commit": "1" * 40,
             "ledger_sha256": "2" * 64,
         }
-        candidate = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        candidate = channel.release_identity(
+            "v1.2.3",
+            COMMIT,
+            "3" * 64,
+            container_digest=f"sha256:{'a' * 64}",
+        )
         store = MemoryStore({"schema_version": 1, "current": previous, "pending": None})
 
         channel.begin_promotion(store, candidate, None)
@@ -319,6 +324,10 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         channel.finish_promotion(store, candidate)
         self.assertEqual(store.writes, 2, "committed transaction should replay")
+        self.assertEqual(
+            channel.journaled_container_digest(store, candidate),
+            f"sha256:{'a' * 64}",
+        )
 
         older = channel.release_identity("v1.2.1", "4" * 40, "5" * 64)
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
@@ -344,6 +353,32 @@ class ReleasePromotionTests(unittest.TestCase):
         different = channel.release_identity("v1.2.4", "4" * 40, "5" * 64)
         with self.assertRaisesRegex(SystemExit, "is incomplete"):
             channel.begin_promotion(store, different, None)
+
+    def test_stable_channel_upgrades_a_legacy_pending_container_identity(self) -> None:
+        channel = load_module(
+            "release_channel_pending_upgrade_test", "release_channel_state.py"
+        )
+
+        class MemoryStore:
+            def __init__(self, document: dict) -> None:
+                self.document = document
+
+            def load(self):
+                return channel.StoredState(self.document, "1")
+
+            def compare_and_swap(self, _previous, document: dict) -> None:
+                self.document = document
+
+        legacy = channel.release_identity("v1.2.3", COMMIT, "3" * 64)
+        candidate = channel.release_identity(
+            "v1.2.3",
+            COMMIT,
+            "3" * 64,
+            container_digest=f"sha256:{'a' * 64}",
+        )
+        store = MemoryStore({"schema_version": 1, "current": None, "pending": legacy})
+        channel.begin_promotion(store, candidate, None)
+        self.assertEqual(store.document["pending"], candidate)
 
     def test_stable_channel_rejects_observed_alias_drift(self) -> None:
         channel = load_module("release_channel_alias_test", "release_channel_state.py")
@@ -391,6 +426,36 @@ class ReleasePromotionTests(unittest.TestCase):
 
         drifted = channel.release_identity("v1.2.3", COMMIT, "4" * 64)
         with self.assertRaisesRegex(SystemExit, "different ledger_sha256"):
+            channel.begin_promotion(MemoryStore(), drifted, None)
+
+    def test_stable_channel_rejects_container_digest_drift(self) -> None:
+        channel = load_module(
+            "release_channel_container_test", "release_channel_state.py"
+        )
+        current = channel.release_identity(
+            "v1.2.3",
+            COMMIT,
+            "3" * 64,
+            container_digest=f"sha256:{'a' * 64}",
+        )
+
+        class MemoryStore:
+            def load(self):
+                return channel.StoredState(
+                    {"schema_version": 1, "current": current, "pending": None},
+                    "1",
+                )
+
+            def compare_and_swap(self, _previous, _document: dict) -> None:
+                raise AssertionError("container drift must not be written")
+
+        drifted = channel.release_identity(
+            "v1.2.3",
+            COMMIT,
+            "3" * 64,
+            container_digest=f"sha256:{'b' * 64}",
+        )
+        with self.assertRaisesRegex(SystemExit, "different container_digest"):
             channel.begin_promotion(MemoryStore(), drifted, None)
 
     def test_next_channel_uses_semver_prerelease_precedence(self) -> None:
@@ -709,12 +774,12 @@ class ReleasePromotionTests(unittest.TestCase):
             release_spec.write_text(
                 json.dumps(
                     {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "tag": "v1.2.3",
                         "version": "1.2.3",
                         "channel": "stable",
                         "source_commit": COMMIT,
-                        "controller_commit": "f" * 40,
+                        "build_controller_commit": "f" * 40,
                         "build_contract_schema": 1,
                         "registry_versions": {
                             "npm": "1.2.3",
@@ -740,6 +805,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 str(output),
                 "--release-spec",
                 str(release_spec),
+                "--promotion-controller-commit",
+                "e" * 40,
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -747,8 +814,9 @@ class ReleasePromotionTests(unittest.TestCase):
             ):
                 self.assertEqual(payload.main(), 0)
             ledger = json.loads((output / "artifacts.json").read_text())
-            self.assertEqual(ledger["schema_version"], 3)
-            self.assertEqual(ledger["controller_commit"], "f" * 40)
+            self.assertEqual(ledger["schema_version"], 4)
+            self.assertEqual(ledger["build_controller_commit"], "f" * 40)
+            self.assertEqual(ledger["promotion_controller_commit"], "e" * 40)
             self.assertEqual(ledger["generated_at"], "1970-01-01T00:00:00Z")
             self.assertEqual(
                 ledger["registry_versions"],

@@ -52,7 +52,7 @@ class LocalReader:
 
 def payload_names(ledger_bytes: bytes) -> list[str]:
     ledger = json.loads(ledger_bytes)
-    if ledger.get("schema_version") not in {1, 2, 3}:
+    if ledger.get("schema_version") not in {1, 2, 3, 4}:
         raise SystemExit("unsupported release ledger schema")
     entries = ledger.get("artifacts")
     if not isinstance(entries, list) or not entries:

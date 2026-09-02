@@ -47,42 +47,43 @@ def _copy(source: str, destination: str, runner: Runner) -> None:
         )
 
 
-def ensure_immutable(
-    source: str, destination: str, runner: Runner = subprocess.run
-) -> str:
-    source_lookup = lookup_digest(source, runner)
-    if source_lookup.state is not LookupState.PRESENT:
-        raise RegistryError(f"immutable container source is missing: {source}")
-    expected = source_lookup.digest
-    assert expected is not None
+def require_digest(ref: str, runner: Runner = subprocess.run) -> str:
+    lookup = lookup_digest(ref, runner)
+    if lookup.state is not LookupState.PRESENT:
+        raise RegistryError(f"container image is missing: {ref}")
+    assert lookup.digest is not None
+    return lookup.digest
 
-    destination_lookup = lookup_digest(destination, runner)
-    if destination_lookup.state is LookupState.PRESENT:
-        if destination_lookup.digest != expected:
-            raise RegistryError(
-                f"immutable container tag differs: {destination}; "
-                f"existing={destination_lookup.digest} new={expected}"
-            )
-        return expected
 
-    _copy(source, destination, runner)
-    actual = lookup_digest(destination, runner)
-    if actual.state is not LookupState.PRESENT or actual.digest != expected:
+def digest_reference(ref: str, digest: str) -> str:
+    """Return a repository reference pinned to an already-resolved digest."""
+    repository = ref.split("@", 1)[0]
+    last_slash = repository.rfind("/")
+    last_colon = repository.rfind(":")
+    if last_colon > last_slash:
+        repository = repository[:last_colon]
+    return f"{repository}@{digest}"
+
+
+def verify_digest(ref: str, expected: str, runner: Runner = subprocess.run) -> str:
+    if not DIGEST_PATTERN.fullmatch(expected):
+        raise RegistryError(f"invalid expected container digest: {expected}")
+    actual = require_digest(ref, runner)
+    if actual != expected:
         raise RegistryError(
-            f"container tag verification failed for {destination}: expected {expected}"
+            f"container digest differs for {ref}: expected={expected} actual={actual}"
         )
-    return expected
+    return actual
 
 
 def promote_alias(
     source: str, destination: str, runner: Runner = subprocess.run
 ) -> str:
-    source_lookup = lookup_digest(source, runner)
-    if source_lookup.state is not LookupState.PRESENT:
-        raise RegistryError(f"container alias source is missing: {source}")
-    expected = source_lookup.digest
-    assert expected is not None
-    _copy(source, destination, runner)
+    expected = require_digest(source, runner)
+    # Tags are mutable aliases, never immutable records. Resolve once, then copy
+    # the digest-pinned source so a concurrent source-tag move cannot change the
+    # bytes promoted by this transaction.
+    _copy(digest_reference(source, expected), destination, runner)
     actual = lookup_digest(destination, runner)
     if actual.state is not LookupState.PRESENT or actual.digest != expected:
         raise RegistryError(

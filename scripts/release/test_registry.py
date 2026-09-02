@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from registry.container import ensure_immutable, lookup_digest, promote_alias
+from registry.container import lookup_digest, promote_alias, verify_digest
 from registry.model import LookupState, RegistryError
 
 DIGEST = f"sha256:{'a' * 64}"
@@ -39,27 +39,30 @@ class ContainerRegistryTests(unittest.TestCase):
             with self.subTest(detail=detail), self.assertRaises(RegistryError):
                 lookup_digest("registry/image:tag", FakeRunner([(1, "", detail)]))
 
-    def test_immutable_creation_is_copied_and_verified(self) -> None:
+    def test_alias_copy_uses_the_resolved_digest_and_is_verified(self) -> None:
         runner = FakeRunner(
             [
                 (0, f"{DIGEST}\n", ""),
-                (1, "", "MANIFEST_UNKNOWN"),
                 (0, "", ""),
                 (0, f"{DIGEST}\n", ""),
             ]
         )
         self.assertEqual(
-            ensure_immutable("registry/source:tag", "registry/dest:tag", runner),
+            promote_alias("registry/source:tag", "registry/dest:tag", runner),
             DIGEST,
         )
-        self.assertEqual(runner.calls[2][1], "copy")
+        self.assertEqual(
+            runner.calls[1],
+            ["crane", "copy", f"registry/source@{DIGEST}", "registry/dest:tag"],
+        )
 
-    def test_immutable_drift_never_copies(self) -> None:
+    def test_alias_verification_rejects_registry_drift(self) -> None:
         different = f"sha256:{'b' * 64}"
-        runner = FakeRunner([(0, f"{DIGEST}\n", ""), (0, f"{different}\n", "")])
-        with self.assertRaisesRegex(RegistryError, "immutable container tag differs"):
-            ensure_immutable("registry/source:tag", "registry/dest:tag", runner)
-        self.assertFalse(any(call[1] == "copy" for call in runner.calls))
+        runner = FakeRunner(
+            [(0, f"{DIGEST}\n", ""), (0, "", ""), (0, f"{different}\n", "")]
+        )
+        with self.assertRaisesRegex(RegistryError, "alias verification failed"):
+            promote_alias("registry/source:tag", "registry/dest:tag", runner)
 
     def test_alias_is_always_verified_after_copy(self) -> None:
         runner = FakeRunner(
@@ -73,6 +76,11 @@ class ContainerRegistryTests(unittest.TestCase):
             promote_alias("registry/source:tag", "registry/dest:latest", runner),
             DIGEST,
         )
+
+    def test_expected_digest_is_checked_without_copying(self) -> None:
+        runner = FakeRunner([(0, f"{DIGEST}\n", "")])
+        self.assertEqual(verify_digest("registry/image:tag", DIGEST, runner), DIGEST)
+        self.assertFalse(any(call[1] == "copy" for call in runner.calls))
 
 
 if __name__ == "__main__":

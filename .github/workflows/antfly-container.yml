@@ -1,7 +1,8 @@
-name: Container promotion
+name: Container build staging
 
-# This workflow is deliberately callable only. The default-branch release
-# controller authenticates and restores the release bundle before invoking it.
+# This workflow is deliberately callable only. It creates run-scoped staging
+# images and returns their content digests; the release controller owns every
+# durable version and channel alias.
 on:
   workflow_call:
     inputs:
@@ -13,14 +14,27 @@ on:
         description: "Authenticated release source commit"
         required: true
         type: string
-      controller_commit:
-        description: "Trusted release-controller commit"
+      promotion_controller_commit:
+        description: "Exact release-controller commit running this promotion"
         required: true
         type: string
       ledger_sha256:
         description: "Digest of the authenticated release ledger"
         required: true
         type: string
+    outputs:
+      image_ref:
+        description: "Run-scoped staged multi-architecture image"
+        value: ${{ jobs.stage.outputs.image_ref }}
+      image_digest:
+        description: "Digest of the staged multi-architecture image"
+        value: ${{ jobs.stage.outputs.image_digest }}
+      amd64_digest:
+        description: "Digest of the staged amd64 image"
+        value: ${{ jobs.stage.outputs.amd64_digest }}
+      arm64_digest:
+        description: "Digest of the staged arm64 image"
+        value: ${{ jobs.stage.outputs.arm64_digest }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -32,24 +46,28 @@ env:
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
 
 jobs:
-  publish:
+  stage:
     runs-on: arc-antfly-publish
     environment: container-publish
+    outputs:
+      image_ref: ${{ steps.identity.outputs.image_ref }}
+      image_digest: ${{ steps.identity.outputs.image_digest }}
+      amd64_digest: ${{ steps.identity.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.identity.outputs.arm64_digest }}
     permissions:
       contents: read
-      packages: write
       id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.controller_commit }}
+          ref: ${{ inputs.promotion_controller_commit }}
           fetch-depth: 0
 
       - name: Revalidate trusted caller and release identity
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
           RELEASE_COMMIT: ${{ inputs.source_commit }}
-          CONTROLLER_COMMIT: ${{ inputs.controller_commit }}
+          PROMOTION_CONTROLLER_COMMIT: ${{ inputs.promotion_controller_commit }}
           LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -63,11 +81,11 @@ jobs:
             exit 2
           fi
           [[ "$LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          test "$(git rev-parse HEAD)" = "$CONTROLLER_COMMIT"
+          test "$(git rev-parse HEAD)" = "$PROMOTION_CONTROLLER_COMMIT"
           git fetch --no-tags origin "$DEFAULT_BRANCH"
           git cat-file -e "$RELEASE_COMMIT^{commit}"
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-          git merge-base --is-ancestor "$CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$PROMOTION_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
 
       - uses: actions/download-artifact@v6
         with:
@@ -103,10 +121,9 @@ jobs:
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
 
-      - name: Authenticate immutable container registries
+      - name: Authenticate staging container registry
         run: |
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Upload verified runtime archives to immutable build inputs
         env:
@@ -149,23 +166,9 @@ jobs:
               --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${BUILD_TAG}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
-      - name: Seal ledger-addressed architecture images
-        env:
-          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
-          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
-        run: |
-          set -euo pipefail
-          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
-          for arch in amd64 arm64; do
-            python3 scripts/release/registryctl.py container-ensure \
-              --source "${image}:${BUILD_TAG}-${arch}" \
-              --destination "${image}:${LEDGER_TAG}-${arch}"
-          done
-
       - name: Create the multi-architecture manifest last
         env:
           BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
-          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -185,47 +188,21 @@ jobs:
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${BUILD_TAG},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${LEDGER_TAG}-amd64,_ARM64_TAG=${LEDGER_TAG}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${BUILD_TAG},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${BUILD_TAG}-amd64,_ARM64_TAG=${BUILD_TAG}-arm64"
 
-      - name: Seal ledger and version image tags
+      - name: Resolve staged image identities
+        id: identity
         env:
-          VERSION: ${{ inputs.tag_name }}
           BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
-          LEDGER_TAG: sha256-${{ inputs.ledger_sha256 }}
         run: |
           set -euo pipefail
-          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
-          python3 scripts/release/registryctl.py container-ensure \
-            --source "${gar_image}:${BUILD_TAG}" \
-            --destination "${gar_image}:${LEDGER_TAG}"
-          for arch in amd64 arm64; do
-            python3 scripts/release/registryctl.py container-ensure \
-              --source "${gar_image}:${LEDGER_TAG}-${arch}" \
-              --destination "${gar_image}:${VERSION}-${arch}"
-          done
-          python3 scripts/release/registryctl.py container-ensure \
-            --source "${gar_image}:${LEDGER_TAG}" \
-            --destination "${gar_image}:${VERSION}"
-          python3 scripts/release/registryctl.py container-ensure \
-            --source "${gar_image}:${LEDGER_TAG}" \
-            --destination "ghcr.io/antflydb/antfly:${VERSION}"
-
-      - uses: sigstore/cosign-installer@v3
-
-      - name: Sign the immutable GAR and GHCR image digests
-        env:
-          VERSION: ${{ inputs.tag_name }}
-          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
-        run: |
-          cosign sign --yes \
-            -a "repo=${{ github.repository }}" \
-            -a "workflow=${{ github.workflow }}" \
-            -a "ref=${{ inputs.source_commit }}" \
-            -a "ledger_sha256=${LEDGER_SHA256}" \
-            "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}"
-          cosign sign --yes \
-            -a "repo=${{ github.repository }}" \
-            -a "workflow=${{ github.workflow }}" \
-            -a "ref=${{ inputs.source_commit }}" \
-            -a "ledger_sha256=${LEDGER_SHA256}" \
-            "ghcr.io/antflydb/antfly:${VERSION}"
+          image_ref="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          image_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}")"
+          amd64_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}-amd64")"
+          arm64_digest="$(python3 scripts/release/registryctl.py container-digest --ref "${image_ref}:${BUILD_TAG}-arm64")"
+          {
+            echo "image_ref=${image_ref}:${BUILD_TAG}"
+            echo "image_digest=$image_digest"
+            echo "amd64_digest=$amd64_digest"
+            echo "arm64_digest=$arm64_digest"
+          } >> "$GITHUB_OUTPUT"

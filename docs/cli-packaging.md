@@ -56,22 +56,26 @@ consumers.
 5. GitHub starts that promotion through `workflow_run`, so the privileged code
    is always loaded from the default branch. The controller verifies the
    source commit's declared build-contract schema and consumes its immutable
-   `ReleaseSpec`, which independently records the source and controller commits.
-   The channel transaction is opened before any registry version is published.
-   The controller then verifies the
+   `ReleaseSpec`, which records the source commit and the default-branch
+   controller that built the artifacts. Promotion records a second, distinct
+   `promotion_controller_commit`; every privileged job checks out that one
+   workflow revision. The controller then verifies the
    complete release bundle before promoting its CLI scope to PyPI and npm, its
    GNU runtime scope to the single container image, and stable archives to
-   Homebrew. Container builds are first sealed under the release-ledger digest;
-   version tags are compare-or-created and cannot be overwritten by a retry.
+   Homebrew. Container images are built under run-scoped staging tags, resolved
+   to OCI digests, and added to the compare-and-swap channel journal before any
+   package or alias is published. Version and channel tags are intentionally
+   mutable aliases of that digest; every copy reads from a digest-pinned source
+   and is verified afterward. OCI content digests, not registry tags, are the
+   immutable container identity.
    npm `latest`, `next`, or `nightly`, plus the channel's container and R2
    aliases and policy-selected GitHub visibility, are committed through
    compare-and-swap channel transactions. PyPI and Homebrew are omitted for
    nightlies.
-   Registry jobs skip an existing version only after comparing its digest; npm
-   additionally verifies the requested dist-tag, so retries cannot conceal
-   content or channel drift.
-   Every privileged job checks out the `controller_commit` recorded in the
-   release specification. Container assembly uses controller-owned Docker and
+   npm additionally verifies the requested dist-tag, so retries cannot conceal
+   content or channel drift. A retry that rebuilds a different container digest
+   cannot resume the pending journal transaction.
+   Container assembly uses promotion-controller-owned Docker and
    Cloud Build inputs plus the verified GNU archives; it never executes release
    tooling from `source_commit`.
    Native archives remain available under
@@ -93,12 +97,12 @@ tag ref, repository, and source-commit digest; binds the promotion to the
 supplied ledger digest; verifies every typed scope and artifact hash; and
 promotes those exact bytes. It never checks out operator-selected source to
 rebuild or publish registry artifacts. Recovery may repair immutable
-object-storage, PyPI, GitHub-asset, and container-version artifacts for a saved
-release, but npm `latest`/`next` and stable Homebrew, container, object-storage,
+object-storage, PyPI, and GitHub assets plus container version aliases for a
+saved release, but npm `latest`/`next` and stable Homebrew, container, object-storage,
 and GitHub `latest` channels move only forward. An interrupted promotion leaves
-a journaled pending identity and only that exact tag, source commit, and ledger
-digest may resume it. A published GitHub release is never changed back to
-draft.
+a journaled pending identity and only that exact tag, source commit,
+release-ledger digest, and container digest may resume it. A published GitHub
+release is never changed back to draft.
 
 Nightly recovery uses the general channel event because nightlies deliberately
 have no GitHub Release. Supply its exact source commit and ledger digest; the

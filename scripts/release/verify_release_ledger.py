@@ -55,10 +55,15 @@ def main() -> int:
         )
 
     ledger = json.loads(args.ledger.read_text(encoding="utf-8"))
-    if ledger.get("schema_version") not in {1, 2, 3}:
+    schema_version = ledger.get("schema_version")
+    if schema_version not in {1, 2, 3, 4}:
         raise SystemExit("unsupported release ledger schema")
     if ledger.get("tag") != args.tag or ledger.get("commit") != args.commit:
         raise SystemExit("release ledger does not match the requested tag and commit")
+    if schema_version == 4:
+        for field in ("build_controller_commit", "promotion_controller_commit"):
+            if not re.fullmatch(r"[0-9a-f]{40}", str(ledger.get(field, ""))):
+                raise SystemExit(f"release ledger has an invalid {field}")
 
     entries: dict[str, dict[str, object]] = {}
     ledger_artifacts = ledger.get("artifacts")
@@ -75,7 +80,7 @@ def main() -> int:
             or name in entries
         ):
             raise SystemExit("release ledger contains an invalid or duplicate artifact")
-        if ledger.get("schema_version") in {2, 3} and entry.get("scope") not in {
+        if schema_version in {2, 3, 4} and entry.get("scope") not in {
             "runtime",
             "cli",
             "support",

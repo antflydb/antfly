@@ -40,9 +40,11 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       tag: ${{ steps.identity.outputs.tag }}
       commit: ${{ steps.identity.outputs.commit }}
-      controller_commit: ${{ steps.identity.outputs.controller_commit }}
+      build_controller_commit: ${{ steps.identity.outputs.build_controller_commit }}
+      promotion_controller_commit: ${{ steps.identity.outputs.promotion_controller_commit }}
       allow_legacy: ${{ steps.identity.outputs.allow_legacy }}
       ledger_sha256: ${{ steps.ledger.outputs.sha256 }}
+      container_digest: ${{ steps.container-state.outputs.digest }}
       channel: ${{ steps.identity.outputs.channel }}
       journal_key: ${{ steps.identity.outputs.journal_key }}
       bootstrap: ${{ steps.identity.outputs.bootstrap }}
@@ -114,12 +116,13 @@ jobs:
         run: |
           set -euo pipefail
           expected_ledger=""
+          promotion_controller_commit="$(git rev-parse HEAD)"
           if [ "$EVENT_NAME" = workflow_run ]; then
             request=dist/release-request/release-request.json
-            test "$(jq -r .schema_version "$request")" = 3
+            test "$(jq -r .schema_version "$request")" = 4
             raw="$(jq -r .tag "$request")"
             commit="$(jq -r .source_commit "$request")"
-            controller_commit="$(jq -r .controller_commit "$request")"
+            build_controller_commit="$(jq -r .build_controller_commit "$request")"
             requested_channel="$(jq -r .channel "$request")"
             allow_legacy=false
             case "$BUILD_EVENT" in
@@ -132,7 +135,7 @@ jobs:
             requested_channel="${RAW_RECOVERY_CHANNEL:-auto}"
             expected_ledger="${RECOVERY_LEDGER_SHA256,,}"
             test -n "$expected_ledger"
-            controller_commit="$(git rev-parse HEAD)"
+            build_controller_commit=""
             allow_legacy=true
           fi
           if ! [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
@@ -161,7 +164,8 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
             echo "commit=$commit"
-            echo "controller_commit=$controller_commit"
+            echo "build_controller_commit=$build_controller_commit"
+            echo "promotion_controller_commit=$promotion_controller_commit"
             echo "allow_legacy=$allow_legacy"
             echo "expected_ledger=$expected_ledger"
           } >> "$GITHUB_OUTPUT"
@@ -171,7 +175,8 @@ jobs:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
           RELEASE_CHANNEL: ${{ steps.identity.outputs.channel }}
-          CONTROLLER_COMMIT: ${{ steps.identity.outputs.controller_commit }}
+          BUILD_CONTROLLER_COMMIT: ${{ steps.identity.outputs.build_controller_commit }}
+          PROMOTION_CONTROLLER_COMMIT: ${{ steps.identity.outputs.promotion_controller_commit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
@@ -182,10 +187,12 @@ jobs:
             git cat-file -e "$RELEASE_COMMIT^{commit}"
           fi
           git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
-          if [ -n "$CONTROLLER_COMMIT" ]; then
-            [[ "$CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-            git cat-file -e "$CONTROLLER_COMMIT^{commit}"
-            git merge-base --is-ancestor "$CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
+          test "$(git rev-parse HEAD)" = "$PROMOTION_CONTROLLER_COMMIT"
+          git merge-base --is-ancestor "$PROMOTION_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
+          if [ -n "$BUILD_CONTROLLER_COMMIT" ]; then
+            [[ "$BUILD_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            git cat-file -e "$BUILD_CONTROLLER_COMMIT^{commit}"
+            git merge-base --is-ancestor "$BUILD_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
           fi
 
       - name: Install hash-locked object storage client
@@ -199,6 +206,7 @@ jobs:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          PROMOTION_CONTROLLER_COMMIT: ${{ steps.identity.outputs.promotion_controller_commit }}
         run: |
           python scripts/release/verify_cli_snapshot.py \
             --snapshot-dir dist/cli-snapshot \
@@ -211,6 +219,7 @@ jobs:
             --extra-dir dist/cli-snapshot \
             --source-dir dist/release-source \
             --release-spec dist/release-request/release-request.json \
+            --promotion-controller-commit "$PROMOTION_CONTROLLER_COMMIT" \
             --out-dir dist/release-payload
 
       - name: Verify the newly assembled release ledger before sealing
@@ -326,6 +335,33 @@ jobs:
             --ledger-sha256 "$actual"
           echo "sha256=$actual" >> "$GITHUB_OUTPUT"
 
+      - name: Reuse any container identity already bound by the channel journal
+        id: container-state
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          LEDGER_SHA256: ${{ steps.ledger.outputs.sha256 }}
+          CHANNEL: ${{ steps.identity.outputs.channel }}
+          JOURNAL_KEY: ${{ steps.identity.outputs.journal_key }}
+          ALLOW_LEGACY: ${{ steps.identity.outputs.allow_legacy }}
+        run: |
+          set -euo pipefail
+          legacy_args=()
+          if [ "$ALLOW_LEGACY" = true ]; then legacy_args=(--allow-legacy-candidate); fi
+          digest="$(python scripts/release/release_channel_state.py resolve-container \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --key "$JOURNAL_KEY" \
+            --channel "$CHANNEL" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256" \
+            "${legacy_args[@]}")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Materialize and verify typed bundle scopes
         env:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
@@ -392,7 +428,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
@@ -423,7 +459,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-cli-snapshot
@@ -455,7 +491,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/download-artifact@v6
         with:
           name: antfly-release-runtime-archives
@@ -477,33 +513,30 @@ jobs:
           path: ${{ runner.temp }}/antfly.rb
           if-no-files-found: error
 
-  publish-container:
-    needs:
-      - prepare-release-promotion
-      - begin-release-channel
-      - publish-cli-pypi
-      - prepare-zig-homebrew
-    if: >-
-      ${{ always() &&
-          needs.prepare-release-promotion.result == 'success' &&
-          needs.begin-release-channel.result == 'success' &&
-          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
-          (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') }}
+  stage-container:
+    name: Build digest-addressed container candidate
+    needs: prepare-release-promotion
+    if: ${{ needs.prepare-release-promotion.outputs.container_digest == '' }}
     permissions:
       contents: read
-      packages: write
       id-token: write
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ needs.prepare-release-promotion.outputs.tag }}
       source_commit: ${{ needs.prepare-release-promotion.outputs.commit }}
-      controller_commit: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+      promotion_controller_commit: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       ledger_sha256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
     secrets: inherit
 
   begin-release-channel:
     name: Begin mutable release channel transaction
-    needs: prepare-release-promotion
+    needs:
+      - prepare-release-promotion
+      - stage-container
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') }}
     runs-on: arc-antfly-standard
     permissions:
       contents: read
@@ -512,7 +545,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -544,6 +577,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
           CHANNEL: ${{ steps.channel.outputs.name }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           CURRENT_TAG: ${{ steps.channel.outputs.current_tag }}
@@ -564,6 +598,7 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --ledger-sha256 "$LEDGER_SHA256" \
+            --container-digest "$CONTAINER_DIGEST" \
             "${legacy_args[@]}" \
             "${bootstrap_args[@]}"
 
@@ -573,7 +608,17 @@ jobs:
       - prepare-release-promotion
       - begin-release-channel
       - publish-cli-npm
-      - publish-container
+      - publish-cli-pypi
+      - prepare-zig-homebrew
+      - stage-container
+    if: >-
+      ${{ always() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
+          needs.publish-cli-npm.result == 'success' &&
+          (needs.publish-cli-pypi.result == 'success' || needs.publish-cli-pypi.result == 'skipped') &&
+          (needs.prepare-zig-homebrew.result == 'success' || needs.prepare-zig-homebrew.result == 'skipped') &&
+          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') }}
     runs-on: arc-antfly-standard
     environment: container-publish
     permissions:
@@ -583,7 +628,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -631,20 +676,54 @@ jobs:
           token_format: access_token
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
-      - name: Commit container channel aliases
+      - uses: sigstore/cosign-installer@v3
+      - name: Commit digest-pinned container version and channel aliases
         env:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
+          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+          LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
         run: |
           set -euo pipefail
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          source="${gar_image}@${CONTAINER_DIGEST}"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "$source" --digest "$CONTAINER_DIGEST"
+          manifest="$(crane manifest "$source")"
+          amd64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | if length == 1 then .[0].digest else error("expected one linux/amd64 manifest") end' <<<"$manifest")"
+          arm64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | if length == 1 then .[0].digest else error("expected one linux/arm64 manifest") end' <<<"$manifest")"
           python3 scripts/release/registryctl.py container-alias \
-            --source "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${RELEASE_TAG}" \
-            --destination "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${CONTAINER_ALIAS}"
+            --source "${gar_image}@${amd64_digest}" \
+            --destination "${gar_image}:${RELEASE_TAG}-amd64"
           python3 scripts/release/registryctl.py container-alias \
-            --source "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
+            --source "${gar_image}@${arm64_digest}" \
+            --destination "${gar_image}:${RELEASE_TAG}-arm64"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "$source" \
+            --destination "${gar_image}:${RELEASE_TAG}"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "$source" \
+            --destination "ghcr.io/antflydb/antfly:${RELEASE_TAG}"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "$source" \
+            --destination "${gar_image}:${CONTAINER_ALIAS}"
+          python3 scripts/release/registryctl.py container-alias \
+            --source "$source" \
             --destination "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}"
+          cosign sign --yes \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ needs.prepare-release-promotion.outputs.commit }}" \
+            -a "ledger_sha256=${LEDGER_SHA256}" \
+            "${gar_image}@${CONTAINER_DIGEST}"
+          cosign sign --yes \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ needs.prepare-release-promotion.outputs.commit }}" \
+            -a "ledger_sha256=${LEDGER_SHA256}" \
+            "ghcr.io/antflydb/antfly@${CONTAINER_DIGEST}"
       - name: Commit object-storage channel aliases
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -683,7 +762,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - name: Publish the verified GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -704,12 +783,14 @@ jobs:
       - publish-cli-npm
       - promote-channel-aliases
       - publish-github-release
+      - stage-container
     if: >-
       ${{ always() &&
           needs.prepare-release-promotion.result == 'success' &&
           needs.begin-release-channel.result == 'success' &&
           needs.publish-cli-npm.result == 'success' &&
           needs.promote-channel-aliases.result == 'success' &&
+          (needs.stage-container.result == 'success' || needs.stage-container.result == 'skipped') &&
           (needs.publish-github-release.result == 'success' || needs.publish-github-release.result == 'skipped') }}
     runs-on: arc-antfly-standard
     permissions:
@@ -717,10 +798,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release-promotion.outputs.controller_commit }}
+          ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
       - name: Install hash-locked object storage client
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
@@ -736,6 +819,18 @@ jobs:
               --package "$package" --tag "$NPM_TAG")"
             test "$observed" = "$RELEASE_VERSION"
           done
+      - name: Verify public container aliases before committing the journal
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
+          CONTAINER_ALIAS: ${{ needs.prepare-release-promotion.outputs.container_alias }}
+          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
+        run: |
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "ghcr.io/antflydb/antfly:${RELEASE_TAG}" \
+            --digest "$CONTAINER_DIGEST"
+          python3 scripts/release/registryctl.py container-verify \
+            --ref "ghcr.io/antflydb/antfly:${CONTAINER_ALIAS}" \
+            --digest "$CONTAINER_DIGEST"
       - name: Commit the release channel transaction
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -744,6 +839,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-release-promotion.outputs.tag }}
           RELEASE_COMMIT: ${{ needs.prepare-release-promotion.outputs.commit }}
           LEDGER_SHA256: ${{ needs.prepare-release-promotion.outputs.ledger_sha256 }}
+          CONTAINER_DIGEST: ${{ needs.prepare-release-promotion.outputs.container_digest || needs.stage-container.outputs.image_digest }}
           CHANNEL: ${{ needs.begin-release-channel.outputs.channel }}
           JOURNAL_KEY: ${{ needs.prepare-release-promotion.outputs.journal_key }}
           ALLOW_LEGACY: ${{ needs.prepare-release-promotion.outputs.allow_legacy }}
@@ -757,5 +853,6 @@ jobs:
             --channel "$CHANNEL" \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
+            --container-digest "$CONTAINER_DIGEST" \
             "${legacy_args[@]}" \
             --ledger-sha256 "$LEDGER_SHA256"
