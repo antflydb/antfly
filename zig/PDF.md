@@ -632,16 +632,21 @@ document. They are architectural requirements, not Florence-specific cleanup:
     `source_parts_json`.** One normalized extractor item-shape parser now drives
     batch compatibility, executor admission, and window formation. It accounts
     for inline data and data URLs using the encoded representation that remains
-    resident alongside decoded buffers, validates base64, trust, and MIME,
-    tracks unknown remote media until provider-owned download admission,
-    enforces one media part per item, and derives only the prompt text when
-    grouping image work. Generator planning uses the same resident-byte rule.
+    resident alongside decoded buffers, fully validates the base64 alphabet,
+    padding, and trailing bits, validates trust and MIME, tracks unknown remote
+    media until provider-owned download admission, enforces one media part per
+    item, and derives only the prompt text when grouping image work. Borrowed
+    attachments charge their binary length; HTTP-bound attachments charge
+    their exact base64 expansion. Generator planning uses the same
+    transport-aware resident-byte rule.
 60. **Extraction batch responses accepted missing or extra results and copied
     a non-JSON batch response to every input.** Batch execution now requires a
     structured output representation, parses the provider envelope once into
-    the generated extraction response type, verifies the resolved model,
-    rejects malformed top-level and per-item objects, and requires exactly one
-    typed result for every requested item before assigning any output. Non-JSON
+    the generated extraction response type, verifies the resolved model, and
+    rejects malformed top-level and known per-item fields while preserving
+    schema-permitted provider extensions. Every input carries a unique wire ID;
+    response items are mapped by that ID, and missing, duplicate, or unknown
+    identities fail the whole batch before any output is assigned. Non-JSON
     extraction falls back to independent task executions, where one response
     has one unambiguous owner.
 61. **The proxy validated numeric batch fields but treated malformed V3 exact

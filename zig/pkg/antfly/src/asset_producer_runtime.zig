@@ -684,6 +684,14 @@ pub const Runtime = struct {
             for (inputs[0..inputs_filled]) |input| alloc.free(input.content_json);
             alloc.free(inputs);
         }
+        const input_ids = try alloc.alloc([]u8, requests.len);
+        var input_ids_filled: usize = 0;
+        defer {
+            for (input_ids[0..input_ids_filled]) |id| alloc.free(id);
+            alloc.free(input_ids);
+        }
+        var input_id_indexes = std.StringHashMapUnmanaged(usize).empty;
+        defer input_id_indexes.deinit(alloc);
 
         var attachment_count: usize = 0;
         for (requests) |request| attachment_count = try std.math.add(usize, attachment_count, request.media.len);
@@ -692,7 +700,16 @@ pub const Runtime = struct {
         var attachment_index: usize = 0;
 
         for (requests, 0..) |request, i| {
+            input_ids[i] = if (request.item_id.len > 0)
+                try alloc.dupe(u8, request.item_id)
+            else
+                try std.fmt.allocPrint(alloc, "antfly-batch-item-{d}", .{i});
+            input_ids_filled += 1;
+            const id_entry = try input_id_indexes.getOrPut(alloc, input_ids[i]);
+            if (id_entry.found_existing) return error.InvalidWorkIdentity;
+            id_entry.value_ptr.* = i;
             inputs[i] = .{
+                .id = input_ids[i],
                 .content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json),
             };
             inputs_filled += 1;
@@ -719,7 +736,7 @@ pub const Runtime = struct {
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
         defer response.deinit();
 
-        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, requests.len);
+        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids);
     }
 
     fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -1633,7 +1650,39 @@ fn dataUriDecodedSize(uri: []const u8) !?usize {
     const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataURI;
     const metadata = uri["data:".len..comma];
     if (!std.ascii.endsWithIgnoreCase(metadata, ";base64")) return error.InvalidDataURI;
-    return std.base64.standard.Decoder.calcSizeForSlice(uri[comma + 1 ..]) catch error.InvalidDataURI;
+    return validateStandardBase64(uri[comma + 1 ..]) catch error.InvalidDataURI;
+}
+
+fn standardBase64Index(byte: u8) ?u8 {
+    return switch (byte) {
+        'A'...'Z' => byte - 'A',
+        'a'...'z' => byte - 'a' + 26,
+        '0'...'9' => byte - '0' + 52,
+        '+' => 62,
+        '/' => 63,
+        else => null,
+    };
+}
+
+/// Validate the complete padded standard-base64 representation without
+/// allocating its decoded payload. Return the exact decoded size.
+fn validateStandardBase64(data: []const u8) !usize {
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(data) catch
+        return error.InvalidDataURI;
+    var padding: usize = 0;
+    while (padding < data.len and data[data.len - 1 - padding] == '=') : (padding += 1) {}
+    if (padding > 2) return error.InvalidDataURI;
+    const content_end = data.len - padding;
+    for (data[0..content_end]) |byte| _ = standardBase64Index(byte) orelse return error.InvalidDataURI;
+    for (data[content_end..]) |byte| if (byte != '=') return error.InvalidDataURI;
+    if (padding == 1) {
+        if (content_end < 3 or (standardBase64Index(data[content_end - 1]).? & 0x03) != 0)
+            return error.InvalidDataURI;
+    } else if (padding == 2) {
+        if (content_end < 2 or (standardBase64Index(data[content_end - 1]).? & 0x0f) != 0)
+            return error.InvalidDataURI;
+    }
+    return decoded_size;
 }
 
 // Admission is defined in terms of the representation resident at the task
@@ -1646,8 +1695,15 @@ fn dataUriResidentSize(uri: []const u8) !?usize {
 
 fn inlineBase64ResidentSize(data: []const u8) !usize {
     if (try dataUriResidentSize(data)) |bytes| return bytes;
-    _ = std.base64.standard.Decoder.calcSizeForSlice(data) catch return error.InvalidDataURI;
+    _ = try validateStandardBase64(data);
     return data.len;
+}
+
+fn borrowedMediaResidentSize(capabilities: inference_work.InferenceCapabilities, bytes: []const u8) usize {
+    return if (capabilities.borrowed_attachments)
+        bytes.len
+    else
+        std.base64.standard.Encoder.calcSize(bytes.len);
 }
 
 fn generatorRequestShape(
@@ -1694,7 +1750,7 @@ fn generatorRequestShape(
         try capabilities.validateMimeType(media.mime_type);
         mergeInferenceModalities(&shape.modalities, try modalityForGeneratorMime(media.mime_type));
         shape.media_parts += 1;
-        shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.bytes.len) catch
+        shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, borrowedMediaResidentSize(capabilities, media.bytes)) catch
             return error.InferenceEncodedBytesExceeded;
     }
     return shape;
@@ -1844,7 +1900,7 @@ fn extractorRequestShape(
         request,
         &shape,
         media.mime_type,
-        media.bytes.len,
+        borrowedMediaResidentSize(capabilities, media.bytes),
         true,
     );
 
@@ -1974,6 +2030,63 @@ test "asset producer runtime generator admission accounts for resident inline me
         error.InferenceEncodedBytesExceeded,
         validateGeneratorInvocation(std.testing.allocator, capabilities, &requests),
     );
+}
+
+test "asset producer runtime media accounting follows attachment transport" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const request = asset_producer.Request{
+        .producer_type = .generator,
+        .config_json = "{}",
+        .source_text = "",
+        .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }},
+    };
+    var capabilities = inference_work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .image = true },
+        .accepted_mime_types = .{ .text_plain = true, .image_png = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 2, .max_encoded_media_bytes = 4, .max_media_parts_per_item = 1 },
+        .output = .generated_text,
+        .borrowed_attachments = false,
+    };
+    const encoded = try generatorRequestShape(std.testing.allocator, capabilities, request);
+    try std.testing.expectEqual(@as(usize, 4), encoded.encoded_media_bytes);
+
+    capabilities.borrowed_attachments = true;
+    const borrowed = try generatorRequestShape(std.testing.allocator, capabilities, request);
+    try std.testing.expectEqual(@as(usize, 3), borrowed.encoded_media_bytes);
+
+    const extractor_request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json = "{}",
+        .source_text = "ocr",
+        .inline_media_trusted = true,
+        .media = request.media,
+    };
+    var extractor_capabilities = capabilities;
+    extractor_capabilities.task = .extract;
+    extractor_capabilities.input_modalities = .{ .image = true };
+    extractor_capabilities.accepted_mime_types = .{ .image_png = true };
+    extractor_capabilities.output = .extraction;
+    extractor_capabilities.result_cardinality = .one_per_item;
+
+    var extractor_borrowed = try extractorRequestShape(std.testing.allocator, extractor_capabilities, extractor_request);
+    defer extractor_borrowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), extractor_borrowed.encoded_media_bytes);
+    extractor_capabilities.borrowed_attachments = false;
+    var extractor_encoded = try extractorRequestShape(std.testing.allocator, extractor_capabilities, extractor_request);
+    defer extractor_encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), extractor_encoded.encoded_media_bytes);
+}
+
+test "asset producer runtime validates the complete base64 representation" {
+    try std.testing.expectEqual(@as(usize, 3), try validateStandardBase64("AQID"));
+    try std.testing.expectEqual(@as(usize, 1), try validateStandardBase64("YQ=="));
+    try std.testing.expectEqual(@as(usize, 2), try validateStandardBase64("YWI="));
+    try std.testing.expectError(error.InvalidDataURI, validateStandardBase64("!!!!"));
+    try std.testing.expectError(error.InvalidDataURI, validateStandardBase64("YQ=A"));
+    try std.testing.expectError(error.InvalidDataURI, validateStandardBase64("YR=="));
+    try std.testing.expectError(error.InvalidDataURI, dataUriResidentSize("data:image/png;base64,!!!!"));
 }
 
 test "asset producer runtime reader URI admission measures data payloads before execution" {
@@ -2355,76 +2468,119 @@ fn extractionResultsJsonAlloc(
     alloc: Allocator,
     response_json: []const u8,
     expected_model: []const u8,
-    expected_items: usize,
+    expected_ids: []const []const u8,
 ) ![][]u8 {
-    var parsed = std.json.parseFromSlice(extraction_api.ExtractionResponse, alloc, response_json, .{
-        .ignore_unknown_fields = false,
+    var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer expected_by_id.deinit(alloc);
+    for (expected_ids, 0..) |id, index| {
+        if (id.len == 0) return error.InvalidWorkIdentity;
+        const entry = try expected_by_id.getOrPut(alloc, id);
+        if (entry.found_existing) return error.InvalidWorkIdentity;
+        entry.value_ptr.* = index;
+    }
+
+    var raw = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{
         .duplicate_field_behavior = .@"error",
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidExtractorResponse,
     };
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.object, "extraction") or
-        !std.mem.eql(u8, parsed.value.model, expected_model))
+    defer raw.deinit();
+    var typed = std.json.parseFromValue(extraction_api.ExtractionResponse, alloc, raw.value, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidExtractorResponse,
+    };
+    defer typed.deinit();
+    if (!std.mem.eql(u8, typed.value.object, "extraction") or
+        !std.mem.eql(u8, typed.value.model, expected_model))
         return error.InvalidExtractorResponse;
-    if (parsed.value.data.len != expected_items) return error.InvalidExtractorResponse;
+    if (typed.value.data.len != expected_ids.len) return error.InvalidExtractorResponse;
+    if (raw.value != .object) return error.InvalidExtractorResponse;
+    const raw_data = raw.value.object.get("data") orelse return error.InvalidExtractorResponse;
+    if (raw_data != .array or raw_data.array.items.len != expected_ids.len)
+        return error.InvalidExtractorResponse;
 
-    const out = try alloc.alloc([]u8, expected_items);
-    var initialized: usize = 0;
+    const out = try alloc.alloc([]u8, expected_ids.len);
+    for (out) |*item| item.* = &.{};
     errdefer {
-        for (out[0..initialized]) |item| alloc.free(item);
+        for (out) |item| if (item.len > 0) alloc.free(item);
         alloc.free(out);
     }
-    for (parsed.value.data, 0..) |item, index| {
+    const seen = try alloc.alloc(bool, expected_ids.len);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (raw_data.array.items) |item| {
+        if (item != .object) return error.InvalidExtractorResponse;
+        const id_value = item.object.get("id") orelse return error.InvalidExtractorResponse;
+        if (id_value != .string) return error.InvalidExtractorResponse;
+        const index = expected_by_id.get(id_value.string) orelse return error.InvalidExtractorResponse;
+        if (seen[index]) return error.InvalidExtractorResponse;
         out[index] = try std.json.Stringify.valueAlloc(alloc, item, .{});
-        initialized += 1;
+        seen[index] = true;
     }
+    for (seen) |was_seen| if (!was_seen) return error.InvalidExtractorResponse;
     return out;
 }
 
-test "asset producer runtime extractor batch response requires exact cardinality" {
+test "asset producer runtime extractor batch response preserves extensions and maps identity" {
     const alloc = std.testing.allocator;
-    const exact = try extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}", "owner/model", 2);
+    const ids = [_][]const u8{ "page-a", "page-b" };
+    const exact = try extractionResultsJsonAlloc(
+        alloc,
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-b\",\"provider_extension\":{\"rank\":2}},{\"id\":\"page-a\",\"provider_extension\":{\"rank\":1}}]}",
+        "owner/model",
+        &ids,
+    );
     defer {
         for (exact) |item| alloc.free(item);
         alloc.free(exact);
     }
-    try std.testing.expectEqualStrings("{\"id\":\"a\"}", exact[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"page-a\",\"provider_extension\":{\"rank\":1}}", exact[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"page-b\",\"provider_extension\":{\"rank\":2}}", exact[1]);
+    const duplicate_ids = [_][]const u8{ "page-a", "page-a" };
     try std.testing.expectError(
-        error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{}, {}, {}]}", "owner/model", 2),
+        error.InvalidWorkIdentity,
+        extractionResultsJsonAlloc(alloc, "{}", "owner/model", &duplicate_ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{}]}", "owner/model", 2),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"}]}", "owner/model", &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[1,2]}", "owner/model", 2),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-a\"}]}", "owner/model", &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"data\":[{},{}]}", "owner/model", 2),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"unknown\"}]}", "owner/model", &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"unexpected\":true},{}]}", "owner/model", 2),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\"},{}]}", "owner/model", &ids),
     );
     try std.testing.expectError(
         error.InvalidExtractorResponse,
-        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{},{}]}", "owner/model", 2),
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-a\",\"entities\":[1]},{\"id\":\"page-b\"}]}", "owner/model", &ids),
+    );
+    try std.testing.expectError(
+        error.InvalidExtractorResponse,
+        extractionResultsJsonAlloc(alloc, "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{\"id\":\"page-a\"},{\"id\":\"page-b\"}]}", "owner/model", &ids),
     );
 }
 
 test "asset producer runtime typed extractor response parsing is allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
+            const ids = [_][]const u8{ "page-a", "page-b" };
             const results = try extractionResultsJsonAlloc(
                 alloc,
-                "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}",
+                "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"page-b\"},{\"id\":\"page-a\"}]}",
                 "owner/model",
-                2,
+                &ids,
             );
             defer {
                 for (results) |item| alloc.free(item);
@@ -4132,11 +4288,17 @@ test "asset producer runtime batches compatible antfly extractor requests" {
             self.extract_calls += 1;
             try std.testing.expectEqualStrings("local-extractor", model);
             try std.testing.expectEqual(@as(usize, 2), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id != null);
+            try std.testing.expect(request.inputs[1].id != null);
             try std.testing.expect(std.mem.indexOf(u8, request.inputs[0].content_json, "Ada") != null);
             try std.testing.expect(std.mem.indexOf(u8, request.inputs[1].content_json, "Grace") != null);
             return .{
                 .allocator = a,
-                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]},{\"entities\":[{\"label\":\"person\",\"text\":\"Grace\"}],\"relations\":[]}]}"),
+                .json = try std.fmt.allocPrint(
+                    a,
+                    "{{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{{\"id\":{f},\"entities\":[{{\"label\":\"person\",\"text\":\"Grace\"}}],\"relations\":[]}},{{\"id\":{f},\"entities\":[{{\"label\":\"person\",\"text\":\"Ada\"}}],\"relations\":[]}}]}}",
+                    .{ std.json.fmt(request.inputs[1].id.?, .{}), std.json.fmt(request.inputs[0].id.?, .{}) },
+                ),
             };
         }
     };
