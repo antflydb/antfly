@@ -8,6 +8,9 @@ on:
     tags:
       - 'py/antfly/sdk/v*'
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

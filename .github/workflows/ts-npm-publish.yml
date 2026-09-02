@@ -17,6 +17,9 @@ on:
       - 'ts/antfly/components/v*'
       - 'ts/antfly/design-system/v*'
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NPM_VERSION: 11.19.1

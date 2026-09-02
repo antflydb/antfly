@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release workflow action-reference policy."""
+"""Tests for the repository-wide workflow security policy."""
 
 from __future__ import annotations
 
@@ -17,55 +17,77 @@ class WorkflowActionPolicyTests(unittest.TestCase):
     def write(self, root: Path, name: str, body: str) -> None:
         (root / name).write_text(body, encoding="utf-8")
 
-    def test_release_control_plane_requires_full_sha(self) -> None:
+    def test_every_workflow_requires_full_sha(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            self.write(root, "antfly-release.yml", "jobs:\n  x:\n    steps:\n      - uses: actions/checkout@v6\n")
+            self.write(
+                root,
+                "ordinary-ci.yml",
+                "permissions:\n  contents: read\njobs:\n  x:\n    steps:\n      - uses: actions/checkout@v6\n",
+            )
             with self.assertRaisesRegex(SystemExit, "full commit SHAs"):
                 validate(root)
 
-    def test_privileged_publish_workflow_is_selected_automatically(self) -> None:
+    def test_secret_bearing_workflow_requires_full_sha(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.write(
                 root,
                 "future-publisher.yml",
-                "permissions:\n  id-token: write\njobs:\n  x:\n    steps:\n      - uses: vendor/publish@v1\n",
+                "permissions: {}\njobs:\n  x:\n    steps:\n      - uses: vendor/publish@v1\n        with:\n          token: ${{ secrets.PUBLISH_TOKEN }}\n",
             )
             with self.assertRaisesRegex(SystemExit, "vendor/publish@v1"):
                 validate(root)
 
-    def test_write_all_yaml_workflow_is_selected_automatically(self) -> None:
+    def test_workflow_permissions_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.write(
                 root,
-                "future-publisher.yaml",
-                "permissions: write-all\njobs:\n  x:\n    steps:\n      - uses: vendor/publish@v1\n",
+                "ordinary-ci.yaml",
+                f"jobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n",
             )
-            with self.assertRaisesRegex(SystemExit, "vendor/publish@v1"):
+            with self.assertRaisesRegex(SystemExit, "missing top-level permissions"):
                 validate(root)
 
-    def test_inline_write_permission_is_selected_automatically(self) -> None:
+    def test_job_permissions_do_not_replace_workflow_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.write(
                 root,
-                "future-publisher.yml",
-                "permissions: {contents: write}\njobs:\n  x:\n    steps:\n      - uses: vendor/publish@v1\n",
+                "publisher.yml",
+                f"jobs:\n  x:\n    permissions:\n      contents: write\n    steps:\n      - uses: {PINNED_CHECKOUT}\n",
             )
-            with self.assertRaisesRegex(SystemExit, "vendor/publish@v1"):
+            with self.assertRaisesRegex(SystemExit, "missing top-level permissions"):
                 validate(root)
 
-    def test_every_github_write_scope_is_privileged(self) -> None:
+    def test_workflow_baseline_must_be_read_only(self) -> None:
+        for name, permissions in (
+            ("write-all.yml", "permissions: write-all"),
+            ("inline-write.yml", "permissions: {contents: write}"),
+            ("block-write.yml", "permissions:\n  packages: write"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                self.write(
+                    root,
+                    name,
+                    f"{permissions}\njobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n",
+                )
+                with self.assertRaisesRegex(
+                    SystemExit, "top-level permissions must be read-only"
+                ):
+                    validate(root)
+
+    def test_workflow_permissions_cannot_be_empty(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.write(
                 root,
-                "future-automation.yml",
-                "permissions:\n  pull-requests: write\njobs:\n  x:\n    steps:\n      - uses: vendor/automation@v1\n",
+                "ordinary-ci.yml",
+                f"permissions:\njobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n",
             )
-            with self.assertRaisesRegex(SystemExit, "vendor/automation@v1"):
+            with self.assertRaisesRegex(SystemExit, "permissions declaration is empty"):
                 validate(root)
 
     def test_pinned_and_local_reusable_workflows_are_allowed(self) -> None:
@@ -74,31 +96,26 @@ class WorkflowActionPolicyTests(unittest.TestCase):
             self.write(
                 root,
                 "antfly-release.yml",
-                f"jobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n  y:\n    uses: ./.github/workflows/build.yml\n",
-            )
-            self.assertEqual(validate(root), [root / "antfly-release.yml"])
-
-    def test_local_reusable_workflow_inherits_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            self.write(
-                root,
-                "antfly-release.yml",
-                "jobs:\n  build:\n    uses: ./.github/workflows/build.yml\n",
+                f"permissions:\n  contents: read\njobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n  y:\n    uses: ./.github/workflows/build.yml\n",
             )
             self.write(
                 root,
                 "build.yml",
-                "jobs:\n  x:\n    steps:\n      - uses: vendor/build@v1\n",
+                "permissions: {}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
             )
-            with self.assertRaisesRegex(SystemExit, "vendor/build@v1"):
-                validate(root)
+            self.assertEqual(
+                validate(root), [root / "antfly-release.yml", root / "build.yml"]
+            )
 
-    def test_unprivileged_nonrelease_workflow_is_out_of_scope(self) -> None:
+    def test_inline_workflow_permissions_are_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            self.write(root, "ordinary-ci.yml", "jobs:\n  x:\n    steps:\n      - uses: actions/checkout@v6\n")
-            self.assertEqual(validate(root), [])
+            self.write(
+                root,
+                "ordinary-ci.yml",
+                f"permissions: {{contents: read}}\njobs:\n  x:\n    steps:\n      - uses: {PINNED_CHECKOUT}\n",
+            )
+            self.assertEqual(validate(root), [root / "ordinary-ci.yml"])
 
 
 if __name__ == "__main__":

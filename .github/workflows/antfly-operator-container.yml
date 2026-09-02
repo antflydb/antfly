@@ -5,6 +5,9 @@ on:
     tags:
       - "go/pkg/operator/v*"
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GCP_REGION: us-central1

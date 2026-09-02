@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require immutable action references throughout the release trust boundary."""
+"""Require an explicit token baseline and immutable actions in every workflow."""
 
 from __future__ import annotations
 
@@ -10,22 +10,8 @@ from pathlib import Path
 
 SHA_REF = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses:\s*([^\s#]+)")
-WRITE_PERMISSION = re.compile(
-    r"(?:^|[{,])\s*(?:actions|attestations|checks|contents|deployments|discussions|"
-    r"id-token|issues|packages|pages|pull-requests|repository-projects|"
-    r"security-events|statuses):\s*write\b"
-)
-WRITE_ALL = re.compile(r"^\s*permissions:\s*write-all\s*(?:#.*)?$")
-
-
-def is_release_control_plane(path: Path, text: str) -> bool:
-    name = path.name
-    return (
-        name.startswith("antfly-release")
-        or name in {"antfly-container.yml", "antfly-nightly.yml", "cli-package.yml"}
-        or any(WRITE_PERMISSION.search(line) for line in text.splitlines())
-        or any(WRITE_ALL.match(line) for line in text.splitlines())
-    )
+WORKFLOW_PERMISSIONS = re.compile(r"^permissions:\s*(.*)$")
+WRITE_VALUE = re.compile(r"\bwrite(?:-all)?\b")
 
 
 def action_references(path: Path) -> list[tuple[int, str]]:
@@ -49,39 +35,41 @@ def mutable_action_references(path: Path) -> list[str]:
     return findings
 
 
+def workflow_permission_findings(path: Path, text: str) -> list[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = WORKFLOW_PERMISSIONS.fullmatch(line)
+        if not match:
+            continue
+
+        values = [match.group(1).split("#", 1)[0].strip()]
+        for nested in lines[index + 1 :]:
+            if nested and not nested[0].isspace():
+                break
+            values.append(nested.split("#", 1)[0].strip())
+        if not any(values):
+            return [f"{path}:{index + 1}: top-level permissions declaration is empty"]
+        if any(WRITE_VALUE.search(value) for value in values):
+            return [f"{path}:{index + 1}: top-level permissions must be read-only"]
+        return []
+    return [f"{path}: missing top-level permissions declaration"]
+
+
 def validate(workflow_dir: Path) -> list[Path]:
     workflows = sorted({*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")})
-    selected = {
-        path
-        for path in workflows
-        if is_release_control_plane(path, path.read_text(encoding="utf-8"))
-    }
-    # Follow local reusable-workflow calls so every executable dependency of a
-    # selected controller inherits the same immutable-reference policy.
-    changed = True
-    while changed:
-        changed = False
-        for path in tuple(selected):
-            for _, reference in action_references(path):
-                prefix = "./.github/workflows/"
-                if not reference.startswith(prefix):
-                    continue
-                dependency = workflow_dir / reference.removeprefix(prefix)
-                if dependency.is_file() and dependency not in selected:
-                    selected.add(dependency)
-                    changed = True
-
     findings: list[str] = []
-    ordered = sorted(selected)
-    for path in ordered:
+    for path in workflows:
+        text = path.read_text(encoding="utf-8")
+        findings.extend(workflow_permission_findings(path, text))
         findings.extend(mutable_action_references(path))
     if findings:
         detail = "\n".join(f"  {finding}" for finding in findings)
         raise SystemExit(
-            "release workflows must pin external actions to full commit SHAs:\n"
+            "workflows must declare token permissions and pin external actions "
+            "to full commit SHAs:\n"
             f"{detail}"
         )
-    return ordered
+    return workflows
 
 
 def main() -> int:
@@ -93,7 +81,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     selected = validate(args.workflow_dir.resolve())
-    print(f"validated immutable action references in {len(selected)} release workflows")
+    print(f"validated permissions and immutable action references in {len(selected)} workflows")
     return 0
 
 

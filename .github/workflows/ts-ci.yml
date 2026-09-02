@@ -18,6 +18,9 @@ on:
       - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
@@ -40,15 +43,15 @@ jobs:
         node-version: ["24.16.0"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: ts/package.json
 
       - name: Use pinned Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: ts/package.json
           cache: 'pnpm'
@@ -73,7 +76,7 @@ jobs:
         run: pnpm build
 
       - name: Upload canonical Antfarm bundle
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: antfarm-linux-node-${{ matrix.node-version }}-${{ github.sha }}
           path: ts/apps/antfarm/dist
@@ -88,10 +91,10 @@ jobs:
     needs: [test]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download canonical Antfarm bundle
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: antfarm-linux-node-24.16.0-${{ github.sha }}
           path: ts/apps/antfarm/dist
@@ -124,14 +127,14 @@ jobs:
           mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
         working-directory: .
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: ts/package.json
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.16.0
 
@@ -181,7 +184,7 @@ jobs:
           ANTFARM_PLAYWRIGHT_USE_SYSTEM_CHROME: "1"
           BASE_URL: http://localhost:4173
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: ${{ !cancelled() }}
         with:
           name: playwright-report

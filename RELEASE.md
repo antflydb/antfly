@@ -169,8 +169,11 @@ promotion read those policies instead of maintaining independent conditionals
 or platform tables. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
-External GitHub Actions in the release trust boundary are pinned to full commit
-SHAs, enforced in CI, and advanced by reviewed Dependabot pull requests.
+Every workflow declares an explicit `GITHUB_TOKEN` permission baseline, and all
+external GitHub Actions are pinned to full commit SHAs. CI enforces both rules
+repository-wide, and reviewed Dependabot pull requests advance those pins. The
+repository-level default workflow permission should remain `read`; explicit
+job-level grants are the only supported way to obtain write access.
 
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:

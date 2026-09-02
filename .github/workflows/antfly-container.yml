@@ -35,6 +35,9 @@ on:
         description: "Digest of the staged multi-architecture image"
         value: ${{ jobs.stage.outputs.image_digest }}
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GCP_REGION: us-central1
