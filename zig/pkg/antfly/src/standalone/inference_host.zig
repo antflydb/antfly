@@ -1554,11 +1554,15 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             shape.modalities.image = true;
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
             if (try antfly.inference.work.parseInlineDataUri(url)) |_| {
+                const next_encoded = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+                if (capabilities.batch.max_encoded_media_bytes) |limit| {
+                    if (next_encoded > limit) return error.InferenceEncodedBytesExceeded;
+                }
                 var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, url);
                 defer decoded.deinit(alloc);
                 try capabilities.validateMimeType(decoded.mime_type);
-                shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
-                    return error.InferenceEncodedBytesExceeded;
+                shape.encoded_media_bytes = next_encoded;
                 const pixels = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
                 shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
                     return error.InferenceDecodedPixelsExceeded;
@@ -1673,14 +1677,19 @@ fn localAntflyGenerateMessages(
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
-    const preflight = try preflightLocalGenerateMessages(messages);
     const capabilities = try localModelCapabilities(node, io, model, .generate);
-    try validateLocalGenerateCapabilities(capabilities, preflight, &.{});
+    const preflight = try preflightLocalGenerateMessagesInternal(messages, null, capabilities);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
     var admission = try node.beginDirectGenerateAdmission(preflight, 256);
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        try localGenerateDecodedPixels(converted.messages),
+    );
     return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
 
@@ -1694,23 +1703,27 @@ fn localAntflyGenerateMessagesWithAttachments(
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
-    const preflight = try preflightLocalGenerateMessagesInternal(messages, attachments);
     const capabilities = try localModelCapabilities(node, io, model, .generate);
-    try validateLocalGenerateCapabilities(capabilities, preflight, attachments);
+    const preflight = try preflightLocalGenerateMessagesInternal(messages, attachments, capabilities);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
     var admission = try node.beginDirectGenerateAdmission(preflight, 256);
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessagesInternal(alloc, messages, preflight.decoded_media_bytes, attachments);
     defer converted.deinit(alloc);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        try localGenerateDecodedPixels(converted.messages),
+    );
     return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
 
 fn validateLocalGenerateCapabilities(
     capabilities: antfly.inference.work.InferenceCapabilities,
     preflight: inference.server.Node.DirectGeneratePreflight,
-    attachments: []const antfly.inference.work.Attachment,
+    decoded_pixels: u64,
 ) !void {
-    for (attachments) |attachment| try capabilities.validateMimeType(attachment.content_type);
     try capabilities.validateInvocation(.generate, .{
         .item_count = 1,
         .modalities = .{
@@ -1719,11 +1732,25 @@ fn validateLocalGenerateCapabilities(
             .audio = preflight.has_audio,
         },
         .encoded_media_bytes = preflight.encoded_media_bytes,
+        .decoded_pixels = decoded_pixels,
         .max_media_parts_per_item = preflight.media_count,
         .text_bytes = preflight.text_bytes,
         .max_text_bytes_per_item = preflight.text_bytes,
         .requested_output_tokens_per_item = 256,
     });
+}
+
+fn localGenerateDecodedPixels(messages: []const inference.pipelines.GenerationMessage) !u64 {
+    var decoded_pixels: u64 = 0;
+    for (messages) |message| if (message.image_bytes) |images| {
+        for (images) |image| {
+            const info = inference.pipelines.image.inspectEncodedForInference(image, null) catch
+                return error.InvalidInferenceMedia;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+    };
+    return decoded_pixels;
 }
 
 /// The provider ABI is an executor boundary, not a trusted shortcut around
@@ -2002,8 +2029,15 @@ fn localModelCapabilities(
     };
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
-        if (std.mem.startsWith(u8, capability, prefix))
-            try result.accepted_mime_types.add(capability[prefix.len..]);
+        if (std.mem.startsWith(u8, capability, prefix)) {
+            const mime_type = capability[prefix.len..];
+            if (mimeEssenceStartsWith(mime_type, "image/") and
+                !inference.pipelines.image.supportsMimeEssence(mime_type))
+            {
+                return error.InvalidInferenceCapabilities;
+            }
+            try result.accepted_mime_types.add(mime_type);
+        }
     }
     try result.validate();
     return result;
@@ -2150,12 +2184,13 @@ fn addLocalGenerateMediaPreflight(
 pub fn preflightLocalGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
 ) !inference.server.Node.DirectGeneratePreflight {
-    return try preflightLocalGenerateMessagesInternal(messages, null);
+    return try preflightLocalGenerateMessagesInternal(messages, null, null);
 }
 
 fn preflightLocalGenerateMessagesInternal(
     messages: []const antfly.inference.ChatMessage,
     attachments: ?[]const antfly.inference.work.Attachment,
+    capabilities: ?antfly.inference.work.InferenceCapabilities,
 ) !inference.server.Node.DirectGeneratePreflight {
     var preflight: inference.server.Node.DirectGeneratePreflight = .{};
     var attachment_index: usize = 0;
@@ -2165,17 +2200,18 @@ fn preflightLocalGenerateMessagesInternal(
             .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
             .parts => |parts| for (parts) |part| switch (part) {
                 .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
-                .image_url => |image_url| try addLocalGenerateMediaPreflight(
-                    &preflight,
-                    try inspectLocalGenerateDataUri(image_url.url, null),
-                    true,
-                ),
+                .image_url => |image_url| {
+                    const descriptor = try inspectLocalGenerateDataUri(image_url.url, null);
+                    if (capabilities) |resolved| try resolved.validateMimeType(descriptor.mime_type);
+                    try addLocalGenerateMediaPreflight(&preflight, descriptor, true);
+                },
                 .media => |media| {
                     const raw = media.url orelse media.data;
                     if (raw.len == 0 and attachments != null) {
                         if (attachment_index >= attachments.?.len) return error.InvalidArguments;
                         const attachment = attachments.?[attachment_index];
                         try attachment.validate();
+                        if (capabilities) |resolved| try resolved.validateMimeType(attachment.content_type);
                         if (media.mime_type.len > 0 and !mimeDeclarationsCompatible(media.mime_type, attachment.content_type))
                             return error.InvalidArguments;
                         try addLocalGenerateMediaPreflight(&preflight, .{
@@ -2186,9 +2222,11 @@ fn preflightLocalGenerateMessagesInternal(
                         }, false);
                         attachment_index += 1;
                     } else {
+                        const descriptor = try inspectLocalGenerateDataUri(raw, media.mime_type);
+                        if (capabilities) |resolved| try resolved.validateMimeType(descriptor.mime_type);
                         try addLocalGenerateMediaPreflight(
                             &preflight,
-                            try inspectLocalGenerateDataUri(raw, media.mime_type),
+                            descriptor,
                             false,
                         );
                     }
@@ -2292,6 +2330,7 @@ fn convertLocalGenerateParts(
                 if (!mimeEssenceStartsWith(decoded.mime_type, "image/")) {
                     return error.UnsupportedGeneratorProvider;
                 }
+                _ = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
                 try images.append(alloc, decoded.data);
                 try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                 try owner.owned_media.append(alloc, decoded.data);
@@ -2307,6 +2346,7 @@ fn convertLocalGenerateParts(
                         return error.InvalidArguments;
                     try decode_budget.reserve(attachment.bytes.len);
                     if (mimeEssenceStartsWith(attachment.content_type, "image/")) {
+                        _ = try antfly.inference.work.encodedImagePixels(attachment.content_type, attachment.bytes);
                         try images.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
@@ -2320,6 +2360,7 @@ fn convertLocalGenerateParts(
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (mimeEssenceStartsWith(decoded.mime_type, "image/")) {
+                    _ = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
                     try images.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
@@ -2403,6 +2444,48 @@ pub fn decodeLocalGenerateDataUri(
     errdefer alloc.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, descriptor.payload);
     return .{ .data = decoded, .mime_type = descriptor.mime_type };
+}
+
+test "linked generator validates concrete MIME and decoded pixels" {
+    const uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const messages = [_]antfly.inference.ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{.{ .image_url = .{ .url = uri } }} },
+    }};
+    var capabilities = antfly.inference.work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .image = true },
+        .accepted_mime_types = .{ .text_plain = true, .image_jpeg = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = uri.len,
+            .max_decoded_pixels = 5,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .generated_text,
+    };
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        preflightLocalGenerateMessagesInternal(&messages, null, capabilities),
+    );
+
+    capabilities.accepted_mime_types = .{ .text_plain = true, .image_png = true };
+    const preflight = try preflightLocalGenerateMessagesInternal(&messages, null, capabilities);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
+    var converted = try convertLocalGenerateMessages(
+        std.testing.allocator,
+        &messages,
+        preflight.decoded_media_bytes,
+    );
+    defer converted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 6), try localGenerateDecodedPixels(converted.messages));
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateLocalGenerateCapabilities(capabilities, preflight, 6),
+    );
 }
 
 // ---------------------------------------------------------------

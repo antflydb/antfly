@@ -29,6 +29,35 @@ pub const conformance = conformance_impl;
 pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
 pub const DecodeLimits = limits.DecodeLimits;
 
+/// Resolve a canonical MIME essence to a format supported by the shared
+/// inference image decoder. Keeping this registry beside `detectFormat` makes
+/// capability advertisement, header inspection, and decoding use one codec
+/// contract instead of three independently maintained allowlists.
+pub fn inferenceFormatForMimeEssence(essence: []const u8) ?Format {
+    if (std.ascii.eqlIgnoreCase(essence, "image/png")) return .png;
+    if (std.ascii.eqlIgnoreCase(essence, "image/jpeg") or
+        std.ascii.eqlIgnoreCase(essence, "image/jpg")) return .jpeg;
+    if (std.ascii.eqlIgnoreCase(essence, "image/gif")) return .gif;
+    if (std.ascii.eqlIgnoreCase(essence, "image/bmp")) return .bmp;
+    if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return .webp;
+    return null;
+}
+
+pub fn inferenceMimeEssenceForFormat(format: Format) ?[]const u8 {
+    return switch (format) {
+        .png => "image/png",
+        .jpeg => "image/jpeg",
+        .gif => "image/gif",
+        .bmp => "image/bmp",
+        .webp => "image/webp",
+        else => null,
+    };
+}
+
+pub fn supportsInferenceMimeEssence(essence: []const u8) bool {
+    return inferenceFormatForMimeEssence(essence) != null;
+}
+
 pub const EncodedImageInfo = struct {
     width: u32,
     height: u32,
@@ -111,6 +140,15 @@ test "detectFormat signatures" {
     try std.testing.expectEqual(Format.jpeg2000_j2k, detectFormat(&.{ 0xFF, 0x4F, 0xFF, 0x51 }));
     try std.testing.expectEqual(Format.jpeg2000_jp2, detectFormat(&.{ 0x00, 0x00, 0x00, 0x0C, 'j', 'P', ' ', ' ', 0x0D, 0x0A, 0x87, 0x0A }));
     try std.testing.expectEqual(Format.unknown, detectFormat("hello"));
+}
+
+test "inference MIME registry contains only decodable formats" {
+    try std.testing.expectEqual(Format.png, inferenceFormatForMimeEssence("image/png").?);
+    try std.testing.expectEqual(Format.jpeg, inferenceFormatForMimeEssence("IMAGE/JPG").?);
+    try std.testing.expectEqualStrings("image/gif", inferenceMimeEssenceForFormat(.gif).?);
+    try std.testing.expect(supportsInferenceMimeEssence("image/bmp"));
+    try std.testing.expect(!supportsInferenceMimeEssence("image/tiff"));
+    try std.testing.expect(inferenceMimeEssenceForFormat(.jpeg2000_jp2) == null);
 }
 
 test "inspectEncoded reports dimensions without decoding pixels" {

@@ -320,15 +320,9 @@ pub const InvocationShape = struct {
 pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
     const essence = mimeTypeEssence(content_type) catch return error.UnsupportedInferenceMimeType;
     const format = antfly_image.detectFormat(bytes);
-    const matches = switch (format) {
-        .png => std.ascii.eqlIgnoreCase(essence, "image/png"),
-        .jpeg => std.ascii.eqlIgnoreCase(essence, "image/jpeg") or std.ascii.eqlIgnoreCase(essence, "image/jpg"),
-        .gif => std.ascii.eqlIgnoreCase(essence, "image/gif"),
-        .bmp => std.ascii.eqlIgnoreCase(essence, "image/bmp"),
-        .webp => std.ascii.eqlIgnoreCase(essence, "image/webp"),
-        else => false,
-    };
-    if (!matches) return error.InvalidInferenceMedia;
+    const declared_format = antfly_image.inferenceFormatForMimeEssence(essence) orelse
+        return error.UnsupportedInferenceMimeType;
+    if (format != declared_format) return error.InvalidInferenceMedia;
     const info = antfly_image.inspectEncoded(bytes) catch return error.InvalidInferenceMedia;
     return info.pixels() catch return error.InferenceDecodedPixelsExceeded;
 }

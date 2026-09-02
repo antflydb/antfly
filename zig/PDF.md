@@ -1039,6 +1039,41 @@ document. They are architectural requirements, not Florence-specific cleanup:
     and partition candidate batches on pixels as well as items and bytes. The
     shared image-header inspector is also used by inference nodes, so linked
     and distributed execution measure the same physical payload.
+106. **Resolved model limits were planner hints at the distributed generation
+    boundary.** `/generate` and `/generate/batch` applied node-wide media
+    admission, but a caller that bypassed or outlived the document planner could
+    exceed stricter limits published by the selected model manifest. Generation
+    now derives an executor contract from the lightweight manifest before model
+    loading. Single requests and independently grouped batch items validate
+    modalities, item count, encoded bytes, decoded pixels, media cardinality,
+    text bytes, requested output tokens, and exact input tokens. Batch execution
+    constructs the largest valid prefix under the resolved item, byte, and pixel
+    ceilings; invalid singleton items retain per-item failures and unconsumed
+    compatible items remain pending for the next bounded window.
+107. **The linked generator preflight discarded concrete media facts.** Its
+    allocation preflight retained byte and item counts but not the declared MIME
+    or physical pixel count, so direct ABI callers could bypass a model-specific
+    MIME or decoded-pixel limit. Capability resolution now precedes preflight;
+    every inline declaration or borrowed attachment is checked while the input
+    is still encoded, and the materialized image headers are inspected before
+    dispatch. The early shape protects allocation while the final concrete
+    shape protects model execution.
+108. **Extensible image MIME advertisement was not coupled to a codec.** A
+    manifest could publish any syntactically valid `image/*` essence even though
+    the common inference decoder and physical header inspector supported only a
+    smaller set. The image library now owns one inference codec registry mapping
+    MIME essence to physical format. Catalog publication, linked capability
+    resolution, physical accounting, and decoding all consult that registry;
+    an unsupported extension makes the resolved model contract invalid instead
+    of advertising a request that must fail later. Adding a future format is one
+    atomic change: header probe, bounded decoder, registry entry, and tests.
+109. **Inline encoded-byte rejection happened after payload materialization.**
+    Reader, generator, embedder, and extractor shaping could decode a complete
+    data URI merely to discover that its already-known wire length exceeded the
+    model ceiling. Shaping and batch partitioning now consume encoded budgets
+    first. Only an item that fits the current invocation may allocate scratch to
+    inspect physical dimensions; the subsequent pixel check remains independent.
+    This ordering applies to both singleton validation and cumulative windows.
 
 ### Post-review implementation contract
 

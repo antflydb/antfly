@@ -6753,7 +6753,8 @@ pub const Node = struct {
 
         // Admission precedes model resolution and media decoding so rejected
         // requests cannot consume model or download work first.
-        const media_admission = requestMediaAdmission(self, generateRequestMediaShape(body));
+        const media_shape = generateRequestMediaShape(body);
+        const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(estimateGenerateRequestAdmissionUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
         var reserved_units = admission_units;
@@ -6764,6 +6765,32 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer admission_manifest.deinit();
+        const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
+            const failure = generateExecutorContractError(err);
+            return ctx.status(failure.status).json(.{
+                .@"error" = failure.batch.code,
+                .message = failure.batch.message,
+                .retryable = failure.batch.retryable,
+            });
+        };
+        validateGenerateExecutorInvocation(executor_contract, .{
+            .text_bytes_per_item = estimateGenerateRequestTextBytes(body),
+            .output_tokens_per_item = @intCast(numeric.max_tokens),
+            .encoded_media_bytes = media_shape.inline_bytes +| media_shape.borrowed_bytes,
+            .media_parts_per_item = media_shape.media_count,
+            .has_image = media_shape.image_count > 0,
+            .has_audio = media_shape.has_audio,
+        }) catch |err| {
+            const failure = generateExecutorContractError(err);
+            return ctx.status(failure.status).json(.{
+                .@"error" = failure.batch.code,
+                .message = failure.batch.message,
+                .retryable = failure.batch.retryable,
+            });
+        };
         var draft_model_path_storage: ?[]const u8 = null;
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
@@ -6788,6 +6815,29 @@ pub const Node = struct {
             if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
             reserved_units = required_units;
         }
+        validateGenerateExecutorInvocation(executor_contract, .{
+            .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages.messages),
+            .output_tokens_per_item = @intCast(numeric.max_tokens),
+            .encoded_media_bytes = media_budget.used_bytes,
+            .decoded_pixels = measureGenerateDecodedImages(&admission_manifest, owned_messages.decoded_images) catch |err| {
+                const failure = generateExecutorContractError(err);
+                return ctx.status(failure.status).json(.{
+                    .@"error" = failure.batch.code,
+                    .message = failure.batch.message,
+                    .retryable = failure.batch.retryable,
+                });
+            },
+            .media_parts_per_item = media_shape.media_count,
+            .has_image = owned_messages.decoded_images.len > 0,
+            .has_audio = owned_messages.decoded_audio.len > 0,
+        }) catch |err| {
+            const failure = generateExecutorContractError(err);
+            return ctx.status(failure.status).json(.{
+                .@"error" = failure.batch.code,
+                .message = failure.batch.message,
+                .retryable = failure.batch.retryable,
+            });
+        };
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
@@ -6881,6 +6931,16 @@ pub const Node = struct {
                 defer ctx.allocator.free(prompt);
 
                 try prependSystemPrompt(ctx.allocator, &messages, prompt);
+            }
+        }
+        if (executor_contract.batch.max_text_bytes_per_item) |limit| {
+            if (self.estimateGeneratePromptBytes(messages.items) > limit) {
+                const failure = generateExecutorContractError(error.InferenceTextBytesExceeded);
+                return ctx.status(failure.status).json(.{
+                    .@"error" = failure.batch.code,
+                    .message = failure.batch.message,
+                    .retryable = failure.batch.retryable,
+                });
             }
         }
 
@@ -7454,6 +7514,16 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         };
+        if (executor_contract.batch.max_input_tokens_per_item) |limit| {
+            if (prompt_tokens > limit) {
+                const failure = generateExecutorContractError(error.InferenceInputTokensExceeded);
+                return ctx.status(failure.status).json(.{
+                    .@"error" = failure.batch.code,
+                    .message = failure.batch.message,
+                    .retryable = failure.batch.retryable,
+                });
+            }
+        }
         const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
             backend_kind,
             gpt_config,
@@ -8273,6 +8343,8 @@ pub const Node = struct {
                                 defer allocator.free(downloaded.content_type);
                                 var owns_downloaded_data = true;
                                 errdefer if (owns_downloaded_data) allocator.free(downloaded.data);
+                                if (data_uri_mod.hasScheme(url_str))
+                                    try validateEncodedImageMime(downloaded.content_type, downloaded.data);
                                 try decoded_images.append(allocator, downloaded.data);
                                 owns_downloaded_data = false;
                                 try msg_images.append(allocator, downloaded.data);
@@ -8296,6 +8368,7 @@ pub const Node = struct {
                                 if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type))
                                     return error.GenerateMediaDataMimeTypeMismatch;
                                 if (std.ascii.startsWithIgnoreCase(mime_value.string, "image/")) {
+                                    try validateEncodedImageMime(mime_value.string, decoded_payload.data);
                                     try decoded_images.append(allocator, decoded_payload.data);
                                     owns_decoded_data = false;
                                     try msg_images.append(allocator, decoded_payload.data);
@@ -8883,6 +8956,9 @@ pub const Node = struct {
         var execution_attempted = try ctx.allocator.alloc(bool, body.requests.len);
         defer ctx.allocator.free(execution_attempted);
         @memset(execution_attempted, false);
+        const item_encoded_media_bytes = try ctx.allocator.alloc(usize, body.requests.len);
+        defer ctx.allocator.free(item_encoded_media_bytes);
+        @memset(item_encoded_media_bytes, 0);
 
         for (body.requests, 0..) |item, idx| {
             results[idx] = .{
@@ -8895,6 +8971,54 @@ pub const Node = struct {
                 results[idx].@"error" = batch_err;
                 pending[idx] = false;
             }
+        }
+
+        // Resolve the per-item model contract before any inline payload is
+        // decoded. The grouped execution path repeats this check with concrete
+        // image headers and token counts, but that later check cannot protect
+        // the parser's allocation boundary from a stricter model byte ceiling.
+        for (body.requests, 0..) |item, idx| {
+            if (!pending[idx]) continue;
+            const model_path = self.resolveRequestModelPath(
+                ctx.allocator,
+                ctx.io,
+                item.body.model,
+                "generators",
+            ) catch |err| {
+                results[idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
+                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
+                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
+                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
+                };
+                pending[idx] = false;
+                continue;
+            };
+            defer ctx.allocator.free(model_path);
+            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
+                results[idx].@"error" = batchModelLoadError(err);
+                pending[idx] = false;
+                continue;
+            };
+            defer admission_manifest.deinit();
+            const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
+                results[idx].@"error" = generateExecutorContractError(err).batch;
+                pending[idx] = false;
+                continue;
+            };
+            const item_media_shape = generateRequestMediaShape(item.body);
+            const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
+            validateGenerateExecutorInvocation(executor_contract, .{
+                .text_bytes_per_item = estimateGenerateRequestTextBytes(item.body),
+                .output_tokens_per_item = max_tokens,
+                .encoded_media_bytes = item_media_shape.inline_bytes +| item_media_shape.borrowed_bytes,
+                .media_parts_per_item = item_media_shape.media_count,
+                .has_image = item_media_shape.image_count > 0,
+                .has_audio = item_media_shape.has_audio,
+            }) catch |err| {
+                results[idx].@"error" = generateExecutorContractError(err).batch;
+                pending[idx] = false;
+                continue;
+            };
         }
 
         var batch_media_shape: RequestMediaAdmissionShape = .{};
@@ -8912,11 +9036,14 @@ pub const Node = struct {
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.requests, 0..) |item, idx| {
             if (!pending[idx]) continue;
+            const prior_media_bytes = media_budget.used_bytes;
             owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 results[idx].@"error" = generateBatchMessageParseError(err).?;
                 break :blk .{ .allocator = ctx.allocator };
             };
+            if (results[idx].@"error" == null)
+                item_encoded_media_bytes[idx] = media_budget.used_bytes - prior_media_bytes;
             if (results[idx].@"error" == null and owned_messages[idx].messages.len == 0) {
                 results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "'messages' must not be empty", .retryable = false };
             }
@@ -8986,6 +9113,76 @@ pub const Node = struct {
                 if (!std.mem.eql(u8, candidate.cache_dtype orelse "", first_body.cache_dtype orelse "")) continue;
                 try group_indices.append(ctx.allocator, idx);
             }
+
+            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
+                for (group_indices.items) |idx| {
+                    results[idx].@"error" = batchModelLoadError(err);
+                    pending[idx] = false;
+                }
+                continue;
+            };
+            defer admission_manifest.deinit();
+            const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
+                const failure = generateExecutorContractError(err).batch;
+                for (group_indices.items) |idx| {
+                    results[idx].@"error" = failure;
+                    pending[idx] = false;
+                }
+                continue;
+            };
+
+            // Build the largest valid model-contract window. Invalid singleton
+            // items receive an exact per-item failure; otherwise the remaining
+            // compatible items stay pending for the next bounded window.
+            var admitted_group_len: usize = 0;
+            var group_encoded_bytes: usize = 0;
+            var group_decoded_pixels: u64 = 0;
+            for (group_indices.items) |idx| {
+                if (admitted_group_len == executor_contract.batch.max_items) break;
+                const item_media_shape = generateRequestMediaShape(body.requests[idx].body);
+                const item_pixels = measureGenerateDecodedImages(
+                    &admission_manifest,
+                    owned_messages[idx].decoded_images,
+                ) catch |err| {
+                    results[idx].@"error" = generateExecutorContractError(err).batch;
+                    pending[idx] = false;
+                    continue;
+                };
+                const max_tokens: usize = if (body.requests[idx].body.max_tokens) |value|
+                    @intCast(value)
+                else
+                    256;
+                validateGenerateExecutorInvocation(executor_contract, .{
+                    .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
+                    .output_tokens_per_item = max_tokens,
+                    .encoded_media_bytes = item_encoded_media_bytes[idx],
+                    .decoded_pixels = item_pixels,
+                    .media_parts_per_item = item_media_shape.media_count,
+                    .has_image = owned_messages[idx].decoded_images.len > 0,
+                    .has_audio = owned_messages[idx].decoded_audio.len > 0,
+                }) catch |err| {
+                    results[idx].@"error" = generateExecutorContractError(err).batch;
+                    pending[idx] = false;
+                    continue;
+                };
+                const next_encoded = std.math.add(usize, group_encoded_bytes, item_encoded_media_bytes[idx]) catch
+                    std.math.maxInt(usize);
+                const next_pixels = std.math.add(u64, group_decoded_pixels, item_pixels) catch
+                    std.math.maxInt(u64);
+                if (admitted_group_len > 0 and
+                    (next_encoded > executor_contract.batch.max_encoded_media_bytes or
+                        (executor_contract.batch.max_decoded_pixels != null and
+                            next_pixels > executor_contract.batch.max_decoded_pixels.?)))
+                {
+                    break;
+                }
+                group_indices.items[admitted_group_len] = idx;
+                admitted_group_len += 1;
+                group_encoded_bytes = next_encoded;
+                group_decoded_pixels = next_pixels;
+            }
+            group_indices.items.len = admitted_group_len;
+            if (admitted_group_len == 0) continue;
 
             const compatibility_summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch CompatibilitySummary{
                 .level = .unknown,
@@ -9119,6 +9316,13 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
+                    if (executor_contract.batch.max_input_tokens_per_item) |limit| {
+                        if (prompt_tokens[pos] > limit) {
+                            results[idx].@"error" = generateExecutorContractError(error.InferenceInputTokensExceeded).batch;
+                            pending[idx] = false;
+                            continue;
+                        }
+                    }
                     prompt_bytes[pos] = self.estimateGeneratePromptBytes(owned_messages[idx].messages);
                     valid_count += 1;
                 }
@@ -14241,8 +14445,6 @@ fn appendResolvedInferenceCapabilities(
     // Kept in lockstep with antfly inference.work.MimeTypes' bounded native
     // capability representation. The wire catalog may contain any validated
     // essence, but no node may publish more extensions than a peer can retain.
-    const max_additional_inference_mime_types = 16;
-    const max_inference_mime_type_bytes = 63;
     const resolved_task = normalizedInferenceTask(task) orelse return;
     if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document) return;
     const resolved = try resolveInferenceBatchCapabilities(
@@ -14292,25 +14494,13 @@ fn appendResolvedInferenceCapabilities(
         const prefix = "inference.mime_type=";
         if (!std.mem.startsWith(u8, capability, prefix)) continue;
         const value = capability[prefix.len..];
-        const parsed = scraping.data_uri.parseMediaType(value) catch return error.InvalidInferenceCapabilities;
-        if (value.len > max_inference_mime_type_bytes or parsed.parameters.len != 0 or !std.mem.eql(u8, parsed.essence, value))
-            return error.InvalidInferenceCapabilities;
-        for (value) |byte| if (std.ascii.isUpper(byte))
-            return error.InvalidInferenceCapabilities;
-        if (std.mem.eql(u8, value, "image/jpg") or std.mem.eql(u8, value, "audio/x-wav"))
-            return error.InvalidInferenceCapabilities;
-        const modality_supported = if (std.mem.startsWith(u8, value, "text/") or
-            std.mem.eql(u8, value, "application/json"))
-            accepts_text
-        else if (std.mem.startsWith(u8, value, "image/"))
-            accepts_image
-        else if (std.mem.startsWith(u8, value, "audio/"))
-            accepts_audio
-        else if (std.mem.startsWith(u8, value, "application/"))
-            accepts_document
-        else
-            false;
-        if (!modality_supported) return error.InvalidInferenceCapabilities;
+        try validateResolvedInferenceMimeCapability(
+            value,
+            accepts_text,
+            accepts_image,
+            accepts_audio,
+            accepts_document,
+        );
         var duplicate = false;
         for (manifest_capabilities[0..capability_index]) |prior| {
             if (std.mem.eql(u8, prior, capability)) duplicate = true;
@@ -14385,6 +14575,45 @@ fn appendResolvedInferenceCapabilities(
     );
     defer allocator.free(limits_suffix);
     try buf.appendSlice(allocator, limits_suffix);
+}
+
+const max_additional_inference_mime_types = 16;
+const max_inference_mime_type_bytes = 63;
+
+/// Validate the canonical MIME extension once for both capability publication
+/// and concrete executor resolution. A model directory must not acquire a
+/// looser execution contract merely because the caller bypassed discovery.
+fn validateResolvedInferenceMimeCapability(
+    value: []const u8,
+    accepts_text: bool,
+    accepts_image: bool,
+    accepts_audio: bool,
+    accepts_document: bool,
+) !void {
+    const parsed = scraping.data_uri.parseMediaType(value) catch
+        return error.InvalidInferenceCapabilities;
+    if (value.len > max_inference_mime_type_bytes or
+        parsed.parameters.len != 0 or
+        !std.mem.eql(u8, parsed.essence, value))
+    {
+        return error.InvalidInferenceCapabilities;
+    }
+    for (value) |byte| if (std.ascii.isUpper(byte))
+        return error.InvalidInferenceCapabilities;
+    if (std.mem.eql(u8, value, "image/jpg") or std.mem.eql(u8, value, "audio/x-wav"))
+        return error.InvalidInferenceCapabilities;
+    const modality_supported = if (std.mem.startsWith(u8, value, "text/") or
+        std.mem.eql(u8, value, "application/json"))
+        accepts_text
+    else if (std.mem.startsWith(u8, value, "image/"))
+        accepts_image and image_pipeline.supportsMimeEssence(value)
+    else if (std.mem.startsWith(u8, value, "audio/"))
+        accepts_audio
+    else if (std.mem.startsWith(u8, value, "application/"))
+        accepts_document
+    else
+        false;
+    if (!modality_supported) return error.InvalidInferenceCapabilities;
 }
 
 pub fn resolvedTaskOutput(resolved_task: []const u8) []const u8 {
@@ -14512,6 +14741,216 @@ pub fn resolveInferenceBatchCapabilities(
     };
 }
 
+/// The exact generation contract used by both catalog publication and the
+/// concrete HTTP executor. It is deliberately derived from the loaded
+/// manifest at the execution boundary so a caller cannot bypass a planner by
+/// constructing `/generate` or `/generate/batch` requests directly.
+const ResolvedGenerateExecutorContract = struct {
+    batch: ResolvedInferenceBatchCapabilities,
+    accepts_text: bool,
+    accepts_image: bool,
+    accepts_audio: bool,
+};
+
+const GenerateExecutorInvocationShape = struct {
+    item_count: usize = 1,
+    text_bytes_per_item: usize = 0,
+    input_tokens_per_item: usize = 0,
+    output_tokens_per_item: usize = 0,
+    encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
+    media_parts_per_item: usize = 0,
+    has_image: bool = false,
+    has_audio: bool = false,
+};
+
+fn resolvedGenerateExecutorContract(
+    node: *Node,
+    manifest: *const manifest_mod.ModelManifest,
+) !ResolvedGenerateExecutorContract {
+    var manifest_text = false;
+    var manifest_image = false;
+    var manifest_audio = false;
+    var manifest_document = false;
+    for (manifest.inputs) |input| {
+        if (std.mem.eql(u8, input, "text")) manifest_text = true;
+        if (std.mem.eql(u8, input, "image")) manifest_image = true;
+        if (std.mem.eql(u8, input, "audio")) manifest_audio = true;
+        if (std.mem.eql(u8, input, "document") or std.mem.eql(u8, input, "pdf"))
+            manifest_document = true;
+    }
+    if (!manifest_text and !manifest_image and !manifest_audio and !manifest_document) {
+        manifest_text = true;
+        // A metadata-free legacy directory has no exact modality contract yet.
+        // Preserve the HTTP executor's parser-level compatibility and let model
+        // loading provide the final architecture check; explicit manifests and
+        // resolved projector metadata remain exact.
+        manifest_image = true;
+        manifest_audio = true;
+    }
+    const modalities = resolvedExecutorModalities(
+        "generate",
+        manifest_text,
+        manifest_image,
+        manifest_audio,
+        manifest_document,
+    );
+    for (manifest.capabilities) |capability| {
+        const prefix = "inference.mime_type=";
+        if (!std.mem.startsWith(u8, capability, prefix)) continue;
+        try validateResolvedInferenceMimeCapability(
+            capability[prefix.len..],
+            modalities.text,
+            modalities.image,
+            modalities.audio,
+            false,
+        );
+    }
+    const max_images = if (modalities.image)
+        std.math.mul(usize, max_generate_batch_items, max_generate_media_parts_per_item) catch
+            std.math.maxInt(usize)
+    else
+        0;
+    return .{
+        .batch = try resolveInferenceBatchCapabilities(
+            "generate",
+            manifest.capabilities,
+            false,
+            requestMediaMaxBytes(node),
+            if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
+            modalities.image,
+            modalities.audio,
+            false,
+        ),
+        .accepts_text = modalities.text,
+        .accepts_image = modalities.image,
+        .accepts_audio = modalities.audio,
+    };
+}
+
+fn manifestAcceptsGenerateImageMime(
+    manifest: *const manifest_mod.ModelManifest,
+    mime_type: []const u8,
+) bool {
+    if (std.mem.eql(u8, mime_type, "image/png") or
+        std.mem.eql(u8, mime_type, "image/jpeg") or
+        std.mem.eql(u8, mime_type, "image/webp")) return true;
+    for (manifest.capabilities) |capability| {
+        const prefix = "inference.mime_type=";
+        if (std.mem.startsWith(u8, capability, prefix) and
+            std.mem.eql(u8, capability[prefix.len..], mime_type)) return true;
+    }
+    return false;
+}
+
+fn validateEncodedImageMime(declared_mime_type: []const u8, bytes: []const u8) !void {
+    const declared = data_uri_mod.mediaTypeEssence(declared_mime_type) catch
+        return error.InvalidInferenceMedia;
+    const physical = image_pipeline.mimeEssenceForEncoded(bytes) orelse
+        return error.InvalidInferenceMedia;
+    if (!std.mem.eql(u8, declared, physical) and
+        !(std.mem.eql(u8, declared, "image/jpg") and std.mem.eql(u8, physical, "image/jpeg")))
+    {
+        return error.InvalidInferenceMedia;
+    }
+}
+
+fn measureGenerateDecodedImages(
+    manifest: *const manifest_mod.ModelManifest,
+    images: []const []const u8,
+) !u64 {
+    var pixels: u64 = 0;
+    for (images) |image| {
+        const mime_type = image_pipeline.mimeEssenceForEncoded(image) orelse
+            return error.InvalidInferenceMedia;
+        if (!manifestAcceptsGenerateImageMime(manifest, mime_type))
+            return error.UnsupportedInferenceMimeType;
+        const info = image_pipeline.inspectEncodedForInference(image, null) catch
+            return error.InvalidInferenceMedia;
+        pixels = std.math.add(u64, pixels, try info.pixels()) catch
+            return error.InferenceDecodedPixelsExceeded;
+    }
+    return pixels;
+}
+
+fn validateGenerateExecutorInvocation(
+    contract: ResolvedGenerateExecutorContract,
+    shape: GenerateExecutorInvocationShape,
+) !void {
+    if (shape.item_count == 0 or shape.item_count > contract.batch.max_items)
+        return error.InferenceBatchTooLarge;
+    if (shape.text_bytes_per_item > 0 and !contract.accepts_text)
+        return error.UnsupportedInferenceModality;
+    if (shape.has_image and !contract.accepts_image)
+        return error.UnsupportedInferenceModality;
+    if (shape.has_audio and !contract.accepts_audio)
+        return error.UnsupportedInferenceModality;
+    if (shape.encoded_media_bytes > contract.batch.max_encoded_media_bytes)
+        return error.InferenceEncodedBytesExceeded;
+    if (contract.batch.max_decoded_pixels) |limit| {
+        if (shape.decoded_pixels > limit) return error.InferenceDecodedPixelsExceeded;
+    }
+    if (shape.media_parts_per_item > contract.batch.max_media_parts_per_item)
+        return error.InferenceMediaPartLimitExceeded;
+    if (contract.batch.max_text_bytes_per_item) |limit| {
+        if (shape.text_bytes_per_item > limit) return error.InferenceTextBytesExceeded;
+    }
+    if (contract.batch.max_input_tokens_per_item) |limit| {
+        if (shape.input_tokens_per_item > limit) return error.InferenceInputTokensExceeded;
+    }
+    if (contract.batch.max_output_tokens_per_item) |limit| {
+        if (shape.output_tokens_per_item > limit) return error.InferenceOutputTokensExceeded;
+    }
+}
+
+const GenerateExecutorContractFailure = struct {
+    status: u16,
+    batch: api.GenerateBatchError,
+};
+
+fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure {
+    const invalid_input = err == error.UnsupportedInferenceMimeType or
+        err == error.UnsupportedInferenceModality or
+        err == error.InvalidInferenceMedia;
+    const invalid_contract = err == error.InvalidInferenceCapabilities;
+    return .{
+        .status = if (invalid_contract) 500 else if (invalid_input) 400 else 413,
+        .batch = .{
+            .code = if (invalid_contract)
+                "INVALID_MODEL_CAPABILITIES"
+            else if (err == error.UnsupportedInferenceMimeType)
+                "UNSUPPORTED_MEDIA_TYPE"
+            else if (err == error.UnsupportedInferenceModality)
+                "UNSUPPORTED_MODALITY"
+            else if (err == error.InvalidInferenceMedia)
+                "INVALID_IMAGE"
+            else if (err == error.InferenceDecodedPixelsExceeded)
+                "DECODED_PIXELS_EXCEEDED"
+            else if (err == error.InferenceEncodedBytesExceeded)
+                "ENCODED_MEDIA_EXCEEDED"
+            else if (err == error.InferenceBatchTooLarge)
+                "BATCH_TOO_LARGE"
+            else if (err == error.InferenceMediaPartLimitExceeded)
+                "MEDIA_PART_LIMIT_EXCEEDED"
+            else if (err == error.InferenceTextBytesExceeded)
+                "TEXT_LIMIT_EXCEEDED"
+            else if (err == error.InferenceInputTokensExceeded)
+                "INPUT_TOKEN_LIMIT_EXCEEDED"
+            else if (err == error.InferenceOutputTokensExceeded)
+                "OUTPUT_TOKEN_LIMIT_EXCEEDED"
+            else
+                "MODEL_RESOURCE_LIMIT",
+            .message = if (invalid_contract)
+                "the resolved model capability contract is invalid"
+            else if (invalid_input)
+                "the request media is not accepted by the resolved model"
+            else
+                "the request exceeds a resolved model capability limit",
+            .retryable = false,
+        },
+    };
+}
+
 fn minOptionalLimit(current: ?usize, requested: usize) ?usize {
     return if (current) |value| @min(value, requested) else requested;
 }
@@ -14579,7 +15018,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
 }
 
-test "standalone inference catalog validates extensible MIME against resolved modalities" {
+test "standalone inference catalog validates extensible MIME against executor codecs" {
     const alloc = std.testing.allocator;
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(alloc);
@@ -14588,7 +15027,7 @@ test "standalone inference catalog validates extensible MIME against resolved mo
         &body,
         alloc,
         "embedders",
-        &.{"inference.mime_type=image/tiff"},
+        &.{"inference.mime_type=image/gif"},
         false,
         1024,
         4096,
@@ -14602,11 +15041,11 @@ test "standalone inference catalog validates extensible MIME against resolved mo
     defer parsed.deinit();
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
     const mime_values = resolved.object.get("accepted_mime_types").?.array.items;
-    var found_tiff = false;
-    for (mime_values) |value| if (std.mem.eql(u8, value.string, "image/tiff")) {
-        found_tiff = true;
+    var found_gif = false;
+    for (mime_values) |value| if (std.mem.eql(u8, value.string, "image/gif")) {
+        found_gif = true;
     };
-    try std.testing.expect(found_tiff);
+    try std.testing.expect(found_gif);
 
     var invalid = std.ArrayListUnmanaged(u8).empty;
     defer invalid.deinit(alloc);
@@ -14620,12 +15059,50 @@ test "standalone inference catalog validates extensible MIME against resolved mo
             false,
             1024,
             4096,
-            true,
             false,
+            true,
             false,
             false,
         ),
     );
+}
+
+test "generation executor contract enforces every resolved resource dimension" {
+    const contract = ResolvedGenerateExecutorContract{
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 2,
+            .max_encoded_media_bytes = 32,
+            .max_decoded_pixels = 6,
+            .max_media_parts_per_item = 1,
+            .per_item_failures = true,
+            .max_text_bytes_per_item = 8,
+            .max_input_tokens_per_item = 4,
+            .max_output_tokens_per_item = 3,
+        },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+    };
+    try validateGenerateExecutorInvocation(contract, .{
+        .item_count = 2,
+        .text_bytes_per_item = 8,
+        .input_tokens_per_item = 4,
+        .output_tokens_per_item = 3,
+        .encoded_media_bytes = 32,
+        .decoded_pixels = 6,
+        .media_parts_per_item = 1,
+        .has_image = true,
+    });
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateGenerateExecutorInvocation(contract, .{ .item_count = 3 }));
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, validateGenerateExecutorInvocation(contract, .{ .encoded_media_bytes = 33 }));
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, validateGenerateExecutorInvocation(contract, .{ .decoded_pixels = 7 }));
+    try std.testing.expectError(error.InferenceMediaPartLimitExceeded, validateGenerateExecutorInvocation(contract, .{ .media_parts_per_item = 2 }));
+    try std.testing.expectError(error.InferenceTextBytesExceeded, validateGenerateExecutorInvocation(contract, .{ .text_bytes_per_item = 9 }));
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateGenerateExecutorInvocation(contract, .{ .input_tokens_per_item = 5 }));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateGenerateExecutorInvocation(contract, .{ .output_tokens_per_item = 4 }));
+    try std.testing.expectError(error.UnsupportedInferenceModality, validateGenerateExecutorInvocation(contract, .{ .has_audio = true }));
 }
 
 test "normalized inference capabilities cover every model family" {
@@ -15456,24 +15933,25 @@ test "generate batch preflight accepts bounded multimodal content for per-item p
 
 test "generate parser consumes generic image and audio media parts strictly" {
     const alloc = std.testing.allocator;
+    const png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
     const request_json =
-        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"media","mime_type":"image/png","data":"AQI="},{"type":"media","mime_type":"audio/wav","data":"AwQ="}]}]}
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"media","mime_type":"image/png","data":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"},{"type":"media","mime_type":"audio/wav","data":"AwQ="}]}]}
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     var node: Node = undefined;
     node.config = .{};
-    var budget = RequestMediaBudget.init(32);
+    var budget = RequestMediaBudget.init(128);
     var messages = try node.parseGenerateMessagesWithBudget(alloc, parsed.value, &budget);
     defer messages.deinit();
     const shape = generateRequestMediaShape(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), messages.messages.len);
     try std.testing.expectEqual(@as(usize, 1), shape.image_count);
-    try std.testing.expectEqual(@as(usize, 8), shape.inline_bytes);
+    try std.testing.expectEqual(png_data_uri.len + "AwQ=".len, shape.inline_bytes);
     try std.testing.expectEqual(@as(usize, 1), messages.decoded_images.len);
     try std.testing.expectEqual(@as(usize, 1), messages.decoded_audio.len);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, messages.messages[0].image_bytes.?[0]);
+    try std.testing.expectEqual(@as(usize, 24), messages.messages[0].image_bytes.?[0].len);
     try std.testing.expectEqualSlices(u8, &.{ 3, 4 }, messages.messages[0].audio_bytes.?[0]);
     try std.testing.expectEqual(@as(usize, 3), messages.messages[0].content_parts.?.len);
     try std.testing.expect(messages.messages[0].content_parts.?[1] == .image);
@@ -15491,7 +15969,7 @@ test "generate parser consumes generic image and audio media parts strictly" {
     );
 
     const too_many_json =
-        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="},{"type":"media","mime_type":"image/png","data":"AA=="}]}]}
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="},{"type":"media","mime_type":"audio/wav","data":"AA=="}]}]}
     ;
     var too_many = try std.json.parseFromSlice(api.GenerateRequest, alloc, too_many_json, .{ .ignore_unknown_fields = true });
     defer too_many.deinit();
@@ -15499,6 +15977,17 @@ test "generate parser consumes generic image and audio media parts strictly" {
     try std.testing.expectError(
         error.GenerateMediaPartLimitExceeded,
         node.parseGenerateMessagesWithBudget(alloc, too_many.value, &too_many_budget),
+    );
+
+    const mismatched_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/jpeg","data":"iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}]}]}
+    ;
+    var mismatched = try std.json.parseFromSlice(api.GenerateRequest, alloc, mismatched_json, .{ .ignore_unknown_fields = true });
+    defer mismatched.deinit();
+    var mismatched_budget = RequestMediaBudget.init(64);
+    try std.testing.expectError(
+        error.InvalidInferenceMedia,
+        node.parseGenerateMessagesWithBudget(alloc, mismatched.value, &mismatched_budget),
     );
 }
 
@@ -16317,6 +16806,81 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         node.embedDenseJsonInputDirect(allocator, "owner/embed", parsed_input.value),
     );
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "generate HTTP enforces resolved manifest media limits before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/model/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/model/model_manifest.json",
+        .data =
+        \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_decoded_pixels=5"]}
+        ,
+    });
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/tiny-bytes");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/tiny-bytes/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/tiny-bytes/model_manifest.json",
+        .data =
+        \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_encoded_media_bytes=8"]}
+        ,
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const body =
+        \\{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}
+    ;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    try request.setJson(body);
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.generateContent(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "DECODED_PIXELS_EXCEEDED") != null);
+
+    const batch_body =
+        \\{"requests":[{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}}]}
+    ;
+    var batch_request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
+    defer batch_request.deinit();
+    try batch_request.setJson(batch_body);
+    var batch_ctx = httpx.Context.init(allocator, std.testing.io, &batch_request);
+    defer batch_ctx.deinit();
+    var batch_response = try node.generateBatchContent(&batch_ctx);
+    defer batch_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), batch_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, batch_response.body.?, "DECODED_PIXELS_EXCEEDED") != null);
+
+    // The payload is deliberately invalid image/base64 data. The model's
+    // known encoded-byte ceiling must reject it before the parser allocates or
+    // attempts to decode it, preserving the same ordering as `/generate`.
+    const bytes_batch_body =
+        \\{"requests":[{"custom_id":"page-2","body":{"model":"owner/tiny-bytes","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"not-valid-base64"}]}]}}]}
+    ;
+    var bytes_batch_request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
+    defer bytes_batch_request.deinit();
+    try bytes_batch_request.setJson(bytes_batch_body);
+    var bytes_batch_ctx = httpx.Context.init(allocator, std.testing.io, &bytes_batch_request);
+    defer bytes_batch_ctx.deinit();
+    var bytes_batch_response = try node.generateBatchContent(&bytes_batch_ctx);
+    defer bytes_batch_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bytes_batch_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, bytes_batch_response.body.?, "ENCODED_MEDIA_EXCEEDED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes_batch_response.body.?, "INVALID_MEDIA_BASE64") == null);
 }
 
 test "sparse embed validates text-only input before model loading" {
@@ -20868,6 +21432,8 @@ const RequestMediaBudget = struct {
 
 const RequestMediaAdmissionShape = struct {
     image_count: usize = 0,
+    media_count: usize = 0,
+    has_audio: bool = false,
     // Inline encoded sources coexist with a separately allocated decoded copy.
     inline_bytes: usize = 0,
     // Direct callers already own decoded media. It is part of the logical
@@ -20876,20 +21442,24 @@ const RequestMediaAdmissionShape = struct {
     has_remote: bool = false,
 
     fn addInline(self: *RequestMediaAdmissionShape, encoded_bytes: usize, is_image: bool) void {
+        self.media_count = std.math.add(usize, self.media_count, 1) catch std.math.maxInt(usize);
         if (is_image) self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
         self.inline_bytes = std.math.add(usize, self.inline_bytes, encoded_bytes) catch std.math.maxInt(usize);
     }
 
     fn addBorrowed(self: *RequestMediaAdmissionShape, bytes: usize, is_image: bool) void {
+        self.media_count = std.math.add(usize, self.media_count, 1) catch std.math.maxInt(usize);
         if (is_image) self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
         self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, bytes) catch std.math.maxInt(usize);
     }
 
     fn merge(self: *RequestMediaAdmissionShape, other: RequestMediaAdmissionShape) void {
+        self.media_count = std.math.add(usize, self.media_count, other.media_count) catch std.math.maxInt(usize);
         self.image_count = std.math.add(usize, self.image_count, other.image_count) catch std.math.maxInt(usize);
         self.inline_bytes = std.math.add(usize, self.inline_bytes, other.inline_bytes) catch std.math.maxInt(usize);
         self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, other.borrowed_bytes) catch std.math.maxInt(usize);
         self.has_remote = self.has_remote or other.has_remote;
+        self.has_audio = self.has_audio or other.has_audio;
     }
 
     fn addImageUrlSlice(self: *RequestMediaAdmissionShape, source: []const u8) void {
@@ -20897,6 +21467,7 @@ const RequestMediaAdmissionShape = struct {
             self.addInline(source.len, true);
             return;
         }
+        self.media_count = std.math.add(usize, self.media_count, 1) catch std.math.maxInt(usize);
         self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
         self.has_remote = true;
     }
@@ -20967,10 +21538,34 @@ fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionSha
             const data = part.object.get("data") orelse continue;
             const mime = part.object.get("mime_type") orelse continue;
             if (data != .string or mime != .string) continue;
-            shape.addInline(data.string.len, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
+            const is_image = std.ascii.startsWithIgnoreCase(mime.string, "image/");
+            shape.addInline(data.string.len, is_image);
+            shape.has_audio = shape.has_audio or std.ascii.startsWithIgnoreCase(mime.string, "audio/");
         }
     }
     return shape;
+}
+
+fn estimateGenerateRequestTextBytes(body: api.GenerateRequest) usize {
+    var text_bytes: usize = 0;
+    for (body.messages) |message| {
+        const content = message.content orelse continue;
+        switch (content) {
+            .string => |text| text_bytes = std.math.add(usize, text_bytes, text.len) catch
+                return std.math.maxInt(usize),
+            .array => |parts| for (parts.items) |part| {
+                if (part != .object) continue;
+                const kind = part.object.get("type") orelse continue;
+                if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
+                const value = part.object.get("text") orelse continue;
+                if (value != .string) continue;
+                text_bytes = std.math.add(usize, text_bytes, value.string.len) catch
+                    return std.math.maxInt(usize);
+            },
+            else => {},
+        }
+    }
+    return text_bytes;
 }
 
 fn denseEmbedRequestMediaShape(input: std.json.Value) RequestMediaAdmissionShape {

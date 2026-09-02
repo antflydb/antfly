@@ -4248,6 +4248,9 @@ fn validateDensePartItemInvocation(
             const wire_bytes = try denseMediaUrlWireBytes(capabilities, url);
             shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, wire_bytes) catch
                 return error.InferenceEncodedBytesExceeded;
+            if (capabilities.batch.max_encoded_media_bytes) |limit| {
+                if (shape.encoded_media_bytes > limit) return error.InferenceEncodedBytesExceeded;
+            }
             const pixels = try denseMediaUrlPixelsAlloc(alloc, url);
             shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
                 return error.InferenceDecodedPixelsExceeded;
@@ -4295,6 +4298,12 @@ fn densePartBatchEnd(
         };
         const next_bytes = std.math.add(usize, encoded_media_bytes, item_bytes) catch
             return error.InferenceEncodedBytesExceeded;
+        if (capabilities.batch.max_encoded_media_bytes) |limit| {
+            if (next_bytes > limit) {
+                if (end == start) return error.InferenceEncodedBytesExceeded;
+                break;
+            }
+        }
         const item_pixels: u64 = switch (items[end]) {
             .text => 0,
             .binary => |value| if ((try modalityForContentType(value.mime_type)).image)
@@ -4305,12 +4314,6 @@ fn densePartBatchEnd(
         };
         const next_pixels = std.math.add(u64, decoded_pixels, item_pixels) catch
             return error.InferenceDecodedPixelsExceeded;
-        if (capabilities.batch.max_encoded_media_bytes) |limit| {
-            if (next_bytes > limit) {
-                if (end == start) return error.InferenceEncodedBytesExceeded;
-                break;
-            }
-        }
         if (capabilities.batch.max_decoded_pixels) |limit| {
             if (next_pixels > limit) {
                 if (end == start) return error.InferenceDecodedPixelsExceeded;
@@ -4374,7 +4377,10 @@ test "managed embedder admission follows the selected attachment transport" {
 
 test "managed embedder partitions and validates inline image data URIs" {
     const first = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
-    const second = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    // The second payload is valid base64 but not an image. The encoded-byte
+    // window closes before it, proving partitioning does not materialize or
+    // inspect a payload that cannot fit the current invocation.
+    const second = "data:image/png;base64,bm90IGFuIGltYWdl";
     const items = [_]template_mod.ContentPart{
         .{ .media_url = first },
         .{ .media_url = second },

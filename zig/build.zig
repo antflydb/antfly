@@ -7592,6 +7592,7 @@ pub fn build(b: *std.Build) void {
             "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
+            "linked generator validates concrete MIME and decoded pixels",
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware enforces dynamic configuration",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",

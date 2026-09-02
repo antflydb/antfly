@@ -32,6 +32,12 @@ pub const DecodeLimits = antfly_image.DecodeLimits;
 
 pub const EncodedImageInfo = antfly_image.EncodedImageInfo;
 
+pub const supportsMimeEssence = antfly_image.supportsInferenceMimeEssence;
+
+pub fn mimeEssenceForEncoded(bytes: []const u8) ?[]const u8 {
+    return antfly_image.inferenceMimeEssenceForFormat(antfly_image.detectFormat(bytes));
+}
+
 /// Decoded image in HWC u8 format.
 pub const Image = struct {
     data: []u8,
