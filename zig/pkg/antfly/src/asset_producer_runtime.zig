@@ -30,6 +30,11 @@ const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
 const default_local_reader_batch_images: usize = 8;
 const max_asset_provider_timeout_ms: u64 = 300_000;
+const max_asset_provider_response_bytes: usize = 4 << 20;
+const invocation_response_resident_multiplier: usize = 4;
+const invocation_nonmedia_resident_multiplier: usize = 8;
+const invocation_result_bytes_per_item: usize = 1 << 20;
+const invocation_control_bytes_per_item: usize = 4096;
 fn mergeReaderExecution(report: *inference_work.ExecutionReport, chunk: readers.BatchExecution) !void {
     report.requested_items = std.math.add(usize, report.requested_items, chunk.requested_items) catch
         return error.InvalidReadExecutionReport;
@@ -104,6 +109,7 @@ pub const Runtime = struct {
         const client = try alloc.create(httpx.Client);
         errdefer alloc.destroy(client);
         var client_config = httpx.ClientConfig{ .keep_alive = false };
+        client_config.max_response_size = max_asset_provider_response_bytes;
         client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
         client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
         client.* = httpx.Client.initWithConfig(alloc, io, client_config);
@@ -130,7 +136,7 @@ pub const Runtime = struct {
             // A caller-owned HTTP client may not have a finite request timeout,
             // so this borrowed interface cannot advertise the foreground
             // liveness contract.
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .produce_batch_reported = produceBatchReported, .batch_mode = batchMode, .can_produce_batch = canProduceBatch, .capabilities_for_requests = capabilitiesForRequests },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .produce_batch_reported = produceBatchReported, .batch_mode = batchMode, .can_produce_batch = canProduceBatch, .capabilities_for_requests = capabilitiesForRequests, .invocation_memory_for_requests = invocationMemoryForRequests },
         };
     }
 
@@ -144,6 +150,7 @@ pub const Runtime = struct {
                 .batch_mode = batchMode,
                 .can_produce_batch = canProduceBatch,
                 .capabilities_for_requests = capabilitiesForRequests,
+                .invocation_memory_for_requests = invocationMemoryForRequests,
                 .deinit = deinitProducer,
                 .foreground_bounded = true,
                 .foreground_bounded_for_requests = foregroundBoundedForRequests,
@@ -165,6 +172,95 @@ pub const Runtime = struct {
             if (!try self.requestForegroundBounded(alloc, request)) return false;
         }
         return true;
+    }
+
+    fn invocationMemoryForRequests(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+    ) !inference_work.InvocationMemoryPlan {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0) return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
+        if (!requestsShareConfig(requests)) return error.InferenceInvocationMemoryUnavailable;
+
+        var has_media = false;
+        var nonmedia_bytes: usize = 0;
+        for (requests) |request| {
+            has_media = has_media or request.media.len > 0;
+            nonmedia_bytes = std.math.add(usize, nonmedia_bytes, request.config_json.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            nonmedia_bytes = std.math.add(usize, nonmedia_bytes, request.source_text.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            if (request.source_parts_json) |parts| nonmedia_bytes = std.math.add(usize, nonmedia_bytes, parts.len) catch
+                return error.InferenceEncodedBytesExceeded;
+        }
+        if (!has_media) return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = nonmedia_bytes };
+
+        var remote = false;
+        const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
+            .reader => blk: {
+                var parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                remote = !isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl());
+                if (!remote) {
+                    const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    const binary = local.read_encoded_images != null or local.read_encoded_images_reported != null;
+                    if (!binary and local.read_images == null) return error.InferenceInvocationMemoryUnavailable;
+                    break :blk if (binary) .borrowed_binary else .data_uri;
+                }
+                break :blk .data_uri;
+            },
+            .generator => blk: {
+                var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+                defer parsed.deinit(alloc);
+                remote = parsed.generator.url.len > 0 or parsed.generator.provider != .antfly;
+                if (!remote) {
+                    const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    if (local.generate_messages_with_attachments != null) break :blk .borrowed_binary;
+                    if (local.generate_messages == null) return error.InferenceInvocationMemoryUnavailable;
+                    break :blk .data_uri;
+                }
+                // Remote Antfly batches stream one base64 body, but OCR may
+                // recover from a failed batch through the singleton provider
+                // adapter, which retains data URIs. Reserve the larger legal
+                // execution path so fallback cannot escape admission.
+                break :blk .data_uri;
+            },
+            .extractor => blk: {
+                var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+                defer parsed.deinit(alloc);
+                remote = !isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl());
+                if (!remote) {
+                    const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
+                    if (local.extract == null) return error.InferenceInvocationMemoryUnavailable;
+                }
+                break :blk extractorAttachmentTransport(parsed);
+            },
+            // Audio and future family adapters must publish an exact route
+            // before they can participate in bounded media planning.
+            .transcriber, .copy, .document_extraction => return error.InferenceInvocationMemoryUnavailable,
+        };
+
+        var fixed = std.math.mul(usize, nonmedia_bytes, invocation_nonmedia_resident_multiplier) catch
+            return error.InferenceEncodedBytesExceeded;
+        const control = std.math.mul(usize, requests.len, invocation_control_bytes_per_item) catch
+            return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
+        const results = std.math.mul(usize, requests.len, invocation_result_bytes_per_item) catch
+            return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, results) catch return error.InferenceEncodedBytesExceeded;
+        if (remote) {
+            const response_peak = std.math.mul(
+                usize,
+                self.http.maxResponseSize(),
+                invocation_response_resident_multiplier,
+            ) catch return error.InferenceEncodedBytesExceeded;
+            fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
+        }
+        return .{ .attachment_transport = transport, .fixed_bytes = fixed };
     }
 
     fn requestForegroundBounded(self: *Runtime, alloc: Allocator, request: asset_producer.Request) !bool {
@@ -2704,18 +2800,42 @@ fn antflyGenerateBatchRequestJsonAlloc(
     requests: []const asset_producer.Request,
 ) ![]u8 {
     const ContentMetadata = struct {
-        elements_json: []u8,
+        elements_size: usize,
         element_count: usize,
-
-        fn deinit(self: *@This(), allocator: Allocator) void {
-            allocator.free(self.elements_json);
-            self.* = undefined;
-        }
     };
     const Helper = struct {
         fn metadata(allocator: Allocator, request: asset_producer.Request) !ContentMetadata {
-            var out = std.ArrayListUnmanaged(u8).empty;
-            errdefer out.deinit(allocator);
+            var count: usize = 0;
+            var size: usize = 0;
+            if (request.source_parts_json) |raw_parts| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_parts, .{});
+                defer parsed.deinit();
+                if (parsed.value != .array) return error.InvalidGeneratorContentParts;
+                for (parsed.value.array.items) |part| {
+                    if (part != .object) continue;
+                    const type_value = part.object.get("type") orelse continue;
+                    if (type_value != .string or std.mem.eql(u8, type_value.string, "metadata")) continue;
+                    const encoded = try std.json.Stringify.valueAlloc(allocator, part, .{});
+                    defer allocator.free(encoded);
+                    if (count > 0) try addSize(&size, 1);
+                    try addSize(&size, encoded.len);
+                    count += 1;
+                }
+            }
+            if (count == 0 and request.media.len == 0 and request.source_parts_json != null and request.source_text.len > 0) {
+                try addSize(&size, "{\"type\":\"text\",\"text\":".len);
+                try addSize(&size, try jsonStringSize(request.source_text));
+                try addSize(&size, 1);
+                count = 1;
+            }
+            return .{ .elements_size = size, .element_count = count };
+        }
+
+        fn writeElements(
+            allocator: Allocator,
+            writer: *std.Io.Writer,
+            request: asset_producer.Request,
+        ) !usize {
             var count: usize = 0;
             if (request.source_parts_json) |raw_parts| {
                 var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_parts, .{});
@@ -2725,24 +2845,19 @@ fn antflyGenerateBatchRequestJsonAlloc(
                     if (part != .object) continue;
                     const type_value = part.object.get("type") orelse continue;
                     if (type_value != .string or std.mem.eql(u8, type_value.string, "metadata")) continue;
-                    if (count > 0) try out.append(allocator, ',');
-                    const encoded = try std.json.Stringify.valueAlloc(allocator, part, .{});
-                    defer allocator.free(encoded);
-                    try out.appendSlice(allocator, encoded);
+                    if (count > 0) try writer.writeByte(',');
+                    var stringify: std.json.Stringify = .{ .writer = writer };
+                    try stringify.write(part);
                     count += 1;
                 }
             }
             if (count == 0 and request.media.len == 0 and request.source_parts_json != null and request.source_text.len > 0) {
-                const encoded = try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"type\":\"text\",\"text\":{f}}}",
-                    .{std.json.fmt(request.source_text, .{})},
-                );
-                defer allocator.free(encoded);
-                try out.appendSlice(allocator, encoded);
+                try writer.writeAll("{\"type\":\"text\",\"text\":");
+                try writeJsonString(writer, request.source_text);
+                try writer.writeByte('}');
                 count = 1;
             }
-            return .{ .elements_json = try out.toOwnedSlice(allocator), .element_count = count };
+            return count;
         }
 
         fn jsonStringSize(value: []const u8) !usize {
@@ -2793,17 +2908,6 @@ fn antflyGenerateBatchRequestJsonAlloc(
         }
     };
 
-    const metadata = try alloc.alloc(ContentMetadata, requests.len);
-    var metadata_count: usize = 0;
-    defer {
-        for (metadata[0..metadata_count]) |*item| item.deinit(alloc);
-        alloc.free(metadata);
-    }
-    for (requests, 0..) |request, i| {
-        metadata[i] = try Helper.metadata(alloc, request);
-        metadata_count += 1;
-    }
-
     const model_json = try std.json.Stringify.valueAlloc(alloc, cfg.model, .{});
     defer alloc.free(model_json);
     var options = std.ArrayListUnmanaged(u8).empty;
@@ -2822,14 +2926,15 @@ fn antflyGenerateBatchRequestJsonAlloc(
     const messages_prefix = ",\"messages\":[{\"role\":\"user\",\"content\":";
     const item_suffix = "}]";
     var exact_size: usize = outer_prefix.len + "]}".len;
-    for (requests, metadata, 0..) |request, item_metadata, i| {
+    for (requests, 0..) |request, i| {
+        const item_metadata = try Helper.metadata(alloc, request);
         if (i > 0) try Helper.addSize(&exact_size, 1);
         try Helper.addSize(&exact_size, item_prefix.len + std.fmt.count("{d}", .{i}) + body_prefix.len);
         try Helper.addSize(&exact_size, model_json.len + messages_prefix.len);
         if (request.source_parts_json == null and request.media.len == 0) {
             try Helper.addSize(&exact_size, try Helper.jsonStringSize(request.source_text));
         } else {
-            try Helper.addSize(&exact_size, 2 + item_metadata.elements_json.len);
+            try Helper.addSize(&exact_size, 2 + item_metadata.elements_size);
             var emitted = item_metadata.element_count;
             for (request.media) |media| {
                 if (emitted > 0) try Helper.addSize(&exact_size, 1);
@@ -2846,7 +2951,7 @@ fn antflyGenerateBatchRequestJsonAlloc(
     var output: std.Io.Writer.Allocating = try .initCapacity(alloc, exact_size);
     defer output.deinit();
     try output.writer.writeAll(outer_prefix);
-    for (requests, metadata, 0..) |request, item_metadata, i| {
+    for (requests, 0..) |request, i| {
         if (i > 0) try output.writer.writeByte(',');
         try output.writer.writeAll(item_prefix);
         try output.writer.print("{d}", .{i});
@@ -2857,11 +2962,9 @@ fn antflyGenerateBatchRequestJsonAlloc(
             try Helper.writeJsonString(&output.writer, request.source_text);
         } else {
             try output.writer.writeByte('[');
-            if (item_metadata.element_count > 0) {
-                try output.writer.writeAll(item_metadata.elements_json);
-            }
+            const element_count = try Helper.writeElements(alloc, &output.writer, request);
             for (request.media, 0..) |media, media_index| {
-                if (item_metadata.element_count > 0 or media_index > 0) try output.writer.writeByte(',');
+                if (element_count > 0 or media_index > 0) try output.writer.writeByte(',');
                 try output.writer.writeAll("{\"type\":\"media\",\"mime_type\":");
                 try Helper.writeJsonString(&output.writer, media.mime_type);
                 try output.writer.writeAll(",\"data\":");

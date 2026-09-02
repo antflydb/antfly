@@ -219,9 +219,9 @@ pub const AttachmentTransport = enum {
     }
 
     /// Peak media bytes retained while a raw attachment is materialized for
-    /// this transport. HTTP adapters are required to build a single request
-    /// body directly; request-envelope overhead is separately charged to the
-    /// caller's allocator. Borrowed execution adds no transport copy.
+    /// this transport. Base64-payload adapters write one request body directly;
+    /// data-URI compatibility adapters retain the URI while a downstream
+    /// provider serializes it. Borrowed execution adds no transport copy.
     pub fn peakResidentSize(
         self: AttachmentTransport,
         raw_bytes: usize,
@@ -229,8 +229,11 @@ pub const AttachmentTransport = enum {
     ) !usize {
         if (self == .borrowed_binary) return raw_bytes;
         const wire_bytes = try self.wireSize(raw_bytes, mime_type_len);
-        return std.math.add(usize, raw_bytes, wire_bytes) catch
-            error.InferenceEncodedBytesExceeded;
+        const retained_wire = if (self == .data_uri)
+            std.math.mul(usize, wire_bytes, 2) catch return error.InferenceEncodedBytesExceeded
+        else
+            wire_bytes;
+        return std.math.add(usize, raw_bytes, retained_wire) catch error.InferenceEncodedBytesExceeded;
     }
 
     /// Conservative aggregate wire size for `item_count` separately encoded
@@ -270,8 +273,13 @@ pub const AttachmentTransport = enum {
     ) !usize {
         if (self == .borrowed_binary) return raw_bytes;
         const wire_bytes = try self.batchWireSizeUpperBound(raw_bytes, mime_type_len, item_count);
-        return std.math.add(usize, raw_bytes, wire_bytes) catch
-            error.InferenceEncodedBytesExceeded;
+        // URI adapters retain the encoded URI while their downstream provider
+        // serializes it into a JSON request body. Account for both copies.
+        const retained_wire = if (self == .data_uri)
+            std.math.mul(usize, wire_bytes, 2) catch return error.InferenceEncodedBytesExceeded
+        else
+            wire_bytes;
+        return std.math.add(usize, raw_bytes, retained_wire) catch error.InferenceEncodedBytesExceeded;
     }
 
     /// Largest raw attachment aggregate satisfying both the provider's wire
@@ -304,6 +312,17 @@ pub const AttachmentTransport = enum {
         }
         return low;
     }
+};
+
+/// Complete route-owned memory contract for one invocation. `fixed_bytes`
+/// excludes the caller-retained raw attachments and the representation
+/// described by `attachment_transport`; it includes every other bounded peak
+/// (request envelopes, parser/transport scratch, response bodies, and typed
+/// results). Media planners must obtain this from the resolved executor rather
+/// than guessing from a provider or model family.
+pub const InvocationMemoryPlan = struct {
+    attachment_transport: AttachmentTransport,
+    fixed_bytes: usize,
 };
 
 pub const InlineDataUri = struct {
@@ -631,6 +650,10 @@ test "attachment transport separates wire and peak resident representations" {
         try AttachmentTransport.data_uri.wireSize(3, "image/png".len),
     );
     try std.testing.expectEqual(@as(usize, 7), try AttachmentTransport.base64_payload.peakResidentSize(3, 0));
+    try std.testing.expectEqual(
+        @as(usize, 3 + 2 * "data:image/png;base64,AQID".len),
+        try AttachmentTransport.data_uri.peakResidentSize(3, "image/png".len),
+    );
     try std.testing.expectEqual(@as(usize, 3), try AttachmentTransport.base64_payload.maxRawBytesForLimits(0, 1, 4, 7));
     try std.testing.expectEqual(@as(usize, 0), try AttachmentTransport.base64_payload.maxRawBytesForLimits(0, 1, 3, 7));
     try std.testing.expectEqual(@as(usize, 12), try AttachmentTransport.base64_payload.batchWireSizeUpperBound(6, 0, 2));

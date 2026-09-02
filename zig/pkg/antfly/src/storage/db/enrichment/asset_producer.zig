@@ -167,6 +167,13 @@ pub const Producer = struct {
         batch_mode: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!inference_work.BatchMode = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         capabilities_for_requests: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!?inference_work.InferenceCapabilities = null,
+        /// Complete peak-memory contract for the concrete route selected by
+        /// these requests. Required for invocations containing media.
+        invocation_memory_for_requests: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+        ) anyerror!inference_work.InvocationMemoryPlan = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         /// See embedder.DenseEmbedder.foreground_bounded. This is deliberately
         /// opt-in so a custom callback cannot silently defeat the write
@@ -257,6 +264,19 @@ pub const Producer = struct {
         return result;
     }
 
+    pub fn invocationMemoryForRequests(
+        self: Producer,
+        alloc: Allocator,
+        requests: []const Request,
+    ) !inference_work.InvocationMemoryPlan {
+        const resolve = self.vtable.invocation_memory_for_requests orelse {
+            for (requests) |request| if (request.media.len > 0)
+                return error.InferenceInvocationMemoryUnavailable;
+            return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 0 };
+        };
+        return try resolve(self.ptr, alloc, requests);
+    }
+
     pub fn deinit(self: Producer, alloc: Allocator) void {
         if (self.vtable.deinit) |deinit_fn| deinit_fn(self.ptr, alloc);
     }
@@ -287,6 +307,31 @@ test "asset producer parses document extraction config" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(ProducerType.document_extraction, cfg.type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"routes\"") != null);
+}
+
+test "asset producer media invocation memory fails closed without route contract" {
+    const Stub = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, _: Request) ![]u8 {
+            return try alloc.alloc(u8, 0);
+        }
+    };
+    var context: u8 = 0;
+    const producer = Producer{
+        .ptr = &context,
+        .vtable = &.{ .produce = Stub.produce },
+    };
+    const media = [_]EncodedMedia{.{ .bytes = &.{1}, .mime_type = "image/png" }};
+    const request = Request{
+        .producer_type = .reader,
+        .config_json = "{}",
+        .source_text = "",
+        .inline_media_trusted = true,
+        .media = &media,
+    };
+    try std.testing.expectError(
+        error.InferenceInvocationMemoryUnavailable,
+        producer.invocationMemoryForRequests(std.testing.allocator, &.{request}),
+    );
 }
 
 test "asset producer parses extractor config" {

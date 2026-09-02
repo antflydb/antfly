@@ -585,6 +585,12 @@ pub const Client = struct {
         };
     }
 
+    /// Hard response-body ceiling applied by this client. Higher-level
+    /// resource planners use the same value to reserve parser/response peaks.
+    pub fn maxResponseSize(self: *const Self) usize {
+        return self.config.max_response_size;
+    }
+
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
         self.interceptors.deinit(self.allocator);

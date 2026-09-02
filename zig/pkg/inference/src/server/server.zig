@@ -14471,7 +14471,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
     }
     try std.testing.expect(found);
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i64, 2), resolved.object.get("version").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
     try std.testing.expectEqualStrings("native", resolved.object.get("batch").?.object.get("mode").?.string);
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
@@ -14522,8 +14522,10 @@ test "normalized inference capabilities cover every model family" {
         const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(case.task, resolved.object.get("task").?.string);
         const batch = resolved.object.get("batch").?.object;
-        if (std.mem.eql(u8, case.task, "read") or std.mem.eql(u8, case.task, "generate") or std.mem.eql(u8, case.task, "embed")) {
+        const expected_max_items = resolvedTaskMaxItems(case.task);
+        if (expected_max_items > 1) {
             try std.testing.expect(batch.get("max_items").?.integer > 1);
+            try std.testing.expect(!std.mem.eql(u8, "none", batch.get("mode").?.string));
         } else {
             try std.testing.expectEqualStrings("none", batch.get("mode").?.string);
             try std.testing.expectEqual(@as(i64, 1), batch.get("max_items").?.integer);
@@ -21585,30 +21587,117 @@ const DecodedDataUri = struct {
 };
 
 fn decodeDataUri(allocator: std.mem.Allocator, uri: []const u8) !DecodedDataUri {
-    // Expect: data:<mime>;base64,<data>
-    const prefix = "data:";
-    if (!std.mem.startsWith(u8, uri, prefix)) return error.InvalidDataUri;
-
-    const b64_marker = ";base64,";
-    const marker_pos = std.mem.indexOf(u8, uri, b64_marker) orelse return error.InvalidDataUri;
-    const mime_start = prefix.len;
-    const mime_raw = uri[mime_start..marker_pos];
-    const b64_start = marker_pos + b64_marker.len;
-    const b64_data = uri[b64_start..];
-
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return error.InvalidBase64;
+    const parsed = try parseDataUri(uri);
+    const decoded_len = try parsed.decodedSize();
     const decoded = try allocator.alloc(u8, decoded_len);
     errdefer allocator.free(decoded);
-
-    std.base64.standard.Decoder.decode(decoded, b64_data) catch return error.InvalidBase64;
+    switch (parsed.encoding) {
+        .base64 => std.base64.standard.Decoder.decode(decoded, parsed.payload) catch return error.InvalidBase64,
+        .percent => {
+            var source_index: usize = 0;
+            var output_index: usize = 0;
+            while (source_index < parsed.payload.len) : (output_index += 1) {
+                if (parsed.payload[source_index] == '%') {
+                    const high = hexValue(parsed.payload[source_index + 1]) orelse return error.InvalidDataUri;
+                    const low = hexValue(parsed.payload[source_index + 2]) orelse return error.InvalidDataUri;
+                    decoded[output_index] = (high << 4) | low;
+                    source_index += 3;
+                } else {
+                    decoded[output_index] = parsed.payload[source_index];
+                    source_index += 1;
+                }
+            }
+        },
+    }
     return .{
-        .mime_type = if (mime_raw.len == 0) null else mime_raw,
+        .mime_type = if (parsed.mime_type.len == 0) null else parsed.mime_type,
         .data = decoded,
     };
 }
 
+const ParsedDataUri = struct {
+    mime_type: []const u8,
+    payload: []const u8,
+    encoding: enum { base64, percent },
+
+    fn decodedSize(self: @This()) !usize {
+        if (self.encoding == .base64)
+            return validateCanonicalDataUriBase64(self.payload);
+        var size: usize = 0;
+        var index: usize = 0;
+        while (index < self.payload.len) {
+            if (self.payload[index] == '%') {
+                if (index + 2 >= self.payload.len or
+                    hexValue(self.payload[index + 1]) == null or
+                    hexValue(self.payload[index + 2]) == null)
+                    return error.InvalidDataUri;
+                index += 3;
+            } else {
+                index += 1;
+            }
+            size = std.math.add(usize, size, 1) catch return error.InvalidDataUri;
+        }
+        return size;
+    }
+};
+
+fn base64Index(byte: u8) ?u8 {
+    return switch (byte) {
+        'A'...'Z' => byte - 'A',
+        'a'...'z' => byte - 'a' + 26,
+        '0'...'9' => byte - '0' + 52,
+        '+' => 62,
+        '/' => 63,
+        else => null,
+    };
+}
+
+fn validateCanonicalDataUriBase64(payload: []const u8) !usize {
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(payload) catch
+        return error.InvalidBase64;
+    var padding: usize = 0;
+    while (padding < payload.len and payload[payload.len - 1 - padding] == '=') : (padding += 1) {}
+    if (padding > 2) return error.InvalidBase64;
+    const content_end = payload.len - padding;
+    for (payload[0..content_end]) |byte| _ = base64Index(byte) orelse return error.InvalidBase64;
+    for (payload[content_end..]) |byte| if (byte != '=') return error.InvalidBase64;
+    if (padding == 1) {
+        if (content_end < 3 or (base64Index(payload[content_end - 1]).? & 0x03) != 0)
+            return error.InvalidBase64;
+    } else if (padding == 2) {
+        if (content_end < 2 or (base64Index(payload[content_end - 1]).? & 0x0f) != 0)
+            return error.InvalidBase64;
+    }
+    return decoded_size;
+}
+
+fn hexValue(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn parseDataUri(uri: []const u8) !ParsedDataUri {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return error.InvalidDataUri;
+    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return error.InvalidDataUri;
+    const metadata = uri["data:".len..comma];
+    const is_base64 = std.ascii.endsWithIgnoreCase(metadata, ";base64");
+    const mime_type = if (is_base64) metadata[0 .. metadata.len - ";base64".len] else metadata;
+    const mime_end = std.mem.indexOfScalar(u8, mime_type, ';') orelse mime_type.len;
+    if (std.mem.trim(u8, mime_type[0..mime_end], &std.ascii.whitespace).len == 0)
+        return error.InvalidDataUri;
+    return .{
+        .mime_type = mime_type,
+        .payload = uri[comma + 1 ..],
+        .encoding = if (is_base64) .base64 else .percent,
+    };
+}
+
 fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataUri {
-    if (std.mem.startsWith(u8, data, "data:")) return try decodeDataUri(allocator, data);
+    if (std.ascii.startsWithIgnoreCase(data, "data:")) return try decodeDataUri(allocator, data);
 
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch return error.InvalidBase64;
     const decoded = try allocator.alloc(u8, decoded_len);
@@ -21621,23 +21710,35 @@ fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataU
 }
 
 fn decodedMediaDataSize(data: []const u8) !usize {
-    const encoded = if (std.mem.startsWith(u8, data, "data:")) blk: {
-        const marker = ";base64,";
-        const marker_pos = std.mem.indexOf(u8, data, marker) orelse return error.InvalidDataUri;
-        break :blk data[marker_pos + marker.len ..];
-    } else data;
-    return std.base64.standard.Decoder.calcSizeForSlice(encoded) catch error.InvalidBase64;
+    if (std.ascii.startsWithIgnoreCase(data, "data:")) return (try parseDataUri(data)).decodedSize();
+    return std.base64.standard.Decoder.calcSizeForSlice(data) catch error.InvalidBase64;
 }
 
 fn encodedMediaBudgetSize(data: []const u8) !usize {
     // Size data URIs independently of their transfer encoding. The scraping
     // layer accepts both base64 and percent-encoded payloads, and both must be
     // admitted by their resident request-body footprint before decoding.
-    if (std.mem.startsWith(u8, data, "data:")) {
+    if (std.ascii.startsWithIgnoreCase(data, "data:")) {
         const comma = std.mem.indexOfScalar(u8, data, ',') orelse return error.InvalidDataUri;
         return if (comma + 1 == data.len) 0 else data.len;
     }
     return if (data.len == 0) 0 else data.len;
+}
+
+test "inference media decoder accepts complete RFC 2397 data URIs" {
+    const alloc = std.testing.allocator;
+    var percent = try decodeDataUri(alloc, "data:image/png;charset=binary,%89PNG%0a");
+    defer percent.deinit(alloc);
+    try std.testing.expectEqualStrings("image/png;charset=binary", percent.mime_type.?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\n' }, percent.data);
+    try std.testing.expectEqual(@as(usize, 5), try decodedMediaDataSize("DATA:image/png,%89PNG%0a"));
+
+    var base64 = try decodeDataUri(alloc, "data:image/png;charset=binary;BASE64,iVBORwo=");
+    defer base64.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\n' }, base64.data);
+    try std.testing.expectError(error.InvalidDataUri, decodeDataUri(alloc, "data:image/png,%8"));
+    try std.testing.expectError(error.InvalidDataUri, decodeDataUri(alloc, "data:;base64,AQID"));
+    try std.testing.expectError(error.InvalidBase64, decodeDataUri(alloc, "data:image/png;base64,YR=="));
 }
 
 fn decodeDataUriWithBudget(

@@ -760,25 +760,56 @@ document. They are architectural requirements, not Florence-specific cleanup:
     percent-encoded payloads. The common non-materializing parser now accepts
     both encodings,
     extracts the media-type essence for capability checks, validates every
-    percent escape or canonical base64 quantum, and reports decoded size.
-    Reader and embedder admission use that same parser, so distributed and
-    linked routes no longer disagree before invocation.
+    percent escape or canonical base64 quantum, and reports decoded size. The
+    inference-node direct-media decoder now implements the same complete RFC
+    2397 surface, including case-insensitive scheme/encoding tokens, MIME
+    parameters, and percent payloads. Reader and embedder admission therefore
+    cannot accept an inline value that fails only after distributed dispatch.
 74. **Remote generator batching retained several full attachment copies.** The
     previous adapter allocated base64 for each image, formatted another complete
     content part, accumulated a per-item content array, formatted each request,
-    and finally copied all requests into the batch body. The adapter now prepares
-    only small non-media metadata, computes the exact final JSON size with
-    overflow checks, allocates that body once, and streams base64 directly into
-    it. A final length assertion makes serializer drift fail closed. Allocation-
-    failure coverage exercises every preparation and final-body allocation.
+    and finally copied all requests into the batch body. The adapter now makes
+    a measurement pass over each request without retaining canonical content
+    copies, allocates the exact final JSON body once, reparses one request at a
+    time, and writes its content plus base64 directly into that body. A final
+    length assertion makes serializer drift fail closed. Allocation-failure
+    coverage exercises both passes and the final-body allocation.
 75. **Dense JSON response cleanup leaked earlier vectors after a later
     allocation failed.** The parser now tracks the initialized vector prefix and
     releases it together with the outer vector array on every error. Exhaustive
     allocation-failure testing covers both parsing and per-vector duplication.
+76. **PDF OCR still used a fixed four-times-PNG heuristic.** Reader and
+    generator producers now expose the same route-owned
+    `InvocationMemoryPlan` used by multimodal embedding. Before rendering a
+    window, the planner builds attachment-size-independent request prototypes,
+    resolves the concrete transport and fixed peak, releases the prototypes,
+    and inverses both provider wire and resident-memory limits. The fixed peak
+    charges non-media request parsing/serialization, bounded response/parser
+    storage, result storage, and control allocations; no provider-name test or
+    Florence-specific multiplier selects the budget.
+77. **A data-URI adapter was charged for only one encoded copy.** The reader
+    compatibility route retains the generated URI while its downstream
+    provider serializes the URI into JSON. `AttachmentTransport.data_uri` now
+    represents raw bytes plus both encoded copies at peak. Borrowed binary and
+    a base64-only streaming executor retain their lower concrete peaks. A
+    remote generator producer that can recover through a data-URI singleton
+    adapter reserves the larger fallback peak even though its normal Antfly
+    batch writes one base64 body.
+78. **Optional embedder memory hooks silently implied borrowed media.** The
+    part-item embedding path now fails closed with
+    `InferenceInvocationMemoryUnavailable` unless its concrete implementation
+    publishes a plan. The managed ClipClap/remote embedding implementation
+    supplies one; adding a new multimodal embedder can no longer accidentally
+    bypass wire and response accounting.
+79. **Remote response memory had no matching transport ceiling.** The owned
+    asset-producer HTTP client now applies a four-MiB response-body limit, and
+    its invocation plan reads the actual client ceiling when reserving response
+    and parser memory. A caller-supplied client keeps its own ceiling, which is
+    reflected by the same route plan rather than overwritten or guessed.
 
 ### Post-review implementation contract
 
-The hardening above follows four long-term rules:
+The hardening above follows these long-term rules:
 
 - A capability snapshot is resolved once per runtime/model/task/auth scope and
   reused by planning and execution. The current implementation uses a bounded
@@ -791,10 +822,13 @@ The hardening above follows four long-term rules:
 - Every executor owns final admission. Remote read and generation calls and
   multimodal embedding calls are split at both model item and encoded-byte
   ceilings. A single item larger than the model ceiling fails before transport.
-- Admission receives the executor-selected attachment representation rather
-  than inferring it from model capabilities. Linked callbacks charge borrowed
-  bytes, remote generator/embedder/extractor payloads charge exact base64
-  expansion, and remote reader adapters charge the complete data URI. Provider
+- Admission receives an executor-owned `InvocationMemoryPlan`, containing the
+  selected attachment representation and the complete attachment-independent
+  peak. Media-capable producer and part-item embedder implementations fail
+  closed when this plan is absent rather than inferring it from model
+  capabilities. Linked callbacks charge borrowed bytes, base64 transports
+  charge exact expansion, and data-URI adapters charge the complete URI plus
+  its downstream serialized copy. Provider
   wire ceilings and process resident ceilings are distinct: render planning
   reserves retained raw media, one concrete transport body, and the complete
   route-specific fixed peak for envelopes, responses, parsing, typed results,
@@ -978,6 +1012,16 @@ The hardening above follows four long-term rules:
     descriptors are validated before singleton publication or intersection;
     legacy task semantics and extractor pixel ceilings match the concrete
     executors.
+31. **Implemented after invocation-memory review:** reader, generator, extractor,
+    and part-item embedder routes publish a shared invocation-memory plan. PDF
+    OCR and visual embedding form render windows from that plan, data-URI
+    adaptation charges its retained URI and downstream JSON copy, and missing
+    media plans fail closed.
+32. **Implemented after serialization/URI review:** Antfly generation batches
+    measure then directly emit non-metadata content without retaining a
+    canonical copy for every request; base64 is written into the one exact body.
+    Direct inference-node media decoding accepts the same validated RFC 2397
+    base64 and percent forms as host preflight.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

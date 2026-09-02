@@ -32,13 +32,7 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
-pub const DensePartInvocationMemory = struct {
-    attachment_transport: inference_work.AttachmentTransport,
-    /// Peak bytes other than retained raw attachments and their encoded media
-    /// representation. This includes request envelopes, transport/control
-    /// scratch, bounded response bodies, parser state, and typed outputs.
-    fixed_bytes: usize,
-};
+pub const DensePartInvocationMemory = inference_work.InvocationMemoryPlan;
 pub const DensePartInvocationMemoryFn = *const fn (
     ptr: *anyopaque,
     embedding_name: []const u8,
@@ -120,8 +114,9 @@ pub const DenseEmbedder = struct {
     }
 
     /// Return the concrete route's complete non-media peak and attachment
-    /// representation. In-process implementations default to borrowed input
-    /// plus the exact vector output and small bounded control storage.
+    /// representation. A media-capable implementation must publish this
+    /// contract: silently assuming borrowed input would make admission depend
+    /// on an implementation detail that can change at runtime.
     pub fn partInvocationMemory(
         self: DenseEmbedder,
         embedding_name: []const u8,
@@ -129,19 +124,8 @@ pub const DenseEmbedder = struct {
         mime_type: []const u8,
         dims: u32,
     ) !DensePartInvocationMemory {
-        const memory_fn = self.part_invocation_memory_fn orelse {
-            const vector_values = std.math.mul(usize, item_count, @as(usize, dims)) catch
-                return error.InferenceEncodedBytesExceeded;
-            const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
-                return error.InferenceEncodedBytesExceeded;
-            const item_bytes = std.math.mul(usize, item_count, 256) catch
-                return error.InferenceEncodedBytesExceeded;
-            return .{
-                .attachment_transport = .borrowed_binary,
-                .fixed_bytes = std.math.add(usize, vector_bytes, item_bytes) catch
-                    return error.InferenceEncodedBytesExceeded,
-            };
-        };
+        const memory_fn = self.part_invocation_memory_fn orelse
+            return error.InferenceInvocationMemoryUnavailable;
         return try memory_fn(self.ptr, embedding_name, item_count, mime_type, dims);
     }
 
