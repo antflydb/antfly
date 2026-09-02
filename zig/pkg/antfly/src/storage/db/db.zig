@@ -876,6 +876,10 @@ pub const QueryVisibilityChange = enum {
     publish,
     publish_consistent,
     publish_blocking,
+    /// The primary source replay target advanced at a durable commit
+    /// boundary. This is convergence-only: it must not revoke an already
+    /// published serving generation.
+    target_advanced,
     index_repair_pending,
     index_repair_cleared,
     /// An exact derived watermark advanced far enough to wake a resident
@@ -917,6 +921,7 @@ pub const IndexRepairVisibility = struct {
 pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
     repair: ?IndexRepairVisibility = null,
+    target_sequence: ?u64 = null,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -4904,6 +4909,18 @@ pub const DB = struct {
         notifyQueryVisibilityEvent(ctx, .{ .change = change });
     }
 
+    fn notifyQueryVisibilityTargetAdvanced(ctx: *AsyncContext, target_sequence: u64) void {
+        notifyQueryVisibilityEvent(ctx, .{
+            .change = .target_advanced,
+            .target_sequence = target_sequence,
+        });
+    }
+
+    fn notifyQueryVisibilityTargetAdvancedContext(ctx: *const BatchExecutionContext, target_sequence: u64) void {
+        if (ctx.async_context) |async_ctx|
+            notifyQueryVisibilityTargetAdvanced(async_ctx, target_sequence);
+    }
+
     fn notifyIndexRepairVisibilityHook(
         ctx: *AsyncContext,
         change: QueryVisibilityChange,
@@ -6995,6 +7012,7 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
 
         var pressure_ctx = self.batchContext();
         try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
@@ -7949,6 +7967,8 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        if (append_derived_replay)
+            notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
         releaseHAMutationShared(&ha_mutation);
         if (!opts.bypass_ha_write_gate) {
             const ha_ctx = self.batchContext();
@@ -10099,6 +10119,7 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -21655,6 +21676,7 @@ pub const DB = struct {
         };
 
         if (retirement_sequence) |sequence| {
+            notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
             self.executor.notifySequence(sequence);
             self.notifyResolverReplayRuntimesForced(sequence);
             try self.runUntilIdle();
@@ -21904,6 +21926,7 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -41284,6 +41307,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
+    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
@@ -41362,6 +41386,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     apply_mutex_held = false;
     if (snapshot_replay) |*lease| lease.release();
     snapshot_replay = null;
+    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -41382,6 +41407,7 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
     defer ctx.alloc.free(payload);
 
     try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -43041,6 +43067,7 @@ fn appendResolutionRecordWithHook(
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
+    DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
 
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
@@ -43768,6 +43795,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
+    DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -51337,6 +51365,7 @@ fn markSplitOffDocumentArtifactChildRangesLocked(
         .sequence = sequence,
         .payload = replay_payload,
     });
+    DB.notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
     self.mirrorHAReplayPayloadBestEffort(replay_payload);
     if (shouldAppendSplitDelta(self)) {
         try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
@@ -59646,6 +59675,49 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
+}
+
+test "db source commit publishes exact target observation sequence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+
+    const HookCtx = struct {
+        target_calls: u64 = 0,
+        target_sequence: u64 = 0,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.target_calls += 1;
+            self.target_sequence = event.target_sequence orelse 0;
+        }
+    };
+    var hook_ctx = HookCtx{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = HookCtx.onChange,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), hook_ctx.target_calls);
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), hook_ctx.target_sequence);
+    try std.testing.expect(hook_ctx.target_sequence > 0);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {

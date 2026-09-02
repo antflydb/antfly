@@ -12611,10 +12611,22 @@ pub const ProvisionedTableWriteSource = struct {
             .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
                 _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
             },
-            .activity, .index_repair_progress => {},
+            .activity, .target_advanced, .index_repair_progress => {},
             else => {},
         };
         switch (event.change) {
+            .target_advanced => {
+                if (self.runtime_status_cache) |cache| {
+                    cache.markGroupTargetObservationPending(
+                        table_name,
+                        group_id,
+                        event.target_sequence,
+                    );
+                }
+                self.markWriteCacheRefreshPending(table_name);
+                self.notifyLocalChange(table_name, .runtime_status);
+                return;
+            },
             .index_repair_progress => {
                 // The DB scheduler already matched this edge to an exact
                 // revision-scoped progress wait. Initial materialization stays
@@ -12677,7 +12689,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return;
             },
             .status => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, false)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, false)) return;
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
                         self.notifyLocalChange(table_name, .data);
@@ -12698,7 +12710,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return;
             },
             .publish => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, true)) return;
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
                         self.invalidateReadCache(table_name);
@@ -12707,12 +12719,11 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 }
-                if (self.runtime_status_cache) |cache|
-                    cache.markGroupTargetObservationPending(table_name, group_id);
+                self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
                 self.markWriteCacheRefreshPending(table_name);
             },
             .publish_consistent => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, true)) return;
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
                         var published = true;
@@ -12727,19 +12738,18 @@ pub const ProvisionedTableWriteSource = struct {
                             }
                         };
                         if (published) _ = self.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
-                        if (!published) snapshot_cache.markGroupTargetObservationPending(table_name, group_id);
+                        if (!published) self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
                         self.invalidateReadCache(table_name);
                         self.markWriteCacheRefreshPending(table_name);
                         self.notifyLocalChange(table_name, .data);
                         return;
                     }
                 }
-                if (self.runtime_status_cache) |cache|
-                    cache.markGroupTargetObservationPending(table_name, group_id);
+                self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
                 self.markWriteCacheRefreshPending(table_name);
             },
             .publish_blocking => {
-                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return;
+                if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, true)) return;
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
                         publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
@@ -12764,7 +12774,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateRuntimeStatusCache(table_name);
                 self.markWriteCacheRefreshPending(table_name);
             },
-            .invalidate => if (self.deferManagedRuntimeStatusPublication(table_name, group_id, true)) return,
+            .invalidate => if (self.deferManagedRuntimeStatusPublication(table_name, group_id, db, true)) return,
         }
         self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .data);
@@ -12784,6 +12794,7 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
+        db: ?*db_mod.DB,
         invalidate_reads: bool,
     ) bool {
         // Query-visibility hooks run on DB/index workers. Sampling whole-DB
@@ -12795,12 +12806,26 @@ pub const ProvisionedTableWriteSource = struct {
         // an accepted target may have advanced. Fence completion immediately;
         // the owner publication below will restore the proof together with the
         // exact replay target. Serving authority is not touched.
-        if (invalidate_reads) if (self.runtime_status_cache) |cache|
-            cache.markGroupTargetObservationPending(table_name, group_id);
+        if (invalidate_reads)
+            self.markGroupTargetObservationPendingBestEffort(table_name, group_id, db);
         self.markWriteCacheRefreshPending(table_name);
         if (invalidate_reads) self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .runtime_status);
         return true;
+    }
+
+    fn markGroupTargetObservationPendingBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        db: ?*db_mod.DB,
+    ) void {
+        const cache = self.runtime_status_cache orelse return;
+        cache.markGroupTargetObservationPending(
+            table_name,
+            group_id,
+            if (db) |managed_db| managed_db.core.nextDerivedSequence() else null,
+        );
     }
 
     fn invalidateWriteCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -27977,10 +28002,15 @@ fn publishRuntimeStatusGroupAfterObservation(
     // refresh from rejecting a lifecycle-completion hook without allowing a
     // retired writer to cross a table/root epoch.
     runTestBeforeRuntimeStatusPublishHook();
-    const completed = try snapshot_cache.capturePublicationToken(table_name);
+    var completed = try snapshot_cache.capturePublicationToken(table_name);
     if (!std.meta.eql(publication_fence.table_epoch, completed.table_epoch)) {
         return error.RuntimeStatusPublicationFenced;
     }
+    // Observation ordering and target authority have different boundaries.
+    // The completed token orders this publication after concurrent cache
+    // writers, while only the token captured before DB sampling can prove
+    // that no target-advance event raced the sampled durable sequence.
+    completed.target_observation_revision = publication_fence.target_observation_revision;
     try acceptRuntimeStatusPublication(try snapshot_cache.publishGroup(completed, table_name, status));
     // Exercise and document the real concurrency boundary: lifecycle edges
     // may arrive after cache publication but before handoff settlement.
@@ -28019,6 +28049,18 @@ fn runtimeStatusNeedsAuthoritativeLifecycleRefresh(status: runtime_status.LocalT
     return false;
 }
 
+fn observedSourceTargetSequence(stats: db_mod.types.DBStats) u64 {
+    var target = @max(
+        stats.doc_identity.max_created_generation,
+        stats.doc_identity.max_deleted_generation,
+    );
+    for (stats.indexes) |item| {
+        target = @max(target, item.replay_target_sequence);
+        for (item.source_replay) |source| target = @max(target, source.target_sequence);
+    }
+    return target;
+}
+
 fn markRuntimeStatusFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     phase: db_mod.types.StartupCatchUpPhase,
@@ -28033,6 +28075,8 @@ fn markRuntimeStatusFromDb(
             .fresh
         else
             startupRuntimeStatusFreshness(phase),
+        .target_observation_revision = observedSourceTargetSequence(status.stats),
+        .target_observation_complete = true,
     });
 }
 
@@ -28437,6 +28481,7 @@ fn setRuntimeStatusMetadata(
     freshness: runtime_status.RuntimeStatusFreshness,
 ) void {
     status.relabel(source, freshness, platform_time.monotonicNs());
+    status.metadata.target_observation_revision = observedSourceTargetSequence(status.stats);
     status.metadata.target_observation_complete = true;
 }
 
@@ -44748,7 +44793,16 @@ test "provisioned owner publication advances exact index replay target" {
     var cached_only = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer cached_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), cached_only.items[0].stats.indexes[0].replay_target_sequence);
-    snapshot_cache.markGroupTargetObservationPending("docs", 7001);
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
+        &source,
+        "docs",
+        7001,
+        cached.db,
+        .{
+            .change = .target_advanced,
+            .target_sequence = cached.db.core.nextDerivedSequence(),
+        },
+    );
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
@@ -51371,7 +51425,11 @@ test "cached runtime status is independent of writer lock and target observation
         runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishGroup(token, "docs", .{
             .group_id = 7001,
-            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .target_observation_revision = 10,
+            },
             .stats = .{
                 .source_doc_count = 10_000,
                 .indexes = @constCast((&[_]db_mod.types.DBIndexStats{.{
@@ -51391,12 +51449,24 @@ test "cached runtime status is independent of writer lock and target observation
     // Capture a would-be owner publication before the next commit edge. It
     // must not be able to reassert convergence after that edge races it.
     const in_flight_token = try cache.capturePublicationToken("docs");
-    cache.markGroupTargetObservationPending("docs", 7001);
+    cache.markGroupTargetObservationPending("docs", 7001, 11);
+    const committed_token = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7001, 11);
+    cache.markGroupTargetObservationPending("docs", 7001, 9);
+    const duplicate_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        committed_token.target_observation_revision,
+        duplicate_token.target_observation_revision,
+    );
     try std.testing.expectEqual(
         runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishGroup(in_flight_token, "docs", .{
             .group_id = 7001,
-            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .target_observation_revision = 10,
+            },
             .stats = .{
                 .source_doc_count = 10_000,
                 .indexes = @constCast((&[_]db_mod.types.DBIndexStats{.{
@@ -51441,7 +51511,11 @@ test "cached runtime status is independent of writer lock and target observation
         runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishGroup(owner_token, "docs", .{
             .group_id = 7001,
-            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .target_observation_revision = 11,
+            },
             .stats = .{ .source_doc_count = 10_001 },
         }),
     );

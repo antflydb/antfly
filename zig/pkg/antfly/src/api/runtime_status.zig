@@ -48,8 +48,8 @@ pub const RuntimeStatusMetadata = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
-    // Monotonic cache-local commit watermark captured before the owner sampled
-    // this observation. It is diagnostic across reporters; the accompanying
+    // Highest durable source target sampled under the same DB lock as this
+    // observation. It is diagnostic across reporters; the accompanying
     // completeness bit is the portable authority decision.
     target_observation_revision: u64 = 0,
     // Independent convergence authority. A committed table mutation clears
@@ -279,11 +279,20 @@ pub const TableRuntimeSnapshotCache = struct {
     };
 
     const TableState = struct {
+        const TargetObservationRequirement = struct {
+            // Cache-local event ordering prevents an observation which began
+            // before a commit notification from clearing its fence.
+            event_revision: u64,
+            // Durable DB replay ordering deduplicates repeated notifications
+            // and proves that the sampled source target includes the commit.
+            source_target_sequence: u64,
+        };
+
         epoch: TableEpoch,
         groups: std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus) = .empty,
         // Latest commit watermark that each group must have observed before
         // its coverage may be treated as current.
-        required_target_observation_revisions: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        required_target_observation_revisions: std.AutoHashMapUnmanaged(u64, TargetObservationRequirement) = .empty,
         // Exact index names whose in-place catalog reconciliation is still in
         // flight. Publications may replace the target, but an opening/catch-up
         // observation cannot revoke authority from an untouched sibling.
@@ -862,8 +871,16 @@ pub const TableRuntimeSnapshotCache = struct {
     /// Records one group's committed target advance without changing any
     /// published serving fact. This is an O(1) commit-path watermark update
     /// under the small status-cache mutex; HTTP readers only clone the result
-    /// and never consult the writer cache or DB.
-    pub fn markGroupTargetObservationPending(self: *@This(), table_name: []const u8, group_id: u64) void {
+    /// and never consult the writer cache or DB. Exact durable sequences make
+    /// duplicate/out-of-order commit delivery an idempotent no-op. A null
+    /// sequence is reserved for structural invalidations with no DB owner and
+    /// therefore always advances the causal event fence.
+    pub fn markGroupTargetObservationPending(
+        self: *@This(),
+        table_name: []const u8,
+        group_id: u64,
+        source_target_sequence: ?u64,
+    ) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const state = self.ensureTableLocked(table_name) catch {
@@ -871,12 +888,17 @@ pub const TableRuntimeSnapshotCache = struct {
             self.advanceInvalidationEpochLocked();
             return;
         };
+        if (source_target_sequence) |sequence| {
+            if (state.required_target_observation_revisions.get(group_id)) |required| {
+                if (sequence <= required.source_target_sequence) return;
+            }
+        }
         self.advanceTargetObservationRevisionLocked();
-        state.required_target_observation_revisions.put(
-            self.alloc,
-            group_id,
-            self.target_observation_revision,
-        ) catch {
+        const requirement = TableState.TargetObservationRequirement{
+            .event_revision = self.target_observation_revision,
+            .source_target_sequence = source_target_sequence orelse 0,
+        };
+        state.required_target_observation_revisions.put(self.alloc, group_id, requirement) catch {
             // Failure to record the convergence fence cannot leave an older
             // completion proof visible. Retire the table observation instead.
             self.invalidateTableStateLocked(state);
@@ -1180,10 +1202,13 @@ pub const TableRuntimeSnapshotCache = struct {
         observed_revision: u64,
     ) void {
         _ = self;
-        const required_revision = state.required_target_observation_revisions.get(group_id) orelse 0;
-        status.metadata.target_observation_revision = observed_revision;
+        const required = state.required_target_observation_revisions.get(group_id) orelse TableState.TargetObservationRequirement{
+            .event_revision = 0,
+            .source_target_sequence = 0,
+        };
         status.metadata.target_observation_complete = status.metadata.target_observation_complete and
-            observed_revision >= required_revision;
+            observed_revision >= required.event_revision and
+            status.metadata.target_observation_revision >= required.source_target_sequence;
     }
 };
 
@@ -3194,7 +3219,7 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
     const transition_token = try cache.capturePublicationToken("docs");
     // A data commit accepted after the structural owner captured its snapshot
     // must remain a convergence fence across the lifecycle replacement.
-    cache.markGroupTargetObservationPending("docs", 7);
+    cache.markGroupTargetObservationPending("docs", 7, null);
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
         try cache.publishLifecycleTransition(transition_token, "docs", &.{

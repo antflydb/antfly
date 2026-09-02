@@ -1280,6 +1280,49 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert second_complete["readiness"]["complete"] is True
     assert second_complete["searchable_vectors"] == 100
 
+    # A newly accepted source revision must fence convergence synchronously.
+    # Serving stays available from the published incarnation, but a status
+    # read immediately after the write must never replay stale complete=true.
+    progressive_openai_embedder.rate_limit_after_next_requests(0)
+    assert (
+        backup_api.batch_write(
+            table_name,
+            inserts={
+                "doc:100": {
+                    "title": "Gamma 100",
+                    "body": "gamma progressive publication document 100",
+                }
+            },
+            sync_level="write",
+        )["inserted"]
+        == 1
+    )
+
+    after_write = backup_api.get_index(table_name, index_name)["status"]
+    assert after_write["readiness"]["incarnation"] == first_incarnation
+    assert after_write["readiness"]["queryable"] is True
+    assert after_write["readiness"]["complete"] is False
+    assert after_write["readiness"]["state"] == "queryable_partial"
+    assert after_write["searchable_vectors"] == 100
+    assert set(after_write["milestones"]["complete"]["blockers"]) & {
+        "target_observation",
+        "source_coverage",
+        "publication",
+    }
+
+    progressive_openai_embedder.allow_rate_limited_requests()
+    reconverged = backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.05,
+        until="complete",
+        require_query_fresh=True,
+    )
+    assert reconverged["readiness"]["complete"] is True
+    assert reconverged["source_coverage"]["covered"] == 101
+    assert reconverged["searchable_vectors"] == 101
+
 
 def test_live_index_activation_preempts_an_active_enrichment_quantum(
     single_item_enrichment_batches,
@@ -1493,6 +1536,13 @@ def test_progressive_publication_remains_queryable_across_process_restart(
                 return None
             if int(status.get("searchable_vectors", 0)) <= 0:
                 return None
+            # Restart from a genuinely observed partial checkpoint, not the
+            # intentionally conservative handoff snapshot where last-known
+            # serving facts remain visible but the new target is still
+            # unobserved and pending is therefore unknown.
+            pending = (status.get("source_coverage") or {}).get("pending")
+            if not isinstance(pending, int) or pending <= 0:
+                return None
             return status
 
         before = wait_until(
@@ -1534,7 +1584,29 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert __import__("time").monotonic() - restarted_at < 8.0
         assert after["milestones"]["queryable"]["blockers"] == []
-        assert after["source_coverage"]["pending"] > 0
+        assert (
+            after["source_coverage"]["covered"] >= before["source_coverage"]["covered"]
+        )
+
+        # Startup may first expose the durable serving checkpoint while its
+        # owner is still re-establishing convergence authority. That must not
+        # delay queries or erase last-known facts, and the current pending
+        # count should become authoritative promptly afterward.
+        def restored_convergence() -> dict | None:
+            status = stateful_api.get_index(table_name, index_name)["status"]
+            pending = (status.get("source_coverage") or {}).get("pending")
+            if status.get("incarnation") != incarnation:
+                return None
+            if not isinstance(pending, int) or pending <= 0:
+                return None
+            return status
+
+        converged_after = wait_until(
+            restored_convergence,
+            timeout_s=8.0,
+            interval_s=0.05,
+        )
+        assert converged_after is not None
 
         query_started = __import__("time").monotonic()
         result = stateful_api.query_table(
