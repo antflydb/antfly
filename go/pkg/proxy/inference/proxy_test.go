@@ -1747,8 +1747,18 @@ func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
 		"unknown modality":    func(value map[string]any) { value["input_modalities"] = []any{"telepathy"} },
 		"duplicate mime":      func(value map[string]any) { value["accepted_mime_types"] = []any{"image/png", "image/png"} },
 		"non-string modality": func(value map[string]any) { value["input_modalities"] = []any{float64(1)} },
+		"non-string task":     func(value map[string]any) { value["task"] = []any{"extract"} },
 		"unknown scalar":      func(value map[string]any) { value["prompt_policy"] = "sometimes" },
 		"wrong cardinality":   func(value map[string]any) { value["result_cardinality"] = "one_per_request" },
+		"preferred exceeds maximum": func(value map[string]any) {
+			value["batch"].(map[string]any)["preferred_items"] = float64(9)
+		},
+		"none mode is not singleton": func(value map[string]any) {
+			batch := value["batch"].(map[string]any)
+			batch["mode"] = "none"
+			batch["preferred_items"] = float64(1)
+			batch["max_items"] = float64(8)
+		},
 		"mime without modality": func(value map[string]any) {
 			value["accepted_mime_types"] = []any{"image/png", "text/plain"}
 		},
@@ -1767,6 +1777,13 @@ func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
 				t.Fatalf("malformed singleton descriptor was not poisoned: %s", got)
 			}
 		})
+	}
+}
+
+func TestSanitizeModelDescriptorRejectsContradictoryLegacyBatch(t *testing.T) {
+	raw := json.RawMessage(`{"inference_capabilities":{"version":2,"task":"generate","batch":{"mode":"none","preferred_items":1,"max_items":2,"max_encoded_media_bytes":0,"max_decoded_pixels":0,"max_media_parts_per_item":0,"per_item_failures":false}}}`)
+	if got := string(sanitizeModelDescriptor(raw)); got != "{}" {
+		t.Fatalf("malformed legacy singleton descriptor was not poisoned: %s", got)
 	}
 }
 

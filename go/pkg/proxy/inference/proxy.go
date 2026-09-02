@@ -1546,9 +1546,9 @@ func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, sourc
 	}
 }
 
-// Exact descriptors are an admission contract, so a malformed descriptor from
-// even one eligible endpoint must poison the merged model instead of being
-// silently weakened into a plausible-looking subset.
+// Capability descriptors are admission contracts, so a malformed descriptor
+// from even one eligible endpoint must poison the merged model instead of
+// being silently weakened into a plausible-looking subset.
 func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
 	var descriptor map[string]any
 	if json.Unmarshal(raw, &descriptor) != nil {
@@ -1564,6 +1564,10 @@ func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
 	}
 	version, ok := inferenceCapabilitiesVersion(capabilityMap)
 	if !ok {
+		return json.RawMessage(`{}`)
+	}
+	task, ok := capabilityMap["task"].(string)
+	if !ok || !exactTasks[task] || !validInferenceBatchCapabilities(capabilityMap, version) {
 		return json.RawMessage(`{}`)
 	}
 	if version >= 3 {
@@ -1615,12 +1619,20 @@ func conservativeModelDescriptor(left, right json.RawMessage) json.RawMessage {
 func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	a, aok := left.(map[string]any)
 	b, bok := right.(map[string]any)
-	if !aok || !bok || a["task"] != b["task"] {
+	if !aok || !bok {
+		return nil, false
+	}
+	aTask, aok := a["task"].(string)
+	bTask, bok := b["task"].(string)
+	if !aok || !bok || !exactTasks[aTask] || aTask != bTask {
 		return nil, false
 	}
 	aVersion, aok := inferenceCapabilitiesVersion(a)
 	bVersion, bok := inferenceCapabilitiesVersion(b)
 	if !aok || !bok {
+		return nil, false
+	}
+	if !validInferenceBatchCapabilities(a, aVersion) || !validInferenceBatchCapabilities(b, bVersion) {
 		return nil, false
 	}
 	if aVersion >= 3 && !validExactInferenceCapabilities(a) ||
@@ -1693,7 +1705,7 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 	}
 	batch["per_item_failures"] = aFailures && bFailures
 	version := 2
-	result := map[string]any{"version": float64(version), "task": a["task"], "batch": batch}
+	result := map[string]any{"version": float64(version), "task": aTask, "batch": batch}
 	if aVersion >= 3 && bVersion >= 3 {
 		modalities, ok := intersectValidatedStringValues(a["input_modalities"], b["input_modalities"], exactModalities)
 		if !ok || len(modalities) == 0 {
@@ -1717,10 +1729,14 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 			return nil, false
 		}
 		result["borrowed_attachments"] = aBorrowed && bBorrowed
-		result["version"] = float64(3)
+		version = 3
+		result["version"] = float64(version)
 		if !validExactInferenceCapabilities(result) {
 			return nil, false
 		}
+	}
+	if !validInferenceBatchCapabilities(result, version) {
+		return nil, false
 	}
 	return result, true
 }
@@ -1884,6 +1900,54 @@ func inferenceCapabilitiesVersion(capabilities map[string]any) (int, bool) {
 
 func validBatchMode(mode string) bool {
 	return mode == "none" || mode == "serial_compatibility" || mode == "native"
+}
+
+// Batch fields form one semantic admission contract. Validate each endpoint's
+// complete contract before taking minima: intersecting individually plausible
+// numbers must not launder an internally contradictory source descriptor.
+func validInferenceBatchCapabilities(capabilities map[string]any, version int) bool {
+	batch, ok := capabilities["batch"].(map[string]any)
+	if !ok {
+		return false
+	}
+	mode, ok := batch["mode"].(string)
+	if !ok || !validBatchMode(mode) {
+		return false
+	}
+	preferred, ok := nonNegativeInteger(batch["preferred_items"])
+	if !ok || preferred == 0 {
+		return false
+	}
+	maximum, ok := nonNegativeInteger(batch["max_items"])
+	if !ok || maximum == 0 || preferred > maximum {
+		return false
+	}
+	if mode == "none" && (preferred != 1 || maximum != 1) {
+		return false
+	}
+	if _, ok := nonNegativeInteger(batch["max_media_parts_per_item"]); !ok {
+		return false
+	}
+	encodedField := "max_encoded_bytes"
+	if version >= 2 {
+		encodedField = "max_encoded_media_bytes"
+	}
+	encoded, found := batch[encodedField]
+	if !found {
+		return false
+	}
+	if _, _, ok := optionalLimit(encoded, version < 2); !ok {
+		return false
+	}
+	pixels, found := batch["max_decoded_pixels"]
+	if !found {
+		return false
+	}
+	if _, _, ok := optionalLimit(pixels, version < 2); !ok {
+		return false
+	}
+	_, ok = batch["per_item_failures"].(bool)
+	return ok
 }
 
 func conservativeRequiredLimit(left, right any) (float64, bool) {

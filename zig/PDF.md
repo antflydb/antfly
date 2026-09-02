@@ -631,22 +631,30 @@ document. They are architectural requirements, not Florence-specific cleanup:
 59. **Extractor admission inspected borrowed attachments but not media inside
     `source_parts_json`.** One normalized extractor item-shape parser now drives
     batch compatibility, executor admission, and window formation. It accounts
-    for inline data and data URLs, validates trust and MIME, tracks unknown
-    remote media until provider-owned download admission, enforces one media
-    part per item, and derives only the prompt text when grouping image work.
+    for inline data and data URLs using the encoded representation that remains
+    resident alongside decoded buffers, validates base64, trust, and MIME,
+    tracks unknown remote media until provider-owned download admission,
+    enforces one media part per item, and derives only the prompt text when
+    grouping image work. Generator planning uses the same resident-byte rule.
 60. **Extraction batch responses accepted missing or extra results and copied
     a non-JSON batch response to every input.** Batch execution now requires a
-    structured output representation, parses the provider envelope once, and
-    requires exactly one result for every requested item before assigning any
-    output. Non-JSON extraction falls back to independent task executions,
-    where one response has one unambiguous owner.
+    structured output representation, parses the provider envelope once into
+    the generated extraction response type, verifies the resolved model,
+    rejects malformed top-level and per-item objects, and requires exactly one
+    typed result for every requested item before assigning any output. Non-JSON
+    extraction falls back to independent task executions, where one response
+    has one unambiguous owner.
 61. **The proxy validated numeric batch fields but treated malformed V3 exact
     sets as a harmless narrower contract.** Every V3 descriptor, including a
     singleton catalog result, is now normalized before merge. Unknown enum
     values, non-string members, duplicates, missing booleans, empty exact
-    sets, and empty intersections poison the model descriptor. A malformed
-    eligible endpoint therefore cannot lend apparently valid capabilities to
-    a heterogeneous route.
+    sets, empty intersections, non-string task values, contradictory
+    preferred/maximum item limits, and nonsingleton `none` mode poison the
+    model descriptor. Batch invariants are also checked on legacy singleton
+    descriptors without changing their published version. Validation runs on
+    each source contract before taking conservative minima, so a malformed
+    eligible endpoint cannot lend apparently valid capabilities to a
+    heterogeneous route or panic the proxy.
 62. **Legacy capability parsing assigned generator-like cardinality and prompt
     defaults to every model family.** V1/V2 compatibility now derives stable
     operation semantics from the task: rerank, chunk, and transcribe return one
