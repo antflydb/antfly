@@ -1,12 +1,18 @@
 package proxy
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 )
 
 func TestEndpointSliceDeleteUsesDiscoveredPort(t *testing.T) {
@@ -32,6 +38,74 @@ func TestEndpointSliceDeleteUsesDiscoveredPort(t *testing.T) {
 
 	if endpoints := p.Registry().GetEndpointsForPool("pool-a"); len(endpoints) != 0 {
 		t.Fatalf("expected endpoint to be removed, got %d endpoints", len(endpoints))
+	}
+}
+
+func TestK8sWatcherActivatesScaleToZeroPool(t *testing.T) {
+	t.Parallel()
+
+	pool := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "antfly.io/v1alpha1",
+		"kind":       "InferencePool",
+		"metadata": map[string]any{
+			"name":      "gpu",
+			"namespace": "inference",
+			"uid":       "gpu-uid",
+		},
+		"spec": map[string]any{
+			"scaleToZero": map[string]any{
+				"enabled":           true,
+				"idleTimeout":       "10m",
+				"activationTimeout": "3m",
+			},
+		},
+	}}
+	pool.SetGroupVersionKind(schema.GroupVersionKind{Group: "antfly.io", Version: "v1alpha1", Kind: "InferencePool"})
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), pool)
+	clientset := kubernetesfake.NewSimpleClientset()
+	w := &K8sWatcher{clientset: clientset, dynamicClient: client, scalePools: make(map[string]scaleToZeroPool)}
+	w.processInferencePool(pool)
+
+	wait, enabled, err := w.Activate(context.Background(), "inference", "gpu")
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if !enabled || wait != 3*time.Minute {
+		t.Fatalf("Activate = (%s, %t), want (3m, true)", wait, enabled)
+	}
+
+	lease, err := clientset.CoordinationV1().Leases("inference").Get(context.Background(), "gpu", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get activation Lease: %v", err)
+	}
+	if lease.Labels[activationLeasePoolLabel] != "gpu" {
+		t.Fatalf("activation Lease labels = %v", lease.Labels)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "gpu-uid" {
+		t.Fatalf("activation Lease holder = %v", lease.Spec.HolderIdentity)
+	}
+	if lease.Spec.LeaseDurationSeconds == nil || *lease.Spec.LeaseDurationSeconds != int32((10*time.Minute)/time.Second) {
+		t.Fatalf("activation Lease duration = %v", lease.Spec.LeaseDurationSeconds)
+	}
+	if lease.Spec.RenewTime == nil {
+		t.Fatal("activation Lease has no renewal time")
+	}
+	if len(lease.OwnerReferences) != 1 || lease.OwnerReferences[0].UID != "gpu-uid" {
+		t.Fatalf("activation Lease owner references = %v", lease.OwnerReferences)
+	}
+}
+
+func TestK8sWatcherRequiresNamespaceForAmbiguousPoolName(t *testing.T) {
+	t.Parallel()
+	w := &K8sWatcher{scalePools: map[string]scaleToZeroPool{
+		"team-a/gpu": {namespace: "team-a"},
+		"team-b/gpu": {namespace: "team-b"},
+	}}
+	if w.IsEnabled("", "gpu") {
+		t.Fatal("ambiguous pool name must not resolve without a namespace")
+	}
+	if !w.IsEnabled("team-b", "gpu") {
+		t.Fatal("exact namespaced pool should resolve")
 	}
 }
 

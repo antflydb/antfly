@@ -48,6 +48,23 @@ const (
 	LoadingStrategyBounded LoadingStrategy = "bounded" // LRU eviction
 )
 
+// InferenceRuntimeBackend is the runtime contract for a pool. Auto preserves
+// legacy accelerator-based selection; new pools should choose an explicit
+// backend so scheduling and runtime failover cannot disagree.
+type InferenceRuntimeBackend string
+
+const (
+	InferenceRuntimeBackendAuto InferenceRuntimeBackend = "auto"
+	InferenceRuntimeBackendCPU  InferenceRuntimeBackend = "cpu"
+	InferenceRuntimeBackendCUDA InferenceRuntimeBackend = "cuda"
+	InferenceRuntimeBackendPJRT InferenceRuntimeBackend = "pjrt"
+)
+
+// ActivationLeasePoolLabel identifies the InferencePool controlled by a
+// request-driven activation Lease. The Lease has the same name and namespace
+// as its pool and uses the pool UID as its holder identity.
+const ActivationLeasePoolLabel = "inference.antfly.io/activation-pool"
+
 // InferencePoolSpec defines the desired state of InferencePool
 type InferencePoolSpec struct {
 	// WorkloadType classifies this pool for routing decisions
@@ -58,8 +75,8 @@ type InferencePoolSpec struct {
 	// Config is the Inference configuration as a JSON string.
 	// This is merged with auto-generated configuration and passed to inference via --config.
 	// Supports Zig runtime options such as admission, prompt_cache, kernel_jit,
-	// keep_alive_ms, and max_loaded_models. Accelerator backends are selected
-	// automatically from spec.hardware.
+	// keep_alive_ms, and max_loaded_models. Runtime selection comes from
+	// spec.hardware.inferenceBackend; auto retains legacy accelerator inference.
 	// Example: {"admission": {"inference": {"max_concurrent_requests": 8}}}
 	// +optional
 	Config string `json:"config,omitempty"`
@@ -76,6 +93,12 @@ type InferencePoolSpec struct {
 	// Autoscaling defines autoscaling behavior
 	// +optional
 	Autoscaling *AutoscalingConfig `json:"autoscaling,omitempty"`
+
+	// ScaleToZero enables request-driven activation for pools whose minimum
+	// replica count is zero. The inference proxy renews a namespaced Lease and
+	// the operator keeps wakeReplicas running for the Lease's active window.
+	// +optional
+	ScaleToZero *ScaleToZeroConfig `json:"scaleToZero,omitempty"`
 
 	// Burst defines burst handling configuration
 	// +optional
@@ -207,6 +230,14 @@ type PerModelReplica struct {
 
 // HardwareConfig defines TPU/accelerator configuration
 type HardwareConfig struct {
+	// InferenceBackend is the required runtime class. CPU maps to Antfly's native
+	// backend, CUDA requires an NVIDIA-compatible GPU, and PJRT requires a TPU.
+	// Auto retains legacy inference from accelerator fields for existing pools.
+	// +kubebuilder:validation:Enum=auto;cpu;cuda;pjrt
+	// +kubebuilder:default=auto
+	// +optional
+	InferenceBackend InferenceRuntimeBackend `json:"inferenceBackend,omitempty"`
+
 	// Accelerator is the accelerator type label (empty = no accelerator/CPU only)
 	// +optional
 	Accelerator string `json:"accelerator,omitempty"`
@@ -244,6 +275,31 @@ type AutoscalingConfig struct {
 	// ScaleDownStabilization is the stabilization window for scale-down
 	// +optional
 	ScaleDownStabilization *metav1.Duration `json:"scaleDownStabilization,omitempty"`
+}
+
+// ScaleToZeroConfig defines request-driven activation and idle shutdown.
+// It is intentionally separate from HPA autoscaling because Kubernetes HPA
+// cannot wake a zero-replica workload from CPU or Pods metrics.
+type ScaleToZeroConfig struct {
+	// Enabled turns on request-driven zero-to-one activation.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// IdleTimeout is how long the operator keeps the pool awake after the most
+	// recent request. Defaults to 15 minutes.
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
+
+	// ActivationTimeout is how long the proxy waits for a healthy endpoint
+	// before applying the route fallback. Defaults to 5 minutes.
+	// +optional
+	ActivationTimeout *metav1.Duration `json:"activationTimeout,omitempty"`
+
+	// WakeReplicas is the number of replicas requested during an active window.
+	// Defaults to 1 and cannot exceed spec.replicas.max.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	WakeReplicas *int32 `json:"wakeReplicas,omitempty"`
 }
 
 // MetricType defines the type of scaling metric

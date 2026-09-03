@@ -4115,6 +4115,7 @@ pub fn build(b: *std.Build) void {
         "api http server create table with local writes waits for projected presence without lifecycle",
         "api http server rejects oversized table definitions before parsing across public and MCP",
         "api http server reports exhausted table mutation authority consistently",
+        "api http server marks every proven table mutation pre-admission failure",
         "api http server retries only pre-admission public table drop failures",
         "ambiguous mutation response is explicitly non-retryable",
         "routed table mutation preserves hop budget for provably unsent request",

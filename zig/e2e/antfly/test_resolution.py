@@ -38,12 +38,15 @@ from urllib.parse import quote
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     resolve_binary_path,
 )
-from test_scaling import MultiNodeScalingCluster
+from test_scaling import (
+    METADATA_MUTATION_NOT_ADMITTED_HEADER,
+    METADATA_MUTATION_NOT_ADMITTED_VALUE,
+    MultiNodeScalingCluster,
+)
 
 AUTOGRAPH_E2E_TIMEOUT_S = 115.0
 AUTOGRAPH_CLUSTER_STARTUP_TIMEOUT_S = 115.0
@@ -52,10 +55,23 @@ POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
 WRITE_REQUEST_TIMEOUT_FLOOR_S = 5.0
 WRITE_OUTCOME_RECONCILE_TIMEOUT_S = 5.0
+METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS = {
+    METADATA_MUTATION_NOT_ADMITTED_HEADER: METADATA_MUTATION_NOT_ADMITTED_VALUE
+}
 
 
 def _new_e2e_deadline() -> "_Deadline":
     return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
+
+
+def _retry_after_delay_s(response: requests.Response) -> float:
+    """Read the same-service Retry-After delta, falling back fail-safe."""
+    raw_delay = response.headers.get("Retry-After", "").strip()
+    try:
+        delay_s = int(raw_delay, 10)
+    except ValueError:
+        return POLL_INTERVAL_S
+    return delay_s if delay_s >= 0 else POLL_INTERVAL_S
 
 
 DOCUMENTS_INDEXES = {
@@ -150,18 +166,54 @@ class _Api:
         if indexes is not None:
             payload["indexes"] = indexes
         max_timeout = 90.0 if indexes is not None or num_shards > 1 else 30.0
-        timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
-        try:
-            response = self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=timeout)
-        except requests.RequestException as exc:
-            stacks = self._server.native_stack_dumps()
-            index_names = sorted(indexes.keys()) if indexes is not None else []
-            raise AssertionError(
-                f"create table timed out/failed table={name!r} shards={num_shards} "
-                f"indexes={index_names!r}: {exc!r}\n[native stacks]\n{stacks}"
-                f"\n[logs]\n{self._server.debug_logs()}"
-            ) from exc
-        return self._check(response)
+        last_not_admitted_response: str | None = None
+        while True:
+            try:
+                timeout = (
+                    deadline.request_timeout(max_timeout)
+                    if deadline is not None
+                    else max_timeout
+                )
+            except AssertionError as exc:
+                stacks = self._server.native_stack_dumps()
+                index_names = sorted(indexes.keys()) if indexes is not None else []
+                raise AssertionError(
+                    f"create table exhausted its {deadline.timeout_s:.1f}s deadline "
+                    f"table={name!r} shards={num_shards} indexes={index_names!r} "
+                    f"last_not_admitted_response={last_not_admitted_response!r}"
+                    f"\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
+                    f"\n[logs]\n{self._server.debug_logs()}"
+                ) from exc
+            try:
+                response = self.s.post(
+                    f"{self.url}/tables/{name}", json=payload, timeout=timeout
+                )
+            except requests.RequestException as exc:
+                # A transport failure does not prove whether the DDL reached
+                # Raft, so never replay it automatically.
+                stacks = self._server.native_stack_dumps()
+                index_names = sorted(indexes.keys()) if indexes is not None else []
+                raise AssertionError(
+                    f"create table timed out/failed table={name!r} shards={num_shards} "
+                    f"indexes={index_names!r}: {exc!r}\n[native stacks]\n{stacks}"
+                    f"\n[logs]\n{self._server.debug_logs()}"
+                ) from exc
+
+            mutation_not_admitted = (
+                response.status_code == 503
+                and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "")
+                .strip()
+                .lower()
+                == METADATA_MUTATION_NOT_ADMITTED_VALUE
+            )
+            if deadline is None or not mutation_not_admitted:
+                return self._check(response)
+
+            last_not_admitted_response = (
+                f"HTTP {response.status_code}: {response.text[:512]}"
+            )
+            deadline.sleep(_retry_after_delay_s(response))
 
     def insert(
         self,
@@ -358,10 +410,144 @@ class _Deadline:
             )
         return min(max_timeout_s, remaining)
 
-    def sleep(self) -> None:
+    def sleep(self, delay_s: float = POLL_INTERVAL_S) -> None:
         remaining = self.remaining()
-        if remaining > 0.0:
-            time.sleep(min(POLL_INTERVAL_S, remaining))
+        bounded_delay_s = min(max(0.0, delay_s), remaining)
+        if bounded_delay_s > 0.0:
+            time.sleep(bounded_delay_s)
+
+
+def _test_response(
+    url: str,
+    status: int,
+    *,
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response.headers.update(headers or {})
+    response._content = body
+    response.url = url
+    response.reason = "test response"
+    response.request = requests.Request("POST", url).prepare()
+    return response
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_delay_s"),
+    [
+        (None, POLL_INTERVAL_S),
+        ("invalid", POLL_INTERVAL_S),
+        ("-1", POLL_INTERVAL_S),
+        ("0", 0.0),
+        ("2", 2.0),
+    ],
+)
+def test_retry_after_delay_uses_valid_delta_seconds_or_poll_fallback(
+    retry_after: str | None,
+    expected_delay_s: float,
+):
+    headers = {"Retry-After": retry_after} if retry_after is not None else None
+    response = _test_response("http://data-a/db/v1/tables/documents", 503, headers=headers)
+
+    assert _retry_after_delay_s(response) == expected_delay_s
+
+
+def test_deadline_sleep_clamps_retry_after_to_remaining_time(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    deadline = _Deadline(10.0)
+    sleep_delays: list[float] = []
+    monkeypatch.setattr(deadline, "remaining", lambda: 0.25)
+    monkeypatch.setattr(time, "sleep", sleep_delays.append)
+
+    deadline.sleep(2.0)
+
+    assert sleep_delays == [0.25]
+
+
+def test_create_table_retries_explicit_non_admission_within_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _Server:
+        pass
+
+    api = _Api("http://data-a/db/v1", _Server())
+    url = "http://data-a/db/v1/tables/documents"
+    responses = iter(
+        [
+            _test_response(
+                url,
+                503,
+                headers={
+                    **METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS,
+                    "Retry-After": "1",
+                },
+                body=b"metadata leader unavailable",
+            ),
+            _test_response(url, 200, body=b"{}"),
+        ]
+    )
+    post_calls = 0
+    sleep_delays: list[float] = []
+
+    def post(*_: Any, **__: Any) -> requests.Response:
+        nonlocal post_calls
+        post_calls += 1
+        return next(responses)
+
+    deadline = _Deadline(10.0)
+    monkeypatch.setattr(api.s, "post", post)
+    monkeypatch.setattr(deadline, "sleep", sleep_delays.append)
+
+    assert api.create_table("documents", deadline=deadline) == {}
+    assert post_calls == 2
+    assert sleep_delays == [1.0]
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "with_deadline"),
+    [
+        (503, {"X-Antfly-Metadata-Not-Leader": "true"}, True),
+        (
+            409,
+            METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS,
+            True,
+        ),
+        (
+            503,
+            METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS,
+            False,
+        ),
+    ],
+)
+def test_create_table_never_retries_without_safe_bounded_non_admission_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    headers: dict[str, str],
+    with_deadline: bool,
+):
+    class _Server:
+        @staticmethod
+        def debug_logs() -> str:
+            return "test logs"
+
+    api = _Api("http://data-a/db/v1", _Server())
+    url = "http://data-a/db/v1/tables/documents"
+    post_calls = 0
+
+    def post(*_: Any, **__: Any) -> requests.Response:
+        nonlocal post_calls
+        post_calls += 1
+        return _test_response(url, status, headers=headers, body=b"mutation failed")
+
+    monkeypatch.setattr(api.s, "post", post)
+    deadline = _Deadline(10.0) if with_deadline else None
+
+    with pytest.raises(requests.HTTPError):
+        api.create_table("documents", deadline=deadline)
+    assert post_calls == 1
 
 
 def test_insert_reconciles_unknown_upsert_before_retry(monkeypatch: pytest.MonkeyPatch):

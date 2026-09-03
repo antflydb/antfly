@@ -5,6 +5,9 @@ on:
     tags:
       - "go/pkg/operator/v*"
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GCP_REGION: us-central1
@@ -22,18 +25,18 @@ jobs:
       packages: write
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Authenticate to Google Cloud
         id: auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
       - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
       - name: Extract version
         id: version
@@ -72,7 +75,7 @@ jobs:
             --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=go/pkg/operator/Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
 
       - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
 
       - name: Mirror image GAR -> GHCR
         run: |
@@ -89,7 +92,7 @@ jobs:
               "ghcr.io/antflydb/antfly-operator:${tag}"
           done
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign container images with annotations (keyless)
         run: |
@@ -103,7 +106,7 @@ jobs:
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
               -a "ref=${{ github.sha }}" \
-              ghcr.io/antflydb/antfly-operator:${tag}
+              "ghcr.io/antflydb/antfly-operator:${tag}"
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \

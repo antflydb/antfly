@@ -15,14 +15,19 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	antflyaiv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 )
@@ -133,19 +138,28 @@ func TestGenerateCompleteConfigPreservesLazyAcceleratorStrategy(t *testing.T) {
 	g.Expect(config).To(HaveKeyWithValue("keep_alive_ms", float64(defaultInferenceKeepAliveMillis)))
 }
 
-func TestInferencePreferredBackend(t *testing.T) {
+func TestInferenceBackendPolicy(t *testing.T) {
 	g := NewWithT(t)
 	tests := []struct {
-		name     string
-		pool     *antflyaiv1alpha1.InferencePool
-		expected string
+		name              string
+		pool              *antflyaiv1alpha1.InferencePool
+		expectedPreferred string
+		expectedRequired  string
 	}{
 		{
 			name: "tpu",
 			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
 				Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "TPU-v5-lite-podslice"},
 			}},
-			expected: "pjrt",
+			expectedPreferred: "pjrt",
+		},
+		{
+			name: "gpu accelerator",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+			}},
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
 		},
 		{
 			name: "gpu resource",
@@ -154,19 +168,72 @@ func TestInferencePreferredBackend(t *testing.T) {
 					"nvidia.com/gpu": resource.MustParse("1"),
 				}},
 			}},
-			expected: "cuda",
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
 		},
 		{
-			name:     "cpu",
-			pool:     &antflyaiv1alpha1.InferencePool{},
-			expected: "",
+			name: "cpu",
+			pool: &antflyaiv1alpha1.InferencePool{},
+		},
+		{
+			name: "explicit cpu",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendCPU},
+			}},
+			expectedPreferred: "native",
+			expectedRequired:  "native",
+		},
+		{
+			name: "explicit cuda",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendCUDA},
+			}},
+			expectedPreferred: "cuda",
+			expectedRequired:  "cuda",
+		},
+		{
+			name: "explicit pjrt",
+			pool: &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+				Hardware: antflyaiv1alpha1.HardwareConfig{InferenceBackend: antflyaiv1alpha1.InferenceRuntimeBackendPJRT},
+			}},
+			expectedPreferred: "pjrt",
+			expectedRequired:  "pjrt",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			g.Expect(inferencePreferredBackend(test.pool)).To(Equal(test.expected))
+			profile := antflyaiv1alpha1.ResolveInferenceBackendProfile(test.pool)
+			g.Expect(profile.PreferredRuntime).To(Equal(test.expectedPreferred))
+			g.Expect(profile.RequiredRuntime).To(Equal(test.expectedRequired))
 		})
 	}
+}
+
+func TestReconcileConfigMapRequiresCUDAForGPUPools(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	g.Expect(antflyaiv1alpha1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+	pool := &antflyaiv1alpha1.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-pool",
+			Namespace: "default",
+			UID:       types.UID("gpu-pool"),
+		},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+	reconciler := &InferencePoolReconciler{Client: client, Scheme: scheme}
+
+	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())
+	configMap := &corev1.ConfigMap{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: "gpu-pool-config", Namespace: "default"}, configMap)).To(Succeed())
+	g.Expect(configMap.Data).To(HaveKeyWithValue("ANTFLY_INFERENCE_PREFERRED_BACKEND", "cuda"))
+	g.Expect(configMap.Data).To(HaveKeyWithValue("ANTFLY_INFERENCE_REQUIRED_BACKEND", "cuda"))
 }
 
 func TestEnsureTPUResourcesIgnoresNonTPUAccelerator(t *testing.T) {
@@ -181,6 +248,56 @@ func TestEnsureTPUResourcesIgnoresNonTPUAccelerator(t *testing.T) {
 	_, limited := resources.Limits["google.com/tpu"]
 	g.Expect(requested).To(BeFalse())
 	g.Expect(limited).To(BeFalse())
+}
+
+func TestApplyGKEPodSpecSelectsL4GPU(t *testing.T) {
+	g := NewWithT(t)
+	template := &corev1.PodTemplateSpec{}
+	pool := &antflyaiv1alpha1.InferencePool{Spec: antflyaiv1alpha1.InferencePoolSpec{
+		Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "nvidia-l4"},
+		Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("1"),
+		}},
+		GKE: &antflyaiv1alpha1.GKEConfig{Autopilot: true, AutopilotComputeClass: "Accelerator"},
+	}}
+
+	(&InferencePoolReconciler{}).applyGKEPodSpec(template, pool)
+	g.Expect(template.Spec.NodeSelector).To(HaveKeyWithValue("cloud.google.com/compute-class", "Accelerator"))
+	g.Expect(template.Spec.NodeSelector).To(HaveKeyWithValue("cloud.google.com/gke-accelerator", "nvidia-l4"))
+}
+
+func TestDesiredInferenceReplicasHonorsActivationWindow(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	idle := metav1.Duration{Duration: 10 * time.Minute}
+	pool := &antflyaiv1alpha1.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu", Namespace: "default", UID: types.UID("gpu-uid")},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Replicas:    antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 1},
+			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
+		},
+	}
+	holder := "gpu-uid"
+	// The operator owns the idle policy and must not trust a proxy-supplied
+	// Lease duration that is longer than the pool configuration.
+	duration := int32((24 * time.Hour) / time.Second)
+	renewedAt := metav1.NewMicroTime(now.Add(-5 * time.Minute))
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu", Namespace: "default", Labels: map[string]string{
+			antflyaiv1alpha1.ActivationLeasePoolLabel: "gpu",
+		}},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renewedAt},
+	}
+
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(1)))
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now.Add(6*time.Minute))).To(Equal(int32(0)))
+	staleHolder := "previous-pool-uid"
+	lease.Spec.HolderIdentity = &staleHolder
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(0)))
+	lease.Spec.HolderIdentity = &holder
+	futureRenewal := metav1.NewMicroTime(now.Add(2 * time.Minute))
+	lease.Spec.RenewTime = &futureRenewal
+	g.Expect(desiredInferenceReplicasAt(pool, lease, now)).To(Equal(int32(0)))
 }
 
 func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {

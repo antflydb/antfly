@@ -39,7 +39,7 @@ jobs:
       run:
         working-directory: rs
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install native build dependencies
         shell: bash
@@ -55,7 +55,7 @@ jobs:
           $sudo_cmd apt-get install --yes --no-install-recommends build-essential cmake pkg-config
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
 
