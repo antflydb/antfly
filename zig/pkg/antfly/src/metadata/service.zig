@@ -1779,15 +1779,13 @@ fn runtimeStatusProtocolCompatible(
     required_version: u16,
 ) bool {
     const peer_incarnation = peer_status.metadata_incarnation orelse return false;
-    const required_profile = metadata_runtime_status_protocol.profileForVersion(required_version) orelse return false;
-    const peer_profile = metadata_runtime_status_protocol.profileForVersion(peer_status.runtime_status_record_version) orelse return false;
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        switch (required_profile) {
-            .released_v0_2_0 => true,
-            .current => peer_profile == .current,
-        };
+        metadata_runtime_status_protocol.profileSatisfies(
+            peer_status.runtime_status_record_version,
+            required_version,
+        );
 }
 
 const RuntimeStatusMembershipFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -4380,7 +4378,10 @@ pub const MetadataService = struct {
     }
 
     fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
-        _ = required_version;
+        if (!metadata_runtime_status_protocol.profileSatisfies(
+            metadata_runtime_status_protocol.current_record_version,
+            required_version,
+        )) return false;
         const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         const membership_sets = [_][]const u64{
@@ -6672,7 +6673,12 @@ pub const MetadataHttpService = struct {
     }
 
     fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
-        if (self.runtimeStatusProtocolActivationVersion() >= required_version) return true;
+        if (metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolActivationVersion(),
+            required_version,
+        )) return true;
+        const required_profile = metadata_runtime_status_protocol.profileForVersion(required_version) orelse return false;
+        const canonical_required_version = required_profile.wireVersion();
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
@@ -6686,29 +6692,30 @@ pub const MetadataHttpService = struct {
             self.reallocation_protocol_peers,
             incarnation,
         );
-        if (self.runtimeStatusProtocolFingerprintReady(membership_fingerprint, required_version)) return true;
+        if (self.runtimeStatusProtocolFingerprintReady(membership_fingerprint, canonical_required_version)) return true;
         if (runtimeStatusProtocolMembershipIsLocalOnly(
             raft_status.conf_state,
             self.reallocation_protocol_peers,
             local_node_id,
         )) {
-            self.storeRuntimeStatusProtocolFingerprint(membership_fingerprint, required_version);
+            self.storeRuntimeStatusProtocolFingerprint(membership_fingerprint, canonical_required_version);
             return true;
         }
 
-        self.scheduleRuntimeStatusProtocolProbe(membership_fingerprint, incarnation, required_version);
+        self.scheduleRuntimeStatusProtocolProbe(membership_fingerprint, incarnation, canonical_required_version);
         return false;
     }
 
     fn runtimeStatusProtocolActivationVersion(self: *MetadataHttpService) u16 {
         const cached = self.runtime_status_protocol_activated_version.load(.acquire);
-        if (cached >= metadata_runtime_status_protocol.current_record_version) return cached;
+        if (cached == metadata_runtime_status_protocol.current_record_version) return cached;
         const store = self.projectedStore() orelse return cached;
         const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return cached;
-        if (version > cached) {
+        if (version == metadata_runtime_status_protocol.current_record_version) {
             self.runtime_status_protocol_activated_version.store(version, .release);
+            return version;
         }
-        return @max(cached, version);
+        return cached;
     }
 
     fn runtimeStatusProtocolReadyVersion(self: *MetadataHttpService) u16 {
@@ -6738,8 +6745,10 @@ pub const MetadataHttpService = struct {
     }
 
     fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
-        if (self.runtimeStatusProtocolActivationVersion() >=
-            metadata_runtime_status_protocol.native_restore_identity_record_version) return true;
+        if (metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolActivationVersion(),
+            metadata_runtime_status_protocol.native_restore_identity_record_version,
+        )) return true;
 
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
@@ -6887,7 +6896,10 @@ pub const MetadataHttpService = struct {
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
         required_version: u16,
     ) bool {
-        return self.runtimeStatusProtocolFingerprintReadyVersion(membership_fingerprint) >= required_version;
+        return metadata_runtime_status_protocol.profileSatisfies(
+            self.runtimeStatusProtocolFingerprintReadyVersion(membership_fingerprint),
+            required_version,
+        );
     }
 
     fn runtimeStatusProtocolFingerprintReadyVersion(
@@ -8258,7 +8270,7 @@ pub const MetadataHttpService = struct {
     ) void {
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
         snapshot.runtime_status_protocol_ready_version = self.runtimeStatusProtocolReadyVersion();
-        if (snapshot.runtime_status_protocol_activated_version >=
+        if (snapshot.runtime_status_protocol_activated_version ==
             metadata_runtime_status_protocol.current_record_version)
         {
             snapshot.runtime_status_protocol_probe_in_flight = false;

@@ -267,6 +267,7 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         error.UnitPrivateError,
         TestBoundary.call("fail", TestBoundary.local_dispatch, &callbacks.privateFail, .{&base}),
     );
+    @import("test_error_logs.zig").expectErrorLogs(1);
     try std.testing.expectError(
         error.RuntimeBoundaryFailure,
         TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.privateFail, .{&base}),

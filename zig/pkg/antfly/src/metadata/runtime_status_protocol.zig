@@ -33,6 +33,18 @@ pub fn profileForVersion(version: u16) ?Profile {
     return std.enums.fromInt(Profile, version);
 }
 
+/// Compatibility is a relationship between named wire profiles, not numeric
+/// ordering. An unknown development or future version must never satisfy a
+/// released profile merely because its integer is larger.
+pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
+    const available = profileForVersion(available_version) orelse return false;
+    const required = profileForVersion(required_version) orelse return false;
+    return switch (required) {
+        .released_v0_2_0 => true,
+        .current => available == .current,
+    };
+}
+
 /// These facts form one current admission-safety profile. Keeping semantic
 /// aliases makes call sites state why V15 is required without inventing
 /// intermediate compatibility levels when new facts join that profile.
@@ -66,6 +78,15 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isNegotiable(14));
     try std.testing.expectEqual(Profile.released_v0_2_0, profileForVersion(12).?);
     try std.testing.expectEqual(Profile.current, profileForVersion(15).?);
+
+    try std.testing.expect(profileSatisfies(12, 12));
+    try std.testing.expect(profileSatisfies(15, 12));
+    try std.testing.expect(profileSatisfies(15, 15));
+    try std.testing.expect(!profileSatisfies(12, 15));
+    try std.testing.expect(!profileSatisfies(13, 12));
+    try std.testing.expect(!profileSatisfies(14, 15));
+    try std.testing.expect(!profileSatisfies(16, 15));
+    try std.testing.expect(!profileSatisfies(15, 16));
 }
 
 const std = @import("std");

@@ -2141,9 +2141,10 @@ pub const RaftApplyStore = struct {
         return (try decodeMetadataIncarnationRecord(encoded)).incarnation;
     }
 
-    /// Returns the highest runtime-status record version durably activated by
-    /// this metadata group. Activation is stored with the cluster incarnation,
-    /// so it survives leader changes, process restarts, and Raft snapshots.
+    /// Returns the exact runtime-status record profile durably activated by
+    /// this metadata group, or zero before activation. Activation is stored
+    /// with the cluster incarnation, so it survives leader changes, process
+    /// restarts, and Raft snapshots.
     pub fn getRuntimeStatusProtocolActivationVersion(
         self: *RaftApplyStore,
         group_id: u64,
@@ -6675,6 +6676,28 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     };
 }
 
+test "metadata incarnation rejects unsupported runtime status activation profiles" {
+    const incarnation: metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+
+    inline for ([_]u16{ 13, 14, 16 }) |unsupported_version| {
+        var encoded: [encoded_len]u8 = undefined;
+        @memcpy(encoded[0..incarnation_len], &incarnation);
+        var pos: usize = incarnation_len;
+        @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
+        pos += metadata_incarnation_extension_magic.len;
+        std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
+        pos += @sizeOf(u16);
+        std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], unsupported_version, .little);
+
+        try std.testing.expectError(
+            error.InvalidMetadataIncarnation,
+            decodeMetadataIncarnationRecord(&encoded),
+        );
+    }
+}
+
 fn activateRuntimeStatusProtocolTxn(
     txn: *docstore.DocStore.Txn,
     group_id: u64,
@@ -6692,7 +6715,7 @@ fn activateRuntimeStatusProtocolTxn(
     const decoded = try decodeMetadataIncarnationRecord(existing);
     if (target_version != runtime_status_protocol.current_record_version)
         return error.InvalidMetadataTransitionEncoding;
-    if (decoded.runtime_status_record_version >= target_version) return;
+    if (decoded.runtime_status_record_version == target_version) return;
 
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
     const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
