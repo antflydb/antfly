@@ -3637,7 +3637,7 @@ pub const ApiHttpServer = struct {
         outcome: transactions_api.IdempotentReceiptOutcome,
     ) void {
         if (!idempotent_receipt) {
-            _ = self.txn_sessions.remove(self.alloc, txn_id);
+            _ = self.txn_sessions.removeInteractiveAfterDecision(self.alloc, txn_id);
             return;
         }
         _ = (self.txn_sessions.recordIdempotentOutcome(
@@ -3648,17 +3648,6 @@ pub const ApiHttpServer = struct {
             std.log.warn("stable idempotent batch rejection persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
             return;
         }) orelse return;
-    }
-
-    /// Once phase-two execution has started, only storage evidence of a
-    /// durable abort may terminalize an idempotency receipt as aborted. Input,
-    /// topology, and availability errors are ambiguous on replay and must
-    /// remain recoverable.
-    fn durableRecoveryAbortOutcome(err: anyerror) ?transactions_api.IdempotentReceiptOutcome {
-        return switch (err) {
-            error.DecisionConflict => .aborted,
-            else => null,
-        };
     }
 
     const SessionRecoveryLeaseHeartbeat = struct {
@@ -3835,7 +3824,7 @@ pub const ApiHttpServer = struct {
                         return;
                     },
                     else => {
-                        if (durableRecoveryAbortOutcome(err)) |abort_outcome| {
+                        if (transactions_api.durableAbortOutcomeForExecutionError(err)) |abort_outcome| {
                             self.finishRejectedSessionRecovery(txn_id, commit.idempotent_receipt, abort_outcome);
                             return;
                         }
@@ -18880,6 +18869,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
             .POST, .PUT, .DELETE => .admin,
         });
     }
+    if (routes.Routes.matchTableIdempotentBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
@@ -19045,6 +19035,18 @@ test "inference connection invocation requires inference write permission" {
         .POST,
         "/connections/local-inference/inference/generate/extra",
     )) == null);
+}
+
+test "idempotent table batch requires table write permission" {
+    const required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/tables/docs%20archive/idempotent-batch",
+    )).?;
+    defer required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("docs archive", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
 }
 
 test "internal service credentials cannot authorize public inference routes" {
@@ -26483,13 +26485,13 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
 test "stable transaction recovery only terminalizes durable abort evidence" {
     try std.testing.expectEqual(
         transactions_api.IdempotentReceiptOutcome.aborted,
-        ApiHttpServer.durableRecoveryAbortOutcome(error.DecisionConflict).?,
+        transactions_api.durableAbortOutcomeForExecutionError(error.DecisionConflict).?,
     );
-    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.DocIdentityNamespaceMismatch) == null);
-    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.InvalidBatchRequest) == null);
-    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.TopologyChanged) == null);
-    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.TableNotFound) == null);
-    try std.testing.expect(ApiHttpServer.durableRecoveryAbortOutcome(error.UnknownGroup) == null);
+    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.DocIdentityNamespaceMismatch) == null);
+    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.InvalidBatchRequest) == null);
+    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.TopologyChanged) == null);
+    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.TableNotFound) == null);
+    try std.testing.expect(transactions_api.durableAbortOutcomeForExecutionError(error.UnknownGroup) == null);
 }
 
 test "stable transaction recovery heartbeat interval stays inside the lease" {
@@ -26575,7 +26577,7 @@ test "stable transaction recovery retains ambiguity and heartbeats its lease" {
         "alice",
         &request,
     );
-    var sealed = (try server.txn_sessions.cloneCommitRequest(alloc, txn_id, &request)) orelse return error.TestExpectedEqual;
+    var sealed = (try server.txn_sessions.cloneIdempotentCommitRequest(alloc, txn_id, &request)) orelse return error.TestExpectedEqual;
     sealed.deinit(alloc);
     _ = (try server.txn_sessions.markCommitExecutionStarted(alloc, txn_id)) orelse return error.TestExpectedEqual;
 

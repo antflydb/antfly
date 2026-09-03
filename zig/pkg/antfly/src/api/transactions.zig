@@ -265,6 +265,15 @@ pub const SessionInfo = struct {
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     sync_level: db_mod.types.SyncLevel,
+    kind: SessionKind = .interactive,
+};
+
+/// Session purpose is a capability boundary, not merely reporting metadata.
+/// Idempotency receipts are owned by the keyed-batch replay/recovery path and
+/// must never be mutated or deleted through interactive transaction APIs.
+pub const SessionKind = enum {
+    interactive,
+    idempotent_receipt,
 };
 
 pub const TerminalCommitStatus = enum {
@@ -287,6 +296,16 @@ pub const IdempotentReceiptOutcome = enum {
         return @tagName(self);
     }
 };
+
+/// After execution begins, only an error that proves the coordinator durably
+/// chose abort may terminalize a keyed receipt. Everything else is ambiguous
+/// and must remain pending for same-ID recovery.
+pub fn durableAbortOutcomeForExecutionError(err: anyerror) ?IdempotentReceiptOutcome {
+    return switch (err) {
+        error.DecisionConflict => .aborted,
+        else => null,
+    };
+}
 
 /// Repair debt is terminal and independently persisted. Only live propagation
 /// or retryable visibility debt keeps coordinator recovery active.
@@ -698,6 +717,7 @@ pub const Session = struct {
             .txn_id = self.txn_id,
             .begin_timestamp = self.begin_timestamp,
             .sync_level = self.sync_level,
+            .kind = if (self.idempotent_receipt) .idempotent_receipt else .interactive,
         };
     }
 
@@ -1866,6 +1886,7 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.idempotent_receipt) return error.IdempotentReceiptImmutable;
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (candidate.staged == null) {
             candidate.staged = try req.clone(alloc);
@@ -1910,6 +1931,7 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.idempotent_receipt) return error.IdempotentReceiptImmutable;
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         try upsertReadSnapshot(alloc, &candidate.read_snapshots, snapshot);
         if (candidate.staged == null) {
@@ -1933,12 +1955,33 @@ pub const SessionRegistry = struct {
         txn_id: db_mod.types.TxnId,
         extra_req: ?*const OwnedTransactionCommitRequest,
     ) !?OwnedTransactionCommitRequest {
+        return try self.cloneCommitRequestForKind(alloc, txn_id, extra_req, .interactive);
+    }
+
+    pub fn cloneIdempotentCommitRequest(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        extra_req: ?*const OwnedTransactionCommitRequest,
+    ) !?OwnedTransactionCommitRequest {
+        return try self.cloneCommitRequestForKind(alloc, txn_id, extra_req, .idempotent_receipt);
+    }
+
+    fn cloneCommitRequestForKind(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        extra_req: ?*const OwnedTransactionCommitRequest,
+        expected_kind: SessionKind,
+    ) !?OwnedTransactionCommitRequest {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         var candidate_owned = true;
         errdefer if (candidate_owned) candidate.deinit(alloc);
+        const actual_kind: SessionKind = if (candidate.idempotent_receipt) .idempotent_receipt else .interactive;
+        if (actual_kind != expected_kind) return error.SessionKindMismatch;
         // Builds predating atomic idempotent create-and-seal may have crashed
         // after publishing the key but before persisting its payload. No 2PC
         // execution can have started without a digest, so terminalize that
@@ -2364,6 +2407,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.idempotent_receipt) return error.IdempotentReceiptImmutable;
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (self.max_savepoints) |limit| {
             if (candidate.savepoints.count() >= limit) return error.SavepointLimitExceeded;
@@ -2398,6 +2442,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.idempotent_receipt) return error.IdempotentReceiptImmutable;
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (!candidate.savepoints.contains(savepoint_id)) return null;
         const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
@@ -2481,25 +2526,12 @@ pub const SessionRegistry = struct {
                         .all => {},
                         .principal => |principal| if (!principalsEqual(session.principal, principal)) return true,
                     }
-                    const counts = stagedCounts(session.staged);
-                    const savepoint_count = session.savepoints.count();
-                    try scan.statuses.append(scan.allocator, .{
-                        .txn_id = session.txn_id,
-                        .owner_node_id = session.owner_node_id,
-                        .begin_timestamp = session.begin_timestamp,
-                        .last_touched_timestamp = session.last_touched_timestamp,
-                        .lease_expires_at = 0,
-                        .sync_level = session.sync_level,
-                        .staged_table_count = counts.tables,
-                        .staged_read_count = counts.reads,
-                        .staged_write_count = counts.writes,
-                        .staged_delete_count = counts.deletes,
-                        .read_snapshot_count = session.read_snapshots.count(),
-                        .savepoint_count = savepoint_count,
-                        .savepoint_limit = scan.registry.max_savepoints,
-                        .remaining_savepoints = if (scan.registry.max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
-                        .durable = true,
-                    });
+                    try scan.statuses.append(scan.allocator, sessionStatusProjection(
+                        &session,
+                        scan.registry.max_savepoints,
+                        true,
+                        0,
+                    ));
                     return true;
                 }
             };
@@ -2686,19 +2718,58 @@ pub const SessionRegistry = struct {
         return removed_count;
     }
 
-    pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+    pub const AbortInteractiveResult = enum {
+        removed,
+        missing,
+        idempotent_receipt,
+        execution_started,
+        terminal_commit,
+    };
+
+    /// Atomically aborts only a still-mutable interactive session. Keeping the
+    /// classification and deletion under the same stripe lock prevents an
+    /// abort racing execution-start persistence from erasing recovery work.
+    pub fn abortInteractive(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !AbortInteractiveResult {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var current = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return .missing;
+        defer current.deinit(alloc);
+        if (current.idempotent_receipt) return .idempotent_receipt;
+        if (current.terminal_commit != null) return .terminal_commit;
+        if (current.commit_execution_started) return .execution_started;
+        if (!(try self.deleteOwnedPersistent(current))) return error.SessionLeaseLost;
+        self.removePublishedLocked(alloc, txn_id);
+        return .removed;
+    }
+
+    /// Deletes an interactive session after the caller has durable evidence
+    /// that it no longer requires recovery. Receipt records are categorically
+    /// protected even if a future caller passes their ID here by mistake.
+    pub fn removeInteractiveAfterDecision(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var current = (self.loadSessionCloneAssumeStripe(alloc, txn_id) catch return false) orelse return false;
         defer current.deinit(alloc);
+        if (current.idempotent_receipt) return false;
         if (!(self.deleteOwnedPersistent(current) catch return false)) return false;
+        self.removePublishedLocked(alloc, txn_id);
+        return true;
+    }
+
+    /// Compatibility alias for interactive transaction completion. The
+    /// registry still enforces receipt protection at this boundary.
+    pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        return self.removeInteractiveAfterDecision(alloc, txn_id);
+    }
+
+    fn removePublishedLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const removed = self.sessions.fetchRemove(txn_id) orelse return false;
+        const removed = self.sessions.fetchRemove(txn_id) orelse return;
         var session = removed.value;
         session.deinit(alloc);
-        return true;
     }
 
     fn sessionLock(self: *SessionRegistry, txn_id: db_mod.types.TxnId) *AtomicMutex {
@@ -4417,7 +4488,12 @@ fn leaseExpiryNs(expires_at_ms: u64) u64 {
     return std.math.mul(u64, expires_at_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
 }
 
-fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, session: *const Session) !SessionStatus {
+fn sessionStatusProjection(
+    session: *const Session,
+    max_savepoints: ?usize,
+    durable: bool,
+    lease_expires_at: u64,
+) SessionStatus {
     const counts = stagedCounts(session.staged);
     const savepoint_count = session.savepoints.count();
     return .{
@@ -4425,7 +4501,7 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .owner_node_id = session.owner_node_id,
         .begin_timestamp = session.begin_timestamp,
         .last_touched_timestamp = session.last_touched_timestamp,
-        .lease_expires_at = try self.loadLeaseExpiryLocked(alloc, session.txn_id),
+        .lease_expires_at = lease_expires_at,
         .sync_level = session.sync_level,
         .staged_table_count = counts.tables,
         .staged_read_count = counts.reads,
@@ -4433,9 +4509,9 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .staged_delete_count = counts.deletes,
         .read_snapshot_count = session.read_snapshots.count(),
         .savepoint_count = savepoint_count,
-        .savepoint_limit = self.max_savepoints,
-        .remaining_savepoints = if (self.max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
-        .durable = self.durable != null,
+        .savepoint_limit = max_savepoints,
+        .remaining_savepoints = if (max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
+        .durable = durable,
         .outcome = if (session.idempotent_outcome) |outcome|
             outcome.text()
         else if (session.terminal_commit) |terminal|
@@ -4446,6 +4522,15 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
             "not_applied",
         .repair_required = if (session.terminal_commit) |terminal| terminal.repair_required else false,
     };
+}
+
+fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, session: *const Session) !SessionStatus {
+    return sessionStatusProjection(
+        session,
+        self.max_savepoints,
+        self.durable != null,
+        try self.loadLeaseExpiryLocked(alloc, session.txn_id),
+    );
 }
 
 /// Stable, non-secret transaction identity for a public idempotency scope.
@@ -5463,6 +5548,12 @@ test "transaction session commit request is sealed across retries" {
         error.TransactionCommitSealed,
         reader.stage(alloc, txn_id, &changed_body),
     );
+    _ = (try reader.markCommitExecutionStarted(alloc, txn_id)).?;
+    try std.testing.expectEqual(
+        SessionRegistry.AbortInteractiveResult.execution_started,
+        try reader.abortInteractive(alloc, txn_id),
+    );
+    try std.testing.expect(reader.getInfo(txn_id) != null);
 }
 
 test "cluster-shared idempotency requires atomic owner fencing" {
@@ -5510,7 +5601,7 @@ test "shared session mutations and cleanup reject an adopted owner incarnation" 
     );
     defer request.deinit(alloc);
     _ = try owner.beginIdempotentForPrincipal(alloc, txn_id, .{ .sync_level = .write }, 7, "alice", &request);
-    var sealed = (try owner.cloneCommitRequest(alloc, txn_id, &request)).?;
+    var sealed = (try owner.cloneIdempotentCommitRequest(alloc, txn_id, &request)).?;
     sealed.deinit(alloc);
 
     var lease = (try leases.load(alloc, txn_id)).?;
@@ -5528,7 +5619,7 @@ test "shared session mutations and cleanup reject an adopted owner incarnation" 
 
     try std.testing.expectError(
         error.SessionLeaseLost,
-        owner.cloneCommitRequest(alloc, txn_id, &request),
+        owner.cloneIdempotentCommitRequest(alloc, txn_id, &request),
     );
     try std.testing.expectEqual(@as(usize, 0), try owner.cleanupExpired(alloc, std.math.maxInt(u64)));
     var persisted = (try durable.load(txn_id)).?;
@@ -6192,6 +6283,7 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     var first_request = try ownedRequestFromBatch(alloc, "docs", first_batch);
     defer first_request.deinit(alloc);
     const first = try registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .write }, 7, "alice", &first_request);
+    try std.testing.expectEqual(SessionKind.idempotent_receipt, first.kind);
     var created = (try durable.load(alice_docs)).?;
     defer created.deinit(alloc);
     try std.testing.expect(created.commit_body_digest != null);
@@ -6202,7 +6294,21 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
         error.IdempotencyConflict,
         registry.beginIdempotentForPrincipal(alloc, alice_docs, .{ .sync_level = .full_index }, 7, "alice", &first_request),
     );
-    var sealed = (try registry.cloneCommitRequest(alloc, alice_docs, &first_request)).?;
+    try std.testing.expectError(
+        error.SessionKindMismatch,
+        registry.cloneCommitRequest(alloc, alice_docs, &first_request),
+    );
+    try std.testing.expectError(
+        error.IdempotentReceiptImmutable,
+        registry.stage(alloc, alice_docs, &first_request),
+    );
+    try std.testing.expectError(
+        error.IdempotentReceiptImmutable,
+        registry.createSavepoint(alloc, alice_docs),
+    );
+    try std.testing.expectEqual(SessionRegistry.AbortInteractiveResult.idempotent_receipt, try registry.abortInteractive(alloc, alice_docs));
+    try std.testing.expect(!registry.remove(alloc, alice_docs));
+    var sealed = (try registry.cloneIdempotentCommitRequest(alloc, alice_docs, &first_request)).?;
     sealed.deinit(alloc);
 
     var changed_batch = try batch_api.parseBatchRequest(alloc,
@@ -6217,7 +6323,7 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     );
     try std.testing.expectError(
         error.TransactionCommitRequestMismatch,
-        registry.cloneCommitRequest(alloc, alice_docs, &changed_request),
+        registry.cloneIdempotentCommitRequest(alloc, alice_docs, &changed_request),
     );
     _ = (try registry.markCommitExecutionStarted(alloc, alice_docs)).?;
     var recovery = (try registry.claimPendingRecovery(alloc, alice_docs, 7, nextTxnTimestamp())).?;
@@ -6235,6 +6341,11 @@ test "idempotent batch identities are scoped and session bodies are sealed" {
     const reloaded_status = (try reloaded.getStatus(alloc, alice_docs)).?;
     try std.testing.expectEqualStrings("aborted", reloaded_status.outcome.?);
     try std.testing.expectEqual(IdempotentReceiptOutcome.aborted, (try reloaded.getIdempotentOutcome(alloc, alice_docs)).?);
+    const listed = try reloaded.listStatusesForPrincipal(alloc, "alice");
+    defer alloc.free(listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("aborted", listed[0].outcome.?);
+    try std.testing.expect(!listed[0].repair_required);
     const pending = try registry.listPendingRecoveryIds(alloc, 8);
     defer alloc.free(pending);
     try std.testing.expectEqual(@as(usize, 0), pending.len);
@@ -6299,7 +6410,7 @@ test "legacy unsealed idempotent receipt is terminalized without binding a retry
     defer request.deinit(alloc);
     try std.testing.expectError(
         error.UnsealedIdempotencyReceipt,
-        registry.cloneCommitRequest(alloc, txn_id, &request),
+        registry.cloneIdempotentCommitRequest(alloc, txn_id, &request),
     );
     try std.testing.expectEqual(IdempotentReceiptOutcome.not_applied, (try registry.getIdempotentOutcome(alloc, txn_id)).?);
     const pending = try registry.listPendingRecoveryIds(alloc, 8);
