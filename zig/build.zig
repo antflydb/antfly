@@ -4727,6 +4727,7 @@ pub fn build(b: *std.Build) void {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
+        "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",

@@ -44,7 +44,7 @@ jobs:
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
       release_tooling: ${{ steps.detect.outputs.release_tooling }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -219,9 +219,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
@@ -248,7 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -287,7 +287,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -333,7 +333,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           submodules: true
@@ -342,7 +342,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -590,7 +590,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -612,7 +612,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -620,7 +620,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -697,7 +697,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -810,7 +810,7 @@ jobs:
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -838,7 +838,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
@@ -868,7 +868,7 @@ jobs:
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
       ANTFLY_CI_TRACE: "1"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -898,7 +898,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -908,7 +908,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -980,7 +980,7 @@ jobs:
       # checks or std.debug.assert invariants.
       ANTFLY_CI_ZIG_STRIP: "true"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -1008,7 +1008,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
@@ -1037,7 +1037,7 @@ jobs:
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -1055,7 +1055,7 @@ jobs:
           ln -s "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1075,7 +1075,7 @@ jobs:
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
