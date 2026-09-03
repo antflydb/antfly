@@ -1,28 +1,46 @@
-name: Container
+name: Container build staging
 
+# This workflow is deliberately callable only. It builds each OCI identity
+# once, retains it by ledger in two registries, and returns its content digest;
+# the release controller owns every public version and channel alias.
 on:
-  release:
-    types: [published]
   workflow_call:
     inputs:
       tag_name:
-        description: "The release tag name (e.g., v1.0.0)"
+        description: "Authenticated release tag (for example v1.0.0)"
         required: true
         type: string
-      artifact_source:
-        description: "Where Linux runtime archives come from: build or github"
-        required: false
-        default: build
-        type: string
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: "The release tag name (e.g., v1.0.0)"
+      channel:
+        description: "Validated stable, next, or nightly channel"
         required: true
-      artifact_source:
-        description: "Where Linux runtime archives come from: build or github"
+        type: string
+      source_commit:
+        description: "Authenticated release source commit"
+        required: true
+        type: string
+      promotion_controller_commit:
+        description: "Exact release-controller commit running this promotion"
+        required: true
+        type: string
+      ledger_sha256:
+        description: "Digest of the authenticated release ledger"
+        required: true
+        type: string
+      expected_digest:
+        description: "Recorded OCI digest that recovery must find in a retention registry"
         required: false
-        default: build
+        default: ""
+        type: string
+    outputs:
+      image_ref:
+        description: "Verified staged or recorded multi-architecture image"
+        value: ${{ jobs.stage.outputs.image_ref }}
+      image_digest:
+        description: "Digest of the staged multi-architecture image"
+        value: ${{ jobs.stage.outputs.image_digest }}
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -32,161 +50,148 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.16.0
-  # Keep the glibc-linked host compiler reproducible while continuing to emit
-  # static musl release artifacts for both architectures.
-  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
 
 jobs:
-  build-artifact:
-    name: Build ${{ matrix.arch }} artifact
-    if: ${{ inputs.artifact_source != 'github' }}
-    runs-on: ${{ matrix.runner }}
-    environment: container-publish
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: arc-antfly-publish
-            zig_arch: x86_64
-            zig_target: x86_64-linux-musl
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - arch: arm64
-            runner: arc-antfly-publish-arm64
-            zig_arch: aarch64
-            zig_target: aarch64-linux-musl
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
-
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Verify runner architecture
-        run: |
-          case "$(uname -m)" in
-            x86_64) actual=amd64 ;;
-            aarch64) actual=arm64 ;;
-            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          if [[ "$actual" != "${{ matrix.arch }}" ]]; then
-            echo "expected ${{ matrix.arch }} runner, got ${actual}" >&2
-            exit 1
-          fi
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
-
-      - name: Install glibc-linked Zig
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
-
-      - name: Build runtime artifact
-        run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
-          VERSION="${VERSION#v}"
-          jobs_arg=()
-          if [ -n "${{ matrix.zig_jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
-          fi
-          scripts/packaging/build_zig_release_archive.sh \
-            --version "$VERSION" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "antfly-zig-${{ matrix.arch }}.tar.gz" \
-            --out-dir "$RUNNER_TEMP" \
-            --metal false \
-            --system-blas false
-
-      - name: Upload runtime artifact to GCS
-        run: |
-          gsutil cp \
-            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" \
-            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}.tar.gz"
-
-  publish:
+  stage:
     runs-on: arc-antfly-publish
-    needs: build-artifact
-    if: ${{ always() && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
-    environment: container-publish
+    outputs:
+      image_ref: ${{ steps.identity.outputs.image_ref }}
+      image_digest: ${{ steps.identity.outputs.image_digest }}
     permissions:
       contents: read
-      packages: write
       id-token: write
+      packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          submodules: true
+          ref: ${{ inputs.promotion_controller_commit }}
+          fetch-depth: 0
 
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: google-github-actions/auth@v3
+      - name: Revalidate trusted caller and release identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          PROMOTION_CONTROLLER_COMMIT: ${{ inputs.promotion_controller_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            workflow_run|repository_dispatch) ;;
+            *) echo "untrusted container caller event: $GITHUB_EVENT_NAME" >&2; exit 2 ;;
+          esac
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 2
+          fi
+          [[ "$LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "$PROMOTION_CONTROLLER_COMMIT"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git cat-file -e "$RELEASE_COMMIT^{commit}"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$PROMOTION_CONTROLLER_COMMIT" "origin/$DEFAULT_BRANCH"
+
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
-
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Download release runtime archives
-        if: ${{ inputs.artifact_source == 'github' }}
-        uses: actions/download-artifact@v6
-        with:
-          pattern: antfly-zig-linux-*
-          merge-multiple: true
+          name: antfly-release-runtime-archives
           path: dist/release-archives
 
-      - name: Upload release runtime archives to GCS
-        if: ${{ inputs.artifact_source == 'github' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install hash-locked object storage client
+        run: |
+          python -m pip install --require-hashes -r scripts/release/requirements.lock
+          python -m pip check
+
+      - name: Select the canonical GNU container archives
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/container-artifacts"
-          cp dist/release-archives/antfly_*_Linux_x86_64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-amd64.tar.gz"
-          cp dist/release-archives/antfly_*_Linux_arm64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-arm64.tar.gz"
+          while IFS= read -r entry; do
+            arch="$(jq -r .container_arch <<<"$entry")"
+            archive_pattern="$(jq -r .archive_pattern <<<"$entry")"
+            mapfile -t archives < <(compgen -G "dist/release-archives/$archive_pattern")
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "expected one $archive_pattern archive, found ${#archives[@]}" >&2
+              exit 1
+            fi
+            cp "${archives[0]}" "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}-gnu.tar.gz"
+          done < <(python scripts/release/release_platforms.py consumer-matrix container | jq -c '.include[]')
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+
+      - name: Authenticate staging container registry
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+
+      - name: Authenticate secondary retention registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Recover an existing recorded candidate
+        id: existing
+        env:
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+        run: |
+          set -euo pipefail
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          mirror_image="ghcr.io/antflydb/antfly"
+          reuse=false
+          if [ -n "$EXPECTED_DIGEST" ]; then
+            observed="$(python3 scripts/release/registryctl.py container-lookup \
+              --ref "${gar_image}@${EXPECTED_DIGEST}")"
+            if [ -z "$observed" ]; then
+              mirror_observed="$(python3 scripts/release/registryctl.py container-lookup \
+                --ref "${mirror_image}@${EXPECTED_DIGEST}")"
+              if [ -z "$mirror_observed" ]; then
+                echo "recorded container digest is missing from both retention registries" >&2
+                echo "digest: $EXPECTED_DIGEST" >&2
+                exit 1
+              fi
+              test "$mirror_observed" = "$EXPECTED_DIGEST"
+              observed="$(python3 scripts/release/registryctl.py container-alias \
+                --source "${mirror_image}@${EXPECTED_DIGEST}" \
+                --destination "${gar_image}:release-ledger-${LEDGER_SHA256}")"
+            fi
+            test "$observed" = "$EXPECTED_DIGEST"
+            reuse=true
+          fi
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified runtime archives to immutable build inputs
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
+        env:
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+        run: |
+          set -euo pipefail
           for arch in amd64 arm64; do
             gsutil cp \
-              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz" \
-              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz"
+              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}-gnu.tar.gz" \
+              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz"
           done
 
-      - name: Extract version
-        id: version
-        run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name }}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Extracted version: ${VERSION}"
-
-      - name: Package GAR images with Cloud Build
+      - name: Package architecture images with Cloud Build
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
+        env:
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -202,17 +207,19 @@ jobs:
               sleep "${sleep_seconds}"
             done
           }
-          VERSION="${{ steps.version.outputs.version }}"
           for arch in amd64 arm64; do
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${RELEASE_COMMIT}/${LEDGER_SHA256}/antfly-zig-${arch}-gnu.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${BUILD_TAG}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
-      - name: Create GAR multi-arch manifest with Cloud Build
+      - name: Create the multi-architecture manifest last
+        if: ${{ steps.existing.outputs.reuse != 'true' }}
+        env:
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -224,68 +231,77 @@ jobs:
                 return 1
               fi
               sleep_seconds=$((attempt * 15))
-              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
               sleep "${sleep_seconds}"
             done
           }
-          VERSION="${{ steps.version.outputs.version }}"
-          ALIAS_TAG=latest
-          if [[ "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
-            ALIAS_TAG=__skip_alias__
-          fi
           submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${BUILD_TAG},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${BUILD_TAG}-amd64,_ARM64_TAG=${BUILD_TAG}-arm64"
 
-      - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
-
-      - name: Mirror image GAR -> GHCR
+      - name: Resolve staged image identities
+        id: identity
+        env:
+          BUILD_TAG: release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          REUSE_EXISTING: ${{ steps.existing.outputs.reuse }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
+          set -euo pipefail
+          image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          image_ref="${image}:${BUILD_TAG}"
+          if [ "$REUSE_EXISTING" = true ]; then
+            image_ref="${image}@${EXPECTED_DIGEST}"
           fi
-          for tag in "${TAGS[@]}"; do
-            crane copy \
-              "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${tag}" \
-              "ghcr.io/antflydb/antfly:${tag}"
-          done
+          image_digest="$(python3 scripts/release/registryctl.py container-digest --ref "$image_ref")"
+          if [ -n "$EXPECTED_DIGEST" ] && [ "$image_digest" != "$EXPECTED_DIGEST" ]; then
+            echo "recovered container differs from recorded identity" >&2
+            echo "expected: $EXPECTED_DIGEST" >&2
+            echo "actual:   $image_digest" >&2
+            exit 1
+          fi
+          {
+            echo "image_ref=$image_ref"
+            echo "image_digest=$image_digest"
+          } >> "$GITHUB_OUTPUT"
 
-      - uses: sigstore/cosign-installer@v3
-
-      - name: Sign GHCR images
+      - name: Bind the immutable per-release container identity
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          CHANNEL: ${{ inputs.channel }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
+          IMAGE_DIGEST: ${{ steps.identity.outputs.image_digest }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
-          fi
-          for tag in "${TAGS[@]}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              "ghcr.io/antflydb/antfly:${tag}"
-          done
+          set -euo pipefail
+          python scripts/release/release_container_state.py bind \
+            --endpoint "$AWS_ENDPOINT_URL" \
+            --bucket antfly-releases \
+            --channel "$CHANNEL" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --ledger-sha256 "$LEDGER_SHA256" \
+            --container-digest "$IMAGE_DIGEST"
 
-      - name: Sign GAR images
+      - name: Retain the digest-addressed candidate in both registries
+        env:
+          IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.identity.outputs.image_digest }}
+          LEDGER_SHA256: ${{ inputs.ledger_sha256 }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
-            TAGS=(latest "${TAGS[@]}")
-          fi
-          for tag in "${TAGS[@]}"; do
-            cosign sign --yes \
-              -a "repo=${{ github.repository }}" \
-              -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
-              "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/antfly:${tag}"
+          set -euo pipefail
+          gar_image="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly"
+          mirror_image="ghcr.io/antflydb/antfly"
+          for destination in \
+            "${gar_image}:release-ledger-${LEDGER_SHA256}" \
+            "${mirror_image}:release-ledger-${LEDGER_SHA256}"
+          do
+            observed="$(python3 scripts/release/registryctl.py container-alias \
+              --source "$IMAGE_REF" \
+              --destination "$destination")"
+            test "$observed" = "$IMAGE_DIGEST"
           done
