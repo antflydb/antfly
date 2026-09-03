@@ -26,26 +26,21 @@ import (
 )
 
 func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
-	var provider EmbedderProvider
 	modelConfig := &EmbedderConfig{}
 	switch v := config.(type) {
 	case OllamaEmbedderConfig:
-		provider = EmbedderProviderOllama
 		if err := modelConfig.FromOllamaEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from ollama embedder config: %w", err)
 		}
 	case OpenAIEmbedderConfig:
-		provider = EmbedderProviderOpenai
 		if err := modelConfig.FromOpenAIEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from openai embedder config: %w", err)
 		}
 	case BedrockEmbedderConfig:
-		provider = EmbedderProviderBedrock
 		if err := modelConfig.FromBedrockEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from bedrock embedder config: %w", err)
 		}
 	case AntflyEmbedderConfig:
-		provider = EmbedderProviderAntfly
 		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from antfly embedder config: %w", err)
 		}
@@ -53,7 +48,6 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		return nil, fmt.Errorf("unknown model config type: %T", v)
 	}
 
-	modelConfig.Provider = provider
 	return modelConfig, nil
 }
 
@@ -76,20 +70,10 @@ func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
 		if err := modelConfig.FromGoogleGeneratorConfig(v); err != nil {
 			return nil, fmt.Errorf("from google generator config: %w", err)
 		}
-	case BedrockGeneratorConfig:
-		provider = GeneratorProviderBedrock
-		if err := modelConfig.FromBedrockGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("from bedrock generator config: %w", err)
-		}
 	case VertexGeneratorConfig:
 		provider = GeneratorProviderVertex
 		if err := modelConfig.FromVertexGeneratorConfig(v); err != nil {
 			return nil, fmt.Errorf("from vertex generator config: %w", err)
-		}
-	case AnthropicGeneratorConfig:
-		provider = GeneratorProviderAnthropic
-		if err := modelConfig.FromAnthropicGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("from anthropic generator config: %w", err)
 		}
 	case AntflyGeneratorConfig:
 		provider = GeneratorProviderAntfly
@@ -601,7 +585,8 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	if config.Embedder.Provider == "" {
+	provider, err := config.Embedder.Discriminator()
+	if err != nil || provider == "" {
 		return nil, fmt.Errorf("embedder provider is required")
 	}
 	if len(config.Sources) == 0 {

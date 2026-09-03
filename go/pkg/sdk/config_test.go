@@ -19,8 +19,12 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEmbedderConfig failed: %v", err)
 	}
-	if cfg.Provider != EmbedderProviderAntfly {
-		t.Fatalf("provider = %q, want %q", cfg.Provider, EmbedderProviderAntfly)
+	provider, err := cfg.Discriminator()
+	if err != nil {
+		t.Fatalf("read provider discriminator: %v", err)
+	}
+	if provider != string(EmbedderProviderAntfly) {
+		t.Fatalf("provider = %q, want %q", provider, EmbedderProviderAntfly)
 	}
 
 	embedder, err := cfg.AsAntflyEmbedderConfig()

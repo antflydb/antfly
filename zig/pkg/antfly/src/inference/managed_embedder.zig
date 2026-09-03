@@ -3300,11 +3300,14 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
         return std.math.cast(u32, dimension) orelse error.InvalidCreateTableRequest;
     }
     if (cfg.embedder) |embedder| {
-        if (embedder.dimension) |dimension| {
+        const declared = switch (embedder) {
+            .ollama_embedder_config => null,
+            .open_ai_embedder_config => |value| value.dimensions,
+            .bedrock_embedder_config => |value| value.dimension orelse value.dimensions,
+            .antfly_embedder_config => null,
+        };
+        if (declared) |dimension| {
             return std.math.cast(u32, dimension) orelse error.InvalidCreateTableRequest;
-        }
-        if (embedder.dimensions) |dimensions| {
-            return std.math.cast(u32, dimensions) orelse error.InvalidCreateTableRequest;
         }
     }
     return null;

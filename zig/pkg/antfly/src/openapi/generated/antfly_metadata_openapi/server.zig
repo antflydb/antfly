@@ -67,8 +67,8 @@ pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.js
 }
 
 /// Parse the JSON request body for globalQuery.
-pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StatefulQueryRequest) {
-    return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GlobalStatefulQueryRequest) {
+    return std.json.parseFromSlice(types.GlobalStatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for restore.

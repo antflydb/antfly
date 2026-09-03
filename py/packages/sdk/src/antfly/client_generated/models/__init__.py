@@ -34,10 +34,11 @@ from .answer_agent_result import AnswerAgentResult
 from .answer_agent_steps import AnswerAgentSteps
 from .antfly_chunker_config import AntflyChunkerConfig
 from .antfly_embedder_config import AntflyEmbedderConfig
+from .antfly_embedder_config_provider import AntflyEmbedderConfigProvider
 from .antfly_generator_config import AntflyGeneratorConfig
+from .antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
-from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
@@ -64,8 +65,8 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
+from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
-from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
@@ -104,7 +105,6 @@ from .cluster_status import ClusterStatus
 from .cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from .cluster_topology import ClusterTopology
 from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
-from .cohere_generator_config import CohereGeneratorConfig
 from .cohere_reranker_config import CohereRerankerConfig
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
@@ -199,6 +199,7 @@ from .edge_metadata import EdgeMetadata
 from .edge_type_config import EdgeTypeConfig
 from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
+from .embedder_provider import EmbedderProvider
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
@@ -302,7 +303,9 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .google_generator_config import GoogleGeneratorConfig
+from .google_generator_config_provider import GoogleGeneratorConfigProvider
 from .graph_aggregate_value import GraphAggregateValue
 from .graph_aggregates_result import GraphAggregatesResult
 from .graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
@@ -676,8 +679,6 @@ from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
-from .managed_embedder_config import ManagedEmbedderConfig
-from .managed_embedder_provider import ManagedEmbedderProvider
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -711,10 +712,13 @@ from .multi_phrase_query import MultiPhraseQuery
 from .node_filter import NodeFilter
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
+from .ollama_embedder_config_provider import OllamaEmbedderConfigProvider
 from .ollama_generator_config import OllamaGeneratorConfig
+from .ollama_generator_config_provider import OllamaGeneratorConfigProvider
 from .open_ai_embedder_config import OpenAIEmbedderConfig
+from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
-from .open_router_generator_config import OpenRouterGeneratorConfig
+from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -960,6 +964,7 @@ from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
 from .vertex_generator_config import VertexGeneratorConfig
+from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_service import VertexSearchConfigService
@@ -1004,10 +1009,11 @@ __all__ = (
     "AnswerAgentSteps",
     "AntflyChunkerConfig",
     "AntflyEmbedderConfig",
+    "AntflyEmbedderConfigProvider",
     "AntflyGeneratorConfig",
+    "AntflyGeneratorConfigProvider",
     "AntflyRerankerConfig",
     "AntflyType",
-    "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
@@ -1034,8 +1040,8 @@ __all__ = (
     "BatchResponse",
     "BatchResponseStatus",
     "BedrockEmbedderConfig",
+    "BedrockEmbedderConfigProvider",
     "BedrockEmbedderConfigRequestFormat",
-    "BedrockGeneratorConfig",
     "BooleanQuery",
     "BoolFieldQuery",
     "BraveSearchConfig",
@@ -1074,7 +1080,6 @@ __all__ = (
     "ClusterStatusDeploymentMode",
     "ClusterTopology",
     "ClusterTopologyDeploymentMode",
-    "CohereGeneratorConfig",
     "CohereRerankerConfig",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
@@ -1167,6 +1172,7 @@ __all__ = (
     "EdgesResponse",
     "EdgeTypeConfig",
     "EdgeTypeConfigTopology",
+    "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
@@ -1270,7 +1276,9 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GlobalStatefulQueryRequest",
     "GoogleGeneratorConfig",
+    "GoogleGeneratorConfigProvider",
     "GraphAggregatesResult",
     "GraphAggregatesResultAggregates",
     "GraphAggregatesResultKind",
@@ -1642,8 +1650,6 @@ __all__ = (
     "LookupKeyConsistency",
     "LookupKeyResponse200",
     "LsmStorageStatus",
-    "ManagedEmbedderConfig",
-    "ManagedEmbedderProvider",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchNoneQuery",
@@ -1675,10 +1681,13 @@ __all__ = (
     "NodeFilter",
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
+    "OllamaEmbedderConfigProvider",
     "OllamaGeneratorConfig",
+    "OllamaGeneratorConfigProvider",
     "OpenAIEmbedderConfig",
+    "OpenAIEmbedderConfigProvider",
     "OpenAIGeneratorConfig",
-    "OpenRouterGeneratorConfig",
+    "OpenAIGeneratorConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",
@@ -1924,6 +1933,7 @@ __all__ = (
     "UserMetadataType0",
     "VADOptions",
     "VertexGeneratorConfig",
+    "VertexGeneratorConfigProvider",
     "VertexRerankerConfig",
     "VertexSearchConfig",
     "VertexSearchConfigService",

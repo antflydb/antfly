@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from ..models.bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from ..types import UNSET, Unset
 
@@ -27,6 +28,7 @@ class BedrockEmbedderConfig:
             {'provider': 'bedrock', 'model': 'cohere.embed-v4', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
 
         Attributes:
+            provider (BedrockEmbedderConfigProvider):
             model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
                 'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4.
             request_format (BedrockEmbedderConfigRequestFormat | Unset): Bedrock provider request schema. `auto` recognizes
@@ -45,6 +47,7 @@ class BedrockEmbedderConfig:
             batch_size (int | Unset): The batch size for embedding requests to optimize throughput. Default: 1.
     """
 
+    provider: BedrockEmbedderConfigProvider
     model: str
     request_format: BedrockEmbedderConfigRequestFormat | Unset = BedrockEmbedderConfigRequestFormat.AUTO
     region: str | Unset = UNSET
@@ -57,6 +60,8 @@ class BedrockEmbedderConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         request_format: str | Unset = UNSET
@@ -81,6 +86,7 @@ class BedrockEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -106,6 +112,8 @@ class BedrockEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = BedrockEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         _request_format = d.pop("request_format", UNSET)
@@ -130,6 +138,7 @@ class BedrockEmbedderConfig:
         batch_size = d.pop("batch_size", UNSET)
 
         bedrock_embedder_config = cls(
+            provider=provider,
             model=model,
             request_format=request_format,
             region=region,

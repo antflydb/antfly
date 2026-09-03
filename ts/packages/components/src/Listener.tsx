@@ -1,5 +1,6 @@
 import {
   type AggregationBucket,
+  type GlobalQueryRequest,
   type QueryHit,
   type QueryResult,
   queryResultTotalHits,
@@ -454,7 +455,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 if (multiqueryData.length) {
                   try {
                     const msearchRequests: MultiqueryRequest[] = multiqueryData.map((item) => ({
-                      query: item.query as Record<string, unknown>,
+                      query: item.query as GlobalQueryRequest,
                     }));
                     const result = await multiquery(url || "", msearchRequests, headers || {});
 

@@ -33,6 +33,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
+  GlobalQueryRequest,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -73,6 +74,15 @@ function validateTableQueryRequest(request: QueryRequest, tableName: string, ind
   throw new Error(
     `Table query ${requestLabel}.table must be omitted; the route already selects table ${JSON.stringify(tableName)}`
   );
+}
+
+function validateGlobalQueryRequest(
+  request: QueryRequest,
+  index?: number
+): asserts request is GlobalQueryRequest {
+  if (typeof request.table === "string" && request.table.length > 0) return;
+  const requestLabel = index === undefined ? "request" : `requests[${index}]`;
+  throw new Error(`Global query ${requestLabel}.table must be a non-empty string`);
 }
 
 export interface RestoreJobListOptions {
@@ -603,6 +613,7 @@ export class AntflyClient {
       validateGraphQueryResponses(data as QueryResponses, [request], tableName);
       return data as QueryResponses;
     } else {
+      validateGlobalQueryRequest(request);
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
         ...(options?.signal ? { signal: options.signal } : {}),
@@ -657,7 +668,7 @@ export class AntflyClient {
    * Global query operations
    */
   async query(
-    request: QueryRequest,
+    request: GlobalQueryRequest,
     options?: QueryExecutionOptions
   ): Promise<QueryResult | undefined> {
     const data = await this.performQuery("/db/v1/query", request, undefined, options);
@@ -668,7 +679,8 @@ export class AntflyClient {
   /**
    * Execute multiple queries in a single request
    */
-  async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
+  async multiquery(requests: GlobalQueryRequest[]): Promise<QueryResponses | undefined> {
+    for (const [index, request] of requests.entries()) validateGlobalQueryRequest(request, index);
     return this.performMultiquery("/db/v1/query", requests);
   }
 

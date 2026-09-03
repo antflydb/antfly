@@ -13,11 +13,14 @@ from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.antfly_embedder_config import AntflyEmbedderConfig
     from ..models.artifact_index_source import ArtifactIndexSource
+    from ..models.bedrock_embedder_config import BedrockEmbedderConfig
     from ..models.chunker_config import ChunkerConfig
     from ..models.enrichment_config import EnrichmentConfig
     from ..models.index_execution_config import IndexExecutionConfig
-    from ..models.managed_embedder_config import ManagedEmbedderConfig
+    from ..models.ollama_embedder_config import OllamaEmbedderConfig
+    from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
 
 
 T = TypeVar("T", bound="CreateEmbeddingsIndexRequest")
@@ -62,7 +65,8 @@ class CreateEmbeddingsIndexRequest:
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
             product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
         mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
-        embedder (ManagedEmbedderConfig | Unset): Embedding provider configuration accepted by managed index creation.
+        embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset):
+            Embedding provider configuration accepted by managed index creation.
         chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
             'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
         top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
@@ -88,7 +92,7 @@ class CreateEmbeddingsIndexRequest:
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
-    embedder: ManagedEmbedderConfig | Unset = UNSET
+    embedder: AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset = UNSET
     chunker: ChunkerConfig | Unset = UNSET
     top_k: int | Unset = 10
     min_weight: float | Unset = 0.0
@@ -97,6 +101,10 @@ class CreateEmbeddingsIndexRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.bedrock_embedder_config import BedrockEmbedderConfig
+        from ..models.ollama_embedder_config import OllamaEmbedderConfig
+        from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+
         type_ = self.type_.value
 
         description = self.description
@@ -145,8 +153,16 @@ class CreateEmbeddingsIndexRequest:
 
         mem_only = self.mem_only
 
-        embedder: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.embedder, Unset):
+        embedder: dict[str, Any] | Unset
+        if isinstance(self.embedder, Unset):
+            embedder = UNSET
+        elif isinstance(self.embedder, OllamaEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, OpenAIEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, BedrockEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        else:
             embedder = self.embedder.to_dict()
 
         chunker: dict[str, Any] | Unset = UNSET
@@ -217,11 +233,14 @@ class CreateEmbeddingsIndexRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.antfly_embedder_config import AntflyEmbedderConfig
         from ..models.artifact_index_source import ArtifactIndexSource
+        from ..models.bedrock_embedder_config import BedrockEmbedderConfig
         from ..models.chunker_config import ChunkerConfig
         from ..models.enrichment_config import EnrichmentConfig
         from ..models.index_execution_config import IndexExecutionConfig
-        from ..models.managed_embedder_config import ManagedEmbedderConfig
+        from ..models.ollama_embedder_config import OllamaEmbedderConfig
+        from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
 
         d = dict(src_dict)
         type_ = CreateEmbeddingsIndexRequestType(d.pop("type"))
@@ -285,12 +304,42 @@ class CreateEmbeddingsIndexRequest:
 
         mem_only = d.pop("mem_only", UNSET)
 
-        _embedder = d.pop("embedder", UNSET)
-        embedder: ManagedEmbedderConfig | Unset
-        if isinstance(_embedder, Unset):
-            embedder = UNSET
-        else:
-            embedder = ManagedEmbedderConfig.from_dict(_embedder)
+        def _parse_embedder(
+            data: object,
+        ) -> AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset:
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_managed_embedder_config_type_0 = OllamaEmbedderConfig.from_dict(data)
+
+                return componentsschemas_managed_embedder_config_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_managed_embedder_config_type_1 = OpenAIEmbedderConfig.from_dict(data)
+
+                return componentsschemas_managed_embedder_config_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_managed_embedder_config_type_2 = BedrockEmbedderConfig.from_dict(data)
+
+                return componentsschemas_managed_embedder_config_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_managed_embedder_config_type_3 = AntflyEmbedderConfig.from_dict(data)
+
+            return componentsschemas_managed_embedder_config_type_3
+
+        embedder = _parse_embedder(d.pop("embedder", UNSET))
 
         _chunker = d.pop("chunker", UNSET)
         chunker: ChunkerConfig | Unset

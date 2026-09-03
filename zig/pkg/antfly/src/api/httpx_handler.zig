@@ -94,7 +94,7 @@ const admin_routes = @import("../admin/routes.zig");
 const internal_routes = @import("../internal/routes.zig");
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {

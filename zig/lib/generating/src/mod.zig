@@ -558,27 +558,18 @@ fn deinitChainAlloc(alloc: std.mem.Allocator, chain: []ChainLink) void {
     alloc.free(chain);
 }
 
-fn providerFromOpenApi(provider: openapi.GeneratorProvider) !Provider {
-    return switch (provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        .mock => .mock,
-        else => error.UnsupportedGeneratorProvider,
-    };
+fn providerFromOpenApi(provider: ?[]const u8) !Provider {
+    const name = provider orelse return error.InvalidGeneratorConfig;
+    if (std.mem.eql(u8, name, "gemini")) return .gemini;
+    if (std.mem.eql(u8, name, "vertex")) return .vertex;
+    if (std.mem.eql(u8, name, "openai")) return .openai;
+    if (std.mem.eql(u8, name, "ollama")) return .ollama;
+    if (std.mem.eql(u8, name, "antfly")) return .antfly;
+    return error.UnsupportedGeneratorProvider;
 }
 
-fn providerToOpenApi(provider: Provider) openapi.GeneratorProvider {
-    return switch (provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        .mock => .mock,
-    };
+fn providerToOpenApi(provider: Provider) []const u8 {
+    return @tagName(provider);
 }
 
 fn chainConditionFromOpenApi(condition: openapi.ChainCondition) !ChainCondition {

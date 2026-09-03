@@ -7,6 +7,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.exact_sort_error import ExactSortError
+from ...models.global_stateful_query_request import GlobalStatefulQueryRequest
 from ...models.graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
 from ...models.graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from ...models.graph_match_operation_limit_exceeded_error import GraphMatchOperationLimitExceededError
@@ -17,7 +18,6 @@ from ...models.hierarchy_cursor_stale_error import HierarchyCursorStaleError
 from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from ...models.query_filter_error import QueryFilterError
 from ...models.query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
-from ...models.stateful_query_request import StatefulQueryRequest
 from ...models.stateful_query_responses import StatefulQueryResponses
 from ...models.table_storage_unreadable_error import TableStorageUnreadableError
 from ...models.topology_changed_error import TopologyChangedError
@@ -28,7 +28,7 @@ from ...types import File, Response
 
 def _get_kwargs(
     *,
-    body: StatefulQueryRequest | File,
+    body: GlobalStatefulQueryRequest | File,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -37,7 +37,7 @@ def _get_kwargs(
         "url": "/db/v1/query",
     }
 
-    if isinstance(body, StatefulQueryRequest):
+    if isinstance(body, GlobalStatefulQueryRequest):
         _kwargs["json"] = body.to_dict()
 
         headers["Content-Type"] = "application/json"
@@ -282,7 +282,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient,
-    body: StatefulQueryRequest | File,
+    body: GlobalStatefulQueryRequest | File,
 ) -> Response[
     Error
     | Error
@@ -361,9 +361,8 @@ def sync_detailed(
     ```
 
     Args:
-        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
-            graph_queries; deprecated graph_searches is retained only at the stateful public transport
-            boundary for the v0.2 transition window.
+        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
+            on this route.
         body (File):
 
     Raises:
@@ -388,7 +387,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient,
-    body: StatefulQueryRequest | File,
+    body: GlobalStatefulQueryRequest | File,
 ) -> (
     Error
     | Error
@@ -468,9 +467,8 @@ def sync(
     ```
 
     Args:
-        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
-            graph_queries; deprecated graph_searches is retained only at the stateful public transport
-            boundary for the v0.2 transition window.
+        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
+            on this route.
         body (File):
 
     Raises:
@@ -490,7 +488,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
-    body: StatefulQueryRequest | File,
+    body: GlobalStatefulQueryRequest | File,
 ) -> Response[
     Error
     | Error
@@ -569,9 +567,8 @@ async def asyncio_detailed(
     ```
 
     Args:
-        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
-            graph_queries; deprecated graph_searches is retained only at the stateful public transport
-            boundary for the v0.2 transition window.
+        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
+            on this route.
         body (File):
 
     Raises:
@@ -594,7 +591,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient,
-    body: StatefulQueryRequest | File,
+    body: GlobalStatefulQueryRequest | File,
 ) -> (
     Error
     | Error
@@ -674,9 +671,8 @@ async def asyncio(
     ```
 
     Args:
-        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
-            graph_queries; deprecated graph_searches is retained only at the stateful public transport
-            boundary for the v0.2 transition window.
+        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
+            on this route.
         body (File):
 
     Raises:

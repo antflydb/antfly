@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ClusterStatus,
   CreateTableRequest,
+  GlobalQueryRequest,
   QueryRequest,
   TableQueryRequest,
   TableStatus,
@@ -162,7 +163,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: GlobalQueryRequest = {
         table: "test",
         limit: 10,
       };
@@ -180,7 +181,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
       const controller = new AbortController();
-      const request: QueryRequest = { limit: 3 };
+      const request: GlobalQueryRequest = { table: "products", limit: 3 };
 
       await client.query(request, { signal: controller.signal });
 
@@ -188,6 +189,15 @@ describe("AntflyClient", () => {
         body: request,
         signal: controller.signal,
       });
+    });
+
+    it("rejects a missing global table before transport", async () => {
+      const invalid = { limit: 3 } as unknown as GlobalQueryRequest;
+
+      await expect(client.query(invalid)).rejects.toThrow(
+        "Global query request.table must be a non-empty string"
+      );
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("should handle query with Bleve full_text_search", async () => {
@@ -212,7 +222,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: TableQueryRequest = {
+      const request: GlobalQueryRequest = {
         table: "products",
         full_text_index: "product_text",
         full_text_search: {
@@ -336,7 +346,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: TableQueryRequest = {
         full_text_search: {
           query: "laptop",
         },

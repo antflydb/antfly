@@ -123,8 +123,9 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 }
 
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !Config {
+    const provider_name = generated.provider orelse return error.InvalidEmbedderConfig;
     var cfg = Config{
-        .provider = generated.provider,
+        .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
         .url = if (generated.url) |url|
@@ -162,7 +163,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
 
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
-        .provider = cfg.provider,
+        .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,
         .url = switch (cfg.provider) {

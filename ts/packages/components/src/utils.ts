@@ -7,7 +7,7 @@ import type {
 } from "@antfly/sdk";
 import {
   AntflyClient,
-  type QueryRequest,
+  type GlobalQueryRequest,
   type QueryResponses,
   type RetrievalAgentRequest,
   type RetrievalAgentResult,
@@ -15,7 +15,7 @@ import {
 import qs from "qs";
 
 export interface MultiqueryRequest {
-  query: QueryRequest;
+  query: GlobalQueryRequest;
 }
 
 let defaultClient: AntflyClient | null = null;

@@ -18,7 +18,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import type { EmbedderProvider } from "@antfly/sdk";
 import { embedderProviders } from "@antfly/sdk";
 import type React from "react";
 import { useMemo } from "react";
@@ -27,7 +26,9 @@ import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connection
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
 
-const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
+type IndexEmbedderProvider = (typeof embedderProviders)[number];
+
+const staticModelSuggestions: Record<IndexEmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
   openai: ["text-embedding-3-small", "text-embedding-3-large"],
@@ -67,14 +68,14 @@ const IndexForm: React.FC<IndexFormProps> = ({
   );
 
   const modelSuggestions = useMemo(() => {
-    const merged: Record<EmbedderProvider, string[]> = {
+    const merged: Record<IndexEmbedderProvider, string[]> = {
       ...staticModelSuggestions,
     };
     // Live provider listings win over static suggestions; unconfigured or
     // failing providers keep their static lists.
     for (const [providerType, models] of Object.entries(liveEmbedders)) {
       if (models.length > 0 && providerType in merged) {
-        merged[providerType as EmbedderProvider] = models;
+        merged[providerType as IndexEmbedderProvider] = models;
       }
     }
     return merged;
@@ -94,7 +95,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
             <FormLabel>Provider</FormLabel>
             <Select
               value={field.value}
-              onValueChange={(value) => field.onChange(value as EmbedderProvider)}
+              onValueChange={(value) => field.onChange(value as IndexEmbedderProvider)}
             >
               <FormControl>
                 <SelectTrigger>
@@ -288,7 +289,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
             <FormLabel>Embedder Model</FormLabel>
             <FormControl>
               <Combobox
-                options={(modelSuggestions[provider as EmbedderProvider] || []).map(
+                options={(modelSuggestions[provider as IndexEmbedderProvider] || []).map(
                   (suggestion) => ({
                     value: suggestion,
                     label: suggestion,

@@ -1131,6 +1131,7 @@ fn addPublicOpenApiModule(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1303,6 +1304,7 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1344,6 +1346,7 @@ fn addOpenApiRegenStep(
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
             .{ "indexes.yaml", "antfly_indexes_openapi" },
             .{ "sort.yaml", "antfly_sort_openapi" },
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "generating.yaml", "antfly_generating_api_openapi" },
             .{ "eval.yaml", "antfly_eval_openapi" },
@@ -1570,6 +1573,7 @@ pub fn build(b: *std.Build) void {
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1586,6 +1590,7 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);

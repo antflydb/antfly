@@ -39,7 +39,7 @@ services:
         "combined",
         "--config",
         "/etc/antfly/config.json",
-        "--bind-host",
+        "--host",
         "0.0.0.0",
         "--health-port",
         "4200",

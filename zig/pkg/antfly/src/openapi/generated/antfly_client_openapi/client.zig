@@ -764,7 +764,7 @@ pub const Client = struct {
 
     /// Perform a global query
     /// POST /db/v1/query
-    pub fn globalQuery(self: *@This(), body: types.StatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
+    pub fn globalQuery(self: *@This(), body: types.GlobalStatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/query", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);

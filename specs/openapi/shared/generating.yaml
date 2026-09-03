@@ -12,13 +12,8 @@ components:
         - vertex
         - ollama
         - openai
-        - openrouter
-        - bedrock
-        - anthropic
-        - cohere
         - antfly
-        - mock
-      description: "The generative AI provider to use."
+      description: "Generator providers implemented by Antfly's generation runtime."
 
     GeneratorConfig:
       description: |
@@ -30,10 +25,6 @@ components:
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/OpenAIGeneratorConfig"
-            - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
-            - $ref: "#/components/schemas/BedrockGeneratorConfig"
-            - $ref: "#/components/schemas/AnthropicGeneratorConfig"
-            - $ref: "#/components/schemas/CohereGeneratorConfig"
         - properties:
             provider:
               $ref: "#/components/schemas/GeneratorProvider"
@@ -246,6 +237,9 @@ components:
       description: |
         Configuration for the Google generative AI provider (Gemini).
       properties:
+        provider:
+          type: string
+          enum: [gemini]
         project_id:
           type: string
           description: "The Google Cloud project ID."
@@ -284,6 +278,7 @@ components:
           format: uri
           description: "The URL of the Google API endpoint."
       required:
+        - provider
         - model
 
     VertexGeneratorConfig:
@@ -291,6 +286,9 @@ components:
       description: |
         Configuration for Google Cloud Vertex AI generative models.
       properties:
+        provider:
+          type: string
+          enum: [vertex]
         model:
           type: string
           description: "The name of the Vertex AI model to use."
@@ -326,6 +324,7 @@ components:
           type: integer
           description: "Top-k sampling parameter."
       required:
+        - provider
         - model
 
     OllamaGeneratorConfig:
@@ -333,6 +332,9 @@ components:
       description: |
         Configuration for the Ollama generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [ollama]
         model:
           type: string
           description: "The name of the Ollama model to use."
@@ -364,6 +366,7 @@ components:
           description: "HTTP response timeout in seconds for Ollama API calls."
           minimum: 1
       required:
+        - provider
         - model
 
     AntflyGeneratorConfig:
@@ -371,6 +374,9 @@ components:
       description: |
         Configuration for the Antfly inference generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [antfly]
         model:
           type: string
           description: "The name of the generator model."
@@ -402,6 +408,7 @@ components:
           description: "HTTP response timeout in seconds for Inference API calls."
           minimum: 1
       required:
+        - provider
         - model
 
     OpenAIGeneratorConfig:
@@ -409,6 +416,9 @@ components:
       description: |
         Configuration for the OpenAI generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [openai]
         model:
           type: string
           description: "The name of the OpenAI model to use."
@@ -450,6 +460,7 @@ components:
           minimum: -2.0
           maximum: 2.0
       required:
+        - provider
         - model
 
     BedrockGeneratorConfig:

@@ -2399,7 +2399,9 @@ fn parseFollowupConfig(request: RetrievalAgentRequest, has_generation: bool) !?P
     const followup = steps.followup orelse return null;
     if (followup.enabled != null and followup.enabled.? == false) return null;
     if (!has_generation) return error.UnsupportedRetrievalAgentRequest;
-    const count = @as(usize, @intCast(@min(@as(i64, 4), @max(@as(i64, 1), followup.count orelse 3))));
+    const requested_count = followup.count orelse 3;
+    if (requested_count < 1 or requested_count > 4) return error.InvalidRetrievalAgentRequest;
+    const count = @as(usize, @intCast(requested_count));
     return .{ .count = count };
 }
 
@@ -2514,14 +2516,19 @@ fn generatorConfigFromGenerated(cfg: generating_api_openapi.GeneratorConfig) !ge
 }
 
 fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
-    const provider: generating.Provider = switch (cfg.provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        else => return error.UnsupportedRetrievalAgentRequest,
-    };
+    const provider_name = cfg.provider orelse return error.InvalidRetrievalAgentRequest;
+    const provider: generating.Provider = if (std.mem.eql(u8, provider_name, "gemini"))
+        .gemini
+    else if (std.mem.eql(u8, provider_name, "vertex"))
+        .vertex
+    else if (std.mem.eql(u8, provider_name, "openai"))
+        .openai
+    else if (std.mem.eql(u8, provider_name, "ollama"))
+        .ollama
+    else if (std.mem.eql(u8, provider_name, "antfly"))
+        .antfly
+    else
+        return error.UnsupportedRetrievalAgentRequest;
     const model = cfg.model orelse return error.InvalidRetrievalAgentRequest;
     const url = switch (provider) {
         .antfly => cfg.api_url orelse "",
@@ -6439,6 +6446,24 @@ test "retrieval agent rejects out of range max tool iterations" {
 
     const too_large_body =
         \\{"query":"find alpha","stream":false,"max_internal_iterations":3,"tools":{"enabled_tools":["semantic_search"],"max_tool_iterations":21},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, too_large_body),
+    );
+}
+
+test "retrieval agent rejects out of range followup counts" {
+    const zero_body =
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":0}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, zero_body),
+    );
+
+    const too_large_body =
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":5}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"},"limit":5}]}
     ;
     try std.testing.expectError(
         error.InvalidRetrievalAgentRequest,

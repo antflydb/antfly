@@ -2,6 +2,7 @@
 // Package: antfly_metadata_openapi
 
 const std = @import("std");
+const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
@@ -3537,6 +3538,8 @@ pub const EdgesResponse = struct {
     }
 };
 
+pub const EmbedderProvider = antfly_embeddings_openapi.EmbedderProvider;
+
 pub const Embedding = std.json.Value;
 
 pub const Error = antfly_usermgr_openapi.Error;
@@ -3973,6 +3976,280 @@ pub const ForeignSource = struct {
         try jw.write(self.postgres_table);
         if (self.columns) |value| {
             try jw.objectField("columns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A stateful global query. The target table is required on this route.
+pub const GlobalStatefulQueryRequest = struct {
+    /// Name of the table to query. Required for global-query requests.
+    table: ?[]const u8 = null,
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
+    query: ?std.json.Value = null,
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
+    semantic_search: ?[]const u8 = null,
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    embedding_template: ?[]const u8 = null,
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
+    indexes: ?[]const []const u8 = null,
+    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
+    filter_prefix: ?[]const u8 = null,
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"` - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}` For structured `geo_bbox`, `min_lon > max_lon` intentionally represents a bounding box that crosses the antimeridian.
+    filter_query: ?RawQuery = null,
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    exclusion_query: ?RawQuery = null,
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    search_effort: ?f32 = null,
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
+    fields: ?[]const []const u8 = null,
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
+    limit: ?i64 = null,
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
+    offset: ?i64 = null,
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
+    timeout_ms: ?i64 = null,
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    order_by: ?[]const SortField = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
+    search_after: ?[]const std.json.Value = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    search_before: ?[]const std.json.Value = null,
+    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
+    distance_under: ?f32 = null,
+    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
+    distance_over: ?f32 = null,
+    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
+    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
+    count: ?bool = null,
+    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
+    profile: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    analyses: ?Analyses = null,
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
+    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    document_renderer: ?[]const u8 = null,
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    pruner: ?antfly_indexes_openapi.Pruner = null,
+    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
+    join: ?JoinClause = null,
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
+    graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
+    /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+    expand_strategy: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "query", "query", true },
+        .{ "full_text_search", "full_text_search", true },
+        .{ "full_text_index", "full_text_index", true },
+        .{ "semantic_search", "semantic_search", true },
+        .{ "embedding_template", "embedding_template", true },
+        .{ "indexes", "indexes", true },
+        .{ "filter_prefix", "filter_prefix", true },
+        .{ "filter_query", "filter_query", true },
+        .{ "exclusion_query", "exclusion_query", true },
+        .{ "aggregations", "aggregations", true },
+        .{ "embeddings", "embeddings", true },
+        .{ "search_effort", "search_effort", true },
+        .{ "fields", "fields", true },
+        .{ "hierarchy", "hierarchy", true },
+        .{ "limit", "limit", true },
+        .{ "offset", "offset", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "order_by", "order_by", true },
+        .{ "search_after", "search_after", true },
+        .{ "search_before", "search_before", true },
+        .{ "distance_under", "distance_under", true },
+        .{ "distance_over", "distance_over", true },
+        .{ "merge_config", "merge_config", false },
+        .{ "count", "count", true },
+        .{ "profile", "profile", true },
+        .{ "reranker", "reranker", false },
+        .{ "analyses", "analyses", true },
+        .{ "graph_queries", "graph_queries", false },
+        .{ "document_renderer", "document_renderer", true },
+        .{ "pruner", "pruner", false },
+        .{ "join", "join", true },
+        .{ "foreign_sources", "foreign_sources", true },
+        .{ "graph_searches", "graph_searches", true },
+        .{ "expand_strategy", "expand_strategy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.full_text_search) |value| {
+            try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
+            try jw.write(value);
+        }
+        if (self.semantic_search) |value| {
+            try jw.objectField("semantic_search");
+            try jw.write(value);
+        }
+        if (self.embedding_template) |value| {
+            try jw.objectField("embedding_template");
+            try jw.write(value);
+        }
+        if (self.indexes) |value| {
+            try jw.objectField("indexes");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.exclusion_query) |value| {
+            try jw.objectField("exclusion_query");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        if (self.embeddings) |value| {
+            try jw.objectField("embeddings");
+            try jw.write(value);
+        }
+        if (self.search_effort) |value| {
+            try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.offset) |value| {
+            try jw.objectField("offset");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.search_after) |value| {
+            try jw.objectField("search_after");
+            try jw.write(value);
+        }
+        if (self.search_before) |value| {
+            try jw.objectField("search_before");
+            try jw.write(value);
+        }
+        if (self.distance_under) |value| {
+            try jw.objectField("distance_under");
+            try jw.write(value);
+        }
+        if (self.distance_over) |value| {
+            try jw.objectField("distance_over");
+            try jw.write(value);
+        }
+        if (self.merge_config) |value| {
+            try jw.objectField("merge_config");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("merge_config");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.reranker) |value| {
+            try jw.objectField("reranker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reranker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.analyses) |value| {
+            try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_queries) |value| {
+            try jw.objectField("graph_queries");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_queries");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.document_renderer) |value| {
+            try jw.objectField("document_renderer");
+            try jw.write(value);
+        }
+        if (self.pruner) |value| {
+            try jw.objectField("pruner");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("pruner");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.join) |value| {
+            try jw.objectField("join");
+            try jw.write(value);
+        }
+        if (self.foreign_sources) |value| {
+            try jw.objectField("foreign_sources");
+            try jw.write(value);
+        }
+        if (self.graph_searches) |value| {
+            try jw.objectField("graph_searches");
+            try jw.write(value);
+        }
+        if (self.expand_strategy) |value| {
+            try jw.objectField("expand_strategy");
             try jw.write(value);
         }
         try jw.endObject();

@@ -3420,7 +3420,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/StatefulQueryRequest'
+              $ref: '#/components/schemas/GlobalStatefulQueryRequest'
           application/x-ndjson:
             schema:
               type: string
@@ -8876,6 +8876,19 @@ components:
           type: boolean
           default: false
           description: Sort direction. true = descending, false = ascending.
+    EmbedderProvider:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - cohere
+        - mock
+        - antfly
+      description: The embedding provider to use.
     ClusterHealth:
       type: string
       enum:
@@ -15387,6 +15400,18 @@ components:
                 - union: Include nodes from both search and graph results
 
                 - intersection: Only include nodes appearing in both
+    GlobalStatefulQueryRequest:
+      description: A stateful global query. The target table is required on this route.
+      allOf:
+        - $ref: '#/components/schemas/StatefulQueryRequest'
+        - type: object
+          properties:
+            table:
+              type: string
+              minLength: 1
+              description: Name of the table to query.
+          required:
+            - table
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -17617,6 +17642,10 @@ components:
 
         **Docs:** https://ollama.com/search?c=embedding
       properties:
+        provider:
+          type: string
+          enum:
+            - ollama
         model:
           type: string
           description: The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
@@ -17629,6 +17658,7 @@ components:
           default: http://localhost:11434
           example: http://localhost:11434
       required:
+        - provider
         - model
       example:
         provider: ollama
@@ -17651,6 +17681,10 @@ components:
 
         **Docs:** https://platform.openai.com/docs/guides/embeddings
       properties:
+        provider:
+          type: string
+          enum:
+            - openai
         model:
           type: string
           description: The name of the OpenAI model to use.
@@ -17672,6 +17706,7 @@ components:
           description: 'Output dimension for the embedding (uses MRL for dimension reduction). Recommended:
             256, 512, 1024, 1536, or 3072.'
       required:
+        - provider
         - model
       example:
         provider: openai
@@ -17692,6 +17727,10 @@ components:
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
       properties:
+        provider:
+          type: string
+          enum:
+            - bedrock
         model:
           type: string
           description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
@@ -17740,6 +17779,7 @@ components:
           description: The batch size for embedding requests to optimize throughput.
           default: 1
       required:
+        - provider
         - model
       example:
         provider: bedrock
@@ -17773,6 +17813,10 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        provider:
+          type: string
+          enum:
+            - antfly
         model:
           type: string
           description: The embedding model name (maps to models/embedders/{name}/ directory).
@@ -17784,33 +17828,26 @@ components:
             environment variable.
           example: http://localhost:8082
       required:
+        - provider
         - model
       example:
         provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
-    ManagedEmbedderProvider:
-      type: string
-      enum:
-        - ollama
-        - openai
-        - bedrock
-        - antfly
-      description: Embedding providers executable by managed index creation.
     ManagedEmbedderConfig:
       description: Embedding provider configuration accepted by managed index creation.
-      allOf:
-        - oneOf:
-            - $ref: '#/components/schemas/OllamaEmbedderConfig'
-            - $ref: '#/components/schemas/OpenAIEmbedderConfig'
-            - $ref: '#/components/schemas/BedrockEmbedderConfig'
-            - $ref: '#/components/schemas/AntflyEmbedderConfig'
-        - type: object
-          required:
-            - provider
-          properties:
-            provider:
-              $ref: '#/components/schemas/ManagedEmbedderProvider'
+      oneOf:
+        - $ref: '#/components/schemas/OllamaEmbedderConfig'
+        - $ref: '#/components/schemas/OpenAIEmbedderConfig'
+        - $ref: '#/components/schemas/BedrockEmbedderConfig'
+        - $ref: '#/components/schemas/AntflyEmbedderConfig'
+      discriminator:
+        propertyName: provider
+        mapping:
+          ollama: '#/components/schemas/OllamaEmbedderConfig'
+          openai: '#/components/schemas/OpenAIEmbedderConfig'
+          bedrock: '#/components/schemas/BedrockEmbedderConfig'
+          antfly: '#/components/schemas/AntflyEmbedderConfig'
     TextChunkOptions:
       type: object
       description: Options specific to text chunking.
@@ -18194,6 +18231,10 @@ components:
       description: >
         Configuration for the Google generative AI provider (Gemini).
       properties:
+        provider:
+          type: string
+          enum:
+            - gemini
         project_id:
           type: string
           description: The Google Cloud project ID.
@@ -18232,12 +18273,17 @@ components:
           format: uri
           description: The URL of the Google API endpoint.
       required:
+        - provider
         - model
     VertexGeneratorConfig:
       type: object
       description: >
         Configuration for Google Cloud Vertex AI generative models.
       properties:
+        provider:
+          type: string
+          enum:
+            - vertex
         model:
           type: string
           description: The name of the Vertex AI model to use.
@@ -18273,12 +18319,17 @@ components:
           type: integer
           description: Top-k sampling parameter.
       required:
+        - provider
         - model
     OllamaGeneratorConfig:
       type: object
       description: >
         Configuration for the Ollama generative AI provider.
       properties:
+        provider:
+          type: string
+          enum:
+            - ollama
         model:
           type: string
           description: The name of the Ollama model to use.
@@ -18310,12 +18361,17 @@ components:
           description: HTTP response timeout in seconds for Ollama API calls.
           minimum: 1
       required:
+        - provider
         - model
     AntflyGeneratorConfig:
       type: object
       description: >
         Configuration for the Antfly inference generative AI provider.
       properties:
+        provider:
+          type: string
+          enum:
+            - antfly
         model:
           type: string
           description: The name of the generator model.
@@ -18348,12 +18404,17 @@ components:
           description: HTTP response timeout in seconds for Inference API calls.
           minimum: 1
       required:
+        - provider
         - model
     OpenAIGeneratorConfig:
       type: object
       description: >
         Configuration for the OpenAI generative AI provider.
       properties:
+        provider:
+          type: string
+          enum:
+            - openai
         model:
           type: string
           description: The name of the OpenAI model to use.
@@ -18395,168 +18456,7 @@ components:
           minimum: -2.0
           maximum: 2.0
       required:
-        - model
-    OpenRouterGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the OpenRouter generative AI provider.
-      properties:
-        model:
-          type: string
-          description: Single model identifier. Either model or models must be provided.
-          example: openai/gpt-4.1
-        models:
-          type: array
-          items:
-            type: string
-          description: >
-            Array of model identifiers for fallback routing. Either model or models must be provided.
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenRouter API key.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        frequency_penalty:
-          type: number
-          format: float
-          description: Penalty for token frequency (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-        presence_penalty:
-          type: number
-          format: float
-          description: Penalty for token presence (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-    BedrockGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the AWS Bedrock generative AI provider.
-      properties:
-        model:
-          type: string
-          description: The Bedrock model ID to use.
-          example: anthropic.claude-sonnet-4-5-20250929-v1:0
-        region:
-          type: string
-          description: The AWS region for the Bedrock service.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-      required:
-        - model
-    AnthropicGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Anthropic generative AI provider.
-      properties:
-        model:
-          type: string
-          description: The full model ID of the Anthropic model to use.
-          default: claude-sonnet-4-5-20250929
-          example: claude-sonnet-4-5-20250929
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Anthropic API key.
-        url:
-          type: string
-          format: uri
-          description: The URL of the Anthropic API endpoint.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-      required:
-        - model
-    CohereGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Cohere generative AI provider.
-      properties:
-        model:
-          type: string
-          description: The name of the Cohere model to use.
-          default: command-r-plus
-          example: command-r-plus
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Cohere API key.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-        frequency_penalty:
-          type: number
-          format: float
-          description: Penalty for token frequency (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        presence_penalty:
-          type: number
-          format: float
-          description: Penalty for token presence (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-      required:
+        - provider
         - model
     GeneratorProvider:
       type: string
@@ -18565,13 +18465,8 @@ components:
         - vertex
         - ollama
         - openai
-        - openrouter
-        - bedrock
-        - anthropic
-        - cohere
         - antfly
-        - mock
-      description: The generative AI provider to use.
+      description: Generator providers implemented by Antfly's generation runtime.
     GeneratorConfig:
       description: >
         A unified configuration for a generative AI provider.
@@ -18582,10 +18477,6 @@ components:
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
-            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
-            - $ref: '#/components/schemas/BedrockGeneratorConfig'
-            - $ref: '#/components/schemas/AnthropicGeneratorConfig'
-            - $ref: '#/components/schemas/CohereGeneratorConfig'
         - properties:
             provider:
               $ref: '#/components/schemas/GeneratorProvider'

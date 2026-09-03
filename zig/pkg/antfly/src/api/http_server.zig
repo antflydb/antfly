@@ -152,7 +152,7 @@ const ArdOpenApiSpec = struct {
 };
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -189,7 +189,7 @@ test "OCC version zero matches only an absent document" {
     try std.testing.expect(ApiHttpServer.readSetVersionMatches(7, 7));
 }
 
-fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
 }

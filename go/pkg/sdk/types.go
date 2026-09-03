@@ -80,27 +80,25 @@ type (
 	AlgebraicIndexConfig        = oapi.AlgebraicIndexConfig
 	FullTextIndexStats          = oapi.FullTextIndexStats
 
-	EmbedderProvider         = oapi.ManagedEmbedderProvider
-	GeneratorProvider        = oapi.GeneratorProvider
-	EmbedderConfig           = oapi.ManagedEmbedderConfig
-	GeneratorConfig          = oapi.GeneratorConfig
-	OllamaEmbedderConfig     = oapi.OllamaEmbedderConfig
-	OpenAIEmbedderConfig     = oapi.OpenAIEmbedderConfig
-	BedrockEmbedderConfig    = oapi.BedrockEmbedderConfig
-	AntflyEmbedderConfig     = oapi.AntflyEmbedderConfig
-	OllamaGeneratorConfig    = oapi.OllamaGeneratorConfig
-	OpenAIGeneratorConfig    = oapi.OpenAIGeneratorConfig
-	GoogleGeneratorConfig    = oapi.GoogleGeneratorConfig
-	BedrockGeneratorConfig   = oapi.BedrockGeneratorConfig
-	VertexGeneratorConfig    = oapi.VertexGeneratorConfig
-	AnthropicGeneratorConfig = oapi.AnthropicGeneratorConfig
-	AntflyGeneratorConfig    = oapi.AntflyGeneratorConfig
-	RerankerConfig           = oapi.RerankerConfig
-	AntflyRerankerConfig     = oapi.AntflyRerankerConfig
-	CohereRerankerConfig     = oapi.CohereRerankerConfig
-	VertexRerankerConfig     = oapi.VertexRerankerConfig
-	RerankerProvider         = oapi.RerankerProvider
-	Pruner                   = oapi.Pruner
+	EmbedderProvider      = oapi.EmbedderProvider
+	GeneratorProvider     = oapi.GeneratorProvider
+	EmbedderConfig        = oapi.ManagedEmbedderConfig
+	GeneratorConfig       = oapi.GeneratorConfig
+	OllamaEmbedderConfig  = oapi.OllamaEmbedderConfig
+	OpenAIEmbedderConfig  = oapi.OpenAIEmbedderConfig
+	BedrockEmbedderConfig = oapi.BedrockEmbedderConfig
+	AntflyEmbedderConfig  = oapi.AntflyEmbedderConfig
+	OllamaGeneratorConfig = oapi.OllamaGeneratorConfig
+	OpenAIGeneratorConfig = oapi.OpenAIGeneratorConfig
+	GoogleGeneratorConfig = oapi.GoogleGeneratorConfig
+	VertexGeneratorConfig = oapi.VertexGeneratorConfig
+	AntflyGeneratorConfig = oapi.AntflyGeneratorConfig
+	RerankerConfig        = oapi.RerankerConfig
+	AntflyRerankerConfig  = oapi.AntflyRerankerConfig
+	CohereRerankerConfig  = oapi.CohereRerankerConfig
+	VertexRerankerConfig  = oapi.VertexRerankerConfig
+	RerankerProvider      = oapi.RerankerProvider
+	Pruner                = oapi.Pruner
 
 	// Chunker config types
 	ChunkerProvider     = oapi.ChunkerProvider
@@ -631,18 +629,20 @@ const (
 	DistanceMetricL2Squared    = oapi.DistanceMetricL2Squared
 
 	// Provider values
-	EmbedderProviderAntfly     = oapi.ManagedEmbedderProviderAntfly
-	EmbedderProviderOllama     = oapi.ManagedEmbedderProviderOllama
-	EmbedderProviderOpenai     = oapi.ManagedEmbedderProviderOpenai
-	EmbedderProviderBedrock    = oapi.ManagedEmbedderProviderBedrock
+	EmbedderProviderAntfly     = oapi.EmbedderProviderAntfly
+	EmbedderProviderOllama     = oapi.EmbedderProviderOllama
+	EmbedderProviderOpenai     = oapi.EmbedderProviderOpenai
+	EmbedderProviderGemini     = oapi.EmbedderProviderGemini
+	EmbedderProviderBedrock    = oapi.EmbedderProviderBedrock
+	EmbedderProviderVertex     = oapi.EmbedderProviderVertex
+	EmbedderProviderCohere     = oapi.EmbedderProviderCohere
+	EmbedderProviderOpenrouter = oapi.EmbedderProviderOpenrouter
+	EmbedderProviderMock       = oapi.EmbedderProviderMock
 	GeneratorProviderAntfly    = oapi.GeneratorProviderAntfly
 	GeneratorProviderOllama    = oapi.GeneratorProviderOllama
 	GeneratorProviderOpenai    = oapi.GeneratorProviderOpenai
 	GeneratorProviderGemini    = oapi.GeneratorProviderGemini
-	GeneratorProviderBedrock   = oapi.GeneratorProviderBedrock
 	GeneratorProviderVertex    = oapi.GeneratorProviderVertex
-	GeneratorProviderAnthropic = oapi.GeneratorProviderAnthropic
-	GeneratorProviderMock      = oapi.GeneratorProviderMock
 	RerankerProviderAntfly     = oapi.RerankerProviderAntfly
 	RerankerProviderCohere     = oapi.RerankerProviderCohere
 	RerankerProviderVertex     = oapi.RerankerProviderVertex

@@ -16,8 +16,11 @@ from antfly.client_generated.api.data_operations import (
 )
 from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
+    AntflyEmbedderConfig,
+    AntflyEmbedderConfigProvider,
     BatchRequest,
     BatchRequestInserts,
+    BedrockEmbedderConfig,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -26,8 +29,6 @@ from antfly.client_generated.models import (
     CreateEmbeddingsIndexRequest,
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
-    ManagedEmbedderConfig as EmbedderConfig,
-    ManagedEmbedderProvider as EmbedderProvider,
     Error,
     GraphKShortestPathsQuery,
     GraphMatchQuery,
@@ -37,7 +38,12 @@ from antfly.client_generated.models import (
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
+    OllamaEmbedderConfig,
+    OpenAIEmbedderConfig,
     QueryResponses,
+)
+from antfly.client_generated.models import (
+    EmbedderProvider as EmbedderProvider,
 )
 from antfly.client_generated.types import UNSET
 
@@ -69,6 +75,7 @@ MAX_GRAPH_MATCH_QUERIES = 8
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
 )
+EmbedderConfig: TypeAlias = AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
 GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
@@ -335,11 +342,11 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
 
 def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
     """Build a typed Antfly inference embedder configuration."""
-    config = EmbedderConfig(provider=EmbedderProvider.ANTFLY)
-    config["model"] = model
-    if api_url is not None:
-        config["api_url"] = api_url
-    return config
+    return AntflyEmbedderConfig(
+        provider=AntflyEmbedderConfigProvider.ANTFLY,
+        model=model,
+        api_url=api_url if api_url is not None else UNSET,
+    )
 
 
 def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, bool]:

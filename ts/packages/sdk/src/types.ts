@@ -52,6 +52,10 @@ export type QueryRequest = Omit<
   /** Named graph queries with non-scoring, stored-document node filters. */
   graph_queries?: Record<string, GraphQuery>;
 };
+/** Query body for the global endpoint, where the target table is part of the body. */
+export type GlobalQueryRequest = QueryRequest & {
+  table: string;
+};
 /**
  * Query body for a table-scoped endpoint. The table is selected exclusively by
  * the route argument so one request cannot carry two competing table names.
@@ -333,13 +337,13 @@ export type EmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
 export type ManagedEmbedderConfig = components["schemas"]["ManagedEmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
-export type EmbedderProvider = components["schemas"]["ManagedEmbedderProvider"];
-export const embedderProviders: components["schemas"]["ManagedEmbedderProvider"][] = [
+export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
+export const embedderProviders = [
   "antfly",
   "ollama",
   "openai",
   "bedrock",
-];
+] as const satisfies readonly EmbedderProvider[];
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
   "antfly",

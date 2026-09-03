@@ -10,7 +10,6 @@ pub const EmbedderConfig = types.EmbedderConfig;
 pub const EmbedderProvider = types.EmbedderProvider;
 pub const GoogleEmbedderConfig = types.GoogleEmbedderConfig;
 pub const ManagedEmbedderConfig = types.ManagedEmbedderConfig;
-pub const ManagedEmbedderProvider = types.ManagedEmbedderProvider;
 pub const OllamaEmbedderConfig = types.OllamaEmbedderConfig;
 pub const OpenAIEmbedderConfig = types.OpenAIEmbedderConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;

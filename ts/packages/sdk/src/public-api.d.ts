@@ -3234,6 +3234,11 @@ export interface components {
             desc?: boolean;
         };
         /**
+         * @description The embedding provider to use.
+         * @enum {string}
+         */
+        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
+        /**
          * @description Overall health status of the cluster
          * @enum {string}
          */
@@ -7219,6 +7224,11 @@ export interface components {
              */
             expand_strategy?: "union" | "intersection";
         };
+        /** @description A stateful global query. The target table is required on this route. */
+        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
+            /** @description Name of the table to query. */
+            table: string;
+        };
         Analyses: {
             pca?: boolean;
             tsne?: boolean;
@@ -8676,6 +8686,11 @@ export interface components {
          */
         OllamaEmbedderConfig: {
             /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "ollama";
+            /**
              * @description The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
              * @example nomic-embed-text
              */
@@ -8704,6 +8719,11 @@ export interface components {
          *     }
          */
         OpenAIEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "openai";
             /**
              * @description The name of the OpenAI model to use.
              * @default text-embedding-3-small
@@ -8738,6 +8758,11 @@ export interface components {
          *     }
          */
         BedrockEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "bedrock";
             /**
              * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
              * @example cohere.embed-v4
@@ -8799,6 +8824,11 @@ export interface components {
          */
         AntflyEmbedderConfig: {
             /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "antfly";
+            /**
              * @description The embedding model name (maps to models/embedders/{name}/ directory).
              * @example bge-base-en-v1.5
              */
@@ -8810,15 +8840,8 @@ export interface components {
              */
             api_url?: string;
         };
-        /**
-         * @description Embedding providers executable by managed index creation.
-         * @enum {string}
-         */
-        ManagedEmbedderProvider: "ollama" | "openai" | "bedrock" | "antfly";
         /** @description Embedding provider configuration accepted by managed index creation. */
-        ManagedEmbedderConfig: (components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
-            provider: components["schemas"]["ManagedEmbedderProvider"];
-        };
+        ManagedEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -9045,6 +9068,8 @@ export interface components {
         };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
+            /** @enum {string} */
+            provider: "gemini";
             /** @description The Google Cloud project ID. */
             project_id?: string;
             /** @description The Google Cloud location (e.g., 'us-central1'). */
@@ -9079,6 +9104,8 @@ export interface components {
         };
         /** @description Configuration for Google Cloud Vertex AI generative models. */
         VertexGeneratorConfig: {
+            /** @enum {string} */
+            provider: "vertex";
             /**
              * @description The name of the Vertex AI model to use.
              * @default gemini-2.5-flash
@@ -9111,6 +9138,8 @@ export interface components {
         };
         /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
+            /** @enum {string} */
+            provider: "ollama";
             /**
              * @description The name of the Ollama model to use.
              * @example llama3.3:70b
@@ -9140,6 +9169,8 @@ export interface components {
         };
         /** @description Configuration for the Antfly inference generative AI provider. */
         AntflyGeneratorConfig: {
+            /** @enum {string} */
+            provider: "antfly";
             /**
              * @description The name of the generator model.
              * @example onnxruntime/Gemma-3-ONNX
@@ -9169,6 +9200,8 @@ export interface components {
         };
         /** @description Configuration for the OpenAI generative AI provider. */
         OpenAIGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openai";
             /**
              * @description The name of the OpenAI model to use.
              * @default gpt-4.1
@@ -9205,134 +9238,11 @@ export interface components {
              */
             presence_penalty?: number;
         };
-        /** @description Configuration for the OpenRouter generative AI provider. */
-        OpenRouterGeneratorConfig: {
-            /**
-             * @description Single model identifier. Either model or models must be provided.
-             * @example openai/gpt-4.1
-             */
-            model?: string;
-            /** @description Array of model identifiers for fallback routing. Either model or models must be provided. */
-            models?: string[];
-            /** @description The OpenRouter API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the AWS Bedrock generative AI provider. */
-        BedrockGeneratorConfig: {
-            /**
-             * @description The Bedrock model ID to use.
-             * @example anthropic.claude-sonnet-4-5-20250929-v1:0
-             */
-            model: string;
-            /** @description The AWS region for the Bedrock service. */
-            region?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Anthropic generative AI provider. */
-        AnthropicGeneratorConfig: {
-            /**
-             * @description The full model ID of the Anthropic model to use.
-             * @default claude-sonnet-4-5-20250929
-             * @example claude-sonnet-4-5-20250929
-             */
-            model: string;
-            /** @description The Anthropic API key. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Anthropic API endpoint.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Cohere generative AI provider. */
-        CohereGeneratorConfig: {
-            /**
-             * @description The name of the Cohere model to use.
-             * @default command-r-plus
-             * @example command-r-plus
-             */
-            model: string;
-            /** @description The Cohere API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (0.0-1.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (0.0-1.0).
-             */
-            presence_penalty?: number;
-        };
         /**
-         * @description The generative AI provider to use.
+         * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "antfly" | "mock";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "antfly";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -9342,7 +9252,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["CohereGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
             provider: components["schemas"]["GeneratorProvider"];
         };
         /** @description Configuration for a specific edge type */
@@ -15677,7 +15587,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["StatefulQueryRequest"];
+                "application/json": components["schemas"]["GlobalStatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };

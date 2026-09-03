@@ -19,11 +19,6 @@ components:
         - antfly
       description: "The embedding provider to use."
 
-    ManagedEmbedderProvider:
-      type: string
-      enum: [ollama, openai, bedrock, antfly]
-      description: "Embedding providers executable by managed index creation."
-
     GoogleEmbedderConfig:
       type: object
       description: |-
@@ -35,6 +30,9 @@ components:
 
         **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
       properties:
+        provider:
+          type: string
+          enum: [gemini]
         project_id:
           type: string
           description: "The Google Cloud project ID (optional for Gemini API, required for Vertex AI)."
@@ -59,6 +57,7 @@ components:
           format: uri
           description: "The URL of the Google API endpoint (optional, uses default if not specified)."
       required:
+        - provider
         - model
       example:
         provider: "gemini"
@@ -77,6 +76,9 @@ components:
 
         **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
       properties:
+        provider:
+          type: string
+          enum: [vertex]
         model:
           type: string
           description: "The name of the Vertex AI embedding model to use."
@@ -98,6 +100,7 @@ components:
           description: "The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding)."
           default: 3072
       required:
+        - provider
         - model
       example:
         provider: "vertex"
@@ -117,6 +120,9 @@ components:
 
         **Docs:** https://ollama.com/search?c=embedding
       properties:
+        provider:
+          type: string
+          enum: [ollama]
         model:
           type: string
           description: "The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large')."
@@ -128,6 +134,7 @@ components:
           default: "http://localhost:11434"
           example: "http://localhost:11434"
       required:
+        - provider
         - model
       example:
         provider: "ollama"
@@ -146,6 +153,9 @@ components:
 
         **Docs:** https://platform.openai.com/docs/guides/embeddings
       properties:
+        provider:
+          type: string
+          enum: [openai]
         model:
           type: string
           description: "The name of the OpenAI model to use."
@@ -165,6 +175,7 @@ components:
           type: integer
           description: "Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072."
       required:
+        - provider
         - model
       example:
         provider: "openai"
@@ -182,6 +193,9 @@ components:
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
       properties:
+        provider:
+          type: string
+          enum: [bedrock]
         model:
           type: string
           description: "The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN)."
@@ -225,6 +239,7 @@ components:
           description: "The batch size for embedding requests to optimize throughput."
           default: 1
       required:
+        - provider
         - model
       example:
         provider: "bedrock"
@@ -243,6 +258,9 @@ components:
 
         **Docs:** https://docs.cohere.com/reference/embed
       properties:
+        provider:
+          type: string
+          enum: [cohere]
         model:
           type: string
           description: "The name of the Cohere embedding model to use."
@@ -270,6 +288,7 @@ components:
             - END
           default: "END"
       required:
+        - provider
         - model
       example:
         provider: "cohere"
@@ -289,6 +308,9 @@ components:
 
         **Docs:** https://openrouter.ai/docs/api/reference/embeddings
       properties:
+        provider:
+          type: string
+          enum: [openrouter]
         model:
           type: string
           description: "The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001')."
@@ -302,6 +324,7 @@ components:
           type: integer
           description: "Output dimension for the embedding (if supported by the model)."
       required:
+        - provider
         - model
       example:
         provider: "openrouter"
@@ -326,6 +349,9 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        provider:
+          type: string
+          enum: [antfly]
         model:
           type: string
           description: "The embedding model name (maps to models/embedders/{name}/ directory)."
@@ -336,6 +362,7 @@ components:
           description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable."
           example: "http://localhost:8082"
       required:
+        - provider
         - model
       example:
         provider: "antfly"
@@ -344,17 +371,18 @@ components:
 
     ManagedEmbedderConfig:
       description: "Embedding provider configuration accepted by managed index creation."
-      allOf:
-        - oneOf:
-            - $ref: "#/components/schemas/OllamaEmbedderConfig"
-            - $ref: "#/components/schemas/OpenAIEmbedderConfig"
-            - $ref: "#/components/schemas/BedrockEmbedderConfig"
-            - $ref: "#/components/schemas/AntflyEmbedderConfig"
-        - type: object
-          required: [provider]
-          properties:
-            provider:
-              $ref: "#/components/schemas/ManagedEmbedderProvider"
+      oneOf:
+        - $ref: "#/components/schemas/OllamaEmbedderConfig"
+        - $ref: "#/components/schemas/OpenAIEmbedderConfig"
+        - $ref: "#/components/schemas/BedrockEmbedderConfig"
+        - $ref: "#/components/schemas/AntflyEmbedderConfig"
+      discriminator:
+        propertyName: provider
+        mapping:
+          ollama: "#/components/schemas/OllamaEmbedderConfig"
+          openai: "#/components/schemas/OpenAIEmbedderConfig"
+          bedrock: "#/components/schemas/BedrockEmbedderConfig"
+          antfly: "#/components/schemas/AntflyEmbedderConfig"
 
     EmbedderConfig:
       description: |-

@@ -2174,6 +2174,8 @@ components:
       $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
       $ref: "sort.yaml#/components/schemas/SortField"
+    EmbedderProvider:
+      $ref: "embeddings.yaml#/components/schemas/EmbedderProvider"
     ClusterHealth:
       type: string
       enum:
@@ -7790,6 +7792,17 @@ components:
                 Strategy for merging legacy graph results with search results:
                 - union: Include nodes from both search and graph results
                 - intersection: Only include nodes appearing in both
+    GlobalStatefulQueryRequest:
+      description: A stateful global query. The target table is required on this route.
+      allOf:
+        - $ref: '#/components/schemas/StatefulQueryRequest'
+        - type: object
+          properties:
+            table:
+              type: string
+              minLength: 1
+              description: Name of the table to query.
+          required: [table]
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -10280,7 +10293,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/StatefulQueryRequest"
+              $ref: "#/components/schemas/GlobalStatefulQueryRequest"
           application/x-ndjson:
             schema:
               type: string

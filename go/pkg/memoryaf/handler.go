@@ -24,7 +24,7 @@ const (
 	embeddingIndex    = "memory_embeddings"
 	graphIndex        = "memory_graph"
 	embedderDimension = 384
-	embedderProvider  = "antfly"
+	embedderModel     = "all-MiniLM-L6-v2"
 )
 
 func canonicalGraphTraversal(startKeys, edgeTypes []string, maxDepth, limit int, memoryFilter *query.Query) map[string]any {
@@ -216,12 +216,14 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		},
 	}
 
+	embedder, err := client.NewEmbedderConfig(client.AntflyEmbedderConfig{Model: embedderModel})
+	if err != nil {
+		return fmt.Errorf("build embedder config: %w", err)
+	}
 	embIdx, err := client.NewCreateIndexRequest(client.EmbeddingsIndexConfig{
 		Dimension: embedderDimension,
 		Field:     "content",
-		Embedder: client.EmbedderConfig{
-			Provider: client.EmbedderProvider(embedderProvider),
-		},
+		Embedder:  *embedder,
 	})
 	if err != nil {
 		return fmt.Errorf("build embedding index config: %w", err)
@@ -229,9 +231,9 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 
 	graphIdx, err := client.NewCreateIndexRequest(client.GraphIndexConfig{
 		EdgeTypes: []client.EdgeTypeConfig{
-			{Name: "mentions", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
-			{Name: "related_to", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
-			{Name: "supersedes", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
+			{Name: "mentions"},
+			{Name: "related_to"},
+			{Name: "supersedes"},
 		},
 		MaxEdgesPerDocument: 0,
 	})
