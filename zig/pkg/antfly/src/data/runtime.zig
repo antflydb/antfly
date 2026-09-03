@@ -19886,7 +19886,10 @@ fn storeNativeGenerationRestoreCapabilityVisible(
 }
 
 fn runtimeStatusReadyForStoreRegistration(ready_version: u16) bool {
-    return ready_version >= metadata_runtime_status_protocol.native_restore_identity_record_version;
+    return metadata_runtime_status_protocol.profileSatisfies(
+        ready_version,
+        metadata_runtime_status_protocol.native_restore_identity_record_version,
+    );
 }
 
 test "data store registration waits for native generation capability acknowledgment" {
@@ -19905,9 +19908,10 @@ test "data store registration waits for native generation capability acknowledgm
     committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
     try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
-    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.repair_status_record_version));
+    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.v0_2_0_record_version));
     try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
     try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.current_record_version));
+    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(16));
 }
 
 fn findRangeByGroupId(
