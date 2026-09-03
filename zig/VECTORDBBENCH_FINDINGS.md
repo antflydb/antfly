@@ -3824,6 +3824,49 @@ profiled server query time to 24.60 ms, so r128 is deliberately not timing
 evidence. The uncontended r126 30.09-second lifecycle and 3.23 ms mean server
 time remain the applicable performance baseline.
 
+### Post-CI-fix performance qualification (r129)
+
+Commit `d68605ac7` was first validated in Debug with the focused Zig coverage,
+the public API regression suites, the exact managed-embedding restart test, and
+the portable backup/restore test. ReleaseFast was used only for these fresh
+performance measurements. Both runs used the public API, official VectorDBBench
+cases, batch size 100, four load workers, the native HBC/vector-block path, and
+float16 scan blocks. The adapter disabled the unrelated default full-text index.
+
+The 50K lifecycle inserted in 21.85 seconds and reached native-ready in 25.88
+seconds (4.03 seconds of final catch-up). Recall was 0.9836 live and warm after
+restart, and 0.9769 cold after restart. The live concurrency 1/10/20/30 curve
+was 173.0/401.9/422.8/347.7 QPS with p95 latency
+7.0/47.7/100.6/157.8 ms. The warm profile scored 23,800 approximate vectors,
+completed 135.6 exact vectors, and visited 207.9 leaves per query; mean client
+and server times were 6.09 and 4.83 ms. Live peak RSS was 2.75 GB and sampled
+attributable demand was 1.12 GB; restart peak RSS was 582 MB and restart demand
+was 167 MB.
+
+The 1M lifecycle inserted in 924.66 seconds and reached native-ready in 934.74
+seconds (15.58 minutes total, including 10.08 seconds of final catch-up). Recall
+was 0.9904 live/warm and 0.9905 cold. The live concurrency 1/10/20/30 curve was
+6.72/107.48/131.45/124.79 QPS with p95 latency
+64.5/116.6/212.6/344.9 ms; official serial p95/p99 was 17.7/18.3 ms. The warm
+profile scored 239,240 approximate vectors, completed 146.3 exact vectors, and
+visited all 2,048 leaves per query. Mean client/server time was 14.97/13.78 ms,
+including 6.31 ms leaf scoring and 3.29 ms artifact reads. Cold-restart serial
+p95/p99 was 127.8/138.0 ms, while warm-restart p95/p99 returned to 17.4/17.9
+ms. Live peak RSS was 7.72 GB and sampled attributable demand was 2.50 GB;
+restart peak RSS was 2.30 GB and restart demand was 940 MB.
+
+These are correctness qualifications but fail the performance gate. Against
+r126 at 50K, approximate work, exact completion, and leaves/query are nearly
+unchanged, yet mean server time regressed from 3.23 to 4.83 ms and
+concurrency-30 throughput from 1,065 to 348 QPS. Against r125 at 1M, ready time
+regressed from 775.94 to 934.74 seconds and the live concurrency curve regressed
+from 14.13/426.46/502.27/483.43 QPS. Attributable live demand remained nearly
+flat (2.60 versus 2.50 GB) while cache-inclusive RSS rose from 3.86 to 7.72 GB.
+Because the candidate shell is unchanged, the next diagnosis
+should focus on serving synchronization, page residency/admission, and artifact
+read behavior introduced after r126 rather than weakening routing or exact
+rerank semantics.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
